@@ -1,0 +1,349 @@
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import cv2
+import numpy as np
+
+from r2v_data_v2.config import PipelineConfig, Sam3Config
+from r2v_data_v2.manifest import iter_source_records
+from r2v_data_v2.mask_utils import (
+    bbox_from_mask,
+    encode_mask,
+    fill_small_enclosed_holes,
+    save_mask_contact_sheet,
+    touches_border,
+)
+from r2v_data_v2.schemas import AnnotationResult
+
+
+@dataclass(frozen=True)
+class SamObservation:
+    frame_slot: int
+    mask: np.ndarray
+    confidence: float
+    object_id: int
+
+
+@dataclass(frozen=True)
+class SamExtractionStats:
+    processed: int = 0
+    sam_failed: int = 0
+    no_valid_candidate: int = 0
+
+
+class Sam3Backend:
+    def __init__(self, config: Sam3Config, *, predictor: object | None = None) -> None:
+        self.config = config
+        if predictor is not None:
+            self.predictor = predictor
+            return
+        code_root = config.code_root.expanduser().resolve()
+        checkpoint = (
+            config.checkpoint.expanduser().resolve() if config.checkpoint else None
+        )
+        if not code_root.is_dir():
+            raise FileNotFoundError(f"SAM3 code_root does not exist: {code_root}")
+        if checkpoint is None:
+            raise ValueError("sam3.checkpoint must be configured explicitly")
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"SAM3 checkpoint does not exist: {checkpoint}")
+        sys.path.insert(0, str(code_root))
+        from sam3.model_builder import build_sam3_video_predictor
+
+        self.predictor = build_sam3_video_predictor(checkpoint_path=str(checkpoint))
+
+    @staticmethod
+    def _observations(frame_slot: int, outputs: dict[str, Any]) -> list[SamObservation]:
+        masks = np.asarray(outputs.get("out_binary_masks", []), dtype=bool)
+        if masks.ndim == 2:
+            masks = masks[None, ...]
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks = masks[:, 0]
+        if masks.ndim != 3:
+            raise ValueError("SAM3 masks must have N-H-W or N-1-H-W shape")
+        probabilities = np.asarray(
+            outputs.get("out_probs", np.ones(len(masks))),
+            dtype=float,
+        ).reshape(-1)
+        object_ids = np.asarray(
+            outputs.get("out_obj_ids", np.arange(len(masks))),
+            dtype=int,
+        ).reshape(-1)
+        result: list[SamObservation] = []
+        for index, mask in enumerate(masks):
+            if not mask.any():
+                continue
+            result.append(
+                SamObservation(
+                    frame_slot=frame_slot,
+                    mask=mask,
+                    confidence=(
+                        float(probabilities[index])
+                        if index < len(probabilities)
+                        else 1.0
+                    ),
+                    object_id=(
+                        int(object_ids[index]) if index < len(object_ids) else index
+                    ),
+                )
+            )
+        return result
+
+    def track(self, *, frames_dir: Path, grounding_prompt: str) -> list[SamObservation]:
+        start = self.predictor.handle_request(
+            {"type": "start_session", "resource_path": str(frames_dir)}
+        )
+        session_id = start["session_id"]
+        frame_outputs: dict[int, dict[str, Any]] = {}
+        try:
+            prompted = self.predictor.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": 0,
+                    "text": grounding_prompt,
+                }
+            )
+            frame_outputs[int(prompted["frame_index"])] = prompted["outputs"]
+            for response in self.predictor.handle_stream_request(
+                {
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                    "propagation_direction": "both",
+                }
+            ):
+                frame_outputs[int(response["frame_index"])] = response["outputs"]
+        finally:
+            self.predictor.handle_request(
+                {"type": "close_session", "session_id": session_id}
+            )
+        observations: list[SamObservation] = []
+        for frame_slot, outputs in sorted(frame_outputs.items()):
+            current = self._observations(frame_slot, outputs)
+            if len(current) > 1:
+                raise ValueError(
+                    f"SAM3 found multiple unresolved instances in frame slot {frame_slot}"
+                )
+            observations.extend(current)
+        object_ids = {item.object_id for item in observations}
+        if len(object_ids) > 1:
+            raise ValueError("SAM3 object identity switched across sampled frames")
+        return observations
+
+    def close(self) -> None:
+        shutdown = getattr(self.predictor, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
+
+def _annotation_from_payload(payload: dict[str, Any]) -> AnnotationResult:
+    return AnnotationResult.model_validate(
+        {
+            "caption": payload["caption"],
+            "prompt_with_refs": payload["prompt_with_refs"],
+            "entities": payload["entities"],
+            "relations": payload.get("relations", []),
+            "background": payload.get("background"),
+        }
+    )
+
+
+def _candidate_from_observation(
+    *,
+    observation: SamObservation,
+    frame: np.ndarray,
+    source_frame_index: int,
+    config: PipelineConfig,
+) -> tuple[dict[str, object], np.ndarray] | None:
+    mask = np.asarray(observation.mask, dtype=bool)
+    if mask.shape != frame.shape[:2] or not mask.any():
+        return None
+    mask = fill_small_enclosed_holes(mask, frame=frame)
+    bbox = bbox_from_mask(mask)
+    x1, y1, x2, y2 = bbox
+    area_ratio = float(mask.mean())
+    effective_short_side = min(x2 - x1, y2 - y1)
+    if observation.confidence < config.sam3.minimum_confidence:
+        return None
+    if effective_short_side < config.ranking.minimum_effective_short_side:
+        return None
+    if not (
+        config.ranking.minimum_mask_area_ratio
+        <= area_ratio
+        <= config.ranking.maximum_mask_area_ratio
+    ):
+        return None
+    return (
+        {
+            "frame_slot": observation.frame_slot,
+            "source_frame_index": source_frame_index,
+            "bbox_xyxy": list(bbox),
+            "mask_area_ratio": area_ratio,
+            "sam_confidence": observation.confidence,
+            "touches_border": touches_border(mask),
+            "visible": True,
+            "effective_short_side": effective_short_side,
+            "mask_rle_key": None,
+        },
+        mask,
+    )
+
+
+def _write_candidates(
+    *,
+    output_root: Path,
+    clip_uid: str,
+    entity_id: str,
+    candidates: list[dict[str, object]],
+    masks: dict[int, np.ndarray],
+    frame_paths: list[Path],
+    save_top_k: int,
+) -> None:
+    destination = output_root / "candidates" / clip_uid / entity_id
+    destination.mkdir(parents=True, exist_ok=True)
+    ranked_slots = [
+        int(candidate["frame_slot"])
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                float(item["sam_confidence"]),
+                int(item["effective_short_side"]),
+            ),
+            reverse=True,
+        )[:save_top_k]
+    ]
+    encoded: dict[str, object] = {}
+    for slot in ranked_slots:
+        key = f"frame_{slot:02d}"
+        encoded[key] = encode_mask(masks[slot])
+        for candidate in candidates:
+            if int(candidate["frame_slot"]) == slot:
+                candidate["mask_rle_key"] = key
+                break
+    with (destination / "candidates.jsonl").open("w", encoding="utf-8") as handle:
+        for candidate in sorted(candidates, key=lambda item: int(item["frame_slot"])):
+            record = {"clip_uid": clip_uid, "entity_id": entity_id, **candidate}
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    (destination / "top_masks.rle.json").write_text(
+        json.dumps(encoded),
+        encoding="utf-8",
+    )
+    save_mask_contact_sheet(
+        frame_paths=frame_paths,
+        candidates=candidates,
+        masks=masks,
+        destination=destination / "contact_sheet.jpg",
+    )
+
+
+def _append_failure(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+
+
+def extract_manifest_candidates(
+    config: PipelineConfig,
+    *,
+    overwrite: bool = False,
+    backend: Sam3Backend | None = None,
+) -> SamExtractionStats:
+    output_root = config.ensure_output_root()
+    annotation_manifest = output_root / "manifests" / "annotations.jsonl"
+    if not annotation_manifest.is_file():
+        raise FileNotFoundError("run Stage 02 before SAM3 extraction")
+    sam = backend or Sam3Backend(config.sam3)
+    processed = failed = no_valid = 0
+    try:
+        for payload in iter_source_records(annotation_manifest):
+            clip = str(payload["clip_uid"])
+            annotation = _annotation_from_payload(payload)
+            frame_dir = output_root / "frames" / clip
+            frame_metadata = json.loads(
+                (frame_dir / "frames.json").read_text(encoding="utf-8")
+            )
+            frame_paths = [
+                frame_dir / f"frame_{slot:02d}.jpg"
+                for slot in range(config.frames.count)
+            ]
+            for entity in annotation.entities:
+                if not entity.reference_worthy:
+                    continue
+                destination = (
+                    output_root
+                    / "candidates"
+                    / clip
+                    / entity.entity_id
+                    / "candidates.jsonl"
+                )
+                if destination.is_file() and not overwrite:
+                    continue
+                try:
+                    observations = sam.track(
+                        frames_dir=frame_dir,
+                        grounding_prompt=entity.grounding_prompt,
+                    )
+                    candidates: list[dict[str, object]] = []
+                    masks: dict[int, np.ndarray] = {}
+                    for observation in observations:
+                        frame = cv2.imread(str(frame_paths[observation.frame_slot]))
+                        if frame is None:
+                            raise RuntimeError("sampled frame is unreadable")
+                        item = _candidate_from_observation(
+                            observation=observation,
+                            frame=frame,
+                            source_frame_index=int(
+                                frame_metadata["sampled_indices"][
+                                    observation.frame_slot
+                                ]
+                            ),
+                            config=config,
+                        )
+                        if item is not None:
+                            candidate, mask = item
+                            candidates.append(candidate)
+                            masks[observation.frame_slot] = mask
+                    if len(candidates) < config.sam3.minimum_visible_frames:
+                        no_valid += 1
+                        _append_failure(
+                            output_root / "logs" / "sam_failed.jsonl",
+                            {
+                                "clip_uid": clip,
+                                "entity_id": entity.entity_id,
+                                "error": "entity is visible in too few sampled frames",
+                            },
+                        )
+                        continue
+                    _write_candidates(
+                        output_root=output_root,
+                        clip_uid=clip,
+                        entity_id=entity.entity_id,
+                        candidates=candidates,
+                        masks=masks,
+                        frame_paths=frame_paths,
+                        save_top_k=config.ranking.save_top_k_mask_rle,
+                    )
+                    processed += 1
+                except Exception as exc:  # noqa: BLE001 - continue with other entities
+                    _append_failure(
+                        output_root / "logs" / "sam_failed.jsonl",
+                        {
+                            "clip_uid": clip,
+                            "entity_id": entity.entity_id,
+                            "error": str(exc),
+                        },
+                    )
+                    failed += 1
+    finally:
+        if backend is None:
+            sam.close()
+    return SamExtractionStats(processed, failed, no_valid)
+
+
+def stats_dict(stats: SamExtractionStats) -> dict[str, int]:
+    return asdict(stats)
