@@ -170,9 +170,9 @@ def hard_rejection_reasons(
             config=config,
         )
     )
-    if dino_temporal_outlier:
+    if dino_temporal_outlier and config.dinov3_exclude_cluster_outliers:
         reasons.append("dino_temporal_outlier")
-    if siglip_wrong_entity:
+    if siglip_wrong_entity and config.siglip2_hard_reject_wrong_entity:
         reasons.append("siglip_wrong_entity")
     if visual_review.completeness < 0.5:
         reasons.append("incomplete")

@@ -265,7 +265,10 @@ def test_dino_outlier_cannot_be_rescued_by_visual_quality() -> None:
 
     ranked = rank_candidates(
         candidates,
-        config=RankingConfig(siglip2_enabled=False),
+        config=RankingConfig(
+            dinov3_exclude_cluster_outliers=True,
+            siglip2_enabled=False,
+        ),
         dino_metrics_by_slot=dino_metrics,
         dino_outlier_slots={0},
     )
@@ -298,13 +301,41 @@ def test_siglip_wrong_entity_cannot_be_rescued_by_sharpness() -> None:
 
     ranked = rank_candidates(
         candidates,
-        config=RankingConfig(dinov3_enabled=False),
+        config=RankingConfig(
+            dinov3_enabled=False,
+            siglip2_hard_reject_wrong_entity=True,
+        ),
         alignment_metrics_by_slot=alignments,
         siglip_wrong_entity_slots={0},
     )
 
     assert ranked[0].frame_slot == 1
     assert "siglip_wrong_entity" in ranked[1].hard_rejection_reasons
+
+
+def test_dino_and_siglip_filters_are_soft_by_default() -> None:
+    candidate = (
+        0,
+        10,
+        0.9,
+        _metrics(border_touch=False, sharpness=10),
+        _review(0),
+    )
+    alignment = AlignmentMetrics(0.1, -0.4, "distractor")
+    config = RankingConfig(dinov3_enabled=True, siglip2_enabled=True)
+
+    ranked = rank_candidates(
+        [candidate],
+        config=config,
+        dino_outlier_slots={0},
+        alignment_metrics_by_slot={0: alignment},
+        siglip_wrong_entity_slots={0},
+    )
+
+    assert not config.dinov3_exclude_cluster_outliers
+    assert not config.siglip2_hard_reject_wrong_entity
+    assert "dino_temporal_outlier" not in ranked[0].hard_rejection_reasons
+    assert "siglip_wrong_entity" not in ranked[0].hard_rejection_reasons
 
 
 def test_disabled_model_weights_are_removed_and_renormalized() -> None:
@@ -481,8 +512,8 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     reference_dir = output_root / "references" / "clip_1" / "e1"
     assert stats.processed == 1
     assert stats.candidate_count_before_models == 3
-    assert stats.candidate_count_after_dino == 2
-    assert stats.candidate_count_after_siglip == 2
+    assert stats.candidate_count_after_dino == 3
+    assert stats.candidate_count_after_siglip == 3
     assert siglip.target_text == "gray-haired man wearing a dark suit"
     assert siglip.distractor_texts == ["small stemmed wine glass"]
     selected_embedding = np.load(
@@ -495,7 +526,6 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
             output_root / "candidates" / "clip_1" / "e1" / "ranking_metadata.json"
         ).read_text(encoding="utf-8")
     )
-    assert metadata["candidates"][2]["hard_rejection_reasons"] == [
-        "dino_temporal_outlier"
-    ]
+    assert metadata["candidates"][2]["hard_rejection_reasons"] == []
+    assert not metadata["candidates"][2]["dino"]["dino_in_stable_cluster"]
     assert metadata["candidates"][0]["siglip"]["best_matching_entity_id"] == "e1"

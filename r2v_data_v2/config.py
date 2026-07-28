@@ -60,13 +60,13 @@ class RankingConfig:
     dinov3_model_name: str = "dinov3_vits16"
     dinov3_batch_size: int = 16
     dinov3_cluster_similarity_threshold: float = 0.70
-    dinov3_exclude_cluster_outliers: bool = True
+    dinov3_exclude_cluster_outliers: bool = False
     siglip2_enabled: bool = False
     siglip2_model_path: Path = Path(
         "/mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex"
     )
     siglip2_batch_size: int = 8
-    siglip2_hard_reject_wrong_entity: bool = True
+    siglip2_hard_reject_wrong_entity: bool = False
 
 
 @dataclass(frozen=True)
