@@ -20,7 +20,9 @@ from r2v_data_v2.metrics import (
     calculate_candidate_metrics,
     padded_crop_box,
 )
+from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
 from r2v_data_v2.schemas import (
+    AnnotationEntity,
     AnnotationResult,
     CandidateJudgeResult,
     CandidateVisualReview,
@@ -328,11 +330,23 @@ def _save_reference(
         "foreground_rgba_path": str(destination / "foreground_rgba.png"),
         "neutral_background_path": str(destination / "neutral_background.jpg"),
     }
-    (destination / "metadata.json").write_text(
-        json.dumps(metadata, indent=2),
-        encoding="utf-8",
-    )
     return metadata
+
+
+def _reference_record(
+    metadata: dict[str, object],
+    entity: AnnotationEntity,
+) -> dict[str, object]:
+    return {
+        **metadata,
+        "phrase": entity.phrase,
+        "canonical_label": entity.canonical_label,
+        "category": entity.category,
+        "ref_token": entity.ref_token,
+        "genericity": entity.genericity,
+        "name_evidence": entity.name_evidence,
+        "separability": entity.separability,
+    }
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
@@ -354,6 +368,8 @@ def rank_manifest_references(
         raise FileNotFoundError("run Stage 02 and Stage 03 before ranking")
     if overwrite:
         reference_manifest.unlink(missing_ok=True)
+        for artifact in (output_root / "references").glob("*/*/metadata.json"):
+            artifact.unlink()
     qwen = judge or QwenCandidateJudge(config.qwen)
     processed = skipped = no_valid = failed = 0
     for payload in iter_source_records(annotation_manifest):
@@ -375,7 +391,27 @@ def rank_manifest_references(
                 continue
             reference_dir = output_root / "references" / clip / entity.entity_id
             if (reference_dir / "metadata.json").is_file() and not overwrite:
-                skipped += 1
+                try:
+                    existing_metadata = json.loads(
+                        (reference_dir / "metadata.json").read_text(encoding="utf-8")
+                    )
+                    if not isinstance(existing_metadata, dict):
+                        raise TypeError("reference metadata must be a JSON object")
+                    write_json_atomic(
+                        reference_dir / "metadata.json",
+                        _reference_record(existing_metadata, entity),
+                    )
+                    skipped += 1
+                except Exception as exc:  # noqa: BLE001 - continue with other entities
+                    _append_jsonl(
+                        output_root / "logs" / "ranking_failed.jsonl",
+                        {
+                            "clip_uid": clip,
+                            "entity_id": entity.entity_id,
+                            "error": str(exc),
+                        },
+                    )
+                    failed += 1
                 continue
             candidate_dir = output_root / "candidates" / clip / entity.entity_id
             try:
@@ -470,23 +506,15 @@ def rank_manifest_references(
                     mask=masks[selected.frame_slot],
                     selected=selected,
                 )
-                selected_dir.mkdir(parents=True, exist_ok=True)
-                (selected_dir / "selection.json").write_text(
-                    json.dumps(metadata, indent=2),
-                    encoding="utf-8",
+                reference_record = _reference_record(metadata, entity)
+                write_json_atomic(
+                    reference_dir / "metadata.json",
+                    reference_record,
                 )
-                _append_jsonl(
-                    reference_manifest,
-                    {
-                        **metadata,
-                        "phrase": entity.phrase,
-                        "canonical_label": entity.canonical_label,
-                        "category": entity.category,
-                        "ref_token": entity.ref_token,
-                        "genericity": entity.genericity,
-                        "name_evidence": entity.name_evidence,
-                        "separability": entity.separability,
-                    },
+                selected_dir.mkdir(parents=True, exist_ok=True)
+                write_json_atomic(
+                    selected_dir / "selection.json",
+                    reference_record,
                 )
                 processed += 1
             except Exception as exc:  # noqa: BLE001 - continue with other entities
@@ -499,6 +527,7 @@ def rank_manifest_references(
                     },
                 )
                 failed += 1
+    reconcile_references(output_root)
     return RankingStats(processed, skipped, no_valid, failed)
 
 

@@ -128,4 +128,6 @@ def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None
     ]
     assert failure["issues"]
     assert not (output_root / "annotations" / "clip-1.json").exists()
-    assert not (output_root / "manifests" / "annotations.jsonl").exists()
+    assert (output_root / "manifests" / "annotations.jsonl").read_text(
+        encoding="utf-8"
+    ) == ""

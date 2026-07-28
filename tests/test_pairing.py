@@ -180,7 +180,7 @@ def test_zero_reference_sample_is_not_written(tmp_path: Path) -> None:
     )
 
     assert stats.failed == 1
-    assert not (manifests / "final_samples.jsonl").exists()
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
     failure = json.loads(
         (output_root / "logs" / "pairing_failed.jsonl").read_text(encoding="utf-8")
     )

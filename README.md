@@ -117,8 +117,14 @@ python scripts/06_augment_references.py --config configs/server.local.yaml
 ├── annotations/<clip_uid>.json
 ├── candidates/<clip_uid>/<entity_id>/
 ├── references/<clip_uid>/<entity_id>/
+├── samples/<clip_uid>.json
 └── logs/
 ```
+
+Annotation JSON files, reference `metadata.json` files, sample JSON files, and
+augmentation sidecars are the durable stage artifacts. Their JSONL manifests
+are rebuilt atomically at the end of each stage, so rerunning after an
+interruption reconciles a completed artifact that was not yet indexed.
 
 Every selected reference keeps:
 

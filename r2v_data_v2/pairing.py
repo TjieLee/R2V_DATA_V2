@@ -12,6 +12,7 @@ from openai import BadRequestError, OpenAI
 from prompts.qwen_cross_pair_prompt import CROSS_PAIR_PROMPT
 from r2v_data_v2.config import PairingConfig, PipelineConfig, QwenConfig
 from r2v_data_v2.manifest import iter_source_records
+from r2v_data_v2.reconciliation import reconcile_final_samples, write_json_atomic
 from r2v_data_v2.reference_binding import (
     rebuild_for_retained_entities,
     validate_final_reference_binding,
@@ -210,10 +211,14 @@ def choose_cross_pair(
     return candidate, result, similarity
 
 
-def _existing_clip_uids(path: Path) -> set[str]:
-    if not path.is_file():
-        return set()
-    return {str(record["clip_uid"]) for record in iter_source_records(path)}
+def _existing_sample_uids(samples_dir: Path) -> set[str]:
+    result: set[str] = set()
+    for artifact in samples_dir.glob("*.json"):
+        value = json.loads(artifact.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or "clip_uid" not in value:
+            raise ValueError(f"invalid final sample artifact: {artifact}")
+        result.add(str(value["clip_uid"]))
+    return result
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
@@ -273,11 +278,14 @@ def build_pairs(
     annotation_path = output_root / "manifests" / "annotations.jsonl"
     reference_path = output_root / "manifests" / "references.jsonl"
     final_path = output_root / "manifests" / "final_samples.jsonl"
+    samples_dir = output_root / "samples"
     if not annotation_path.is_file() or not reference_path.is_file():
         raise FileNotFoundError("run Stages 02-04 before pairing")
     if overwrite:
         final_path.unlink(missing_ok=True)
-    existing = _existing_clip_uids(final_path)
+        for artifact in samples_dir.glob("*.json"):
+            artifact.unlink()
+    existing = _existing_sample_uids(samples_dir)
     annotations = _annotations_by_clip(annotation_path)
     references = _references_by_clip(reference_path, annotations)
     qwen = judge or QwenCrossPairJudge(config.qwen)
@@ -387,7 +395,7 @@ def build_pairs(
             in_pairs += sample_in_pairs
             cross_pairs += sample_cross_pairs
             fallbacks += sample_fallbacks
-            _append_jsonl(final_path, sample)
+            write_json_atomic(samples_dir / f"{clip}.json", sample)
             existing.add(clip)
             processed += 1
         except Exception as exc:  # noqa: BLE001 - one sample must not stop the batch
@@ -396,6 +404,7 @@ def build_pairs(
                 {"clip_uid": clip, "error": str(exc)},
             )
             failed += 1
+    reconcile_final_samples(output_root)
     return PairingStats(
         processed,
         skipped,

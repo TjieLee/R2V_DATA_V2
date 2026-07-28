@@ -10,6 +10,12 @@ import numpy as np
 
 from r2v_data_v2.config import PipelineConfig
 from r2v_data_v2.manifest import iter_source_records
+from r2v_data_v2.reconciliation import (
+    augmentation_artifact_paths,
+    reconcile_augmentations,
+    reconcile_final_samples,
+    write_json_atomic,
+)
 
 Editor = Callable[[Path, Path, Path, int], Path]
 VariantValidator = Callable[[Path, Path, Path, str], dict[str, object]]
@@ -128,21 +134,38 @@ def _try_variant(
     )
 
 
-def _update_final_samples(
-    final_path: Path,
+def _update_final_sample_artifacts(
+    output_root: Path,
     variants: dict[str, list[dict[str, object]]],
 ) -> None:
-    if not final_path.is_file():
+    artifacts = list((output_root / "samples").glob("*.json"))
+    if not artifacts:
         return
-    temporary = final_path.with_suffix(".jsonl.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        for sample in iter_source_records(final_path):
-            sample["augmentation_variants"] = variants.get(
-                str(sample["clip_uid"]),
-                [],
-            )
-            handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
-    temporary.replace(final_path)
+    for artifact in artifacts:
+        sample = json.loads(artifact.read_text(encoding="utf-8"))
+        if not isinstance(sample, dict):
+            raise TypeError(f"final sample artifact must be a JSON object: {artifact}")
+        sample["augmentation_variants"] = variants.get(str(sample["clip_uid"]), [])
+        write_json_atomic(artifact, sample)
+    reconcile_final_samples(output_root)
+
+
+def _existing_augmentation_variants(
+    output_root: Path,
+) -> dict[tuple[str, str, str, int], dict[str, object]]:
+    result: dict[tuple[str, str, str, int], dict[str, object]] = {}
+    for artifact in augmentation_artifact_paths(output_root):
+        variant = json.loads(artifact.read_text(encoding="utf-8"))
+        if not isinstance(variant, dict):
+            raise TypeError(f"augmentation artifact must be a JSON object: {artifact}")
+        key = (
+            str(variant["clip_uid"]),
+            str(variant["entity_id"]),
+            str(variant["variant_type"]),
+            int(variant["variant_index"]),
+        )
+        result[key] = variant
+    return result
 
 
 def augment_references(
@@ -154,7 +177,16 @@ def augment_references(
     validator: VariantValidator | None = None,
 ) -> AugmentationStats:
     output_root = config.ensure_output_root()
+    existing_variants = _existing_augmentation_variants(output_root)
     if not config.augmentation.enabled:
+        if existing_variants:
+            reconcile_augmentations(output_root)
+            variants_by_clip: dict[str, list[dict[str, object]]] = {}
+            for variant in existing_variants.values():
+                variants_by_clip.setdefault(str(variant["clip_uid"]), []).append(
+                    variant
+                )
+            _update_final_sample_artifacts(output_root, variants_by_clip)
         return AugmentationStats(disabled=True)
     reference_path = output_root / "manifests" / "references.jsonl"
     augmentation_path = output_root / "manifests" / "augmentations.jsonl"
@@ -162,16 +194,17 @@ def augment_references(
         raise FileNotFoundError("run Stage 04 before augmentation")
     if overwrite:
         augmentation_path.unlink(missing_ok=True)
-    existing_variants: dict[tuple[str, str, str, int], dict[str, object]] = {}
-    if augmentation_path.is_file():
-        for variant in iter_source_records(augmentation_path):
-            key = (
-                str(variant["clip_uid"]),
-                str(variant["entity_id"]),
-                str(variant["variant_type"]),
-                int(variant["variant_index"]),
+        for artifact in augmentation_artifact_paths(output_root):
+            variant = json.loads(artifact.read_text(encoding="utf-8"))
+            image_path = (
+                Path(str(variant.get("image_path", ""))).resolve(strict=False)
+                if isinstance(variant, dict)
+                else None
             )
-            existing_variants[key] = variant
+            if image_path is not None and artifact.parent in image_path.parents:
+                image_path.unlink(missing_ok=True)
+            artifact.unlink()
+        existing_variants = {}
     processed = skipped = accepted = rejected = failed = 0
     variants_by_clip: dict[str, list[dict[str, object]]] = {}
     for variant in existing_variants.values():
@@ -220,7 +253,10 @@ def augment_references(
                         },
                     )
                     continue
-                _append_jsonl(augmentation_path, variant)
+                write_json_atomic(
+                    destination / f"{variant_type}_{index:02d}.json",
+                    variant,
+                )
                 variants_by_clip.setdefault(clip, []).append(variant)
                 accepted += 1
             except Exception as exc:  # noqa: BLE001 - preserve canonical on failure
@@ -236,10 +272,8 @@ def augment_references(
                 )
                 failed += 1
         processed += 1
-    _update_final_samples(
-        output_root / "manifests" / "final_samples.jsonl",
-        variants_by_clip,
-    )
+    reconcile_augmentations(output_root)
+    _update_final_sample_artifacts(output_root, variants_by_clip)
     return AugmentationStats(False, processed, skipped, accepted, rejected, failed)
 
 

@@ -19,6 +19,7 @@ from r2v_data_v2.caption_validation import (
 )
 from r2v_data_v2.config import PipelineConfig, QwenConfig
 from r2v_data_v2.manifest import iter_source_records
+from r2v_data_v2.reconciliation import reconcile_annotations, write_json_atomic
 from r2v_data_v2.reference_binding import (
     ReferenceBindingError,
     assign_reference_tokens,
@@ -279,6 +280,8 @@ def annotate_manifest(
         raise FileNotFoundError("run Stage 00 before Qwen annotation")
     if overwrite:
         annotation_manifest.unlink(missing_ok=True)
+        for artifact in (output_root / "annotations").glob("*.json"):
+            artifact.unlink()
     qwen = client or QwenAnnotationClient(config.qwen)
     processed = skipped = failed = no_ref = generic_count = 0
     for source in iter_source_records(source_manifest):
@@ -341,22 +344,10 @@ def annotate_manifest(
             "parent_video_id": source["parent_video_id"],
             "clip_suffix": source["clip_suffix"],
             "clip_order": source["clip_order"],
+            "annotation_path": str(destination),
             "warnings": warnings,
         }
-        destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        _append_jsonl(
-            annotation_manifest,
-            {
-                "clip_uid": clip,
-                "video_path": source["video_path"],
-                "parent_video_id": source["parent_video_id"],
-                "clip_suffix": source["clip_suffix"],
-                "clip_order": source["clip_order"],
-                "annotation_path": str(destination),
-                **result.model_dump(mode="json"),
-                "warnings": warnings,
-            },
-        )
+        write_json_atomic(destination, payload)
         reference_entities = sum(entity.reference_worthy for entity in result.entities)
         no_ref += reference_entities == 0 and not (
             result.background and result.background.reference_worthy
@@ -366,6 +357,7 @@ def annotate_manifest(
             for entity in result.entities
         )
         processed += 1
+    reconcile_annotations(output_root)
     return AnnotationStats(processed, skipped, failed, no_ref, generic_count)
 
 
