@@ -30,6 +30,39 @@ class PairingStats:
     failed: int = 0
 
 
+CrossPairKey = tuple[str, str, str]
+
+
+def cross_pair_index_key(reference: dict[str, Any]) -> CrossPairKey:
+    return (
+        str(reference["parent_video_id"]),
+        str(reference["category"]).casefold(),
+        str(reference["canonical_label"]).casefold(),
+    )
+
+
+def build_cross_pair_index(
+    references_by_clip: dict[str, list[dict[str, Any]]],
+) -> dict[CrossPairKey, list[dict[str, Any]]]:
+    index: dict[CrossPairKey, list[dict[str, Any]]] = {}
+    for references in references_by_clip.values():
+        for reference in references:
+            index.setdefault(cross_pair_index_key(reference), []).append(reference)
+    return index
+
+
+def indexed_cross_pair_candidates(
+    index: dict[CrossPairKey, list[dict[str, Any]]],
+    target: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        candidate
+        for candidate in index.get(cross_pair_index_key(target), [])
+        if candidate["clip_uid"] != target["clip_uid"]
+        and candidate["clip_suffix"] != target["clip_suffix"]
+    ]
+
+
 def is_same_parent_cross_candidate(
     target: dict[str, Any],
     candidate: dict[str, Any],
@@ -53,8 +86,10 @@ def is_same_parent_cross_candidate(
         return (
             target_named
             and candidate_named
-            and target.get("name_evidence") != "none"
-            and candidate.get("name_evidence") != "none"
+            and str(target["canonical_label"]).strip()
+            == str(candidate["canonical_label"]).strip()
+            and target.get("name_evidence") in {"draft_caption", "metadata"}
+            and candidate.get("name_evidence") in {"draft_caption", "metadata"}
         )
     return True
 
@@ -288,6 +323,7 @@ def build_pairs(
     existing = _existing_sample_uids(samples_dir)
     annotations = _annotations_by_clip(annotation_path)
     references = _references_by_clip(reference_path, annotations)
+    cross_pair_index = build_cross_pair_index(references)
     qwen = judge or QwenCrossPairJudge(config.qwen)
     processed = skipped = in_pairs = cross_pairs = fallbacks = failed = 0
     for clip, annotation in annotations.items():
@@ -317,16 +353,13 @@ def build_pairs(
                 pair_type = "in_pair"
                 judgment = None
                 visual_similarity = None
-                siblings = [
-                    reference
-                    for sibling_clip, sibling_references in references.items()
-                    if sibling_clip != clip
-                    for reference in sibling_references
-                ]
                 if config.pairing.enable_same_parent_cross_pair:
                     cross = choose_cross_pair(
                         target=target,
-                        candidates=siblings,
+                        candidates=indexed_cross_pair_candidates(
+                            cross_pair_index,
+                            target,
+                        ),
                         config=config.pairing,
                         judge=qwen,
                     )
