@@ -30,6 +30,13 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
+Install the optional local vision-model clients without changing the server's
+Torch or CUDA packages:
+
+```bash
+.venv/bin/pip install -r requirements-vision.txt
+```
+
 The current upstream SAM3 package has its own CUDA, PyTorch, and Python
 requirements. Install the repository already present at the configured
 `sam3.code_root` into the server environment; do not let this project replace
@@ -75,6 +82,16 @@ The following roots are inputs and must remain read-only:
 ```text
 /mnt/workspace/public/dataset/
 /mnt/workspace/public/pretrained/
+```
+
+Inspect the available DINOv3 checkpoints before setting
+`ranking.dinov3_model_path`; the pipeline never guesses or downloads one:
+
+```bash
+find /mnt/workspace/public/pretrained/dinov3 \
+  -maxdepth 4 -type f \
+  \( -name "*.pth" -o -name "*.pt" -o -name "*.safetensors" -o -name "config.json" \) \
+  | sort | head -100
 ```
 
 ## Run

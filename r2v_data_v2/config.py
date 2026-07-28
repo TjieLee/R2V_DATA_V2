@@ -9,6 +9,7 @@ import yaml
 ALLOWED_OUTPUT_ROOT = Path("/mnt/workspace/litengjie/data").resolve()
 ALLOWED_DATASET_ROOT = Path("/mnt/workspace/public/dataset").resolve()
 ALLOWED_PRETRAINED_ROOT = Path("/mnt/workspace/public/pretrained").resolve()
+ALLOWED_USER_MODEL_ROOT = Path("/mnt/workspace/litengjie/data/models").resolve()
 
 
 def _is_at_or_below(path: Path, root: Path) -> bool:
@@ -49,6 +50,17 @@ class RankingConfig:
     reject_border_touch: bool = True
     top_k_for_vlm_judge: int = 3
     save_top_k_mask_rle: int = 5
+    minimum_exposure_score: float = 0.35
+    minimum_crop_subject_ratio: float = 0.08
+    maximum_crop_subject_ratio: float = 0.92
+    maximum_other_mask_overlap: float = 0.50
+    dinov3_enabled: bool = True
+    dinov3_repo_dir: Path = Path("/mnt/workspace/public/pretrained/dinov3")
+    dinov3_model_path: Path | None = None
+    dinov3_model_name: str = "dinov3_vits16"
+    dinov3_batch_size: int = 16
+    dinov3_cluster_similarity_threshold: float = 0.70
+    dinov3_exclude_cluster_outliers: bool = True
 
 
 @dataclass(frozen=True)
@@ -93,6 +105,24 @@ class PipelineConfig:
                 raise ValueError(
                     "local qwen.model must be inside /mnt/workspace/public/pretrained"
                 )
+        ranking_model_paths = [
+            ("ranking.dinov3_repo_dir", self.ranking.dinov3_repo_dir),
+        ]
+        if self.ranking.dinov3_model_path is not None:
+            ranking_model_paths.append(
+                ("ranking.dinov3_model_path", self.ranking.dinov3_model_path)
+            )
+        for field_name, ranking_model_path in ranking_model_paths:
+            resolved = ranking_model_path.expanduser().resolve(strict=False)
+            if not (
+                _is_at_or_below(resolved, ALLOWED_PRETRAINED_ROOT)
+                or _is_at_or_below(resolved, ALLOWED_USER_MODEL_ROOT)
+            ):
+                raise ValueError(
+                    f"{field_name} must be inside "
+                    "/mnt/workspace/public/pretrained or "
+                    "/mnt/workspace/litengjie/data/models"
+                )
 
     def ensure_output_root(self) -> Path:
         self.validate_paths()
@@ -123,6 +153,10 @@ def load_config(path: str | Path) -> PipelineConfig:
         sam3.get("code_root", "/mnt/workspace/litengjie/data/vendor/sam3")
     ).expanduser()
     sam3["checkpoint"] = _path_or_none(sam3.get("checkpoint"))
+    ranking["dinov3_repo_dir"] = Path(
+        ranking.get("dinov3_repo_dir", "/mnt/workspace/public/pretrained/dinov3")
+    ).expanduser()
+    ranking["dinov3_model_path"] = _path_or_none(ranking.get("dinov3_model_path"))
 
     config = PipelineConfig(
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
@@ -158,6 +192,12 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("ranking.maximum_mask_area_ratio must not exceed 1")
     if config.ranking.minimum_mask_area_ratio >= config.ranking.maximum_mask_area_ratio:
         raise ValueError("ranking mask area bounds are invalid")
+    if config.ranking.dinov3_batch_size < 1:
+        raise ValueError("ranking.dinov3_batch_size must be positive")
+    if not 0.0 <= config.ranking.dinov3_cluster_similarity_threshold <= 1.0:
+        raise ValueError(
+            "ranking.dinov3_cluster_similarity_threshold must be between 0 and 1"
+        )
 
 
 def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
@@ -173,7 +213,15 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
                 str(config.sam3.checkpoint) if config.sam3.checkpoint else None
             ),
         },
-        "ranking": vars(config.ranking),
+        "ranking": {
+            **vars(config.ranking),
+            "dinov3_repo_dir": str(config.ranking.dinov3_repo_dir),
+            "dinov3_model_path": (
+                str(config.ranking.dinov3_model_path)
+                if config.ranking.dinov3_model_path
+                else None
+            ),
+        },
         "pairing": vars(config.pairing),
         "augmentation": vars(config.augmentation),
     }

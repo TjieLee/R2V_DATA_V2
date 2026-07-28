@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import r2v_data_v2.config as config_module
-from r2v_data_v2.config import PipelineConfig, QwenConfig
+from r2v_data_v2.config import PipelineConfig, QwenConfig, RankingConfig
 
 
 def test_output_and_dataset_must_stay_inside_allowed_roots(
@@ -57,6 +57,7 @@ def test_absolute_local_qwen_model_must_use_pretrained_root(
     common = {
         "dataset_json": tmp_path / "source.jsonl",
         "output_root": tmp_path / "output",
+        "ranking": RankingConfig(dinov3_repo_dir=pretrained / "dinov3"),
     }
     PipelineConfig(
         **common,
@@ -71,4 +72,20 @@ def test_absolute_local_qwen_model_must_use_pretrained_root(
         PipelineConfig(
             **common,
             qwen=QwenConfig(model=str(tmp_path / "private-model")),
+        ).validate_paths()
+
+
+def test_dinov3_paths_must_use_allowed_model_roots(tmp_path: Path) -> None:
+    common = {
+        "dataset_json": tmp_path / "source.jsonl",
+        "output_root": tmp_path / "output",
+        "qwen": QwenConfig(model="served-model-name"),
+    }
+    with pytest.raises(ValueError, match="ranking.dinov3_model_path must be inside"):
+        PipelineConfig(
+            **common,
+            ranking=RankingConfig(
+                dinov3_repo_dir=config_module.ALLOWED_PRETRAINED_ROOT / "dinov3",
+                dinov3_model_path=tmp_path / "unapproved" / "model.pth",
+            ),
         ).validate_paths()
