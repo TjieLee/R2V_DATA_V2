@@ -8,7 +8,15 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from r2v_data_v2.config import PipelineConfig, QwenConfig, RankingConfig
+from r2v_data_v2.config import (
+    DinoEvaluatorConfig,
+    PipelineConfig,
+    QwenConfig,
+    QwenVisualEvaluatorConfig,
+    RankingConfig,
+    RankingEvaluatorsConfig,
+    SiglipEvaluatorConfig,
+)
 from r2v_data_v2.mask_utils import encode_mask
 from r2v_data_v2.metrics import CandidateMetrics, classify_entity_overlap
 from r2v_data_v2.ranking import (
@@ -271,8 +279,12 @@ def test_dino_outlier_cannot_be_rescued_by_visual_quality() -> None:
     ranked = rank_candidates(
         candidates,
         config=RankingConfig(
-            dinov3_exclude_cluster_outliers=True,
-            siglip2_enabled=False,
+            evaluators=RankingEvaluatorsConfig(
+                dinov3=DinoEvaluatorConfig(
+                    enabled=True,
+                    hard_reject_outlier=True,
+                )
+            ),
         ),
         dino_metrics_by_slot=dino_metrics,
         dino_outlier_slots={0},
@@ -307,8 +319,12 @@ def test_siglip_wrong_entity_cannot_be_rescued_by_sharpness() -> None:
     ranked = rank_candidates(
         candidates,
         config=RankingConfig(
-            dinov3_enabled=False,
-            siglip2_hard_reject_wrong_entity=True,
+            evaluators=RankingEvaluatorsConfig(
+                siglip2=SiglipEvaluatorConfig(
+                    enabled=True,
+                    hard_reject_wrong_entity=True,
+                )
+            ),
         ),
         alignment_metrics_by_slot=alignments,
         siglip_wrong_entity_slots={0},
@@ -327,7 +343,12 @@ def test_dino_and_siglip_filters_are_soft_by_default() -> None:
         _review(0),
     )
     alignment = AlignmentMetrics(0.1, -0.4, "distractor")
-    config = RankingConfig(dinov3_enabled=True, siglip2_enabled=True)
+    config = RankingConfig(
+        evaluators=RankingEvaluatorsConfig(
+            dinov3=DinoEvaluatorConfig(enabled=True),
+            siglip2=SiglipEvaluatorConfig(enabled=True),
+        )
+    )
 
     ranked = rank_candidates(
         [candidate],
@@ -337,8 +358,8 @@ def test_dino_and_siglip_filters_are_soft_by_default() -> None:
         siglip_wrong_entity_slots={0},
     )
 
-    assert not config.dinov3_exclude_cluster_outliers
-    assert not config.siglip2_hard_reject_wrong_entity
+    assert not config.evaluators.dinov3.hard_reject_outlier
+    assert not config.evaluators.siglip2.hard_reject_wrong_entity
     assert "dino_temporal_outlier" not in ranked[0].hard_rejection_reasons
     assert "siglip_wrong_entity" not in ranked[0].hard_rejection_reasons
 
@@ -348,7 +369,7 @@ def test_disabled_model_weights_are_removed_and_renormalized() -> None:
     review = _review(0)
     ranked = rank_candidates(
         [(0, 10, 0.8, metrics, review)],
-        config=RankingConfig(dinov3_enabled=False, siglip2_enabled=False),
+        config=RankingConfig(),
     )
 
     crop_score = 1.0 - abs(0.7 - 0.55) / 0.55
@@ -381,11 +402,95 @@ def test_visual_quality_and_inverse_occlusion_affect_final_score() -> None:
             (0, 10, 0.8, metrics, low_quality),
             (1, 20, 0.8, metrics, high_quality),
         ],
-        config=RankingConfig(dinov3_enabled=False, siglip2_enabled=False),
+        config=RankingConfig(),
     )
 
     assert ranked[0].frame_slot == 1
     assert ranked[0].ranking_score > ranked[1].ranking_score
+
+
+def test_dino_can_run_without_participating_in_final_score() -> None:
+    candidates = [
+        (
+            slot,
+            slot * 10,
+            0.8,
+            _metrics(border_touch=False, sharpness=10),
+            _review(slot),
+        )
+        for slot in (0, 1)
+    ]
+    dino_metrics = {
+        slot: TemporalRepresentationMetrics(
+            frame_slot=slot,
+            dino_representativeness=float(slot),
+            dino_nearest_similarity=0.9,
+            dino_cluster_id=0,
+            dino_in_stable_cluster=True,
+        )
+        for slot in (0, 1)
+    }
+    config = RankingConfig(
+        evaluators=RankingEvaluatorsConfig(
+            qwen_visual=QwenVisualEvaluatorConfig(enabled=False),
+            dinov3=DinoEvaluatorConfig(
+                enabled=True,
+                use_for_preselection=True,
+                use_for_final_score=False,
+            ),
+        )
+    )
+
+    ranked = rank_candidates(
+        candidates,
+        config=config,
+        dino_metrics_by_slot=dino_metrics,
+    )
+
+    assert ranked[0].ranking_score == pytest.approx(ranked[1].ranking_score)
+    assert all(candidate.dino_metrics is not None for candidate in ranked)
+
+
+def test_siglip_can_be_record_only_and_qwen_visual_can_be_disabled() -> None:
+    candidates = [
+        (
+            slot,
+            slot * 10,
+            0.8,
+            _metrics(border_touch=False, sharpness=10),
+            _review(slot).model_copy(
+                update={
+                    "completeness": 0.1 if slot == 0 else 1.0,
+                    "visual_quality": float(slot),
+                }
+            ),
+        )
+        for slot in (0, 1)
+    ]
+    alignments = {
+        0: AlignmentMetrics(0.1, -0.5, "distractor"),
+        1: AlignmentMetrics(0.9, 0.5, "target"),
+    }
+    config = RankingConfig(
+        evaluators=RankingEvaluatorsConfig(
+            qwen_visual=QwenVisualEvaluatorConfig(enabled=False),
+            siglip2=SiglipEvaluatorConfig(
+                enabled=True,
+                use_for_preselection=False,
+                use_for_final_score=False,
+            ),
+        )
+    )
+
+    ranked = rank_candidates(
+        candidates,
+        config=config,
+        alignment_metrics_by_slot=alignments,
+    )
+
+    assert ranked[0].ranking_score == pytest.approx(ranked[1].ranking_score)
+    assert all(candidate.alignment_metrics is not None for candidate in ranked)
+    assert all("incomplete" not in candidate.hard_rejection_reasons for candidate in ranked)
 
 
 class _FakeDinoEmbedder:
@@ -442,6 +547,12 @@ class _FakeCandidateJudge:
             candidates=reviews,
             best_frame_slot=frame_slots[-1],
         )
+
+
+class _NeverCalledCandidateJudge:
+    def review(self, **kwargs: object) -> CandidateJudgeResult:
+        del kwargs
+        raise AssertionError("Qwen candidate judge must remain disabled")
 
 
 def _write_ranking_fixture(output_root: Path) -> None:
@@ -623,9 +734,11 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
             output_root=output_root,
             qwen=QwenConfig(model="served-model-name"),
             ranking=RankingConfig(
-                dinov3_enabled=True,
+                evaluators=RankingEvaluatorsConfig(
+                    dinov3=DinoEvaluatorConfig(enabled=True),
+                    siglip2=SiglipEvaluatorConfig(enabled=True),
+                ),
                 dinov3_cluster_similarity_threshold=0.7,
-                siglip2_enabled=True,
             ),
         ),
         judge=_FakeCandidateJudge(),
@@ -661,3 +774,34 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     assert reference_metadata["dino_medoid_slot"] == 0
     assert reference_metadata["qwen_suggested_best_frame_slot"] == 2
     assert reference_metadata["frame_slot"] != 2
+
+
+def test_disabled_qwen_visual_skips_contact_sheet_and_judge(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_ranking_fixture(output_root)
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=output_root,
+        qwen=QwenConfig(model="served-model-name"),
+        ranking=RankingConfig(
+            evaluators=RankingEvaluatorsConfig(
+                qwen_visual=QwenVisualEvaluatorConfig(enabled=False)
+            )
+        ),
+    )
+
+    stats = rank_manifest_references(
+        config,
+        judge=_NeverCalledCandidateJudge(),  # type: ignore[arg-type]
+    )
+
+    candidate_dir = output_root / "candidates" / "clip_1" / "e1"
+    reference_metadata = json.loads(
+        (
+            output_root / "references" / "clip_1" / "e1" / "metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert stats.processed == 1
+    assert not (candidate_dir / "selected" / "top_candidates.jpg").exists()
+    assert reference_metadata["qwen_suggested_best_frame_slot"] is None
+    assert reference_metadata["visual_review"]["completeness"] == 0.5

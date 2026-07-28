@@ -170,20 +170,39 @@ def hard_rejection_reasons(
             config=config,
         )
     )
-    if dino_temporal_outlier and config.dinov3_exclude_cluster_outliers:
+    if dino_temporal_outlier and config.evaluators.dinov3.hard_reject_outlier:
         reasons.append("dino_temporal_outlier")
-    if siglip_wrong_entity and config.siglip2_hard_reject_wrong_entity:
+    if (
+        siglip_wrong_entity
+        and config.evaluators.siglip2.hard_reject_wrong_entity
+    ):
         reasons.append("siglip_wrong_entity")
-    if visual_review.completeness < 0.5:
-        reasons.append("incomplete")
-    if visual_review.occlusion > 0.5:
-        reasons.append("occluded")
-    if visual_review.mask_quality < 0.5:
-        reasons.append("mask_quality")
-    if not visual_review.identity_features_visible:
-        reasons.append("identity_features_not_visible")
-    reasons.extend(visual_review.rejection_reasons)
+    if config.evaluators.qwen_visual.enabled:
+        if visual_review.completeness < 0.5:
+            reasons.append("incomplete")
+        if visual_review.occlusion > 0.5:
+            reasons.append("occluded")
+        if visual_review.mask_quality < 0.5:
+            reasons.append("mask_quality")
+        if not visual_review.identity_features_visible:
+            reasons.append("identity_features_not_visible")
+        reasons.extend(visual_review.rejection_reasons)
     return tuple(dict.fromkeys(reasons))
+
+
+def _effective_weights(
+    configured: dict[str, float],
+    available_metrics: set[str],
+) -> dict[str, float]:
+    retained = {
+        name: float(weight)
+        for name, weight in configured.items()
+        if name in available_metrics and weight > 0
+    }
+    total = sum(retained.values())
+    if total <= 0:
+        raise ValueError("at least one available metric must have a positive weight")
+    return {name: weight / total for name, weight in retained.items()}
 
 
 def rank_candidates(
@@ -211,24 +230,60 @@ def rank_candidates(
             _min_max([item[3].tenengrad_sharpness for item in candidates]),
         )
     )
-    siglip_raw_scores = []
-    for frame_slot, _, _, _, _ in candidates:
-        alignment = alignment_metrics_by_slot.get(frame_slot)
-        if alignment is None:
-            siglip_raw_scores.append(0.5)
-        elif alignment.alignment_margin is not None:
-            siglip_raw_scores.append(alignment.alignment_margin)
-        else:
-            siglip_raw_scores.append(alignment.target_similarity)
-    normalized_siglip_by_slot = {
-        **dict(
-            zip(
-                [item[0] for item in candidates],
-                _min_max(siglip_raw_scores),
-            )
-        ),
-        **normalized_siglip_scores_by_slot,
+    aligned_slots = [
+        frame_slot
+        for frame_slot, _, _, _, _ in candidates
+        if frame_slot in alignment_metrics_by_slot
+    ]
+    normalized_siglip_by_slot = dict(
+        zip(
+            aligned_slots,
+            _min_max(
+                [
+                    float(
+                        alignment_metrics_by_slot[slot].alignment_margin
+                        if alignment_metrics_by_slot[slot].alignment_margin is not None
+                        else alignment_metrics_by_slot[slot].target_similarity
+                    )
+                    for slot in aligned_slots
+                ]
+            ),
+        )
+    )
+    normalized_siglip_by_slot.update(normalized_siglip_scores_by_slot)
+    available_metrics = {
+        "mask_area_continuity",
+        "sharpness_exposure",
+        "isolation",
+        "crop_subject_ratio",
+        "sam_confidence",
     }
+    if (
+        config.evaluators.qwen_visual.enabled
+        and config.evaluators.qwen_visual.use_for_final_score
+    ):
+        available_metrics.update(
+            {
+                "qwen_completeness",
+                "qwen_recognizability",
+                "qwen_mask_quality",
+                "qwen_visual_quality",
+                "inverse_qwen_occlusion",
+            }
+        )
+    if (
+        config.evaluators.dinov3.enabled
+        and config.evaluators.dinov3.use_for_final_score
+        and all(item[0] in dino_metrics_by_slot for item in candidates)
+    ):
+        available_metrics.add("dino_representativeness")
+    if (
+        config.evaluators.siglip2.enabled
+        and config.evaluators.siglip2.use_for_final_score
+        and all(item[0] in normalized_siglip_by_slot for item in candidates)
+    ):
+        available_metrics.add("siglip_alignment")
+    weights = _effective_weights(config.final_weights, available_metrics)
     ranked: list[RankedCandidate] = []
     for frame_slot, source_index, sam_confidence, metrics, visual_review in candidates:
         dino_metrics = dino_metrics_by_slot.get(frame_slot)
@@ -242,48 +297,28 @@ def rank_candidates(
             siglip_wrong_entity=frame_slot in siglip_wrong_entity_slots,
         )
         component_scores = {
-            "dino": (
+            "dino_representativeness": (
                 _clamp_unit(dino_metrics.dino_representativeness)
                 if dino_metrics is not None
-                else 0.5
+                else 0.0
             ),
-            "completeness": visual_review.completeness,
-            "recognizability": visual_review.recognizability,
-            "siglip": normalized_siglip_by_slot[frame_slot],
-            "mask_quality": visual_review.mask_quality,
+            "qwen_completeness": visual_review.completeness,
+            "qwen_recognizability": visual_review.recognizability,
+            "siglip_alignment": normalized_siglip_by_slot.get(frame_slot, 0.0),
+            "qwen_mask_quality": visual_review.mask_quality,
             "mask_area_continuity": metrics.mask_area_continuity,
-            "quality": (
+            "sharpness_exposure": (
                 0.6 * normalized_sharpness_by_slot[frame_slot]
                 + 0.4 * metrics.exposure_score
             ),
-            "visual_quality": visual_review.visual_quality,
-            "occlusion": 1.0 - visual_review.occlusion,
+            "qwen_visual_quality": visual_review.visual_quality,
+            "inverse_qwen_occlusion": 1.0 - visual_review.occlusion,
             "isolation": _isolation_score(metrics),
-            "crop": _crop_subject_ratio_score(metrics),
-            "sam": sam_confidence,
+            "crop_subject_ratio": _crop_subject_ratio_score(metrics),
+            "sam_confidence": sam_confidence,
         }
-        weights = {
-            "dino": 0.23,
-            "completeness": 0.17,
-            "recognizability": 0.14,
-            "siglip": 0.10,
-            "mask_quality": 0.08,
-            "mask_area_continuity": 0.05,
-            "quality": 0.06,
-            "visual_quality": 0.04,
-            "occlusion": 0.04,
-            "isolation": 0.04,
-            "crop": 0.03,
-            "sam": 0.02,
-        }
-        if not config.dinov3_enabled:
-            weights.pop("dino")
-        if not config.siglip2_enabled:
-            weights.pop("siglip")
-        total_weight = sum(weights.values())
-        score = (
-            sum(weights[name] * _clamp_unit(component_scores[name]) for name in weights)
-            / total_weight
+        score = sum(
+            weights[name] * _clamp_unit(component_scores[name]) for name in weights
         )
         ranked.append(
             RankedCandidate(
@@ -579,32 +614,34 @@ def _preliminary_top_candidates(
     normalized_sharpness = _min_max(
         [candidate.metrics.tenengrad_sharpness for candidate in candidates]
     )
+    available_metrics = {
+        "sharpness",
+        "exposure",
+        "isolation",
+        "sam_confidence",
+    }
+    if (
+        config.evaluators.dinov3.enabled
+        and config.evaluators.dinov3.use_for_preselection
+        and all(candidate.dino_metrics is not None for candidate in candidates)
+    ):
+        available_metrics.add("dino_representativeness")
+    weights = _effective_weights(config.preselection_weights, available_metrics)
     scored: list[tuple[float, CandidateWorkItem]] = []
     for index, candidate in enumerate(candidates):
         components = {
-            "dino": (
+            "dino_representativeness": (
                 _clamp_unit(candidate.dino_metrics.dino_representativeness)
                 if candidate.dino_metrics is not None
-                else 0.5
+                else 0.0
             ),
             "sharpness": normalized_sharpness[index],
             "exposure": candidate.metrics.exposure_score,
             "isolation": _isolation_score(candidate.metrics),
-            "sam": candidate.sam_confidence,
+            "sam_confidence": candidate.sam_confidence,
         }
-        weights = {
-            "dino": 0.45,
-            "sharpness": 0.20,
-            "exposure": 0.15,
-            "isolation": 0.10,
-            "sam": 0.10,
-        }
-        if not config.dinov3_enabled:
-            weights.pop("dino")
-        total_weight = sum(weights.values())
-        score = (
-            sum(weights[name] * _clamp_unit(components[name]) for name in weights)
-            / total_weight
+        score = sum(
+            weights[name] * _clamp_unit(components[name]) for name in weights
         )
         scored.append((score, candidate))
     return [
@@ -713,7 +750,7 @@ def _save_reference(
     selected: RankedCandidate,
     dino_embedding: np.ndarray | None,
     dino_medoid_slot: int | None,
-    qwen_suggested_best_frame_slot: int,
+    qwen_suggested_best_frame_slot: int | None,
 ) -> dict[str, object]:
     frame_bgr = cv2.imread(str(frame_path))
     if frame_bgr is None:
@@ -823,7 +860,11 @@ def rank_manifest_references(
         reference_manifest.unlink(missing_ok=True)
         for artifact in (output_root / "references").glob("*/*/metadata.json"):
             artifact.unlink()
-    qwen = judge or QwenCandidateJudge(config.qwen)
+    qwen = (
+        judge or QwenCandidateJudge(config.qwen)
+        if config.ranking.evaluators.qwen_visual.enabled
+        else None
+    )
     dino = dino_embedder
     siglip = siglip_aligner
     owns_dino = False
@@ -831,12 +872,12 @@ def rank_manifest_references(
     dino_load_seconds = 0.0
     siglip_load_seconds = 0.0
     try:
-        if config.ranking.dinov3_enabled and dino is None:
+        if config.ranking.evaluators.dinov3.enabled and dino is None:
             started = time.perf_counter()
             dino = DinoV3Embedder(config.ranking)
             dino_load_seconds = time.perf_counter() - started
             owns_dino = True
-        if config.ranking.siglip2_enabled and siglip is None:
+        if config.ranking.evaluators.siglip2.enabled and siglip is None:
             started = time.perf_counter()
             siglip = Siglip2Aligner(
                 config.ranking.siglip2_model_path,
@@ -967,7 +1008,7 @@ def rank_manifest_references(
                         no_valid += 1
                         continue
 
-                    if config.ranking.dinov3_enabled:
+                    if config.ranking.evaluators.dinov3.enabled:
                         if dino is None:
                             raise RuntimeError("DINOv3 embedder was not initialized")
                         started = time.perf_counter()
@@ -1018,7 +1059,7 @@ def rank_manifest_references(
                             item.dino_metrics = temporal_by_slot[item.frame_slot]
                             if (
                                 warning is None
-                                and config.ranking.dinov3_exclude_cluster_outliers
+                                and config.ranking.evaluators.dinov3.hard_reject_outlier
                                 and not item.dino_metrics.dino_in_stable_cluster
                             ):
                                 item.hard_rejection_reasons.append(
@@ -1050,7 +1091,7 @@ def rank_manifest_references(
                         no_valid += 1
                         continue
 
-                    if config.ranking.siglip2_enabled:
+                    if config.ranking.evaluators.siglip2.enabled:
                         if siglip is None:
                             raise RuntimeError("SigLIP 2 aligner was not initialized")
                         distractors = siglip_distractor_entities(
@@ -1087,7 +1128,7 @@ def rank_manifest_references(
                                 else entity_id_by_text.get(alignment.best_matching_text)
                             )
                             if (
-                                config.ranking.siglip2_hard_reject_wrong_entity
+                                config.ranking.evaluators.siglip2.hard_reject_wrong_entity
                                 and is_siglip_wrong_entity(
                                     alignment,
                                     target_text=entity.grounding_prompt,
@@ -1116,35 +1157,51 @@ def rank_manifest_references(
                     normalized_siglip_scores = _normalized_siglip_scores(
                         model_candidates
                     )
-                    preliminary = _preliminary_top_candidates(
-                        model_candidates,
-                        config=config.ranking,
-                    )
-                    slots = [item.frame_slot for item in preliminary]
+                    qwen_suggested_best_frame_slot = None
+                    reviews: dict[int, CandidateVisualReview] = {}
                     selected_dir = candidate_dir / "selected"
-                    sheet = selected_dir / "top_candidates.jpg"
-                    _top_candidate_sheet(
-                        frame_paths={
-                            slot: (
-                                output_root / "frames" / clip / f"frame_{slot:02d}.jpg"
+                    if config.ranking.evaluators.qwen_visual.enabled:
+                        preliminary = _preliminary_top_candidates(
+                            model_candidates,
+                            config=config.ranking,
+                        )
+                        slots = [item.frame_slot for item in preliminary]
+                        sheet = selected_dir / "top_candidates.jpg"
+                        _top_candidate_sheet(
+                            frame_paths={
+                                slot: (
+                                    output_root
+                                    / "frames"
+                                    / clip
+                                    / f"frame_{slot:02d}.jpg"
+                                )
+                                for slot in slots
+                            },
+                            masks={slot: masks[slot] for slot in slots},
+                            candidates=[
+                                (item.record, item.metrics) for item in preliminary
+                            ],
+                            destination=sheet,
+                        )
+                        if qwen is None:
+                            raise RuntimeError(
+                                "Qwen candidate judge was not initialized"
                             )
-                            for slot in slots
-                        },
-                        masks={slot: masks[slot] for slot in slots},
-                        candidates=[
-                            (item.record, item.metrics) for item in preliminary
-                        ],
-                        destination=sheet,
-                    )
-                    review_result = qwen.review(
-                        entity_id=entity.entity_id,
-                        entity_phrase=entity.phrase,
-                        contact_sheet=sheet,
-                        frame_slots=slots,
-                    )
-                    reviews = {
-                        review.frame_slot: review for review in review_result.candidates
-                    }
+                        review_result = qwen.review(
+                            entity_id=entity.entity_id,
+                            entity_phrase=entity.phrase,
+                            contact_sheet=sheet,
+                            frame_slots=slots,
+                        )
+                        reviews = {
+                            review.frame_slot: review
+                            for review in review_result.candidates
+                        }
+                        qwen_suggested_best_frame_slot = (
+                            review_result.best_frame_slot
+                        )
+                    else:
+                        preliminary = model_candidates
                     ranked = rank_candidates(
                         [
                             (
@@ -1195,7 +1252,7 @@ def rank_manifest_references(
                             qwen_reviews=reviews,
                             dino_medoid_slot=dino_medoid_slot,
                             qwen_suggested_best_frame_slot=(
-                                review_result.best_frame_slot
+                                qwen_suggested_best_frame_slot
                             ),
                         ),
                     )
@@ -1223,7 +1280,9 @@ def rank_manifest_references(
                         selected=selected,
                         dino_embedding=selected_work_item.dino_embedding,
                         dino_medoid_slot=dino_medoid_slot,
-                        qwen_suggested_best_frame_slot=(review_result.best_frame_slot),
+                        qwen_suggested_best_frame_slot=(
+                            qwen_suggested_best_frame_slot
+                        ),
                     )
                     reference_record = _reference_record(metadata, entity)
                     write_json_atomic(

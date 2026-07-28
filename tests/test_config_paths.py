@@ -6,9 +6,12 @@ import pytest
 
 import r2v_data_v2.config as config_module
 from r2v_data_v2.config import (
+    DinoEvaluatorConfig,
     PipelineConfig,
     QwenConfig,
     RankingConfig,
+    RankingEvaluatorsConfig,
+    SiglipEvaluatorConfig,
     load_config,
 )
 
@@ -90,7 +93,9 @@ def test_dinov3_paths_must_use_allowed_model_roots(tmp_path: Path) -> None:
         PipelineConfig(
             **common,
             ranking=RankingConfig(
-                dinov3_enabled=True,
+                evaluators=RankingEvaluatorsConfig(
+                    dinov3=DinoEvaluatorConfig(enabled=True)
+                ),
                 dinov3_repo_dir=config_module.ALLOWED_PRETRAINED_ROOT / "dinov3",
                 dinov3_model_path=tmp_path / "unapproved" / "model.pth",
             ),
@@ -104,7 +109,9 @@ def test_siglip2_path_must_use_allowed_model_roots(tmp_path: Path) -> None:
             output_root=tmp_path / "output",
             qwen=QwenConfig(model="served-model-name"),
             ranking=RankingConfig(
-                siglip2_enabled=True,
+                evaluators=RankingEvaluatorsConfig(
+                    siglip2=SiglipEvaluatorConfig(enabled=True)
+                ),
                 siglip2_model_path=tmp_path / "unapproved" / "siglip2",
             ),
         ).validate_paths()
@@ -131,7 +138,12 @@ def _write_visual_model_config(
 def test_enabled_dinov3_requires_explicit_model_path(tmp_path: Path) -> None:
     config_path = _write_visual_model_config(
         tmp_path,
-        ranking_yaml="  dinov3_enabled: true\n  dinov3_model_path: null\n",
+        ranking_yaml=(
+            "  evaluators:\n"
+            "    dinov3:\n"
+            "      enabled: true\n"
+            "  dinov3_model_path: null\n"
+        ),
     )
 
     with pytest.raises(ValueError, match="dinov3_model_path is required"):
@@ -147,7 +159,12 @@ def test_enabled_dinov3_rejects_missing_model_path(
     missing = model_root / "missing.pth"
     config_path = _write_visual_model_config(
         tmp_path,
-        ranking_yaml=(f"  dinov3_enabled: true\n  dinov3_model_path: {missing}\n"),
+        ranking_yaml=(
+            "  evaluators:\n"
+            "    dinov3:\n"
+            "      enabled: true\n"
+            f"  dinov3_model_path: {missing}\n"
+        ),
     )
 
     with pytest.raises(FileNotFoundError, match="model path does not exist"):
@@ -166,7 +183,12 @@ def test_enabled_dinov3_accepts_complete_local_hf_layout(
     (model_path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
     config_path = _write_visual_model_config(
         tmp_path,
-        ranking_yaml=(f"  dinov3_enabled: true\n  dinov3_model_path: {model_path}\n"),
+        ranking_yaml=(
+            "  evaluators:\n"
+            "    dinov3:\n"
+            "      enabled: true\n"
+            f"  dinov3_model_path: {model_path}\n"
+        ),
     )
 
     assert load_config(config_path).ranking.dinov3_model_path == model_path
@@ -186,7 +208,9 @@ def test_enabled_dinov3_accepts_local_torch_hub_layout(
     config_path = _write_visual_model_config(
         tmp_path,
         ranking_yaml=(
-            "  dinov3_enabled: true\n"
+            "  evaluators:\n"
+            "    dinov3:\n"
+            "      enabled: true\n"
             f"  dinov3_repo_dir: {repo}\n"
             f"  dinov3_model_path: {checkpoint}\n"
         ),
@@ -206,8 +230,35 @@ def test_enabled_siglip2_rejects_missing_local_directory(
     missing = model_root / "missing-siglip2"
     config_path = _write_visual_model_config(
         tmp_path,
-        ranking_yaml=(f"  siglip2_enabled: true\n  siglip2_model_path: {missing}\n"),
+        ranking_yaml=(
+            "  evaluators:\n"
+            "    siglip2:\n"
+            "      enabled: true\n"
+            f"  siglip2_model_path: {missing}\n"
+        ),
     )
 
     with pytest.raises(FileNotFoundError, match="model directory does not exist"):
+        load_config(config_path)
+
+
+def test_unknown_ranking_metric_is_rejected_during_config_load(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml="  final_weights:\n    unknown_metric: 1.0\n",
+    )
+
+    with pytest.raises(ValueError, match="unknown metrics"):
+        load_config(config_path)
+
+
+def test_zero_enabled_ranking_weights_are_rejected(tmp_path: Path) -> None:
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml="  final_weights:\n    sam_confidence: 0.0\n",
+    )
+
+    with pytest.raises(ValueError, match="at least one enabled positive weight"):
         load_config(config_path)

@@ -302,7 +302,7 @@ def augment_references(
         + config.augmentation.viewpoint_count
         > 0
     )
-    if config.ranking.dinov3_enabled and has_jobs and dino is None:
+    if config.ranking.evaluators.dinov3.enabled and has_jobs and dino is None:
         dino = DinoV3Embedder(config.ranking)
         owns_dino = True
     processed = skipped = accepted = rejected = failed = 0

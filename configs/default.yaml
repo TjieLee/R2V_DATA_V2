@@ -38,17 +38,47 @@ ranking:
   minimum_crop_subject_ratio: 0.08
   maximum_crop_subject_ratio: 0.92
   maximum_other_mask_overlap: 0.50
-  dinov3_enabled: false
+  evaluators:
+    qwen_visual:
+      enabled: true
+      use_for_final_score: true
+    dinov3:
+      enabled: false
+      use_for_preselection: true
+      use_for_final_score: true
+      hard_reject_outlier: false
+    siglip2:
+      enabled: false
+      use_for_preselection: true
+      use_for_final_score: true
+      hard_reject_wrong_entity: false
+  preselection_weights:
+    dino_representativeness: 0.35
+    siglip_alignment: 0.20
+    sharpness: 0.18
+    exposure: 0.10
+    isolation: 0.10
+    sam_confidence: 0.07
+  final_weights:
+    dino_representativeness: 0.23
+    qwen_completeness: 0.17
+    qwen_recognizability: 0.14
+    siglip_alignment: 0.10
+    qwen_mask_quality: 0.08
+    mask_area_continuity: 0.05
+    sharpness_exposure: 0.06
+    qwen_visual_quality: 0.04
+    inverse_qwen_occlusion: 0.04
+    isolation: 0.04
+    crop_subject_ratio: 0.03
+    sam_confidence: 0.02
   dinov3_repo_dir: /mnt/workspace/public/pretrained/dinov3
   dinov3_model_path: null
   dinov3_model_name: dinov3_vits16
   dinov3_batch_size: 16
   dinov3_cluster_similarity_threshold: 0.70
-  dinov3_exclude_cluster_outliers: false
-  siglip2_enabled: false
   siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
   siglip2_batch_size: 8
-  siglip2_hard_reject_wrong_entity: false
 
 pairing:
   enable_in_pair: true

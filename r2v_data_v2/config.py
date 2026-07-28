@@ -11,6 +11,33 @@ ALLOWED_DATASET_ROOT = Path("/mnt/workspace/public/dataset").resolve()
 ALLOWED_PRETRAINED_ROOT = Path("/mnt/workspace/public/pretrained").resolve()
 ALLOWED_USER_MODEL_ROOT = Path("/mnt/workspace/litengjie/data/models").resolve()
 
+PRESELECTION_METRICS = frozenset(
+    {
+        "dino_representativeness",
+        "siglip_alignment",
+        "sharpness",
+        "exposure",
+        "isolation",
+        "sam_confidence",
+    }
+)
+FINAL_METRICS = frozenset(
+    {
+        "dino_representativeness",
+        "qwen_completeness",
+        "qwen_recognizability",
+        "siglip_alignment",
+        "qwen_mask_quality",
+        "mask_area_continuity",
+        "sharpness_exposure",
+        "qwen_visual_quality",
+        "inverse_qwen_occlusion",
+        "isolation",
+        "crop_subject_ratio",
+        "sam_confidence",
+    }
+)
+
 
 def _is_at_or_below(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
@@ -53,6 +80,65 @@ class Sam3Config:
 
 
 @dataclass(frozen=True)
+class QwenVisualEvaluatorConfig:
+    enabled: bool = True
+    use_for_final_score: bool = True
+
+
+@dataclass(frozen=True)
+class DinoEvaluatorConfig:
+    enabled: bool = False
+    use_for_preselection: bool = True
+    use_for_final_score: bool = True
+    hard_reject_outlier: bool = False
+
+
+@dataclass(frozen=True)
+class SiglipEvaluatorConfig:
+    enabled: bool = False
+    use_for_preselection: bool = True
+    use_for_final_score: bool = True
+    hard_reject_wrong_entity: bool = False
+
+
+@dataclass(frozen=True)
+class RankingEvaluatorsConfig:
+    qwen_visual: QwenVisualEvaluatorConfig = field(
+        default_factory=QwenVisualEvaluatorConfig
+    )
+    dinov3: DinoEvaluatorConfig = field(default_factory=DinoEvaluatorConfig)
+    siglip2: SiglipEvaluatorConfig = field(default_factory=SiglipEvaluatorConfig)
+
+
+def _default_preselection_weights() -> dict[str, float]:
+    return {
+        "dino_representativeness": 0.35,
+        "siglip_alignment": 0.20,
+        "sharpness": 0.18,
+        "exposure": 0.10,
+        "isolation": 0.10,
+        "sam_confidence": 0.07,
+    }
+
+
+def _default_final_weights() -> dict[str, float]:
+    return {
+        "dino_representativeness": 0.23,
+        "qwen_completeness": 0.17,
+        "qwen_recognizability": 0.14,
+        "siglip_alignment": 0.10,
+        "qwen_mask_quality": 0.08,
+        "mask_area_continuity": 0.05,
+        "sharpness_exposure": 0.06,
+        "qwen_visual_quality": 0.04,
+        "inverse_qwen_occlusion": 0.04,
+        "isolation": 0.04,
+        "crop_subject_ratio": 0.03,
+        "sam_confidence": 0.02,
+    }
+
+
+@dataclass(frozen=True)
 class RankingConfig:
     minimum_effective_short_side: int = 128
     minimum_mask_area_ratio: float = 0.005
@@ -64,19 +150,20 @@ class RankingConfig:
     minimum_crop_subject_ratio: float = 0.08
     maximum_crop_subject_ratio: float = 0.92
     maximum_other_mask_overlap: float = 0.50
-    dinov3_enabled: bool = False
+    evaluators: RankingEvaluatorsConfig = field(default_factory=RankingEvaluatorsConfig)
+    preselection_weights: dict[str, float] = field(
+        default_factory=_default_preselection_weights
+    )
+    final_weights: dict[str, float] = field(default_factory=_default_final_weights)
     dinov3_repo_dir: Path = Path("/mnt/workspace/public/pretrained/dinov3")
     dinov3_model_path: Path | None = None
     dinov3_model_name: str = "dinov3_vits16"
     dinov3_batch_size: int = 16
     dinov3_cluster_similarity_threshold: float = 0.70
-    dinov3_exclude_cluster_outliers: bool = False
-    siglip2_enabled: bool = False
     siglip2_model_path: Path = Path(
         "/mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex"
     )
     siglip2_batch_size: int = 8
-    siglip2_hard_reject_wrong_entity: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,15 +209,18 @@ class PipelineConfig:
                     "local qwen.model must be inside /mnt/workspace/public/pretrained"
                 )
         ranking_model_paths = []
-        if self.ranking.dinov3_enabled:
+        if self.ranking.evaluators.dinov3.enabled:
             ranking_model_paths.append(
                 ("ranking.dinov3_repo_dir", self.ranking.dinov3_repo_dir)
             )
-        if self.ranking.dinov3_enabled and self.ranking.dinov3_model_path is not None:
+        if (
+            self.ranking.evaluators.dinov3.enabled
+            and self.ranking.dinov3_model_path is not None
+        ):
             ranking_model_paths.append(
                 ("ranking.dinov3_model_path", self.ranking.dinov3_model_path)
             )
-        if self.ranking.siglip2_enabled:
+        if self.ranking.evaluators.siglip2.enabled:
             ranking_model_paths.append(
                 ("ranking.siglip2_model_path", self.ranking.siglip2_model_path)
             )
@@ -170,6 +260,14 @@ def load_config(path: str | Path) -> PipelineConfig:
     frames = dict(raw.get("frames", {}))
     sam3 = dict(raw.get("sam3", {}))
     ranking = dict(raw.get("ranking", {}))
+    evaluator_values = dict(ranking.pop("evaluators", {}))
+    qwen_visual_evaluator = dict(evaluator_values.pop("qwen_visual", {}))
+    dino_evaluator = dict(evaluator_values.pop("dinov3", {}))
+    siglip_evaluator = dict(evaluator_values.pop("siglip2", {}))
+    if evaluator_values:
+        raise ValueError(
+            f"unknown ranking evaluators: {sorted(evaluator_values)}"
+        )
     pairing = dict(raw.get("pairing", {}))
     augmentation = dict(raw.get("augmentation", {}))
     sam3["code_root"] = Path(
@@ -193,7 +291,14 @@ def load_config(path: str | Path) -> PipelineConfig:
         qwen=QwenConfig(**qwen, video=QwenVideoConfig(**qwen_video)),
         frames=FramesConfig(**frames),
         sam3=Sam3Config(**sam3),
-        ranking=RankingConfig(**ranking),
+        ranking=RankingConfig(
+            **ranking,
+            evaluators=RankingEvaluatorsConfig(
+                qwen_visual=QwenVisualEvaluatorConfig(**qwen_visual_evaluator),
+                dinov3=DinoEvaluatorConfig(**dino_evaluator),
+                siglip2=SiglipEvaluatorConfig(**siglip_evaluator),
+            ),
+        ),
         pairing=PairingConfig(**pairing),
         augmentation=AugmentationConfig(**augmentation),
     )
@@ -250,7 +355,19 @@ def _validate_config(config: PipelineConfig) -> None:
         )
     if config.ranking.siglip2_batch_size < 1:
         raise ValueError("ranking.siglip2_batch_size must be positive")
-    if config.ranking.dinov3_enabled:
+    _validate_metric_weights(
+        name="ranking.preselection_weights",
+        weights=config.ranking.preselection_weights,
+        known_metrics=PRESELECTION_METRICS,
+        enabled_metrics=_enabled_preselection_metrics(config.ranking),
+    )
+    _validate_metric_weights(
+        name="ranking.final_weights",
+        weights=config.ranking.final_weights,
+        known_metrics=FINAL_METRICS,
+        enabled_metrics=_enabled_final_metrics(config.ranking),
+    )
+    if config.ranking.evaluators.dinov3.enabled:
         model_path = config.ranking.dinov3_model_path
         if model_path is None:
             raise ValueError(
@@ -281,7 +398,7 @@ def _validate_config(config: PipelineConfig) -> None:
                 f"{resolved_repo}; missing hubconf.py"
             )
     if (
-        config.ranking.siglip2_enabled
+        config.ranking.evaluators.siglip2.enabled
         and not config.ranking.siglip2_model_path.expanduser()
         .resolve(strict=False)
         .is_dir()
@@ -290,6 +407,68 @@ def _validate_config(config: PipelineConfig) -> None:
             "SigLIP 2 model directory does not exist: "
             f"{config.ranking.siglip2_model_path.expanduser().resolve(strict=False)}"
         )
+
+
+def _enabled_preselection_metrics(config: RankingConfig) -> set[str]:
+    enabled = set(PRESELECTION_METRICS - {"dino_representativeness", "siglip_alignment"})
+    if (
+        config.evaluators.dinov3.enabled
+        and config.evaluators.dinov3.use_for_preselection
+    ):
+        enabled.add("dino_representativeness")
+    if (
+        config.evaluators.siglip2.enabled
+        and config.evaluators.siglip2.use_for_preselection
+    ):
+        enabled.add("siglip_alignment")
+    return enabled
+
+
+def _enabled_final_metrics(config: RankingConfig) -> set[str]:
+    qwen_metrics = {
+        "qwen_completeness",
+        "qwen_recognizability",
+        "qwen_mask_quality",
+        "qwen_visual_quality",
+        "inverse_qwen_occlusion",
+    }
+    enabled = set(
+        FINAL_METRICS
+        - qwen_metrics
+        - {"dino_representativeness", "siglip_alignment"}
+    )
+    if (
+        config.evaluators.qwen_visual.enabled
+        and config.evaluators.qwen_visual.use_for_final_score
+    ):
+        enabled.update(qwen_metrics)
+    if (
+        config.evaluators.dinov3.enabled
+        and config.evaluators.dinov3.use_for_final_score
+    ):
+        enabled.add("dino_representativeness")
+    if (
+        config.evaluators.siglip2.enabled
+        and config.evaluators.siglip2.use_for_final_score
+    ):
+        enabled.add("siglip_alignment")
+    return enabled
+
+
+def _validate_metric_weights(
+    *,
+    name: str,
+    weights: dict[str, float],
+    known_metrics: frozenset[str],
+    enabled_metrics: set[str],
+) -> None:
+    unknown = sorted(set(weights) - known_metrics)
+    if unknown:
+        raise ValueError(f"{name} contains unknown metrics: {unknown}")
+    if any(weight < 0 for weight in weights.values()):
+        raise ValueError(f"{name} weights must be non-negative")
+    if not any(weights.get(metric, 0.0) > 0 for metric in enabled_metrics):
+        raise ValueError(f"{name} must have at least one enabled positive weight")
 
 
 def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
@@ -310,6 +489,11 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
         },
         "ranking": {
             **vars(config.ranking),
+            "evaluators": {
+                "qwen_visual": vars(config.ranking.evaluators.qwen_visual),
+                "dinov3": vars(config.ranking.evaluators.dinov3),
+                "siglip2": vars(config.ranking.evaluators.siglip2),
+            },
             "dinov3_repo_dir": str(config.ranking.dinov3_repo_dir),
             "dinov3_model_path": (
                 str(config.ranking.dinov3_model_path)

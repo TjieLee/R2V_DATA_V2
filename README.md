@@ -128,12 +128,25 @@ must enable them explicitly with real local paths:
 
 ```yaml
 ranking:
-  dinov3_enabled: true
+  evaluators:
+    qwen_visual:
+      enabled: true
+      use_for_final_score: true
+    dinov3:
+      enabled: true
+      use_for_preselection: true
+      use_for_final_score: true
+      hard_reject_outlier: false
+    siglip2:
+      enabled: true
+      use_for_preselection: true
+      use_for_final_score: true
+      hard_reject_wrong_entity: false
+
   dinov3_repo_dir: /mnt/workspace/public/pretrained/dinov3
   dinov3_model_path: /mnt/workspace/public/pretrained/dinov3/<actual_checkpoint>
   dinov3_model_name: dinov3_vits16
 
-  siglip2_enabled: true
   siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
 ```
 
