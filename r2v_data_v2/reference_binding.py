@@ -4,10 +4,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from r2v_data_v2.caption_validation import (
-    ValidationIssue,
-    exact_phrase_spans,
-)
+from r2v_data_v2.caption_validation import exact_phrase_spans
 from r2v_data_v2.schemas import (
     AnnotationEntity,
     AnnotationResult,
@@ -15,6 +12,7 @@ from r2v_data_v2.schemas import (
     QwenAnnotationEntity,
     QwenAnnotationResult,
 )
+from r2v_data_v2.structured_output import ValidationIssue
 
 _REF_TOKEN = re.compile(r"<ref_(?:subject|object|bg|group)_\d+>")
 _ANY_REF_TOKEN = re.compile(r"<ref_[^>]+>")

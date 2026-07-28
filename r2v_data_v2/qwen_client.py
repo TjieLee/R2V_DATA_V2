@@ -2,18 +2,15 @@ from __future__ import annotations
 
 import base64
 import json
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from openai import BadRequestError, OpenAI
-from pydantic import BaseModel, ValidationError
 
 from prompts.qwen_annotation_prompt import ICL_EXAMPLES, SYSTEM_PROMPT
 from prompts.qwen_repair_prompt import build_repair_prompt
 from r2v_data_v2.caption_validation import (
-    ValidationIssue,
     annotation_warnings,
     validate_annotation,
 )
@@ -25,8 +22,11 @@ from r2v_data_v2.reference_binding import (
     assign_reference_tokens,
 )
 from r2v_data_v2.schemas import AnnotationResult, QwenAnnotationResult
-
-ModelT = TypeVar("ModelT", bound=BaseModel)
+from r2v_data_v2.structured_output import (
+    StructuredOutputFailure,
+    ValidationIssue,
+    parse_qwen_json_issues,
+)
 
 
 @dataclass(frozen=True)
@@ -38,77 +38,8 @@ class AnnotationStats:
     generic_entity_labels: int = 0
 
 
-class QwenAnnotationFailure(ValueError):
-    def __init__(
-        self,
-        *,
-        raw_responses: list[str],
-        issues: list[ValidationIssue],
-        attempt_count: int | None = None,
-    ) -> None:
-        super().__init__("Qwen annotation failed parsing or semantic validation")
-        self.raw_responses = raw_responses
-        self.issues = issues
-        self.attempt_count = (
-            len(raw_responses) if attempt_count is None else attempt_count
-        )
-
-
-def _strip_complete_json_fence(content: str) -> str:
-    stripped = content.strip()
-    if not stripped.startswith("```"):
-        return stripped
-    match = re.fullmatch(
-        r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```",
-        stripped,
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        raise ValueError("response must be one complete JSON object")
-    return match.group(1).strip()
-
-
-def parse_qwen_json_response(raw: str, model: type[ModelT]) -> ModelT:
-    payload = json.loads(_strip_complete_json_fence(raw))
-    if not isinstance(payload, dict):
-        raise TypeError("Qwen response must be one JSON object")
-    return model.model_validate(payload)
-
-
-def _parse_issues(
-    raw: str, model: type[ModelT]
-) -> tuple[ModelT | None, list[ValidationIssue]]:
-    try:
-        return parse_qwen_json_response(raw, model), []
-    except json.JSONDecodeError as exc:
-        return None, [
-            ValidationIssue(
-                code="invalid_json",
-                field=None,
-                message=f"{exc.msg} at line {exc.lineno} column {exc.colno}",
-            )
-        ]
-    except ValidationError as exc:
-        issues = []
-        for error in exc.errors(include_url=False):
-            location = ".".join(str(part) for part in error["loc"]) or None
-            error_type = str(error["type"])
-            code = {
-                "extra_forbidden": "schema_extra_field",
-                "missing": "schema_missing_field",
-            }.get(error_type, "schema_validation")
-            issues.append(
-                ValidationIssue(
-                    code=code,
-                    field=location,
-                    message=str(error["msg"]),
-                )
-            )
-        return None, issues
-    except (TypeError, ValueError) as exc:
-        return None, [
-            ValidationIssue(code="invalid_json_object", field=None, message=str(exc))
-        ]
+class QwenAnnotationFailure(StructuredOutputFailure):
+    pass
 
 
 def _image_content(frame_paths: list[Path]) -> list[dict[str, object]]:
@@ -255,7 +186,10 @@ class QwenAnnotationClient:
                     attempt_count=attempt + 1,
                 ) from exc
             raw_responses.append(raw_response)
-            semantic, issues = _parse_issues(raw_response, QwenAnnotationResult)
+            semantic, issues = parse_qwen_json_issues(
+                raw_response,
+                QwenAnnotationResult,
+            )
             if semantic is not None:
                 issues = validate_annotation(
                     semantic,

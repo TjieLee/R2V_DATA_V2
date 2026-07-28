@@ -27,6 +27,11 @@ from r2v_data_v2.schemas import (
     CandidateJudgeResult,
     CandidateVisualReview,
 )
+from r2v_data_v2.structured_output import (
+    StructuredOutputFailure,
+    ValidationIssue,
+    request_structured_output,
+)
 
 
 @dataclass(frozen=True)
@@ -140,19 +145,7 @@ class QwenCandidateJudge:
             timeout=config.timeout_seconds,
         )
 
-    def review(
-        self,
-        *,
-        entity_id: str,
-        entity_phrase: str,
-        contact_sheet: Path,
-        frame_slots: list[int],
-    ) -> CandidateJudgeResult:
-        encoded = base64.b64encode(contact_sheet.read_bytes()).decode()
-        prompt = (
-            CANDIDATE_JUDGE_PROMPT.format(entity_phrase=entity_phrase)
-            + f"\nentity_id={entity_id}\nframe_slots={frame_slots}"
-        )
+    def _request(self, *, prompt: str, encoded_image: str) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
@@ -162,7 +155,9 @@ class QwenCandidateJudge:
                         {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{encoded_image}"
+                            },
                         },
                     ],
                 }
@@ -192,20 +187,59 @@ class QwenCandidateJudge:
         content = response.choices[0].message.content
         if not content:
             raise RuntimeError("Qwen returned an empty candidate review")
-        result = CandidateJudgeResult.model_validate_json(content)
-        returned_slot_list = [candidate.frame_slot for candidate in result.candidates]
-        returned_slots = set(returned_slot_list)
-        if (
-            result.entity_id != entity_id
-            or returned_slots != set(frame_slots)
-            or len(returned_slot_list) != len(frame_slots)
-        ):
-            raise ValueError(
-                "candidate review does not match the requested entity and slots"
-            )
-        if result.best_frame_slot not in returned_slots:
-            raise ValueError("candidate review best_frame_slot is invalid")
-        return result
+        return content
+
+    def review(
+        self,
+        *,
+        entity_id: str,
+        entity_phrase: str,
+        contact_sheet: Path,
+        frame_slots: list[int],
+    ) -> CandidateJudgeResult:
+        encoded = base64.b64encode(contact_sheet.read_bytes()).decode()
+        prompt = (
+            CANDIDATE_JUDGE_PROMPT.format(entity_phrase=entity_phrase)
+            + f"\nentity_id={entity_id}\nframe_slots={frame_slots}"
+        )
+
+        def validate(result: CandidateJudgeResult) -> list[ValidationIssue]:
+            issues: list[ValidationIssue] = []
+            returned_slot_list = [
+                candidate.frame_slot for candidate in result.candidates
+            ]
+            returned_slots = set(returned_slot_list)
+            if (
+                result.entity_id != entity_id
+                or returned_slots != set(frame_slots)
+                or len(returned_slot_list) != len(frame_slots)
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "candidate_slots_mismatch",
+                        "candidates",
+                        "candidate review must match the requested entity and slots",
+                    )
+                )
+            if result.best_frame_slot not in returned_slots:
+                issues.append(
+                    ValidationIssue(
+                        "invalid_best_frame_slot",
+                        "best_frame_slot",
+                        "best_frame_slot must be one of the reviewed slots",
+                    )
+                )
+            return issues
+
+        return request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                encoded_image=encoded,
+            ),
+            original_request=prompt,
+            model=CandidateJudgeResult,
+            validate=validate,
+        )
 
 
 def _fit_candidate_panel(
@@ -626,13 +660,16 @@ def rank_manifest_references(
                 )
                 processed += 1
             except Exception as exc:  # noqa: BLE001 - continue with other entities
+                failure: dict[str, object] = {
+                    "clip_uid": clip,
+                    "entity_id": entity.entity_id,
+                    "error": str(exc),
+                }
+                if isinstance(exc, StructuredOutputFailure):
+                    failure["structured_output"] = exc.to_dict()
                 _append_jsonl(
                     output_root / "logs" / "ranking_failed.jsonl",
-                    {
-                        "clip_uid": clip,
-                        "entity_id": entity.entity_id,
-                        "error": str(exc),
-                    },
+                    failure,
                 )
                 failed += 1
     reconcile_references(output_root)

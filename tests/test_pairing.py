@@ -17,6 +17,10 @@ from r2v_data_v2.pairing import (
 )
 from r2v_data_v2.reference_binding import assign_reference_tokens
 from r2v_data_v2.schemas import CrossPairJudgeResult, QwenAnnotationResult
+from r2v_data_v2.structured_output import (
+    StructuredOutputFailure,
+    ValidationIssue,
+)
 from tests.test_caption_validation import _valid_payload
 
 
@@ -60,6 +64,20 @@ class _FakeJudge:
         del target, candidate
         self.calls += 1
         return self.result
+
+
+class _FailingJudge:
+    def judge(
+        self,
+        *,
+        target: dict[str, object],
+        candidate: dict[str, object],
+    ) -> CrossPairJudgeResult:
+        del target, candidate
+        raise StructuredOutputFailure(
+            raw_responses=["not json", '{"still": "invalid"}'],
+            issues=[ValidationIssue("schema_missing_field", "confidence", "missing")],
+        )
 
 
 def _judgment(
@@ -220,6 +238,38 @@ def test_verified_cross_pair_is_selected(tmp_path: Path) -> None:
     assert selected is not None
     assert selected[0]["clip_uid"] == "sibling"
     assert judge.calls == 1
+
+
+def test_invalid_cross_pair_judge_output_is_recorded_and_skipped(
+    tmp_path: Path,
+) -> None:
+    target = _reference(
+        tmp_path,
+        clip_uid="target",
+        parent="movie",
+        suffix="11_0",
+    )
+    sibling = _reference(
+        tmp_path,
+        clip_uid="sibling",
+        parent="movie",
+        suffix="12_0",
+    )
+    failures: list[dict[str, object]] = []
+
+    selected = choose_cross_pair(
+        target=target,
+        candidates=[sibling],
+        config=PairingConfig(),
+        judge=_FailingJudge(),  # type: ignore[arg-type]
+        structured_failures=failures,
+    )
+
+    assert selected is None
+    assert failures[0]["raw_responses"] == [
+        "not json",
+        '{"still": "invalid"}',
+    ]
 
 
 def test_uncertain_or_near_duplicate_cross_pair_falls_back() -> None:

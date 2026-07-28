@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from r2v_data_v2.caption_validation import ValidationIssue
+from r2v_data_v2.structured_output import ValidationIssue
 
 
 def build_repair_prompt(

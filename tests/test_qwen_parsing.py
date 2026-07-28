@@ -12,9 +12,9 @@ from r2v_data_v2.qwen_client import (
     QwenAnnotationClient,
     QwenAnnotationFailure,
     annotate_manifest,
-    parse_qwen_json_response,
 )
 from r2v_data_v2.schemas import QwenAnnotationResult
+from r2v_data_v2.structured_output import parse_qwen_json_response
 from tests.test_caption_validation import _valid_payload
 
 

@@ -18,6 +18,10 @@ from r2v_data_v2.reference_binding import (
     validate_final_reference_binding,
 )
 from r2v_data_v2.schemas import AnnotationResult, CrossPairJudgeResult
+from r2v_data_v2.structured_output import (
+    StructuredOutputFailure,
+    request_structured_output,
+)
 
 
 @dataclass(frozen=True)
@@ -138,16 +142,13 @@ class QwenCrossPairJudge:
             "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
         }
 
-    def judge(
+    def _request(
         self,
         *,
+        prompt: str,
         target: dict[str, Any],
         candidate: dict[str, Any],
-    ) -> CrossPairJudgeResult:
-        prompt = CROSS_PAIR_PROMPT.format(
-            target_phrase=target["phrase"],
-            candidate_label=candidate["canonical_label"],
-        )
+    ) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
@@ -185,7 +186,27 @@ class QwenCrossPairJudge:
         content = response.choices[0].message.content
         if not content:
             raise RuntimeError("Qwen returned an empty cross-pair decision")
-        return CrossPairJudgeResult.model_validate_json(content)
+        return content
+
+    def judge(
+        self,
+        *,
+        target: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> CrossPairJudgeResult:
+        prompt = CROSS_PAIR_PROMPT.format(
+            target_phrase=target["phrase"],
+            candidate_label=candidate["canonical_label"],
+        )
+        return request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                target=target,
+                candidate=candidate,
+            ),
+            original_request=prompt,
+            model=CrossPairJudgeResult,
+        )
 
 
 def _annotations_by_clip(path: Path) -> dict[str, dict[str, Any]]:
@@ -217,6 +238,7 @@ def choose_cross_pair(
     candidates: list[dict[str, Any]],
     config: PairingConfig,
     judge: QwenCrossPairJudge,
+    structured_failures: list[dict[str, object]] | None = None,
 ) -> tuple[dict[str, Any], CrossPairJudgeResult, float] | None:
     coarse: list[tuple[float, dict[str, Any]]] = []
     for candidate in candidates:
@@ -230,7 +252,18 @@ def choose_cross_pair(
     coarse.sort(key=lambda item: item[0], reverse=True)
     passing: list[tuple[float, float, dict[str, Any], CrossPairJudgeResult]] = []
     for similarity, candidate in coarse[: config.maximum_candidates_per_entity]:
-        result = judge.judge(target=target, candidate=candidate)
+        try:
+            result = judge.judge(target=target, candidate=candidate)
+        except StructuredOutputFailure as exc:
+            if structured_failures is not None:
+                structured_failures.append(
+                    {
+                        "target_entity_id": target["entity_id"],
+                        "candidate_clip_uid": candidate["clip_uid"],
+                        **exc.to_dict(),
+                    }
+                )
+            continue
         if cross_pair_passes(
             result,
             minimum_confidence=config.cross_pair_minimum_confidence,
@@ -348,6 +381,7 @@ def build_pairs(
             final_references: list[dict[str, object]] = []
             warnings = list(annotation.get("warnings", []))
             sample_in_pairs = sample_cross_pairs = sample_fallbacks = 0
+            structured_failures: list[dict[str, object]] = []
             for target in target_references:
                 selected = target
                 pair_type = "in_pair"
@@ -362,6 +396,7 @@ def build_pairs(
                         ),
                         config=config.pairing,
                         judge=qwen,
+                        structured_failures=structured_failures,
                     )
                     if cross is not None:
                         selected, judgment, visual_similarity = cross
@@ -387,6 +422,14 @@ def build_pairs(
                         judge_result=judgment,
                         visual_similarity=visual_similarity,
                     )
+                )
+            for structured_failure in structured_failures:
+                _append_jsonl(
+                    output_root / "logs" / "cross_pair_judge_failed.jsonl",
+                    {
+                        "clip_uid": clip,
+                        **structured_failure,
+                    },
                 )
             background = annotation.get("background")
             background_reference = None

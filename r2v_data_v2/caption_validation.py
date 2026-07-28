@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import re
 import string
-from dataclasses import asdict, dataclass
 
 from r2v_data_v2.schemas import QwenAnnotationResult
+from r2v_data_v2.structured_output import ValidationIssue
 
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
 _GENERIC_LABELS = {"man", "woman", "child", "person"}
@@ -15,16 +15,6 @@ _ALLOWED_IDENTITY_METADATA_FIELDS = {
     "person_name",
     "entity_names",
 }
-
-
-@dataclass(frozen=True)
-class ValidationIssue:
-    code: str
-    field: str | None
-    message: str
-
-    def to_dict(self) -> dict[str, str | None]:
-        return asdict(self)
 
 
 def _issue(code: str, field: str | None, message: str) -> ValidationIssue:
