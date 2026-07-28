@@ -39,6 +39,10 @@ ranking:
   dinov3_batch_size: 16
   dinov3_cluster_similarity_threshold: 0.70
   dinov3_exclude_cluster_outliers: true
+  siglip2_enabled: true
+  siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
+  siglip2_batch_size: 8
+  siglip2_hard_reject_wrong_entity: true
 
 pairing:
   enable_in_pair: true

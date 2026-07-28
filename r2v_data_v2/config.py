@@ -61,6 +61,12 @@ class RankingConfig:
     dinov3_batch_size: int = 16
     dinov3_cluster_similarity_threshold: float = 0.70
     dinov3_exclude_cluster_outliers: bool = True
+    siglip2_enabled: bool = True
+    siglip2_model_path: Path = Path(
+        "/mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex"
+    )
+    siglip2_batch_size: int = 8
+    siglip2_hard_reject_wrong_entity: bool = True
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,9 @@ class PipelineConfig:
             ranking_model_paths.append(
                 ("ranking.dinov3_model_path", self.ranking.dinov3_model_path)
             )
+        ranking_model_paths.append(
+            ("ranking.siglip2_model_path", self.ranking.siglip2_model_path)
+        )
         for field_name, ranking_model_path in ranking_model_paths:
             resolved = ranking_model_path.expanduser().resolve(strict=False)
             if not (
@@ -157,6 +166,12 @@ def load_config(path: str | Path) -> PipelineConfig:
         ranking.get("dinov3_repo_dir", "/mnt/workspace/public/pretrained/dinov3")
     ).expanduser()
     ranking["dinov3_model_path"] = _path_or_none(ranking.get("dinov3_model_path"))
+    ranking["siglip2_model_path"] = Path(
+        ranking.get(
+            "siglip2_model_path",
+            "/mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex",
+        )
+    ).expanduser()
 
     config = PipelineConfig(
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
@@ -198,6 +213,8 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError(
             "ranking.dinov3_cluster_similarity_threshold must be between 0 and 1"
         )
+    if config.ranking.siglip2_batch_size < 1:
+        raise ValueError("ranking.siglip2_batch_size must be positive")
 
 
 def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
@@ -221,6 +238,7 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
                 if config.ranking.dinov3_model_path
                 else None
             ),
+            "siglip2_model_path": str(config.ranking.siglip2_model_path),
         },
         "pairing": vars(config.pairing),
         "augmentation": vars(config.augmentation),

@@ -94,6 +94,18 @@ find /mnt/workspace/public/pretrained/dinov3 \
   | sort | head -100
 ```
 
+SigLIP 2 is also local-only at runtime. Download it explicitly into the
+writable user model directory:
+
+```bash
+python scripts/download_optional_models.py \
+  --siglip2 google/siglip2-base-patch16-naflex \
+  --destination /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
+```
+
+The downloader rejects destinations outside the user model and Hugging Face
+cache roots. It never writes to `/mnt/workspace/public/pretrained/`.
+
 ## Run
 
 Run the first 20 records:
