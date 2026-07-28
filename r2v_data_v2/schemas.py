@@ -9,13 +9,12 @@ class SchemaModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class AnnotationEntity(SchemaModel):
+class QwenAnnotationEntity(SchemaModel):
     entity_id: str
     phrase: str
     grounding_prompt: str
     canonical_label: str
     category: Literal["person", "animal", "character", "object", "product", "vehicle"]
-    ref_token: Optional[str] = None
     reference_worthy: bool
     salience: Literal["primary", "secondary", "incidental"]
     genericity: Literal["named", "descriptive", "generic"]
@@ -29,24 +28,36 @@ class AnnotationEntity(SchemaModel):
     selection_reason: str
 
 
+class AnnotationEntity(QwenAnnotationEntity):
+    ref_token: Optional[str] = None
+
+
 class EntityRelation(SchemaModel):
     subject_id: str
     predicate: str
     object_id: str
 
 
-class BackgroundAnnotation(SchemaModel):
+class QwenBackgroundAnnotation(SchemaModel):
     phrase: str
     grounding_prompt: str
-    ref_token: Optional[str] = None
     reference_worthy: bool
 
 
-class AnnotationResult(SchemaModel):
+class BackgroundAnnotation(QwenBackgroundAnnotation):
+    ref_token: Optional[str] = None
+
+
+class QwenAnnotationResult(SchemaModel):
     caption: str
+    entities: list[QwenAnnotationEntity]
+    relations: list[EntityRelation] = Field(default_factory=list)
+    background: Optional[QwenBackgroundAnnotation] = None
+
+
+class AnnotationResult(QwenAnnotationResult):
     prompt_with_refs: str
     entities: list[AnnotationEntity]
-    relations: list[EntityRelation] = Field(default_factory=list)
     background: Optional[BackgroundAnnotation] = None
 
 

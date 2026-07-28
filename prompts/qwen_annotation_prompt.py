@@ -7,7 +7,7 @@ containing:
 1. one concise chronological video caption;
 2. visually meaningful reference entities;
 3. visible entity relations;
-4. a copy of the caption with explicit reference-token bindings.
+4. an optional background description.
 
 CAPTION:
 Write one flowing English paragraph that starts directly with the main action.
@@ -31,11 +31,10 @@ duplicate phrases referring to the same instance. A famous identity may be
 used only when supported by supplied metadata, the draft caption, or visible
 text; never identify a person from facial appearance alone.
 
-BINDING:
-Place each token immediately after its exact noun phrase:
-<ref_subject_n>, <ref_object_n>, <ref_bg_n>, or <ref_group_n>.
-Each selected phrase and token must occur exactly once. Use no token for an
-entity that is not selected as reference-worthy.
+PHRASES:
+Each reference-worthy entity phrase must be copied exactly from one unique
+location in the caption. Do not generate reference tokens or a second prompt;
+the caller assigns bindings deterministically after validating your JSON.
 
 RELATIONS:
 Record visible relations such as holding, wearing, riding, carrying, inside,
@@ -59,13 +58,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                 "from a low rear angle. His red insulated jacket and black backpack "
                 "remain visible against a broad alpine valley under cold blue light."
             ),
-            "prompt_with_refs": (
-                "Michael Jordan <ref_subject_1> climbs steadily over a rocky "
-                "snow-covered ridge, planting his boots between exposed stones as "
-                "the camera follows from a low rear angle. His red insulated jacket "
-                "and black backpack remain visible against a broad alpine valley "
-                "<ref_bg_1> under cold blue light."
-            ),
             "entities": [
                 {
                     "entity_id": "e1",
@@ -73,7 +65,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "Michael Jordan in a red insulated jacket",
                     "canonical_label": "Michael Jordan",
                     "category": "person",
-                    "ref_token": "<ref_subject_1>",
                     "reference_worthy": True,
                     "salience": "primary",
                     "genericity": "named",
@@ -86,7 +77,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
             "background": {
                 "phrase": "a broad alpine valley",
                 "grounding_prompt": "empty broad snowy alpine valley",
-                "ref_token": "<ref_bg_1>",
                 "reference_worthy": True,
             },
         },
@@ -100,13 +90,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                 "The handheld camera moves backward at chest height as cool daylight "
                 "reflects from blue awnings and damp pavement."
             ),
-            "prompt_with_refs": (
-                "A woman in a yellow raincoat <ref_subject_1> walks beside a man in "
-                "a navy cap <ref_subject_2> through a wet market lane, while both "
-                "step around shallow puddles. The handheld camera moves backward at "
-                "chest height as cool daylight reflects from blue awnings and damp "
-                "pavement."
-            ),
             "entities": [
                 {
                     "entity_id": "e1",
@@ -114,7 +97,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "woman wearing a yellow raincoat",
                     "canonical_label": "woman",
                     "category": "person",
-                    "ref_token": "<ref_subject_1>",
                     "reference_worthy": True,
                     "salience": "primary",
                     "genericity": "descriptive",
@@ -128,7 +110,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "man wearing a navy cap",
                     "canonical_label": "man",
                     "category": "person",
-                    "ref_token": "<ref_subject_2>",
                     "reference_worthy": True,
                     "salience": "secondary",
                     "genericity": "descriptive",
@@ -156,12 +137,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                 "holds a steady medium view inside a softly lit reception hall with "
                 "warm highlights along the glass and his jacket."
             ),
-            "prompt_with_refs": (
-                "A gray-haired man in a dark suit <ref_subject_1> raises a small wine "
-                "glass near his shoulder, pauses, and lowers it toward a white table. "
-                "The camera holds a steady medium view inside a softly lit reception "
-                "hall with warm highlights along the glass and his jacket."
-            ),
             "entities": [
                 {
                     "entity_id": "e1",
@@ -169,7 +144,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "gray-haired man wearing a dark suit",
                     "canonical_label": "man",
                     "category": "person",
-                    "ref_token": "<ref_subject_1>",
                     "reference_worthy": True,
                     "salience": "primary",
                     "genericity": "descriptive",
@@ -183,7 +157,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "small stemmed wine glass in his hand",
                     "canonical_label": "wine glass",
                     "category": "object",
-                    "ref_token": None,
                     "reference_worthy": False,
                     "salience": "secondary",
                     "genericity": "descriptive",
@@ -207,13 +180,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                 "briefly steadies the case before leaving the frame, while a locked "
                 "close camera and soft white studio lights reveal crisp reflections."
             ),
-            "prompt_with_refs": (
-                "A silver dive watch <ref_object_1> rotates slowly inside an open "
-                "black presentation case <ref_object_2>, bringing its blue dial and "
-                "metal bracelet into view. A hand briefly steadies the case before "
-                "leaving the frame, while a locked close camera and soft white studio "
-                "lights reveal crisp reflections."
-            ),
             "entities": [
                 {
                     "entity_id": "e1",
@@ -221,7 +187,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "silver dive watch with blue dial",
                     "canonical_label": "watch",
                     "category": "product",
-                    "ref_token": "<ref_object_1>",
                     "reference_worthy": True,
                     "salience": "primary",
                     "genericity": "descriptive",
@@ -235,7 +200,6 @@ ICL_EXAMPLES: list[dict[str, object]] = [
                     "grounding_prompt": "open black watch presentation case",
                     "canonical_label": "presentation case",
                     "category": "object",
-                    "ref_token": "<ref_object_2>",
                     "reference_worthy": True,
                     "salience": "secondary",
                     "genericity": "descriptive",

@@ -19,7 +19,11 @@ from r2v_data_v2.caption_validation import (
 )
 from r2v_data_v2.config import PipelineConfig, QwenConfig
 from r2v_data_v2.manifest import iter_source_records
-from r2v_data_v2.schemas import AnnotationResult
+from r2v_data_v2.reference_binding import (
+    ReferenceBindingError,
+    assign_reference_tokens,
+)
+from r2v_data_v2.schemas import AnnotationResult, QwenAnnotationResult
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
@@ -190,7 +194,7 @@ class QwenAnnotationClient:
                     "json_schema": {
                         "name": "annotation_result",
                         "strict": True,
-                        "schema": AnnotationResult.model_json_schema(),
+                        "schema": QwenAnnotationResult.model_json_schema(),
                     },
                 },
             )
@@ -218,7 +222,7 @@ class QwenAnnotationClient:
                 repair_prompt = build_repair_prompt(
                     invalid_response=raw_responses[-1],
                     validation_issues=issues,
-                    json_schema=AnnotationResult.model_json_schema(),
+                    json_schema=QwenAnnotationResult.model_json_schema(),
                     draft_caption=caption_raw,
                 )
             raw_response = self._request(
@@ -229,11 +233,20 @@ class QwenAnnotationClient:
                 )
             )
             raw_responses.append(raw_response)
-            result, issues = _parse_issues(raw_response, AnnotationResult)
-            if result is not None:
-                issues = validate_annotation(result)
+            semantic, issues = _parse_issues(raw_response, QwenAnnotationResult)
+            if semantic is not None:
+                issues = validate_annotation(semantic)
+            result = None
+            if semantic is not None and not issues:
+                try:
+                    result = assign_reference_tokens(semantic)
+                except ReferenceBindingError as exc:
+                    issues = exc.issues
             if result is not None and not issues:
-                return result, annotation_warnings(result)
+                warnings = annotation_warnings(semantic)
+                if semantic.background and semantic.background.reference_worthy:
+                    warnings.append("background_reference_deferred")
+                return result, warnings
             if self.config.repair_retries < 1:
                 break
         raise QwenAnnotationFailure(raw_responses=raw_responses, issues=issues)

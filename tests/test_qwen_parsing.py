@@ -14,21 +14,21 @@ from r2v_data_v2.qwen_client import (
     annotate_manifest,
     parse_qwen_json_response,
 )
-from r2v_data_v2.schemas import AnnotationResult
+from r2v_data_v2.schemas import QwenAnnotationResult
 from tests.test_caption_validation import _valid_payload
 
 
 def test_strict_json_object_parses() -> None:
     result = parse_qwen_json_response(
         json.dumps(_valid_payload()),
-        AnnotationResult,
+        QwenAnnotationResult,
     )
     assert result.entities[0].entity_id == "e1"
 
 
 def test_complete_markdown_json_fence_parses() -> None:
     raw = f"```json\n{json.dumps(_valid_payload())}\n```"
-    assert parse_qwen_json_response(raw, AnnotationResult).caption
+    assert parse_qwen_json_response(raw, QwenAnnotationResult).caption
 
 
 @pytest.mark.parametrize(
@@ -40,14 +40,22 @@ def test_complete_markdown_json_fence_parses() -> None:
 )
 def test_explanations_and_python_literals_fail(raw: str) -> None:
     with pytest.raises((json.JSONDecodeError, ValueError)):
-        parse_qwen_json_response(raw, AnnotationResult)
+        parse_qwen_json_response(raw, QwenAnnotationResult)
 
 
 def test_extra_schema_field_fails() -> None:
     payload = _valid_payload()
     payload["unexpected"] = True
     with pytest.raises(ValidationError):
-        parse_qwen_json_response(json.dumps(payload), AnnotationResult)
+        parse_qwen_json_response(json.dumps(payload), QwenAnnotationResult)
+
+
+def test_qwen_cannot_supply_tokens_or_final_prompt() -> None:
+    payload = _valid_payload()
+    payload["prompt_with_refs"] = payload["caption"]
+    payload["entities"][0]["ref_token"] = "<ref_subject_99>"  # type: ignore[index]
+    with pytest.raises(ValidationError):
+        parse_qwen_json_response(json.dumps(payload), QwenAnnotationResult)
 
 
 class _FakeAnnotationClient(QwenAnnotationClient):

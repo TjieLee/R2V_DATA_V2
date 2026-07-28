@@ -4,9 +4,8 @@ import re
 import string
 from dataclasses import asdict, dataclass
 
-from r2v_data_v2.schemas import AnnotationResult
+from r2v_data_v2.schemas import QwenAnnotationResult
 
-_REF_TOKEN = re.compile(r"<ref_(?:subject|object|bg|group)_\d+>")
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
 _GENERIC_LABELS = {"man", "woman", "child", "person"}
 
@@ -27,10 +26,6 @@ def _issue(code: str, field: str | None, message: str) -> ValidationIssue:
 
 def _normalize_whitespace(value: str) -> str:
     return " ".join(value.split())
-
-
-def _normalize_binding_text(value: str) -> str:
-    return re.sub(r"\s+([,.;:!?])", r"\1", _normalize_whitespace(value))
 
 
 def _normalize_sentence(value: str) -> str:
@@ -73,7 +68,7 @@ def exact_phrase_occurrence_count(caption: str, phrase: str) -> int:
     return len(exact_phrase_spans(caption, phrase))
 
 
-def validate_annotation(result: AnnotationResult) -> list[ValidationIssue]:
+def validate_annotation(result: QwenAnnotationResult) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     caption = result.caption.strip()
     if not caption:
@@ -195,65 +190,8 @@ def validate_annotation(result: AnnotationResult) -> list[ValidationIssue]:
                 )
             )
 
-    expected_tokens = [
-        entity.ref_token for entity in result.entities if entity.ref_token is not None
-    ]
-    if result.background and result.background.ref_token:
-        expected_tokens.append(result.background.ref_token)
-    if len(expected_tokens) != len(set(expected_tokens)):
-        issues.append(
-            _issue("duplicate_ref_token", "entities", "ref_token values must be unique")
-        )
-    prompt_tokens = _REF_TOKEN.findall(result.prompt_with_refs)
-    if len(prompt_tokens) != len(set(prompt_tokens)):
-        issues.append(
-            _issue(
-                "duplicate_prompt_token",
-                "prompt_with_refs",
-                "each ref token must occur exactly once",
-            )
-        )
-    if sorted(prompt_tokens) != sorted(expected_tokens):
-        issues.append(
-            _issue(
-                "prompt_token_mismatch",
-                "prompt_with_refs",
-                "prompt ref tokens do not match selected entities",
-            )
-        )
-
-    prompt_without_tokens = _REF_TOKEN.sub("", result.prompt_with_refs)
-    if _normalize_binding_text(prompt_without_tokens) != _normalize_binding_text(
-        caption
-    ):
-        issues.append(
-            _issue(
-                "prompt_caption_mismatch",
-                "prompt_with_refs",
-                "prompt must equal caption after removing ref tokens",
-            )
-        )
-
     for index, entity in enumerate(result.entities):
         field = f"entities[{index}]"
-        if entity.reference_worthy != (entity.ref_token is not None):
-            issues.append(
-                _issue(
-                    "reference_token_disagreement",
-                    f"{field}.ref_token",
-                    "reference_worthy and ref_token disagree",
-                )
-            )
-        if entity.ref_token:
-            binding = f"{entity.phrase} {entity.ref_token}"
-            if result.prompt_with_refs.count(binding) != 1:
-                issues.append(
-                    _issue(
-                        "token_not_after_phrase",
-                        f"{field}.ref_token",
-                        "token must immediately follow its phrase",
-                    )
-                )
         if entity.genericity == "named" and entity.name_evidence == "none":
             issues.append(
                 _issue(
@@ -270,19 +208,6 @@ def validate_annotation(result: AnnotationResult) -> list[ValidationIssue]:
                     "attached accessory must not be reference-worthy",
                 )
             )
-        if (
-            entity.separability == "composite_candidate"
-            and entity.reference_worthy
-            and (entity.ref_token or "").startswith("<ref_group_") is False
-        ):
-            issues.append(
-                _issue(
-                    "invalid_composite_token",
-                    f"{field}.ref_token",
-                    "composite reference must use ref_group",
-                )
-            )
-
     if result.background:
         background = result.background
         spans = exact_phrase_spans(caption, background.phrase)
@@ -302,25 +227,6 @@ def validate_annotation(result: AnnotationResult) -> list[ValidationIssue]:
                     "reference-worthy background phrase must occur exactly once",
                 )
             )
-        if background.reference_worthy != (background.ref_token is not None):
-            issues.append(
-                _issue(
-                    "reference_token_disagreement",
-                    "background.ref_token",
-                    "background reference_worthy and ref_token disagree",
-                )
-            )
-        if background.ref_token:
-            binding = f"{background.phrase} {background.ref_token}"
-            if result.prompt_with_refs.count(binding) != 1:
-                issues.append(
-                    _issue(
-                        "token_not_after_phrase",
-                        "background.ref_token",
-                        "background token must immediately follow its phrase",
-                    )
-                )
-
     known_ids = set(entity_ids)
     for index, relation in enumerate(result.relations):
         if relation.subject_id not in known_ids or relation.object_id not in known_ids:
@@ -346,7 +252,7 @@ def validate_annotation(result: AnnotationResult) -> list[ValidationIssue]:
     return issues
 
 
-def annotation_warnings(result: AnnotationResult) -> list[str]:
+def annotation_warnings(result: QwenAnnotationResult) -> list[str]:
     warnings: list[str] = []
     word_count = len(result.caption.split())
     if not 40 <= word_count <= 180:
