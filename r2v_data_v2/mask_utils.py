@@ -100,7 +100,7 @@ def fill_small_enclosed_holes(
 
 def save_mask_png(path: str | Path, mask: np.ndarray) -> None:
     binary = np.asarray(mask, dtype=bool)
-    Image.fromarray(binary.astype(np.uint8) * 255, mode="L").save(path)
+    Image.fromarray(binary.astype(np.uint8) * 255).save(path)
 
 
 def save_mask_contact_sheet(

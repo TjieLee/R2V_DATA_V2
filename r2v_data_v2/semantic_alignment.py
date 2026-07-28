@@ -88,7 +88,11 @@ class Siglip2Aligner:
             )
         if batch_size < 1:
             raise ValueError("SigLIP 2 batch_size must be positive")
-        self._load()
+        try:
+            self._load()
+        except Exception:
+            self.close()
+            raise
 
     def _load(self) -> None:
         import torch

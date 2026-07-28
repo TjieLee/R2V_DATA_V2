@@ -10,7 +10,8 @@ source JSON/JSONL
 -> fixed eight-frame sampling
 -> Qwen caption, entities, and explicit ref bindings
 -> SAM3 text-prompted masks
--> hard gates, metrics, and Top-3 Qwen candidate review
+-> hard gates, DINOv3 representativeness, optional SigLIP 2 alignment
+-> Top-3 Qwen candidate review and code-owned final ranking
 -> one canonical reference per retained entity
 -> in-pair or verified same-parent cross-pair
 -> final_samples.jsonl
@@ -61,6 +62,8 @@ Required server inputs:
 - `qwen.model`: the actual video-capable model served at that endpoint;
 - `sam3.code_root`: the installed SAM3 checkout;
 - `sam3.checkpoint`: an explicit local checkpoint path;
+- `ranking.dinov3_model_path`: a verified local DINOv3 checkpoint or HF directory;
+- `ranking.siglip2_model_path`: the explicitly downloaded local SigLIP 2 directory;
 - `output_root`: a directory below `/mnt/workspace/litengjie/data/`.
 
 The Qwen service launch command depends on the model and vLLM version installed
@@ -166,6 +169,11 @@ Every selected reference keeps:
 
 Candidate masks are stored as packed, zlib-compressed JSON for only the
 shortlist. The final selected mask is the only mandatory PNG mask.
+Stage 04 also stores per-candidate ranking metadata and float16 DINOv3
+embeddings. The selected reference keeps `dinov3_embedding.npy` for downstream
+reuse. DINOv3 and SigLIP 2 can each be disabled; their score weight is then
+removed and the remaining weights are normalized. Q-Align is not part of this
+pilot.
 
 Cross-pair search is limited to the same `parent_video_id` and a different
 complete numeric `clip_suffix`. Category/name evidence is checked before Qwen

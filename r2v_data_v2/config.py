@@ -207,6 +207,19 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("ranking.maximum_mask_area_ratio must not exceed 1")
     if config.ranking.minimum_mask_area_ratio >= config.ranking.maximum_mask_area_ratio:
         raise ValueError("ranking mask area bounds are invalid")
+    if not 1 <= config.ranking.top_k_for_vlm_judge <= 3:
+        raise ValueError("ranking.top_k_for_vlm_judge must be between 1 and 3")
+    if not 0.0 <= config.ranking.minimum_exposure_score <= 1.0:
+        raise ValueError("ranking.minimum_exposure_score must be between 0 and 1")
+    if not (
+        0.0
+        <= config.ranking.minimum_crop_subject_ratio
+        < config.ranking.maximum_crop_subject_ratio
+        <= 1.0
+    ):
+        raise ValueError("ranking crop subject ratio bounds are invalid")
+    if not 0.0 <= config.ranking.maximum_other_mask_overlap <= 1.0:
+        raise ValueError("ranking.maximum_other_mask_overlap must be between 0 and 1")
     if config.ranking.dinov3_batch_size < 1:
         raise ValueError("ranking.dinov3_batch_size must be positive")
     if not 0.0 <= config.ranking.dinov3_cluster_similarity_threshold <= 1.0:

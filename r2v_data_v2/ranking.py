@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,23 +15,36 @@ from PIL import Image, ImageDraw
 from prompts.qwen_candidate_judge_prompt import CANDIDATE_JUDGE_PROMPT
 from r2v_data_v2.config import PipelineConfig, QwenConfig, RankingConfig
 from r2v_data_v2.manifest import iter_source_records
-from r2v_data_v2.mask_utils import decode_mask, save_mask_png
+from r2v_data_v2.mask_utils import bbox_from_mask, decode_mask, save_mask_png
 from r2v_data_v2.metrics import (
     CandidateMetrics,
     calculate_candidate_metrics,
     padded_crop_box,
 )
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
+from r2v_data_v2.reference_image import build_neutral_subject_crop
 from r2v_data_v2.schemas import (
     AnnotationEntity,
     AnnotationResult,
     CandidateJudgeResult,
     CandidateVisualReview,
 )
+from r2v_data_v2.semantic_alignment import (
+    AlignmentMetrics,
+    Siglip2Aligner,
+    is_siglip_wrong_entity,
+)
 from r2v_data_v2.structured_output import (
     StructuredOutputFailure,
     ValidationIssue,
     request_structured_output,
+)
+from r2v_data_v2.visual_embedding import (
+    DinoV3Embedder,
+    TemporalRepresentationMetrics,
+    save_dinov3_embeddings,
+    save_selected_dinov3_embedding,
+    temporal_representation_metrics,
 )
 
 
@@ -41,6 +55,9 @@ class RankedCandidate:
     sam_confidence: float
     metrics: CandidateMetrics
     visual_review: CandidateVisualReview
+    dino_metrics: TemporalRepresentationMetrics | None
+    alignment_metrics: AlignmentMetrics | None
+    best_matching_entity_id: str | None
     hard_rejection_reasons: tuple[str, ...]
     ranking_score: float
 
@@ -51,13 +68,66 @@ class RankingStats:
     skipped_existing: int = 0
     no_valid_candidate: int = 0
     failed: int = 0
+    dino_load_seconds: float = 0.0
+    dino_inference_seconds: float = 0.0
+    siglip_load_seconds: float = 0.0
+    siglip_inference_seconds: float = 0.0
+    candidate_count_before_models: int = 0
+    candidate_count_after_dino: int = 0
+    candidate_count_after_siglip: int = 0
 
 
-def hard_rejection_reasons(
+@dataclass
+class CandidateWorkItem:
+    record: dict[str, object]
+    metrics: CandidateMetrics
+    neutral_crop: Image.Image
+    hard_rejection_reasons: list[str]
+    dino_embedding: np.ndarray | None = None
+    dino_metrics: TemporalRepresentationMetrics | None = None
+    alignment_metrics: AlignmentMetrics | None = None
+    best_matching_entity_id: str | None = None
+
+    @property
+    def frame_slot(self) -> int:
+        return int(self.record["frame_slot"])
+
+    @property
+    def sam_confidence(self) -> float:
+        return float(self.record["sam_confidence"])
+
+
+def _clamp_unit(value: float) -> float:
+    return min(1.0, max(0.0, float(value)))
+
+
+def _min_max(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    low, high = min(values), max(values)
+    if high == low:
+        return [0.5] * len(values)
+    return [(value - low) / (high - low) for value in values]
+
+
+def _isolation_score(metrics: CandidateMetrics) -> float:
+    return _clamp_unit(
+        1.0
+        - max(
+            metrics.maximum_other_mask_overlap,
+            0.5 * metrics.maximum_bbox_containment,
+        )
+    )
+
+
+def _crop_subject_ratio_score(metrics: CandidateMetrics) -> float:
+    return _clamp_unit(1.0 - abs(metrics.crop_subject_ratio - 0.55) / 0.55)
+
+
+def basic_hard_rejection_reasons(
     *,
     metrics: CandidateMetrics,
     sam_confidence: float,
-    visual_review: CandidateVisualReview,
     config: RankingConfig,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
@@ -73,6 +143,37 @@ def hard_rejection_reasons(
         reasons.append("border_touch")
     if sam_confidence <= 0:
         reasons.append("sam_confidence")
+    if metrics.exposure_score < config.minimum_exposure_score:
+        reasons.append("extreme_exposure")
+    if metrics.crop_subject_ratio < config.minimum_crop_subject_ratio:
+        reasons.append("subject_too_small_in_crop")
+    if metrics.crop_subject_ratio > config.maximum_crop_subject_ratio:
+        reasons.append("crop_too_tight")
+    if metrics.maximum_other_mask_overlap > config.maximum_other_mask_overlap:
+        reasons.append("other_subject_contamination")
+    return tuple(reasons)
+
+
+def hard_rejection_reasons(
+    *,
+    metrics: CandidateMetrics,
+    sam_confidence: float,
+    visual_review: CandidateVisualReview,
+    config: RankingConfig,
+    dino_temporal_outlier: bool = False,
+    siglip_wrong_entity: bool = False,
+) -> tuple[str, ...]:
+    reasons = list(
+        basic_hard_rejection_reasons(
+            metrics=metrics,
+            sam_confidence=sam_confidence,
+            config=config,
+        )
+    )
+    if dino_temporal_outlier:
+        reasons.append("dino_temporal_outlier")
+    if siglip_wrong_entity:
+        reasons.append("siglip_wrong_entity")
     if visual_review.completeness < 0.5:
         reasons.append("incomplete")
     if visual_review.occlusion > 0.5:
@@ -89,31 +190,96 @@ def rank_candidates(
     candidates: list[tuple[int, int, float, CandidateMetrics, CandidateVisualReview]],
     *,
     config: RankingConfig,
+    dino_metrics_by_slot: dict[int, TemporalRepresentationMetrics] | None = None,
+    dino_outlier_slots: set[int] | None = None,
+    alignment_metrics_by_slot: dict[int, AlignmentMetrics] | None = None,
+    normalized_siglip_scores_by_slot: dict[int, float] | None = None,
+    best_matching_entity_ids: dict[int, str] | None = None,
+    siglip_wrong_entity_slots: set[int] | None = None,
 ) -> list[RankedCandidate]:
     if not candidates:
         return []
-    sharpness_values = [item[3].tenengrad_sharpness for item in candidates]
-    low, high = min(sharpness_values), max(sharpness_values)
+    dino_metrics_by_slot = dino_metrics_by_slot or {}
+    dino_outlier_slots = dino_outlier_slots or set()
+    alignment_metrics_by_slot = alignment_metrics_by_slot or {}
+    normalized_siglip_scores_by_slot = normalized_siglip_scores_by_slot or {}
+    best_matching_entity_ids = best_matching_entity_ids or {}
+    siglip_wrong_entity_slots = siglip_wrong_entity_slots or set()
+    normalized_sharpness_by_slot = dict(
+        zip(
+            [item[0] for item in candidates],
+            _min_max([item[3].tenengrad_sharpness for item in candidates]),
+        )
+    )
+    siglip_raw_scores = []
+    for frame_slot, _, _, _, _ in candidates:
+        alignment = alignment_metrics_by_slot.get(frame_slot)
+        if alignment is None:
+            siglip_raw_scores.append(0.5)
+        elif alignment.alignment_margin is not None:
+            siglip_raw_scores.append(alignment.alignment_margin)
+        else:
+            siglip_raw_scores.append(alignment.target_similarity)
+    normalized_siglip_by_slot = {
+        **dict(
+            zip(
+                [item[0] for item in candidates],
+                _min_max(siglip_raw_scores),
+            )
+        ),
+        **normalized_siglip_scores_by_slot,
+    }
     ranked: list[RankedCandidate] = []
     for frame_slot, source_index, sam_confidence, metrics, visual_review in candidates:
+        dino_metrics = dino_metrics_by_slot.get(frame_slot)
+        alignment_metrics = alignment_metrics_by_slot.get(frame_slot)
         reasons = hard_rejection_reasons(
             metrics=metrics,
             sam_confidence=sam_confidence,
             visual_review=visual_review,
             config=config,
+            dino_temporal_outlier=frame_slot in dino_outlier_slots,
+            siglip_wrong_entity=frame_slot in siglip_wrong_entity_slots,
         )
-        normalized_sharpness = (
-            1.0 if high == low else (metrics.tenengrad_sharpness - low) / (high - low)
-        )
-        isolation = max(0.0, 1.0 - metrics.maximum_other_mask_overlap)
+        component_scores = {
+            "dino": (
+                _clamp_unit(dino_metrics.dino_representativeness)
+                if dino_metrics is not None
+                else 0.5
+            ),
+            "completeness": visual_review.completeness,
+            "recognizability": visual_review.recognizability,
+            "siglip": normalized_siglip_by_slot[frame_slot],
+            "mask_quality": visual_review.mask_quality,
+            "mask_area_continuity": metrics.mask_area_continuity,
+            "quality": (
+                0.6 * normalized_sharpness_by_slot[frame_slot]
+                + 0.4 * metrics.exposure_score
+            ),
+            "isolation": _isolation_score(metrics),
+            "crop": _crop_subject_ratio_score(metrics),
+            "sam": sam_confidence,
+        }
+        weights = {
+            "dino": 0.25,
+            "completeness": 0.18,
+            "recognizability": 0.15,
+            "siglip": 0.12,
+            "mask_quality": 0.08,
+            "mask_area_continuity": 0.06,
+            "quality": 0.06,
+            "isolation": 0.05,
+            "crop": 0.03,
+            "sam": 0.02,
+        }
+        if not config.dinov3_enabled:
+            weights.pop("dino")
+        if not config.siglip2_enabled:
+            weights.pop("siglip")
+        total_weight = sum(weights.values())
         score = (
-            0.25 * visual_review.completeness
-            + 0.20 * visual_review.recognizability
-            + 0.15 * normalized_sharpness
-            + 0.15 * visual_review.mask_quality
-            + 0.10 * sam_confidence
-            + 0.10 * isolation
-            + 0.05 * visual_review.visual_quality
+            sum(weights[name] * _clamp_unit(component_scores[name]) for name in weights)
+            / total_weight
         )
         ranked.append(
             RankedCandidate(
@@ -122,6 +288,9 @@ def rank_candidates(
                 sam_confidence=sam_confidence,
                 metrics=metrics,
                 visual_review=visual_review,
+                dino_metrics=dino_metrics,
+                alignment_metrics=alignment_metrics,
+                best_matching_entity_id=best_matching_entity_ids.get(frame_slot),
                 hard_rejection_reasons=reasons,
                 ranking_score=float(score),
             )
@@ -396,6 +565,113 @@ def _default_review(record: dict[str, object]) -> CandidateVisualReview:
     )
 
 
+def _preliminary_top_candidates(
+    candidates: list[CandidateWorkItem],
+    *,
+    config: RankingConfig,
+) -> list[CandidateWorkItem]:
+    if not candidates:
+        return []
+    normalized_sharpness = _min_max(
+        [candidate.metrics.tenengrad_sharpness for candidate in candidates]
+    )
+    scored: list[tuple[float, CandidateWorkItem]] = []
+    for index, candidate in enumerate(candidates):
+        components = {
+            "dino": (
+                _clamp_unit(candidate.dino_metrics.dino_representativeness)
+                if candidate.dino_metrics is not None
+                else 0.5
+            ),
+            "sharpness": normalized_sharpness[index],
+            "exposure": candidate.metrics.exposure_score,
+            "isolation": _isolation_score(candidate.metrics),
+            "sam": candidate.sam_confidence,
+        }
+        weights = {
+            "dino": 0.45,
+            "sharpness": 0.20,
+            "exposure": 0.15,
+            "isolation": 0.10,
+            "sam": 0.10,
+        }
+        if not config.dinov3_enabled:
+            weights.pop("dino")
+        total_weight = sum(weights.values())
+        score = (
+            sum(weights[name] * _clamp_unit(components[name]) for name in weights)
+            / total_weight
+        )
+        scored.append((score, candidate))
+    return [
+        candidate
+        for _, candidate in sorted(
+            scored,
+            key=lambda item: (-item[0], item[1].frame_slot),
+        )[: config.top_k_for_vlm_judge]
+    ]
+
+
+def _normalized_siglip_scores(
+    candidates: list[CandidateWorkItem],
+) -> dict[int, float]:
+    aligned = [
+        candidate for candidate in candidates if candidate.alignment_metrics is not None
+    ]
+    raw_scores = [
+        (
+            candidate.alignment_metrics.alignment_margin
+            if candidate.alignment_metrics.alignment_margin is not None
+            else candidate.alignment_metrics.target_similarity
+        )
+        for candidate in aligned
+    ]
+    return dict(
+        zip(
+            [candidate.frame_slot for candidate in aligned],
+            _min_max([float(value) for value in raw_scores]),
+        )
+    )
+
+
+def _candidate_ranking_metadata(
+    items: list[CandidateWorkItem],
+    *,
+    qwen_reviews: dict[int, CandidateVisualReview] | None = None,
+) -> dict[str, object]:
+    qwen_reviews = qwen_reviews or {}
+    candidates = []
+    for item in items:
+        alignment = item.alignment_metrics
+        candidates.append(
+            {
+                "frame_slot": item.frame_slot,
+                "source_frame_index": int(item.record["source_frame_index"]),
+                "sam_confidence": item.sam_confidence,
+                "metrics": item.metrics.to_dict(),
+                "hard_rejection_reasons": item.hard_rejection_reasons,
+                "dino": (
+                    asdict(item.dino_metrics) if item.dino_metrics is not None else None
+                ),
+                "siglip": (
+                    {
+                        "target_similarity": alignment.target_similarity,
+                        "alignment_margin": alignment.alignment_margin,
+                        "best_matching_entity_id": item.best_matching_entity_id,
+                    }
+                    if alignment is not None
+                    else None
+                ),
+                "visual_review": (
+                    qwen_reviews[item.frame_slot].model_dump(mode="json")
+                    if item.frame_slot in qwen_reviews
+                    else None
+                ),
+            }
+        )
+    return {"candidates": candidates}
+
+
 def _save_reference(
     *,
     output_root: Path,
@@ -404,6 +680,7 @@ def _save_reference(
     frame_path: Path,
     mask: np.ndarray,
     selected: RankedCandidate,
+    dino_embedding: np.ndarray | None,
 ) -> dict[str, object]:
     frame_bgr = cv2.imread(str(frame_path))
     if frame_bgr is None:
@@ -431,10 +708,14 @@ def _save_reference(
     Image.fromarray(crop_rgb).save(destination / "canonical.jpg", quality=95)
     save_mask_png(destination / "mask.png", crop_mask)
     rgba = np.dstack((crop_rgb, crop_mask.astype(np.uint8) * 255))
-    Image.fromarray(rgba, mode="RGBA").save(destination / "foreground_rgba.png")
+    Image.fromarray(rgba).save(destination / "foreground_rgba.png")
     neutral = np.full_like(crop_rgb, 204)
     neutral[crop_mask] = crop_rgb[crop_mask]
     Image.fromarray(neutral).save(destination / "neutral_background.jpg", quality=95)
+    dino_embedding_path = None
+    if dino_embedding is not None:
+        dino_embedding_path = destination / "dinov3_embedding.npy"
+        save_selected_dinov3_embedding(dino_embedding_path, dino_embedding)
     metadata = {
         "clip_uid": clip_uid,
         "entity_id": entity_id,
@@ -444,11 +725,26 @@ def _save_reference(
         "sam_confidence": selected.sam_confidence,
         "metrics": selected.metrics.to_dict(),
         "visual_review": selected.visual_review.model_dump(mode="json"),
+        "dino": (
+            asdict(selected.dino_metrics) if selected.dino_metrics is not None else None
+        ),
+        "siglip": (
+            {
+                "target_similarity": selected.alignment_metrics.target_similarity,
+                "alignment_margin": selected.alignment_metrics.alignment_margin,
+                "best_matching_entity_id": selected.best_matching_entity_id,
+            }
+            if selected.alignment_metrics is not None
+            else None
+        ),
         "crop_xyxy": list(crop_box),
         "canonical_path": str(destination / "canonical.jpg"),
         "mask_path": str(destination / "mask.png"),
         "foreground_rgba_path": str(destination / "foreground_rgba.png"),
         "neutral_background_path": str(destination / "neutral_background.jpg"),
+        "dinov3_embedding_path": (
+            str(dino_embedding_path) if dino_embedding_path is not None else None
+        ),
     }
     return metadata
 
@@ -480,6 +776,8 @@ def rank_manifest_references(
     *,
     overwrite: bool = False,
     judge: QwenCandidateJudge | None = None,
+    dino_embedder: DinoV3Embedder | None = None,
+    siglip_aligner: Siglip2Aligner | None = None,
 ) -> RankingStats:
     output_root = config.ensure_output_root()
     annotation_manifest = output_root / "manifests" / "annotations.jsonl"
@@ -491,169 +789,432 @@ def rank_manifest_references(
         for artifact in (output_root / "references").glob("*/*/metadata.json"):
             artifact.unlink()
     qwen = judge or QwenCandidateJudge(config.qwen)
+    dino = dino_embedder
+    siglip = siglip_aligner
+    owns_dino = False
+    owns_siglip = False
+    dino_load_seconds = 0.0
+    siglip_load_seconds = 0.0
+    try:
+        if config.ranking.dinov3_enabled and dino is None:
+            started = time.perf_counter()
+            dino = DinoV3Embedder(config.ranking)
+            dino_load_seconds = time.perf_counter() - started
+            owns_dino = True
+        if config.ranking.siglip2_enabled and siglip is None:
+            started = time.perf_counter()
+            siglip = Siglip2Aligner(
+                config.ranking.siglip2_model_path,
+                config.ranking.siglip2_batch_size,
+            )
+            siglip_load_seconds = time.perf_counter() - started
+            owns_siglip = True
+    except Exception:
+        if owns_dino and dino is not None:
+            dino.close()
+        raise
+
     processed = skipped = no_valid = failed = 0
-    for payload in iter_source_records(annotation_manifest):
-        clip = str(payload["clip_uid"])
-        annotation = AnnotationResult.model_validate(
-            {
-                key: payload.get(key)
-                for key in (
-                    "caption",
-                    "prompt_with_refs",
-                    "entities",
-                    "relations",
-                    "background",
-                )
-            }
-        )
-        for entity in annotation.entities:
-            if not entity.reference_worthy:
-                continue
-            reference_dir = output_root / "references" / clip / entity.entity_id
-            if (reference_dir / "metadata.json").is_file() and not overwrite:
-                try:
-                    existing_metadata = json.loads(
-                        (reference_dir / "metadata.json").read_text(encoding="utf-8")
+    dino_inference_seconds = 0.0
+    siglip_inference_seconds = 0.0
+    before_models = after_dino = after_siglip = 0
+    try:
+        for payload in iter_source_records(annotation_manifest):
+            clip = str(payload["clip_uid"])
+            annotation = AnnotationResult.model_validate(
+                {
+                    key: payload.get(key)
+                    for key in (
+                        "caption",
+                        "prompt_with_refs",
+                        "entities",
+                        "relations",
+                        "background",
                     )
-                    if not isinstance(existing_metadata, dict):
-                        raise TypeError("reference metadata must be a JSON object")
-                    write_json_atomic(
-                        reference_dir / "metadata.json",
-                        _reference_record(existing_metadata, entity),
-                    )
-                    skipped += 1
-                except Exception as exc:  # noqa: BLE001 - continue with other entities
-                    _append_jsonl(
-                        output_root / "logs" / "ranking_failed.jsonl",
-                        {
-                            "clip_uid": clip,
-                            "entity_id": entity.entity_id,
-                            "error": str(exc),
-                        },
-                    )
-                    failed += 1
-                continue
-            candidate_dir = output_root / "candidates" / clip / entity.entity_id
-            try:
-                records, masks = _load_entity_candidates(candidate_dir)
-                if not masks:
-                    no_valid += 1
-                    continue
-                other_masks = _load_other_entity_masks(
-                    output_root=output_root,
-                    clip_uid=clip,
-                    current_entity_id=entity.entity_id,
-                    annotation=annotation,
-                )
-                areas = [float(mask.mean()) for mask in masks.values()]
-                area_median = float(np.median(areas))
-                metric_records: list[tuple[dict[str, object], CandidateMetrics]] = []
-                for record in records:
-                    slot = int(record["frame_slot"])
-                    if slot not in masks:
-                        continue
-                    frame = cv2.imread(
-                        str(output_root / "frames" / clip / f"frame_{slot:02d}.jpg")
-                    )
-                    if frame is None:
-                        raise RuntimeError("candidate frame is unreadable")
-                    metrics = calculate_candidate_metrics(
-                        frame=frame,
-                        mask=masks[slot],
-                        area_median=area_median,
-                        other_masks=other_masks.get(slot, []),
-                    )
-                    metric_records.append((record, metrics))
-                preliminary = sorted(
-                    metric_records,
-                    key=lambda item: (
-                        item[1].border_touch,
-                        -item[1].tenengrad_sharpness,
-                        -float(item[0]["sam_confidence"]),
-                    ),
-                )[: config.ranking.top_k_for_vlm_judge]
-                slots = [int(item[0]["frame_slot"]) for item in preliminary]
-                selected_dir = candidate_dir / "selected"
-                sheet = selected_dir / "top_candidates.jpg"
-                _top_candidate_sheet(
-                    frame_paths={
-                        slot: output_root / "frames" / clip / f"frame_{slot:02d}.jpg"
-                        for slot in slots
-                    },
-                    masks={slot: masks[slot] for slot in slots},
-                    candidates=preliminary,
-                    destination=sheet,
-                )
-                review_result = qwen.review(
-                    entity_id=entity.entity_id,
-                    entity_phrase=entity.phrase,
-                    contact_sheet=sheet,
-                    frame_slots=slots,
-                )
-                reviews = {
-                    review.frame_slot: review for review in review_result.candidates
                 }
-                ranked = rank_candidates(
-                    [
-                        (
-                            int(record["frame_slot"]),
-                            int(record["source_frame_index"]),
-                            float(record["sam_confidence"]),
-                            metrics,
-                            reviews.get(
-                                int(record["frame_slot"]),
-                                _default_review(record),
+            )
+            for entity in annotation.entities:
+                if not entity.reference_worthy:
+                    continue
+                reference_dir = output_root / "references" / clip / entity.entity_id
+                if (reference_dir / "metadata.json").is_file() and not overwrite:
+                    try:
+                        existing_metadata = json.loads(
+                            (reference_dir / "metadata.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        if not isinstance(existing_metadata, dict):
+                            raise TypeError("reference metadata must be a JSON object")
+                        write_json_atomic(
+                            reference_dir / "metadata.json",
+                            _reference_record(existing_metadata, entity),
+                        )
+                        skipped += 1
+                    except Exception as exc:  # noqa: BLE001
+                        _append_jsonl(
+                            output_root / "logs" / "ranking_failed.jsonl",
+                            {
+                                "clip_uid": clip,
+                                "entity_id": entity.entity_id,
+                                "error": str(exc),
+                            },
+                        )
+                        failed += 1
+                    continue
+                candidate_dir = output_root / "candidates" / clip / entity.entity_id
+                try:
+                    records, masks = _load_entity_candidates(candidate_dir)
+                    if not masks:
+                        no_valid += 1
+                        continue
+                    other_masks = _load_other_entity_masks(
+                        output_root=output_root,
+                        clip_uid=clip,
+                        current_entity_id=entity.entity_id,
+                        annotation=annotation,
+                    )
+                    areas = [float(mask.mean()) for mask in masks.values()]
+                    area_median = float(np.median(areas))
+                    items: list[CandidateWorkItem] = []
+                    for record in records:
+                        slot = int(record["frame_slot"])
+                        if slot not in masks:
+                            continue
+                        frame = cv2.imread(
+                            str(output_root / "frames" / clip / f"frame_{slot:02d}.jpg")
+                        )
+                        if frame is None:
+                            raise RuntimeError("candidate frame is unreadable")
+                        metrics = calculate_candidate_metrics(
+                            frame=frame,
+                            mask=masks[slot],
+                            area_median=area_median,
+                            other_masks=other_masks.get(slot, []),
+                        )
+                        crop_box = padded_crop_box(
+                            bbox_from_mask(masks[slot]),
+                            image_width=frame.shape[1],
+                            image_height=frame.shape[0],
+                        )
+                        items.append(
+                            CandidateWorkItem(
+                                record=record,
+                                metrics=metrics,
+                                neutral_crop=build_neutral_subject_crop(
+                                    frame,
+                                    masks[slot],
+                                    crop_box,
+                                ),
+                                hard_rejection_reasons=list(
+                                    basic_hard_rejection_reasons(
+                                        metrics=metrics,
+                                        sam_confidence=float(record["sam_confidence"]),
+                                        config=config.ranking,
+                                    )
+                                ),
+                            )
+                        )
+
+                    model_candidates = [
+                        item for item in items if not item.hard_rejection_reasons
+                    ]
+                    before_models += len(model_candidates)
+                    if not model_candidates:
+                        write_json_atomic(
+                            candidate_dir / "ranking_metadata.json",
+                            _candidate_ranking_metadata(items),
+                        )
+                        no_valid += 1
+                        continue
+
+                    if config.ranking.dinov3_enabled:
+                        if dino is None:
+                            raise RuntimeError("DINOv3 embedder was not initialized")
+                        started = time.perf_counter()
+                        embeddings = dino.encode(
+                            [item.neutral_crop for item in model_candidates]
+                        )
+                        dino_inference_seconds += time.perf_counter() - started
+                        if len(embeddings) != len(model_candidates):
+                            raise RuntimeError(
+                                "DINOv3 returned an unexpected embedding count"
+                            )
+                        save_dinov3_embeddings(
+                            candidate_dir / "dinov3_embeddings.npz",
+                            frame_slots=[item.frame_slot for item in model_candidates],
+                            embeddings=embeddings,
+                            model_name=config.ranking.dinov3_model_name,
+                        )
+                        normalized_sharpness = _min_max(
+                            [
+                                item.metrics.tenengrad_sharpness
+                                for item in model_candidates
+                            ]
+                        )
+                        temporal_metrics, _, warning = temporal_representation_metrics(
+                            frame_slots=[item.frame_slot for item in model_candidates],
+                            embeddings=embeddings,
+                            sam_confidences=[
+                                item.sam_confidence for item in model_candidates
+                            ],
+                            base_quality_scores=[
+                                0.6 * normalized_sharpness[index]
+                                + 0.4 * item.metrics.exposure_score
+                                for index, item in enumerate(model_candidates)
+                            ],
+                            threshold=(
+                                config.ranking.dinov3_cluster_similarity_threshold
                             ),
                         )
-                        for record, metrics in preliminary
-                    ],
-                    config=config.ranking,
-                )
-                valid = [item for item in ranked if not item.hard_rejection_reasons]
-                if not valid:
-                    no_valid += 1
-                    continue
-                selected = valid[0]
-                metadata = _save_reference(
-                    output_root=output_root,
-                    clip_uid=clip,
-                    entity_id=entity.entity_id,
-                    frame_path=(
-                        output_root
-                        / "frames"
-                        / clip
-                        / f"frame_{selected.frame_slot:02d}.jpg"
-                    ),
-                    mask=masks[selected.frame_slot],
-                    selected=selected,
-                )
-                reference_record = _reference_record(metadata, entity)
-                write_json_atomic(
-                    reference_dir / "metadata.json",
-                    reference_record,
-                )
-                selected_dir.mkdir(parents=True, exist_ok=True)
-                write_json_atomic(
-                    selected_dir / "selection.json",
-                    reference_record,
-                )
-                processed += 1
-            except Exception as exc:  # noqa: BLE001 - continue with other entities
-                failure: dict[str, object] = {
-                    "clip_uid": clip,
-                    "entity_id": entity.entity_id,
-                    "error": str(exc),
-                }
-                if isinstance(exc, StructuredOutputFailure):
-                    failure["structured_output"] = exc.to_dict()
-                _append_jsonl(
-                    output_root / "logs" / "ranking_failed.jsonl",
-                    failure,
-                )
-                failed += 1
+                        temporal_by_slot = {
+                            metric.frame_slot: metric for metric in temporal_metrics
+                        }
+                        for index, item in enumerate(model_candidates):
+                            item.dino_embedding = embeddings[index]
+                            item.dino_metrics = temporal_by_slot[item.frame_slot]
+                            if (
+                                warning is None
+                                and config.ranking.dinov3_exclude_cluster_outliers
+                                and not item.dino_metrics.dino_in_stable_cluster
+                            ):
+                                item.hard_rejection_reasons.append(
+                                    "dino_temporal_outlier"
+                                )
+                        if warning is not None:
+                            _append_jsonl(
+                                output_root / "logs" / "ranking_warnings.jsonl",
+                                {
+                                    "clip_uid": clip,
+                                    "entity_id": entity.entity_id,
+                                    "warning": warning,
+                                },
+                            )
+                    model_candidates = [
+                        item
+                        for item in model_candidates
+                        if not item.hard_rejection_reasons
+                    ]
+                    after_dino += len(model_candidates)
+                    if not model_candidates:
+                        write_json_atomic(
+                            candidate_dir / "ranking_metadata.json",
+                            _candidate_ranking_metadata(items),
+                        )
+                        no_valid += 1
+                        continue
+
+                    if config.ranking.siglip2_enabled:
+                        if siglip is None:
+                            raise RuntimeError("SigLIP 2 aligner was not initialized")
+                        distractors = [
+                            other
+                            for other in annotation.entities
+                            if other.entity_id != entity.entity_id
+                        ]
+                        distractor_texts = [
+                            other.grounding_prompt for other in distractors
+                        ]
+                        entity_id_by_text = {
+                            other.grounding_prompt: other.entity_id
+                            for other in distractors
+                        }
+                        started = time.perf_counter()
+                        alignment_results = siglip.score(
+                            [item.neutral_crop for item in model_candidates],
+                            entity.grounding_prompt,
+                            distractor_texts,
+                        )
+                        siglip_inference_seconds += time.perf_counter() - started
+                        if len(alignment_results) != len(model_candidates):
+                            raise RuntimeError(
+                                "SigLIP 2 returned an unexpected score count"
+                            )
+                        for item, alignment in zip(
+                            model_candidates,
+                            alignment_results,
+                        ):
+                            item.alignment_metrics = alignment
+                            item.best_matching_entity_id = (
+                                entity.entity_id
+                                if alignment.best_matching_text
+                                == entity.grounding_prompt
+                                else entity_id_by_text.get(alignment.best_matching_text)
+                            )
+                            if (
+                                config.ranking.siglip2_hard_reject_wrong_entity
+                                and is_siglip_wrong_entity(
+                                    alignment,
+                                    target_text=entity.grounding_prompt,
+                                )
+                            ):
+                                item.hard_rejection_reasons.append(
+                                    "siglip_wrong_entity"
+                                )
+                    model_candidates = [
+                        item
+                        for item in model_candidates
+                        if not item.hard_rejection_reasons
+                    ]
+                    after_siglip += len(model_candidates)
+                    if not model_candidates:
+                        write_json_atomic(
+                            candidate_dir / "ranking_metadata.json",
+                            _candidate_ranking_metadata(items),
+                        )
+                        no_valid += 1
+                        continue
+
+                    normalized_siglip_scores = _normalized_siglip_scores(
+                        model_candidates
+                    )
+                    preliminary = _preliminary_top_candidates(
+                        model_candidates,
+                        config=config.ranking,
+                    )
+                    slots = [item.frame_slot for item in preliminary]
+                    selected_dir = candidate_dir / "selected"
+                    sheet = selected_dir / "top_candidates.jpg"
+                    _top_candidate_sheet(
+                        frame_paths={
+                            slot: (
+                                output_root / "frames" / clip / f"frame_{slot:02d}.jpg"
+                            )
+                            for slot in slots
+                        },
+                        masks={slot: masks[slot] for slot in slots},
+                        candidates=[
+                            (item.record, item.metrics) for item in preliminary
+                        ],
+                        destination=sheet,
+                    )
+                    review_result = qwen.review(
+                        entity_id=entity.entity_id,
+                        entity_phrase=entity.phrase,
+                        contact_sheet=sheet,
+                        frame_slots=slots,
+                    )
+                    reviews = {
+                        review.frame_slot: review for review in review_result.candidates
+                    }
+                    ranked = rank_candidates(
+                        [
+                            (
+                                item.frame_slot,
+                                int(item.record["source_frame_index"]),
+                                item.sam_confidence,
+                                item.metrics,
+                                reviews.get(
+                                    item.frame_slot,
+                                    _default_review(item.record),
+                                ),
+                            )
+                            for item in preliminary
+                        ],
+                        config=config.ranking,
+                        dino_metrics_by_slot={
+                            item.frame_slot: item.dino_metrics
+                            for item in preliminary
+                            if item.dino_metrics is not None
+                        },
+                        alignment_metrics_by_slot={
+                            item.frame_slot: item.alignment_metrics
+                            for item in preliminary
+                            if item.alignment_metrics is not None
+                        },
+                        normalized_siglip_scores_by_slot={
+                            item.frame_slot: normalized_siglip_scores[item.frame_slot]
+                            for item in preliminary
+                            if item.frame_slot in normalized_siglip_scores
+                        },
+                        best_matching_entity_ids={
+                            item.frame_slot: item.best_matching_entity_id
+                            for item in preliminary
+                            if item.best_matching_entity_id is not None
+                        },
+                    )
+                    ranked_by_slot = {
+                        candidate.frame_slot: candidate for candidate in ranked
+                    }
+                    for item in preliminary:
+                        item.hard_rejection_reasons = list(
+                            ranked_by_slot[item.frame_slot].hard_rejection_reasons
+                        )
+                    write_json_atomic(
+                        candidate_dir / "ranking_metadata.json",
+                        _candidate_ranking_metadata(
+                            items,
+                            qwen_reviews=reviews,
+                        ),
+                    )
+                    valid = [item for item in ranked if not item.hard_rejection_reasons]
+                    if not valid:
+                        no_valid += 1
+                        continue
+                    selected = valid[0]
+                    selected_work_item = next(
+                        item
+                        for item in preliminary
+                        if item.frame_slot == selected.frame_slot
+                    )
+                    metadata = _save_reference(
+                        output_root=output_root,
+                        clip_uid=clip,
+                        entity_id=entity.entity_id,
+                        frame_path=(
+                            output_root
+                            / "frames"
+                            / clip
+                            / f"frame_{selected.frame_slot:02d}.jpg"
+                        ),
+                        mask=masks[selected.frame_slot],
+                        selected=selected,
+                        dino_embedding=selected_work_item.dino_embedding,
+                    )
+                    reference_record = _reference_record(metadata, entity)
+                    write_json_atomic(
+                        reference_dir / "metadata.json",
+                        reference_record,
+                    )
+                    selected_dir.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(
+                        selected_dir / "selection.json",
+                        reference_record,
+                    )
+                    processed += 1
+                except Exception as exc:  # noqa: BLE001
+                    failure: dict[str, object] = {
+                        "clip_uid": clip,
+                        "entity_id": entity.entity_id,
+                        "error": str(exc),
+                    }
+                    if isinstance(exc, StructuredOutputFailure):
+                        failure["structured_output"] = exc.to_dict()
+                    _append_jsonl(
+                        output_root / "logs" / "ranking_failed.jsonl",
+                        failure,
+                    )
+                    failed += 1
+    finally:
+        if owns_siglip and siglip is not None:
+            siglip.close()
+        if owns_dino and dino is not None:
+            dino.close()
     reconcile_references(output_root)
-    return RankingStats(processed, skipped, no_valid, failed)
+    return RankingStats(
+        processed=processed,
+        skipped_existing=skipped,
+        no_valid_candidate=no_valid,
+        failed=failed,
+        dino_load_seconds=dino_load_seconds,
+        dino_inference_seconds=dino_inference_seconds,
+        siglip_load_seconds=siglip_load_seconds,
+        siglip_inference_seconds=siglip_inference_seconds,
+        candidate_count_before_models=before_models,
+        candidate_count_after_dino=after_dino,
+        candidate_count_after_siglip=after_siglip,
+    )
 
 
-def stats_dict(stats: RankingStats) -> dict[str, int]:
+def stats_dict(stats: RankingStats) -> dict[str, int | float]:
     return asdict(stats)

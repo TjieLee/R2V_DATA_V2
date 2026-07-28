@@ -189,7 +189,11 @@ class DinoV3Embedder:
         self._layout = ""
         self._device = ""
         self._closed = False
-        self._load()
+        try:
+            self._load()
+        except Exception:
+            self.close()
+            raise
 
     def _load(self) -> None:
         model_path = self.config.dinov3_model_path
