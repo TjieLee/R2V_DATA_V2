@@ -353,16 +353,39 @@ def test_disabled_model_weights_are_removed_and_renormalized() -> None:
 
     crop_score = 1.0 - abs(0.7 - 0.55) / 0.55
     expected = (
-        0.18 * 0.9
-        + 0.15 * 0.9
+        0.17 * 0.9
+        + 0.14 * 0.9
         + 0.08 * 0.9
-        + 0.06 * 0.9
+        + 0.05 * 0.9
         + 0.06 * (0.6 * 0.5 + 0.4 * 0.9)
-        + 0.05 * 1.0
+        + 0.04 * 0.8
+        + 0.04 * 0.9
+        + 0.04 * 1.0
         + 0.03 * crop_score
         + 0.02 * 0.8
-    ) / 0.63
+    ) / 0.67
     assert ranked[0].ranking_score == pytest.approx(expected)
+
+
+def test_visual_quality_and_inverse_occlusion_affect_final_score() -> None:
+    metrics = _metrics(border_touch=False, sharpness=10)
+    low_quality = _review(0).model_copy(
+        update={"visual_quality": 0.2, "occlusion": 0.4}
+    )
+    high_quality = _review(1).model_copy(
+        update={"visual_quality": 0.9, "occlusion": 0.1}
+    )
+
+    ranked = rank_candidates(
+        [
+            (0, 10, 0.8, metrics, low_quality),
+            (1, 20, 0.8, metrics, high_quality),
+        ],
+        config=RankingConfig(dinov3_enabled=False, siglip2_enabled=False),
+    )
+
+    assert ranked[0].frame_slot == 1
+    assert ranked[0].ranking_score > ranked[1].ranking_score
 
 
 class _FakeDinoEmbedder:
@@ -412,9 +435,11 @@ class _FakeCandidateJudge:
     ) -> CandidateJudgeResult:
         del entity_phrase
         assert contact_sheet.is_file()
+        reviews = [_review(slot) for slot in frame_slots]
+        reviews[-1] = reviews[-1].model_copy(update={"completeness": 0.2})
         return CandidateJudgeResult(
             entity_id=entity_id,
-            candidates=[_review(slot) for slot in frame_slots],
+            candidates=reviews,
             best_frame_slot=frame_slots[-1],
         )
 
@@ -625,11 +650,14 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
             output_root / "candidates" / "clip_1" / "e1" / "ranking_metadata.json"
         ).read_text(encoding="utf-8")
     )
-    assert metadata["candidates"][2]["hard_rejection_reasons"] == []
+    assert metadata["candidates"][2]["hard_rejection_reasons"] == ["incomplete"]
     assert not metadata["candidates"][2]["dino"]["dino_in_stable_cluster"]
     assert metadata["dino_medoid_slot"] == 0
+    assert metadata["qwen_suggested_best_frame_slot"] == 2
     assert metadata["candidates"][0]["siglip"]["best_matching_entity_id"] == "e1"
     reference_metadata = json.loads(
         (reference_dir / "metadata.json").read_text(encoding="utf-8")
     )
     assert reference_metadata["dino_medoid_slot"] == 0
+    assert reference_metadata["qwen_suggested_best_frame_slot"] == 2
+    assert reference_metadata["frame_slot"] != 2

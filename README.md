@@ -190,7 +190,10 @@ Stage 04 also stores per-candidate ranking metadata and float16 DINOv3
 embeddings. The selected reference keeps `dinov3_embedding.npy` for downstream
 reuse. DINOv3 and SigLIP 2 can each be disabled; their score weight is then
 removed and the remaining weights are normalized. Q-Align is not part of this
-pilot.
+pilot. Qwen completeness, recognizability, mask quality, visual quality, and
+inverse occlusion all contribute to the code-owned final score.
+`qwen_suggested_best_frame_slot` is retained only as a diagnostic and never
+overrides hard gates or the final weighted ordering.
 
 Cross-pair search is limited to the same `parent_video_id` and a different
 complete numeric `clip_suffix`. It uses cached selected-reference DINOv3

@@ -256,19 +256,23 @@ def rank_candidates(
                 0.6 * normalized_sharpness_by_slot[frame_slot]
                 + 0.4 * metrics.exposure_score
             ),
+            "visual_quality": visual_review.visual_quality,
+            "occlusion": 1.0 - visual_review.occlusion,
             "isolation": _isolation_score(metrics),
             "crop": _crop_subject_ratio_score(metrics),
             "sam": sam_confidence,
         }
         weights = {
-            "dino": 0.25,
-            "completeness": 0.18,
-            "recognizability": 0.15,
-            "siglip": 0.12,
+            "dino": 0.23,
+            "completeness": 0.17,
+            "recognizability": 0.14,
+            "siglip": 0.10,
             "mask_quality": 0.08,
-            "mask_area_continuity": 0.06,
+            "mask_area_continuity": 0.05,
             "quality": 0.06,
-            "isolation": 0.05,
+            "visual_quality": 0.04,
+            "occlusion": 0.04,
+            "isolation": 0.04,
             "crop": 0.03,
             "sam": 0.02,
         }
@@ -660,6 +664,7 @@ def _candidate_ranking_metadata(
     *,
     qwen_reviews: dict[int, CandidateVisualReview] | None = None,
     dino_medoid_slot: int | None = None,
+    qwen_suggested_best_frame_slot: int | None = None,
 ) -> dict[str, object]:
     qwen_reviews = qwen_reviews or {}
     candidates = []
@@ -693,6 +698,7 @@ def _candidate_ranking_metadata(
         )
     return {
         "dino_medoid_slot": dino_medoid_slot,
+        "qwen_suggested_best_frame_slot": qwen_suggested_best_frame_slot,
         "candidates": candidates,
     }
 
@@ -707,6 +713,7 @@ def _save_reference(
     selected: RankedCandidate,
     dino_embedding: np.ndarray | None,
     dino_medoid_slot: int | None,
+    qwen_suggested_best_frame_slot: int,
 ) -> dict[str, object]:
     frame_bgr = cv2.imread(str(frame_path))
     if frame_bgr is None:
@@ -755,6 +762,7 @@ def _save_reference(
             asdict(selected.dino_metrics) if selected.dino_metrics is not None else None
         ),
         "dino_medoid_slot": dino_medoid_slot,
+        "qwen_suggested_best_frame_slot": qwen_suggested_best_frame_slot,
         "siglip": (
             {
                 "target_similarity": selected.alignment_metrics.target_similarity,
@@ -1186,6 +1194,9 @@ def rank_manifest_references(
                             items,
                             qwen_reviews=reviews,
                             dino_medoid_slot=dino_medoid_slot,
+                            qwen_suggested_best_frame_slot=(
+                                review_result.best_frame_slot
+                            ),
                         ),
                     )
                     valid = [item for item in ranked if not item.hard_rejection_reasons]
@@ -1212,6 +1223,7 @@ def rank_manifest_references(
                         selected=selected,
                         dino_embedding=selected_work_item.dino_embedding,
                         dino_medoid_slot=dino_medoid_slot,
+                        qwen_suggested_best_frame_slot=(review_result.best_frame_slot),
                     )
                     reference_record = _reference_record(metadata, entity)
                     write_json_atomic(
