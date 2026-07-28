@@ -1,0 +1,45 @@
+dataset_json: /mnt/workspace/public/dataset/jea-video/zicai_5th_moive/train_zicai_5th_moive.json
+output_root: /mnt/workspace/litengjie/data/r2v_data_v2
+
+qwen:
+  base_url: http://localhost:8000/v1
+  api_key: EMPTY
+  model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+  temperature: 0.0
+  max_tokens: 2048
+  timeout_seconds: 3600
+  repair_retries: 1
+
+frames:
+  count: 8
+  jpeg_quality: 92
+  max_side: 1280
+
+sam3:
+  code_root: /mnt/workspace/litengjie/data/vendor/sam3
+  checkpoint: null
+  minimum_confidence: 0.55
+  minimum_visible_frames: 2
+
+ranking:
+  minimum_effective_short_side: 128
+  minimum_mask_area_ratio: 0.005
+  maximum_mask_area_ratio: 0.75
+  reject_border_touch: true
+  top_k_for_vlm_judge: 3
+  save_top_k_mask_rle: 5
+
+pairing:
+  enable_in_pair: true
+  enable_same_parent_cross_pair: true
+  cross_pair_minimum_confidence: 0.90
+  cross_pair_fallback_to_in_pair: true
+  maximum_candidates_per_entity: 10
+
+augmentation:
+  enabled: false
+  save_rgba: true
+  save_neutral_background: true
+  generated_background_count: 0
+  viewpoint_count: 0
+
