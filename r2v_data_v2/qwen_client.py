@@ -220,6 +220,9 @@ def annotate_manifest(
             **result.model_dump(mode="json"),
             "clip_uid": clip,
             "video_path": source["video_path"],
+            "parent_video_id": source["parent_video_id"],
+            "clip_suffix": source["clip_suffix"],
+            "clip_order": source["clip_order"],
             "warnings": warnings,
         }
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -228,6 +231,9 @@ def annotate_manifest(
             {
                 "clip_uid": clip,
                 "video_path": source["video_path"],
+                "parent_video_id": source["parent_video_id"],
+                "clip_suffix": source["clip_suffix"],
+                "clip_order": source["clip_order"],
                 "annotation_path": str(destination),
                 **result.model_dump(mode="json"),
                 "warnings": warnings,

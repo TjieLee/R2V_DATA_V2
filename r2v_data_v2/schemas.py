@@ -65,3 +65,12 @@ class CandidateJudgeResult(SchemaModel):
     entity_id: str
     candidates: list[CandidateVisualReview]
     best_frame_slot: int
+
+
+class CrossPairJudgeResult(SchemaModel):
+    same_exact_instance: Literal["yes", "no", "uncertain"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    context_difference: Literal["small", "moderate", "large"]
+    near_duplicate: bool
+    conflicting_attributes: list[str] = Field(default_factory=list)
+    reason: str

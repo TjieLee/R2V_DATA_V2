@@ -483,6 +483,9 @@ def rank_manifest_references(
                         "canonical_label": entity.canonical_label,
                         "category": entity.category,
                         "ref_token": entity.ref_token,
+                        "genericity": entity.genericity,
+                        "name_evidence": entity.name_evidence,
+                        "separability": entity.separability,
                     },
                 )
                 processed += 1

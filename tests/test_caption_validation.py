@@ -86,6 +86,14 @@ def test_named_identity_requires_explicit_evidence() -> None:
     assert "e1 named identity has no explicit evidence" in errors
 
 
+def test_attached_accessory_cannot_keep_independent_ref_token() -> None:
+    payload = deepcopy(_valid_payload())
+    entity = payload["entities"][0]  # type: ignore[index]
+    entity["separability"] = "attached_accessory"  # type: ignore[index]
+    errors = validate_annotation(AnnotationResult.model_validate(payload))
+    assert "e1 attached accessory must not have a ref token" in errors
+
+
 def test_four_icl_examples_have_complete_valid_json() -> None:
     assert len(ICL_EXAMPLES) == 4
     for example in ICL_EXAMPLES:

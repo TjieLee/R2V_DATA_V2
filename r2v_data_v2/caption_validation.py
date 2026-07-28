@@ -101,6 +101,16 @@ def validate_annotation(result: AnnotationResult) -> list[str]:
                 )
         if entity.genericity == "named" and entity.name_evidence == "none":
             errors.append(f"{entity.entity_id} named identity has no explicit evidence")
+        if entity.separability == "attached_accessory" and entity.reference_worthy:
+            errors.append(
+                f"{entity.entity_id} attached accessory must not have a ref token"
+            )
+        if (
+            entity.separability == "composite_candidate"
+            and entity.reference_worthy
+            and (entity.ref_token or "").startswith("<ref_group_") is False
+        ):
+            errors.append(f"{entity.entity_id} composite reference must use ref_group")
 
     if result.background:
         background = result.background
