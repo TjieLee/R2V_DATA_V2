@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 import r2v_data_v2.config as config_module
-from r2v_data_v2.config import PipelineConfig, QwenConfig, RankingConfig
+from r2v_data_v2.config import (
+    PipelineConfig,
+    QwenConfig,
+    RankingConfig,
+    load_config,
+)
 
 
 def test_output_and_dataset_must_stay_inside_allowed_roots(
@@ -85,6 +90,7 @@ def test_dinov3_paths_must_use_allowed_model_roots(tmp_path: Path) -> None:
         PipelineConfig(
             **common,
             ranking=RankingConfig(
+                dinov3_enabled=True,
                 dinov3_repo_dir=config_module.ALLOWED_PRETRAINED_ROOT / "dinov3",
                 dinov3_model_path=tmp_path / "unapproved" / "model.pth",
             ),
@@ -98,7 +104,110 @@ def test_siglip2_path_must_use_allowed_model_roots(tmp_path: Path) -> None:
             output_root=tmp_path / "output",
             qwen=QwenConfig(model="served-model-name"),
             ranking=RankingConfig(
-                dinov3_repo_dir=config_module.ALLOWED_PRETRAINED_ROOT / "dinov3",
+                siglip2_enabled=True,
                 siglip2_model_path=tmp_path / "unapproved" / "siglip2",
             ),
         ).validate_paths()
+
+
+def _write_visual_model_config(
+    tmp_path: Path,
+    *,
+    ranking_yaml: str,
+) -> Path:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"dataset_json: {tmp_path / 'source.jsonl'}\n"
+        f"output_root: {tmp_path / 'output'}\n"
+        "qwen:\n"
+        "  model: served-model-name\n"
+        "ranking:\n"
+        f"{ranking_yaml}",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_enabled_dinov3_requires_explicit_model_path(tmp_path: Path) -> None:
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml="  dinov3_enabled: true\n  dinov3_model_path: null\n",
+    )
+
+    with pytest.raises(ValueError, match="dinov3_model_path is required"):
+        load_config(config_path)
+
+
+def test_enabled_dinov3_rejects_missing_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = (tmp_path / "models").resolve()
+    monkeypatch.setattr(config_module, "ALLOWED_USER_MODEL_ROOT", model_root)
+    missing = model_root / "missing.pth"
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml=(f"  dinov3_enabled: true\n  dinov3_model_path: {missing}\n"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="model path does not exist"):
+        load_config(config_path)
+
+
+def test_enabled_dinov3_accepts_complete_local_hf_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = (tmp_path / "models").resolve()
+    monkeypatch.setattr(config_module, "ALLOWED_USER_MODEL_ROOT", model_root)
+    model_path = model_root / "dinov3-hf"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    (model_path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml=(f"  dinov3_enabled: true\n  dinov3_model_path: {model_path}\n"),
+    )
+
+    assert load_config(config_path).ranking.dinov3_model_path == model_path
+
+
+def test_enabled_dinov3_accepts_local_torch_hub_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = (tmp_path / "models").resolve()
+    monkeypatch.setattr(config_module, "ALLOWED_USER_MODEL_ROOT", model_root)
+    repo = model_root / "dinov3"
+    repo.mkdir(parents=True)
+    (repo / "hubconf.py").write_text("", encoding="utf-8")
+    checkpoint = model_root / "dinov3_vits16.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml=(
+            "  dinov3_enabled: true\n"
+            f"  dinov3_repo_dir: {repo}\n"
+            f"  dinov3_model_path: {checkpoint}\n"
+        ),
+    )
+
+    loaded = load_config(config_path)
+    assert loaded.ranking.dinov3_model_path == checkpoint
+    assert loaded.ranking.dinov3_repo_dir == repo
+
+
+def test_enabled_siglip2_rejects_missing_local_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = (tmp_path / "models").resolve()
+    monkeypatch.setattr(config_module, "ALLOWED_USER_MODEL_ROOT", model_root)
+    missing = model_root / "missing-siglip2"
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml=(f"  siglip2_enabled: true\n  siglip2_model_path: {missing}\n"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="model directory does not exist"):
+        load_config(config_path)

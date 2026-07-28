@@ -62,8 +62,10 @@ Required server inputs:
 - `qwen.model`: the actual video-capable model served at that endpoint;
 - `sam3.code_root`: the installed SAM3 checkout;
 - `sam3.checkpoint`: an explicit local checkpoint path;
-- `ranking.dinov3_model_path`: a verified local DINOv3 checkpoint or HF directory;
-- `ranking.siglip2_model_path`: the explicitly downloaded local SigLIP 2 directory;
+- `ranking.dinov3_model_path`: required when DINOv3 is enabled; use a verified
+  local checkpoint or complete HF directory;
+- `ranking.siglip2_model_path`: required when SigLIP 2 is enabled; use the
+  explicitly downloaded local directory;
 - `output_root`: a directory below `/mnt/workspace/litengjie/data/`.
 
 The Qwen service launch command depends on the model and vLLM version installed
@@ -95,6 +97,20 @@ find /mnt/workspace/public/pretrained/dinov3 \
   -maxdepth 4 -type f \
   \( -name "*.pth" -o -name "*.pt" -o -name "*.safetensors" -o -name "config.json" \) \
   | sort | head -100
+```
+
+The repository default disables both optional visual models. A server pilot
+must enable them explicitly with real local paths:
+
+```yaml
+ranking:
+  dinov3_enabled: true
+  dinov3_repo_dir: /mnt/workspace/public/pretrained/dinov3
+  dinov3_model_path: /mnt/workspace/public/pretrained/dinov3/<actual_checkpoint>
+  dinov3_model_name: dinov3_vits16
+
+  siglip2_enabled: true
+  siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
 ```
 
 SigLIP 2 is also local-only at runtime. Download it explicitly into the

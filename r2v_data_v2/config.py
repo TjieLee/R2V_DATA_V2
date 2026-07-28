@@ -54,14 +54,14 @@ class RankingConfig:
     minimum_crop_subject_ratio: float = 0.08
     maximum_crop_subject_ratio: float = 0.92
     maximum_other_mask_overlap: float = 0.50
-    dinov3_enabled: bool = True
+    dinov3_enabled: bool = False
     dinov3_repo_dir: Path = Path("/mnt/workspace/public/pretrained/dinov3")
     dinov3_model_path: Path | None = None
     dinov3_model_name: str = "dinov3_vits16"
     dinov3_batch_size: int = 16
     dinov3_cluster_similarity_threshold: float = 0.70
     dinov3_exclude_cluster_outliers: bool = True
-    siglip2_enabled: bool = True
+    siglip2_enabled: bool = False
     siglip2_model_path: Path = Path(
         "/mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex"
     )
@@ -111,16 +111,19 @@ class PipelineConfig:
                 raise ValueError(
                     "local qwen.model must be inside /mnt/workspace/public/pretrained"
                 )
-        ranking_model_paths = [
-            ("ranking.dinov3_repo_dir", self.ranking.dinov3_repo_dir),
-        ]
-        if self.ranking.dinov3_model_path is not None:
+        ranking_model_paths = []
+        if self.ranking.dinov3_enabled:
+            ranking_model_paths.append(
+                ("ranking.dinov3_repo_dir", self.ranking.dinov3_repo_dir)
+            )
+        if self.ranking.dinov3_enabled and self.ranking.dinov3_model_path is not None:
             ranking_model_paths.append(
                 ("ranking.dinov3_model_path", self.ranking.dinov3_model_path)
             )
-        ranking_model_paths.append(
-            ("ranking.siglip2_model_path", self.ranking.siglip2_model_path)
-        )
+        if self.ranking.siglip2_enabled:
+            ranking_model_paths.append(
+                ("ranking.siglip2_model_path", self.ranking.siglip2_model_path)
+            )
         for field_name, ranking_model_path in ranking_model_paths:
             resolved = ranking_model_path.expanduser().resolve(strict=False)
             if not (
@@ -228,6 +231,46 @@ def _validate_config(config: PipelineConfig) -> None:
         )
     if config.ranking.siglip2_batch_size < 1:
         raise ValueError("ranking.siglip2_batch_size must be positive")
+    if config.ranking.dinov3_enabled:
+        model_path = config.ranking.dinov3_model_path
+        if model_path is None:
+            raise ValueError(
+                "ranking.dinov3_model_path is required when DINOv3 is enabled"
+            )
+        resolved_model = model_path.expanduser().resolve(strict=False)
+        resolved_repo = config.ranking.dinov3_repo_dir.expanduser().resolve(
+            strict=False
+        )
+        if not resolved_model.exists():
+            raise FileNotFoundError(
+                f"DINOv3 model path does not exist: {resolved_model}"
+            )
+        if resolved_model.is_dir():
+            missing_hf_files = [
+                filename
+                for filename in ("config.json", "preprocessor_config.json")
+                if not (resolved_model / filename).is_file()
+            ]
+            if missing_hf_files:
+                raise FileNotFoundError(
+                    "DINOv3 Hugging Face model directory is incomplete: "
+                    f"{resolved_model}; missing {', '.join(missing_hf_files)}"
+                )
+        elif not (resolved_repo / "hubconf.py").is_file():
+            raise FileNotFoundError(
+                "DINOv3 Torch Hub repository is incomplete: "
+                f"{resolved_repo}; missing hubconf.py"
+            )
+    if (
+        config.ranking.siglip2_enabled
+        and not config.ranking.siglip2_model_path.expanduser()
+        .resolve(strict=False)
+        .is_dir()
+    ):
+        raise FileNotFoundError(
+            "SigLIP 2 model directory does not exist: "
+            f"{config.ranking.siglip2_model_path.expanduser().resolve(strict=False)}"
+        )
 
 
 def config_to_dict(config: PipelineConfig) -> dict[str, Any]:

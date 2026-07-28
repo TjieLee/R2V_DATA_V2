@@ -32,14 +32,14 @@ ranking:
   minimum_crop_subject_ratio: 0.08
   maximum_crop_subject_ratio: 0.92
   maximum_other_mask_overlap: 0.50
-  dinov3_enabled: true
+  dinov3_enabled: false
   dinov3_repo_dir: /mnt/workspace/public/pretrained/dinov3
   dinov3_model_path: null
   dinov3_model_name: dinov3_vits16
   dinov3_batch_size: 16
   dinov3_cluster_similarity_threshold: 0.70
   dinov3_exclude_cluster_outliers: true
-  siglip2_enabled: true
+  siglip2_enabled: false
   siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
   siglip2_batch_size: 8
   siglip2_hard_reject_wrong_entity: true

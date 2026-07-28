@@ -468,7 +468,9 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
             output_root=output_root,
             qwen=QwenConfig(model="served-model-name"),
             ranking=RankingConfig(
+                dinov3_enabled=True,
                 dinov3_cluster_similarity_threshold=0.7,
+                siglip2_enabled=True,
             ),
         ),
         judge=_FakeCandidateJudge(),
