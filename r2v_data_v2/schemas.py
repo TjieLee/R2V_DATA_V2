@@ -48,3 +48,20 @@ class AnnotationResult(SchemaModel):
     entities: list[AnnotationEntity]
     relations: list[EntityRelation] = Field(default_factory=list)
     background: Optional[BackgroundAnnotation] = None
+
+
+class CandidateVisualReview(SchemaModel):
+    frame_slot: int
+    completeness: float = Field(ge=0.0, le=1.0)
+    recognizability: float = Field(ge=0.0, le=1.0)
+    occlusion: float = Field(ge=0.0, le=1.0)
+    mask_quality: float = Field(ge=0.0, le=1.0)
+    visual_quality: float = Field(ge=0.0, le=1.0)
+    identity_features_visible: bool
+    rejection_reasons: list[str] = Field(default_factory=list)
+
+
+class CandidateJudgeResult(SchemaModel):
+    entity_id: str
+    candidates: list[CandidateVisualReview]
+    best_frame_slot: int
