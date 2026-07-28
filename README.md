@@ -176,9 +176,12 @@ removed and the remaining weights are normalized. Q-Align is not part of this
 pilot.
 
 Cross-pair search is limited to the same `parent_video_id` and a different
-complete numeric `clip_suffix`. Category/name evidence is checked before Qwen
-dual-image exact-instance review. Uncertain, near-duplicate, conflicting, or
-low-confidence candidates fall back to in-pair.
+complete numeric `clip_suffix`. It uses cached selected-reference DINOv3
+embeddings for Top-10 coarse retrieval and falls back to color histograms when
+either embedding is unavailable. Category/name evidence is checked before Qwen
+dual-image exact-instance review. DINOv3 never decides identity: uncertain,
+near-duplicate, conflicting, or low-confidence Qwen decisions fall back to
+in-pair.
 
 ## Augmentation
 
@@ -188,7 +191,9 @@ for a later server integration. Generated variants are accepted only when the
 foreground core remains nearly unchanged and the supplied identity validator
 passes after restoration; otherwise they are deleted while canonical references
 remain intact. Each accepted sidecar records core similarity both before and
-after original foreground pixels are restored.
+after original foreground pixels are restored. When DINOv3 is enabled, the
+sidecar also records neutral-crop canonical-to-augmented cosine similarity as a
+diagnostic; it is not a hard rejection threshold.
 
 ## Validate
 

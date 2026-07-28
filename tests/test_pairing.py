@@ -5,12 +5,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
+import r2v_data_v2.pairing as pairing_module
 from r2v_data_v2.config import PairingConfig, PipelineConfig
 from r2v_data_v2.pairing import (
     build_cross_pair_index,
     build_pairs,
     choose_cross_pair,
+    cross_pair_coarse_similarity,
     cross_pair_passes,
     indexed_cross_pair_candidates,
     is_same_parent_cross_candidate,
@@ -54,6 +57,7 @@ class _FakeJudge:
     def __init__(self, result: CrossPairJudgeResult) -> None:
         self.result = result
         self.calls = 0
+        self.seen_clip_uids: list[str] = []
 
     def judge(
         self,
@@ -61,8 +65,9 @@ class _FakeJudge:
         target: dict[str, object],
         candidate: dict[str, object],
     ) -> CrossPairJudgeResult:
-        del target, candidate
+        del target
         self.calls += 1
+        self.seen_clip_uids.append(str(candidate["clip_uid"]))
         return self.result
 
 
@@ -237,6 +242,115 @@ def test_verified_cross_pair_is_selected(tmp_path: Path) -> None:
 
     assert selected is not None
     assert selected[0]["clip_uid"] == "sibling"
+    assert judge.calls == 1
+
+
+def test_cross_pair_prefers_cached_dino_embedding_for_top_k(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _reference(
+        tmp_path,
+        clip_uid="target",
+        parent="movie",
+        suffix="11_0",
+    )
+    far = _reference(
+        tmp_path,
+        clip_uid="far",
+        parent="movie",
+        suffix="12_0",
+    )
+    close = _reference(
+        tmp_path,
+        clip_uid="close",
+        parent="movie",
+        suffix="13_0",
+    )
+    for reference, embedding in (
+        (target, [1.0, 0.0]),
+        (far, [0.0, 1.0]),
+        (close, [1.0, 0.0]),
+    ):
+        path = tmp_path / f"{reference['clip_uid']}.npy"
+        np.save(path, np.asarray(embedding, dtype=np.float16))
+        reference["dinov3_embedding_path"] = str(path)
+    monkeypatch.setattr(
+        pairing_module,
+        "visual_histogram_similarity",
+        lambda *_: (_ for _ in ()).throw(
+            AssertionError("histogram fallback must not run")
+        ),
+    )
+    judge = _FakeJudge(_judgment())
+
+    selected = choose_cross_pair(
+        target=target,
+        candidates=[far, close],
+        config=PairingConfig(maximum_candidates_per_entity=1),
+        judge=judge,  # type: ignore[arg-type]
+    )
+
+    assert selected is not None
+    assert selected[0]["clip_uid"] == "close"
+    assert selected[2] == pytest.approx(1.0)
+    assert judge.seen_clip_uids == ["close"]
+
+
+def test_cross_pair_falls_back_to_histogram_when_embedding_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _reference(
+        tmp_path,
+        clip_uid="target",
+        parent="movie",
+        suffix="11_0",
+    )
+    candidate = _reference(
+        tmp_path,
+        clip_uid="candidate",
+        parent="movie",
+        suffix="12_0",
+    )
+    monkeypatch.setattr(
+        pairing_module,
+        "visual_histogram_similarity",
+        lambda *_: 0.42,
+    )
+
+    assert cross_pair_coarse_similarity(target, candidate) == 0.42
+
+
+def test_high_dino_similarity_does_not_bypass_qwen_identity_judgment(
+    tmp_path: Path,
+) -> None:
+    target = _reference(
+        tmp_path,
+        clip_uid="target",
+        parent="movie",
+        suffix="11_0",
+    )
+    candidate = _reference(
+        tmp_path,
+        clip_uid="candidate",
+        parent="movie",
+        suffix="12_0",
+    )
+    for reference in (target, candidate):
+        path = tmp_path / f"{reference['clip_uid']}.npy"
+        np.save(path, np.asarray([1.0, 0.0], dtype=np.float16))
+        reference["dinov3_embedding_path"] = str(path)
+    judge = _FakeJudge(_judgment(same="no"))
+
+    selected = choose_cross_pair(
+        target=target,
+        candidates=[candidate],
+        config=PairingConfig(),
+        judge=judge,  # type: ignore[arg-type]
+    )
+
+    assert selected is None
     assert judge.calls == 1
 
 

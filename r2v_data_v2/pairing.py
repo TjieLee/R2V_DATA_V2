@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 from openai import BadRequestError, OpenAI
 
 from prompts.qwen_cross_pair_prompt import CROSS_PAIR_PROMPT
@@ -21,6 +22,10 @@ from r2v_data_v2.schemas import AnnotationResult, CrossPairJudgeResult
 from r2v_data_v2.structured_output import (
     StructuredOutputFailure,
     request_structured_output,
+)
+from r2v_data_v2.visual_embedding import (
+    embedding_cosine_similarity,
+    load_selected_dinov3_embedding,
 )
 
 
@@ -123,6 +128,44 @@ def visual_histogram_similarity(left_path: str | Path, right_path: str | Path) -
     cv2.normalize(right_hist, right_hist)
     correlation = float(cv2.compareHist(left_hist, right_hist, cv2.HISTCMP_CORREL))
     return max(0.0, min(1.0, (correlation + 1.0) / 2.0))
+
+
+def _reference_dino_embedding(
+    reference: dict[str, Any],
+) -> np.ndarray | None:
+    configured = reference.get("dinov3_embedding_path")
+    path = (
+        Path(configured)
+        if isinstance(configured, str) and configured
+        else Path(str(reference["canonical_path"])).parent / "dinov3_embedding.npy"
+    )
+    if not path.is_file():
+        return None
+    try:
+        return load_selected_dinov3_embedding(path)
+    except (OSError, ValueError):
+        return None
+
+
+def cross_pair_coarse_similarity(
+    target: dict[str, Any],
+    candidate: dict[str, Any],
+) -> float:
+    target_embedding = _reference_dino_embedding(target)
+    candidate_embedding = _reference_dino_embedding(candidate)
+    if (
+        target_embedding is not None
+        and candidate_embedding is not None
+        and target_embedding.shape == candidate_embedding.shape
+    ):
+        return embedding_cosine_similarity(
+            target_embedding,
+            candidate_embedding,
+        )
+    return visual_histogram_similarity(
+        target["canonical_path"],
+        candidate["canonical_path"],
+    )
 
 
 class QwenCrossPairJudge:
@@ -244,14 +287,12 @@ def choose_cross_pair(
     for candidate in candidates:
         if not is_same_parent_cross_candidate(target, candidate):
             continue
-        similarity = visual_histogram_similarity(
-            target["canonical_path"],
-            candidate["canonical_path"],
-        )
+        similarity = cross_pair_coarse_similarity(target, candidate)
         coarse.append((similarity, candidate))
     coarse.sort(key=lambda item: item[0], reverse=True)
     passing: list[tuple[float, float, dict[str, Any], CrossPairJudgeResult]] = []
-    for similarity, candidate in coarse[: config.maximum_candidates_per_entity]:
+    maximum_candidates = min(10, config.maximum_candidates_per_entity)
+    for similarity, candidate in coarse[:maximum_candidates]:
         try:
             result = judge.judge(target=target, candidate=candidate)
         except StructuredOutputFailure as exc:

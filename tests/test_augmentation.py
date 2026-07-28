@@ -10,6 +10,18 @@ from r2v_data_v2.augmentation import augment_references
 from r2v_data_v2.config import load_config
 
 
+class _FakeDinoEmbedder:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def encode(self, images: list[object]) -> np.ndarray:
+        self.batch_sizes.append(len(images))
+        return np.tile(
+            np.asarray([[1.0, 0.0]], dtype=np.float32),
+            (len(images), 1),
+        )
+
+
 def _write_config(tmp_path: Path, *, enabled: bool) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -47,6 +59,8 @@ def test_augmentation_restores_core_and_skips_existing_variant(
     cv2.imwrite(str(reference_dir / "canonical.png"), canonical)
     cv2.imwrite(str(reference_dir / "foreground_rgba.png"), canonical)
     cv2.imwrite(str(reference_dir / "mask.png"), mask)
+    embedding_path = reference_dir / "dinov3_embedding.npy"
+    np.save(embedding_path, np.asarray([1.0, 0.0], dtype=np.float16))
     manifest = tmp_path / "output" / "manifests" / "references.jsonl"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(
@@ -57,12 +71,14 @@ def test_augmentation_restores_core_and_skips_existing_variant(
                 "canonical_path": str(reference_dir / "canonical.png"),
                 "foreground_rgba_path": str(reference_dir / "foreground_rgba.png"),
                 "mask_path": str(reference_dir / "mask.png"),
+                "dinov3_embedding_path": str(embedding_path),
             }
         )
         + "\n",
         encoding="utf-8",
     )
     calls = 0
+    dino = _FakeDinoEmbedder()
 
     def editor(
         canonical_path: Path,
@@ -90,11 +106,13 @@ def test_augmentation_restores_core_and_skips_existing_variant(
         config,
         background_editor=editor,
         validator=validator,
+        dino_embedder=dino,  # type: ignore[arg-type]
     )
     second = augment_references(
         config,
         background_editor=editor,
         validator=validator,
+        dino_embedder=dino,  # type: ignore[arg-type]
     )
 
     candidate = cv2.imread(
@@ -103,6 +121,7 @@ def test_augmentation_restores_core_and_skips_existing_variant(
     assert first.accepted == 1
     assert second.skipped_existing == 1
     assert calls == 1
+    assert dino.batch_sizes == [1]
     assert np.array_equal(candidate[10:22, 10:22], canonical[10:22, 10:22])
     variant = json.loads(
         (tmp_path / "output" / "manifests" / "augmentations.jsonl").read_text(
@@ -111,4 +130,5 @@ def test_augmentation_restores_core_and_skips_existing_variant(
     )
     assert variant["pre_restore_core_similarity"] < 1.0
     assert variant["post_restore_core_similarity"] >= 0.995
+    assert variant["dino_identity_similarity"] == 1.0
     assert "foreground_core_similarity" not in variant

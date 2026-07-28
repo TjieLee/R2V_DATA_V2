@@ -180,6 +180,28 @@ def save_selected_dinov3_embedding(path: Path, embedding: np.ndarray) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def load_selected_dinov3_embedding(path: Path) -> np.ndarray:
+    embedding = np.load(path, allow_pickle=False)
+    if embedding.ndim != 1 or not np.all(np.isfinite(embedding)):
+        raise ValueError("selected DINOv3 embedding must be a finite vector")
+    return l2_normalize_embeddings(embedding.reshape(1, -1))[0]
+
+
+def embedding_cosine_similarity(
+    left: np.ndarray,
+    right: np.ndarray,
+) -> float:
+    normalized = l2_normalize_embeddings(
+        np.stack(
+            [
+                np.asarray(left, dtype=np.float32).reshape(-1),
+                np.asarray(right, dtype=np.float32).reshape(-1),
+            ]
+        )
+    )
+    return float(np.clip(normalized[0] @ normalized[1], -1.0, 1.0))
+
+
 class DinoV3Embedder:
     def __init__(self, config: RankingConfig) -> None:
         self.config = config
