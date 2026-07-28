@@ -6,6 +6,14 @@ from typing import Any
 
 import yaml
 
+ALLOWED_OUTPUT_ROOT = Path("/mnt/workspace/litengjie/data").resolve()
+ALLOWED_DATASET_ROOT = Path("/mnt/workspace/public/dataset").resolve()
+ALLOWED_PRETRAINED_ROOT = Path("/mnt/workspace/public/pretrained").resolve()
+
+
+def _is_at_or_below(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
 
 @dataclass(frozen=True)
 class QwenConfig:
@@ -72,11 +80,25 @@ class PipelineConfig:
     pairing: PairingConfig = field(default_factory=PairingConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
 
+    def validate_paths(self) -> None:
+        dataset = self.dataset_json.expanduser().resolve(strict=False)
+        if not _is_at_or_below(dataset, ALLOWED_DATASET_ROOT):
+            raise ValueError(
+                "dataset_json must be inside /mnt/workspace/public/dataset"
+            )
+        model_path = Path(self.qwen.model).expanduser()
+        if model_path.is_absolute() or model_path.exists():
+            resolved_model = model_path.resolve(strict=False)
+            if not _is_at_or_below(resolved_model, ALLOWED_PRETRAINED_ROOT):
+                raise ValueError(
+                    "local qwen.model must be inside /mnt/workspace/public/pretrained"
+                )
+
     def ensure_output_root(self) -> Path:
+        self.validate_paths()
         output = self.output_root.expanduser().resolve()
-        public_root = Path("/mnt/workspace/public").resolve()
-        if output == public_root or public_root in output.parents:
-            raise ValueError("output_root must not be inside /mnt/workspace/public")
+        if not _is_at_or_below(output, ALLOWED_OUTPUT_ROOT):
+            raise ValueError("output_root must be inside /mnt/workspace/litengjie/data")
         output.mkdir(parents=True, exist_ok=True)
         return output
 
@@ -117,6 +139,7 @@ def load_config(path: str | Path) -> PipelineConfig:
 
 
 def _validate_config(config: PipelineConfig) -> None:
+    config.validate_paths()
     if config.frames.count != 8:
         raise ValueError("the MVP requires exactly 8 sampled frames")
     if not 1 <= config.frames.jpeg_quality <= 100:

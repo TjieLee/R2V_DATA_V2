@@ -33,6 +33,10 @@ requirements. Install the repository already present at the configured
 `sam3.code_root` into the server environment; do not let this project replace
 the server's global Torch/CUDA packages.
 
+`requirements.txt` is deliberately lightweight. It does not install or upgrade
+Torch, torchvision, torchaudio, CUDA, cupy, nixl, flash-attn, or SAM3. Manage
+those packages in the existing GPU server environment.
+
 ## Configure
 
 Copy the example and edit only machine-specific values:
@@ -147,4 +151,3 @@ No real Qwen or SAM3 model is needed for local tests:
 python -m pytest -q
 python -m ruff check .
 ```
-
