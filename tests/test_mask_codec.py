@@ -4,12 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from r2v_data_v2.config import Sam3Config
 from r2v_data_v2.mask_utils import (
     decode_mask,
     encode_mask,
     fill_small_enclosed_holes,
+    save_mask_contact_sheet,
 )
 from r2v_data_v2.sam3_backend import Sam3Backend
 
@@ -56,7 +58,7 @@ class _FakePredictor:
 
     def handle_stream_request(self, request: dict[str, object]):
         assert request["type"] == "propagate_in_video"
-        for frame_slot in range(1, 8):
+        for frame_slot in range(1, 10):
             yield {"frame_index": frame_slot, "outputs": self._outputs(frame_slot)}
 
     @staticmethod
@@ -70,13 +72,13 @@ class _FakePredictor:
         }
 
 
-def test_fake_sam_tracks_same_object_over_eight_frames(tmp_path: Path) -> None:
+def test_fake_sam_tracks_same_object_over_ten_frames(tmp_path: Path) -> None:
     predictor = _FakePredictor()
     backend = Sam3Backend(Sam3Config(), predictor=predictor)
     observations = backend.track(frames_dir=tmp_path, grounding_prompt="red coat")
 
-    assert len(observations) == 8
-    assert {item.frame_slot for item in observations} == set(range(8))
+    assert len(observations) == 10
+    assert {item.frame_slot for item in observations} == set(range(10))
     assert {item.object_id for item in observations} == {7}
     assert predictor.closed
 
@@ -137,24 +139,54 @@ class _AnchorPredictor:
             yield {"frame_index": slot, "outputs": outputs}
 
 
-def test_sam_anchor_can_start_when_entity_first_appears_in_slot_five(
+def test_sam_anchor_can_start_when_entity_first_appears_in_slot_eight(
     tmp_path: Path,
 ) -> None:
     outputs = _AnchorPredictor.outputs(object_ids=[7], confidences=[0.96])
     predictor = _AnchorPredictor(
-        anchor_outputs={5: outputs},
+        anchor_outputs={8: outputs},
         propagation_outputs={
-            4: _AnchorPredictor.outputs(object_ids=[7], confidences=[0.91]),
-            6: _AnchorPredictor.outputs(object_ids=[7], confidences=[0.92]),
+            7: _AnchorPredictor.outputs(object_ids=[7], confidences=[0.91]),
+            9: _AnchorPredictor.outputs(object_ids=[7], confidences=[0.92]),
         },
     )
     backend = Sam3Backend(Sam3Config(), predictor=predictor)
 
     observations = backend.track(frames_dir=tmp_path, grounding_prompt="late subject")
 
-    assert {item.frame_slot for item in observations} == {4, 5, 6}
-    assert predictor.session_count == 9
-    assert len(predictor.closed_sessions) == 9
+    assert {item.frame_slot for item in observations} == {7, 8, 9}
+    assert predictor.session_count == 11
+    assert len(predictor.closed_sessions) == 11
+
+
+def test_ten_frame_mask_contact_sheet_uses_all_slots(tmp_path: Path) -> None:
+    frame_paths = []
+    masks = {}
+    candidates = []
+    for slot in range(10):
+        path = tmp_path / f"frame_{slot:02d}.png"
+        Image.new("RGB", (48, 32), color=(slot * 20, 40, 80)).save(path)
+        frame_paths.append(path)
+        mask = np.zeros((32, 48), dtype=bool)
+        mask[8:24, 12:36] = True
+        masks[slot] = mask
+        candidates.append(
+            {
+                "frame_slot": slot,
+                "bbox_xyxy": [12, 8, 36, 24],
+            }
+        )
+    destination = tmp_path / "contact_sheet.jpg"
+
+    save_mask_contact_sheet(
+        frame_paths=frame_paths,
+        candidates=candidates,
+        masks=masks,
+        destination=destination,
+    )
+
+    with Image.open(destination) as sheet:
+        assert sheet.size == (48 * 5, 32 * 2)
 
 
 def test_low_margin_multiple_instances_do_not_make_a_valid_anchor(

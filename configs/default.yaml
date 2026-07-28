@@ -11,7 +11,7 @@ qwen:
   repair_retries: 1
 
 frames:
-  count: 8
+  count: 10
   jpeg_quality: 92
   max_side: 1280
 

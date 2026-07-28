@@ -6,10 +6,18 @@ import pytest
 from r2v_data_v2.video_io import resize_without_upscaling, sample_frame_indices
 
 
-def test_fixed_eight_frame_indices_match_specification() -> None:
-    assert sample_frame_indices(240) == [14, 44, 74, 104, 134, 164, 194, 224]
-    assert sample_frame_indices(8) == list(range(8))
-    assert len(sample_frame_indices(3)) == 8
+def test_fixed_ten_frame_indices_match_specification() -> None:
+    assert sample_frame_indices(240) == [12, 36, 60, 84, 108, 132, 156, 180, 204, 228]
+    assert sample_frame_indices(10) == list(range(10))
+
+
+def test_short_video_keeps_ten_bounded_slots() -> None:
+    indices = sample_frame_indices(3)
+
+    assert len(indices) == 10
+    assert min(indices) >= 0
+    assert max(indices) == 2
+    assert len(set(indices)) < len(indices)
 
 
 def test_frame_indices_reject_empty_video() -> None:

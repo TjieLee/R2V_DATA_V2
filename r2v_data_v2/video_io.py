@@ -18,7 +18,7 @@ class FrameSamplingStats:
     failed: int = 0
 
 
-def sample_frame_indices(total_frames: int, count: int = 8) -> list[int]:
+def sample_frame_indices(total_frames: int, count: int = 10) -> list[int]:
     if total_frames < 1:
         raise ValueError("video must contain at least one frame")
     if count < 1:

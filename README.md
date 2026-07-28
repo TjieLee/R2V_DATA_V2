@@ -7,7 +7,7 @@ The MVP follows one direct path:
 
 ```text
 source JSON/JSONL
--> fixed eight-frame sampling
+-> fixed ten-frame sampling
 -> Qwen caption, entities, and explicit ref bindings
 -> SAM3 text-prompted masks
 -> hard gates, DINOv3 representativeness, optional SigLIP 2 alignment
@@ -68,7 +68,7 @@ Required server inputs:
 
 The Qwen service launch command depends on the model and vLLM version installed
 on the server. Do not use a language-model-only service for frame annotation.
-The pipeline sends the same eight JPEG frames to Qwen and SAM3; it never sends a
+The pipeline sends the same ten JPEG frames to Qwen and SAM3; it never sends a
 Base64-encoded whole video.
 
 Keep model and package caches in the writable user directory, for example:

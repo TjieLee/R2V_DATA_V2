@@ -46,7 +46,7 @@ def _image_content(frame_paths: list[Path]) -> list[dict[str, object]]:
     content: list[dict[str, object]] = [
         {
             "type": "text",
-            "text": "Inspect these eight frames in chronological order.",
+            "text": "Inspect these ten frames in chronological order.",
         }
     ]
     for path in frame_paths:
@@ -247,7 +247,7 @@ def annotate_manifest(
         ]
         try:
             if not all(path.is_file() for path in frame_paths):
-                raise FileNotFoundError("eight sampled frames are required")
+                raise FileNotFoundError("ten sampled frames are required")
             result, warnings = qwen.annotate(
                 frame_paths=frame_paths,
                 caption_raw=str(source.get("caption_raw", "")),

@@ -12,7 +12,7 @@ from r2v_data_v2.video_io import sample_manifest_frames, stats_dict
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sample exactly eight video frames")
+    parser = argparse.ArgumentParser(description="Sample exactly ten video frames")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()

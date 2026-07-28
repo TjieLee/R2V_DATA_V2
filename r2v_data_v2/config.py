@@ -29,7 +29,7 @@ class QwenConfig:
 
 @dataclass(frozen=True)
 class FramesConfig:
-    count: int = 8
+    count: int = 10
     jpeg_quality: int = 92
     max_side: int = 1280
 
@@ -189,8 +189,8 @@ def load_config(path: str | Path) -> PipelineConfig:
 
 def _validate_config(config: PipelineConfig) -> None:
     config.validate_paths()
-    if config.frames.count != 8:
-        raise ValueError("the MVP requires exactly 8 sampled frames")
+    if config.frames.count != 10:
+        raise ValueError("the MVP requires exactly 10 sampled frames")
     if not 1 <= config.frames.jpeg_quality <= 100:
         raise ValueError("frames.jpeg_quality must be between 1 and 100")
     if config.frames.max_side < 1:

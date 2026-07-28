@@ -45,8 +45,15 @@ class SamExtractionStats:
 
 
 class Sam3Backend:
-    def __init__(self, config: Sam3Config, *, predictor: object | None = None) -> None:
+    def __init__(
+        self,
+        config: Sam3Config,
+        *,
+        predictor: object | None = None,
+        frame_count: int = 10,
+    ) -> None:
         self.config = config
+        self.frame_count = frame_count
         if predictor is not None:
             self.predictor = predictor
             return
@@ -142,7 +149,7 @@ class Sam3Backend:
         grounding_prompt: str,
     ) -> AnchorResult | None:
         candidates: list[AnchorResult] = []
-        for frame_slot in range(8):
+        for frame_slot in range(self.frame_count):
             session_id = self._start_session(frames_dir)
             try:
                 prompted = self.predictor.handle_request(
@@ -351,7 +358,7 @@ def extract_manifest_candidates(
     annotation_manifest = output_root / "manifests" / "annotations.jsonl"
     if not annotation_manifest.is_file():
         raise FileNotFoundError("run Stage 02 before SAM3 extraction")
-    sam = backend or Sam3Backend(config.sam3)
+    sam = backend or Sam3Backend(config.sam3, frame_count=config.frames.count)
     processed = failed = no_valid = 0
     try:
         for payload in iter_source_records(annotation_manifest):

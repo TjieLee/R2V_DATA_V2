@@ -13,7 +13,7 @@ from r2v_data_v2.sam3_backend import extract_manifest_candidates, stats_dict
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract entity candidates from the eight sampled frames"
+        description="Extract entity candidates from the ten sampled frames"
     )
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--sam3-checkpoint")

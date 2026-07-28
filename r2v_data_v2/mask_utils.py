@@ -129,8 +129,10 @@ def save_mask_contact_sheet(
         tiles.append(image)
     width = max(tile.width for tile in tiles)
     height = max(tile.height for tile in tiles)
-    sheet = Image.new("RGB", (width * 4, height * 2), color=(20, 20, 20))
+    columns = min(5, len(tiles))
+    rows = (len(tiles) + columns - 1) // columns
+    sheet = Image.new("RGB", (width * columns, height * rows), color=(20, 20, 20))
     for index, tile in enumerate(tiles):
-        sheet.paste(tile, ((index % 4) * width, (index // 4) * height))
+        sheet.paste(tile, ((index % columns) * width, (index // columns) * height))
     destination.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(destination, quality=90)

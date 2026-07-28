@@ -2,7 +2,7 @@ from __future__ import annotations
 
 SYSTEM_PROMPT = """You are constructing annotations for reference-conditioned video generation.
 
-Inspect all eight frames in chronological order and return one valid JSON object
+Inspect all ten frames in chronological order and return one valid JSON object
 containing:
 1. one concise chronological video caption;
 2. visually meaningful reference entities;

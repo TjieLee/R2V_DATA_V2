@@ -7,10 +7,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from prompts.qwen_annotation_prompt import SYSTEM_PROMPT
 from r2v_data_v2.config import PipelineConfig, QwenConfig
 from r2v_data_v2.qwen_client import (
     QwenAnnotationClient,
     QwenAnnotationFailure,
+    _image_content,
     annotate_manifest,
 )
 from r2v_data_v2.schemas import QwenAnnotationResult
@@ -56,6 +58,20 @@ def test_qwen_cannot_supply_tokens_or_final_prompt() -> None:
     payload["entities"][0]["ref_token"] = "<ref_subject_99>"  # type: ignore[index]
     with pytest.raises(ValidationError):
         parse_qwen_json_response(json.dumps(payload), QwenAnnotationResult)
+
+
+def test_qwen_prompt_and_image_content_require_ten_frames(tmp_path: Path) -> None:
+    assert "Inspect all ten frames" in SYSTEM_PROMPT
+    frame_paths = []
+    for slot in range(10):
+        path = tmp_path / f"frame_{slot:02d}.jpg"
+        path.write_bytes(b"jpeg")
+        frame_paths.append(path)
+
+    content = _image_content(frame_paths)
+
+    assert content[0]["text"] == "Inspect these ten frames in chronological order."
+    assert sum(item["type"] == "image_url" for item in content) == 10
 
 
 class _FakeAnnotationClient(QwenAnnotationClient):
@@ -119,7 +135,7 @@ def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None
     )
     frame_dir = output_root / "frames" / "clip-1"
     frame_dir.mkdir(parents=True)
-    for slot in range(8):
+    for slot in range(10):
         (frame_dir / f"frame_{slot:02d}.jpg").write_bytes(b"jpeg")
 
     stats = annotate_manifest(
@@ -143,3 +159,43 @@ def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None
     assert (output_root / "manifests" / "annotations.jsonl").read_text(
         encoding="utf-8"
     ) == ""
+
+
+def test_missing_one_of_ten_frames_is_logged_before_qwen_request(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    source_manifest = output_root / "manifests" / "source.jsonl"
+    source_manifest.parent.mkdir(parents=True)
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "video_path": "/read-only/video.mp4",
+                "parent_video_id": "parent",
+                "clip_suffix": "1_0",
+                "clip_order": [1, 0],
+                "caption_raw": "draft",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    frame_dir = output_root / "frames" / "clip-1"
+    frame_dir.mkdir(parents=True)
+    for slot in range(9):
+        (frame_dir / f"frame_{slot:02d}.jpg").write_bytes(b"jpeg")
+
+    stats = annotate_manifest(
+        PipelineConfig(
+            dataset_json=tmp_path / "source.jsonl",
+            output_root=output_root,
+        ),
+        client=_FakeAnnotationClient([]),
+    )
+
+    failure = json.loads(
+        (output_root / "logs" / "qwen_failed.jsonl").read_text(encoding="utf-8")
+    )
+    assert stats.qwen_failed == 1
+    assert failure["issues"][0]["message"] == "ten sampled frames are required"
