@@ -634,10 +634,32 @@ def _normalized_siglip_scores(
     )
 
 
+def _normalized_entity_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def siglip_distractor_entities(
+    annotation: AnnotationResult,
+    target: AnnotationEntity,
+) -> list[AnnotationEntity]:
+    target_label = _normalized_entity_text(target.canonical_label)
+    target_prompt = _normalized_entity_text(target.grounding_prompt)
+    return [
+        entity
+        for entity in annotation.entities
+        if entity.entity_id != target.entity_id
+        and entity.separability != "attached_accessory"
+        and _normalized_entity_text(entity.canonical_label) != target_label
+        and _normalized_entity_text(entity.grounding_prompt) != target_prompt
+        and not (not entity.reference_worthy and entity.salience == "incidental")
+    ]
+
+
 def _candidate_ranking_metadata(
     items: list[CandidateWorkItem],
     *,
     qwen_reviews: dict[int, CandidateVisualReview] | None = None,
+    dino_medoid_slot: int | None = None,
 ) -> dict[str, object]:
     qwen_reviews = qwen_reviews or {}
     candidates = []
@@ -669,7 +691,10 @@ def _candidate_ranking_metadata(
                 ),
             }
         )
-    return {"candidates": candidates}
+    return {
+        "dino_medoid_slot": dino_medoid_slot,
+        "candidates": candidates,
+    }
 
 
 def _save_reference(
@@ -681,6 +706,7 @@ def _save_reference(
     mask: np.ndarray,
     selected: RankedCandidate,
     dino_embedding: np.ndarray | None,
+    dino_medoid_slot: int | None,
 ) -> dict[str, object]:
     frame_bgr = cv2.imread(str(frame_path))
     if frame_bgr is None:
@@ -728,6 +754,7 @@ def _save_reference(
         "dino": (
             asdict(selected.dino_metrics) if selected.dino_metrics is not None else None
         ),
+        "dino_medoid_slot": dino_medoid_slot,
         "siglip": (
             {
                 "target_similarity": selected.alignment_metrics.target_similarity,
@@ -919,11 +946,15 @@ def rank_manifest_references(
                     model_candidates = [
                         item for item in items if not item.hard_rejection_reasons
                     ]
+                    dino_medoid_slot = None
                     before_models += len(model_candidates)
                     if not model_candidates:
                         write_json_atomic(
                             candidate_dir / "ranking_metadata.json",
-                            _candidate_ranking_metadata(items),
+                            _candidate_ranking_metadata(
+                                items,
+                                dino_medoid_slot=dino_medoid_slot,
+                            ),
                         )
                         no_valid += 1
                         continue
@@ -952,7 +983,11 @@ def rank_manifest_references(
                                 for item in model_candidates
                             ]
                         )
-                        temporal_metrics, _, warning = temporal_representation_metrics(
+                        (
+                            temporal_metrics,
+                            dino_medoid_slot,
+                            warning,
+                        ) = temporal_representation_metrics(
                             frame_slots=[item.frame_slot for item in model_candidates],
                             embeddings=embeddings,
                             sam_confidences=[
@@ -999,7 +1034,10 @@ def rank_manifest_references(
                     if not model_candidates:
                         write_json_atomic(
                             candidate_dir / "ranking_metadata.json",
-                            _candidate_ranking_metadata(items),
+                            _candidate_ranking_metadata(
+                                items,
+                                dino_medoid_slot=dino_medoid_slot,
+                            ),
                         )
                         no_valid += 1
                         continue
@@ -1007,11 +1045,10 @@ def rank_manifest_references(
                     if config.ranking.siglip2_enabled:
                         if siglip is None:
                             raise RuntimeError("SigLIP 2 aligner was not initialized")
-                        distractors = [
-                            other
-                            for other in annotation.entities
-                            if other.entity_id != entity.entity_id
-                        ]
+                        distractors = siglip_distractor_entities(
+                            annotation,
+                            entity,
+                        )
                         distractor_texts = [
                             other.grounding_prompt for other in distractors
                         ]
@@ -1060,7 +1097,10 @@ def rank_manifest_references(
                     if not model_candidates:
                         write_json_atomic(
                             candidate_dir / "ranking_metadata.json",
-                            _candidate_ranking_metadata(items),
+                            _candidate_ranking_metadata(
+                                items,
+                                dino_medoid_slot=dino_medoid_slot,
+                            ),
                         )
                         no_valid += 1
                         continue
@@ -1145,6 +1185,7 @@ def rank_manifest_references(
                         _candidate_ranking_metadata(
                             items,
                             qwen_reviews=reviews,
+                            dino_medoid_slot=dino_medoid_slot,
                         ),
                     )
                     valid = [item for item in ranked if not item.hard_rejection_reasons]
@@ -1170,6 +1211,7 @@ def rank_manifest_references(
                         mask=masks[selected.frame_slot],
                         selected=selected,
                         dino_embedding=selected_work_item.dino_embedding,
+                        dino_medoid_slot=dino_medoid_slot,
                     )
                     reference_record = _reference_record(metadata, entity)
                     write_json_atomic(

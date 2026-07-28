@@ -63,6 +63,23 @@ def _connected_components(
     return components
 
 
+def _medoid_index(
+    component: list[int],
+    similarity: np.ndarray,
+) -> int:
+    return min(
+        component,
+        key=lambda index: (
+            -float(
+                np.mean(
+                    [similarity[index, peer] for peer in component if peer != index]
+                )
+            ),
+            index,
+        ),
+    )
+
+
 def temporal_representation_metrics(
     *,
     frame_slots: list[int],
@@ -95,8 +112,22 @@ def temporal_representation_metrics(
             -min(component),
         ),
     )
-    has_stable_cluster = len(stable_component) >= 2
-    stable_indexes = set(stable_component) if has_stable_cluster else set()
+    medoid_index = (
+        _medoid_index(stable_component, similarity)
+        if len(stable_component) >= 2
+        else None
+    )
+    cleaned_component = (
+        [
+            index
+            for index in stable_component
+            if similarity[medoid_index, index] >= threshold
+        ]
+        if medoid_index is not None
+        else []
+    )
+    has_stable_cluster = len(cleaned_component) >= 2
+    stable_indexes = set(cleaned_component) if has_stable_cluster else set()
     metrics: list[TemporalRepresentationMetrics] = []
     for index, frame_slot in enumerate(frame_slots):
         if count == 1:
@@ -104,7 +135,7 @@ def temporal_representation_metrics(
         else:
             nearest_similarity = float(np.max(np.delete(similarity[index], index)))
         if index in stable_indexes:
-            peers = [peer for peer in stable_component if peer != index]
+            peers = [peer for peer in cleaned_component if peer != index]
             representativeness = (
                 float(np.mean(similarity[index, peers])) if peers else 0.5
             )
@@ -123,16 +154,7 @@ def temporal_representation_metrics(
         )
 
     warning = None if has_stable_cluster else "no_stable_dino_cluster"
-    medoid_slot = None
-    if has_stable_cluster:
-        stable_metrics = [metric for metric in metrics if metric.dino_in_stable_cluster]
-        medoid_slot = min(
-            stable_metrics,
-            key=lambda metric: (
-                -metric.dino_representativeness,
-                metric.frame_slot,
-            ),
-        ).frame_slot
+    medoid_slot = frame_slots[medoid_index] if has_stable_cluster else None
     return metrics, medoid_slot, warning
 
 

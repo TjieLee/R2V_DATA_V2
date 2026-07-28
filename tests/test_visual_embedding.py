@@ -75,6 +75,30 @@ def test_no_stable_cluster_keeps_all_candidates() -> None:
     assert all(item.dino_representativeness == 0.5 for item in metrics)
 
 
+def test_medoid_cleanup_removes_single_link_chain_member() -> None:
+    angles = np.deg2rad([0.0, 40.0, 80.0, 120.0])
+    embeddings = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
+
+    metrics, medoid_slot, warning = temporal_representation_metrics(
+        frame_slots=[0, 1, 2, 3],
+        embeddings=embeddings,
+        sam_confidences=[0.9, 0.9, 0.9, 0.9],
+        base_quality_scores=[0.8, 0.8, 0.8, 0.8],
+        threshold=0.70,
+    )
+
+    assert warning is None
+    assert medoid_slot == 1
+    assert {item.frame_slot for item in metrics if item.dino_in_stable_cluster} == {
+        0,
+        1,
+        2,
+    }
+    chain_tail = next(item for item in metrics if item.frame_slot == 3)
+    assert not chain_tail.dino_in_stable_cluster
+    assert chain_tail.dino_representativeness == 0.0
+
+
 def test_embedding_npz_and_selected_embedding_are_float16(tmp_path: Path) -> None:
     path = tmp_path / "dinov3_embeddings.npz"
     embeddings = np.asarray([[3.0, 4.0], [4.0, 3.0]], dtype=np.float32)

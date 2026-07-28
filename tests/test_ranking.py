@@ -17,8 +17,13 @@ from r2v_data_v2.ranking import (
     basic_hard_rejection_reasons,
     rank_candidates,
     rank_manifest_references,
+    siglip_distractor_entities,
 )
-from r2v_data_v2.schemas import CandidateJudgeResult, CandidateVisualReview
+from r2v_data_v2.schemas import (
+    AnnotationResult,
+    CandidateJudgeResult,
+    CandidateVisualReview,
+)
 from r2v_data_v2.semantic_alignment import AlignmentMetrics
 from r2v_data_v2.visual_embedding import TemporalRepresentationMetrics
 
@@ -386,7 +391,14 @@ class _FakeSiglipAligner:
     ) -> list[AlignmentMetrics]:
         self.target_text = target_text
         self.distractor_texts = distractor_texts
-        return [AlignmentMetrics(0.8, 0.2, target_text) for _ in images]
+        return [
+            AlignmentMetrics(
+                0.8,
+                0.2 if distractor_texts else None,
+                target_text,
+            )
+            for _ in images
+        ]
 
 
 class _FakeCandidateJudge:
@@ -487,6 +499,93 @@ def _write_ranking_fixture(output_root: Path) -> None:
     )
 
 
+def _distractor_entity(
+    entity_id: str,
+    *,
+    canonical_label: str,
+    grounding_prompt: str,
+    reference_worthy: bool = True,
+    salience: str = "secondary",
+    separability: str = "independent",
+) -> dict[str, object]:
+    return {
+        "entity_id": entity_id,
+        "phrase": f"entity {entity_id}",
+        "grounding_prompt": grounding_prompt,
+        "canonical_label": canonical_label,
+        "category": "object",
+        "reference_worthy": reference_worthy,
+        "salience": salience,
+        "genericity": "descriptive",
+        "name_evidence": "none",
+        "separability": separability,
+        "selection_reason": "test entity",
+        "ref_token": None,
+    }
+
+
+def test_siglip_distractors_keep_only_distinct_independent_entities() -> None:
+    annotation = AnnotationResult.model_validate(
+        {
+            "caption": "Test entities stand together.",
+            "prompt_with_refs": "Test entities stand together.",
+            "entities": [
+                _distractor_entity(
+                    "target",
+                    canonical_label="gray-haired man",
+                    grounding_prompt="gray-haired man wearing a dark suit",
+                ),
+                _distractor_entity(
+                    "attached",
+                    canonical_label="wine glass",
+                    grounding_prompt="small stemmed wine glass",
+                    separability="attached_accessory",
+                ),
+                _distractor_entity(
+                    "same-label",
+                    canonical_label="Gray-Haired Man",
+                    grounding_prompt="man in another pose",
+                ),
+                _distractor_entity(
+                    "same-prompt",
+                    canonical_label="person",
+                    grounding_prompt="  GRAY-HAIRED   MAN wearing a DARK suit ",
+                ),
+                _distractor_entity(
+                    "incidental",
+                    canonical_label="chair",
+                    grounding_prompt="small chair in the distance",
+                    reference_worthy=False,
+                    salience="incidental",
+                ),
+                _distractor_entity(
+                    "independent",
+                    canonical_label="woman",
+                    grounding_prompt="woman wearing a red coat",
+                ),
+                _distractor_entity(
+                    "secondary-nonref",
+                    canonical_label="car",
+                    grounding_prompt="blue sedan",
+                    reference_worthy=False,
+                ),
+            ],
+            "relations": [],
+            "background": None,
+        }
+    )
+
+    distractors = siglip_distractor_entities(
+        annotation,
+        annotation.entities[0],
+    )
+
+    assert [entity.entity_id for entity in distractors] == [
+        "independent",
+        "secondary-nonref",
+    ]
+
+
 def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     tmp_path: Path,
 ) -> None:
@@ -515,7 +614,7 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     assert stats.candidate_count_after_dino == 3
     assert stats.candidate_count_after_siglip == 3
     assert siglip.target_text == "gray-haired man wearing a dark suit"
-    assert siglip.distractor_texts == ["small stemmed wine glass"]
+    assert siglip.distractor_texts == []
     selected_embedding = np.load(
         reference_dir / "dinov3_embedding.npy",
         allow_pickle=False,
@@ -528,4 +627,9 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     )
     assert metadata["candidates"][2]["hard_rejection_reasons"] == []
     assert not metadata["candidates"][2]["dino"]["dino_in_stable_cluster"]
+    assert metadata["dino_medoid_slot"] == 0
     assert metadata["candidates"][0]["siglip"]["best_matching_entity_id"] == "e1"
+    reference_metadata = json.loads(
+        (reference_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert reference_metadata["dino_medoid_slot"] == 0
