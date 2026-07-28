@@ -174,11 +174,13 @@ def _try_variant(
             candidate_path=candidate,
             mask_path=mask,
         )
-        _restore_foreground_core(
-            canonical_path=canonical,
-            candidate_path=candidate,
-            mask_path=mask,
-        )
+        foreground_core_restored = variant_type == "generated_background"
+        if foreground_core_restored:
+            _restore_foreground_core(
+                canonical_path=canonical,
+                candidate_path=candidate,
+                mask_path=mask,
+            )
         post_restore_similarity = foreground_core_similarity(
             canonical_path=canonical,
             candidate_path=candidate,
@@ -195,7 +197,10 @@ def _try_variant(
             if dino_embedder is not None
             else None
         )
-        if post_restore_similarity < 0.995 or validation.get("accepted") is not True:
+        failed_core_validation = (
+            foreground_core_restored and post_restore_similarity < 0.995
+        )
+        if failed_core_validation or validation.get("accepted") is not True:
             candidate.unlink(missing_ok=True)
             return None, f"{variant_type} failed identity or foreground-core validation"
         variant = {
@@ -206,6 +211,7 @@ def _try_variant(
             "image_path": str(candidate),
             "pre_restore_core_similarity": pre_restore_similarity,
             "post_restore_core_similarity": post_restore_similarity,
+            "foreground_core_restored": foreground_core_restored,
             "validation": validation,
         }
         if identity_similarity is not None:

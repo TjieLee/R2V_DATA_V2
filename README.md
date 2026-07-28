@@ -207,13 +207,15 @@ in-pair.
 
 Augmentation is disabled by default and never loads FLUX or Qwen-Image-Edit in
 that mode. The module exposes small programmatic editor and validator callables
-for a later server integration. Generated variants are accepted only when the
-foreground core remains nearly unchanged and the supplied identity validator
-passes after restoration; otherwise they are deleted while canonical references
-remain intact. Each accepted sidecar records core similarity both before and
-after original foreground pixels are restored. When DINOv3 is enabled, the
-sidecar also records neutral-crop canonical-to-augmented cosine similarity as a
-diagnostic; it is not a hard rejection threshold.
+for a later server integration. Generated-background variants restore the
+canonical foreground core before edge and identity validation and require at
+least 0.995 post-restore core similarity. Viewpoint variants keep the generated
+subject unchanged, then run the validator and optional DINOv3 diagnostic on that
+generated output. Rejected variants are deleted while canonical references
+remain intact. Each accepted sidecar records pre- and final-core similarity plus
+`foreground_core_restored`. When DINOv3 is enabled, the sidecar also records
+neutral-crop canonical-to-augmented cosine similarity as a diagnostic; it is not
+a hard rejection threshold.
 
 ## Validate
 
