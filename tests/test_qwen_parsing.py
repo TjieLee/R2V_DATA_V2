@@ -59,13 +59,16 @@ def test_qwen_cannot_supply_tokens_or_final_prompt() -> None:
 
 
 class _FakeAnnotationClient(QwenAnnotationClient):
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[str | Exception]) -> None:
         self.config = QwenConfig(repair_retries=1)
-        self._responses: Iterator[str] = iter(responses)
+        self._responses: Iterator[str | Exception] = iter(responses)
 
     def _request(self, messages: list[dict[str, object]]) -> str:
         assert messages
-        return next(self._responses)
+        response = next(self._responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def test_one_repair_can_succeed() -> None:
@@ -85,6 +88,15 @@ def test_two_failed_responses_are_preserved() -> None:
         '{"caption": "still invalid"}',
     ]
     assert caught.value.issues
+
+
+def test_repair_request_failure_preserves_first_raw_response() -> None:
+    client = _FakeAnnotationClient(["not json", RuntimeError("service unavailable")])
+    with pytest.raises(QwenAnnotationFailure) as caught:
+        client.annotate(frame_paths=[], caption_raw="draft", metadata={})
+    assert caught.value.attempt_count == 2
+    assert caught.value.raw_responses == ["not json"]
+    assert caught.value.issues[0].code == "qwen_request_failed"
 
 
 def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None:

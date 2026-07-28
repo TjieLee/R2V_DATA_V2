@@ -106,18 +106,23 @@ def _try_variant(
         raise ValueError(
             "augmentation editor output must remain inside its destination"
         )
+    pre_restore_similarity = foreground_core_similarity(
+        canonical_path=canonical,
+        candidate_path=candidate,
+        mask_path=mask,
+    )
     _restore_foreground_core(
         canonical_path=canonical,
         candidate_path=candidate,
         mask_path=mask,
     )
-    core_similarity = foreground_core_similarity(
+    post_restore_similarity = foreground_core_similarity(
         canonical_path=canonical,
         candidate_path=candidate,
         mask_path=mask,
     )
     validation = validator(canonical, candidate, mask, variant_type)
-    if core_similarity < 0.98 or validation.get("accepted") is not True:
+    if post_restore_similarity < 0.995 or validation.get("accepted") is not True:
         candidate.unlink(missing_ok=True)
         return None, f"{variant_type} failed identity or foreground-core validation"
     return (
@@ -127,7 +132,8 @@ def _try_variant(
             "variant_type": variant_type,
             "variant_index": variant_index,
             "image_path": str(candidate),
-            "foreground_core_similarity": core_similarity,
+            "pre_restore_core_similarity": pre_restore_similarity,
+            "post_restore_core_similarity": post_restore_similarity,
             "validation": validation,
         },
         None,

@@ -193,8 +193,13 @@ class QwenCandidateJudge:
         if not content:
             raise RuntimeError("Qwen returned an empty candidate review")
         result = CandidateJudgeResult.model_validate_json(content)
-        returned_slots = {candidate.frame_slot for candidate in result.candidates}
-        if result.entity_id != entity_id or returned_slots != set(frame_slots):
+        returned_slot_list = [candidate.frame_slot for candidate in result.candidates]
+        returned_slots = set(returned_slot_list)
+        if (
+            result.entity_id != entity_id
+            or returned_slots != set(frame_slots)
+            or len(returned_slot_list) != len(frame_slots)
+        ):
             raise ValueError(
                 "candidate review does not match the requested entity and slots"
             )
@@ -203,29 +208,127 @@ class QwenCandidateJudge:
         return result
 
 
+def _fit_candidate_panel(
+    image: Image.Image,
+    *,
+    width: int,
+    height: int,
+) -> Image.Image:
+    fitted = image.copy()
+    fitted.thumbnail((width, height), Image.Resampling.LANCZOS)
+    panel = Image.new("RGB", (width, height), color=(24, 24, 24))
+    panel.paste(
+        fitted,
+        ((width - fitted.width) // 2, (height - fitted.height) // 2),
+    )
+    return panel
+
+
+def _candidate_sheet_label(
+    record: dict[str, object],
+    metrics: CandidateMetrics,
+) -> str:
+    return (
+        f"frame_slot={int(record['frame_slot'])}  "
+        f"SAM={float(record['sam_confidence']):.3f}  "
+        f"effective_short_side={metrics.effective_short_side}  "
+        f"mask_area_ratio={metrics.mask_area_ratio:.4f}  "
+        f"Tenengrad={metrics.tenengrad_sharpness:.1f}  "
+        f"border_touch={str(metrics.border_touch).lower()}"
+    )
+
+
 def _top_candidate_sheet(
     *,
     frame_paths: dict[int, Path],
     masks: dict[int, np.ndarray],
+    candidates: list[tuple[dict[str, object], CandidateMetrics]],
     destination: Path,
 ) -> None:
-    tiles: list[Image.Image] = []
-    for slot, frame_path in frame_paths.items():
+    panel_width = 480
+    panel_height = 320
+    label_height = 42
+    rows: list[Image.Image] = []
+    for record, metrics in candidates:
+        slot = int(record["frame_slot"])
+        frame_path = frame_paths[slot]
         image = Image.open(frame_path).convert("RGB")
         overlay = np.asarray(image).copy()
         overlay[masks[slot]] = (
             0.5 * overlay[masks[slot]] + 0.5 * np.array([255, 60, 60])
         ).astype(np.uint8)
-        tile = Image.fromarray(overlay)
-        ImageDraw.Draw(tile).text((10, 10), f"frame_slot={slot}", fill=(255, 255, 0))
-        tiles.append(tile)
-    width = max(tile.width for tile in tiles)
-    height = max(tile.height for tile in tiles)
-    sheet = Image.new("RGB", (width * len(tiles), height), color=(20, 20, 20))
-    for index, tile in enumerate(tiles):
-        sheet.paste(tile, (index * width, 0))
+        mask = masks[slot]
+        y_indices, x_indices = np.nonzero(mask)
+        bbox = (
+            int(x_indices.min()),
+            int(y_indices.min()),
+            int(x_indices.max()) + 1,
+            int(y_indices.max()) + 1,
+        )
+        crop_box = padded_crop_box(
+            bbox,
+            image_width=image.width,
+            image_height=image.height,
+        )
+        panels = [
+            _fit_candidate_panel(image, width=panel_width, height=panel_height),
+            _fit_candidate_panel(
+                Image.fromarray(overlay),
+                width=panel_width,
+                height=panel_height,
+            ),
+            _fit_candidate_panel(
+                image.crop(crop_box),
+                width=panel_width,
+                height=panel_height,
+            ),
+        ]
+        row = Image.new(
+            "RGB",
+            (panel_width * 3, label_height + panel_height),
+            color=(16, 16, 16),
+        )
+        draw = ImageDraw.Draw(row)
+        draw.text(
+            (10, 8),
+            _candidate_sheet_label(record, metrics),
+            fill=(255, 255, 0),
+        )
+        for panel_index, (panel, panel_name) in enumerate(
+            zip(
+                panels,
+                ("ORIGINAL FRAME", "MASK OVERLAY", "PADDED SUBJECT CROP"),
+            )
+        ):
+            ImageDraw.Draw(panel).text((8, 8), panel_name, fill=(255, 255, 0))
+            row.paste(panel, (panel_index * panel_width, label_height))
+        rows.append(row)
+    sheet = Image.new(
+        "RGB",
+        (panel_width * 3, (label_height + panel_height) * len(rows)),
+        color=(16, 16, 16),
+    )
+    for row_index, row in enumerate(rows):
+        sheet.paste(row, (0, row_index * (label_height + panel_height)))
     destination.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(destination, quality=90)
+
+
+def _ensure_best_frame_has_no_hard_rejection(
+    ranked: list[RankedCandidate],
+    best_frame_slot: int,
+) -> None:
+    selected = next(
+        (item for item in ranked if item.frame_slot == best_frame_slot),
+        None,
+    )
+    if selected is None:
+        raise ValueError("candidate review best_frame_slot was not ranked")
+    if selected.hard_rejection_reasons:
+        raise ValueError(
+            "candidate review best_frame_slot has hard rejection: "
+            + ", ".join(selected.hard_rejection_reasons)
+        )
 
 
 def _load_entity_candidates(
@@ -461,6 +564,7 @@ def rank_manifest_references(
                         for slot in slots
                     },
                     masks={slot: masks[slot] for slot in slots},
+                    candidates=preliminary,
                     destination=sheet,
                 )
                 review_result = qwen.review(
@@ -487,6 +591,10 @@ def rank_manifest_references(
                         for record, metrics in preliminary
                     ],
                     config=config.ranking,
+                )
+                _ensure_best_frame_has_no_hard_rejection(
+                    ranked,
+                    review_result.best_frame_slot,
                 )
                 valid = [item for item in ranked if not item.hard_rejection_reasons]
                 if not valid:

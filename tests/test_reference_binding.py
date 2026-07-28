@@ -86,6 +86,16 @@ def test_same_token_kind_increments_in_caption_order() -> None:
     assert result.entities[1].ref_token == "<ref_subject_2>"
 
 
+def test_token_numbering_uses_caption_order_not_entity_list_order() -> None:
+    payload = _multi_entity_payload()
+    payload["entities"][1]["category"] = "person"  # type: ignore[index]
+    payload["entities"] = list(reversed(payload["entities"]))  # type: ignore[arg-type]
+    result = assign_reference_tokens(QwenAnnotationResult.model_validate(payload))
+    tokens_by_id = {entity.entity_id: entity.ref_token for entity in result.entities}
+    assert tokens_by_id["e1"] == "<ref_subject_1>"
+    assert tokens_by_id["e2"] == "<ref_subject_2>"
+
+
 @pytest.mark.parametrize(
     ("caption", "code"),
     [

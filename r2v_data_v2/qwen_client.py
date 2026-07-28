@@ -44,10 +44,14 @@ class QwenAnnotationFailure(ValueError):
         *,
         raw_responses: list[str],
         issues: list[ValidationIssue],
+        attempt_count: int | None = None,
     ) -> None:
         super().__init__("Qwen annotation failed parsing or semantic validation")
         self.raw_responses = raw_responses
         self.issues = issues
+        self.attempt_count = (
+            len(raw_responses) if attempt_count is None else attempt_count
+        )
 
 
 def _strip_complete_json_fence(content: str) -> str:
@@ -229,14 +233,27 @@ class QwenAnnotationClient:
                     draft_caption=caption_raw,
                     metadata=metadata,
                 )
-            raw_response = self._request(
-                self._messages(
-                    frame_paths=frame_paths,
-                    caption_raw=caption_raw,
-                    metadata=metadata,
-                    repair_prompt=repair_prompt,
+            try:
+                raw_response = self._request(
+                    self._messages(
+                        frame_paths=frame_paths,
+                        caption_raw=caption_raw,
+                        metadata=metadata,
+                        repair_prompt=repair_prompt,
+                    )
                 )
-            )
+            except Exception as exc:
+                raise QwenAnnotationFailure(
+                    raw_responses=raw_responses,
+                    issues=[
+                        ValidationIssue(
+                            code="qwen_request_failed",
+                            field=None,
+                            message=str(exc),
+                        )
+                    ],
+                    attempt_count=attempt + 1,
+                ) from exc
             raw_responses.append(raw_response)
             semantic, issues = _parse_issues(raw_response, QwenAnnotationResult)
             if semantic is not None:
@@ -311,7 +328,7 @@ def annotate_manifest(
                 output_root / "logs" / "qwen_failed.jsonl",
                 {
                     "clip_uid": clip,
-                    "attempt_count": len(exc.raw_responses),
+                    "attempt_count": exc.attempt_count,
                     "raw_responses": exc.raw_responses,
                     "issues": [issue.to_dict() for issue in exc.issues],
                 },

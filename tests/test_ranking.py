@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+from PIL import Image
+
 from r2v_data_v2.config import RankingConfig
 from r2v_data_v2.metrics import CandidateMetrics, classify_entity_overlap
-from r2v_data_v2.ranking import rank_candidates
+from r2v_data_v2.ranking import (
+    _candidate_sheet_label,
+    _ensure_best_frame_has_no_hard_rejection,
+    _top_candidate_sheet,
+    rank_candidates,
+)
 from r2v_data_v2.schemas import CandidateVisualReview
 
 
@@ -105,3 +117,62 @@ def test_entity_overlap_classification() -> None:
     assert attached == "attached_accessory"
     assert important == "important_independent_object"
     assert duplicate == "duplicate_entity"
+
+
+def test_candidate_sheet_contains_three_panels_and_metric_label(
+    tmp_path: Path,
+) -> None:
+    frame_path = tmp_path / "frame.jpg"
+    frame = np.full((120, 180, 3), (30, 120, 220), dtype=np.uint8)
+    assert cv2.imwrite(str(frame_path), frame)
+    mask = np.zeros((120, 180), dtype=bool)
+    mask[25:100, 55:135] = True
+    metrics = _metrics(border_touch=False, sharpness=123.4)
+    record: dict[str, object] = {
+        "frame_slot": 2,
+        "sam_confidence": 0.91,
+    }
+    destination = tmp_path / "sheet.jpg"
+
+    _top_candidate_sheet(
+        frame_paths={2: frame_path},
+        masks={2: mask},
+        candidates=[(record, metrics)],
+        destination=destination,
+    )
+
+    with Image.open(destination) as sheet:
+        assert sheet.size == (1440, 362)
+    label = _candidate_sheet_label(record, metrics)
+    assert "frame_slot=2" in label
+    assert "SAM=0.910" in label
+    assert "effective_short_side=300" in label
+    assert "mask_area_ratio=0.2000" in label
+    assert "Tenengrad=123.4" in label
+    assert "border_touch=false" in label
+
+
+def test_qwen_best_frame_must_not_have_hard_rejection() -> None:
+    ranked = rank_candidates(
+        [
+            (
+                0,
+                10,
+                0.99,
+                _metrics(border_touch=True, sharpness=100),
+                _review(0),
+            ),
+            (
+                1,
+                20,
+                0.90,
+                _metrics(border_touch=False, sharpness=80),
+                _review(1),
+            ),
+        ],
+        config=RankingConfig(),
+    )
+
+    _ensure_best_frame_has_no_hard_rejection(ranked, 1)
+    with pytest.raises(ValueError, match="hard rejection"):
+        _ensure_best_frame_has_no_hard_rejection(ranked, 0)

@@ -147,7 +147,9 @@ Augmentation is disabled by default and never loads FLUX or Qwen-Image-Edit in
 that mode. The module exposes small programmatic editor and validator callables
 for a later server integration. Generated variants are accepted only when the
 foreground core remains nearly unchanged and the supplied identity validator
-passes; otherwise they are deleted while canonical references remain intact.
+passes after restoration; otherwise they are deleted while canonical references
+remain intact. Each accepted sidecar records core similarity both before and
+after original foreground pixels are restored.
 
 ## Validate
 

@@ -104,3 +104,11 @@ def test_augmentation_restores_core_and_skips_existing_variant(
     assert second.skipped_existing == 1
     assert calls == 1
     assert np.array_equal(candidate[10:22, 10:22], canonical[10:22, 10:22])
+    variant = json.loads(
+        (tmp_path / "output" / "manifests" / "augmentations.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert variant["pre_restore_core_similarity"] < 1.0
+    assert variant["post_restore_core_similarity"] >= 0.995
+    assert "foreground_core_similarity" not in variant
