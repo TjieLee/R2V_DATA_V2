@@ -30,6 +30,14 @@ class SamObservation:
 
 
 @dataclass(frozen=True)
+class AnchorResult:
+    frame_slot: int
+    confidence: float
+    object_id: int
+    mask_area_ratio: float
+
+
+@dataclass(frozen=True)
 class SamExtractionStats:
     processed: int = 0
     sam_failed: int = 0
@@ -60,6 +68,8 @@ class Sam3Backend:
     @staticmethod
     def _observations(frame_slot: int, outputs: dict[str, Any]) -> list[SamObservation]:
         masks = np.asarray(outputs.get("out_binary_masks", []), dtype=bool)
+        if masks.size == 0:
+            return []
         if masks.ndim == 2:
             masks = masks[None, ...]
         if masks.ndim == 4 and masks.shape[1] == 1:
@@ -94,22 +104,100 @@ class Sam3Backend:
             )
         return result
 
-    def track(self, *, frames_dir: Path, grounding_prompt: str) -> list[SamObservation]:
+    def _start_session(self, frames_dir: Path) -> str:
         start = self.predictor.handle_request(
             {"type": "start_session", "resource_path": str(frames_dir)}
         )
-        session_id = start["session_id"]
-        frame_outputs: dict[int, dict[str, Any]] = {}
+        return str(start["session_id"])
+
+    def _close_session(self, session_id: str) -> None:
+        self.predictor.handle_request(
+            {"type": "close_session", "session_id": session_id}
+        )
+
+    def _best_anchor_observation(
+        self,
+        frame_slot: int,
+        outputs: dict[str, Any],
+    ) -> SamObservation | None:
+        candidates = [
+            observation
+            for observation in self._observations(frame_slot, outputs)
+            if observation.confidence >= self.config.minimum_confidence
+            and 0.001 <= float(observation.mask.mean()) <= 0.90
+        ]
+        candidates.sort(key=lambda item: item.confidence, reverse=True)
+        if not candidates:
+            return None
+        if (
+            len(candidates) > 1
+            and candidates[0].confidence - candidates[1].confidence < 0.10
+        ):
+            return None
+        return candidates[0]
+
+    def find_best_anchor(
+        self,
+        frames_dir: Path,
+        grounding_prompt: str,
+    ) -> AnchorResult | None:
+        candidates: list[AnchorResult] = []
+        for frame_slot in range(8):
+            session_id = self._start_session(frames_dir)
+            try:
+                prompted = self.predictor.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": frame_slot,
+                        "text": grounding_prompt,
+                    }
+                )
+                observation = self._best_anchor_observation(
+                    int(prompted["frame_index"]),
+                    prompted["outputs"],
+                )
+                if observation is not None:
+                    candidates.append(
+                        AnchorResult(
+                            frame_slot=observation.frame_slot,
+                            confidence=observation.confidence,
+                            object_id=observation.object_id,
+                            mask_area_ratio=float(observation.mask.mean()),
+                        )
+                    )
+            finally:
+                self._close_session(session_id)
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (item.confidence, item.mask_area_ratio, -item.frame_slot),
+        )
+
+    def track(self, *, frames_dir: Path, grounding_prompt: str) -> list[SamObservation]:
+        anchor = self.find_best_anchor(frames_dir, grounding_prompt)
+        if anchor is None:
+            return []
+        session_id = self._start_session(frames_dir)
+        observations: list[SamObservation] = []
         try:
             prompted = self.predictor.handle_request(
                 {
                     "type": "add_prompt",
                     "session_id": session_id,
-                    "frame_index": 0,
+                    "frame_index": anchor.frame_slot,
                     "text": grounding_prompt,
                 }
             )
-            frame_outputs[int(prompted["frame_index"])] = prompted["outputs"]
+            anchored = self._best_anchor_observation(
+                int(prompted["frame_index"]),
+                prompted["outputs"],
+            )
+            if anchored is None:
+                return []
+            tracked_object_id = anchored.object_id
+            observations.append(anchored)
             for response in self.predictor.handle_stream_request(
                 {
                     "type": "propagate_in_video",
@@ -117,23 +205,29 @@ class Sam3Backend:
                     "propagation_direction": "both",
                 }
             ):
-                frame_outputs[int(response["frame_index"])] = response["outputs"]
-        finally:
-            self.predictor.handle_request(
-                {"type": "close_session", "session_id": session_id}
-            )
-        observations: list[SamObservation] = []
-        for frame_slot, outputs in sorted(frame_outputs.items()):
-            current = self._observations(frame_slot, outputs)
-            if len(current) > 1:
-                raise ValueError(
-                    f"SAM3 found multiple unresolved instances in frame slot {frame_slot}"
+                current = self._observations(
+                    int(response["frame_index"]),
+                    response["outputs"],
                 )
-            observations.extend(current)
+                if not current:
+                    continue
+                matching = [
+                    item for item in current if item.object_id == tracked_object_id
+                ]
+                if len(matching) != 1 or len(current) != 1:
+                    raise ValueError(
+                        "SAM3 object identity switched across sampled frames"
+                    )
+                observations.append(matching[0])
+        finally:
+            self._close_session(session_id)
         object_ids = {item.object_id for item in observations}
         if len(object_ids) > 1:
             raise ValueError("SAM3 object identity switched across sampled frames")
-        return observations
+        unique_by_slot = {item.frame_slot: item for item in observations}
+        if len(unique_by_slot) < self.config.minimum_visible_frames:
+            return []
+        return [unique_by_slot[slot] for slot in sorted(unique_by_slot)]
 
     def close(self) -> None:
         shutdown = getattr(self.predictor, "shutdown", None)
