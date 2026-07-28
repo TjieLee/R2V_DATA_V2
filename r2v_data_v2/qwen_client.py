@@ -244,7 +244,8 @@ def annotate_manifest(
             result.background and result.background.reference_worthy
         )
         generic_count += sum(
-            warning.startswith("generic_entity_label_count=") for warning in warnings
+            entity.canonical_label.casefold() in {"man", "woman", "person"}
+            for entity in result.entities
         )
         processed += 1
     return AnnotationStats(processed, skipped, failed, no_ref, generic_count)
