@@ -78,7 +78,7 @@ ICL_EXAMPLES: list[dict[str, object]] = [
             "background": {
                 "phrase": "a broad alpine valley",
                 "grounding_prompt": "empty broad snowy alpine valley",
-                "reference_worthy": True,
+                "reference_worthy": False,
             },
         },
     },

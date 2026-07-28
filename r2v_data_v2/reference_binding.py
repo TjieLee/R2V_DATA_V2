@@ -4,6 +4,9 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from r2v_data_v2.caption_validation import exact_phrase_spans
 from r2v_data_v2.schemas import (
     AnnotationEntity,
@@ -84,7 +87,8 @@ def build_prompt_with_refs(
         else:
             insertions.append((*spans[0], background.ref_token, "background.phrase"))
     insertions.sort()
-    for left, right in zip(insertions, insertions[1:]):
+    for index in range(len(insertions) - 1):
+        left, right = insertions[index : index + 2]
         if right[0] < left[1]:
             issues.append(
                 ValidationIssue(
@@ -230,6 +234,70 @@ def validate_final_reference_binding(
     issues: list[ValidationIssue] = []
     prompt = str(sample.get("prompt_with_refs", ""))
     prompt_tokens = _ANY_REF_TOKEN.findall(prompt)
+    sample_entities = sample.get("entities")
+    entities_by_id: dict[str, dict[str, object]] = {}
+    if not isinstance(sample_entities, list):
+        issues.append(
+            ValidationIssue(
+                "sample_entities_missing",
+                "entities",
+                "final sample must contain its complete entity list",
+            )
+        )
+        sample_entities = []
+    for index, entity in enumerate(sample_entities):
+        if not isinstance(entity, dict) or not isinstance(entity.get("entity_id"), str):
+            issues.append(
+                ValidationIssue(
+                    "invalid_sample_entity",
+                    f"entities[{index}]",
+                    "sample entity must be an object with entity_id",
+                )
+            )
+            continue
+        entity_id = str(entity["entity_id"])
+        if entity_id in entities_by_id:
+            issues.append(
+                ValidationIssue(
+                    "duplicate_sample_entity",
+                    f"entities[{index}].entity_id",
+                    "sample entity IDs must be unique",
+                )
+            )
+        entities_by_id[entity_id] = entity
+
+    relations = sample.get("relations", [])
+    if not isinstance(relations, list):
+        issues.append(
+            ValidationIssue(
+                "invalid_sample_relations",
+                "relations",
+                "sample relations must be a list",
+            )
+        )
+        relations = []
+    for index, relation in enumerate(relations):
+        if not isinstance(relation, dict):
+            issues.append(
+                ValidationIssue(
+                    "invalid_sample_relation",
+                    f"relations[{index}]",
+                    "sample relation must be a JSON object",
+                )
+            )
+            continue
+        if (
+            relation.get("subject_id") not in entities_by_id
+            or relation.get("object_id") not in entities_by_id
+        ):
+            issues.append(
+                ValidationIssue(
+                    "invalid_relation_entity",
+                    f"relations[{index}]",
+                    "relation subject_id and object_id must exist in sample.entities",
+                )
+            )
+
     references = sample.get("references")
     if not isinstance(references, list) or not references:
         issues.append(
@@ -279,6 +347,7 @@ def validate_final_reference_binding(
                     )
                 )
         image_path = reference.get("image_path")
+        canonical_image = None
         if not isinstance(image_path, str) or not Path(image_path).is_file():
             issues.append(
                 ValidationIssue(
@@ -287,8 +356,75 @@ def validate_final_reference_binding(
                     "reference image must exist",
                 )
             )
+        else:
+            canonical_image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if canonical_image is None:
+                issues.append(
+                    ValidationIssue(
+                        "reference_image_unreadable",
+                        f"{field}.image_path",
+                        "reference image must be readable",
+                    )
+                )
+        mask_path = reference.get("mask_path")
+        if not isinstance(mask_path, str) or not Path(mask_path).is_file():
+            issues.append(
+                ValidationIssue(
+                    "reference_mask_missing",
+                    f"{field}.mask_path",
+                    "reference mask must exist",
+                )
+            )
+        else:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                issues.append(
+                    ValidationIssue(
+                        "reference_mask_unreadable",
+                        f"{field}.mask_path",
+                        "reference mask must be readable",
+                    )
+                )
+            elif not np.any(mask):
+                issues.append(
+                    ValidationIssue(
+                        "reference_mask_empty",
+                        f"{field}.mask_path",
+                        "reference mask must contain foreground pixels",
+                    )
+                )
+            elif (
+                canonical_image is not None and mask.shape != canonical_image.shape[:2]
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "reference_mask_size_mismatch",
+                        f"{field}.mask_path",
+                        "reference mask dimensions must match canonical image",
+                    )
+                )
+        entity_id = str(reference.get("entity_id", ""))
+        sample_entity = entities_by_id.get(entity_id)
+        if sample_entity is None or sample_entity.get("reference_worthy") is not True:
+            issues.append(
+                ValidationIssue(
+                    "reference_entity_not_reference_worthy",
+                    f"{field}.entity_id",
+                    "reference must map to a reference-worthy sample entity",
+                )
+            )
+        elif (
+            sample_entity.get("ref_token") != token
+            or sample_entity.get("phrase") != phrase
+        ):
+            issues.append(
+                ValidationIssue(
+                    "reference_entity_binding_mismatch",
+                    field,
+                    "reference phrase and token must match sample.entities",
+                )
+            )
         if annotation is not None:
-            entity_id = str(reference.get("entity_id", ""))
             entity = annotation_by_id.get(entity_id)
             if (
                 entity is None

@@ -442,6 +442,19 @@ def build_pairs(
                 "target_video": annotation["video_path"],
                 "caption": annotation["caption"],
                 "prompt_with_refs": retained_annotation.prompt_with_refs,
+                "entities": [
+                    {
+                        "entity_id": entity.entity_id,
+                        "phrase": entity.phrase,
+                        "grounding_prompt": entity.grounding_prompt,
+                        "canonical_label": entity.canonical_label,
+                        "category": entity.category,
+                        "reference_worthy": entity.reference_worthy,
+                        "ref_token": entity.ref_token,
+                        "separability": entity.separability,
+                    }
+                    for entity in retained_annotation.entities
+                ],
                 "references": final_references,
                 "relations": annotation.get("relations", []),
                 "background_reference": background_reference,

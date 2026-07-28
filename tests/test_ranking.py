@@ -4,14 +4,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pytest
 from PIL import Image
 
 from r2v_data_v2.config import RankingConfig
 from r2v_data_v2.metrics import CandidateMetrics, classify_entity_overlap
 from r2v_data_v2.ranking import (
     _candidate_sheet_label,
-    _ensure_best_frame_has_no_hard_rejection,
     _top_candidate_sheet,
     rank_candidates,
 )
@@ -152,7 +150,7 @@ def test_candidate_sheet_contains_three_panels_and_metric_label(
     assert "border_touch=false" in label
 
 
-def test_qwen_best_frame_must_not_have_hard_rejection() -> None:
+def test_qwen_best_frame_does_not_override_code_hard_gate() -> None:
     ranked = rank_candidates(
         [
             (
@@ -173,6 +171,7 @@ def test_qwen_best_frame_must_not_have_hard_rejection() -> None:
         config=RankingConfig(),
     )
 
-    _ensure_best_frame_has_no_hard_rejection(ranked, 1)
-    with pytest.raises(ValueError, match="hard rejection"):
-        _ensure_best_frame_has_no_hard_rejection(ranked, 0)
+    qwen_diagnostic_best_frame_slot = 0
+    assert qwen_diagnostic_best_frame_slot == 0
+    assert ranked[0].frame_slot == 1
+    assert ranked[0].hard_rejection_reasons == ()

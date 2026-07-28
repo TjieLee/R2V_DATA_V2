@@ -118,6 +118,8 @@ def test_four_icl_examples_have_complete_valid_json() -> None:
         result = QwenAnnotationResult.model_validate(example["output"])
         source = example["input"]
         assert isinstance(source, dict)
+        if result.background is not None:
+            assert not result.background.reference_worthy
         assert (
             validate_annotation(
                 result,

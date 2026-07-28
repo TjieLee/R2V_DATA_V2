@@ -343,9 +343,14 @@ def test_missing_cross_pair_falls_back_to_in_pair(tmp_path: Path) -> None:
     )
     reference_image = output_root / "references" / "clip-1" / "e1" / "canonical.jpg"
     reference_image.parent.mkdir(parents=True)
-    reference_image.write_bytes(b"image")
+    assert cv2.imwrite(
+        str(reference_image),
+        np.full((32, 48, 3), 128, dtype=np.uint8),
+    )
     mask_path = reference_image.with_name("mask.png")
-    mask_path.write_bytes(b"mask")
+    mask = np.zeros((32, 48), dtype=np.uint8)
+    mask[4:28, 8:40] = 255
+    assert cv2.imwrite(str(mask_path), mask)
     reference_record = {
         "clip_uid": "clip-1",
         "entity_id": "e1",
@@ -378,3 +383,5 @@ def test_missing_cross_pair_falls_back_to_in_pair(tmp_path: Path) -> None:
     assert stats.fallback_count == 1
     assert stats.cross_pair_count == 0
     assert sample["references"][0]["pair_type"] == "in_pair"
+    assert sample["entities"][0]["entity_id"] == "e1"
+    assert sample["entities"][0]["reference_worthy"]

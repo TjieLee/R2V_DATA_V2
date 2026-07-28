@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 from r2v_data_v2.caption_validation import validate_annotation
@@ -13,7 +15,7 @@ from r2v_data_v2.reference_binding import (
     rebuild_for_retained_entities,
     validate_final_reference_binding,
 )
-from r2v_data_v2.schemas import QwenAnnotationResult
+from r2v_data_v2.schemas import AnnotationResult, QwenAnnotationResult
 from tests.test_caption_validation import _valid_payload
 
 
@@ -196,22 +198,44 @@ def test_prompt_builder_rejects_overlap_even_with_manual_tokens() -> None:
 
 def _final_sample(
     tmp_path: Path,
-) -> tuple[dict[str, object], object]:
+) -> tuple[dict[str, object], AnnotationResult]:
     annotation = assign_reference_tokens(
         QwenAnnotationResult.model_validate(_valid_payload())
     )
     image = tmp_path / "reference.jpg"
-    image.write_bytes(b"image")
+    mask = tmp_path / "mask.png"
+    assert cv2.imwrite(
+        str(image),
+        np.full((32, 48, 3), 128, dtype=np.uint8),
+    )
+    valid_mask = np.zeros((32, 48), dtype=np.uint8)
+    valid_mask[4:28, 8:40] = 255
+    assert cv2.imwrite(str(mask), valid_mask)
     sample: dict[str, object] = {
         "prompt_with_refs": annotation.prompt_with_refs,
+        "entities": [
+            {
+                "entity_id": entity.entity_id,
+                "phrase": entity.phrase,
+                "grounding_prompt": entity.grounding_prompt,
+                "canonical_label": entity.canonical_label,
+                "category": entity.category,
+                "reference_worthy": entity.reference_worthy,
+                "ref_token": entity.ref_token,
+                "separability": entity.separability,
+            }
+            for entity in annotation.entities
+        ],
         "references": [
             {
                 "entity_id": "e1",
                 "phrase": annotation.entities[0].phrase,
                 "ref_token": annotation.entities[0].ref_token,
                 "image_path": str(image),
+                "mask_path": str(mask),
             }
         ],
+        "relations": [],
         "background_reference": None,
     }
     return sample, annotation
@@ -219,7 +243,7 @@ def _final_sample(
 
 def test_final_prompt_tokens_match_existing_reference(tmp_path: Path) -> None:
     sample, annotation = _final_sample(tmp_path)
-    assert validate_final_reference_binding(sample, annotation) == []  # type: ignore[arg-type]
+    assert validate_final_reference_binding(sample, annotation) == []
 
 
 def test_final_binding_rejects_missing_or_zero_reference(tmp_path: Path) -> None:
@@ -229,7 +253,7 @@ def test_final_binding_rejects_missing_or_zero_reference(tmp_path: Path) -> None
         issue.code
         for issue in validate_final_reference_binding(
             sample,
-            annotation,  # type: ignore[arg-type]
+            annotation,
         )
     }
     assert "reference_image_missing" in codes
@@ -239,10 +263,64 @@ def test_final_binding_rejects_missing_or_zero_reference(tmp_path: Path) -> None
         issue.code
         for issue in validate_final_reference_binding(
             sample,
-            annotation,  # type: ignore[arg-type]
+            annotation,
         )
     }
     assert {"no_references", "final_prompt_token_mismatch"} <= codes
+
+
+def test_final_reference_mask_must_exist_be_nonempty_and_match_image(
+    tmp_path: Path,
+) -> None:
+    sample, annotation = _final_sample(tmp_path)
+    reference = sample["references"][0]  # type: ignore[index]
+    mask_path = Path(str(reference["mask_path"]))
+
+    reference["mask_path"] = str(tmp_path / "missing.png")
+    codes = {
+        issue.code for issue in validate_final_reference_binding(sample, annotation)
+    }
+    assert "reference_mask_missing" in codes
+
+    reference["mask_path"] = str(mask_path)
+    mask_path.write_bytes(b"not an image")
+    codes = {
+        issue.code for issue in validate_final_reference_binding(sample, annotation)
+    }
+    assert "reference_mask_unreadable" in codes
+
+    assert cv2.imwrite(str(mask_path), np.zeros((32, 48), dtype=np.uint8))
+    codes = {
+        issue.code for issue in validate_final_reference_binding(sample, annotation)
+    }
+    assert "reference_mask_empty" in codes
+
+    assert cv2.imwrite(
+        str(mask_path),
+        np.full((16, 24), 255, dtype=np.uint8),
+    )
+    codes = {
+        issue.code for issue in validate_final_reference_binding(sample, annotation)
+    }
+    assert "reference_mask_size_mismatch" in codes
+
+
+def test_final_entities_cover_relations_and_references(tmp_path: Path) -> None:
+    sample, annotation = _final_sample(tmp_path)
+    sample["relations"] = [
+        {"subject_id": "e1", "predicate": "beside", "object_id": "e2"}
+    ]
+    codes = {
+        issue.code for issue in validate_final_reference_binding(sample, annotation)
+    }
+    assert "invalid_relation_entity" in codes
+
+    sample["relations"] = []
+    sample["entities"][0]["reference_worthy"] = False  # type: ignore[index]
+    codes = {
+        issue.code for issue in validate_final_reference_binding(sample, annotation)
+    }
+    assert "reference_entity_not_reference_worthy" in codes
 
 
 def test_filtered_entity_does_not_leave_dangling_token() -> None:

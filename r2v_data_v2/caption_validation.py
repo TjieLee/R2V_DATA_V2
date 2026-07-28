@@ -210,7 +210,8 @@ def validate_annotation(
         else:
             selected_spans.append((*spans[0], field))
     selected_spans.sort()
-    for left, right in zip(selected_spans, selected_spans[1:]):
+    for index in range(len(selected_spans) - 1):
+        left, right = selected_spans[index : index + 2]
         if right[0] < left[1]:
             issues.append(
                 _issue(

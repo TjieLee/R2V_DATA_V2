@@ -21,6 +21,8 @@ workflow, evidence chain, state machine, or complex resume manager.
 
 ## Install
 
+Python 3.12 or newer is required.
+
 ```bash
 git clone https://github.com/TjieLee/R2V_DATA_V2.git
 cd R2V_DATA_V2

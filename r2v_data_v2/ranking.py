@@ -348,23 +348,6 @@ def _top_candidate_sheet(
     sheet.save(destination, quality=90)
 
 
-def _ensure_best_frame_has_no_hard_rejection(
-    ranked: list[RankedCandidate],
-    best_frame_slot: int,
-) -> None:
-    selected = next(
-        (item for item in ranked if item.frame_slot == best_frame_slot),
-        None,
-    )
-    if selected is None:
-        raise ValueError("candidate review best_frame_slot was not ranked")
-    if selected.hard_rejection_reasons:
-        raise ValueError(
-            "candidate review best_frame_slot has hard rejection: "
-            + ", ".join(selected.hard_rejection_reasons)
-        )
-
-
 def _load_entity_candidates(
     candidate_dir: Path,
 ) -> tuple[list[dict[str, object]], dict[int, np.ndarray]]:
@@ -625,10 +608,6 @@ def rank_manifest_references(
                         for record, metrics in preliminary
                     ],
                     config=config.ranking,
-                )
-                _ensure_best_frame_has_no_hard_rejection(
-                    ranked,
-                    review_result.best_frame_slot,
                 )
                 valid = [item for item in ranked if not item.hard_rejection_reasons]
                 if not valid:
