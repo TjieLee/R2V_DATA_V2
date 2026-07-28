@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from r2v_data_v2.mask_utils import (
     fill_small_enclosed_holes,
     save_mask_contact_sheet,
 )
-from r2v_data_v2.sam3_backend import Sam3Backend
+from r2v_data_v2.sam3_backend import Sam3Backend, _write_candidates
 
 
 def test_mask_codec_is_lossless() -> None:
@@ -187,6 +188,58 @@ def test_ten_frame_mask_contact_sheet_uses_all_slots(tmp_path: Path) -> None:
 
     with Image.open(destination) as sheet:
         assert sheet.size == (48 * 5, 32 * 2)
+
+
+def test_all_ten_valid_candidate_masks_are_saved_as_rle(tmp_path: Path) -> None:
+    frame_paths = []
+    candidates = []
+    masks = {}
+    for slot in range(10):
+        path = tmp_path / f"frame_{slot:02d}.png"
+        Image.new("RGB", (48, 32), color=(slot * 20, 40, 80)).save(path)
+        frame_paths.append(path)
+        mask = np.zeros((32, 48), dtype=bool)
+        mask[6:26, 10 + slot : 30 + slot] = True
+        masks[slot] = mask
+        candidates.append(
+            {
+                "frame_slot": slot,
+                "source_frame_index": slot * 10,
+                "bbox_xyxy": [10 + slot, 6, 30 + slot, 26],
+                "mask_area_ratio": float(mask.mean()),
+                "sam_confidence": 0.99 - slot * 0.01,
+                "touches_border": False,
+                "visible": True,
+                "effective_short_side": 20,
+                "mask_rle_key": None,
+            }
+        )
+
+    _write_candidates(
+        output_root=tmp_path,
+        clip_uid="clip-1",
+        entity_id="e1",
+        candidates=candidates,
+        masks=masks,
+        frame_paths=frame_paths,
+        save_top_k=10,
+    )
+
+    candidate_dir = tmp_path / "candidates" / "clip-1" / "e1"
+    encoded = json.loads(
+        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    )
+    records = [
+        json.loads(line)
+        for line in (candidate_dir / "candidates.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(encoded) == 10
+    assert all(record["mask_rle_key"] in encoded for record in records)
+    for slot in range(10):
+        assert np.array_equal(decode_mask(encoded[f"frame_{slot:02d}"]), masks[slot])
+    assert not list(candidate_dir.glob("mask*.png"))
 
 
 def test_low_margin_multiple_instances_do_not_make_a_valid_anchor(

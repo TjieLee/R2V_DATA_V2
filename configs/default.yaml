@@ -27,7 +27,7 @@ ranking:
   maximum_mask_area_ratio: 0.75
   reject_border_touch: true
   top_k_for_vlm_judge: 3
-  save_top_k_mask_rle: 5
+  save_top_k_mask_rle: 10
   minimum_exposure_score: 0.35
   minimum_crop_subject_ratio: 0.08
   maximum_crop_subject_ratio: 0.92

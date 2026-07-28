@@ -167,8 +167,9 @@ Every selected reference keeps:
 - `foreground_rgba.png`: original foreground pixels with alpha;
 - `neutral_background.jpg`: original foreground on light gray.
 
-Candidate masks are stored as packed, zlib-compressed JSON for only the
-shortlist. The final selected mask is the only mandatory PNG mask.
+All valid candidate masks from the ten sampled slots are stored as packed,
+zlib-compressed JSON and participate in ranking. The final selected mask is the
+only mandatory PNG mask.
 Stage 04 also stores per-candidate ranking metadata and float16 DINOv3
 embeddings. The selected reference keeps `dinov3_embedding.npy` for downstream
 reuse. DINOv3 and SigLIP 2 can each be disabled; their score weight is then

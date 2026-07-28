@@ -49,7 +49,7 @@ class RankingConfig:
     maximum_mask_area_ratio: float = 0.75
     reject_border_touch: bool = True
     top_k_for_vlm_judge: int = 3
-    save_top_k_mask_rle: int = 5
+    save_top_k_mask_rle: int = 10
     minimum_exposure_score: float = 0.35
     minimum_crop_subject_ratio: float = 0.08
     maximum_crop_subject_ratio: float = 0.92
