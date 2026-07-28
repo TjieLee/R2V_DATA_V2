@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from r2v_data_v2.config import PairingConfig
+from r2v_data_v2.config import PairingConfig, PipelineConfig
 from r2v_data_v2.pairing import (
+    build_pairs,
     choose_cross_pair,
     cross_pair_passes,
     is_same_parent_cross_candidate,
 )
-from r2v_data_v2.schemas import CrossPairJudgeResult
+from r2v_data_v2.reference_binding import assign_reference_tokens
+from r2v_data_v2.schemas import CrossPairJudgeResult, QwenAnnotationResult
+from tests.test_caption_validation import _valid_payload
 
 
 def _reference(
@@ -145,3 +149,39 @@ def test_uncertain_or_near_duplicate_cross_pair_falls_back() -> None:
         _judgment(confidence=0.89),
         minimum_confidence=0.9,
     )
+
+
+def test_zero_reference_sample_is_not_written(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    manifests = output_root / "manifests"
+    manifests.mkdir(parents=True)
+    annotation = assign_reference_tokens(
+        QwenAnnotationResult.model_validate(_valid_payload())
+    )
+    record = {
+        **annotation.model_dump(mode="json"),
+        "clip_uid": "clip-1",
+        "video_path": "/read-only/video.mp4",
+        "parent_video_id": "parent",
+        "clip_suffix": "1_0",
+    }
+    (manifests / "annotations.jsonl").write_text(
+        json.dumps(record) + "\n",
+        encoding="utf-8",
+    )
+    (manifests / "references.jsonl").write_text("", encoding="utf-8")
+
+    stats = build_pairs(
+        PipelineConfig(
+            dataset_json=tmp_path / "source.jsonl",
+            output_root=output_root,
+        ),
+        judge=_FakeJudge(_judgment()),  # type: ignore[arg-type]
+    )
+
+    assert stats.failed == 1
+    assert not (manifests / "final_samples.jsonl").exists()
+    failure = json.loads(
+        (output_root / "logs" / "pairing_failed.jsonl").read_text(encoding="utf-8")
+    )
+    assert failure["issues"][0]["code"] == "no_references"

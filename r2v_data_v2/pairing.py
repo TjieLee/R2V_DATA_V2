@@ -12,7 +12,11 @@ from openai import BadRequestError, OpenAI
 from prompts.qwen_cross_pair_prompt import CROSS_PAIR_PROMPT
 from r2v_data_v2.config import PairingConfig, PipelineConfig, QwenConfig
 from r2v_data_v2.manifest import iter_source_records
-from r2v_data_v2.schemas import CrossPairJudgeResult
+from r2v_data_v2.reference_binding import (
+    rebuild_for_retained_entities,
+    validate_final_reference_binding,
+)
+from r2v_data_v2.schemas import AnnotationResult, CrossPairJudgeResult
 
 
 @dataclass(frozen=True)
@@ -218,6 +222,21 @@ def _append_jsonl(path: Path, value: dict[str, object]) -> None:
         handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
+def _annotation_from_record(record: dict[str, Any]) -> AnnotationResult:
+    return AnnotationResult.model_validate(
+        {
+            key: record.get(key)
+            for key in (
+                "caption",
+                "prompt_with_refs",
+                "entities",
+                "relations",
+                "background",
+            )
+        }
+    )
+
+
 def _target_reference(
     *,
     target: dict[str, Any],
@@ -269,8 +288,22 @@ def build_pairs(
             continue
         try:
             target_references = references.get(clip, [])
+            retained_annotation = rebuild_for_retained_entities(
+                _annotation_from_record(annotation),
+                {str(reference["entity_id"]) for reference in target_references},
+            )
+            retained_by_id = {
+                entity.entity_id: entity
+                for entity in retained_annotation.entities
+                if entity.reference_worthy
+            }
+            for target in target_references:
+                retained = retained_by_id[str(target["entity_id"])]
+                target["ref_token"] = retained.ref_token
+                target["phrase"] = retained.phrase
             final_references: list[dict[str, object]] = []
             warnings = list(annotation.get("warnings", []))
+            sample_in_pairs = sample_cross_pairs = sample_fallbacks = 0
             for target in target_references:
                 selected = target
                 pair_type = "in_pair"
@@ -292,9 +325,9 @@ def build_pairs(
                     if cross is not None:
                         selected, judgment, visual_similarity = cross
                         pair_type = "same_parent_cross_pair"
-                        cross_pairs += 1
+                        sample_cross_pairs += 1
                     elif config.pairing.cross_pair_fallback_to_in_pair:
-                        fallbacks += 1
+                        sample_fallbacks += 1
                         warnings.append(
                             f"{target['entity_id']}: no verified cross-pair; used in-pair"
                         )
@@ -304,7 +337,7 @@ def build_pairs(
                             f"{target['entity_id']}: no permitted reference pair"
                         )
                         continue
-                    in_pairs += 1
+                    sample_in_pairs += 1
                 final_references.append(
                     _target_reference(
                         target=target,
@@ -324,7 +357,7 @@ def build_pairs(
                 "clip_suffix": annotation["clip_suffix"],
                 "target_video": annotation["video_path"],
                 "caption": annotation["caption"],
-                "prompt_with_refs": annotation["prompt_with_refs"],
+                "prompt_with_refs": retained_annotation.prompt_with_refs,
                 "references": final_references,
                 "relations": annotation.get("relations", []),
                 "background_reference": background_reference,
@@ -337,6 +370,23 @@ def build_pairs(
                 },
                 "warnings": warnings,
             }
+            binding_issues = validate_final_reference_binding(
+                sample,
+                retained_annotation,
+            )
+            if binding_issues:
+                _append_jsonl(
+                    output_root / "logs" / "pairing_failed.jsonl",
+                    {
+                        "clip_uid": clip,
+                        "issues": [issue.to_dict() for issue in binding_issues],
+                    },
+                )
+                failed += 1
+                continue
+            in_pairs += sample_in_pairs
+            cross_pairs += sample_cross_pairs
+            fallbacks += sample_fallbacks
             _append_jsonl(final_path, sample)
             existing.add(clip)
             processed += 1

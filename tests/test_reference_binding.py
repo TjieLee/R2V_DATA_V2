@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +10,8 @@ from r2v_data_v2.reference_binding import (
     ReferenceBindingError,
     assign_reference_tokens,
     build_prompt_with_refs,
+    rebuild_for_retained_entities,
+    validate_final_reference_binding,
 )
 from r2v_data_v2.schemas import QwenAnnotationResult
 from tests.test_caption_validation import _valid_payload
@@ -174,3 +177,65 @@ def test_prompt_builder_rejects_overlap_even_with_manual_tokens() -> None:
             ],
             None,
         )
+
+
+def _final_sample(
+    tmp_path: Path,
+) -> tuple[dict[str, object], object]:
+    annotation = assign_reference_tokens(
+        QwenAnnotationResult.model_validate(_valid_payload())
+    )
+    image = tmp_path / "reference.jpg"
+    image.write_bytes(b"image")
+    sample: dict[str, object] = {
+        "prompt_with_refs": annotation.prompt_with_refs,
+        "references": [
+            {
+                "entity_id": "e1",
+                "phrase": annotation.entities[0].phrase,
+                "ref_token": annotation.entities[0].ref_token,
+                "image_path": str(image),
+            }
+        ],
+        "background_reference": None,
+    }
+    return sample, annotation
+
+
+def test_final_prompt_tokens_match_existing_reference(tmp_path: Path) -> None:
+    sample, annotation = _final_sample(tmp_path)
+    assert validate_final_reference_binding(sample, annotation) == []  # type: ignore[arg-type]
+
+
+def test_final_binding_rejects_missing_or_zero_reference(tmp_path: Path) -> None:
+    sample, annotation = _final_sample(tmp_path)
+    sample["references"][0]["image_path"] = str(tmp_path / "missing.jpg")  # type: ignore[index]
+    codes = {
+        issue.code
+        for issue in validate_final_reference_binding(
+            sample,
+            annotation,  # type: ignore[arg-type]
+        )
+    }
+    assert "reference_image_missing" in codes
+
+    sample["references"] = []
+    codes = {
+        issue.code
+        for issue in validate_final_reference_binding(
+            sample,
+            annotation,  # type: ignore[arg-type]
+        )
+    }
+    assert {"no_references", "final_prompt_token_mismatch"} <= codes
+
+
+def test_filtered_entity_does_not_leave_dangling_token() -> None:
+    annotation = assign_reference_tokens(
+        QwenAnnotationResult.model_validate(_multi_entity_payload())
+    )
+    retained = rebuild_for_retained_entities(annotation, {"e1"})
+    assert retained.entities[0].ref_token == "<ref_subject_1>"
+    assert all(entity.ref_token is None for entity in retained.entities[1:])
+    assert "<ref_object_" not in retained.prompt_with_refs
+    assert "<ref_group_" not in retained.prompt_with_refs
