@@ -752,6 +752,10 @@ def _preliminary_top_candidates(
         metric_name="sam_confidence",
         config=config,
     )
+    normalized_siglip = _normalized_siglip_scores(
+        candidates,
+        config=config,
+    )
     available_metrics = {
         "sharpness",
         "exposure",
@@ -764,11 +768,20 @@ def _preliminary_top_candidates(
         and all(candidate.dino_metrics is not None for candidate in candidates)
     ):
         available_metrics.add("dino_representativeness")
+    if (
+        config.evaluators.siglip2.enabled
+        and config.evaluators.siglip2.use_for_preselection
+        and all(
+            candidate.frame_slot in normalized_siglip for candidate in candidates
+        )
+    ):
+        available_metrics.add("siglip_alignment")
     weights = _effective_weights(config.preselection_weights, available_metrics)
     scored: list[tuple[float, CandidateWorkItem]] = []
     for candidate in candidates:
         components = {
             "dino_representativeness": normalized_dino[candidate.frame_slot],
+            "siglip_alignment": normalized_siglip.get(candidate.frame_slot, 0.0),
             "sharpness": normalized_sharpness[candidate.frame_slot],
             "exposure": normalized_exposure[candidate.frame_slot],
             "isolation": normalized_isolation[candidate.frame_slot],

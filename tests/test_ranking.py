@@ -20,7 +20,9 @@ from r2v_data_v2.config import (
 from r2v_data_v2.mask_utils import encode_mask
 from r2v_data_v2.metrics import CandidateMetrics, classify_entity_overlap
 from r2v_data_v2.ranking import (
+    CandidateWorkItem,
     _candidate_sheet_label,
+    _preliminary_top_candidates,
     _top_candidate_sheet,
     basic_hard_rejection_reasons,
     rank_candidates,
@@ -493,6 +495,125 @@ def test_siglip_can_be_record_only_and_qwen_visual_can_be_disabled() -> None:
     assert all("incomplete" not in candidate.hard_rejection_reasons for candidate in ranked)
 
 
+def _work_item(
+    slot: int,
+    *,
+    sam_confidence: float,
+    siglip_alignment: float | None = None,
+) -> CandidateWorkItem:
+    return CandidateWorkItem(
+        record={
+            "frame_slot": slot,
+            "source_frame_index": slot * 10,
+            "sam_confidence": sam_confidence,
+        },
+        metrics=_metrics(border_touch=False, sharpness=10),
+        neutral_crop=Image.new("RGB", (16, 16)),
+        hard_rejection_reasons=[],
+        alignment_metrics=(
+            AlignmentMetrics(
+                target_similarity=siglip_alignment,
+                alignment_margin=siglip_alignment,
+                best_matching_text="target",
+            )
+            if siglip_alignment is not None
+            else None
+        ),
+    )
+
+
+def test_siglip_alignment_changes_top_three_preselection() -> None:
+    candidates = [
+        _work_item(
+            slot,
+            sam_confidence=0.8,
+            siglip_alignment=1.0 if slot == 3 else 0.0,
+        )
+        for slot in range(4)
+    ]
+    config = RankingConfig(
+        top_k_for_vlm_judge=3,
+        evaluators=RankingEvaluatorsConfig(
+            siglip2=SiglipEvaluatorConfig(
+                enabled=True,
+                use_for_preselection=True,
+                use_for_final_score=False,
+            )
+        ),
+        preselection_weights={"siglip_alignment": 1.0},
+    )
+
+    selected = _preliminary_top_candidates(candidates, config=config)
+
+    assert [candidate.frame_slot for candidate in selected] == [3, 0, 1]
+
+
+@pytest.mark.parametrize(
+    ("evaluator", "weights"),
+    [
+        (
+            SiglipEvaluatorConfig(
+                enabled=True,
+                use_for_preselection=False,
+                use_for_final_score=False,
+            ),
+            {"siglip_alignment": 0.9, "sam_confidence": 0.1},
+        ),
+        (
+            SiglipEvaluatorConfig(enabled=False),
+            {"siglip_alignment": 0.9, "sam_confidence": 0.1},
+        ),
+    ],
+)
+def test_siglip_preselection_weight_is_removed_when_not_participating(
+    evaluator: SiglipEvaluatorConfig,
+    weights: dict[str, float],
+) -> None:
+    candidates = [
+        _work_item(
+            slot,
+            sam_confidence=0.5 + slot * 0.1,
+            siglip_alignment=1.0 if slot == 0 else 0.0,
+        )
+        for slot in range(4)
+    ]
+    config = RankingConfig(
+        top_k_for_vlm_judge=3,
+        evaluators=RankingEvaluatorsConfig(siglip2=evaluator),
+        preselection_weights=weights,
+    )
+
+    selected = _preliminary_top_candidates(candidates, config=config)
+
+    assert [candidate.frame_slot for candidate in selected] == [3, 2, 1]
+
+
+def test_dino_preselection_weight_is_removed_when_disabled() -> None:
+    candidates = [
+        _work_item(slot, sam_confidence=0.5 + slot * 0.1)
+        for slot in range(4)
+    ]
+    for candidate in candidates:
+        candidate.dino_metrics = TemporalRepresentationMetrics(
+            frame_slot=candidate.frame_slot,
+            dino_representativeness=1.0 if candidate.frame_slot == 0 else 0.0,
+            dino_nearest_similarity=0.9,
+            dino_cluster_id=0,
+            dino_in_stable_cluster=True,
+        )
+    config = RankingConfig(
+        top_k_for_vlm_judge=3,
+        preselection_weights={
+            "dino_representativeness": 0.9,
+            "sam_confidence": 0.1,
+        },
+    )
+
+    selected = _preliminary_top_candidates(candidates, config=config)
+
+    assert [candidate.frame_slot for candidate in selected] == [3, 2, 1]
+
+
 class _FakeDinoEmbedder:
     def encode(self, images: list[Image.Image]) -> np.ndarray:
         assert len(images) == 3
@@ -555,7 +676,33 @@ class _NeverCalledCandidateJudge:
         raise AssertionError("Qwen candidate judge must remain disabled")
 
 
-def _write_ranking_fixture(output_root: Path) -> None:
+class _RecordingCandidateJudge:
+    def __init__(self) -> None:
+        self.frame_slots: list[int] = []
+
+    def review(
+        self,
+        *,
+        entity_id: str,
+        entity_phrase: str,
+        contact_sheet: Path,
+        frame_slots: list[int],
+    ) -> CandidateJudgeResult:
+        del entity_phrase
+        assert contact_sheet.is_file()
+        self.frame_slots = frame_slots
+        return CandidateJudgeResult(
+            entity_id=entity_id,
+            candidates=[_review(slot) for slot in frame_slots],
+            best_frame_slot=frame_slots[0],
+        )
+
+
+def _write_ranking_fixture(
+    output_root: Path,
+    *,
+    candidate_count: int = 3,
+) -> None:
     annotation = {
         "clip_uid": "clip_1",
         "video_path": str(output_root / "source.mp4"),
@@ -612,7 +759,8 @@ def _write_ranking_fixture(output_root: Path) -> None:
     mask[40:200, 55:185] = True
     records = []
     encoded_masks = {}
-    for slot, confidence in enumerate((0.90, 0.95, 0.99)):
+    confidences = (0.90, 0.95, 0.99, 0.92)
+    for slot, confidence in enumerate(confidences[:candidate_count]):
         frame = np.full((240, 240, 3), 80 + slot * 30, dtype=np.uint8)
         assert cv2.imwrite(str(frame_dir / f"frame_{slot:02d}.jpg"), frame)
         key = f"mask_{slot}"
@@ -805,3 +953,22 @@ def test_disabled_qwen_visual_skips_contact_sheet_and_judge(tmp_path: Path) -> N
     assert not (candidate_dir / "selected" / "top_candidates.jpg").exists()
     assert reference_metadata["qwen_suggested_best_frame_slot"] is None
     assert reference_metadata["visual_review"]["completeness"] == 0.5
+
+
+def test_only_top_three_candidates_enter_qwen_judge(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_ranking_fixture(output_root, candidate_count=4)
+    judge = _RecordingCandidateJudge()
+
+    stats = rank_manifest_references(
+        PipelineConfig(
+            dataset_json=tmp_path / "source.jsonl",
+            output_root=output_root,
+            qwen=QwenConfig(model="served-model-name"),
+        ),
+        judge=judge,  # type: ignore[arg-type]
+    )
+
+    assert stats.processed == 1
+    assert len(judge.frame_slots) == 3
+    assert set(judge.frame_slots).issubset({0, 1, 2, 3})
