@@ -37,6 +37,26 @@ FINAL_METRICS = frozenset(
         "sam_confidence",
     }
 )
+NORMALIZATION_METRICS = frozenset(
+    {
+        "dino_representativeness",
+        "siglip_alignment",
+        "sharpness",
+        "exposure",
+        "isolation",
+        "sam_confidence",
+        "qwen_completeness",
+        "qwen_recognizability",
+        "qwen_mask_quality",
+        "qwen_visual_quality",
+        "inverse_qwen_occlusion",
+        "mask_area_continuity",
+        "crop_subject_ratio",
+    }
+)
+NORMALIZATION_METHODS = frozenset(
+    {"identity", "minmax", "robust_minmax", "fixed_range"}
+)
 
 
 def _is_at_or_below(path: Path, root: Path) -> bool:
@@ -139,6 +159,30 @@ def _default_final_weights() -> dict[str, float]:
 
 
 @dataclass(frozen=True)
+class MetricNormalizationConfig:
+    method: str = "identity"
+    minimum: float | None = None
+    maximum: float | None = None
+
+
+def _default_normalization() -> dict[str, MetricNormalizationConfig]:
+    return {
+        "dino_representativeness": MetricNormalizationConfig(
+            method="fixed_range",
+            minimum=0.60,
+            maximum=0.95,
+        ),
+        "siglip_alignment": MetricNormalizationConfig(method="robust_minmax"),
+        "sharpness": MetricNormalizationConfig(method="robust_minmax"),
+        **{
+            name: MetricNormalizationConfig()
+            for name in NORMALIZATION_METRICS
+            - {"dino_representativeness", "siglip_alignment", "sharpness"}
+        },
+    }
+
+
+@dataclass(frozen=True)
 class RankingConfig:
     minimum_effective_short_side: int = 128
     minimum_mask_area_ratio: float = 0.005
@@ -155,6 +199,9 @@ class RankingConfig:
         default_factory=_default_preselection_weights
     )
     final_weights: dict[str, float] = field(default_factory=_default_final_weights)
+    normalization: dict[str, MetricNormalizationConfig] = field(
+        default_factory=_default_normalization
+    )
     dinov3_repo_dir: Path = Path("/mnt/workspace/public/pretrained/dinov3")
     dinov3_model_path: Path | None = None
     dinov3_model_name: str = "dinov3_vits16"
@@ -268,6 +315,14 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError(
             f"unknown ranking evaluators: {sorted(evaluator_values)}"
         )
+    normalization_values = dict(ranking.pop("normalization", {}))
+    normalization = _default_normalization()
+    for metric_name, metric_config in normalization_values.items():
+        if not isinstance(metric_config, dict):
+            raise TypeError(
+                f"ranking.normalization.{metric_name} must be a mapping"
+            )
+        normalization[metric_name] = MetricNormalizationConfig(**metric_config)
     pairing = dict(raw.get("pairing", {}))
     augmentation = dict(raw.get("augmentation", {}))
     sam3["code_root"] = Path(
@@ -298,6 +353,7 @@ def load_config(path: str | Path) -> PipelineConfig:
                 dinov3=DinoEvaluatorConfig(**dino_evaluator),
                 siglip2=SiglipEvaluatorConfig(**siglip_evaluator),
             ),
+            normalization=normalization,
         ),
         pairing=PairingConfig(**pairing),
         augmentation=AugmentationConfig(**augmentation),
@@ -367,6 +423,7 @@ def _validate_config(config: PipelineConfig) -> None:
         known_metrics=FINAL_METRICS,
         enabled_metrics=_enabled_final_metrics(config.ranking),
     )
+    _validate_normalization(config.ranking.normalization)
     if config.ranking.evaluators.dinov3.enabled:
         model_path = config.ranking.dinov3_model_path
         if model_path is None:
@@ -471,6 +528,36 @@ def _validate_metric_weights(
         raise ValueError(f"{name} must have at least one enabled positive weight")
 
 
+def _validate_normalization(
+    normalization: dict[str, MetricNormalizationConfig],
+) -> None:
+    unknown = sorted(set(normalization) - NORMALIZATION_METRICS)
+    if unknown:
+        raise ValueError(
+            f"ranking.normalization contains unknown metrics: {unknown}"
+        )
+    missing = sorted(NORMALIZATION_METRICS - set(normalization))
+    if missing:
+        raise ValueError(
+            f"ranking.normalization is missing metrics: {missing}"
+        )
+    for metric_name, policy in normalization.items():
+        if policy.method not in NORMALIZATION_METHODS:
+            raise ValueError(
+                f"ranking.normalization.{metric_name}.method must be one of "
+                f"{sorted(NORMALIZATION_METHODS)}"
+            )
+        if policy.method == "fixed_range" and (
+            policy.minimum is None
+            or policy.maximum is None
+            or policy.minimum >= policy.maximum
+        ):
+            raise ValueError(
+                f"ranking.normalization.{metric_name} fixed_range requires "
+                "minimum < maximum"
+            )
+
+
 def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
     return {
         "dataset_json": str(config.dataset_json),
@@ -493,6 +580,10 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
                 "qwen_visual": vars(config.ranking.evaluators.qwen_visual),
                 "dinov3": vars(config.ranking.evaluators.dinov3),
                 "siglip2": vars(config.ranking.evaluators.siglip2),
+            },
+            "normalization": {
+                name: vars(policy)
+                for name, policy in config.ranking.normalization.items()
             },
             "dinov3_repo_dir": str(config.ranking.dinov3_repo_dir),
             "dinov3_model_path": (

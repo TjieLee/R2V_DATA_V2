@@ -150,6 +150,15 @@ ranking:
   siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
 ```
 
+Evaluator execution, preselection participation, final-score participation, and
+pilot hard gates are separate switches. `ranking.preselection_weights` and
+`ranking.final_weights` accept only the metric names shown in
+`configs/default.yaml`; enabled positive weights are normalized at runtime, so
+they do not need to sum to one. Metric scaling is explicit under
+`ranking.normalization` and supports only `identity`, `minmax`,
+`robust_minmax`, and `fixed_range`. Hard gates always use raw measurements or
+raw model judgments, never candidate-relative normalized values.
+
 SigLIP 2 is also local-only at runtime. Download it explicitly into the
 writable user model directory:
 

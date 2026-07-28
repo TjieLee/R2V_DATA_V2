@@ -262,3 +262,33 @@ def test_zero_enabled_ranking_weights_are_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="at least one enabled positive weight"):
         load_config(config_path)
+
+
+def test_invalid_normalization_policy_is_rejected(tmp_path: Path) -> None:
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml=(
+            "  normalization:\n"
+            "    sharpness:\n"
+            "      method: zscore\n"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="method must be one of"):
+        load_config(config_path)
+
+
+def test_fixed_range_normalization_requires_ordered_bounds(tmp_path: Path) -> None:
+    config_path = _write_visual_model_config(
+        tmp_path,
+        ranking_yaml=(
+            "  normalization:\n"
+            "    dino_representativeness:\n"
+            "      method: fixed_range\n"
+            "      minimum: 0.9\n"
+            "      maximum: 0.6\n"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="minimum < maximum"):
+        load_config(config_path)

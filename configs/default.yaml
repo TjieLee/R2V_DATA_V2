@@ -72,6 +72,35 @@ ranking:
     isolation: 0.04
     crop_subject_ratio: 0.03
     sam_confidence: 0.02
+  normalization:
+    dino_representativeness:
+      method: fixed_range
+      minimum: 0.60
+      maximum: 0.95
+    siglip_alignment:
+      method: robust_minmax
+    sharpness:
+      method: robust_minmax
+    exposure:
+      method: identity
+    isolation:
+      method: identity
+    sam_confidence:
+      method: identity
+    qwen_completeness:
+      method: identity
+    qwen_recognizability:
+      method: identity
+    qwen_mask_quality:
+      method: identity
+    qwen_visual_quality:
+      method: identity
+    inverse_qwen_occlusion:
+      method: identity
+    mask_area_continuity:
+      method: identity
+    crop_subject_ratio:
+      method: identity
   dinov3_repo_dir: /mnt/workspace/public/pretrained/dinov3
   dinov3_model_path: null
   dinov3_model_name: dinov3_vits16

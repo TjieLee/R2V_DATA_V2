@@ -21,6 +21,7 @@ from r2v_data_v2.metrics import (
     calculate_candidate_metrics,
     padded_crop_box,
 )
+from r2v_data_v2.normalization import normalize_metric_values
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
 from r2v_data_v2.reference_image import build_neutral_subject_crop
 from r2v_data_v2.schemas import (
@@ -101,13 +102,27 @@ def _clamp_unit(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
 
 
-def _min_max(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    low, high = min(values), max(values)
-    if high == low:
-        return [0.5] * len(values)
-    return [(value - low) / (high - low) for value in values]
+def _normalized_by_slot(
+    *,
+    frame_slots: list[int],
+    raw_values: list[float],
+    metric_name: str,
+    config: RankingConfig,
+) -> dict[int, float]:
+    if len(frame_slots) != len(raw_values):
+        raise ValueError("normalization slots and values must have equal lengths")
+    try:
+        policy = config.normalization[metric_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"missing normalization policy for metric: {metric_name}"
+        ) from exc
+    return dict(
+        zip(
+            frame_slots,
+            normalize_metric_values(raw_values, policy),
+        )
+    )
 
 
 def _isolation_score(metrics: CandidateMetrics) -> float:
@@ -224,31 +239,105 @@ def rank_candidates(
     normalized_siglip_scores_by_slot = normalized_siglip_scores_by_slot or {}
     best_matching_entity_ids = best_matching_entity_ids or {}
     siglip_wrong_entity_slots = siglip_wrong_entity_slots or set()
-    normalized_sharpness_by_slot = dict(
-        zip(
-            [item[0] for item in candidates],
-            _min_max([item[3].tenengrad_sharpness for item in candidates]),
-        )
-    )
+    frame_slots = [item[0] for item in candidates]
+    normalized_by_metric = {
+        "sharpness": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[3].tenengrad_sharpness for item in candidates],
+            metric_name="sharpness",
+            config=config,
+        ),
+        "exposure": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[3].exposure_score for item in candidates],
+            metric_name="exposure",
+            config=config,
+        ),
+        "isolation": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[_isolation_score(item[3]) for item in candidates],
+            metric_name="isolation",
+            config=config,
+        ),
+        "crop_subject_ratio": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[_crop_subject_ratio_score(item[3]) for item in candidates],
+            metric_name="crop_subject_ratio",
+            config=config,
+        ),
+        "sam_confidence": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[2] for item in candidates],
+            metric_name="sam_confidence",
+            config=config,
+        ),
+        "mask_area_continuity": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[3].mask_area_continuity for item in candidates],
+            metric_name="mask_area_continuity",
+            config=config,
+        ),
+        "qwen_completeness": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[4].completeness for item in candidates],
+            metric_name="qwen_completeness",
+            config=config,
+        ),
+        "qwen_recognizability": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[4].recognizability for item in candidates],
+            metric_name="qwen_recognizability",
+            config=config,
+        ),
+        "qwen_mask_quality": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[4].mask_quality for item in candidates],
+            metric_name="qwen_mask_quality",
+            config=config,
+        ),
+        "qwen_visual_quality": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[4].visual_quality for item in candidates],
+            metric_name="qwen_visual_quality",
+            config=config,
+        ),
+        "inverse_qwen_occlusion": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[1.0 - item[4].occlusion for item in candidates],
+            metric_name="inverse_qwen_occlusion",
+            config=config,
+        ),
+        "dino_representativeness": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[
+                (
+                    dino_metrics_by_slot[slot].dino_representativeness
+                    if slot in dino_metrics_by_slot
+                    else 0.0
+                )
+                for slot in frame_slots
+            ],
+            metric_name="dino_representativeness",
+            config=config,
+        ),
+    }
     aligned_slots = [
         frame_slot
         for frame_slot, _, _, _, _ in candidates
         if frame_slot in alignment_metrics_by_slot
     ]
-    normalized_siglip_by_slot = dict(
-        zip(
-            aligned_slots,
-            _min_max(
-                [
-                    float(
-                        alignment_metrics_by_slot[slot].alignment_margin
-                        if alignment_metrics_by_slot[slot].alignment_margin is not None
-                        else alignment_metrics_by_slot[slot].target_similarity
-                    )
-                    for slot in aligned_slots
-                ]
-            ),
-        )
+    normalized_siglip_by_slot = _normalized_by_slot(
+        frame_slots=aligned_slots,
+        raw_values=[
+            float(
+                alignment_metrics_by_slot[slot].alignment_margin
+                if alignment_metrics_by_slot[slot].alignment_margin is not None
+                else alignment_metrics_by_slot[slot].target_similarity
+            )
+            for slot in aligned_slots
+        ],
+        metric_name="siglip_alignment",
+        config=config,
     )
     normalized_siglip_by_slot.update(normalized_siglip_scores_by_slot)
     available_metrics = {
@@ -297,25 +386,37 @@ def rank_candidates(
             siglip_wrong_entity=frame_slot in siglip_wrong_entity_slots,
         )
         component_scores = {
-            "dino_representativeness": (
-                _clamp_unit(dino_metrics.dino_representativeness)
-                if dino_metrics is not None
-                else 0.0
-            ),
-            "qwen_completeness": visual_review.completeness,
-            "qwen_recognizability": visual_review.recognizability,
+            "dino_representativeness": normalized_by_metric[
+                "dino_representativeness"
+            ][frame_slot],
+            "qwen_completeness": normalized_by_metric["qwen_completeness"][
+                frame_slot
+            ],
+            "qwen_recognizability": normalized_by_metric[
+                "qwen_recognizability"
+            ][frame_slot],
             "siglip_alignment": normalized_siglip_by_slot.get(frame_slot, 0.0),
-            "qwen_mask_quality": visual_review.mask_quality,
-            "mask_area_continuity": metrics.mask_area_continuity,
+            "qwen_mask_quality": normalized_by_metric["qwen_mask_quality"][
+                frame_slot
+            ],
+            "mask_area_continuity": normalized_by_metric[
+                "mask_area_continuity"
+            ][frame_slot],
             "sharpness_exposure": (
-                0.6 * normalized_sharpness_by_slot[frame_slot]
-                + 0.4 * metrics.exposure_score
+                0.6 * normalized_by_metric["sharpness"][frame_slot]
+                + 0.4 * normalized_by_metric["exposure"][frame_slot]
             ),
-            "qwen_visual_quality": visual_review.visual_quality,
-            "inverse_qwen_occlusion": 1.0 - visual_review.occlusion,
-            "isolation": _isolation_score(metrics),
-            "crop_subject_ratio": _crop_subject_ratio_score(metrics),
-            "sam_confidence": sam_confidence,
+            "qwen_visual_quality": normalized_by_metric["qwen_visual_quality"][
+                frame_slot
+            ],
+            "inverse_qwen_occlusion": normalized_by_metric[
+                "inverse_qwen_occlusion"
+            ][frame_slot],
+            "isolation": normalized_by_metric["isolation"][frame_slot],
+            "crop_subject_ratio": normalized_by_metric["crop_subject_ratio"][
+                frame_slot
+            ],
+            "sam_confidence": normalized_by_metric["sam_confidence"][frame_slot],
         }
         score = sum(
             weights[name] * _clamp_unit(component_scores[name]) for name in weights
@@ -611,8 +712,45 @@ def _preliminary_top_candidates(
 ) -> list[CandidateWorkItem]:
     if not candidates:
         return []
-    normalized_sharpness = _min_max(
-        [candidate.metrics.tenengrad_sharpness for candidate in candidates]
+    frame_slots = [candidate.frame_slot for candidate in candidates]
+    normalized_sharpness = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[
+            candidate.metrics.tenengrad_sharpness for candidate in candidates
+        ],
+        metric_name="sharpness",
+        config=config,
+    )
+    normalized_dino = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[
+            (
+                candidate.dino_metrics.dino_representativeness
+                if candidate.dino_metrics is not None
+                else 0.0
+            )
+            for candidate in candidates
+        ],
+        metric_name="dino_representativeness",
+        config=config,
+    )
+    normalized_exposure = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[candidate.metrics.exposure_score for candidate in candidates],
+        metric_name="exposure",
+        config=config,
+    )
+    normalized_isolation = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[_isolation_score(candidate.metrics) for candidate in candidates],
+        metric_name="isolation",
+        config=config,
+    )
+    normalized_sam = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[candidate.sam_confidence for candidate in candidates],
+        metric_name="sam_confidence",
+        config=config,
     )
     available_metrics = {
         "sharpness",
@@ -628,17 +766,13 @@ def _preliminary_top_candidates(
         available_metrics.add("dino_representativeness")
     weights = _effective_weights(config.preselection_weights, available_metrics)
     scored: list[tuple[float, CandidateWorkItem]] = []
-    for index, candidate in enumerate(candidates):
+    for candidate in candidates:
         components = {
-            "dino_representativeness": (
-                _clamp_unit(candidate.dino_metrics.dino_representativeness)
-                if candidate.dino_metrics is not None
-                else 0.0
-            ),
-            "sharpness": normalized_sharpness[index],
-            "exposure": candidate.metrics.exposure_score,
-            "isolation": _isolation_score(candidate.metrics),
-            "sam_confidence": candidate.sam_confidence,
+            "dino_representativeness": normalized_dino[candidate.frame_slot],
+            "sharpness": normalized_sharpness[candidate.frame_slot],
+            "exposure": normalized_exposure[candidate.frame_slot],
+            "isolation": normalized_isolation[candidate.frame_slot],
+            "sam_confidence": normalized_sam[candidate.frame_slot],
         }
         score = sum(
             weights[name] * _clamp_unit(components[name]) for name in weights
@@ -655,6 +789,8 @@ def _preliminary_top_candidates(
 
 def _normalized_siglip_scores(
     candidates: list[CandidateWorkItem],
+    *,
+    config: RankingConfig,
 ) -> dict[int, float]:
     aligned = [
         candidate for candidate in candidates if candidate.alignment_metrics is not None
@@ -667,11 +803,11 @@ def _normalized_siglip_scores(
         )
         for candidate in aligned
     ]
-    return dict(
-        zip(
-            [candidate.frame_slot for candidate in aligned],
-            _min_max([float(value) for value in raw_scores]),
-        )
+    return _normalized_by_slot(
+        frame_slots=[candidate.frame_slot for candidate in aligned],
+        raw_values=[float(value) for value in raw_scores],
+        metric_name="siglip_alignment",
+        config=config,
     )
 
 
@@ -1026,11 +1162,26 @@ def rank_manifest_references(
                             embeddings=embeddings,
                             model_name=config.ranking.dinov3_model_name,
                         )
-                        normalized_sharpness = _min_max(
-                            [
+                        frame_slots = [
+                            item.frame_slot for item in model_candidates
+                        ]
+                        normalized_sharpness = _normalized_by_slot(
+                            frame_slots=frame_slots,
+                            raw_values=[
                                 item.metrics.tenengrad_sharpness
                                 for item in model_candidates
-                            ]
+                            ],
+                            metric_name="sharpness",
+                            config=config.ranking,
+                        )
+                        normalized_exposure = _normalized_by_slot(
+                            frame_slots=frame_slots,
+                            raw_values=[
+                                item.metrics.exposure_score
+                                for item in model_candidates
+                            ],
+                            metric_name="exposure",
+                            config=config.ranking,
                         )
                         (
                             temporal_metrics,
@@ -1043,9 +1194,9 @@ def rank_manifest_references(
                                 item.sam_confidence for item in model_candidates
                             ],
                             base_quality_scores=[
-                                0.6 * normalized_sharpness[index]
-                                + 0.4 * item.metrics.exposure_score
-                                for index, item in enumerate(model_candidates)
+                                0.6 * normalized_sharpness[item.frame_slot]
+                                + 0.4 * normalized_exposure[item.frame_slot]
+                                for item in model_candidates
                             ],
                             threshold=(
                                 config.ranking.dinov3_cluster_similarity_threshold
@@ -1155,7 +1306,8 @@ def rank_manifest_references(
                         continue
 
                     normalized_siglip_scores = _normalized_siglip_scores(
-                        model_candidates
+                        model_candidates,
+                        config=config.ranking,
                     )
                     qwen_suggested_best_frame_slot = None
                     reviews: dict[int, CandidateVisualReview] = {}
