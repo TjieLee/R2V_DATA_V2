@@ -72,14 +72,14 @@ def test_one_repair_can_succeed() -> None:
     client = _FakeAnnotationClient(
         ["not json", json.dumps(_valid_payload())],
     )
-    result, _ = client.annotate(frame_paths=[], caption_raw="draft")
+    result, _ = client.annotate(frame_paths=[], caption_raw="draft", metadata={})
     assert result.entities[0].entity_id == "e1"
 
 
 def test_two_failed_responses_are_preserved() -> None:
     client = _FakeAnnotationClient(["not json", '{"caption": "still invalid"}'])
     with pytest.raises(QwenAnnotationFailure) as caught:
-        client.annotate(frame_paths=[], caption_raw="draft")
+        client.annotate(frame_paths=[], caption_raw="draft", metadata={})
     assert caught.value.raw_responses == [
         "not json",
         '{"caption": "still invalid"}',

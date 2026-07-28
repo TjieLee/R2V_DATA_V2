@@ -123,7 +123,12 @@ def test_overlapping_phrase_spans_fail() -> None:
     with pytest.raises(ReferenceBindingError) as caught:
         assign_reference_tokens(annotation)
     assert "overlapping_phrase_spans" in {
-        issue.code for issue in validate_annotation(annotation)
+        issue.code
+        for issue in validate_annotation(
+            annotation,
+            caption_raw="",
+            metadata={},
+        )
     }
     assert caught.value.issues
 

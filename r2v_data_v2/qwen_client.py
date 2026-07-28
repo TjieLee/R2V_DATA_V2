@@ -138,6 +138,7 @@ class QwenAnnotationClient:
         *,
         frame_paths: list[Path],
         caption_raw: str,
+        metadata: dict[str, object],
         repair_prompt: str | None = None,
     ) -> list[dict[str, object]]:
         messages: list[dict[str, object]] = [
@@ -167,7 +168,7 @@ class QwenAnnotationClient:
                         "Draft caption and explicit metadata follow. Treat the draft "
                         "as evidence, not as trusted prose:\n"
                         + json.dumps(
-                            {"draft_caption": caption_raw, "metadata": {}},
+                            {"draft_caption": caption_raw, "metadata": metadata},
                             ensure_ascii=False,
                         )
                     )
@@ -213,6 +214,7 @@ class QwenAnnotationClient:
         *,
         frame_paths: list[Path],
         caption_raw: str,
+        metadata: dict[str, object],
     ) -> tuple[AnnotationResult, list[str]]:
         raw_responses: list[str] = []
         issues: list[ValidationIssue] = []
@@ -224,18 +226,24 @@ class QwenAnnotationClient:
                     validation_issues=issues,
                     json_schema=QwenAnnotationResult.model_json_schema(),
                     draft_caption=caption_raw,
+                    metadata=metadata,
                 )
             raw_response = self._request(
                 self._messages(
                     frame_paths=frame_paths,
                     caption_raw=caption_raw,
+                    metadata=metadata,
                     repair_prompt=repair_prompt,
                 )
             )
             raw_responses.append(raw_response)
             semantic, issues = _parse_issues(raw_response, QwenAnnotationResult)
             if semantic is not None:
-                issues = validate_annotation(semantic)
+                issues = validate_annotation(
+                    semantic,
+                    caption_raw=caption_raw,
+                    metadata=metadata,
+                )
             result = None
             if semantic is not None and not issues:
                 try:
@@ -289,6 +297,11 @@ def annotate_manifest(
             result, warnings = qwen.annotate(
                 frame_paths=frame_paths,
                 caption_raw=str(source.get("caption_raw", "")),
+                metadata=(
+                    source["metadata"]
+                    if isinstance(source.get("metadata"), dict)
+                    else {}
+                ),
             )
         except QwenAnnotationFailure as exc:
             _append_jsonl(

@@ -7,8 +7,22 @@ from r2v_data_v2.caption_validation import validate_annotation
 from r2v_data_v2.schemas import QwenAnnotationResult
 
 
-def _codes(result: QwenAnnotationResult) -> set[str]:
-    return {issue.code for issue in validate_annotation(result)}
+def _codes(
+    result: QwenAnnotationResult,
+    *,
+    caption_raw: str = "",
+    metadata: dict[str, object] | None = None,
+    visible_text: list[str] | None = None,
+) -> set[str]:
+    return {
+        issue.code
+        for issue in validate_annotation(
+            result,
+            caption_raw=caption_raw,
+            metadata=metadata or {},
+            visible_text=visible_text,
+        )
+    }
 
 
 def _valid_payload() -> dict[str, object]:
@@ -41,7 +55,7 @@ def _valid_payload() -> dict[str, object]:
 
 def test_valid_semantic_annotation() -> None:
     result = QwenAnnotationResult.model_validate(_valid_payload())
-    assert validate_annotation(result) == []
+    assert validate_annotation(result, caption_raw="", metadata={}) == []
 
 
 def test_reference_phrase_must_be_unique_in_caption() -> None:
@@ -102,4 +116,76 @@ def test_four_icl_examples_have_complete_valid_json() -> None:
     assert len(ICL_EXAMPLES) == 4
     for example in ICL_EXAMPLES:
         result = QwenAnnotationResult.model_validate(example["output"])
-        assert validate_annotation(result) == []
+        source = example["input"]
+        assert isinstance(source, dict)
+        assert (
+            validate_annotation(
+                result,
+                caption_raw=str(source["draft_caption"]),
+                metadata=source["metadata"],  # type: ignore[arg-type]
+            )
+            == []
+        )
+
+
+def _named_payload() -> dict[str, object]:
+    payload = _valid_payload()
+    payload["caption"] = str(payload["caption"]).replace(
+        "A woman in a red raincoat",
+        "Serena Williams",
+    )
+    entity = payload["entities"][0]  # type: ignore[index]
+    entity["phrase"] = "Serena Williams"  # type: ignore[index]
+    entity["canonical_label"] = "Serena Williams"  # type: ignore[index]
+    entity["genericity"] = "named"  # type: ignore[index]
+    return payload
+
+
+def test_named_identity_present_in_draft_caption_passes() -> None:
+    payload = _named_payload()
+    payload["entities"][0]["name_evidence"] = "draft_caption"  # type: ignore[index]
+    result = QwenAnnotationResult.model_validate(payload)
+    assert "named_identity_without_evidence" not in _codes(
+        result,
+        caption_raw="Serena Williams walks across a plaza.",
+    )
+
+
+def test_named_identity_cannot_lie_about_draft_caption_evidence() -> None:
+    payload = _named_payload()
+    payload["entities"][0]["name_evidence"] = "draft_caption"  # type: ignore[index]
+    result = QwenAnnotationResult.model_validate(payload)
+    assert "named_identity_without_evidence" in _codes(
+        result,
+        caption_raw="A tennis player walks across a plaza.",
+    )
+
+
+def test_named_identity_in_allowed_metadata_field_passes() -> None:
+    payload = _named_payload()
+    payload["entities"][0]["name_evidence"] = "metadata"  # type: ignore[index]
+    result = QwenAnnotationResult.model_validate(payload)
+    assert "named_identity_without_evidence" not in _codes(
+        result,
+        metadata={"person_name": "Serena Williams"},
+    )
+
+
+def test_named_identity_ignores_unapproved_metadata_fields() -> None:
+    payload = _named_payload()
+    payload["entities"][0]["name_evidence"] = "metadata"  # type: ignore[index]
+    result = QwenAnnotationResult.model_validate(payload)
+    assert "named_identity_without_evidence" in _codes(
+        result,
+        metadata={"identity_source": "Serena Williams"},
+    )
+
+
+def test_visible_text_evidence_is_rejected_until_ocr_exists() -> None:
+    payload = _named_payload()
+    payload["entities"][0]["name_evidence"] = "visible_text"  # type: ignore[index]
+    result = QwenAnnotationResult.model_validate(payload)
+    assert "named_identity_without_evidence" in _codes(
+        result,
+        visible_text=["Serena Williams"],
+    )

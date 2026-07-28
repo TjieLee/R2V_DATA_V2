@@ -8,6 +8,13 @@ from r2v_data_v2.schemas import QwenAnnotationResult
 
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
 _GENERIC_LABELS = {"man", "woman", "child", "person"}
+_ALLOWED_IDENTITY_METADATA_FIELDS = {
+    "title",
+    "caption",
+    "text",
+    "person_name",
+    "entity_names",
+}
 
 
 @dataclass(frozen=True)
@@ -68,7 +75,40 @@ def exact_phrase_occurrence_count(caption: str, phrase: str) -> int:
     return len(exact_phrase_spans(caption, phrase))
 
 
-def validate_annotation(result: QwenAnnotationResult) -> list[ValidationIssue]:
+def _metadata_text(metadata: dict[str, object]) -> str:
+    values: list[str] = []
+    for key in _ALLOWED_IDENTITY_METADATA_FIELDS:
+        value = metadata.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, str))
+    return " ".join(values)
+
+
+def _contains_identity(evidence: str, phrase: str, label: str) -> bool:
+    normalized = _normalize_whitespace(evidence).casefold()
+    for candidate in (phrase, label):
+        identity = _normalize_whitespace(candidate).casefold()
+        if not identity:
+            continue
+        pattern = re.escape(identity)
+        if identity[0].isalnum():
+            pattern = rf"(?<!\w){pattern}"
+        if identity[-1].isalnum():
+            pattern = rf"{pattern}(?!\w)"
+        if re.search(pattern, normalized):
+            return True
+    return False
+
+
+def validate_annotation(
+    result: QwenAnnotationResult,
+    *,
+    caption_raw: str,
+    metadata: dict[str, object],
+    visible_text: list[str] | None = None,
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     caption = result.caption.strip()
     if not caption:
@@ -192,14 +232,28 @@ def validate_annotation(result: QwenAnnotationResult) -> list[ValidationIssue]:
 
     for index, entity in enumerate(result.entities):
         field = f"entities[{index}]"
-        if entity.genericity == "named" and entity.name_evidence == "none":
-            issues.append(
-                _issue(
-                    "named_identity_without_evidence",
-                    f"{field}.name_evidence",
-                    "named identity has no explicit evidence",
+        if entity.genericity == "named":
+            evidence_valid = False
+            if entity.name_evidence == "draft_caption":
+                evidence_valid = _contains_identity(
+                    caption_raw,
+                    entity.phrase,
+                    entity.canonical_label,
                 )
-            )
+            elif entity.name_evidence == "metadata":
+                evidence_valid = _contains_identity(
+                    _metadata_text(metadata),
+                    entity.phrase,
+                    entity.canonical_label,
+                )
+            if not evidence_valid:
+                issues.append(
+                    _issue(
+                        "named_identity_without_evidence",
+                        f"{field}.name_evidence",
+                        "named identity is not supported by the declared input evidence",
+                    )
+                )
         if entity.separability == "attached_accessory" and entity.reference_worthy:
             issues.append(
                 _issue(

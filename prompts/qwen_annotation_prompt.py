@@ -28,8 +28,9 @@ Generic phrases such as "man", "woman", "child", and "person" are allowed when
 the video provides no reliable distinguishing attributes, but minimize them.
 Exclude actions, body parts, vague attributes, tiny incidental objects, and
 duplicate phrases referring to the same instance. A famous identity may be
-used only when supported by supplied metadata, the draft caption, or visible
-text; never identify a person from facial appearance alone.
+used only when its name appears in the supplied draft caption or metadata;
+never identify a person from facial appearance alone. OCR evidence is not
+available in this pipeline.
 
 PHRASES:
 Each reference-worthy entity phrase must be copied exactly from one unique
@@ -49,7 +50,7 @@ ICL_EXAMPLES: list[dict[str, object]] = [
     {
         "input": {
             "draft_caption": "Michael Jordan climbs a snowy ridge.",
-            "metadata": {"identity_source": "draft_caption"},
+            "metadata": {"person_name": "Michael Jordan"},
         },
         "output": {
             "caption": (

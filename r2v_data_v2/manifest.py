@@ -11,6 +11,14 @@ import ijson
 from r2v_data_v2.config import PipelineConfig
 from r2v_data_v2.naming import parse_clip_identity
 
+_IDENTITY_METADATA_FIELDS = (
+    "title",
+    "caption",
+    "text",
+    "person_name",
+    "entity_names",
+)
+
 
 @dataclass(frozen=True)
 class ManifestBuildStats:
@@ -82,6 +90,14 @@ def _record_caption(raw: dict[str, Any]) -> str:
         if isinstance(value, str):
             return value
     return ""
+
+
+def _record_identity_metadata(raw: dict[str, Any]) -> dict[str, object]:
+    return {
+        key: raw[key]
+        for key in _IDENTITY_METADATA_FIELDS
+        if isinstance(raw.get(key), (str, list))
+    }
 
 
 def _existing_clip_uids(path: Path) -> set[str]:
@@ -163,6 +179,7 @@ def build_manifest(
             "clip_uid": identity.clip_uid,
             "video_path": str(video_path),
             "caption_raw": _record_caption(raw),
+            "metadata": _record_identity_metadata(raw),
             "parent_video_id": identity.parent_video_id,
             "clip_suffix": identity.clip_suffix,
             "clip_order": list(identity.clip_order),
