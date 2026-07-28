@@ -9,6 +9,12 @@ qwen:
   max_tokens: 2048
   timeout_seconds: 3600
   repair_retries: 1
+  video:
+    input_mode: full_video
+    fps: 2.0
+    do_sample_frames: true
+    max_pixels: null
+    total_pixels: null
 
 frames:
   count: 10

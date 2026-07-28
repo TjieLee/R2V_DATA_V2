@@ -17,6 +17,15 @@ def _is_at_or_below(path: Path, root: Path) -> bool:
 
 
 @dataclass(frozen=True)
+class QwenVideoConfig:
+    input_mode: str = "full_video"
+    fps: float = 2.0
+    do_sample_frames: bool = True
+    max_pixels: int | None = None
+    total_pixels: int | None = None
+
+
+@dataclass(frozen=True)
 class QwenConfig:
     base_url: str = "http://localhost:8000/v1"
     api_key: str = "EMPTY"
@@ -25,6 +34,7 @@ class QwenConfig:
     max_tokens: int = 2048
     timeout_seconds: int = 3600
     repair_retries: int = 1
+    video: QwenVideoConfig = field(default_factory=QwenVideoConfig)
 
 
 @dataclass(frozen=True)
@@ -156,6 +166,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise TypeError("configuration must be a YAML mapping")
 
     qwen = dict(raw.get("qwen", {}))
+    qwen_video = dict(qwen.pop("video", {}))
     frames = dict(raw.get("frames", {}))
     sam3 = dict(raw.get("sam3", {}))
     ranking = dict(raw.get("ranking", {}))
@@ -179,7 +190,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     config = PipelineConfig(
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
         output_root=Path(str(raw["output_root"])).expanduser(),
-        qwen=QwenConfig(**qwen),
+        qwen=QwenConfig(**qwen, video=QwenVideoConfig(**qwen_video)),
         frames=FramesConfig(**frames),
         sam3=Sam3Config(**sam3),
         ranking=RankingConfig(**ranking),
@@ -202,6 +213,14 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("qwen.temperature must be 0.0 for deterministic annotation")
     if config.qwen.max_tokens > 2048:
         raise ValueError("qwen.max_tokens must not exceed 2048")
+    if config.qwen.video.input_mode != "full_video":
+        raise ValueError("qwen.video.input_mode currently only supports full_video")
+    if config.qwen.video.fps <= 0:
+        raise ValueError("qwen.video.fps must be positive")
+    if config.qwen.video.max_pixels is not None and config.qwen.video.max_pixels < 1:
+        raise ValueError("qwen.video.max_pixels must be positive when configured")
+    if config.qwen.video.total_pixels is not None and config.qwen.video.total_pixels < 1:
+        raise ValueError("qwen.video.total_pixels must be positive when configured")
     if config.sam3.minimum_visible_frames < 1:
         raise ValueError("sam3.minimum_visible_frames must be positive")
     if not 0.0 <= config.ranking.minimum_mask_area_ratio:
@@ -277,7 +296,10 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
     return {
         "dataset_json": str(config.dataset_json),
         "output_root": str(config.output_root),
-        "qwen": vars(config.qwen),
+        "qwen": {
+            **vars(config.qwen),
+            "video": vars(config.qwen.video),
+        },
         "frames": vars(config.frames),
         "sam3": {
             **vars(config.sam3),

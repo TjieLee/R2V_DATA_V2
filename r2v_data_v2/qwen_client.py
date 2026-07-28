@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -42,22 +41,25 @@ class QwenAnnotationFailure(StructuredOutputFailure):
     pass
 
 
-def _image_content(frame_paths: list[Path]) -> list[dict[str, object]]:
-    content: list[dict[str, object]] = [
+def _video_content(video_path: Path) -> list[dict[str, object]]:
+    return [
         {
-            "type": "text",
-            "text": "Inspect these ten frames in chronological order.",
-        }
+            "type": "video_url",
+            "video_url": {"url": video_path.resolve().as_uri()},
+        },
     ]
-    for path in frame_paths:
-        encoded = base64.b64encode(path.read_bytes()).decode()
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-            }
-        )
-    return content
+
+
+def _video_processor_extra_body(config: QwenConfig) -> dict[str, object]:
+    processor_kwargs: dict[str, object] = {
+        "fps": config.video.fps,
+        "do_sample_frames": config.video.do_sample_frames,
+    }
+    if config.video.max_pixels is not None:
+        processor_kwargs["max_pixels"] = config.video.max_pixels
+    if config.video.total_pixels is not None:
+        processor_kwargs["total_pixels"] = config.video.total_pixels
+    return {"mm_processor_kwargs": processor_kwargs}
 
 
 class QwenAnnotationClient:
@@ -72,7 +74,7 @@ class QwenAnnotationClient:
     def _messages(
         self,
         *,
-        frame_paths: list[Path],
+        video_path: Path,
         caption_raw: str,
         metadata: dict[str, object],
         repair_prompt: str | None = None,
@@ -93,7 +95,7 @@ class QwenAnnotationClient:
                     },
                 )
             )
-        current = _image_content(frame_paths)
+        current = _video_content(video_path)
         current.append(
             {
                 "type": "text",
@@ -122,6 +124,7 @@ class QwenAnnotationClient:
             "top_p": 1.0,
             "presence_penalty": 0.0,
             "max_tokens": self.config.max_tokens,
+            "extra_body": _video_processor_extra_body(self.config),
         }
         try:
             response = self.client.chat.completions.create(
@@ -148,7 +151,7 @@ class QwenAnnotationClient:
     def annotate(
         self,
         *,
-        frame_paths: list[Path],
+        video_path: Path,
         caption_raw: str,
         metadata: dict[str, object],
     ) -> tuple[AnnotationResult, list[str]]:
@@ -167,7 +170,7 @@ class QwenAnnotationClient:
             try:
                 raw_response = self._request(
                     self._messages(
-                        frame_paths=frame_paths,
+                        video_path=video_path,
                         caption_raw=caption_raw,
                         metadata=metadata,
                         repair_prompt=repair_prompt,
@@ -241,15 +244,12 @@ def annotate_manifest(
         if destination.is_file() and not overwrite:
             skipped += 1
             continue
-        frame_paths = [
-            output_root / "frames" / clip / f"frame_{slot:02d}.jpg"
-            for slot in range(config.frames.count)
-        ]
+        video_path = Path(str(source["video_path"]))
         try:
-            if not all(path.is_file() for path in frame_paths):
-                raise FileNotFoundError("ten sampled frames are required")
+            if not video_path.is_file():
+                raise FileNotFoundError(f"source video does not exist: {video_path}")
             result, warnings = qwen.annotate(
-                frame_paths=frame_paths,
+                video_path=video_path,
                 caption_raw=str(source.get("caption_raw", "")),
                 metadata=(
                     source["metadata"]

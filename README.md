@@ -7,8 +7,8 @@ The MVP follows one direct path:
 
 ```text
 source JSON/JSONL
--> fixed ten-frame sampling
--> Qwen caption, entities, and explicit ref bindings
+-> Qwen full-video caption, entities, and explicit ref bindings
+-> independent fixed ten-frame sampling
 -> SAM3 text-prompted masks
 -> hard gates, DINOv3 representativeness, optional SigLIP 2 alignment
 -> Top-3 Qwen candidate review and code-owned final ranking
@@ -69,9 +69,33 @@ Required server inputs:
 - `output_root`: a directory below `/mnt/workspace/litengjie/data/`.
 
 The Qwen service launch command depends on the model and vLLM version installed
-on the server. Do not use a language-model-only service for frame annotation.
-The pipeline sends the same ten JPEG frames to Qwen and SAM3; it never sends a
-Base64-encoded whole video.
+on the server. Do not use a language-model-only service for video annotation.
+Qwen receives a local `file://` URI for the complete source video while SAM3 and
+reference ranking use the independently sampled ten JPEG frames. The client
+does not Base64-encode the video or depend on the frame directory.
+
+The trusted server must explicitly allow vLLM to read the read-only dataset
+root, for example:
+
+```bash
+vllm serve /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct \
+  --allowed-local-media-path /mnt/workspace/public/dataset
+```
+
+Configure Qwen's internal video processing independently from SAM3 sampling:
+
+```yaml
+qwen:
+  video:
+    input_mode: full_video
+    fps: 2.0
+    do_sample_frames: true
+    max_pixels: null
+    total_pixels: null
+```
+
+The `fps`, optional pixel budgets, and internal sampling are forwarded to the
+Qwen/vLLM media processor. They do not change `frames.count`, which remains ten.
 
 Keep model and package caches in the writable user directory, for example:
 
@@ -133,7 +157,7 @@ Run the first 20 records:
 python run_pipeline.py \
   --config configs/server.local.yaml \
   --limit 20 \
-  --stages manifest,frames,qwen,sam,rank,pair
+  --stages manifest,qwen,frames,sam,rank,pair
 ```
 
 Stages are ordinary Python functions called in order, not subprocesses. Existing
@@ -144,8 +168,8 @@ Each stage can also run directly:
 
 ```bash
 python scripts/00_build_manifest.py --config configs/server.local.yaml --limit 20
-python scripts/01_sample_frames.py --config configs/server.local.yaml
 python scripts/02_qwen_annotate.py --config configs/server.local.yaml
+python scripts/01_sample_frames.py --config configs/server.local.yaml
 python scripts/03_sam3_extract.py \
   --config configs/server.local.yaml \
   --sam3-checkpoint /path/to/explicit/checkpoint.pt

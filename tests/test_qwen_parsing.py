@@ -8,11 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from prompts.qwen_annotation_prompt import SYSTEM_PROMPT
-from r2v_data_v2.config import PipelineConfig, QwenConfig
+from r2v_data_v2.config import PipelineConfig, QwenConfig, QwenVideoConfig
 from r2v_data_v2.qwen_client import (
     QwenAnnotationClient,
     QwenAnnotationFailure,
-    _image_content,
+    _video_content,
+    _video_processor_extra_body,
     annotate_manifest,
 )
 from r2v_data_v2.schemas import QwenAnnotationResult
@@ -60,27 +61,57 @@ def test_qwen_cannot_supply_tokens_or_final_prompt() -> None:
         parse_qwen_json_response(json.dumps(payload), QwenAnnotationResult)
 
 
-def test_qwen_prompt_and_image_content_require_ten_frames(tmp_path: Path) -> None:
-    assert "Inspect all ten frames" in SYSTEM_PROMPT
-    frame_paths = []
-    for slot in range(10):
-        path = tmp_path / f"frame_{slot:02d}.jpg"
-        path.write_bytes(b"jpeg")
-        frame_paths.append(path)
+def test_qwen_prompt_and_content_use_complete_video(tmp_path: Path) -> None:
+    assert "complete video" in SYSTEM_PROMPT
+    assert "ten frames" not in SYSTEM_PROMPT
+    video_path = tmp_path / "clip.mp4"
 
-    content = _image_content(frame_paths)
+    content = _video_content(video_path)
 
-    assert content[0]["text"] == "Inspect these ten frames in chronological order."
-    assert sum(item["type"] == "image_url" for item in content) == 10
+    assert content == [
+        {
+            "type": "video_url",
+            "video_url": {"url": video_path.resolve().as_uri()},
+        }
+    ]
+    assert not any(item["type"] == "image_url" for item in content)
+
+
+def test_qwen_video_processor_parameters_omit_null_pixel_budgets() -> None:
+    default = _video_processor_extra_body(QwenConfig())
+    assert default == {
+        "mm_processor_kwargs": {
+            "fps": 2.0,
+            "do_sample_frames": True,
+        }
+    }
+    configured = _video_processor_extra_body(
+        QwenConfig(
+            video=QwenVideoConfig(
+                fps=3.5,
+                do_sample_frames=False,
+                max_pixels=640_000,
+                total_pixels=2_560_000,
+            )
+        )
+    )
+    assert configured["mm_processor_kwargs"] == {
+        "fps": 3.5,
+        "do_sample_frames": False,
+        "max_pixels": 640_000,
+        "total_pixels": 2_560_000,
+    }
 
 
 class _FakeAnnotationClient(QwenAnnotationClient):
     def __init__(self, responses: list[str | Exception]) -> None:
         self.config = QwenConfig(repair_retries=1)
         self._responses: Iterator[str | Exception] = iter(responses)
+        self.requests: list[list[dict[str, object]]] = []
 
     def _request(self, messages: list[dict[str, object]]) -> str:
         assert messages
+        self.requests.append(messages)
         response = next(self._responses)
         if isinstance(response, Exception):
             raise response
@@ -91,14 +122,30 @@ def test_one_repair_can_succeed() -> None:
     client = _FakeAnnotationClient(
         ["not json", json.dumps(_valid_payload())],
     )
-    result, _ = client.annotate(frame_paths=[], caption_raw="draft", metadata={})
+    video_path = Path("/read-only/video.mp4")
+    result, _ = client.annotate(
+        video_path=video_path,
+        caption_raw="draft",
+        metadata={},
+    )
     assert result.entities[0].entity_id == "e1"
+    for messages in client.requests:
+        user_content = messages[-1]["content"]
+        assert isinstance(user_content, list)
+        assert user_content[0] == {
+            "type": "video_url",
+            "video_url": {"url": video_path.as_uri()},
+        }
 
 
 def test_two_failed_responses_are_preserved() -> None:
     client = _FakeAnnotationClient(["not json", '{"caption": "still invalid"}'])
     with pytest.raises(QwenAnnotationFailure) as caught:
-        client.annotate(frame_paths=[], caption_raw="draft", metadata={})
+        client.annotate(
+            video_path=Path("/read-only/video.mp4"),
+            caption_raw="draft",
+            metadata={},
+        )
     assert caught.value.raw_responses == [
         "not json",
         '{"caption": "still invalid"}',
@@ -109,7 +156,11 @@ def test_two_failed_responses_are_preserved() -> None:
 def test_repair_request_failure_preserves_first_raw_response() -> None:
     client = _FakeAnnotationClient(["not json", RuntimeError("service unavailable")])
     with pytest.raises(QwenAnnotationFailure) as caught:
-        client.annotate(frame_paths=[], caption_raw="draft", metadata={})
+        client.annotate(
+            video_path=Path("/read-only/video.mp4"),
+            caption_raw="draft",
+            metadata={},
+        )
     assert caught.value.attempt_count == 2
     assert caught.value.raw_responses == ["not json"]
     assert caught.value.issues[0].code == "qwen_request_failed"
@@ -117,13 +168,15 @@ def test_repair_request_failure_preserves_first_raw_response() -> None:
 
 def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None:
     output_root = tmp_path / "output"
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
     source_manifest = output_root / "manifests" / "source.jsonl"
     source_manifest.parent.mkdir(parents=True)
     source_manifest.write_text(
         json.dumps(
             {
                 "clip_uid": "clip-1",
-                "video_path": "/read-only/video.mp4",
+                "video_path": str(video_path),
                 "parent_video_id": "parent",
                 "clip_suffix": "1_0",
                 "clip_order": [1, 0],
@@ -133,11 +186,6 @@ def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None
         + "\n",
         encoding="utf-8",
     )
-    frame_dir = output_root / "frames" / "clip-1"
-    frame_dir.mkdir(parents=True)
-    for slot in range(10):
-        (frame_dir / f"frame_{slot:02d}.jpg").write_bytes(b"jpeg")
-
     stats = annotate_manifest(
         PipelineConfig(dataset_json=tmp_path / "source.jsonl", output_root=output_root),
         client=_FakeAnnotationClient(
@@ -161,17 +209,19 @@ def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None
     ) == ""
 
 
-def test_missing_one_of_ten_frames_is_logged_before_qwen_request(
+def test_qwen_annotation_does_not_require_sampled_frames(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "output"
+    video_path = tmp_path / "video.mp4"
+    video_path.write_bytes(b"video")
     source_manifest = output_root / "manifests" / "source.jsonl"
     source_manifest.parent.mkdir(parents=True)
     source_manifest.write_text(
         json.dumps(
             {
                 "clip_uid": "clip-1",
-                "video_path": "/read-only/video.mp4",
+                "video_path": str(video_path),
                 "parent_video_id": "parent",
                 "clip_suffix": "1_0",
                 "clip_order": [1, 0],
@@ -181,21 +231,54 @@ def test_missing_one_of_ten_frames_is_logged_before_qwen_request(
         + "\n",
         encoding="utf-8",
     )
-    frame_dir = output_root / "frames" / "clip-1"
-    frame_dir.mkdir(parents=True)
-    for slot in range(9):
-        (frame_dir / f"frame_{slot:02d}.jpg").write_bytes(b"jpeg")
+    stats = annotate_manifest(
+        PipelineConfig(
+            dataset_json=tmp_path / "source.jsonl",
+            output_root=output_root,
+        ),
+        client=_FakeAnnotationClient([json.dumps(_valid_payload())]),
+    )
+
+    assert stats.processed == 1
+    assert stats.qwen_failed == 0
+    assert not (output_root / "frames").exists()
+    assert (output_root / "annotations" / "clip-1.json").is_file()
+
+
+def test_missing_source_video_is_logged_before_qwen_request(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    source_manifest = output_root / "manifests" / "source.jsonl"
+    source_manifest.parent.mkdir(parents=True)
+    missing_video = tmp_path / "missing.mp4"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "video_path": str(missing_video),
+                "parent_video_id": "parent",
+                "clip_suffix": "1_0",
+                "clip_order": [1, 0],
+                "caption_raw": "draft",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    client = _FakeAnnotationClient([])
 
     stats = annotate_manifest(
         PipelineConfig(
             dataset_json=tmp_path / "source.jsonl",
             output_root=output_root,
         ),
-        client=_FakeAnnotationClient([]),
+        client=client,
     )
 
     failure = json.loads(
         (output_root / "logs" / "qwen_failed.jsonl").read_text(encoding="utf-8")
     )
     assert stats.qwen_failed == 1
-    assert failure["issues"][0]["message"] == "ten sampled frames are required"
+    assert failure["issues"][0]["message"] == (
+        f"source video does not exist: {missing_video}"
+    )
+    assert client.requests == []

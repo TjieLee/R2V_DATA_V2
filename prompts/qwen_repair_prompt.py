@@ -14,8 +14,8 @@ def build_repair_prompt(
     metadata: dict[str, object],
 ) -> str:
     return (
-        "Repair only the listed errors in the annotation. Reinspect the same ten "
-        "frames, preserve supported visible facts, and return one JSON object only."
+        "Repair only the listed errors in the annotation. Reinspect the same complete "
+        "video, preserve supported visible facts, and return one JSON object only."
         "\nOriginal draft caption:\n"
         f"{draft_caption}\nAllowed metadata evidence:\n"
         f"{json.dumps(metadata, ensure_ascii=False)}\nJSON Schema:\n"

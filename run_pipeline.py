@@ -13,7 +13,7 @@ from r2v_data_v2.ranking import rank_manifest_references
 from r2v_data_v2.sam3_backend import extract_manifest_candidates
 from r2v_data_v2.video_io import sample_manifest_frames
 
-_STAGE_ORDER = ("manifest", "frames", "qwen", "sam", "rank", "pair", "augment")
+_STAGE_ORDER = ("manifest", "qwen", "frames", "sam", "rank", "pair", "augment")
 
 
 def run_pipeline(
@@ -89,8 +89,8 @@ def main() -> None:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument(
         "--stages",
-        default="manifest,frames,qwen,sam,rank,pair",
-        help="comma-separated subset of manifest,frames,qwen,sam,rank,pair,augment",
+        default="manifest,qwen,frames,sam,rank,pair",
+        help="comma-separated subset of manifest,qwen,frames,sam,rank,pair,augment",
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
