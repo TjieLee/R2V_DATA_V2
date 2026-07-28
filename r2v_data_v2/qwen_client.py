@@ -2,19 +2,26 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from openai import BadRequestError, OpenAI
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from prompts.qwen_annotation_prompt import ICL_EXAMPLES, SYSTEM_PROMPT
 from prompts.qwen_repair_prompt import build_repair_prompt
-from r2v_data_v2.caption_validation import annotation_warnings, validate_annotation
+from r2v_data_v2.caption_validation import (
+    ValidationIssue,
+    annotation_warnings,
+    validate_annotation,
+)
 from r2v_data_v2.config import PipelineConfig, QwenConfig
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.schemas import AnnotationResult
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 @dataclass(frozen=True)
@@ -26,12 +33,73 @@ class AnnotationStats:
     generic_entity_labels: int = 0
 
 
-def _json_from_response(content: str) -> str:
+class QwenAnnotationFailure(ValueError):
+    def __init__(
+        self,
+        *,
+        raw_responses: list[str],
+        issues: list[ValidationIssue],
+    ) -> None:
+        super().__init__("Qwen annotation failed parsing or semantic validation")
+        self.raw_responses = raw_responses
+        self.issues = issues
+
+
+def _strip_complete_json_fence(content: str) -> str:
     stripped = content.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.split("\n", 1)[-1]
-        stripped = stripped.rsplit("```", 1)[0]
-    return stripped.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    match = re.fullmatch(
+        r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        raise ValueError("response must be one complete JSON object")
+    return match.group(1).strip()
+
+
+def parse_qwen_json_response(raw: str, model: type[ModelT]) -> ModelT:
+    payload = json.loads(_strip_complete_json_fence(raw))
+    if not isinstance(payload, dict):
+        raise TypeError("Qwen response must be one JSON object")
+    return model.model_validate(payload)
+
+
+def _parse_issues(
+    raw: str, model: type[ModelT]
+) -> tuple[ModelT | None, list[ValidationIssue]]:
+    try:
+        return parse_qwen_json_response(raw, model), []
+    except json.JSONDecodeError as exc:
+        return None, [
+            ValidationIssue(
+                code="invalid_json",
+                field=None,
+                message=f"{exc.msg} at line {exc.lineno} column {exc.colno}",
+            )
+        ]
+    except ValidationError as exc:
+        issues = []
+        for error in exc.errors(include_url=False):
+            location = ".".join(str(part) for part in error["loc"]) or None
+            error_type = str(error["type"])
+            code = {
+                "extra_forbidden": "schema_extra_field",
+                "missing": "schema_missing_field",
+            }.get(error_type, "schema_validation")
+            issues.append(
+                ValidationIssue(
+                    code=code,
+                    field=location,
+                    message=str(error["msg"]),
+                )
+            )
+        return None, issues
+    except (TypeError, ValueError) as exc:
+        return None, [
+            ValidationIssue(code="invalid_json_object", field=None, message=str(exc))
+        ]
 
 
 def _image_content(frame_paths: list[Path]) -> list[dict[str, object]]:
@@ -134,7 +202,7 @@ class QwenAnnotationClient:
         content = response.choices[0].message.content
         if not content:
             raise RuntimeError("Qwen returned an empty annotation response")
-        return _json_from_response(content)
+        return content
 
     def annotate(
         self,
@@ -142,32 +210,33 @@ class QwenAnnotationClient:
         frame_paths: list[Path],
         caption_raw: str,
     ) -> tuple[AnnotationResult, list[str]]:
-        raw_response = self._request(
-            self._messages(frame_paths=frame_paths, caption_raw=caption_raw)
-        )
-        attempts = 0
-        while True:
-            try:
-                result = AnnotationResult.model_validate_json(raw_response)
-                errors = validate_annotation(result)
-            except (ValidationError, json.JSONDecodeError) as exc:
-                result = None
-                errors = [str(exc)]
-            if result is not None and not errors:
-                return result, annotation_warnings(result)
-            if attempts >= min(1, self.config.repair_retries):
-                raise ValueError(f"Qwen annotation validation failed: {errors}")
+        raw_responses: list[str] = []
+        issues: list[ValidationIssue] = []
+        for attempt in range(2):
+            repair_prompt = None
+            if attempt:
+                repair_prompt = build_repair_prompt(
+                    invalid_response=raw_responses[-1],
+                    validation_issues=issues,
+                    json_schema=AnnotationResult.model_json_schema(),
+                    draft_caption=caption_raw,
+                )
             raw_response = self._request(
                 self._messages(
                     frame_paths=frame_paths,
                     caption_raw=caption_raw,
-                    repair_prompt=build_repair_prompt(
-                        invalid_response=raw_response,
-                        validation_errors=errors,
-                    ),
+                    repair_prompt=repair_prompt,
                 )
             )
-            attempts += 1
+            raw_responses.append(raw_response)
+            result, issues = _parse_issues(raw_response, AnnotationResult)
+            if result is not None:
+                issues = validate_annotation(result)
+            if result is not None and not issues:
+                return result, annotation_warnings(result)
+            if self.config.repair_retries < 1:
+                break
+        raise QwenAnnotationFailure(raw_responses=raw_responses, issues=issues)
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
@@ -208,10 +277,33 @@ def annotate_manifest(
                 frame_paths=frame_paths,
                 caption_raw=str(source.get("caption_raw", "")),
             )
+        except QwenAnnotationFailure as exc:
+            _append_jsonl(
+                output_root / "logs" / "qwen_failed.jsonl",
+                {
+                    "clip_uid": clip,
+                    "attempt_count": len(exc.raw_responses),
+                    "raw_responses": exc.raw_responses,
+                    "issues": [issue.to_dict() for issue in exc.issues],
+                },
+            )
+            failed += 1
+            continue
         except Exception as exc:  # noqa: BLE001 - one bad sample must not stop the batch
             _append_jsonl(
                 output_root / "logs" / "qwen_failed.jsonl",
-                {"clip_uid": clip, "error": str(exc)},
+                {
+                    "clip_uid": clip,
+                    "attempt_count": 0,
+                    "raw_responses": [],
+                    "issues": [
+                        ValidationIssue(
+                            code="qwen_request_failed",
+                            field=None,
+                            message=str(exc),
+                        ).to_dict()
+                    ],
+                },
             )
             failed += 1
             continue

@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import re
 import string
+from dataclasses import asdict, dataclass
 
 from r2v_data_v2.schemas import AnnotationResult
 
 _REF_TOKEN = re.compile(r"<ref_(?:subject|object|bg|group)_\d+>")
+_ENTITY_ID = re.compile(r"e[1-9]\d*")
 _GENERIC_LABELS = {"man", "woman", "child", "person"}
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    code: str
+    field: str | None
+    message: str
+
+    def to_dict(self) -> dict[str, str | None]:
+        return asdict(self)
+
+
+def _issue(code: str, field: str | None, message: str) -> ValidationIssue:
+    return ValidationIssue(code=code, field=field, message=message)
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -41,35 +57,143 @@ def _jaccard(left: set[object], right: set[object]) -> float:
     return len(left & right) / len(left | right)
 
 
-def validate_annotation(result: AnnotationResult) -> list[str]:
-    errors: list[str] = []
+def exact_phrase_spans(caption: str, phrase: str) -> list[tuple[int, int]]:
+    words = phrase.split()
+    if not words:
+        return []
+    pattern = r"\s+".join(re.escape(word) for word in words)
+    if words[0][0].isalnum():
+        pattern = rf"(?<!\w){pattern}"
+    if words[-1][-1].isalnum():
+        pattern = rf"{pattern}(?!\w)"
+    return [match.span() for match in re.finditer(pattern, caption)]
+
+
+def exact_phrase_occurrence_count(caption: str, phrase: str) -> int:
+    return len(exact_phrase_spans(caption, phrase))
+
+
+def validate_annotation(result: AnnotationResult) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
     caption = result.caption.strip()
+    if not caption:
+        issues.append(_issue("caption_empty", "caption", "caption must not be empty"))
     if "\n" in caption:
-        errors.append("caption must be one paragraph")
+        issues.append(
+            _issue(
+                "caption_multiple_paragraphs",
+                "caption",
+                "caption must be one paragraph",
+            )
+        )
     word_count = len(caption.split())
     if word_count < 20:
-        errors.append("caption must contain at least 20 English words")
+        issues.append(
+            _issue(
+                "caption_too_short",
+                "caption",
+                "caption must contain at least 20 English words",
+            )
+        )
     if word_count > 200:
-        errors.append("caption exceeds the 200-word hard limit")
+        issues.append(
+            _issue(
+                "caption_over_200_words",
+                "caption",
+                "caption exceeds the 200-word hard limit",
+            )
+        )
 
     sentences = _sentences(caption)
     normalized_sentences = [_normalize_sentence(sentence) for sentence in sentences]
     if len(normalized_sentences) != len(set(normalized_sentences)):
-        errors.append("caption contains an exact repeated sentence")
-    for index in range(len(sentences) - 1):
-        left, right = sentences[index : index + 2]
-        if _jaccard(_trigrams(left), _trigrams(right)) > 0.85:
-            errors.append("caption contains highly similar adjacent sentences")
+        issues.append(
+            _issue(
+                "caption_repeated_sentence",
+                "caption",
+                "caption contains an exact repeated sentence",
+            )
+        )
+    for left_index, left in enumerate(sentences):
+        for right_index in range(left_index + 1, len(sentences)):
+            right = sentences[right_index]
+            threshold = 0.85 if right_index == left_index + 1 else 0.90
+            if _jaccard(_trigrams(left), _trigrams(right)) > threshold:
+                issues.append(
+                    _issue(
+                        "caption_high_similarity",
+                        "caption",
+                        "caption contains highly similar sentences",
+                    )
+                )
+                break
+        if any(issue.code == "caption_high_similarity" for issue in issues):
             break
 
     entity_ids = [entity.entity_id for entity in result.entities]
     if len(entity_ids) != len(set(entity_ids)):
-        errors.append("entity_id values must be unique")
+        issues.append(
+            _issue(
+                "duplicate_entity_id",
+                "entities",
+                "entity_id values must be unique",
+            )
+        )
+    for index, entity in enumerate(result.entities):
+        if _ENTITY_ID.fullmatch(entity.entity_id) is None:
+            issues.append(
+                _issue(
+                    "invalid_entity_id",
+                    f"entities[{index}].entity_id",
+                    "entity_id must match e followed by a positive integer",
+                )
+            )
     phrases = [
-        _normalize_whitespace(entity.phrase).lower() for entity in result.entities
+        _normalize_whitespace(entity.phrase).casefold() for entity in result.entities
     ]
     if len(phrases) != len(set(phrases)):
-        errors.append("entity phrases must be unique")
+        issues.append(
+            _issue(
+                "duplicate_phrase",
+                "entities",
+                "entity phrases must be unique",
+            )
+        )
+
+    selected_spans: list[tuple[int, int, str]] = []
+    for index, entity in enumerate(result.entities):
+        if not entity.reference_worthy:
+            continue
+        field = f"entities[{index}].phrase"
+        spans = exact_phrase_spans(caption, entity.phrase)
+        if not spans:
+            issues.append(
+                _issue(
+                    "phrase_missing_from_caption",
+                    field,
+                    "reference-worthy phrase must occur in caption",
+                )
+            )
+        elif len(spans) > 1:
+            issues.append(
+                _issue(
+                    "phrase_occurs_multiple_times",
+                    field,
+                    "reference-worthy phrase must occur exactly once",
+                )
+            )
+        else:
+            selected_spans.append((*spans[0], field))
+    selected_spans.sort()
+    for left, right in zip(selected_spans, selected_spans[1:]):
+        if right[0] < left[1]:
+            issues.append(
+                _issue(
+                    "overlapping_phrase_spans",
+                    right[2],
+                    "reference-worthy phrase spans must not overlap",
+                )
+            )
 
     expected_tokens = [
         entity.ref_token for entity in result.entities if entity.ref_token is not None
@@ -77,61 +201,149 @@ def validate_annotation(result: AnnotationResult) -> list[str]:
     if result.background and result.background.ref_token:
         expected_tokens.append(result.background.ref_token)
     if len(expected_tokens) != len(set(expected_tokens)):
-        errors.append("ref_token values must be unique")
+        issues.append(
+            _issue("duplicate_ref_token", "entities", "ref_token values must be unique")
+        )
     prompt_tokens = _REF_TOKEN.findall(result.prompt_with_refs)
     if len(prompt_tokens) != len(set(prompt_tokens)):
-        errors.append("each ref token must occur exactly once")
+        issues.append(
+            _issue(
+                "duplicate_prompt_token",
+                "prompt_with_refs",
+                "each ref token must occur exactly once",
+            )
+        )
     if sorted(prompt_tokens) != sorted(expected_tokens):
-        errors.append("prompt ref tokens do not match selected entities")
+        issues.append(
+            _issue(
+                "prompt_token_mismatch",
+                "prompt_with_refs",
+                "prompt ref tokens do not match selected entities",
+            )
+        )
 
     prompt_without_tokens = _REF_TOKEN.sub("", result.prompt_with_refs)
     if _normalize_binding_text(prompt_without_tokens) != _normalize_binding_text(
         caption
     ):
-        errors.append("prompt_with_refs must equal caption after removing ref tokens")
+        issues.append(
+            _issue(
+                "prompt_caption_mismatch",
+                "prompt_with_refs",
+                "prompt must equal caption after removing ref tokens",
+            )
+        )
 
-    for entity in result.entities:
+    for index, entity in enumerate(result.entities):
+        field = f"entities[{index}]"
         if entity.reference_worthy != (entity.ref_token is not None):
-            errors.append(f"{entity.entity_id} reference_worthy and ref_token disagree")
+            issues.append(
+                _issue(
+                    "reference_token_disagreement",
+                    f"{field}.ref_token",
+                    "reference_worthy and ref_token disagree",
+                )
+            )
         if entity.ref_token:
             binding = f"{entity.phrase} {entity.ref_token}"
             if result.prompt_with_refs.count(binding) != 1:
-                errors.append(
-                    f"{entity.entity_id} token must immediately follow its phrase"
+                issues.append(
+                    _issue(
+                        "token_not_after_phrase",
+                        f"{field}.ref_token",
+                        "token must immediately follow its phrase",
+                    )
                 )
         if entity.genericity == "named" and entity.name_evidence == "none":
-            errors.append(f"{entity.entity_id} named identity has no explicit evidence")
+            issues.append(
+                _issue(
+                    "named_identity_without_evidence",
+                    f"{field}.name_evidence",
+                    "named identity has no explicit evidence",
+                )
+            )
         if entity.separability == "attached_accessory" and entity.reference_worthy:
-            errors.append(
-                f"{entity.entity_id} attached accessory must not have a ref token"
+            issues.append(
+                _issue(
+                    "attached_accessory_reference",
+                    f"{field}.reference_worthy",
+                    "attached accessory must not be reference-worthy",
+                )
             )
         if (
             entity.separability == "composite_candidate"
             and entity.reference_worthy
             and (entity.ref_token or "").startswith("<ref_group_") is False
         ):
-            errors.append(f"{entity.entity_id} composite reference must use ref_group")
+            issues.append(
+                _issue(
+                    "invalid_composite_token",
+                    f"{field}.ref_token",
+                    "composite reference must use ref_group",
+                )
+            )
 
     if result.background:
         background = result.background
+        spans = exact_phrase_spans(caption, background.phrase)
+        if background.reference_worthy and not spans:
+            issues.append(
+                _issue(
+                    "background_phrase_missing",
+                    "background.phrase",
+                    "reference-worthy background phrase must occur in caption",
+                )
+            )
+        elif background.reference_worthy and len(spans) > 1:
+            issues.append(
+                _issue(
+                    "phrase_occurs_multiple_times",
+                    "background.phrase",
+                    "reference-worthy background phrase must occur exactly once",
+                )
+            )
         if background.reference_worthy != (background.ref_token is not None):
-            errors.append("background reference_worthy and ref_token disagree")
+            issues.append(
+                _issue(
+                    "reference_token_disagreement",
+                    "background.ref_token",
+                    "background reference_worthy and ref_token disagree",
+                )
+            )
         if background.ref_token:
             binding = f"{background.phrase} {background.ref_token}"
             if result.prompt_with_refs.count(binding) != 1:
-                errors.append("background token must immediately follow its phrase")
+                issues.append(
+                    _issue(
+                        "token_not_after_phrase",
+                        "background.ref_token",
+                        "background token must immediately follow its phrase",
+                    )
+                )
 
     known_ids = set(entity_ids)
-    for relation in result.relations:
+    for index, relation in enumerate(result.relations):
         if relation.subject_id not in known_ids or relation.object_id not in known_ids:
-            errors.append("relation refers to an unknown entity_id")
+            issues.append(
+                _issue(
+                    "invalid_relation_entity",
+                    f"relations[{index}]",
+                    "relation refers to an unknown entity_id",
+                )
+            )
 
     non_background_references = sum(
         entity.reference_worthy for entity in result.entities
     )
     if non_background_references > 3:
-        errors.append("at most three non-background references are allowed")
-    return errors
+        issues.append(
+            _issue(
+                "too_many_references",
+                "entities",
+                "at most three non-background references are allowed",
+            )
+        )
+    return issues
 
 
 def annotation_warnings(result: AnnotationResult) -> list[str]:
@@ -140,7 +352,8 @@ def annotation_warnings(result: AnnotationResult) -> list[str]:
     if not 40 <= word_count <= 180:
         warnings.append("caption is outside the recommended 40-180 word range")
     generic = sum(
-        entity.canonical_label.lower() in _GENERIC_LABELS for entity in result.entities
+        entity.canonical_label.casefold() in _GENERIC_LABELS
+        for entity in result.entities
     )
     if generic:
         warnings.append(f"generic_entity_label_count={generic}")

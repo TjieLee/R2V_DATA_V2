@@ -7,6 +7,10 @@ from r2v_data_v2.caption_validation import validate_annotation
 from r2v_data_v2.schemas import AnnotationResult
 
 
+def _codes(result: AnnotationResult) -> set[str]:
+    return {issue.code for issue in validate_annotation(result)}
+
+
 def _valid_payload() -> dict[str, object]:
     caption = (
         "A woman in a red raincoat walks across a wet stone plaza and raises her "
@@ -49,8 +53,7 @@ def test_valid_ref_token_and_phrase_binding() -> None:
 def test_duplicate_token_and_mismatched_prompt_are_rejected() -> None:
     payload = _valid_payload()
     payload["prompt_with_refs"] = str(payload["prompt_with_refs"]) + " <ref_subject_1>"
-    errors = validate_annotation(AnnotationResult.model_validate(payload))
-    assert "each ref token must occur exactly once" in errors
+    assert "duplicate_prompt_token" in _codes(AnnotationResult.model_validate(payload))
 
 
 def test_repeated_caption_sentence_is_rejected() -> None:
@@ -63,8 +66,9 @@ def test_repeated_caption_sentence_is_rejected() -> None:
         "A woman in a red raincoat <ref_subject_1> walks across a wet stone plaza "
         f"and waves slowly. {sentence}"
     )
-    errors = validate_annotation(AnnotationResult.model_validate(payload))
-    assert "caption contains an exact repeated sentence" in errors
+    assert "caption_repeated_sentence" in _codes(
+        AnnotationResult.model_validate(payload)
+    )
 
 
 def test_caption_over_200_words_is_rejected() -> None:
@@ -73,8 +77,7 @@ def test_caption_over_200_words_is_rejected() -> None:
     payload["prompt_with_refs"] = (
         "A woman in a red raincoat <ref_subject_1> " + " ".join(["visible"] * 201)
     )
-    errors = validate_annotation(AnnotationResult.model_validate(payload))
-    assert "caption exceeds the 200-word hard limit" in errors
+    assert "caption_over_200_words" in _codes(AnnotationResult.model_validate(payload))
 
 
 def test_named_identity_requires_explicit_evidence() -> None:
@@ -82,16 +85,18 @@ def test_named_identity_requires_explicit_evidence() -> None:
     entity = payload["entities"][0]  # type: ignore[index]
     entity["genericity"] = "named"  # type: ignore[index]
     entity["name_evidence"] = "none"  # type: ignore[index]
-    errors = validate_annotation(AnnotationResult.model_validate(payload))
-    assert "e1 named identity has no explicit evidence" in errors
+    assert "named_identity_without_evidence" in _codes(
+        AnnotationResult.model_validate(payload)
+    )
 
 
 def test_attached_accessory_cannot_keep_independent_ref_token() -> None:
     payload = deepcopy(_valid_payload())
     entity = payload["entities"][0]  # type: ignore[index]
     entity["separability"] = "attached_accessory"  # type: ignore[index]
-    errors = validate_annotation(AnnotationResult.model_validate(payload))
-    assert "e1 attached accessory must not have a ref token" in errors
+    assert "attached_accessory_reference" in _codes(
+        AnnotationResult.model_validate(payload)
+    )
 
 
 def test_four_icl_examples_have_complete_valid_json() -> None:
