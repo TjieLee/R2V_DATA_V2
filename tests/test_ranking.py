@@ -916,12 +916,44 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     assert metadata["dino_medoid_slot"] == 0
     assert metadata["qwen_suggested_best_frame_slot"] == 2
     assert metadata["candidates"][0]["siglip"]["best_matching_entity_id"] == "e1"
+    assert sum(metadata["preselection_effective_weights"].values()) == pytest.approx(
+        1.0
+    )
+    assert sum(metadata["final_effective_weights"].values()) == pytest.approx(1.0)
+    assert "dino_representativeness" in metadata["preselection_effective_weights"]
+    assert "siglip_alignment" in metadata["preselection_effective_weights"]
+    assert metadata["normalization"]["dino_representativeness"] == {
+        "method": "fixed_range",
+        "minimum": 0.6,
+        "maximum": 0.95,
+    }
+    for candidate in metadata["candidates"]:
+        assert candidate["raw_scores"]["sharpness"] >= 0.0
+        assert candidate["normalized_scores"]["sharpness"] == 0.5
+        assert candidate["preselection_score"] is not None
+        assert candidate["final_score"] is not None
+        expected_siglip = (
+            candidate["siglip"]["alignment_margin"]
+            if candidate["siglip"]["alignment_margin"] is not None
+            else candidate["siglip"]["target_similarity"]
+        )
+        assert candidate["raw_scores"]["siglip_alignment"] == pytest.approx(
+            expected_siglip
+        )
+        assert candidate["raw_scores"]["dino_representativeness"] == pytest.approx(
+            candidate["dino"]["dino_representativeness"]
+        )
     reference_metadata = json.loads(
         (reference_dir / "metadata.json").read_text(encoding="utf-8")
     )
     assert reference_metadata["dino_medoid_slot"] == 0
     assert reference_metadata["qwen_suggested_best_frame_slot"] == 2
     assert reference_metadata["frame_slot"] != 2
+    assert reference_metadata["raw_scores"]
+    assert reference_metadata["normalized_scores"]
+    assert sum(reference_metadata["effective_final_weights"].values()) == pytest.approx(
+        1.0
+    )
 
 
 def test_disabled_qwen_visual_skips_contact_sheet_and_judge(tmp_path: Path) -> None:
@@ -953,6 +985,17 @@ def test_disabled_qwen_visual_skips_contact_sheet_and_judge(tmp_path: Path) -> N
     assert not (candidate_dir / "selected" / "top_candidates.jpg").exists()
     assert reference_metadata["qwen_suggested_best_frame_slot"] is None
     assert reference_metadata["visual_review"]["completeness"] == 0.5
+    ranking_metadata = json.loads(
+        (candidate_dir / "ranking_metadata.json").read_text(encoding="utf-8")
+    )
+    assert not any(
+        name.startswith("qwen_")
+        for name in ranking_metadata["final_effective_weights"]
+    )
+    assert not any(
+        name.startswith("qwen_")
+        for name in ranking_metadata["candidates"][0]["raw_scores"]
+    )
 
 
 def test_only_top_three_candidates_enter_qwen_judge(tmp_path: Path) -> None:

@@ -241,6 +241,13 @@ inverse occlusion all contribute to the code-owned final score.
 `qwen_suggested_best_frame_slot` is retained only as a diagnostic and never
 overrides hard gates or the final weighted ordering.
 
+`ranking_metadata.json` records each candidate's `raw_scores`,
+`normalized_scores`, `preselection_score`, and `final_score`. Its top level
+records the effective preselection and final weights plus all normalization
+policies. The selected reference metadata repeats its raw and normalized score
+composition and `effective_final_weights`, so pilot decisions remain
+explainable after manifests are reconciled.
+
 Cross-pair search is limited to the same `parent_video_id` and a different
 complete numeric `clip_suffix`. It uses cached selected-reference DINOv3
 embeddings for Top-10 coarse retrieval and falls back to color histograms when

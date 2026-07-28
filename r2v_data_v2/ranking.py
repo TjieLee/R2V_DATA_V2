@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +61,9 @@ class RankedCandidate:
     best_matching_entity_id: str | None
     hard_rejection_reasons: tuple[str, ...]
     ranking_score: float
+    raw_scores: dict[str, float]
+    normalized_scores: dict[str, float]
+    effective_final_weights: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,10 @@ class CandidateWorkItem:
     dino_metrics: TemporalRepresentationMetrics | None = None
     alignment_metrics: AlignmentMetrics | None = None
     best_matching_entity_id: str | None = None
+    raw_scores: dict[str, float] = field(default_factory=dict)
+    normalized_scores: dict[str, float] = field(default_factory=dict)
+    preselection_score: float | None = None
+    final_score: float | None = None
 
     @property
     def frame_slot(self) -> int:
@@ -418,6 +425,65 @@ def rank_candidates(
             ],
             "sam_confidence": normalized_by_metric["sam_confidence"][frame_slot],
         }
+        raw_scores = {
+            "sharpness": metrics.tenengrad_sharpness,
+            "exposure": metrics.exposure_score,
+            "sharpness_exposure": (
+                0.6 * metrics.tenengrad_sharpness
+                + 0.4 * metrics.exposure_score
+            ),
+            "mask_area_continuity": metrics.mask_area_continuity,
+            "isolation": _isolation_score(metrics),
+            "crop_subject_ratio": _crop_subject_ratio_score(metrics),
+            "sam_confidence": sam_confidence,
+        }
+        normalized_scores = {
+            "sharpness": normalized_by_metric["sharpness"][frame_slot],
+            "exposure": normalized_by_metric["exposure"][frame_slot],
+            "sharpness_exposure": component_scores["sharpness_exposure"],
+            "mask_area_continuity": component_scores["mask_area_continuity"],
+            "isolation": component_scores["isolation"],
+            "crop_subject_ratio": component_scores["crop_subject_ratio"],
+            "sam_confidence": component_scores["sam_confidence"],
+        }
+        if config.evaluators.qwen_visual.enabled:
+            raw_scores.update(
+                {
+                    "qwen_completeness": visual_review.completeness,
+                    "qwen_recognizability": visual_review.recognizability,
+                    "qwen_mask_quality": visual_review.mask_quality,
+                    "qwen_visual_quality": visual_review.visual_quality,
+                    "inverse_qwen_occlusion": 1.0 - visual_review.occlusion,
+                }
+            )
+            normalized_scores.update(
+                {
+                    name: component_scores[name]
+                    for name in (
+                        "qwen_completeness",
+                        "qwen_recognizability",
+                        "qwen_mask_quality",
+                        "qwen_visual_quality",
+                        "inverse_qwen_occlusion",
+                    )
+                }
+            )
+        if dino_metrics is not None:
+            raw_scores["dino_representativeness"] = (
+                dino_metrics.dino_representativeness
+            )
+            normalized_scores["dino_representativeness"] = component_scores[
+                "dino_representativeness"
+            ]
+        if alignment_metrics is not None:
+            raw_scores["siglip_alignment"] = float(
+                alignment_metrics.alignment_margin
+                if alignment_metrics.alignment_margin is not None
+                else alignment_metrics.target_similarity
+            )
+            normalized_scores["siglip_alignment"] = component_scores[
+                "siglip_alignment"
+            ]
         score = sum(
             weights[name] * _clamp_unit(component_scores[name]) for name in weights
         )
@@ -433,6 +499,9 @@ def rank_candidates(
                 best_matching_entity_id=best_matching_entity_ids.get(frame_slot),
                 hard_rejection_reasons=reasons,
                 ranking_score=float(score),
+                raw_scores=raw_scores,
+                normalized_scores=normalized_scores,
+                effective_final_weights=dict(weights),
             )
         )
     return sorted(
@@ -705,6 +774,33 @@ def _default_review(record: dict[str, object]) -> CandidateVisualReview:
     )
 
 
+def _preselection_available_metrics(
+    candidates: list[CandidateWorkItem],
+    config: RankingConfig,
+) -> set[str]:
+    available_metrics = {
+        "sharpness",
+        "exposure",
+        "isolation",
+        "sam_confidence",
+    }
+    if (
+        config.evaluators.dinov3.enabled
+        and config.evaluators.dinov3.use_for_preselection
+        and all(candidate.dino_metrics is not None for candidate in candidates)
+    ):
+        available_metrics.add("dino_representativeness")
+    if (
+        config.evaluators.siglip2.enabled
+        and config.evaluators.siglip2.use_for_preselection
+        and all(
+            candidate.alignment_metrics is not None for candidate in candidates
+        )
+    ):
+        available_metrics.add("siglip_alignment")
+    return available_metrics
+
+
 def _preliminary_top_candidates(
     candidates: list[CandidateWorkItem],
     *,
@@ -752,31 +848,30 @@ def _preliminary_top_candidates(
         metric_name="sam_confidence",
         config=config,
     )
+    normalized_continuity = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[
+            candidate.metrics.mask_area_continuity for candidate in candidates
+        ],
+        metric_name="mask_area_continuity",
+        config=config,
+    )
+    normalized_crop = _normalized_by_slot(
+        frame_slots=frame_slots,
+        raw_values=[
+            _crop_subject_ratio_score(candidate.metrics) for candidate in candidates
+        ],
+        metric_name="crop_subject_ratio",
+        config=config,
+    )
     normalized_siglip = _normalized_siglip_scores(
         candidates,
         config=config,
     )
-    available_metrics = {
-        "sharpness",
-        "exposure",
-        "isolation",
-        "sam_confidence",
-    }
-    if (
-        config.evaluators.dinov3.enabled
-        and config.evaluators.dinov3.use_for_preselection
-        and all(candidate.dino_metrics is not None for candidate in candidates)
-    ):
-        available_metrics.add("dino_representativeness")
-    if (
-        config.evaluators.siglip2.enabled
-        and config.evaluators.siglip2.use_for_preselection
-        and all(
-            candidate.frame_slot in normalized_siglip for candidate in candidates
-        )
-    ):
-        available_metrics.add("siglip_alignment")
-    weights = _effective_weights(config.preselection_weights, available_metrics)
+    weights = _effective_weights(
+        config.preselection_weights,
+        _preselection_available_metrics(candidates, config),
+    )
     scored: list[tuple[float, CandidateWorkItem]] = []
     for candidate in candidates:
         components = {
@@ -787,9 +882,55 @@ def _preliminary_top_candidates(
             "isolation": normalized_isolation[candidate.frame_slot],
             "sam_confidence": normalized_sam[candidate.frame_slot],
         }
+        candidate.raw_scores.update(
+            {
+                "sharpness": candidate.metrics.tenengrad_sharpness,
+                "exposure": candidate.metrics.exposure_score,
+                "sharpness_exposure": (
+                    0.6 * candidate.metrics.tenengrad_sharpness
+                    + 0.4 * candidate.metrics.exposure_score
+                ),
+                "mask_area_continuity": candidate.metrics.mask_area_continuity,
+                "isolation": _isolation_score(candidate.metrics),
+                "crop_subject_ratio": _crop_subject_ratio_score(candidate.metrics),
+                "sam_confidence": candidate.sam_confidence,
+            }
+        )
+        candidate.normalized_scores.update(
+            {
+                name: components[name]
+                for name in ("sharpness", "exposure", "isolation", "sam_confidence")
+            }
+            | {
+                "sharpness_exposure": (
+                    0.6 * components["sharpness"] + 0.4 * components["exposure"]
+                ),
+                "mask_area_continuity": normalized_continuity[
+                    candidate.frame_slot
+                ],
+                "crop_subject_ratio": normalized_crop[candidate.frame_slot],
+            }
+        )
+        if candidate.dino_metrics is not None:
+            candidate.raw_scores["dino_representativeness"] = (
+                candidate.dino_metrics.dino_representativeness
+            )
+            candidate.normalized_scores["dino_representativeness"] = components[
+                "dino_representativeness"
+            ]
+        if candidate.alignment_metrics is not None:
+            candidate.raw_scores["siglip_alignment"] = float(
+                candidate.alignment_metrics.alignment_margin
+                if candidate.alignment_metrics.alignment_margin is not None
+                else candidate.alignment_metrics.target_similarity
+            )
+            candidate.normalized_scores["siglip_alignment"] = components[
+                "siglip_alignment"
+            ]
         score = sum(
             weights[name] * _clamp_unit(components[name]) for name in weights
         )
+        candidate.preselection_score = float(score)
         scored.append((score, candidate))
     return [
         candidate
@@ -848,9 +989,12 @@ def siglip_distractor_entities(
 def _candidate_ranking_metadata(
     items: list[CandidateWorkItem],
     *,
+    config: RankingConfig,
     qwen_reviews: dict[int, CandidateVisualReview] | None = None,
     dino_medoid_slot: int | None = None,
     qwen_suggested_best_frame_slot: int | None = None,
+    preselection_effective_weights: dict[str, float] | None = None,
+    final_effective_weights: dict[str, float] | None = None,
 ) -> dict[str, object]:
     qwen_reviews = qwen_reviews or {}
     candidates = []
@@ -862,6 +1006,10 @@ def _candidate_ranking_metadata(
                 "source_frame_index": int(item.record["source_frame_index"]),
                 "sam_confidence": item.sam_confidence,
                 "metrics": item.metrics.to_dict(),
+                "raw_scores": item.raw_scores,
+                "normalized_scores": item.normalized_scores,
+                "preselection_score": item.preselection_score,
+                "final_score": item.final_score,
                 "hard_rejection_reasons": item.hard_rejection_reasons,
                 "dino": (
                     asdict(item.dino_metrics) if item.dino_metrics is not None else None
@@ -885,6 +1033,11 @@ def _candidate_ranking_metadata(
     return {
         "dino_medoid_slot": dino_medoid_slot,
         "qwen_suggested_best_frame_slot": qwen_suggested_best_frame_slot,
+        "preselection_effective_weights": preselection_effective_weights or {},
+        "final_effective_weights": final_effective_weights or {},
+        "normalization": {
+            name: asdict(policy) for name, policy in config.normalization.items()
+        },
         "candidates": candidates,
     }
 
@@ -941,6 +1094,9 @@ def _save_reference(
         "frame_slot": selected.frame_slot,
         "source_frame_index": selected.source_frame_index,
         "ranking_score": selected.ranking_score,
+        "raw_scores": selected.raw_scores,
+        "normalized_scores": selected.normalized_scores,
+        "effective_final_weights": selected.effective_final_weights,
         "sam_confidence": selected.sam_confidence,
         "metrics": selected.metrics.to_dict(),
         "visual_review": selected.visual_review.model_dump(mode="json"),
@@ -1151,6 +1307,7 @@ def rank_manifest_references(
                             candidate_dir / "ranking_metadata.json",
                             _candidate_ranking_metadata(
                                 items,
+                                config=config.ranking,
                                 dino_medoid_slot=dino_medoid_slot,
                             ),
                         )
@@ -1249,6 +1406,7 @@ def rank_manifest_references(
                             candidate_dir / "ranking_metadata.json",
                             _candidate_ranking_metadata(
                                 items,
+                                config=config.ranking,
                                 dino_medoid_slot=dino_medoid_slot,
                             ),
                         )
@@ -1312,6 +1470,7 @@ def rank_manifest_references(
                             candidate_dir / "ranking_metadata.json",
                             _candidate_ranking_metadata(
                                 items,
+                                config=config.ranking,
                                 dino_medoid_slot=dino_medoid_slot,
                             ),
                         )
@@ -1322,14 +1481,22 @@ def rank_manifest_references(
                         model_candidates,
                         config=config.ranking,
                     )
+                    preselection_effective_weights = _effective_weights(
+                        config.ranking.preselection_weights,
+                        _preselection_available_metrics(
+                            model_candidates,
+                            config.ranking,
+                        ),
+                    )
+                    preselected = _preliminary_top_candidates(
+                        model_candidates,
+                        config=config.ranking,
+                    )
                     qwen_suggested_best_frame_slot = None
                     reviews: dict[int, CandidateVisualReview] = {}
                     selected_dir = candidate_dir / "selected"
                     if config.ranking.evaluators.qwen_visual.enabled:
-                        preliminary = _preliminary_top_candidates(
-                            model_candidates,
-                            config=config.ranking,
-                        )
+                        preliminary = preselected
                         slots = [item.frame_slot for item in preliminary]
                         sheet = selected_dir / "top_candidates.jpg"
                         _top_candidate_sheet(
@@ -1407,18 +1574,30 @@ def rank_manifest_references(
                         candidate.frame_slot: candidate for candidate in ranked
                     }
                     for item in preliminary:
+                        ranked_candidate = ranked_by_slot[item.frame_slot]
                         item.hard_rejection_reasons = list(
-                            ranked_by_slot[item.frame_slot].hard_rejection_reasons
+                            ranked_candidate.hard_rejection_reasons
                         )
+                        item.raw_scores = ranked_candidate.raw_scores
+                        item.normalized_scores = ranked_candidate.normalized_scores
+                        item.final_score = ranked_candidate.ranking_score
+                    final_effective_weights = (
+                        ranked[0].effective_final_weights if ranked else {}
+                    )
                     write_json_atomic(
                         candidate_dir / "ranking_metadata.json",
                         _candidate_ranking_metadata(
                             items,
+                            config=config.ranking,
                             qwen_reviews=reviews,
                             dino_medoid_slot=dino_medoid_slot,
                             qwen_suggested_best_frame_slot=(
                                 qwen_suggested_best_frame_slot
                             ),
+                            preselection_effective_weights=(
+                                preselection_effective_weights
+                            ),
+                            final_effective_weights=final_effective_weights,
                         ),
                     )
                     valid = [item for item in ranked if not item.hard_rejection_reasons]
