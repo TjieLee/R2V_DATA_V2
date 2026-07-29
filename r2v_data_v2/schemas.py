@@ -70,11 +70,35 @@ class CandidateVisualReview(SchemaModel):
     visual_quality: float = Field(ge=0.0, le=1.0)
     identity_features_visible: bool
     rejection_reasons: list[str] = Field(default_factory=list)
+    viewpoint: Literal[
+        "front",
+        "front_three_quarter",
+        "side",
+        "back",
+        "unclear",
+        "not_applicable",
+    ] = "unclear"
+    canonical_view_score: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class CandidateJudgeResult(SchemaModel):
     entity_id: str
     candidates: list[CandidateVisualReview]
+    best_frame_slot: int
+
+
+class BackgroundVisualReview(SchemaModel):
+    frame_slot: int
+    scene_completeness: float = Field(ge=0.0, le=1.0)
+    scene_recognizability: float = Field(ge=0.0, le=1.0)
+    foreground_distraction: float = Field(ge=0.0, le=1.0)
+    visual_quality: float = Field(ge=0.0, le=1.0)
+    reusable_as_background: bool
+    rejection_reasons: list[str] = Field(default_factory=list)
+
+
+class BackgroundJudgeResult(SchemaModel):
+    candidates: list[BackgroundVisualReview]
     best_frame_slot: int
 
 

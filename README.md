@@ -11,9 +11,10 @@ source JSON/JSONL
 -> independent fixed ten-frame sampling
 -> SAM3 text-prompted masks
 -> hard gates, DINOv3 representativeness, optional SigLIP 2 alignment
--> Top-3 Qwen candidate review and code-owned final ranking
--> one canonical reference per retained entity
--> in-pair or verified same-parent cross-pair
+-> category-aware Qwen candidate review and code-owned final ranking
+-> entity and optional background canonical references
+-> optional local FLUX.1 Fill repair with strict pixel preservation
+-> entity in-pair/cross-pair plus background in-pair binding
 -> final_samples.jsonl
 ```
 
@@ -38,6 +39,13 @@ Torch or CUDA packages:
 .venv/bin/pip install -r requirements-vision.txt
 ```
 
+FLUX.1 Fill is a separate opt-in install. Use it only in the server environment
+that already has the intended Torch build:
+
+```bash
+.venv/bin/pip install -r requirements-inpaint.txt
+```
+
 The current upstream SAM3 package has its own CUDA, PyTorch, and Python
 requirements. Install the repository already present at the configured
 `sam3.code_root` into the server environment; do not let this project replace
@@ -58,8 +66,9 @@ cp configs/default.yaml configs/server.local.yaml
 Required server inputs:
 
 - `dataset_json`: source JSON or JSONL;
-- `qwen.base_url`: an OpenAI-compatible multimodal Qwen endpoint;
-- `qwen.model`: the actual video-capable model served at that endpoint;
+- `qwen.annotation`: the OpenAI-compatible video annotation endpoint/model;
+- `qwen.candidate_judge`, `qwen.background_judge`, and
+  `qwen.cross_pair_judge`: independently replaceable image endpoints/models;
 - `sam3.code_root`: the installed SAM3 checkout;
 - `sam3.checkpoint`: an explicit local checkpoint path;
 - `ranking.dinov3_model_path`: required when DINOv3 is enabled; use a verified
@@ -86,16 +95,24 @@ Configure Qwen's internal video processing independently from SAM3 sampling:
 
 ```yaml
 qwen:
-  video:
-    input_mode: full_video
-    fps: 2.0
-    do_sample_frames: true
-    max_pixels: null
-    total_pixels: null
+  annotation:
+    base_url: http://127.0.0.1:8000/v1
+    model: /mnt/workspace/public/pretrained/Qwen/<video-model>
+    video:
+      input_mode: full_video
+      fps: 2.0
+      do_sample_frames: true
+      max_pixels: null
+      total_pixels: null
+  candidate_judge:
+    base_url: http://127.0.0.1:8001/v1
+    model: /mnt/workspace/public/pretrained/Qwen/<image-model>
 ```
 
 The `fps`, optional pixel budgets, and internal sampling are forwarded to the
 Qwen/vLLM media processor. They do not change `frames.count`, which remains ten.
+The former flat `qwen` mapping remains accepted and is mapped to every service
+for compatibility.
 
 Keep model and package caches in the writable user directory, for example:
 
@@ -179,7 +196,7 @@ Run the first 20 records:
 python run_pipeline.py \
   --config configs/server.local.yaml \
   --limit 20 \
-  --stages manifest,qwen,frames,sam,rank,pair
+  --stages manifest,qwen,frames,sam,rank,background,pair
 ```
 
 Stages are ordinary Python functions called in order, not subprocesses. Existing
@@ -212,7 +229,8 @@ python scripts/06_augment_references.py --config configs/server.local.yaml
 ├── frames/<clip_uid>/
 ├── annotations/<clip_uid>.json
 ├── candidates/<clip_uid>/<entity_id>/
-├── references/<clip_uid>/<entity_id>/
+├── background_candidates/<clip_uid>/
+├── references/<clip_uid>/<entity_id-or-bg1>/
 ├── samples/<clip_uid>.json
 └── logs/
 ```
@@ -224,6 +242,7 @@ interruption reconciles a completed artifact that was not yet indexed.
 
 Every selected reference keeps:
 
+- `canonical_raw.jpg`: immutable pre-repair source reference;
 - `canonical.jpg`: natural crop from the source frame;
 - `mask.png`: selected crop mask;
 - `foreground_rgba.png`: original foreground pixels with alpha;
@@ -238,6 +257,9 @@ reuse. DINOv3 and SigLIP 2 can each be disabled; their score weight is then
 removed and the remaining weights are normalized. Q-Align is not part of this
 pilot. Qwen completeness, recognizability, mask quality, visual quality, and
 inverse occlusion all contribute to the code-owned final score.
+Canonical view is a preferred tier among otherwise valid candidates; it is not
+a front-view hard gate. Border contact is a soft completeness score by default
+and can still be restored as a hard gate with `ranking.reject_border_touch`.
 `qwen_suggested_best_frame_slot` is retained only as a diagnostic and never
 overrides hard gates or the final weighted ordering.
 
@@ -255,6 +277,32 @@ either embedding is unavailable. Category/name evidence is checked before Qwen
 dual-image exact-instance review. DINOv3 never decides identity: uncertain,
 near-duplicate, conflicting, or low-confidence Qwen decisions fall back to
 in-pair.
+
+Background references use `<ref_bg_1>`, stay in-pair, and are added only when
+their phrase has one exact caption binding. An unbindable background is dropped
+with a warning without dropping valid entity references. The optional
+`inpaint` stage loads FLUX only when `inpainting.enabled: true` and an explicit
+existing local `model_path` is configured. Generated pixels are accepted only
+inside the repair mask; output outside that mask remains exactly equal to the
+raw reference.
+
+## Qwen Benchmark
+
+Compare already-served OpenAI-compatible video backends on a fixed source
+manifest without starting vLLM:
+
+```bash
+python scripts/benchmark_qwen_backends.py \
+  --source-manifest /path/to/source.jsonl \
+  --clip-uids-file /path/to/fixed_clip_uids.txt \
+  --backend large http://127.0.0.1:8000/v1 served-large-model \
+  --backend small http://127.0.0.1:8002/v1 served-small-model \
+  --output-dir benchmarks/qwen
+```
+
+Each invocation creates a unique JSON summary and per-clip JSONL record. Prior
+runs are never overwritten. The script only calls endpoints and models supplied
+on the command line; it does not launch services or download weights.
 
 ## Augmentation
 

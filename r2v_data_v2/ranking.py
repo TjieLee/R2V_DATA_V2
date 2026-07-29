@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -13,7 +15,12 @@ from openai import BadRequestError, OpenAI
 from PIL import Image, ImageDraw
 
 from prompts.qwen_candidate_judge_prompt import CANDIDATE_JUDGE_PROMPT
-from r2v_data_v2.config import PipelineConfig, QwenConfig, RankingConfig
+from r2v_data_v2.config import (
+    PipelineConfig,
+    QwenImageConfig,
+    RankingConfig,
+    _qwen_services,
+)
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import bbox_from_mask, decode_mask, save_mask_png
 from r2v_data_v2.metrics import (
@@ -144,6 +151,19 @@ def _isolation_score(metrics: CandidateMetrics) -> float:
 
 def _crop_subject_ratio_score(metrics: CandidateMetrics) -> float:
     return _clamp_unit(1.0 - abs(metrics.crop_subject_ratio - 0.55) / 0.55)
+
+
+def _border_completeness_score(metrics: CandidateMetrics) -> float:
+    return 0.75 if metrics.border_touch else 1.0
+
+
+def is_preferred_canonical_candidate(review: CandidateVisualReview) -> bool:
+    return (
+        review.occlusion <= 0.20
+        and review.completeness >= 0.80
+        and review.recognizability >= 0.75
+        and review.canonical_view_score >= 0.70
+    )
 
 
 def basic_hard_rejection_reasons(
@@ -314,6 +334,18 @@ def rank_candidates(
             metric_name="inverse_qwen_occlusion",
             config=config,
         ),
+        "qwen_canonical_view": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[item[4].canonical_view_score for item in candidates],
+            metric_name="qwen_canonical_view",
+            config=config,
+        ),
+        "border_completeness": _normalized_by_slot(
+            frame_slots=frame_slots,
+            raw_values=[_border_completeness_score(item[3]) for item in candidates],
+            metric_name="border_completeness",
+            config=config,
+        ),
         "dino_representativeness": _normalized_by_slot(
             frame_slots=frame_slots,
             raw_values=[
@@ -351,6 +383,7 @@ def rank_candidates(
         "mask_area_continuity",
         "sharpness_exposure",
         "isolation",
+        "border_completeness",
         "crop_subject_ratio",
         "sam_confidence",
     }
@@ -365,6 +398,7 @@ def rank_candidates(
                 "qwen_mask_quality",
                 "qwen_visual_quality",
                 "inverse_qwen_occlusion",
+                "qwen_canonical_view",
             }
         )
     if (
@@ -419,7 +453,13 @@ def rank_candidates(
             "inverse_qwen_occlusion": normalized_by_metric[
                 "inverse_qwen_occlusion"
             ][frame_slot],
+            "qwen_canonical_view": normalized_by_metric[
+                "qwen_canonical_view"
+            ][frame_slot],
             "isolation": normalized_by_metric["isolation"][frame_slot],
+            "border_completeness": normalized_by_metric[
+                "border_completeness"
+            ][frame_slot],
             "crop_subject_ratio": normalized_by_metric["crop_subject_ratio"][
                 frame_slot
             ],
@@ -434,6 +474,7 @@ def rank_candidates(
             ),
             "mask_area_continuity": metrics.mask_area_continuity,
             "isolation": _isolation_score(metrics),
+            "border_completeness": _border_completeness_score(metrics),
             "crop_subject_ratio": _crop_subject_ratio_score(metrics),
             "sam_confidence": sam_confidence,
         }
@@ -443,6 +484,7 @@ def rank_candidates(
             "sharpness_exposure": component_scores["sharpness_exposure"],
             "mask_area_continuity": component_scores["mask_area_continuity"],
             "isolation": component_scores["isolation"],
+            "border_completeness": component_scores["border_completeness"],
             "crop_subject_ratio": component_scores["crop_subject_ratio"],
             "sam_confidence": component_scores["sam_confidence"],
         }
@@ -454,6 +496,7 @@ def rank_candidates(
                     "qwen_mask_quality": visual_review.mask_quality,
                     "qwen_visual_quality": visual_review.visual_quality,
                     "inverse_qwen_occlusion": 1.0 - visual_review.occlusion,
+                    "qwen_canonical_view": visual_review.canonical_view_score,
                 }
             )
             normalized_scores.update(
@@ -465,6 +508,7 @@ def rank_candidates(
                         "qwen_mask_quality",
                         "qwen_visual_quality",
                         "inverse_qwen_occlusion",
+                        "qwen_canonical_view",
                     )
                 }
             )
@@ -504,10 +548,19 @@ def rank_candidates(
                 effective_final_weights=dict(weights),
             )
         )
+    has_preferred_valid_candidate = any(
+        not item.hard_rejection_reasons
+        and is_preferred_canonical_candidate(item.visual_review)
+        for item in ranked
+    )
     return sorted(
         ranked,
         key=lambda item: (
             bool(item.hard_rejection_reasons),
+            (
+                has_preferred_valid_candidate
+                and not is_preferred_canonical_candidate(item.visual_review)
+            ),
             -item.ranking_score,
             item.frame_slot,
         ),
@@ -515,7 +568,7 @@ def rank_candidates(
 
 
 class QwenCandidateJudge:
-    def __init__(self, config: QwenConfig) -> None:
+    def __init__(self, config: QwenImageConfig) -> None:
         self.config = config
         self.client = OpenAI(
             base_url=config.base_url,
@@ -574,10 +627,16 @@ class QwenCandidateJudge:
         entity_phrase: str,
         contact_sheet: Path,
         frame_slots: list[int],
+        category: str = "object",
+        canonical_label: str = "",
     ) -> CandidateJudgeResult:
         encoded = base64.b64encode(contact_sheet.read_bytes()).decode()
         prompt = (
-            CANDIDATE_JUDGE_PROMPT.format(entity_phrase=entity_phrase)
+            CANDIDATE_JUDGE_PROMPT.format(
+                entity_phrase=entity_phrase,
+                category=category,
+                canonical_label=canonical_label,
+            )
             + f"\nentity_id={entity_id}\nframe_slots={frame_slots}"
         )
 
@@ -618,6 +677,39 @@ class QwenCandidateJudge:
             model=CandidateJudgeResult,
             validate=validate,
         )
+
+
+def _review_candidates(
+    judge: object,
+    *,
+    entity_id: str,
+    entity_phrase: str,
+    category: str,
+    canonical_label: str,
+    contact_sheet: Path,
+    frame_slots: list[int],
+) -> CandidateJudgeResult:
+    review = judge.review
+    kwargs: dict[str, object] = {
+        "entity_id": entity_id,
+        "entity_phrase": entity_phrase,
+        "contact_sheet": contact_sheet,
+        "frame_slots": frame_slots,
+    }
+    try:
+        parameters = inspect.signature(review).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    parameter_names = {parameter.name for parameter in parameters}
+    accepts_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if accepts_keywords or "category" in parameter_names:
+        kwargs["category"] = category
+    if accepts_keywords or "canonical_label" in parameter_names:
+        kwargs["canonical_label"] = canonical_label
+    return review(**kwargs)
 
 
 def _fit_candidate_panel(
@@ -1077,7 +1169,10 @@ def _save_reference(
     crop_mask = mask[y1:y2, x1:x2]
     destination = output_root / "references" / clip_uid / entity_id
     destination.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(crop_rgb).save(destination / "canonical.jpg", quality=95)
+    raw_canonical_path = destination / "canonical_raw.jpg"
+    canonical_path = destination / "canonical.jpg"
+    Image.fromarray(crop_rgb).save(raw_canonical_path, quality=95)
+    shutil.copyfile(raw_canonical_path, canonical_path)
     save_mask_png(destination / "mask.png", crop_mask)
     rgba = np.dstack((crop_rgb, crop_mask.astype(np.uint8) * 255))
     Image.fromarray(rgba).save(destination / "foreground_rgba.png")
@@ -1115,7 +1210,8 @@ def _save_reference(
             else None
         ),
         "crop_xyxy": list(crop_box),
-        "canonical_path": str(destination / "canonical.jpg"),
+        "raw_canonical_path": str(raw_canonical_path),
+        "canonical_path": str(canonical_path),
         "mask_path": str(destination / "mask.png"),
         "foreground_rgba_path": str(destination / "foreground_rgba.png"),
         "neutral_background_path": str(destination / "neutral_background.jpg"),
@@ -1132,6 +1228,12 @@ def _reference_record(
 ) -> dict[str, object]:
     return {
         **metadata,
+        "raw_canonical_path": metadata.get(
+            "raw_canonical_path",
+            metadata.get("canonical_path"),
+        ),
+        "reference_id": entity.entity_id,
+        "reference_type": "entity",
         "phrase": entity.phrase,
         "canonical_label": entity.canonical_label,
         "category": entity.category,
@@ -1139,6 +1241,7 @@ def _reference_record(
         "genericity": entity.genericity,
         "name_evidence": entity.name_evidence,
         "separability": entity.separability,
+        "inpainted": bool(metadata.get("inpainted", False)),
     }
 
 
@@ -1166,7 +1269,8 @@ def rank_manifest_references(
         for artifact in (output_root / "references").glob("*/*/metadata.json"):
             artifact.unlink()
     qwen = (
-        judge or QwenCandidateJudge(config.qwen)
+        judge
+        or QwenCandidateJudge(_qwen_services(config.qwen).candidate_judge)
         if config.ranking.evaluators.qwen_visual.enabled
         else None
     )
@@ -1519,9 +1623,12 @@ def rank_manifest_references(
                             raise RuntimeError(
                                 "Qwen candidate judge was not initialized"
                             )
-                        review_result = qwen.review(
+                        review_result = _review_candidates(
+                            qwen,
                             entity_id=entity.entity_id,
                             entity_phrase=entity.phrase,
+                            category=entity.category,
+                            canonical_label=entity.canonical_label,
                             contact_sheet=sheet,
                             frame_slots=slots,
                         )

@@ -1,0 +1,5 @@
+# Install only in the server environment that already provides the desired torch build.
+diffusers>=0.35
+transformers>=4.49
+accelerate>=1.2
+safetensors>=0.5

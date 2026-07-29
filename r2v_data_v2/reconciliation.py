@@ -66,9 +66,13 @@ def reconcile_annotations(output_root: Path) -> int:
 
 
 def reconcile_references(output_root: Path) -> int:
+    reference_root = output_root / "references"
     return rebuild_jsonl(
         output_root / "manifests" / "references.jsonl",
-        (output_root / "references").glob("*/*/metadata.json"),
+        [
+            *reference_root.glob("*/*/metadata.json"),
+            *reference_root.glob("*/*/reference_metadata.json"),
+        ],
     )
 
 

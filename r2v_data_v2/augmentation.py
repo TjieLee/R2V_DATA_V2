@@ -311,6 +311,8 @@ def augment_references(
         variants_by_clip.setdefault(str(variant["clip_uid"]), []).append(variant)
     try:
         for reference in iter_source_records(reference_path):
+            if reference.get("reference_type", "entity") != "entity":
+                continue
             clip = str(reference["clip_uid"])
             entity = str(reference["entity_id"])
             destination = output_root / "references" / clip / entity / "augmented"

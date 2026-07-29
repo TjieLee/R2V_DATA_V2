@@ -227,6 +227,43 @@ def rebuild_for_retained_entities(
     return assign_reference_tokens(semantic)
 
 
+def bind_background_reference(
+    annotation: AnnotationResult,
+    *,
+    phrase: str,
+    ref_token: str = "<ref_bg_1>",
+) -> AnnotationResult:
+    if annotation.background is None:
+        raise ReferenceBindingError(
+            [
+                ValidationIssue(
+                    "background_annotation_missing",
+                    "background",
+                    "a background reference requires a background annotation",
+                )
+            ]
+        )
+    background = BackgroundAnnotation.model_validate(
+        {
+            **annotation.background.model_dump(mode="json"),
+            "phrase": phrase,
+            "reference_worthy": True,
+            "ref_token": ref_token,
+        }
+    )
+    prompt = build_prompt_with_refs(
+        annotation.caption,
+        annotation.entities,
+        background,
+    )
+    return annotation.model_copy(
+        update={
+            "prompt_with_refs": prompt,
+            "background": background,
+        }
+    )
+
+
 def validate_final_reference_binding(
     sample: dict[str, object],
     annotation: AnnotationResult | None = None,
@@ -328,6 +365,15 @@ def validate_final_reference_binding(
             continue
         token = reference.get("ref_token")
         phrase = reference.get("phrase")
+        reference_type = str(reference.get("reference_type", "entity"))
+        if reference_type not in {"entity", "background"}:
+            issues.append(
+                ValidationIssue(
+                    "invalid_reference_type",
+                    f"{field}.reference_type",
+                    "reference_type must be entity or background",
+                )
+            )
         if not isinstance(token, str) or _REF_TOKEN.fullmatch(token) is None:
             issues.append(
                 ValidationIssue(
@@ -385,7 +431,7 @@ def validate_final_reference_binding(
                         "reference mask must be readable",
                     )
                 )
-            elif not np.any(mask):
+            elif reference_type == "entity" and not np.any(mask):
                 issues.append(
                     ValidationIssue(
                         "reference_mask_empty",
@@ -403,6 +449,30 @@ def validate_final_reference_binding(
                         "reference mask dimensions must match canonical image",
                     )
                 )
+        if reference_type == "background":
+            if (
+                reference.get("reference_id") != "bg1"
+                or not isinstance(token, str)
+                or not token.startswith("<ref_bg_")
+                or reference.get("pair_type") != "in_pair"
+            ):
+                issues.append(
+                    ValidationIssue(
+                        "invalid_background_reference",
+                        field,
+                        "background references must use bg1, a background token, "
+                        "and in-pair pairing",
+                    )
+                )
+            if reference.get("entity_id") not in (None, ""):
+                issues.append(
+                    ValidationIssue(
+                        "background_has_entity_id",
+                        f"{field}.entity_id",
+                        "background references must not have an entity_id",
+                    )
+                )
+            continue
         entity_id = str(reference.get("entity_id", ""))
         sample_entity = entities_by_id.get(entity_id)
         if sample_entity is None or sample_entity.get("reference_worthy") is not True:
@@ -453,6 +523,12 @@ def validate_final_reference_binding(
         else:
             token = background.get("ref_token")
             image_path = background.get("image_path")
+            unified_backgrounds = [
+                reference
+                for reference in references
+                if isinstance(reference, dict)
+                and reference.get("reference_type") == "background"
+            ]
             if (
                 not isinstance(token, str)
                 or _REF_TOKEN.fullmatch(token) is None
@@ -466,7 +542,23 @@ def validate_final_reference_binding(
                     )
                 )
             else:
-                expected_tokens.append(token)
+                if not unified_backgrounds:
+                    expected_tokens.append(token)
+                elif not any(
+                    reference.get("reference_id")
+                    == background.get("reference_id")
+                    and reference.get("ref_token") == token
+                    and reference.get("image_path") == image_path
+                    for reference in unified_backgrounds
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "background_reference_mismatch",
+                            "background_reference",
+                            "background_reference must match the unified "
+                            "background reference",
+                        )
+                    )
             if not isinstance(image_path, str) or not Path(image_path).is_file():
                 issues.append(
                     ValidationIssue(

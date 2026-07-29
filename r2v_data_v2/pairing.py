@@ -11,10 +11,17 @@ import numpy as np
 from openai import BadRequestError, OpenAI
 
 from prompts.qwen_cross_pair_prompt import CROSS_PAIR_PROMPT
-from r2v_data_v2.config import PairingConfig, PipelineConfig, QwenConfig
+from r2v_data_v2.config import (
+    PairingConfig,
+    PipelineConfig,
+    QwenImageConfig,
+    _qwen_services,
+)
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.reconciliation import reconcile_final_samples, write_json_atomic
 from r2v_data_v2.reference_binding import (
+    ReferenceBindingError,
+    bind_background_reference,
     rebuild_for_retained_entities,
     validate_final_reference_binding,
 )
@@ -56,6 +63,8 @@ def build_cross_pair_index(
     index: dict[CrossPairKey, list[dict[str, Any]]] = {}
     for references in references_by_clip.values():
         for reference in references:
+            if reference.get("reference_type", "entity") == "background":
+                continue
             index.setdefault(cross_pair_index_key(reference), []).append(reference)
     return index
 
@@ -169,7 +178,7 @@ def cross_pair_coarse_similarity(
 
 
 class QwenCrossPairJudge:
-    def __init__(self, config: QwenConfig) -> None:
+    def __init__(self, config: QwenImageConfig) -> None:
         self.config = config
         self.client = OpenAI(
             base_url=config.base_url,
@@ -262,6 +271,13 @@ def _references_by_clip(
 ) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
     for reference in iter_source_records(path):
+        reference.setdefault("reference_type", "entity")
+        reference.setdefault(
+            "reference_id",
+            reference.get("entity_id"),
+        )
+        if reference.get("rejected") is True:
+            continue
         clip = str(reference["clip_uid"])
         annotation = annotations[clip]
         reference.update(
@@ -360,6 +376,8 @@ def _target_reference(
     visual_similarity: float | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
+        "reference_id": target.get("reference_id", target["entity_id"]),
+        "reference_type": "entity",
         "entity_id": target["entity_id"],
         "phrase": target["phrase"],
         "ref_token": target["ref_token"],
@@ -375,6 +393,25 @@ def _target_reference(
         result["cross_pair_judgment"] = judge_result.model_dump(mode="json")
         result["cross_pair_visual_similarity"] = visual_similarity
     return result
+
+
+def _background_target_reference(
+    reference: dict[str, Any],
+) -> dict[str, object]:
+    return {
+        "reference_id": reference.get("reference_id", "bg1"),
+        "reference_type": "background",
+        "entity_id": None,
+        "phrase": reference["phrase"],
+        "ref_token": "<ref_bg_1>",
+        "category": "background",
+        "image_path": reference["canonical_path"],
+        "mask_path": reference["mask_path"],
+        "pair_type": "in_pair",
+        "source_clip_uid": reference["clip_uid"],
+        "source_frame_index": reference["source_frame_index"],
+        "ranking_score": reference["ranking_score"],
+    }
 
 
 def build_pairs(
@@ -398,14 +435,26 @@ def build_pairs(
     annotations = _annotations_by_clip(annotation_path)
     references = _references_by_clip(reference_path, annotations)
     cross_pair_index = build_cross_pair_index(references)
-    qwen = judge or QwenCrossPairJudge(config.qwen)
+    qwen = judge or QwenCrossPairJudge(
+        _qwen_services(config.qwen).cross_pair_judge
+    )
     processed = skipped = in_pairs = cross_pairs = fallbacks = failed = 0
     for clip, annotation in annotations.items():
         if clip in existing:
             skipped += 1
             continue
         try:
-            target_references = references.get(clip, [])
+            clip_references = references.get(clip, [])
+            target_references = [
+                reference
+                for reference in clip_references
+                if reference.get("reference_type", "entity") == "entity"
+            ]
+            background_references = [
+                reference
+                for reference in clip_references
+                if reference.get("reference_type") == "background"
+            ]
             retained_annotation = rebuild_for_retained_entities(
                 _annotation_from_record(annotation),
                 {str(reference["entity_id"]) for reference in target_references},
@@ -472,10 +521,37 @@ def build_pairs(
                         **structured_failure,
                     },
                 )
-            background = annotation.get("background")
             background_reference = None
-            if isinstance(background, dict) and background.get("reference_worthy"):
-                warnings.append("background reference selection is deferred")
+            if background_references:
+                selected_background = min(
+                    background_references,
+                    key=lambda reference: str(
+                        reference.get("reference_id", "bg1")
+                    ),
+                )
+                if len(background_references) > 1:
+                    warnings.append(
+                        "multiple background references found; retained bg1 only"
+                    )
+                if not config.pairing.enable_in_pair:
+                    warnings.append("bg1: no permitted in-pair reference")
+                else:
+                    try:
+                        retained_annotation = bind_background_reference(
+                            retained_annotation,
+                            phrase=str(selected_background["phrase"]),
+                        )
+                    except ReferenceBindingError as exc:
+                        warnings.append(
+                            "background_reference_dropped: "
+                            + ",".join(issue.code for issue in exc.issues)
+                        )
+                    else:
+                        background_reference = _background_target_reference(
+                            selected_background
+                        )
+                        final_references.append(background_reference)
+                        sample_in_pairs += 1
             sample = {
                 "clip_uid": clip,
                 "parent_video_id": annotation["parent_video_id"],

@@ -74,7 +74,7 @@ def _review(slot: int, visual_quality: float = 0.8) -> CandidateVisualReview:
 
 
 def test_hard_gate_beats_weighted_score() -> None:
-    config = RankingConfig()
+    config = RankingConfig(reject_border_touch=True)
     invalid = (
         0,
         10,
@@ -95,6 +95,94 @@ def test_hard_gate_beats_weighted_score() -> None:
     assert ranked[0].frame_slot == 1
     assert ranked[0].hard_rejection_reasons == ()
     assert "border_touch" in ranked[1].hard_rejection_reasons
+
+
+def test_border_touch_is_a_soft_penalty_by_default() -> None:
+    ranked = rank_candidates(
+        [
+            (
+                0,
+                10,
+                0.9,
+                _metrics(border_touch=True, sharpness=100),
+                _review(0),
+            )
+        ],
+        config=RankingConfig(),
+    )
+
+    assert ranked[0].hard_rejection_reasons == ()
+    assert ranked[0].raw_scores["border_completeness"] == 0.75
+    assert ranked[0].normalized_scores["border_completeness"] == 0.75
+
+
+def test_preferred_canonical_tier_beats_higher_weighted_fallback() -> None:
+    fallback = _review(0, 1.0).model_copy(
+        update={"canonical_view_score": 0.69}
+    )
+    preferred = _review(1, 0.2).model_copy(
+        update={
+            "viewpoint": "front_three_quarter",
+            "canonical_view_score": 0.70,
+        }
+    )
+
+    ranked = rank_candidates(
+        [
+            (0, 10, 0.95, _metrics(border_touch=False, sharpness=100), fallback),
+            (1, 20, 0.70, _metrics(border_touch=False, sharpness=10), preferred),
+        ],
+        config=RankingConfig(),
+    )
+
+    assert ranked[0].frame_slot == 1
+    assert ranked[0].raw_scores["qwen_canonical_view"] == 0.70
+
+
+def test_canonical_tier_falls_back_when_no_candidate_is_preferred() -> None:
+    stronger = _review(0, 1.0).model_copy(
+        update={"canonical_view_score": 0.60}
+    )
+    weaker = _review(1, 0.2).model_copy(
+        update={"canonical_view_score": 0.65}
+    )
+
+    ranked = rank_candidates(
+        [
+            (0, 10, 0.9, _metrics(border_touch=False, sharpness=100), stronger),
+            (1, 20, 0.9, _metrics(border_touch=False, sharpness=100), weaker),
+        ],
+        config=RankingConfig(),
+    )
+
+    assert ranked[0].frame_slot == 0
+
+
+def test_non_front_animal_view_is_not_an_automatic_hard_rejection() -> None:
+    review = _review(0).model_copy(
+        update={
+            "viewpoint": "side",
+            "canonical_view_score": 0.75,
+        }
+    )
+
+    ranked = rank_candidates(
+        [(0, 10, 0.9, _metrics(border_touch=False, sharpness=100), review)],
+        config=RankingConfig(),
+    )
+
+    assert ranked[0].hard_rejection_reasons == ()
+
+
+def test_not_applicable_is_a_valid_object_viewpoint() -> None:
+    review = _review(0).model_copy(
+        update={
+            "viewpoint": "not_applicable",
+            "canonical_view_score": 0.8,
+        }
+    )
+
+    assert review.viewpoint == "not_applicable"
 
 
 def test_low_completeness_is_hard_failure() -> None:
@@ -197,7 +285,7 @@ def test_qwen_best_frame_does_not_override_code_hard_gate() -> None:
                 _review(1),
             ),
         ],
-        config=RankingConfig(),
+        config=RankingConfig(reject_border_touch=True),
     )
 
     qwen_diagnostic_best_frame_slot = 0
@@ -383,10 +471,12 @@ def test_disabled_model_weights_are_removed_and_renormalized() -> None:
         + 0.06 * (0.6 * 0.5 + 0.4 * 0.9)
         + 0.04 * 0.8
         + 0.04 * 0.9
+        + 0.06 * 0.5
         + 0.04 * 1.0
+        + 0.03 * 1.0
         + 0.03 * crop_score
         + 0.02 * 0.8
-    ) / 0.67
+    ) / 0.76
     assert ranked[0].ranking_score == pytest.approx(expected)
 
 

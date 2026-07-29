@@ -15,7 +15,12 @@ from r2v_data_v2.caption_validation import (
     exact_phrase_spans,
     validate_annotation,
 )
-from r2v_data_v2.config import PipelineConfig, QwenConfig
+from r2v_data_v2.config import (
+    PipelineConfig,
+    QwenConfig,
+    QwenImageConfig,
+    _qwen_services,
+)
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.reconciliation import reconcile_annotations, write_json_atomic
 from r2v_data_v2.reference_binding import (
@@ -168,13 +173,30 @@ def _align_reference_phrases(
 
 
 class QwenAnnotationClient:
-    def __init__(self, config: QwenConfig) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        *,
+        repair_config: QwenImageConfig | None = None,
+    ) -> None:
         self.config = config
+        self.repair_config = repair_config
         self.client = OpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
             timeout=config.timeout_seconds,
         )
+        self.repair_client = (
+            OpenAI(
+                base_url=repair_config.base_url,
+                api_key=repair_config.api_key,
+                timeout=repair_config.timeout_seconds,
+            )
+            if repair_config is not None
+            else None
+        )
+        self._active_client = self.client
+        self._active_config: QwenImageConfig = config
 
     def _messages(
         self,
@@ -222,17 +244,19 @@ class QwenAnnotationClient:
         return messages
 
     def _request(self, messages: list[dict[str, object]]) -> str:
+        active_config = getattr(self, "_active_config", self.config)
+        active_client = getattr(self, "_active_client", self.client)
         parameters: dict[str, Any] = {
-            "model": self.config.model,
+            "model": active_config.model,
             "messages": messages,
-            "temperature": self.config.temperature,
+            "temperature": active_config.temperature,
             "top_p": 1.0,
             "presence_penalty": 0.0,
-            "max_tokens": self.config.max_tokens,
+            "max_tokens": active_config.max_tokens,
             "extra_body": _video_processor_extra_body(self.config),
         }
         try:
-            response = self.client.chat.completions.create(
+            response = active_client.chat.completions.create(
                 **parameters,
                 response_format={
                     "type": "json_schema",
@@ -244,7 +268,7 @@ class QwenAnnotationClient:
                 },
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
+            response = active_client.chat.completions.create(
                 **parameters,
                 response_format={"type": "json_object"},
             )
@@ -273,6 +297,14 @@ class QwenAnnotationClient:
                     metadata=metadata,
                 )
             try:
+                repair_config = getattr(self, "repair_config", None)
+                repair_client = getattr(self, "repair_client", None)
+                if attempt and repair_config is not None and repair_client is not None:
+                    self._active_config = repair_config
+                    self._active_client = repair_client
+                else:
+                    self._active_config = self.config
+                    self._active_client = getattr(self, "client", None)
                 raw_response = self._request(
                     self._messages(
                         video_path=video_path,
@@ -348,7 +380,11 @@ def annotate_manifest(
         annotation_manifest.unlink(missing_ok=True)
         for artifact in (output_root / "annotations").glob("*.json"):
             artifact.unlink()
-    qwen = client or QwenAnnotationClient(config.qwen)
+    services = _qwen_services(config.qwen)
+    qwen = client or QwenAnnotationClient(
+        services.annotation,
+        repair_config=services.repair_judge,
+    )
     processed = skipped = failed = no_ref = generic_count = 0
     for source in iter_source_records(source_manifest):
         clip = str(source["clip_uid"])

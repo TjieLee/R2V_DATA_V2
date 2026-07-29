@@ -32,7 +32,9 @@ FINAL_METRICS = frozenset(
         "sharpness_exposure",
         "qwen_visual_quality",
         "inverse_qwen_occlusion",
+        "qwen_canonical_view",
         "isolation",
+        "border_completeness",
         "crop_subject_ratio",
         "sam_confidence",
     }
@@ -50,7 +52,9 @@ NORMALIZATION_METRICS = frozenset(
         "qwen_mask_quality",
         "qwen_visual_quality",
         "inverse_qwen_occlusion",
+        "qwen_canonical_view",
         "mask_area_continuity",
+        "border_completeness",
         "crop_subject_ratio",
     }
 )
@@ -73,7 +77,7 @@ class QwenVideoConfig:
 
 
 @dataclass(frozen=True)
-class QwenConfig:
+class QwenImageConfig:
     base_url: str = "http://localhost:8000/v1"
     api_key: str = "EMPTY"
     model: str = "/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct"
@@ -81,7 +85,72 @@ class QwenConfig:
     max_tokens: int = 2048
     timeout_seconds: int = 3600
     repair_retries: int = 1
+
+
+@dataclass(frozen=True)
+class QwenConfig(QwenImageConfig):
     video: QwenVideoConfig = field(default_factory=QwenVideoConfig)
+
+
+def _image_config_from_annotation(config: QwenConfig) -> QwenImageConfig:
+    return QwenImageConfig(
+        **{
+            name: getattr(config, name)
+            for name in QwenImageConfig.__dataclass_fields__
+        }
+    )
+
+
+@dataclass(frozen=True)
+class QwenServicesConfig:
+    annotation: QwenConfig = field(default_factory=QwenConfig)
+    candidate_judge: QwenImageConfig = field(default_factory=QwenImageConfig)
+    background_judge: QwenImageConfig = field(default_factory=QwenImageConfig)
+    cross_pair_judge: QwenImageConfig = field(default_factory=QwenImageConfig)
+    repair_judge: QwenImageConfig | None = None
+
+    @classmethod
+    def from_flat(cls, config: QwenConfig) -> QwenServicesConfig:
+        image_config = _image_config_from_annotation(config)
+        return cls(
+            annotation=config,
+            candidate_judge=image_config,
+            background_judge=image_config,
+            cross_pair_judge=image_config,
+        )
+
+    # Compatibility for callers that still read config.qwen.<flat field>.
+    @property
+    def base_url(self) -> str:
+        return self.annotation.base_url
+
+    @property
+    def api_key(self) -> str:
+        return self.annotation.api_key
+
+    @property
+    def model(self) -> str:
+        return self.annotation.model
+
+    @property
+    def temperature(self) -> float:
+        return self.annotation.temperature
+
+    @property
+    def max_tokens(self) -> int:
+        return self.annotation.max_tokens
+
+    @property
+    def timeout_seconds(self) -> int:
+        return self.annotation.timeout_seconds
+
+    @property
+    def repair_retries(self) -> int:
+        return self.annotation.repair_retries
+
+    @property
+    def video(self) -> QwenVideoConfig:
+        return self.annotation.video
 
 
 @dataclass(frozen=True)
@@ -152,7 +221,9 @@ def _default_final_weights() -> dict[str, float]:
         "sharpness_exposure": 0.06,
         "qwen_visual_quality": 0.04,
         "inverse_qwen_occlusion": 0.04,
+        "qwen_canonical_view": 0.06,
         "isolation": 0.04,
+        "border_completeness": 0.03,
         "crop_subject_ratio": 0.03,
         "sam_confidence": 0.02,
     }
@@ -187,7 +258,7 @@ class RankingConfig:
     minimum_effective_short_side: int = 128
     minimum_mask_area_ratio: float = 0.005
     maximum_mask_area_ratio: float = 0.75
-    reject_border_touch: bool = True
+    reject_border_touch: bool = False
     top_k_for_vlm_judge: int = 3
     save_top_k_mask_rle: int = 10
     minimum_exposure_score: float = 0.35
@@ -223,6 +294,65 @@ class PairingConfig:
 
 
 @dataclass(frozen=True)
+class BackgroundConfig:
+    enabled: bool = True
+    raw_foreground_area_ratio: float = 0.05
+    maximum_foreground_area_ratio: float = 0.25
+    maximum_hole_area_ratio: float = 0.25
+    minimum_exposure_score: float = 0.35
+    minimum_sharpness: float = 0.0
+    qwen_judge_enabled: bool = False
+    top_k_for_vlm_judge: int = 3
+
+
+@dataclass(frozen=True)
+class InpaintingBackgroundConfig:
+    enabled: bool = True
+    maximum_hole_area_ratio: float = 0.25
+
+
+@dataclass(frozen=True)
+class InpaintingEntityConfig:
+    enabled: bool = False
+    maximum_repair_area_ratio: float = 0.08
+    maximum_component_area_ratio: float = 0.05
+    minimum_completeness_before_repair: float = 0.70
+    require_reliable_repair_mask: bool = True
+
+
+@dataclass(frozen=True)
+class InpaintingConsistencyConfig:
+    preserve_unmasked_pixels: bool = True
+    minimum_dino_similarity: float = 0.92
+    maximum_unmasked_l1_diff: float = 0.0
+    fallback_to_raw: bool = True
+
+
+@dataclass(frozen=True)
+class InpaintingConfig:
+    enabled: bool = False
+    backend: str = "flux1_fill"
+    model_path: Path | None = None
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    seed: int = 42
+    num_inference_steps: int = 28
+    guidance_scale: float = 30.0
+    mask_dilation_pixels: int = 8
+    feather_pixels: int = 4
+    top_k_per_reference: int = 2
+    background: InpaintingBackgroundConfig = field(
+        default_factory=InpaintingBackgroundConfig
+    )
+    entity: InpaintingEntityConfig = field(
+        default_factory=InpaintingEntityConfig
+    )
+    consistency: InpaintingConsistencyConfig = field(
+        default_factory=InpaintingConsistencyConfig
+    )
+
+
+@dataclass(frozen=True)
 class AugmentationConfig:
     enabled: bool = False
     save_rgba: bool = True
@@ -235,12 +365,18 @@ class AugmentationConfig:
 class PipelineConfig:
     dataset_json: Path
     output_root: Path
-    qwen: QwenConfig = field(default_factory=QwenConfig)
+    qwen: QwenServicesConfig | QwenConfig = field(default_factory=QwenServicesConfig)
     frames: FramesConfig = field(default_factory=FramesConfig)
     sam3: Sam3Config = field(default_factory=Sam3Config)
     ranking: RankingConfig = field(default_factory=RankingConfig)
+    background: BackgroundConfig = field(default_factory=BackgroundConfig)
+    inpainting: InpaintingConfig = field(default_factory=InpaintingConfig)
     pairing: PairingConfig = field(default_factory=PairingConfig)
     augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.qwen, QwenConfig):
+            object.__setattr__(self, "qwen", QwenServicesConfig.from_flat(self.qwen))
 
     def validate_paths(self) -> None:
         dataset = self.dataset_json.expanduser().resolve(strict=False)
@@ -248,13 +384,17 @@ class PipelineConfig:
             raise ValueError(
                 "dataset_json must be inside /mnt/workspace/public/dataset"
             )
-        model_path = Path(self.qwen.model).expanduser()
-        if model_path.is_absolute() or model_path.exists():
-            resolved_model = model_path.resolve(strict=False)
-            if not _is_at_or_below(resolved_model, ALLOWED_PRETRAINED_ROOT):
-                raise ValueError(
-                    "local qwen.model must be inside /mnt/workspace/public/pretrained"
-                )
+        qwen_services = _qwen_services(self.qwen)
+        for service_name, service in _iter_qwen_services(qwen_services):
+            model_path = Path(service.model).expanduser()
+            if model_path.is_absolute() or model_path.exists():
+                resolved_model = model_path.resolve(strict=False)
+                if not _is_at_or_below(resolved_model, ALLOWED_PRETRAINED_ROOT):
+                    raise ValueError(
+                        "local qwen.model must be inside "
+                        "/mnt/workspace/public/pretrained; "
+                        f"invalid service: qwen.{service_name}"
+                    )
         ranking_model_paths = []
         if self.ranking.evaluators.dinov3.enabled:
             ranking_model_paths.append(
@@ -282,6 +422,19 @@ class PipelineConfig:
                     "/mnt/workspace/public/pretrained or "
                     "/mnt/workspace/litengjie/data/models"
                 )
+        if self.inpainting.model_path is not None:
+            inpainting_model_path = (
+                self.inpainting.model_path.expanduser().resolve(strict=False)
+            )
+            if not (
+                _is_at_or_below(inpainting_model_path, ALLOWED_PRETRAINED_ROOT)
+                or _is_at_or_below(inpainting_model_path, ALLOWED_USER_MODEL_ROOT)
+            ):
+                raise ValueError(
+                    "inpainting.model_path must be inside "
+                    "/mnt/workspace/public/pretrained or "
+                    "/mnt/workspace/litengjie/data/models"
+                )
 
     def ensure_output_root(self) -> Path:
         self.validate_paths()
@@ -296,14 +449,130 @@ def _path_or_none(value: object) -> Path | None:
     return None if value in (None, "") else Path(str(value)).expanduser()
 
 
+def _qwen_services(
+    value: QwenServicesConfig | QwenConfig,
+) -> QwenServicesConfig:
+    return value if isinstance(value, QwenServicesConfig) else QwenServicesConfig.from_flat(value)
+
+
+def _iter_qwen_services(
+    config: QwenServicesConfig,
+) -> list[tuple[str, QwenImageConfig]]:
+    services = [
+        ("annotation", config.annotation),
+        ("candidate_judge", config.candidate_judge),
+        ("background_judge", config.background_judge),
+        ("cross_pair_judge", config.cross_pair_judge),
+    ]
+    if config.repair_judge is not None:
+        services.append(("repair_judge", config.repair_judge))
+    return services
+
+
+def _parse_annotation_config(
+    values: dict[str, object],
+    *,
+    fallback: QwenConfig | None = None,
+) -> QwenConfig:
+    merged = vars(fallback).copy() if fallback is not None else {}
+    fallback_video = (
+        vars(fallback.video).copy() if fallback is not None else {}
+    )
+    merged.update(values)
+    video_values = merged.pop("video", {})
+    if not isinstance(video_values, dict):
+        raise TypeError("qwen.annotation.video must be a mapping")
+    fallback_video.update(video_values)
+    return QwenConfig(**merged, video=QwenVideoConfig(**fallback_video))
+
+
+def _parse_image_config(
+    values: dict[str, object] | None,
+    *,
+    fallback: QwenImageConfig,
+    field_name: str,
+) -> QwenImageConfig:
+    if values is None:
+        return fallback
+    if not isinstance(values, dict):
+        raise TypeError(f"qwen.{field_name} must be a mapping")
+    if "video" in values:
+        raise ValueError(f"qwen.{field_name} is image-only and does not accept video")
+    merged = vars(fallback).copy()
+    merged.update(values)
+    return QwenImageConfig(**merged)
+
+
+def _parse_qwen_services(raw_qwen: object) -> QwenServicesConfig:
+    if not isinstance(raw_qwen, dict):
+        raise TypeError("qwen configuration must be a mapping")
+    service_keys = {
+        "annotation",
+        "candidate_judge",
+        "background_judge",
+        "cross_pair_judge",
+        "repair_judge",
+    }
+    if not service_keys.intersection(raw_qwen):
+        flat = dict(raw_qwen)
+        video_values = flat.pop("video", {})
+        if not isinstance(video_values, dict):
+            raise TypeError("qwen.video must be a mapping")
+        annotation = QwenConfig(
+            **flat,
+            video=QwenVideoConfig(**video_values),
+        )
+        return QwenServicesConfig.from_flat(annotation)
+
+    unknown = sorted(set(raw_qwen) - service_keys)
+    if unknown:
+        raise ValueError(f"unknown qwen service configuration keys: {unknown}")
+    annotation_values = raw_qwen.get("annotation", {})
+    if not isinstance(annotation_values, dict):
+        raise TypeError("qwen.annotation must be a mapping")
+    annotation = _parse_annotation_config(dict(annotation_values))
+    annotation_image = _image_config_from_annotation(annotation)
+    candidate = _parse_image_config(
+        raw_qwen.get("candidate_judge"),
+        fallback=annotation_image,
+        field_name="candidate_judge",
+    )
+    background = _parse_image_config(
+        raw_qwen.get("background_judge"),
+        fallback=candidate,
+        field_name="background_judge",
+    )
+    cross_pair = _parse_image_config(
+        raw_qwen.get("cross_pair_judge"),
+        fallback=candidate,
+        field_name="cross_pair_judge",
+    )
+    repair_values = raw_qwen.get("repair_judge")
+    repair = (
+        _parse_image_config(
+            repair_values,
+            fallback=annotation_image,
+            field_name="repair_judge",
+        )
+        if repair_values is not None
+        else None
+    )
+    return QwenServicesConfig(
+        annotation=annotation,
+        candidate_judge=candidate,
+        background_judge=background,
+        cross_pair_judge=cross_pair,
+        repair_judge=repair,
+    )
+
+
 def load_config(path: str | Path) -> PipelineConfig:
     config_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise TypeError("configuration must be a YAML mapping")
 
-    qwen = dict(raw.get("qwen", {}))
-    qwen_video = dict(qwen.pop("video", {}))
+    qwen = _parse_qwen_services(raw.get("qwen", {}))
     frames = dict(raw.get("frames", {}))
     sam3 = dict(raw.get("sam3", {}))
     ranking = dict(raw.get("ranking", {}))
@@ -324,6 +593,12 @@ def load_config(path: str | Path) -> PipelineConfig:
             )
         normalization[metric_name] = MetricNormalizationConfig(**metric_config)
     pairing = dict(raw.get("pairing", {}))
+    background = dict(raw.get("background", {}))
+    inpainting = dict(raw.get("inpainting", {}))
+    inpainting_background = dict(inpainting.pop("background", {}))
+    inpainting_entity = dict(inpainting.pop("entity", {}))
+    inpainting_consistency = dict(inpainting.pop("consistency", {}))
+    inpainting["model_path"] = _path_or_none(inpainting.get("model_path"))
     augmentation = dict(raw.get("augmentation", {}))
     sam3["code_root"] = Path(
         sam3.get("code_root", "/mnt/workspace/litengjie/data/vendor/sam3")
@@ -343,7 +618,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     config = PipelineConfig(
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
         output_root=Path(str(raw["output_root"])).expanduser(),
-        qwen=QwenConfig(**qwen, video=QwenVideoConfig(**qwen_video)),
+        qwen=qwen,
         frames=FramesConfig(**frames),
         sam3=Sam3Config(**sam3),
         ranking=RankingConfig(
@@ -354,6 +629,15 @@ def load_config(path: str | Path) -> PipelineConfig:
                 siglip2=SiglipEvaluatorConfig(**siglip_evaluator),
             ),
             normalization=normalization,
+        ),
+        background=BackgroundConfig(**background),
+        inpainting=InpaintingConfig(
+            **inpainting,
+            background=InpaintingBackgroundConfig(**inpainting_background),
+            entity=InpaintingEntityConfig(**inpainting_entity),
+            consistency=InpaintingConsistencyConfig(
+                **inpainting_consistency
+            ),
         ),
         pairing=PairingConfig(**pairing),
         augmentation=AugmentationConfig(**augmentation),
@@ -370,17 +654,37 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("frames.jpeg_quality must be between 1 and 100")
     if config.frames.max_side < 1:
         raise ValueError("frames.max_side must be positive")
-    if config.qwen.temperature != 0.0:
-        raise ValueError("qwen.temperature must be 0.0 for deterministic annotation")
-    if config.qwen.max_tokens > 2048:
-        raise ValueError("qwen.max_tokens must not exceed 2048")
-    if config.qwen.video.input_mode != "full_video":
+    qwen = _qwen_services(config.qwen)
+    for service_name, service in _iter_qwen_services(qwen):
+        if service.temperature != 0.0:
+            raise ValueError(
+                f"qwen.{service_name}.temperature must be 0.0 for deterministic use"
+            )
+        if service.max_tokens < 1 or service.max_tokens > 2048:
+            raise ValueError(
+                f"qwen.{service_name}.max_tokens must be between 1 and 2048"
+            )
+        if service.timeout_seconds < 1:
+            raise ValueError(
+                f"qwen.{service_name}.timeout_seconds must be positive"
+            )
+        if service.repair_retries < 0:
+            raise ValueError(
+                f"qwen.{service_name}.repair_retries must be non-negative"
+            )
+    if qwen.annotation.video.input_mode != "full_video":
         raise ValueError("qwen.video.input_mode currently only supports full_video")
-    if config.qwen.video.fps <= 0:
+    if qwen.annotation.video.fps <= 0:
         raise ValueError("qwen.video.fps must be positive")
-    if config.qwen.video.max_pixels is not None and config.qwen.video.max_pixels < 1:
+    if (
+        qwen.annotation.video.max_pixels is not None
+        and qwen.annotation.video.max_pixels < 1
+    ):
         raise ValueError("qwen.video.max_pixels must be positive when configured")
-    if config.qwen.video.total_pixels is not None and config.qwen.video.total_pixels < 1:
+    if (
+        qwen.annotation.video.total_pixels is not None
+        and qwen.annotation.video.total_pixels < 1
+    ):
         raise ValueError("qwen.video.total_pixels must be positive when configured")
     if config.sam3.minimum_visible_frames < 1:
         raise ValueError("sam3.minimum_visible_frames must be positive")
@@ -411,6 +715,86 @@ def _validate_config(config: PipelineConfig) -> None:
         )
     if config.ranking.siglip2_batch_size < 1:
         raise ValueError("ranking.siglip2_batch_size must be positive")
+    if not (
+        0.0
+        <= config.background.raw_foreground_area_ratio
+        <= config.background.maximum_foreground_area_ratio
+        <= 1.0
+    ):
+        raise ValueError("background foreground area thresholds are invalid")
+    if not 0.0 <= config.background.maximum_hole_area_ratio <= 1.0:
+        raise ValueError(
+            "background.maximum_hole_area_ratio must be between 0 and 1"
+        )
+    if not 0.0 <= config.background.minimum_exposure_score <= 1.0:
+        raise ValueError(
+            "background.minimum_exposure_score must be between 0 and 1"
+        )
+    if config.background.minimum_sharpness < 0:
+        raise ValueError("background.minimum_sharpness must be non-negative")
+    if not 1 <= config.background.top_k_for_vlm_judge <= 3:
+        raise ValueError(
+            "background.top_k_for_vlm_judge must be between 1 and 3"
+        )
+    if config.inpainting.backend not in {"flux1_fill", "noop"}:
+        raise ValueError("inpainting.backend must be flux1_fill or noop")
+    if config.inpainting.enabled and config.inpainting.backend == "flux1_fill":
+        model_path = config.inpainting.model_path
+        if model_path is None:
+            raise ValueError(
+                "inpainting.model_path is required when FLUX inpainting is enabled"
+            )
+        if not model_path.expanduser().resolve(strict=False).exists():
+            raise FileNotFoundError(
+                "FLUX inpainting model path does not exist: "
+                f"{model_path.expanduser().resolve(strict=False)}"
+            )
+    if config.inpainting.dtype not in {"float16", "bfloat16", "float32"}:
+        raise ValueError(
+            "inpainting.dtype must be float16, bfloat16, or float32"
+        )
+    if config.inpainting.num_inference_steps < 1:
+        raise ValueError("inpainting.num_inference_steps must be positive")
+    if config.inpainting.guidance_scale < 0:
+        raise ValueError("inpainting.guidance_scale must be non-negative")
+    if config.inpainting.mask_dilation_pixels < 0:
+        raise ValueError("inpainting.mask_dilation_pixels must be non-negative")
+    if config.inpainting.feather_pixels < 0:
+        raise ValueError("inpainting.feather_pixels must be non-negative")
+    if config.inpainting.top_k_per_reference < 1:
+        raise ValueError("inpainting.top_k_per_reference must be positive")
+    if not config.inpainting.consistency.preserve_unmasked_pixels:
+        raise ValueError(
+            "inpainting.consistency.preserve_unmasked_pixels must remain true"
+        )
+    for field_name, value in (
+        (
+            "inpainting.background.maximum_hole_area_ratio",
+            config.inpainting.background.maximum_hole_area_ratio,
+        ),
+        (
+            "inpainting.entity.maximum_repair_area_ratio",
+            config.inpainting.entity.maximum_repair_area_ratio,
+        ),
+        (
+            "inpainting.entity.maximum_component_area_ratio",
+            config.inpainting.entity.maximum_component_area_ratio,
+        ),
+        (
+            "inpainting.entity.minimum_completeness_before_repair",
+            config.inpainting.entity.minimum_completeness_before_repair,
+        ),
+        (
+            "inpainting.consistency.minimum_dino_similarity",
+            config.inpainting.consistency.minimum_dino_similarity,
+        ),
+        (
+            "inpainting.consistency.maximum_unmasked_l1_diff",
+            config.inpainting.consistency.maximum_unmasked_l1_diff,
+        ),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{field_name} must be between 0 and 1")
     _validate_metric_weights(
         name="ranking.preselection_weights",
         weights=config.ranking.preselection_weights,
@@ -488,6 +872,7 @@ def _enabled_final_metrics(config: RankingConfig) -> set[str]:
         "qwen_mask_quality",
         "qwen_visual_quality",
         "inverse_qwen_occlusion",
+        "qwen_canonical_view",
     }
     enabled = set(
         FINAL_METRICS
@@ -559,12 +944,27 @@ def _validate_normalization(
 
 
 def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
+    qwen = _qwen_services(config.qwen)
+
+    def image_service(value: QwenImageConfig) -> dict[str, object]:
+        return dict(vars(value))
+
     return {
         "dataset_json": str(config.dataset_json),
         "output_root": str(config.output_root),
         "qwen": {
-            **vars(config.qwen),
-            "video": vars(config.qwen.video),
+            "annotation": {
+                **vars(qwen.annotation),
+                "video": vars(qwen.annotation.video),
+            },
+            "candidate_judge": image_service(qwen.candidate_judge),
+            "background_judge": image_service(qwen.background_judge),
+            "cross_pair_judge": image_service(qwen.cross_pair_judge),
+            "repair_judge": (
+                image_service(qwen.repair_judge)
+                if qwen.repair_judge is not None
+                else None
+            ),
         },
         "frames": vars(config.frames),
         "sam3": {
@@ -592,6 +992,18 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
                 else None
             ),
             "siglip2_model_path": str(config.ranking.siglip2_model_path),
+        },
+        "background": vars(config.background),
+        "inpainting": {
+            **vars(config.inpainting),
+            "model_path": (
+                str(config.inpainting.model_path)
+                if config.inpainting.model_path is not None
+                else None
+            ),
+            "background": vars(config.inpainting.background),
+            "entity": vars(config.inpainting.entity),
+            "consistency": vars(config.inpainting.consistency),
         },
         "pairing": vars(config.pairing),
         "augmentation": vars(config.augmentation),

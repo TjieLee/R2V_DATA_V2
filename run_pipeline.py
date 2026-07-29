@@ -5,7 +5,9 @@ import json
 from dataclasses import asdict
 
 from r2v_data_v2.augmentation import augment_references
+from r2v_data_v2.background_reference import build_background_references
 from r2v_data_v2.config import load_config
+from r2v_data_v2.inpainting import run_inpainting
 from r2v_data_v2.manifest import build_manifest
 from r2v_data_v2.pairing import build_pairs
 from r2v_data_v2.qwen_client import annotate_manifest
@@ -13,7 +15,17 @@ from r2v_data_v2.ranking import rank_manifest_references
 from r2v_data_v2.sam3_backend import extract_manifest_candidates
 from r2v_data_v2.video_io import sample_manifest_frames
 
-_STAGE_ORDER = ("manifest", "qwen", "frames", "sam", "rank", "pair", "augment")
+_STAGE_ORDER = (
+    "manifest",
+    "qwen",
+    "frames",
+    "sam",
+    "rank",
+    "background",
+    "inpaint",
+    "pair",
+    "augment",
+)
 
 
 def run_pipeline(
@@ -47,6 +59,10 @@ def run_pipeline(
             value = extract_manifest_candidates(config, overwrite=overwrite)
         elif stage == "rank":
             value = rank_manifest_references(config, overwrite=overwrite)
+        elif stage == "background":
+            value = build_background_references(config, overwrite=overwrite)
+        elif stage == "inpaint":
+            value = run_inpainting(config, overwrite=overwrite)
         elif stage == "pair":
             value = build_pairs(config, overwrite=overwrite)
         else:
@@ -56,6 +72,8 @@ def run_pipeline(
     annotation = results.get("qwen", {})
     sam = results.get("sam", {})
     ranking = results.get("rank", {})
+    background = results.get("background", {})
+    inpainting = results.get("inpaint", {})
     pairing = results.get("pair", {})
     processed = 0
     for stage in reversed(_STAGE_ORDER):
@@ -73,6 +91,17 @@ def run_pipeline(
             "no_valid_candidate",
             sam.get("no_valid_candidate", 0),
         ),
+        "background_failed": background.get("failed", 0),
+        "raw_background_count": background.get("raw_background_count", 0),
+        "needs_inpainting_count": background.get(
+            "needs_inpainting_count",
+            0,
+        ),
+        "inpainting_repaired": inpainting.get("repaired", 0),
+        "inpainting_fallback_to_raw": inpainting.get(
+            "fallback_to_raw",
+            0,
+        ),
         "in_pair_count": pairing.get("in_pair_count", 0),
         "cross_pair_count": pairing.get("cross_pair_count", 0),
         "fallback_count": pairing.get("fallback_count", 0),
@@ -89,8 +118,11 @@ def main() -> None:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument(
         "--stages",
-        default="manifest,qwen,frames,sam,rank,pair",
-        help="comma-separated subset of manifest,qwen,frames,sam,rank,pair,augment",
+        default="manifest,qwen,frames,sam,rank,background,pair",
+        help=(
+            "comma-separated subset of "
+            "manifest,qwen,frames,sam,rank,background,inpaint,pair,augment"
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()

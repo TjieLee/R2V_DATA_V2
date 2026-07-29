@@ -1,19 +1,45 @@
 dataset_json: /mnt/workspace/public/dataset/jea-video/zicai_5th_moive/train_zicai_5th_moive.json
 output_root: /mnt/workspace/litengjie/data/r2v_data_v2
 qwen:
-  base_url: http://localhost:8000/v1
-  api_key: EMPTY
-  model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
-  temperature: 0.0
-  max_tokens: 2048
-  timeout_seconds: 3600
-  repair_retries: 1
-  video:
-    input_mode: full_video
-    fps: 2.0
-    do_sample_frames: false
-    max_pixels: null
-    total_pixels: null
+  annotation:
+    base_url: http://localhost:8000/v1
+    api_key: EMPTY
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+    temperature: 0.0
+    max_tokens: 2048
+    timeout_seconds: 3600
+    repair_retries: 1
+    video:
+      input_mode: full_video
+      fps: 2.0
+      do_sample_frames: false
+      max_pixels: null
+      total_pixels: null
+  candidate_judge:
+    base_url: http://localhost:8000/v1
+    api_key: EMPTY
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+    temperature: 0.0
+    max_tokens: 1024
+    timeout_seconds: 1200
+    repair_retries: 1
+  background_judge:
+    base_url: http://localhost:8000/v1
+    api_key: EMPTY
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+    temperature: 0.0
+    max_tokens: 1024
+    timeout_seconds: 1200
+    repair_retries: 1
+  cross_pair_judge:
+    base_url: http://localhost:8000/v1
+    api_key: EMPTY
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-8B-Instruct
+    temperature: 0.0
+    max_tokens: 1024
+    timeout_seconds: 1200
+    repair_retries: 1
+
 frames:
   count: 10
   jpeg_quality: 92
@@ -27,7 +53,7 @@ ranking:
   minimum_effective_short_side: 128
   minimum_mask_area_ratio: 0.005
   maximum_mask_area_ratio: 0.75
-  reject_border_touch: true
+  reject_border_touch: false
   top_k_for_vlm_judge: 3
   save_top_k_mask_rle: 10
   minimum_exposure_score: 0.35
@@ -65,7 +91,9 @@ ranking:
     sharpness_exposure: 0.06
     qwen_visual_quality: 0.04
     inverse_qwen_occlusion: 0.04
+    qwen_canonical_view: 0.06
     isolation: 0.04
+    border_completeness: 0.03
     crop_subject_ratio: 0.03
     sam_confidence: 0.02
   normalization:
@@ -93,7 +121,11 @@ ranking:
       method: identity
     inverse_qwen_occlusion:
       method: identity
+    qwen_canonical_view:
+      method: identity
     mask_area_continuity:
+      method: identity
+    border_completeness:
       method: identity
     crop_subject_ratio:
       method: identity
@@ -104,6 +136,44 @@ ranking:
   dinov3_cluster_similarity_threshold: 0.7
   siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
   siglip2_batch_size: 8
+
+background:
+  enabled: true
+  raw_foreground_area_ratio: 0.05
+  maximum_foreground_area_ratio: 0.25
+  maximum_hole_area_ratio: 0.25
+  minimum_exposure_score: 0.35
+  minimum_sharpness: 0.0
+  qwen_judge_enabled: false
+  top_k_for_vlm_judge: 3
+
+inpainting:
+  enabled: false
+  backend: flux1_fill
+  model_path: null
+  device: cuda
+  dtype: bfloat16
+  seed: 42
+  num_inference_steps: 28
+  guidance_scale: 30.0
+  mask_dilation_pixels: 8
+  feather_pixels: 4
+  top_k_per_reference: 2
+  background:
+    enabled: true
+    maximum_hole_area_ratio: 0.25
+  entity:
+    enabled: false
+    maximum_repair_area_ratio: 0.08
+    maximum_component_area_ratio: 0.05
+    minimum_completeness_before_repair: 0.70
+    require_reliable_repair_mask: true
+  consistency:
+    preserve_unmasked_pixels: true
+    minimum_dino_similarity: 0.92
+    maximum_unmasked_l1_diff: 0.0
+    fallback_to_raw: true
+
 pairing:
   enable_in_pair: true
   enable_same_parent_cross_pair: true
