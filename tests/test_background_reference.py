@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -132,6 +133,7 @@ def test_background_only_clip_produces_raw_reference(tmp_path: Path) -> None:
     assert metadata["entity_id"] is None
     assert metadata["needs_inpainting"] is False
     assert metadata["inpainted"] is False
+    assert metadata["status"] == "ready"
     assert Path(str(metadata["raw_canonical_path"])).is_file()
     assert Path(str(metadata["canonical_path"])).is_file()
     assert len(list((config.output_root / "references" / "clip-1").iterdir())) == 1
@@ -161,6 +163,7 @@ def test_medium_foreground_ratio_marks_candidate_for_inpainting(
     assert stats.needs_inpainting_count == 1
     assert metadata["foreground_area_ratio"] == 0.10
     assert metadata["needs_inpainting"] is True
+    assert metadata["status"] == "pending_inpainting"
 
 
 def test_hole_ratio_over_limit_is_quality_rejection(tmp_path: Path) -> None:
@@ -202,3 +205,104 @@ def test_disabled_background_stage_is_noop(tmp_path: Path) -> None:
 
     assert stats.processed == 0
     assert not config.output_root.exists()
+
+
+def test_missing_entity_masks_is_quality_rejection(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    (
+        config.output_root
+        / "candidates"
+        / "clip-1"
+        / "e1"
+        / "top_masks.rle.json"
+    ).unlink()
+
+    class _NeverDino:
+        def encode(self, images: list[object]) -> np.ndarray:
+            del images
+            raise AssertionError("incomplete masks must skip semantic ranking")
+
+    class _NeverSiglip:
+        def score(self, *args: object) -> list[object]:
+            del args
+            raise AssertionError("incomplete masks must skip semantic ranking")
+
+    stats = build_background_references(
+        config,
+        dino_embedder=_NeverDino(),  # type: ignore[arg-type]
+        siglip_aligner=_NeverSiglip(),  # type: ignore[arg-type]
+    )
+
+    ranking = json.loads(
+        (
+            config.output_root
+            / "background_candidates"
+            / "clip-1"
+            / "ranking_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert stats.no_valid_candidate == 1
+    assert stats.failed == 0
+    assert ranking["incomplete_mask_entities"] == ["e1"]
+    assert all(
+        "incomplete_foreground_masks" in candidate["rejection_reasons"]
+        for candidate in ranking["candidates"]
+    )
+
+
+def test_background_ranking_uses_dino_and_siglip_semantics(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=0.04)
+
+    class _Dino:
+        def encode(self, images: list[object]) -> np.ndarray:
+            assert len(images) == 10
+            embeddings = np.eye(10, dtype=np.float32)
+            embeddings[8] = embeddings[7]
+            embeddings[9] = embeddings[7]
+            return embeddings
+
+    class _Siglip:
+        def score(
+            self,
+            images: list[object],
+            target_text: str,
+            distractor_texts: list[str],
+        ) -> list[object]:
+            assert len(images) == 10
+            assert target_text == "a quiet brick courtyard at noon"
+            assert distractor_texts == []
+            return [
+                SimpleNamespace(
+                    target_similarity=0.95 if index == 9 else 0.1
+                )
+                for index in range(10)
+            ]
+
+    stats = build_background_references(
+        config,
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+        siglip_aligner=_Siglip(),  # type: ignore[arg-type]
+    )
+
+    metadata = _metadata(config.output_root)
+    ranking = json.loads(
+        (
+            config.output_root
+            / "background_candidates"
+            / "clip-1"
+            / "ranking_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    selected = next(
+        candidate
+        for candidate in ranking["candidates"]
+        if candidate["frame_slot"] == 9
+    )
+    assert stats.processed == 1
+    assert metadata["frame_slot"] == 9
+    assert selected["dino_representativeness"] == 1.0
+    assert selected["siglip_alignment"] == 0.95

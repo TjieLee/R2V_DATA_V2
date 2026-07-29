@@ -18,7 +18,6 @@ from r2v_data_v2.caption_validation import (
 from r2v_data_v2.config import (
     PipelineConfig,
     QwenConfig,
-    QwenImageConfig,
     _qwen_services,
 )
 from r2v_data_v2.manifest import iter_source_records
@@ -172,12 +171,94 @@ def _align_reference_phrases(
     )
 
 
+def _sanitize_final_structure(
+    annotation: QwenAnnotationResult,
+) -> tuple[QwenAnnotationResult, list[str]]:
+    sanitized, warnings = _align_reference_phrases(annotation)
+    entities = []
+    for entity in sanitized.entities:
+        if (
+            entity.reference_worthy
+            and len(exact_phrase_spans(sanitized.caption, entity.phrase)) != 1
+        ):
+            entities.append(
+                entity.model_copy(update={"reference_worthy": False})
+            )
+            warnings.append(
+                f"demoted_unalignable_reference:{entity.entity_id}"
+            )
+        else:
+            entities.append(entity)
+
+    known_ids = {entity.entity_id for entity in entities}
+    relations = []
+    for index, relation in enumerate(sanitized.relations):
+        if (
+            relation.subject_id not in known_ids
+            or relation.object_id not in known_ids
+        ):
+            warnings.append(f"dropped_invalid_relation:{index}")
+            continue
+        relations.append(relation)
+
+    salience_rank = {"primary": 0, "secondary": 1, "incidental": 2}
+    selected_indexes = {
+        index
+        for index, entity in sorted(
+            enumerate(entities),
+            key=lambda item: (
+                salience_rank[item[1].salience],
+                item[0],
+            ),
+        )
+        if entity.reference_worthy
+    }
+    selected_indexes = set(
+        sorted(
+            selected_indexes,
+            key=lambda index: (
+                salience_rank[entities[index].salience],
+                index,
+            ),
+        )[:3]
+    )
+    capped_entities = []
+    for index, entity in enumerate(entities):
+        if entity.reference_worthy and index not in selected_indexes:
+            capped_entities.append(
+                entity.model_copy(update={"reference_worthy": False})
+            )
+            warnings.append(f"demoted_reference_cap:{entity.entity_id}")
+        else:
+            capped_entities.append(entity)
+
+    background = sanitized.background
+    if (
+        background is not None
+        and background.reference_worthy
+        and len(exact_phrase_spans(sanitized.caption, background.phrase)) != 1
+    ):
+        background = background.model_copy(update={"reference_worthy": False})
+        warnings.append("demoted_unalignable_reference:background")
+
+    return (
+        sanitized.model_copy(
+            update={
+                "entities": capped_entities,
+                "relations": relations,
+                "background": background,
+            }
+        ),
+        warnings,
+    )
+
+
 class QwenAnnotationClient:
     def __init__(
         self,
         config: QwenConfig,
         *,
-        repair_config: QwenImageConfig | None = None,
+        repair_config: QwenConfig | None = None,
     ) -> None:
         self.config = config
         self.repair_config = repair_config
@@ -196,7 +277,7 @@ class QwenAnnotationClient:
             else None
         )
         self._active_client = self.client
-        self._active_config: QwenImageConfig = config
+        self._active_config: QwenConfig = config
 
     def _messages(
         self,
@@ -253,7 +334,7 @@ class QwenAnnotationClient:
             "top_p": 1.0,
             "presence_penalty": 0.0,
             "max_tokens": active_config.max_tokens,
-            "extra_body": _video_processor_extra_body(self.config),
+            "extra_body": _video_processor_extra_body(active_config),
         }
         try:
             response = active_client.chat.completions.create(
@@ -332,8 +413,8 @@ class QwenAnnotationClient:
             )
             alignment_warnings: list[str] = []
             if semantic is not None:
-                semantic, alignment_warnings = (
-                    _align_reference_phrases(semantic)
+                semantic, alignment_warnings = _sanitize_final_structure(
+                    semantic
                 )
                 issues = validate_annotation(
                     semantic,

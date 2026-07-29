@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,6 +16,7 @@ from r2v_data_v2.config import (
     QwenImageConfig,
     _qwen_services,
 )
+from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.reconciliation import reconcile_final_samples, write_json_atomic
 from r2v_data_v2.reference_binding import (
@@ -63,6 +63,11 @@ def build_cross_pair_index(
     index: dict[CrossPairKey, list[dict[str, Any]]] = {}
     for references in references_by_clip.values():
         for reference in references:
+            if (
+                reference.get("status", "ready") != "ready"
+                or reference.get("rejected") is True
+            ):
+                continue
             if reference.get("reference_type", "entity") == "background":
                 continue
             index.setdefault(cross_pair_index_key(reference), []).append(reference)
@@ -188,10 +193,9 @@ class QwenCrossPairJudge:
 
     @staticmethod
     def _image(path: str | Path) -> dict[str, object]:
-        encoded = base64.b64encode(Path(path).read_bytes()).decode()
         return {
             "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+            "image_url": {"url": image_data_uri(path)},
         }
 
     def _request(
@@ -276,7 +280,21 @@ def _references_by_clip(
             "reference_id",
             reference.get("entity_id"),
         )
-        if reference.get("rejected") is True:
+        if "status" not in reference:
+            if reference.get("rejected") is True:
+                reference["status"] = "rejected"
+            elif (
+                reference.get("reference_type") == "background"
+                and reference.get("needs_inpainting") is True
+                and reference.get("inpainted") is not True
+            ):
+                reference["status"] = "pending_inpainting"
+            else:
+                reference["status"] = "ready"
+        if (
+            reference.get("status") != "ready"
+            or reference.get("rejected") is True
+        ):
             continue
         clip = str(reference["clip_uid"])
         annotation = annotations[clip]
@@ -344,6 +362,28 @@ def _existing_sample_uids(samples_dir: Path) -> set[str]:
             raise ValueError(f"invalid final sample artifact: {artifact}")
         result.add(str(value["clip_uid"]))
     return result
+
+
+def _remove_samples_with_non_ready_references(
+    samples_dir: Path,
+    references_by_clip: dict[str, list[dict[str, Any]]],
+) -> None:
+    ready_paths = {
+        str(reference["canonical_path"])
+        for references in references_by_clip.values()
+        for reference in references
+    }
+    for artifact in samples_dir.glob("*.json"):
+        sample = json.loads(artifact.read_text(encoding="utf-8"))
+        if not isinstance(sample, dict):
+            raise TypeError(f"final sample artifact must be an object: {artifact}")
+        sample_references = sample.get("references", [])
+        if not isinstance(sample_references, list) or any(
+            not isinstance(reference, dict)
+            or str(reference.get("image_path")) not in ready_paths
+            for reference in sample_references
+        ):
+            artifact.unlink()
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
@@ -431,9 +471,11 @@ def build_pairs(
         final_path.unlink(missing_ok=True)
         for artifact in samples_dir.glob("*.json"):
             artifact.unlink()
-    existing = _existing_sample_uids(samples_dir)
     annotations = _annotations_by_clip(annotation_path)
     references = _references_by_clip(reference_path, annotations)
+    if not overwrite:
+        _remove_samples_with_non_ready_references(samples_dir, references)
+    existing = _existing_sample_uids(samples_dir)
     cross_pair_index = build_cross_pair_index(references)
     qwen = judge or QwenCrossPairJudge(
         _qwen_services(config.qwen).cross_pair_judge

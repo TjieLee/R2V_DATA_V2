@@ -171,6 +171,8 @@ inpainting:
   consistency:
     preserve_unmasked_pixels: true
     minimum_dino_similarity: 0.92
+    minimum_siglip_similarity: 0.0
+    maximum_siglip_similarity_drop: 0.05
     maximum_unmasked_l1_diff: 0.0
     fallback_to_raw: true
 

@@ -1105,3 +1105,30 @@ def test_only_top_three_candidates_enter_qwen_judge(tmp_path: Path) -> None:
     assert stats.processed == 1
     assert len(judge.frame_slots) == 3
     assert set(judge.frame_slots).issubset({0, 1, 2, 3})
+
+
+def test_missing_sam_artifacts_count_as_no_valid_candidate(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_ranking_fixture(output_root)
+    (
+        output_root
+        / "candidates"
+        / "clip_1"
+        / "e1"
+        / "top_masks.rle.json"
+    ).unlink()
+
+    stats = rank_manifest_references(
+        PipelineConfig(
+            dataset_json=tmp_path / "source.jsonl",
+            output_root=output_root,
+            qwen=QwenConfig(model="served-model-name"),
+        ),
+        judge=_FakeCandidateJudge(),
+    )
+
+    assert stats.no_valid_candidate == 1
+    assert stats.failed == 0
+    assert not (output_root / "logs" / "ranking_failed.jsonl").exists()

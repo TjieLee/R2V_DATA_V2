@@ -257,6 +257,26 @@ def _existing_augmentation_variants(
     return result
 
 
+def _remove_non_ready_augmentation_artifacts(
+    output_root: Path,
+    *,
+    ready_references: set[tuple[str, str]],
+) -> None:
+    for artifact in augmentation_artifact_paths(output_root):
+        variant = json.loads(artifact.read_text(encoding="utf-8"))
+        if not isinstance(variant, dict):
+            raise TypeError(f"augmentation artifact must be an object: {artifact}")
+        key = (str(variant.get("clip_uid")), str(variant.get("entity_id")))
+        if key in ready_references:
+            continue
+        image_path_value = variant.get("image_path")
+        if isinstance(image_path_value, str):
+            image_path = Path(image_path_value).resolve(strict=False)
+            if artifact.parent in image_path.parents:
+                image_path.unlink(missing_ok=True)
+        artifact.unlink()
+
+
 def augment_references(
     config: PipelineConfig,
     *,
@@ -267,6 +287,19 @@ def augment_references(
     dino_embedder: DinoV3Embedder | None = None,
 ) -> AugmentationStats:
     output_root = config.ensure_output_root()
+    reference_path = output_root / "manifests" / "references.jsonl"
+    if reference_path.is_file():
+        ready_references = {
+            (str(reference["clip_uid"]), str(reference["entity_id"]))
+            for reference in iter_source_records(reference_path)
+            if reference.get("reference_type", "entity") == "entity"
+            and reference.get("status", "ready") == "ready"
+            and reference.get("rejected") is not True
+        }
+        _remove_non_ready_augmentation_artifacts(
+            output_root,
+            ready_references=ready_references,
+        )
     existing_variants = _existing_augmentation_variants(output_root)
     if not config.augmentation.enabled:
         if existing_variants:
@@ -278,7 +311,6 @@ def augment_references(
                 )
             _update_final_sample_artifacts(output_root, variants_by_clip)
         return AugmentationStats(disabled=True)
-    reference_path = output_root / "manifests" / "references.jsonl"
     augmentation_path = output_root / "manifests" / "augmentations.jsonl"
     if not reference_path.is_file():
         raise FileNotFoundError("run Stage 04 before augmentation")
@@ -311,6 +343,11 @@ def augment_references(
         variants_by_clip.setdefault(str(variant["clip_uid"]), []).append(variant)
     try:
         for reference in iter_source_records(reference_path):
+            if (
+                reference.get("status", "ready") != "ready"
+                or reference.get("rejected") is True
+            ):
+                continue
             if reference.get("reference_type", "entity") != "entity":
                 continue
             clip = str(reference["clip_uid"])

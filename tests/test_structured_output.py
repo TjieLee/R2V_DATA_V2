@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from PIL import Image
 from pydantic import BaseModel, ValidationError
 
 from r2v_data_v2.config import QwenConfig
@@ -80,8 +81,8 @@ class _FakeCandidateJudge(QwenCandidateJudge):
         self.responses: Iterator[str] = iter(responses)
         self.requests: list[str] = []
 
-    def _request(self, *, prompt: str, encoded_image: str) -> str:
-        assert encoded_image
+    def _request(self, *, prompt: str, image_url: str) -> str:
+        assert image_url.startswith("data:image/jpeg;base64,")
         self.requests.append(prompt)
         return next(self.responses)
 
@@ -106,7 +107,7 @@ class _FakeCrossPairJudge(QwenCrossPairJudge):
 
 def test_candidate_judge_repairs_once_with_original_image(tmp_path: Path) -> None:
     contact_sheet = tmp_path / "sheet.jpg"
-    contact_sheet.write_bytes(b"image")
+    Image.new("RGB", (8, 6)).save(contact_sheet, format="JPEG")
     judge = _FakeCandidateJudge(["not json", json.dumps(_candidate_payload())])
 
     result = judge.review(
@@ -126,7 +127,7 @@ def test_candidate_judge_two_failures_preserve_raw_responses(
     tmp_path: Path,
 ) -> None:
     contact_sheet = tmp_path / "sheet.jpg"
-    contact_sheet.write_bytes(b"image")
+    Image.new("RGB", (8, 6)).save(contact_sheet, format="JPEG")
     judge = _FakeCandidateJudge(["not json", '{"still": "wrong"}'])
 
     with pytest.raises(StructuredOutputFailure) as caught:

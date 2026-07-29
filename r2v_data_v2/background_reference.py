@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import os
 import shutil
@@ -20,6 +19,7 @@ from r2v_data_v2.config import (
     QwenImageConfig,
     _qwen_services,
 )
+from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import decode_mask, save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
@@ -28,9 +28,14 @@ from r2v_data_v2.schemas import (
     BackgroundJudgeResult,
     BackgroundVisualReview,
 )
+from r2v_data_v2.semantic_alignment import Siglip2Aligner
 from r2v_data_v2.structured_output import (
     ValidationIssue,
     request_structured_output,
+)
+from r2v_data_v2.visual_embedding import (
+    DinoV3Embedder,
+    temporal_representation_metrics,
 )
 
 
@@ -57,6 +62,8 @@ class BackgroundCandidate:
     ranking_score: float
     rejection_reasons: tuple[str, ...]
     visual_review: BackgroundVisualReview | None = None
+    dino_representativeness: float | None = None
+    siglip_alignment: float | None = None
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
@@ -85,8 +92,9 @@ def _load_foreground_masks(
     output_root: Path,
     clip_uid: str,
     annotation: AnnotationResult,
-) -> dict[int, list[np.ndarray]]:
+) -> tuple[dict[int, list[np.ndarray]], tuple[str, ...]]:
     masks_by_slot: dict[int, list[np.ndarray]] = {}
+    incomplete_entities: list[str] = []
     for entity in annotation.entities:
         if not entity.reference_worthy:
             continue
@@ -98,9 +106,8 @@ def _load_foreground_masks(
             / "top_masks.rle.json"
         )
         if not mask_path.is_file():
-            raise FileNotFoundError(
-                f"foreground masks are missing for entity {entity.entity_id}"
-            )
+            incomplete_entities.append(entity.entity_id)
+            continue
         encoded = json.loads(mask_path.read_text(encoding="utf-8"))
         if not isinstance(encoded, dict):
             raise TypeError(f"foreground mask artifact must be an object: {mask_path}")
@@ -109,7 +116,9 @@ def _load_foreground_masks(
                 continue
             slot = int(key.removeprefix("frame_"))
             masks_by_slot.setdefault(slot, []).append(decode_mask(value))
-    return masks_by_slot
+        if not encoded:
+            incomplete_entities.append(entity.entity_id)
+    return masks_by_slot, tuple(dict.fromkeys(incomplete_entities))
 
 
 def _union_mask(
@@ -230,7 +239,7 @@ class QwenBackgroundJudge:
             timeout=config.timeout_seconds,
         )
 
-    def _request(self, *, prompt: str, encoded_image: str) -> str:
+    def _request(self, *, prompt: str, image_url: str) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
@@ -240,9 +249,7 @@ class QwenBackgroundJudge:
                         {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{encoded_image}"
-                            },
+                            "image_url": {"url": image_url},
                         },
                     ],
                 }
@@ -287,8 +294,6 @@ class QwenBackgroundJudge:
             )
             + f"\nframe_slots={frame_slots}"
         )
-        encoded = base64.b64encode(contact_sheet.read_bytes()).decode()
-
         def validate(result: BackgroundJudgeResult) -> list[ValidationIssue]:
             returned = [candidate.frame_slot for candidate in result.candidates]
             issues: list[ValidationIssue] = []
@@ -313,7 +318,7 @@ class QwenBackgroundJudge:
         return request_structured_output(
             request=lambda request_text: self._request(
                 prompt=request_text,
-                encoded_image=encoded,
+                image_url=image_data_uri(contact_sheet),
             ),
             original_request=prompt,
             model=BackgroundJudgeResult,
@@ -401,6 +406,12 @@ def _save_reference(
             candidate.foreground_area_ratio > raw_threshold
         ),
         "inpainted": False,
+        "status": (
+            "pending_inpainting"
+            if candidate.foreground_area_ratio > raw_threshold
+            else "ready"
+        ),
+        "rejected": False,
     }
     write_json_atomic(destination / "reference_metadata.json", record)
     return record
@@ -411,6 +422,8 @@ def build_background_references(
     *,
     overwrite: bool = False,
     judge: QwenBackgroundJudge | None = None,
+    dino_embedder: DinoV3Embedder | None = None,
+    siglip_aligner: Siglip2Aligner | None = None,
 ) -> BackgroundReferenceStats:
     if not config.background.enabled:
         return BackgroundReferenceStats()
@@ -423,6 +436,10 @@ def build_background_references(
         qwen = QwenBackgroundJudge(
             _qwen_services(config.qwen).background_judge
         )
+    dino = dino_embedder
+    siglip = siglip_aligner
+    owns_dino = False
+    owns_siglip = False
 
     processed = skipped = no_valid = failed = raw_count = inpaint_count = 0
     for payload in iter_source_records(annotation_manifest):
@@ -440,6 +457,22 @@ def build_background_references(
             reference_dir = output_root / "references" / clip_uid / "bg1"
             metadata_path = reference_dir / "reference_metadata.json"
             if metadata_path.is_file() and not overwrite:
+                existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    raise TypeError(
+                        f"background reference metadata must be an object: "
+                        f"{metadata_path}"
+                    )
+                if existing.get("rejected") is True:
+                    existing["status"] = "rejected"
+                elif (
+                    existing.get("needs_inpainting") is True
+                    and existing.get("inpainted") is not True
+                ):
+                    existing["status"] = "pending_inpainting"
+                else:
+                    existing["status"] = "ready"
+                write_json_atomic(metadata_path, existing)
                 skipped += 1
                 continue
             if overwrite:
@@ -456,7 +489,7 @@ def build_background_references(
                 (frame_dir / "frames.json").read_text(encoding="utf-8")
             )
             source_indices = frame_metadata["sampled_indices"]
-            masks_by_slot = _load_foreground_masks(
+            masks_by_slot, incomplete_mask_entities = _load_foreground_masks(
                 output_root=output_root,
                 clip_uid=clip_uid,
                 annotation=annotation,
@@ -493,22 +526,97 @@ def build_background_references(
                             sharpness=sharpness,
                             exposure=exposure,
                             config=config.background,
+                        )
+                        + (
+                            ("incomplete_foreground_masks",)
+                            if incomplete_mask_entities
+                            else ()
                         ),
                     }
                 )
             normalized_sharpness = _normalize_sharpness(
                 [float(item["sharpness"]) for item in raw_candidates]
             )
+            base_scores = [
+                (
+                    0.40 * normalized_sharpness[index]
+                    + 0.35 * float(item["exposure"])
+                    + 0.25 * (1.0 - float(item["foreground_area_ratio"]))
+                )
+                for index, item in enumerate(raw_candidates)
+            ]
+            if not incomplete_mask_entities:
+                if (
+                    config.ranking.evaluators.dinov3.enabled
+                    and dino is None
+                ):
+                    dino = DinoV3Embedder(config.ranking)
+                    owns_dino = True
+                if (
+                    config.ranking.evaluators.siglip2.enabled
+                    and siglip is None
+                ):
+                    siglip = Siglip2Aligner(
+                        config.ranking.siglip2_model_path,
+                        config.ranking.siglip2_batch_size,
+                    )
+                    owns_siglip = True
+            dino_scores: dict[int, float] = {}
+            if dino is not None and not incomplete_mask_entities:
+                images = [
+                    Image.open(Path(item["frame_path"])).convert("RGB")
+                    for item in raw_candidates
+                ]
+                embeddings = dino.encode(images)
+                metrics, _, _ = temporal_representation_metrics(
+                    frame_slots=[
+                        int(item["frame_slot"]) for item in raw_candidates
+                    ],
+                    embeddings=embeddings,
+                    sam_confidences=[1.0] * len(raw_candidates),
+                    base_quality_scores=base_scores,
+                    threshold=config.ranking.dinov3_cluster_similarity_threshold,
+                )
+                dino_scores = {
+                    metric.frame_slot: metric.dino_representativeness
+                    for metric in metrics
+                }
+            siglip_scores: dict[int, float] = {}
+            if siglip is not None and not incomplete_mask_entities:
+                images = [
+                    Image.open(Path(item["frame_path"])).convert("RGB")
+                    for item in raw_candidates
+                ]
+                alignment = siglip.score(images, background.phrase, [])
+                if len(alignment) != len(raw_candidates):
+                    raise RuntimeError(
+                        "SigLIP returned an unexpected background score count"
+                    )
+                siglip_scores = {
+                    int(item["frame_slot"]): result.target_similarity
+                    for item, result in zip(raw_candidates, alignment)
+                }
             candidates = [
                 BackgroundCandidate(
                     **item,
                     ranking_score=(
-                        0.40 * normalized_sharpness[index]
-                        + 0.35 * float(item["exposure"])
-                        + 0.25 * (
-                            1.0 - float(item["foreground_area_ratio"])
+                        (
+                            0.50 * base_scores[index]
+                            + 0.30
+                            * dino_scores.get(int(item["frame_slot"]), 0.0)
+                            + 0.20
+                            * siglip_scores.get(int(item["frame_slot"]), 0.0)
+                        )
+                        / (
+                            0.50
+                            + (0.30 if dino_scores else 0.0)
+                            + (0.20 if siglip_scores else 0.0)
                         )
                     ),
+                    dino_representativeness=dino_scores.get(
+                        int(item["frame_slot"])
+                    ),
+                    siglip_alignment=siglip_scores.get(int(item["frame_slot"])),
                 )
                 for index, item in enumerate(raw_candidates)
             ]
@@ -559,6 +667,7 @@ def build_background_references(
                 {
                     "clip_uid": clip_uid,
                     "background_phrase": background.phrase,
+                    "incomplete_mask_entities": list(incomplete_mask_entities),
                     "selected_frame_slot": (
                         selected.frame_slot if selected is not None else None
                     ),
@@ -582,7 +691,14 @@ def build_background_references(
                     output_root / "logs" / "background_rejected.jsonl",
                     {
                         "clip_uid": clip_uid,
-                        "reason": "no valid background candidate",
+                        "reason": (
+                            "incomplete foreground masks"
+                            if incomplete_mask_entities
+                            else "no valid background candidate"
+                        ),
+                        "incomplete_mask_entities": list(
+                            incomplete_mask_entities
+                        ),
                     },
                 )
                 no_valid += 1
@@ -609,6 +725,10 @@ def build_background_references(
             )
             failed += 1
     reconcile_references(output_root)
+    if owns_dino and dino is not None:
+        dino.close()
+    if owns_siglip and siglip is not None:
+        siglip.close()
     return BackgroundReferenceStats(
         processed=processed,
         skipped_existing=skipped,

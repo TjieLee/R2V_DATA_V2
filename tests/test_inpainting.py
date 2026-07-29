@@ -4,6 +4,7 @@ import builtins
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +20,8 @@ from r2v_data_v2.config import (
 from r2v_data_v2.inpainting import (
     Flux1FillBackend,
     InpaintingDependencyError,
+    NoOpInpaintBackend,
+    ProductionConsistencyValidator,
     run_inpainting,
 )
 
@@ -63,7 +66,7 @@ def _write_reference(
     destination = output_root / "references" / "clip-1" / reference_id
     destination.mkdir(parents=True)
     raw_path = destination / "canonical_raw.jpg"
-    Image.fromarray(_raw_image()).save(raw_path, format="PNG")
+    Image.fromarray(_raw_image()).save(raw_path, format="JPEG", quality=95)
     canonical_path = destination / "canonical.jpg"
     shutil.copyfile(raw_path, canonical_path)
     mask_path = (
@@ -97,6 +100,12 @@ def _write_reference(
         "mask_path": str(mask_path),
         "needs_inpainting": needs_inpainting,
         "inpainted": False,
+        "status": (
+            "pending_inpainting"
+            if reference_type == "background" and needs_inpainting
+            else "ready"
+        ),
+        "rejected": False,
         "visual_review": {"completeness": 0.9},
     }
     artifact = destination / (
@@ -139,6 +148,15 @@ def _config(
     )
 
 
+def _accept_consistency(**kwargs: object) -> dict[str, object]:
+    del kwargs
+    return {
+        "accepted": True,
+        "dino_similarity": 0.99,
+        "rejection_reasons": [],
+    }
+
+
 def test_disabled_inpainting_is_complete_noop(tmp_path: Path) -> None:
     config = _config(tmp_path, enabled=False)
 
@@ -163,7 +181,11 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     )
     backend = _WholeImageBackend()
 
-    stats = run_inpainting(config, backend=backend)
+    stats = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+    )
 
     metadata = json.loads(artifact.read_text(encoding="utf-8"))
     raw = np.asarray(Image.open(metadata["raw_canonical_path"]).convert("RGB"))
@@ -176,6 +198,9 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     )
     assert stats.repaired == 1
     assert metadata["inpainted"] is True
+    assert metadata["status"] == "ready"
+    assert Path(metadata["canonical_path"]).suffix == ".png"
+    assert Image.open(metadata["canonical_path"]).format == "PNG"
     assert np.array_equal(raw[~repair_mask], repaired[~repair_mask])
     inpainting_metadata = json.loads(
         (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
@@ -202,14 +227,17 @@ def test_repair_area_over_threshold_does_not_call_backend(
 
     assert backend.prompts == []
     assert stats.rejected == 1
-    assert stats.fallback_to_raw == 1
+    assert stats.fallback_to_raw == 0
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    assert reference["status"] == "rejected"
+    assert reference["rejected"] is True
     metadata = json.loads(
         (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
     )
     assert metadata["rejection_reasons"] == ["repair_area_ratio"]
 
 
-def test_consistency_failure_falls_back_to_raw(tmp_path: Path) -> None:
+def test_consistency_failure_rejects_background_reference(tmp_path: Path) -> None:
     config = _config(tmp_path)
     mask = np.zeros((32, 32), dtype=bool)
     mask[12:16, 12:16] = True
@@ -232,8 +260,10 @@ def test_consistency_failure_falls_back_to_raw(tmp_path: Path) -> None:
     )
 
     metadata = json.loads(artifact.read_text(encoding="utf-8"))
-    assert stats.fallback_to_raw == 1
+    assert stats.fallback_to_raw == 0
     assert metadata["inpainted"] is False
+    assert metadata["status"] == "rejected"
+    assert metadata["rejected"] is True
     assert Path(metadata["canonical_path"]).read_bytes() == Path(
         metadata["raw_canonical_path"]
     ).read_bytes()
@@ -262,11 +292,206 @@ def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
     )
     backend = _WholeImageBackend()
 
-    stats = run_inpainting(config, backend=backend)
+    stats = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+    )
 
     assert stats.repaired == 2
     assert any("foreground subjects" in prompt for prompt in backend.prompts)
     assert any("exact same entity identity" in prompt for prompt in backend.prompts)
+
+
+def test_flux_pads_non_square_inputs_and_unpads_output() -> None:
+    config = InpaintingConfig(enabled=True)
+    backend = Flux1FillBackend(config)
+
+    class _Generator:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def manual_seed(self, seed: int) -> _Generator:
+            self.seed = seed
+            return self
+
+    class _Torch:
+        Generator = _Generator
+
+    class _Pipeline:
+        def __init__(self) -> None:
+            self.call: dict[str, object] = {}
+
+        def __call__(self, **kwargs: object) -> object:
+            self.call = kwargs
+            return SimpleNamespace(
+                images=[
+                    Image.new(
+                        "RGB",
+                        (int(kwargs["width"]), int(kwargs["height"])),
+                        (20, 30, 40),
+                    )
+                ]
+            )
+
+    pipeline = _Pipeline()
+    backend._pipeline = pipeline
+    backend._torch = _Torch()
+
+    result = backend.inpaint(
+        image=Image.new("RGB", (37, 23), (1, 2, 3)),
+        mask=Image.new("L", (37, 23), 255),
+        prompt="repair",
+        seed=17,
+    )
+
+    assert pipeline.call["width"] == 48
+    assert pipeline.call["height"] == 32
+    assert pipeline.call["image"].size == (48, 32)
+    assert pipeline.call["mask_image"].size == (48, 32)
+    assert result.size == (37, 23)
+
+
+def test_production_default_rejects_without_semantic_models(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    stats = run_inpainting(config, backend=_WholeImageBackend())
+
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
+    )
+    assert stats.repaired == 0
+    assert "dinov3_validator_unavailable" in metadata["rejection_reasons"]
+    assert "siglip_validator_unavailable" in metadata["rejection_reasons"]
+
+
+def test_production_validator_uses_dino_and_siglip(tmp_path: Path) -> None:
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            assert len(images) == 2
+            return np.asarray([[1.0, 0.0], [0.999, 0.001]])
+
+    class _Siglip:
+        def score(
+            self,
+            images: list[Image.Image],
+            target_text: str,
+            distractor_texts: list[str],
+        ) -> list[object]:
+            assert len(images) == 2
+            assert target_text == "a brick courtyard"
+            assert distractor_texts == []
+            return [
+                SimpleNamespace(target_similarity=0.8),
+                SimpleNamespace(target_similarity=0.79),
+            ]
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+        siglip_aligner=_Siglip(),  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.new("L", (17, 13)),
+        reference={"phrase": "a brick courtyard"},
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is True
+    assert result["dino_similarity"] > 0.99
+    assert result["repaired_siglip_similarity"] == 0.79
+
+
+def test_noop_backend_never_marks_reference_inpainted(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    stats = run_inpainting(
+        config,
+        backend=NoOpInpaintBackend(),
+        validator=_accept_consistency,
+    )
+
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
+    )
+    assert stats.repaired == 0
+    assert reference["inpainted"] is False
+    assert reference["status"] == "rejected"
+    assert "noop_backend_test_only" in metadata["rejection_reasons"]
+
+
+def test_overwrite_clears_stale_repair_and_restores_raw(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    mask = np.zeros((32, 32), dtype=bool)
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=False,
+    )
+    stale_repaired = artifact.parent / "canonical_repaired.png"
+    Image.new("RGB", (32, 32), (255, 0, 0)).save(stale_repaired)
+    Image.new("L", (32, 32), 255).save(artifact.parent / "repair_mask.png")
+    (artifact.parent / "inpainting_metadata.json").write_text(
+        json.dumps({"accepted": True}),
+        encoding="utf-8",
+    )
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    reference.update(
+        {
+            "canonical_path": str(stale_repaired),
+            "inpainted": True,
+            "status": "ready",
+            "inpainting_metadata_path": str(
+                artifact.parent / "inpainting_metadata.json"
+            ),
+        }
+    )
+    artifact.write_text(json.dumps(reference), encoding="utf-8")
+
+    stats = run_inpainting(
+        config,
+        overwrite=True,
+        backend=_WholeImageBackend(),
+        validator=_accept_consistency,
+    )
+
+    restored = json.loads(artifact.read_text(encoding="utf-8"))
+    assert stats.skipped_no_repair_needed == 1
+    assert not stale_repaired.exists()
+    assert not (artifact.parent / "repair_mask.png").exists()
+    assert not (artifact.parent / "inpainting_metadata.json").exists()
+    assert restored["inpainted"] is False
+    assert restored["status"] == "ready"
+    assert Path(restored["canonical_path"]).read_bytes() == Path(
+        restored["raw_canonical_path"]
+    ).read_bytes()
 
 
 def test_missing_flux_dependencies_report_optional_install(

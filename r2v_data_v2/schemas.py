@@ -109,3 +109,11 @@ class CrossPairJudgeResult(SchemaModel):
     near_duplicate: bool
     conflicting_attributes: list[str] = Field(default_factory=list)
     reason: str
+
+
+class InpaintingSemanticReview(SchemaModel):
+    same_semantic_content: bool
+    identity_preserved: bool
+    reference_phrase_supported: bool
+    new_salient_objects: bool
+    reason: str

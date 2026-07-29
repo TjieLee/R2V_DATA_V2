@@ -5,14 +5,34 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
+from openai import BadRequestError, OpenAI
 from PIL import Image
 
-from r2v_data_v2.config import InpaintingConfig, PipelineConfig
+from prompts.qwen_inpainting_consistency_prompt import (
+    INPAINTING_CONSISTENCY_PROMPT,
+)
+from r2v_data_v2.config import (
+    InpaintingConfig,
+    PipelineConfig,
+    QwenConfig,
+    _qwen_services,
+)
+from r2v_data_v2.image_utils import (
+    image_data_uri,
+    image_extension,
+)
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
+from r2v_data_v2.schemas import InpaintingSemanticReview
+from r2v_data_v2.semantic_alignment import Siglip2Aligner
+from r2v_data_v2.structured_output import request_structured_output
+from r2v_data_v2.visual_embedding import (
+    DinoV3Embedder,
+    embedding_cosine_similarity,
+)
 
 BACKGROUND_INPAINT_PROMPT = (
     "Remove the masked foreground subjects and reconstruct the original "
@@ -51,6 +71,17 @@ class ConsistencyValidator(Protocol):
         reference: dict[str, object],
         mode: str,
     ) -> dict[str, object]: ...
+
+
+class InpaintingSemanticJudge(Protocol):
+    def review(
+        self,
+        *,
+        original_path: Path,
+        repaired_path: Path,
+        reference_phrase: str,
+        mode: str,
+    ) -> InpaintingSemanticReview: ...
 
 
 class InpaintingDependencyError(RuntimeError):
@@ -128,20 +159,290 @@ class Flux1FillBackend:
         self._load()
         if self._pipeline is None or self._torch is None:
             raise RuntimeError("FLUX.1 Fill failed to initialize")
+        source = image.convert("RGB")
+        source_mask = mask.convert("L")
+        if source.size != source_mask.size:
+            raise ValueError("FLUX image and mask dimensions must match")
+        width, height = source.size
+        padded_width = ((width + 15) // 16) * 16
+        padded_height = ((height + 15) // 16) * 16
+        image_array = np.asarray(source)
+        mask_array = np.asarray(source_mask)
+        padded_image = Image.fromarray(
+            np.pad(
+                image_array,
+                (
+                    (0, padded_height - height),
+                    (0, padded_width - width),
+                    (0, 0),
+                ),
+                mode="edge",
+            )
+        )
+        padded_mask = Image.fromarray(
+            np.pad(
+                mask_array,
+                (
+                    (0, padded_height - height),
+                    (0, padded_width - width),
+                ),
+                mode="constant",
+                constant_values=0,
+            )
+        )
         generator = self._torch.Generator(device=self.config.device).manual_seed(
             seed
         )
         result = self._pipeline(
             prompt=prompt,
-            image=image,
-            mask_image=mask,
+            image=padded_image,
+            mask_image=padded_mask,
+            height=padded_height,
+            width=padded_width,
             generator=generator,
             num_inference_steps=self.config.num_inference_steps,
             guidance_scale=self.config.guidance_scale,
         )
         if not getattr(result, "images", None):
             raise RuntimeError("FLUX.1 Fill returned no image")
-        return result.images[0].convert("RGB")
+        generated = result.images[0].convert("RGB")
+        if generated.size != (padded_width, padded_height):
+            raise ValueError("FLUX.1 Fill returned unexpected padded dimensions")
+        return generated.crop((0, 0, width, height))
+
+
+class QwenInpaintingConsistencyJudge:
+    def __init__(self, config: QwenConfig) -> None:
+        self.config = config
+        self.client = OpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout_seconds,
+        )
+
+    def _request(
+        self,
+        *,
+        prompt: str,
+        original_path: Path,
+        repaired_path: Path,
+    ) -> str:
+        parameters: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_uri(original_path)},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_uri(repaired_path)},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "max_tokens": min(512, self.config.max_tokens),
+        }
+        try:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "inpainting_semantic_review",
+                        "strict": True,
+                        "schema": InpaintingSemanticReview.model_json_schema(),
+                    },
+                },
+            )
+        except BadRequestError:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={"type": "json_object"},
+            )
+        content = response.choices[0].message.content
+        if not content:
+            raise RuntimeError("Qwen returned an empty inpainting review")
+        return content
+
+    def review(
+        self,
+        *,
+        original_path: Path,
+        repaired_path: Path,
+        reference_phrase: str,
+        mode: str,
+    ) -> InpaintingSemanticReview:
+        prompt = INPAINTING_CONSISTENCY_PROMPT.format(
+            reference_phrase=reference_phrase,
+            repair_mode=mode,
+        )
+        return request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                original_path=original_path,
+                repaired_path=repaired_path,
+            ),
+            original_request=prompt,
+            model=InpaintingSemanticReview,
+        )
+
+
+class ProductionConsistencyValidator:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        *,
+        dino_embedder: DinoV3Embedder | None = None,
+        siglip_aligner: Siglip2Aligner | None = None,
+        qwen_judge: InpaintingSemanticJudge | None = None,
+    ) -> None:
+        self.config = config
+        self.dino = dino_embedder
+        self.siglip = siglip_aligner
+        self.qwen = qwen_judge
+        self._owns_dino = False
+        self._owns_siglip = False
+
+    def _ensure_models(self) -> list[str]:
+        reasons: list[str] = []
+        if self.dino is None and self.config.ranking.evaluators.dinov3.enabled:
+            try:
+                self.dino = DinoV3Embedder(self.config.ranking)
+                self._owns_dino = True
+            except Exception:  # noqa: BLE001
+                reasons.append("dinov3_validator_unavailable")
+        if self.siglip is None and self.config.ranking.evaluators.siglip2.enabled:
+            try:
+                self.siglip = Siglip2Aligner(
+                    self.config.ranking.siglip2_model_path,
+                    self.config.ranking.siglip2_batch_size,
+                )
+                self._owns_siglip = True
+            except Exception:  # noqa: BLE001
+                reasons.append("siglip_validator_unavailable")
+        if self.dino is None:
+            reasons.append("dinov3_validator_unavailable")
+        if self.siglip is None:
+            reasons.append("siglip_validator_unavailable")
+        if self.qwen is None:
+            repair_config = _qwen_services(self.config.qwen).repair_judge
+            if repair_config is not None:
+                self.qwen = QwenInpaintingConsistencyJudge(repair_config)
+        return list(dict.fromkeys(reasons))
+
+    def __call__(
+        self,
+        *,
+        original: Image.Image,
+        repaired: Image.Image,
+        repair_mask: Image.Image,
+        reference: dict[str, object],
+        mode: str,
+    ) -> dict[str, object]:
+        del repair_mask
+        reasons = self._ensure_models()
+        dino_similarity: float | None = None
+        raw_siglip: float | None = None
+        repaired_siglip: float | None = None
+        phrase = str(
+            reference.get("phrase")
+            or reference.get("canonical_label")
+            or "reference image"
+        )
+        if self.dino is not None:
+            try:
+                embeddings = self.dino.encode([original, repaired])
+                if len(embeddings) != 2:
+                    raise RuntimeError("unexpected DINO embedding count")
+                dino_similarity = embedding_cosine_similarity(
+                    embeddings[0],
+                    embeddings[1],
+                )
+                if (
+                    dino_similarity
+                    < self.config.inpainting.consistency.minimum_dino_similarity
+                ):
+                    reasons.append("dino_similarity")
+            except Exception:  # noqa: BLE001
+                reasons.append("dinov3_validation_failed")
+        if self.siglip is not None:
+            try:
+                scores = self.siglip.score([original, repaired], phrase, [])
+                if len(scores) != 2:
+                    raise RuntimeError("unexpected SigLIP score count")
+                raw_siglip = float(scores[0].target_similarity)
+                repaired_siglip = float(scores[1].target_similarity)
+                if (
+                    repaired_siglip
+                    < self.config.inpainting.consistency.minimum_siglip_similarity
+                ):
+                    reasons.append("siglip_similarity")
+                if (
+                    raw_siglip - repaired_siglip
+                    > self.config.inpainting.consistency.maximum_siglip_similarity_drop
+                ):
+                    reasons.append("siglip_similarity_drop")
+            except Exception:  # noqa: BLE001
+                reasons.append("siglip_validation_failed")
+
+        qwen_review: dict[str, object] | None = None
+        if self.qwen is not None:
+            temporary_root = Path(
+                str(reference.get("raw_canonical_path", "."))
+            ).parent
+            original_path = temporary_root / ".inpainting_qwen_original.png"
+            repaired_path = temporary_root / ".inpainting_qwen_repaired.png"
+            try:
+                _save_lossless_atomic(original, original_path)
+                _save_lossless_atomic(repaired, repaired_path)
+                review = self.qwen.review(
+                    original_path=original_path,
+                    repaired_path=repaired_path,
+                    reference_phrase=phrase,
+                    mode=mode,
+                )
+                qwen_review = review.model_dump(mode="json")
+                if not (
+                    review.same_semantic_content
+                    and review.identity_preserved
+                    and review.reference_phrase_supported
+                    and not review.new_salient_objects
+                ):
+                    reasons.append("qwen_semantic_consistency")
+            except Exception:  # noqa: BLE001
+                reasons.append("qwen_validation_failed")
+            finally:
+                original_path.unlink(missing_ok=True)
+                repaired_path.unlink(missing_ok=True)
+
+        reasons = list(dict.fromkeys(reasons))
+        return {
+            "accepted": not reasons,
+            "dino_similarity": dino_similarity,
+            "raw_siglip_similarity": raw_siglip,
+            "repaired_siglip_similarity": repaired_siglip,
+            "siglip_similarity_drop": (
+                raw_siglip - repaired_siglip
+                if raw_siglip is not None and repaired_siglip is not None
+                else None
+            ),
+            "qwen_review": qwen_review,
+            "rejection_reasons": reasons,
+        }
+
+    def close(self) -> None:
+        if self._owns_dino and self.dino is not None:
+            self.dino.close()
+        if self._owns_siglip and self.siglip is not None:
+            self.siglip.close()
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
@@ -362,16 +663,69 @@ def _reference_artifacts(output_root: Path) -> list[Path]:
     )
 
 
-def _fallback_to_raw(
+def _canonical_copy_path(artifact: Path, raw_path: Path) -> Path:
+    return artifact.parent / f"canonical{image_extension(raw_path)}"
+
+
+def _restore_from_raw(
     *,
     reference: dict[str, object],
     artifact: Path,
     raw_path: Path,
-    canonical_path: Path,
-    metadata: dict[str, object],
-    rejected: bool,
-) -> None:
+    write_artifact: bool = True,
+) -> Path:
+    canonical_path = _canonical_copy_path(artifact, raw_path)
+    for stale in (artifact.parent / "canonical.jpg", artifact.parent / "canonical.png"):
+        if stale != canonical_path:
+            stale.unlink(missing_ok=True)
     _copy_atomic(raw_path, canonical_path)
+    needs_inpainting = (
+        reference.get("reference_type", "entity") == "background"
+        and bool(reference.get("needs_inpainting", False))
+    )
+    reference.update(
+        {
+            "canonical_path": str(canonical_path),
+            "inpainted": False,
+            "status": "pending_inpainting" if needs_inpainting else "ready",
+            "rejected": False,
+        }
+    )
+    reference.pop("inpainting_metadata_path", None)
+    if write_artifact:
+        write_json_atomic(artifact, reference)
+    return canonical_path
+
+
+def _clear_stale_inpainting_artifacts(artifact: Path) -> None:
+    for filename in (
+        "repair_mask.png",
+        "canonical_repaired.jpg",
+        "canonical_repaired.png",
+        "inpainting_metadata.json",
+    ):
+        (artifact.parent / filename).unlink(missing_ok=True)
+
+
+def _publish_rejection(
+    *,
+    reference: dict[str, object],
+    artifact: Path,
+    raw_path: Path,
+    metadata: dict[str, object],
+    config: InpaintingConfig,
+) -> bool:
+    canonical_path = _restore_from_raw(
+        reference=reference,
+        artifact=artifact,
+        raw_path=raw_path,
+        write_artifact=False,
+    )
+    fallback = (
+        reference.get("reference_type", "entity") != "background"
+        and config.consistency.fallback_to_raw
+    )
+    metadata["fallback_to_raw"] = fallback
     reference.update(
         {
             "canonical_path": str(canonical_path),
@@ -379,11 +733,34 @@ def _fallback_to_raw(
             "inpainting_metadata_path": str(
                 artifact.parent / "inpainting_metadata.json"
             ),
-            "rejected": rejected,
+            "status": "ready" if fallback else "rejected",
+            "rejected": not fallback,
         }
     )
     write_json_atomic(artifact.parent / "inpainting_metadata.json", metadata)
     write_json_atomic(artifact, reference)
+    return fallback
+
+
+def _metadata_base(
+    *,
+    config: InpaintingConfig,
+    mode: str | None,
+    repair_area_ratio: float,
+) -> dict[str, object]:
+    return {
+        "backend": config.backend,
+        "model_path": (
+            str(config.model_path) if config.model_path is not None else None
+        ),
+        "mode": mode,
+        "seed": config.seed,
+        "repair_area_ratio": repair_area_ratio,
+        "unmasked_l1_diff": 0.0,
+        "dino_similarity": None,
+        "accepted": False,
+        "fallback_to_raw": False,
+    }
 
 
 def run_inpainting(
@@ -407,12 +784,18 @@ def run_inpainting(
             if config.inpainting.backend == "noop"
             else Flux1FillBackend(config.inpainting)
         )
+    active_validator = validator
+    owned_validator: ProductionConsistencyValidator | None = None
+    if active_validator is None:
+        owned_validator = ProductionConsistencyValidator(config)
+        active_validator = owned_validator
 
     processed = skipped = repaired_count = fallback_count = rejected = failed = 0
     for artifact in _reference_artifacts(output_root):
         reference = json.loads(artifact.read_text(encoding="utf-8"))
         if not isinstance(reference, dict):
             raise TypeError(f"reference metadata must be an object: {artifact}")
+        reference.setdefault("status", "ready")
         inpainting_metadata_path = artifact.parent / "inpainting_metadata.json"
         if inpainting_metadata_path.is_file() and not overwrite:
             existing = json.loads(
@@ -424,17 +807,28 @@ def run_inpainting(
             elif existing.get("fallback_to_raw") is True:
                 fallback_count += 1
             continue
+        if reference.get("status") == "rejected" and not overwrite:
+            skipped += 1
+            continue
         raw_path = Path(
             str(reference.get("raw_canonical_path") or reference["canonical_path"])
         )
-        canonical_path = artifact.parent / "canonical.jpg"
         if not raw_path.is_file():
             raise FileNotFoundError(f"raw canonical reference is missing: {raw_path}")
         if "raw_canonical_path" not in reference:
-            new_raw_path = artifact.parent / "canonical_raw.jpg"
+            new_raw_path = (
+                artifact.parent / f"canonical_raw{image_extension(raw_path)}"
+            )
             _copy_atomic(raw_path, new_raw_path)
             raw_path = new_raw_path
             reference["raw_canonical_path"] = str(raw_path)
+        if overwrite:
+            _clear_stale_inpainting_artifacts(artifact)
+            _restore_from_raw(
+                reference=reference,
+                artifact=artifact,
+                raw_path=raw_path,
+            )
         try:
             original_image = Image.open(raw_path).convert("RGB")
             original = np.asarray(original_image).copy()
@@ -445,40 +839,25 @@ def run_inpainting(
             )
             if repair_mask is None or mode is None or not repair_mask.any():
                 if mask_reasons:
-                    metadata: dict[str, object] = {
-                        "backend": config.inpainting.backend,
-                        "model_path": (
-                            str(config.inpainting.model_path)
-                            if config.inpainting.model_path is not None
-                            else None
-                        ),
-                        "mode": mode,
-                        "seed": config.inpainting.seed,
-                        "repair_area_ratio": (
+                    metadata = _metadata_base(
+                        config=config.inpainting,
+                        mode=mode,
+                        repair_area_ratio=(
                             float(repair_mask.mean())
                             if repair_mask is not None
                             else 0.0
                         ),
-                        "unmasked_l1_diff": 0.0,
-                        "dino_similarity": None,
-                        "accepted": False,
-                        "fallback_to_raw": (
-                            config.inpainting.consistency.fallback_to_raw
-                        ),
-                        "rejection_reasons": mask_reasons,
-                    }
-                    _fallback_to_raw(
+                    )
+                    metadata["rejection_reasons"] = mask_reasons
+                    did_fallback = _publish_rejection(
                         reference=reference,
                         artifact=artifact,
                         raw_path=raw_path,
-                        canonical_path=canonical_path,
                         metadata=metadata,
-                        rejected=not (
-                            config.inpainting.consistency.fallback_to_raw
-                        ),
+                        config=config.inpainting,
                     )
                     rejected += 1
-                    if config.inpainting.consistency.fallback_to_raw:
+                    if did_fallback:
                         fallback_count += 1
                     _append_jsonl(
                         output_root / "logs" / "inpainting_rejected.jsonl",
@@ -491,39 +870,31 @@ def run_inpainting(
                         },
                     )
                 else:
+                    _restore_from_raw(
+                        reference=reference,
+                        artifact=artifact,
+                        raw_path=raw_path,
+                    )
                     skipped += 1
                 continue
             processed += 1
             repair_area_ratio = float(repair_mask.mean())
             if mask_reasons:
-                metadata = {
-                    "backend": config.inpainting.backend,
-                    "model_path": (
-                        str(config.inpainting.model_path)
-                        if config.inpainting.model_path is not None
-                        else None
-                    ),
-                    "mode": mode,
-                    "seed": config.inpainting.seed,
-                    "repair_area_ratio": repair_area_ratio,
-                    "unmasked_l1_diff": 0.0,
-                    "dino_similarity": None,
-                    "accepted": False,
-                    "fallback_to_raw": (
-                        config.inpainting.consistency.fallback_to_raw
-                    ),
-                    "rejection_reasons": mask_reasons,
-                }
-                _fallback_to_raw(
+                metadata = _metadata_base(
+                    config=config.inpainting,
+                    mode=mode,
+                    repair_area_ratio=repair_area_ratio,
+                )
+                metadata["rejection_reasons"] = mask_reasons
+                did_fallback = _publish_rejection(
                     reference=reference,
                     artifact=artifact,
                     raw_path=raw_path,
-                    canonical_path=canonical_path,
                     metadata=metadata,
-                    rejected=not config.inpainting.consistency.fallback_to_raw,
+                    config=config.inpainting,
                 )
                 rejected += 1
-                if config.inpainting.consistency.fallback_to_raw:
+                if did_fallback:
                     fallback_count += 1
                 _append_jsonl(
                     output_root / "logs" / "inpainting_rejected.jsonl",
@@ -568,16 +939,12 @@ def run_inpainting(
                 if protected.any()
                 else 0.0
             )
-            validation = (
-                validator(
-                    original=original_image,
-                    repaired=Image.fromarray(final),
-                    repair_mask=repair_mask_image,
-                    reference=reference,
-                    mode=mode,
-                )
-                if validator is not None
-                else {"accepted": True}
+            validation = active_validator(
+                original=original_image,
+                repaired=Image.fromarray(final),
+                repair_mask=repair_mask_image,
+                reference=reference,
+                mode=mode,
             )
             rejection_reasons = [
                 str(reason)
@@ -602,57 +969,55 @@ def run_inpainting(
                 rejection_reasons.append("dino_similarity")
             if validation.get("accepted") is not True:
                 rejection_reasons.append("consistency_validator")
+            if isinstance(engine, NoOpInpaintBackend):
+                rejection_reasons.append("noop_backend_test_only")
             rejection_reasons = list(dict.fromkeys(rejection_reasons))
             accepted = not rejection_reasons
-            metadata = {
-                "backend": config.inpainting.backend,
-                "model_path": (
-                    str(config.inpainting.model_path)
-                    if config.inpainting.model_path is not None
-                    else None
-                ),
-                "mode": mode,
-                "seed": config.inpainting.seed,
-                "repair_area_ratio": repair_area_ratio,
-                "unmasked_l1_diff": unmasked_l1_diff,
-                "dino_similarity": dino_similarity,
-                "accepted": accepted,
-                "fallback_to_raw": (
-                    not accepted
-                    and config.inpainting.consistency.fallback_to_raw
-                ),
-                "rejection_reasons": rejection_reasons,
-                "validator": validation,
-                "lossless_storage": True,
-            }
+            metadata = _metadata_base(
+                config=config.inpainting,
+                mode=mode,
+                repair_area_ratio=repair_area_ratio,
+            )
+            metadata.update(
+                {
+                    "unmasked_l1_diff": unmasked_l1_diff,
+                    "dino_similarity": dino_similarity,
+                    "accepted": accepted,
+                    "rejection_reasons": rejection_reasons,
+                    "validator": validation,
+                    "lossless_storage": True,
+                }
+            )
             if accepted:
-                repaired_path = artifact.parent / "canonical_repaired.jpg"
+                repaired_path = artifact.parent / "canonical_repaired.png"
                 _save_lossless_atomic(Image.fromarray(final), repaired_path)
-                _copy_atomic(repaired_path, canonical_path)
+                (artifact.parent / "canonical_repaired.jpg").unlink(
+                    missing_ok=True
+                )
                 write_json_atomic(inpainting_metadata_path, metadata)
                 reference.update(
                     {
-                        "canonical_path": str(canonical_path),
+                        "canonical_path": str(repaired_path),
                         "inpainted": True,
                         "inpainting_metadata_path": str(
                             inpainting_metadata_path
                         ),
+                        "status": "ready",
                         "rejected": False,
                     }
                 )
                 write_json_atomic(artifact, reference)
                 repaired_count += 1
             else:
-                _fallback_to_raw(
+                did_fallback = _publish_rejection(
                     reference=reference,
                     artifact=artifact,
                     raw_path=raw_path,
-                    canonical_path=canonical_path,
                     metadata=metadata,
-                    rejected=not config.inpainting.consistency.fallback_to_raw,
+                    config=config.inpainting,
                 )
                 rejected += 1
-                if config.inpainting.consistency.fallback_to_raw:
+                if did_fallback:
                     fallback_count += 1
                 _append_jsonl(
                     output_root / "logs" / "inpainting_rejected.jsonl",
@@ -665,6 +1030,8 @@ def run_inpainting(
                     },
                 )
         except InpaintingDependencyError:
+            if owned_validator is not None:
+                owned_validator.close()
             raise
         except Exception as exc:  # noqa: BLE001
             failed += 1
@@ -678,13 +1045,30 @@ def run_inpainting(
                     "error": str(exc),
                 },
             )
-            if config.inpainting.consistency.fallback_to_raw:
-                _copy_atomic(raw_path, canonical_path)
-                reference["canonical_path"] = str(canonical_path)
-                reference["inpainted"] = False
-                write_json_atomic(artifact, reference)
+            metadata = _metadata_base(
+                config=config.inpainting,
+                mode=None,
+                repair_area_ratio=0.0,
+            )
+            metadata.update(
+                {
+                    "rejection_reasons": ["inpainting_runtime_failure"],
+                    "error": str(exc),
+                }
+            )
+            did_fallback = _publish_rejection(
+                reference=reference,
+                artifact=artifact,
+                raw_path=raw_path,
+                metadata=metadata,
+                config=config.inpainting,
+            )
+            rejected += 1
+            if did_fallback:
                 fallback_count += 1
     reconcile_references(output_root)
+    if owned_validator is not None:
+        owned_validator.close()
     return InpaintingStats(
         processed=processed,
         skipped_no_repair_needed=skipped,

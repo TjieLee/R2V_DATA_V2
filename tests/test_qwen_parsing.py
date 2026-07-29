@@ -8,10 +8,12 @@ import pytest
 from pydantic import ValidationError
 
 from prompts.qwen_annotation_prompt import SYSTEM_PROMPT
+from r2v_data_v2.caption_validation import validate_annotation
 from r2v_data_v2.config import PipelineConfig, QwenConfig, QwenVideoConfig
 from r2v_data_v2.qwen_client import (
     QwenAnnotationClient,
     QwenAnnotationFailure,
+    _sanitize_final_structure,
     _video_content,
     _video_processor_extra_body,
     annotate_manifest,
@@ -164,6 +166,76 @@ def test_repair_request_failure_preserves_first_raw_response() -> None:
     assert caught.value.attempt_count == 2
     assert caught.value.raw_responses == ["not json"]
     assert caught.value.issues[0].code == "qwen_request_failed"
+
+
+def test_final_structure_sanitizer_demotes_drops_and_caps() -> None:
+    caption = (
+        "A red bicycle stands beside a blue car while a tall lamp lights a "
+        "small bench in a broad city plaza during a calm evening tracking shot."
+    )
+
+    def entity(
+        entity_id: str,
+        phrase: str,
+        salience: str,
+    ) -> dict[str, object]:
+        return {
+            "entity_id": entity_id,
+            "phrase": phrase,
+            "grounding_prompt": phrase,
+            "canonical_label": phrase,
+            "category": "object",
+            "reference_worthy": True,
+            "salience": salience,
+            "genericity": "descriptive",
+            "name_evidence": "none",
+            "separability": "independent",
+            "selection_reason": "visible",
+        }
+
+    semantic = QwenAnnotationResult.model_validate(
+        {
+            "caption": caption,
+            "entities": [
+                entity("e1", "A red bicycle", "secondary"),
+                entity("e2", "a blue car", "primary"),
+                entity("e3", "a tall lamp", "incidental"),
+                entity("e4", "a small bench", "primary"),
+                entity("e5", "a green boat", "primary"),
+            ],
+            "relations": [
+                {
+                    "subject_id": "e2",
+                    "predicate": "near",
+                    "object_id": "missing",
+                }
+            ],
+            "background": {
+                "phrase": "a forest clearing",
+                "grounding_prompt": "forest clearing",
+                "reference_worthy": True,
+            },
+        }
+    )
+
+    sanitized, warnings = _sanitize_final_structure(semantic)
+
+    retained = [
+        item.entity_id for item in sanitized.entities if item.reference_worthy
+    ]
+    assert retained == ["e1", "e2", "e4"]
+    assert sanitized.relations == []
+    assert sanitized.background is not None
+    assert sanitized.background.reference_worthy is False
+    assert "demoted_unalignable_reference:e5" in warnings
+    assert "dropped_invalid_relation:0" in warnings
+    assert "demoted_reference_cap:e3" in warnings
+    assert "demoted_unalignable_reference:background" in warnings
+    assert validate_annotation(
+        sanitized,
+        caption_raw="",
+        metadata={},
+    ) == []
 
 
 def test_two_failed_responses_write_complete_failure_log(tmp_path: Path) -> None:

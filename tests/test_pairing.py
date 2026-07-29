@@ -499,3 +499,45 @@ def test_missing_cross_pair_falls_back_to_in_pair(tmp_path: Path) -> None:
     assert sample["references"][0]["pair_type"] == "in_pair"
     assert sample["entities"][0]["entity_id"] == "e1"
     assert sample["entities"][0]["reference_worthy"]
+
+
+def test_cross_pair_index_only_contains_ready_references(
+    tmp_path: Path,
+) -> None:
+    ready = _reference(
+        tmp_path,
+        clip_uid="ready",
+        parent="parent",
+        suffix="1_0",
+    )
+    pending = {
+        **_reference(
+            tmp_path,
+            clip_uid="pending",
+            parent="parent",
+            suffix="2_0",
+        ),
+        "status": "pending_inpainting",
+    }
+    rejected = {
+        **_reference(
+            tmp_path,
+            clip_uid="rejected",
+            parent="parent",
+            suffix="3_0",
+        ),
+        "status": "rejected",
+        "rejected": True,
+    }
+
+    index = build_cross_pair_index(
+        {
+            "ready": [ready],
+            "pending": [pending],
+            "rejected": [rejected],
+        }
+    )
+
+    assert [item["clip_uid"] for item in next(iter(index.values()))] == [
+        "ready"
+    ]

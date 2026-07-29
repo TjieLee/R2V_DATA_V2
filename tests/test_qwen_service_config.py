@@ -104,3 +104,29 @@ def test_image_judge_rejects_video_configuration(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="image-only"):
         load_config(path)
+
+
+def test_repair_judge_accepts_video_capable_configuration(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path,
+            "  annotation:\n"
+            "    model: annotation-model\n"
+            "    video:\n"
+            "      fps: 2.0\n"
+            "  repair_judge:\n"
+            "    model: repair-video-model\n"
+            "    video:\n"
+            "      fps: 1.25\n"
+            "      max_pixels: 320000\n",
+        )
+    )
+
+    assert isinstance(config.qwen, QwenServicesConfig)
+    assert config.qwen.repair_judge is not None
+    assert config.qwen.repair_judge.model == "repair-video-model"
+    assert config.qwen.repair_judge.video.fps == 1.25
+    serialized = config_to_dict(config)["qwen"]["repair_judge"]
+    assert serialized["video"]["max_pixels"] == 320000

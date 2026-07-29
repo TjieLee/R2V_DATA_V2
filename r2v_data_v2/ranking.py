@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import inspect
 import json
 import shutil
@@ -21,6 +20,7 @@ from r2v_data_v2.config import (
     RankingConfig,
     _qwen_services,
 )
+from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import bbox_from_mask, decode_mask, save_mask_png
 from r2v_data_v2.metrics import (
@@ -576,7 +576,7 @@ class QwenCandidateJudge:
             timeout=config.timeout_seconds,
         )
 
-    def _request(self, *, prompt: str, encoded_image: str) -> str:
+    def _request(self, *, prompt: str, image_url: str) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
@@ -586,9 +586,7 @@ class QwenCandidateJudge:
                         {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{encoded_image}"
-                            },
+                            "image_url": {"url": image_url},
                         },
                     ],
                 }
@@ -630,7 +628,6 @@ class QwenCandidateJudge:
         category: str = "object",
         canonical_label: str = "",
     ) -> CandidateJudgeResult:
-        encoded = base64.b64encode(contact_sheet.read_bytes()).decode()
         prompt = (
             CANDIDATE_JUDGE_PROMPT.format(
                 entity_phrase=entity_phrase,
@@ -671,7 +668,7 @@ class QwenCandidateJudge:
         return request_structured_output(
             request=lambda request_text: self._request(
                 prompt=request_text,
-                encoded_image=encoded,
+                image_url=image_data_uri(contact_sheet),
             ),
             original_request=prompt,
             model=CandidateJudgeResult,
@@ -1242,6 +1239,8 @@ def _reference_record(
         "name_evidence": entity.name_evidence,
         "separability": entity.separability,
         "inpainted": bool(metadata.get("inpainted", False)),
+        "status": str(metadata.get("status", "ready")),
+        "rejected": bool(metadata.get("rejected", False)),
     }
 
 
@@ -1348,6 +1347,12 @@ def rank_manifest_references(
                         failed += 1
                     continue
                 candidate_dir = output_root / "candidates" / clip / entity.entity_id
+                if not (
+                    (candidate_dir / "candidates.jsonl").is_file()
+                    and (candidate_dir / "top_masks.rle.json").is_file()
+                ):
+                    no_valid += 1
+                    continue
                 try:
                     records, masks = _load_entity_candidates(candidate_dir)
                     if not masks:
@@ -1746,6 +1751,9 @@ def rank_manifest_references(
                         reference_record,
                     )
                     processed += 1
+                except FileNotFoundError:
+                    no_valid += 1
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     failure: dict[str, object] = {
                         "clip_uid": clip,

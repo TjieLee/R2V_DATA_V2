@@ -233,3 +233,62 @@ def test_viewpoint_augmentation_keeps_generated_foreground_core(
         == variant["pre_restore_core_similarity"]
     )
     assert variant["dino_identity_similarity"] == 1.0
+
+
+def test_augmentation_filters_rejected_and_pending_references(
+    tmp_path: Path,
+) -> None:
+    config = load_config(_write_config(tmp_path, enabled=True))
+    manifest = tmp_path / "output" / "manifests" / "references.jsonl"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "clip_uid": f"clip-{status}",
+                    "entity_id": "e1",
+                    "reference_type": "entity",
+                    "status": status,
+                    "rejected": status == "rejected",
+                }
+            )
+            for status in ("pending_inpainting", "rejected")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    stale_dir = (
+        tmp_path
+        / "output"
+        / "references"
+        / "clip-rejected"
+        / "e1"
+        / "augmented"
+    )
+    stale_dir.mkdir(parents=True)
+    stale_image = stale_dir / "background_0.png"
+    cv2.imwrite(str(stale_image), np.zeros((8, 8, 3), dtype=np.uint8))
+    stale_artifact = stale_dir / "generated_background_00.json"
+    stale_artifact.write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-rejected",
+                "entity_id": "e1",
+                "variant_type": "generated_background",
+                "variant_index": 0,
+                "image_path": str(stale_image),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def editor(*args: object) -> Path:
+        del args
+        raise AssertionError("filtered references must not reach editors")
+
+    stats = augment_references(config, background_editor=editor)
+
+    assert stats.processed == 0
+    assert stats.failed == 0
+    assert not stale_artifact.exists()
+    assert not stale_image.exists()

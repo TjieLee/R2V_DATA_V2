@@ -107,7 +107,7 @@ class QwenServicesConfig:
     candidate_judge: QwenImageConfig = field(default_factory=QwenImageConfig)
     background_judge: QwenImageConfig = field(default_factory=QwenImageConfig)
     cross_pair_judge: QwenImageConfig = field(default_factory=QwenImageConfig)
-    repair_judge: QwenImageConfig | None = None
+    repair_judge: QwenConfig | None = None
 
     @classmethod
     def from_flat(cls, config: QwenConfig) -> QwenServicesConfig:
@@ -324,6 +324,8 @@ class InpaintingEntityConfig:
 class InpaintingConsistencyConfig:
     preserve_unmasked_pixels: bool = True
     minimum_dino_similarity: float = 0.92
+    minimum_siglip_similarity: float = 0.0
+    maximum_siglip_similarity_drop: float = 0.05
     maximum_unmasked_l1_diff: float = 0.0
     fallback_to_raw: bool = True
 
@@ -473,6 +475,7 @@ def _parse_annotation_config(
     values: dict[str, object],
     *,
     fallback: QwenConfig | None = None,
+    field_name: str = "annotation",
 ) -> QwenConfig:
     merged = vars(fallback).copy() if fallback is not None else {}
     fallback_video = (
@@ -481,7 +484,7 @@ def _parse_annotation_config(
     merged.update(values)
     video_values = merged.pop("video", {})
     if not isinstance(video_values, dict):
-        raise TypeError("qwen.annotation.video must be a mapping")
+        raise TypeError(f"qwen.{field_name}.video must be a mapping")
     fallback_video.update(video_values)
     return QwenConfig(**merged, video=QwenVideoConfig(**fallback_video))
 
@@ -548,10 +551,12 @@ def _parse_qwen_services(raw_qwen: object) -> QwenServicesConfig:
         field_name="cross_pair_judge",
     )
     repair_values = raw_qwen.get("repair_judge")
+    if repair_values is not None and not isinstance(repair_values, dict):
+        raise TypeError("qwen.repair_judge must be a mapping")
     repair = (
-        _parse_image_config(
-            repair_values,
-            fallback=annotation_image,
+        _parse_annotation_config(
+            dict(repair_values),
+            fallback=annotation,
             field_name="repair_judge",
         )
         if repair_values is not None
@@ -672,20 +677,33 @@ def _validate_config(config: PipelineConfig) -> None:
             raise ValueError(
                 f"qwen.{service_name}.repair_retries must be non-negative"
             )
-    if qwen.annotation.video.input_mode != "full_video":
-        raise ValueError("qwen.video.input_mode currently only supports full_video")
-    if qwen.annotation.video.fps <= 0:
-        raise ValueError("qwen.video.fps must be positive")
-    if (
-        qwen.annotation.video.max_pixels is not None
-        and qwen.annotation.video.max_pixels < 1
-    ):
-        raise ValueError("qwen.video.max_pixels must be positive when configured")
-    if (
-        qwen.annotation.video.total_pixels is not None
-        and qwen.annotation.video.total_pixels < 1
-    ):
-        raise ValueError("qwen.video.total_pixels must be positive when configured")
+    video_services = [("annotation", qwen.annotation)]
+    if qwen.repair_judge is not None:
+        video_services.append(("repair_judge", qwen.repair_judge))
+    for service_name, service in video_services:
+        if service.video.input_mode != "full_video":
+            raise ValueError(
+                f"qwen.{service_name}.video.input_mode currently only supports "
+                "full_video"
+            )
+        if service.video.fps <= 0:
+            raise ValueError(f"qwen.{service_name}.video.fps must be positive")
+        if (
+            service.video.max_pixels is not None
+            and service.video.max_pixels < 1
+        ):
+            raise ValueError(
+                f"qwen.{service_name}.video.max_pixels must be positive "
+                "when configured"
+            )
+        if (
+            service.video.total_pixels is not None
+            and service.video.total_pixels < 1
+        ):
+            raise ValueError(
+                f"qwen.{service_name}.video.total_pixels must be positive "
+                "when configured"
+            )
     if config.sam3.minimum_visible_frames < 1:
         raise ValueError("sam3.minimum_visible_frames must be positive")
     if not 0.0 <= config.ranking.minimum_mask_area_ratio:
@@ -789,12 +807,20 @@ def _validate_config(config: PipelineConfig) -> None:
             config.inpainting.consistency.minimum_dino_similarity,
         ),
         (
+            "inpainting.consistency.maximum_siglip_similarity_drop",
+            config.inpainting.consistency.maximum_siglip_similarity_drop,
+        ),
+        (
             "inpainting.consistency.maximum_unmasked_l1_diff",
             config.inpainting.consistency.maximum_unmasked_l1_diff,
         ),
     ):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{field_name} must be between 0 and 1")
+    if not -1.0 <= config.inpainting.consistency.minimum_siglip_similarity <= 1.0:
+        raise ValueError(
+            "inpainting.consistency.minimum_siglip_similarity must be between -1 and 1"
+        )
     _validate_metric_weights(
         name="ranking.preselection_weights",
         weights=config.ranking.preselection_weights,
@@ -961,7 +987,10 @@ def config_to_dict(config: PipelineConfig) -> dict[str, Any]:
             "background_judge": image_service(qwen.background_judge),
             "cross_pair_judge": image_service(qwen.cross_pair_judge),
             "repair_judge": (
-                image_service(qwen.repair_judge)
+                {
+                    **vars(qwen.repair_judge),
+                    "video": vars(qwen.repair_judge.video),
+                }
                 if qwen.repair_judge is not None
                 else None
             ),

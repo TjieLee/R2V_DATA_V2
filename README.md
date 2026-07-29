@@ -284,7 +284,12 @@ with a warning without dropping valid entity references. The optional
 `inpaint` stage loads FLUX only when `inpainting.enabled: true` and an explicit
 existing local `model_path` is configured. Generated pixels are accepted only
 inside the repair mask; output outside that mask remains exactly equal to the
-raw reference.
+raw reference. References have an explicit `ready`, `pending_inpainting`, or
+`rejected` status, and only `ready` records may enter pairing or augmentation.
+Backgrounds that require repair remain pending until FLUX succeeds and the
+default DINOv3/SigLIP consistency checks pass; a failed background repair is
+rejected instead of falling back to the contaminated raw frame. An optional
+video-capable `qwen.repair_judge` adds a semantic consistency check.
 
 ## Qwen Benchmark
 
