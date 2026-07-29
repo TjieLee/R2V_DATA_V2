@@ -166,6 +166,31 @@ def test_disabled_inpainting_is_complete_noop(tmp_path: Path) -> None:
     assert not config.output_root.exists()
 
 
+def test_direct_production_run_rejects_missing_semantic_configuration(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "flux"
+    model_path.mkdir()
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        inpainting=InpaintingConfig(
+            enabled=True,
+            backend="flux1_fill",
+            model_path=model_path,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="production inpainting requires"):
+        run_inpainting(
+            config,
+            backend=_WholeImageBackend(),
+            validator=_accept_consistency,
+        )
+
+    assert not config.output_root.exists()
+
+
 def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     tmp_path: Path,
 ) -> None:
@@ -301,6 +326,74 @@ def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
     assert stats.repaired == 2
     assert any("foreground subjects" in prompt for prompt in backend.prompts)
     assert any("exact same entity identity" in prompt for prompt in backend.prompts)
+
+
+def test_entity_repair_regenerates_mask_derived_artifacts_and_dino(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, entity_enabled=True)
+    subject_mask = np.zeros((32, 32), dtype=bool)
+    subject_mask[5:27, 5:27] = True
+    subject_mask[14:17, 14:17] = False
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="e1",
+        reference_type="entity",
+        mask=subject_mask,
+        needs_inpainting=False,
+    )
+    stale_rgba = np.zeros((32, 32, 4), dtype=np.uint8)
+    Image.fromarray(stale_rgba).save(artifact.parent / "foreground_rgba.png")
+    Image.new("RGB", (32, 32), (0, 0, 0)).save(
+        artifact.parent / "neutral_background.jpg"
+    )
+    stale_embedding = artifact.parent / "dinov3_embedding.npy"
+    np.save(stale_embedding, np.asarray([1.0, 0.0], dtype=np.float16))
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    reference.update(
+        {
+            "foreground_rgba_path": str(
+                artifact.parent / "foreground_rgba.png"
+            ),
+            "neutral_background_path": str(
+                artifact.parent / "neutral_background.jpg"
+            ),
+            "dinov3_embedding_path": str(stale_embedding),
+        }
+    )
+    artifact.write_text(json.dumps(reference), encoding="utf-8")
+
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            assert len(images) == 1
+            return np.asarray([[0.0, 3.0]], dtype=np.float32)
+
+    stats = run_inpainting(
+        config,
+        backend=_WholeImageBackend(),
+        validator=_accept_consistency,
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+    )
+
+    updated = json.loads(artifact.read_text(encoding="utf-8"))
+    repaired_mask = (
+        np.asarray(Image.open(artifact.parent / "repair_mask.png").convert("L"))
+        >= 128
+    )
+    expected_mask = subject_mask | repaired_mask
+    saved_mask = np.asarray(Image.open(updated["mask_path"]).convert("L")) >= 128
+    rgba = np.asarray(Image.open(updated["foreground_rgba_path"]).convert("RGBA"))
+    neutral = np.asarray(
+        Image.open(updated["neutral_background_path"]).convert("RGB")
+    )
+    embedding = np.load(updated["dinov3_embedding_path"], allow_pickle=False)
+
+    assert stats.repaired == 1
+    assert np.array_equal(saved_mask, expected_mask)
+    assert np.array_equal(rgba[..., 3] >= 128, expected_mask)
+    assert np.allclose(embedding.astype(np.float32), [0.0, 1.0], atol=1e-3)
+    assert float(neutral[~expected_mask].mean()) == pytest.approx(204, abs=3)
+    assert rgba[expected_mask, :3].mean() > 0
 
 
 def test_flux_pads_non_square_inputs_and_unpads_output() -> None:

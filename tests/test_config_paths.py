@@ -254,6 +254,53 @@ def test_unknown_ranking_metric_is_rejected_during_config_load(
         load_config(config_path)
 
 
+def test_production_inpainting_requires_semantic_validator_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = (tmp_path / "models").resolve()
+    monkeypatch.setattr(config_module, "ALLOWED_USER_MODEL_ROOT", model_root)
+    flux_path = model_root / "flux-fill"
+    flux_path.mkdir(parents=True)
+    config_path = tmp_path / "inpainting.yaml"
+    config_path.write_text(
+        f"dataset_json: {tmp_path / 'source.jsonl'}\n"
+        f"output_root: {tmp_path / 'output'}\n"
+        "qwen:\n"
+        "  annotation:\n"
+        "    model: annotation-model\n"
+        "inpainting:\n"
+        "  enabled: true\n"
+        "  backend: flux1_fill\n"
+        f"  model_path: {flux_path}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires DINOv3\+SigLIP2 or an explicit qwen\.repair_judge",
+    ):
+        load_config(config_path)
+
+    config_path.write_text(
+        f"dataset_json: {tmp_path / 'source.jsonl'}\n"
+        f"output_root: {tmp_path / 'output'}\n"
+        "qwen:\n"
+        "  annotation:\n"
+        "    model: annotation-model\n"
+        "  repair_judge:\n"
+        "    model: consistency-model\n"
+        "inpainting:\n"
+        "  enabled: true\n"
+        "  backend: flux1_fill\n"
+        f"  model_path: {flux_path}\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(config_path)
+    assert loaded.qwen.repair_judge is not None
+
+
 def test_zero_enabled_ranking_weights_are_rejected(tmp_path: Path) -> None:
     config_path = _write_visual_model_config(
         tmp_path,

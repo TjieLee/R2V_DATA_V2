@@ -20,11 +20,13 @@ from r2v_data_v2.config import (
     PipelineConfig,
     QwenConfig,
     _qwen_services,
+    has_inpainting_semantic_validator,
 )
 from r2v_data_v2.image_utils import (
     image_data_uri,
     image_extension,
 )
+from r2v_data_v2.mask_utils import save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
 from r2v_data_v2.schemas import InpaintingSemanticReview
 from r2v_data_v2.semantic_alignment import Siglip2Aligner
@@ -32,6 +34,7 @@ from r2v_data_v2.structured_output import request_structured_output
 from r2v_data_v2.visual_embedding import (
     DinoV3Embedder,
     embedding_cosine_similarity,
+    save_selected_dinov3_embedding,
 )
 
 BACKGROUND_INPAINT_PROMPT = (
@@ -312,13 +315,13 @@ class ProductionConsistencyValidator:
         self._owns_siglip = False
 
     def _ensure_models(self) -> list[str]:
-        reasons: list[str] = []
+        unavailable: list[str] = []
         if self.dino is None and self.config.ranking.evaluators.dinov3.enabled:
             try:
                 self.dino = DinoV3Embedder(self.config.ranking)
                 self._owns_dino = True
             except Exception:  # noqa: BLE001
-                reasons.append("dinov3_validator_unavailable")
+                unavailable.append("dinov3_validator_unavailable")
         if self.siglip is None and self.config.ranking.evaluators.siglip2.enabled:
             try:
                 self.siglip = Siglip2Aligner(
@@ -327,16 +330,20 @@ class ProductionConsistencyValidator:
                 )
                 self._owns_siglip = True
             except Exception:  # noqa: BLE001
-                reasons.append("siglip_validator_unavailable")
-        if self.dino is None:
-            reasons.append("dinov3_validator_unavailable")
-        if self.siglip is None:
-            reasons.append("siglip_validator_unavailable")
+                unavailable.append("siglip_validator_unavailable")
         if self.qwen is None:
             repair_config = _qwen_services(self.config.qwen).repair_judge
             if repair_config is not None:
                 self.qwen = QwenInpaintingConsistencyJudge(repair_config)
-        return list(dict.fromkeys(reasons))
+        if self.dino is not None and self.siglip is not None:
+            return []
+        if self.qwen is not None:
+            return []
+        if self.dino is None:
+            unavailable.append("dinov3_validator_unavailable")
+        if self.siglip is None:
+            unavailable.append("siglip_validator_unavailable")
+        return list(dict.fromkeys(unavailable))
 
     def __call__(
         self,
@@ -470,6 +477,19 @@ def _save_lossless_atomic(image: Image.Image, destination: Path) -> None:
     try:
         # Lossless storage is required for the strict unmasked-pixel contract.
         image.save(temporary, format="PNG")
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _save_jpeg_atomic(image: Image.Image, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        image.save(temporary, format="JPEG", quality=95)
         with temporary.open("rb") as handle:
             os.fsync(handle.fileno())
         temporary.replace(destination)
@@ -763,18 +783,75 @@ def _metadata_base(
     }
 
 
+def _regenerate_entity_artifacts(
+    *,
+    artifact: Path,
+    reference: dict[str, object],
+    repaired: np.ndarray,
+    original_mask: np.ndarray,
+    repair_mask: np.ndarray,
+    dino_embedder: DinoV3Embedder | None,
+) -> None:
+    updated_mask = np.asarray(original_mask | repair_mask, dtype=bool)
+    mask_path = artifact.parent / "mask.png"
+    rgba_path = artifact.parent / "foreground_rgba.png"
+    neutral_path = artifact.parent / "neutral_background.jpg"
+    embedding_path = artifact.parent / "dinov3_embedding.npy"
+
+    rgba = np.dstack((repaired, updated_mask.astype(np.uint8) * 255))
+    neutral = np.full_like(repaired, 204)
+    neutral[updated_mask] = repaired[updated_mask]
+    selected_embedding: np.ndarray | None = None
+    if dino_embedder is not None:
+        embeddings = dino_embedder.encode([Image.fromarray(neutral)])
+        if len(embeddings) != 1:
+            raise RuntimeError("DINOv3 returned an unexpected embedding count")
+        selected_embedding = embeddings[0]
+
+    save_mask_png(mask_path, updated_mask)
+    _save_lossless_atomic(Image.fromarray(rgba), rgba_path)
+    _save_jpeg_atomic(Image.fromarray(neutral), neutral_path)
+    if selected_embedding is not None:
+        save_selected_dinov3_embedding(embedding_path, selected_embedding)
+        reference["dinov3_embedding_path"] = str(embedding_path)
+    else:
+        previous_embedding = reference.get("dinov3_embedding_path")
+        if isinstance(previous_embedding, str) and previous_embedding:
+            previous_path = Path(previous_embedding).resolve(strict=False)
+            if previous_path.parent == artifact.parent.resolve():
+                previous_path.unlink(missing_ok=True)
+        embedding_path.unlink(missing_ok=True)
+        reference["dinov3_embedding_path"] = None
+    reference.update(
+        {
+            "mask_path": str(mask_path),
+            "foreground_rgba_path": str(rgba_path),
+            "neutral_background_path": str(neutral_path),
+        }
+    )
+
+
 def run_inpainting(
     config: PipelineConfig,
     *,
     overwrite: bool = False,
     backend: InpaintBackend | None = None,
     validator: ConsistencyValidator | None = None,
+    dino_embedder: DinoV3Embedder | None = None,
 ) -> InpaintingStats:
     if not config.inpainting.enabled:
         return InpaintingStats(skipped_disabled=1)
     if not config.inpainting.consistency.preserve_unmasked_pixels:
         raise ValueError(
             "inpainting.consistency.preserve_unmasked_pixels must remain true"
+        )
+    if (
+        config.inpainting.backend == "flux1_fill"
+        and not has_inpainting_semantic_validator(config)
+    ):
+        raise ValueError(
+            "production inpainting requires DINOv3+SigLIP2 or an explicit "
+            "qwen.repair_judge consistency validator"
         )
     output_root = config.ensure_output_root()
     engine = backend
@@ -787,7 +864,10 @@ def run_inpainting(
     active_validator = validator
     owned_validator: ProductionConsistencyValidator | None = None
     if active_validator is None:
-        owned_validator = ProductionConsistencyValidator(config)
+        owned_validator = ProductionConsistencyValidator(
+            config,
+            dino_embedder=dino_embedder,
+        )
         active_validator = owned_validator
 
     processed = skipped = repaired_count = fallback_count = rejected = failed = 0
@@ -994,6 +1074,27 @@ def run_inpainting(
                 (artifact.parent / "canonical_repaired.jpg").unlink(
                     missing_ok=True
                 )
+                if reference.get("reference_type", "entity") == "entity":
+                    entity_dino = dino_embedder
+                    if (
+                        entity_dino is None
+                        and isinstance(
+                            active_validator,
+                            ProductionConsistencyValidator,
+                        )
+                    ):
+                        entity_dino = active_validator.dino
+                    _regenerate_entity_artifacts(
+                        artifact=artifact,
+                        reference=reference,
+                        repaired=final,
+                        original_mask=_read_mask(
+                            Path(str(reference["mask_path"])),
+                            final.shape[:2],
+                        ),
+                        repair_mask=repair_mask,
+                        dino_embedder=entity_dino,
+                    )
                 write_json_atomic(inpainting_metadata_path, metadata)
                 reference.update(
                     {

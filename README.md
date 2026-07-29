@@ -286,10 +286,14 @@ existing local `model_path` is configured. Generated pixels are accepted only
 inside the repair mask; output outside that mask remains exactly equal to the
 raw reference. References have an explicit `ready`, `pending_inpainting`, or
 `rejected` status, and only `ready` records may enter pairing or augmentation.
-Backgrounds that require repair remain pending until FLUX succeeds and the
-default DINOv3/SigLIP consistency checks pass; a failed background repair is
-rejected instead of falling back to the contaminated raw frame. An optional
-video-capable `qwen.repair_judge` adds a semantic consistency check.
+Background masking includes every separable visible entity, and a clean raw
+background is preferred over a higher-scoring candidate that requires repair.
+Backgrounds that require repair remain pending until FLUX succeeds and semantic
+consistency checks pass; a failed background repair is rejected instead of
+falling back to the contaminated raw frame. Enabling production FLUX requires
+configured DINOv3 plus SigLIP2 evaluators or an explicit video-capable
+`qwen.repair_judge`. Successful entity repair rebuilds its mask, RGBA, neutral
+background, and selected DINO embedding so downstream artifacts remain aligned.
 
 ## Qwen Benchmark
 

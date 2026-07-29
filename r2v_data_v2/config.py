@@ -471,6 +471,14 @@ def _iter_qwen_services(
     return services
 
 
+def has_inpainting_semantic_validator(config: PipelineConfig) -> bool:
+    qwen = _qwen_services(config.qwen)
+    return (
+        config.ranking.evaluators.dinov3.enabled
+        and config.ranking.evaluators.siglip2.enabled
+    ) or qwen.repair_judge is not None
+
+
 def _parse_annotation_config(
     values: dict[str, object],
     *,
@@ -478,11 +486,13 @@ def _parse_annotation_config(
     field_name: str = "annotation",
 ) -> QwenConfig:
     merged = vars(fallback).copy() if fallback is not None else {}
+    merged.pop("video", None)
     fallback_video = (
         vars(fallback.video).copy() if fallback is not None else {}
     )
-    merged.update(values)
-    video_values = merged.pop("video", {})
+    provided = dict(values)
+    video_values = provided.pop("video", {})
+    merged.update(provided)
     if not isinstance(video_values, dict):
         raise TypeError(f"qwen.{field_name}.video must be a mapping")
     fallback_video.update(video_values)
@@ -757,6 +767,11 @@ def _validate_config(config: PipelineConfig) -> None:
     if config.inpainting.backend not in {"flux1_fill", "noop"}:
         raise ValueError("inpainting.backend must be flux1_fill or noop")
     if config.inpainting.enabled and config.inpainting.backend == "flux1_fill":
+        if not has_inpainting_semantic_validator(config):
+            raise ValueError(
+                "production inpainting requires DINOv3+SigLIP2 or an explicit "
+                "qwen.repair_judge consistency validator"
+            )
         model_path = config.inpainting.model_path
         if model_path is None:
             raise ValueError(

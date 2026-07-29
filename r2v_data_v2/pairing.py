@@ -44,6 +44,7 @@ class PairingStats:
     cross_pair_count: int = 0
     fallback_count: int = 0
     failed: int = 0
+    skipped_no_ready_reference: int = 0
 
 
 CrossPairKey = tuple[str, str, str]
@@ -480,13 +481,16 @@ def build_pairs(
     qwen = judge or QwenCrossPairJudge(
         _qwen_services(config.qwen).cross_pair_judge
     )
-    processed = skipped = in_pairs = cross_pairs = fallbacks = failed = 0
+    processed = skipped = no_ready = in_pairs = cross_pairs = fallbacks = failed = 0
     for clip, annotation in annotations.items():
         if clip in existing:
             skipped += 1
             continue
+        clip_references = references.get(clip, [])
+        if not clip_references:
+            no_ready += 1
+            continue
         try:
-            clip_references = references.get(clip, [])
             target_references = [
                 reference
                 for reference in clip_references
@@ -654,12 +658,13 @@ def build_pairs(
             failed += 1
     reconcile_final_samples(output_root)
     return PairingStats(
-        processed,
-        skipped,
-        in_pairs,
-        cross_pairs,
-        fallbacks,
-        failed,
+        processed=processed,
+        skipped_existing=skipped,
+        skipped_no_ready_reference=no_ready,
+        in_pair_count=in_pairs,
+        cross_pair_count=cross_pairs,
+        fallback_count=fallbacks,
+        failed=failed,
     )
 
 

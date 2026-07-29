@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from r2v_data_v2.config import PipelineConfig, Sam3Config
+from r2v_data_v2.entity_policy import requires_foreground_mask
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import (
     bbox_from_mask,
@@ -377,7 +378,7 @@ def extract_manifest_candidates(
                 for slot in range(config.frames.count)
             ]
             for entity in annotation.entities:
-                if not entity.reference_worthy:
+                if not requires_foreground_mask(entity):
                     continue
                 destination = (
                     output_root

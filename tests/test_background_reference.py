@@ -10,6 +10,7 @@ import numpy as np
 from r2v_data_v2.background_reference import build_background_references
 from r2v_data_v2.config import BackgroundConfig, PipelineConfig
 from r2v_data_v2.mask_utils import encode_mask
+from r2v_data_v2.schemas import BackgroundJudgeResult
 
 
 def _annotation(*, with_entity: bool) -> dict[str, object]:
@@ -166,6 +167,78 @@ def test_medium_foreground_ratio_marks_candidate_for_inpainting(
     assert metadata["status"] == "pending_inpainting"
 
 
+def test_non_reference_worthy_separable_entity_is_in_foreground_mask(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    manifest = config.output_root / "manifests" / "annotations.jsonl"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["entities"][0]["reference_worthy"] = False
+    payload["entities"][0]["ref_token"] = None
+    manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    stats = build_background_references(config)
+    metadata = _metadata(config.output_root)
+
+    assert stats.processed == 1
+    assert metadata["foreground_area_ratio"] == 0.10
+    assert metadata["needs_inpainting"] is True
+
+
+def test_clean_raw_candidate_preferred_over_higher_scoring_inpaint_candidate(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    encoded = json.loads(
+        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    )
+    clean_mask = np.zeros((100, 100), dtype=bool)
+    clean_mask[:4, :] = True
+    encoded["frame_00"] = encode_mask(clean_mask)
+    (candidate_dir / "top_masks.rle.json").write_text(
+        json.dumps(encoded),
+        encoding="utf-8",
+    )
+    frame_dir = config.output_root / "frames" / "clip-1"
+    flat = np.full((100, 100, 3), 110, dtype=np.uint8)
+    checker = (
+        (np.indices((100, 100)).sum(axis=0) % 2) * 180 + 30
+    ).astype(np.uint8)
+    textured = np.repeat(checker[..., None], 3, axis=2)
+    assert cv2.imwrite(str(frame_dir / "frame_00.jpg"), flat)
+    for slot in range(1, 10):
+        assert cv2.imwrite(str(frame_dir / f"frame_{slot:02d}.jpg"), textured)
+
+    stats = build_background_references(config)
+    metadata = _metadata(config.output_root)
+    ranking = json.loads(
+        (
+            config.output_root
+            / "background_candidates"
+            / "clip-1"
+            / "ranking_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    selected_score = next(
+        candidate["ranking_score"]
+        for candidate in ranking["candidates"]
+        if candidate["frame_slot"] == 0
+    )
+    highest_pending_score = max(
+        candidate["ranking_score"]
+        for candidate in ranking["candidates"]
+        if candidate["frame_slot"] != 0
+    )
+
+    assert stats.raw_background_count == 1
+    assert metadata["frame_slot"] == 0
+    assert metadata["status"] == "ready"
+    assert highest_pending_score > selected_score
+
+
 def test_hole_ratio_over_limit_is_quality_rejection(tmp_path: Path) -> None:
     config = _config(
         tmp_path,
@@ -249,6 +322,67 @@ def test_missing_entity_masks_is_quality_rejection(tmp_path: Path) -> None:
         "incomplete_foreground_masks" in candidate["rejection_reasons"]
         for candidate in ranking["candidates"]
     )
+
+
+def test_missing_entity_masks_require_qwen_review_when_enabled(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        background=BackgroundConfig(qwen_judge_enabled=True),
+    )
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    (
+        config.output_root
+        / "candidates"
+        / "clip-1"
+        / "e1"
+        / "top_masks.rle.json"
+    ).unlink()
+
+    class _Judge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def review(
+            self,
+            *,
+            background_phrase: str,
+            contact_sheet: Path,
+            frame_slots: list[int],
+            incomplete_mask_entities: tuple[str, ...],
+        ) -> BackgroundJudgeResult:
+            self.calls += 1
+            assert background_phrase
+            assert contact_sheet.is_file()
+            assert incomplete_mask_entities == ("e1",)
+            return BackgroundJudgeResult.model_validate(
+                {
+                    "candidates": [
+                        {
+                            "frame_slot": slot,
+                            "scene_completeness": 0.9,
+                            "scene_recognizability": 0.9,
+                            "foreground_distraction": 0.1,
+                            "visual_quality": 0.9,
+                            "reusable_as_background": True,
+                            "rejection_reasons": [],
+                        }
+                        for slot in frame_slots
+                    ],
+                    "best_frame_slot": frame_slots[0],
+                }
+            )
+
+    judge = _Judge()
+    stats = build_background_references(
+        config,
+        judge=judge,  # type: ignore[arg-type]
+    )
+
+    assert judge.calls == 1
+    assert stats.processed == 1
+    assert _metadata(config.output_root)["status"] == "ready"
 
 
 def test_background_ranking_uses_dino_and_siglip_semantics(

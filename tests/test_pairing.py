@@ -401,7 +401,9 @@ def test_uncertain_or_near_duplicate_cross_pair_falls_back() -> None:
     )
 
 
-def test_zero_reference_sample_is_not_written(tmp_path: Path) -> None:
+def test_no_ready_reference_sample_is_skipped_without_failure(
+    tmp_path: Path,
+) -> None:
     output_root = tmp_path / "output"
     manifests = output_root / "manifests"
     manifests.mkdir(parents=True)
@@ -419,7 +421,18 @@ def test_zero_reference_sample_is_not_written(tmp_path: Path) -> None:
         json.dumps(record) + "\n",
         encoding="utf-8",
     )
-    (manifests / "references.jsonl").write_text("", encoding="utf-8")
+    (manifests / "references.jsonl").write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "reference_type": "entity",
+                "entity_id": "e1",
+                "status": "pending_inpainting",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     stats = build_pairs(
         PipelineConfig(
@@ -429,12 +442,10 @@ def test_zero_reference_sample_is_not_written(tmp_path: Path) -> None:
         judge=_FakeJudge(_judgment()),  # type: ignore[arg-type]
     )
 
-    assert stats.failed == 1
+    assert stats.failed == 0
+    assert stats.skipped_no_ready_reference == 1
     assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
-    failure = json.loads(
-        (output_root / "logs" / "pairing_failed.jsonl").read_text(encoding="utf-8")
-    )
-    assert failure["issues"][0]["code"] == "no_references"
+    assert not (output_root / "logs" / "pairing_failed.jsonl").exists()
 
 
 def test_missing_cross_pair_falls_back_to_in_pair(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ from r2v_data_v2.config import (
     QwenImageConfig,
     _qwen_services,
 )
+from r2v_data_v2.entity_policy import requires_foreground_mask
 from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import decode_mask, save_mask_png
@@ -96,7 +98,7 @@ def _load_foreground_masks(
     masks_by_slot: dict[int, list[np.ndarray]] = {}
     incomplete_entities: list[str] = []
     for entity in annotation.entities:
-        if not entity.reference_worthy:
+        if not requires_foreground_mask(entity):
             continue
         mask_path = (
             output_root
@@ -287,6 +289,7 @@ class QwenBackgroundJudge:
         background_phrase: str,
         contact_sheet: Path,
         frame_slots: list[int],
+        incomplete_mask_entities: tuple[str, ...] = (),
     ) -> BackgroundJudgeResult:
         prompt = (
             BACKGROUND_JUDGE_PROMPT.format(
@@ -294,6 +297,13 @@ class QwenBackgroundJudge:
             )
             + f"\nframe_slots={frame_slots}"
         )
+        if incomplete_mask_entities:
+            prompt += (
+                "\nForeground masks are incomplete for entity ids "
+                f"{list(incomplete_mask_entities)}. Treat any visible foreground "
+                "entity as unmasked: reject candidates where it remains distracting "
+                "or prevents direct background reuse."
+            )
         def validate(result: BackgroundJudgeResult) -> list[ValidationIssue]:
             returned = [candidate.frame_slot for candidate in result.candidates]
             issues: list[ValidationIssue] = []
@@ -530,6 +540,7 @@ def build_background_references(
                         + (
                             ("incomplete_foreground_masks",)
                             if incomplete_mask_entities
+                            and not config.background.qwen_judge_enabled
                             else ()
                         ),
                     }
@@ -629,6 +640,8 @@ def build_background_references(
                 top = sorted(
                     valid,
                     key=lambda candidate: (
+                        candidate.foreground_area_ratio
+                        > config.background.raw_foreground_area_ratio,
                         -candidate.ranking_score,
                         candidate.frame_slot,
                     ),
@@ -638,10 +651,22 @@ def build_background_references(
             if config.background.qwen_judge_enabled and valid:
                 if qwen is None:
                     raise RuntimeError("Qwen background judge was not initialized")
+                review_arguments: dict[str, object] = {
+                    "background_phrase": background.phrase,
+                    "contact_sheet": sheet_path,
+                    "frame_slots": [
+                        candidate.frame_slot for candidate in top
+                    ],
+                }
+                if (
+                    "incomplete_mask_entities"
+                    in inspect.signature(qwen.review).parameters
+                ):
+                    review_arguments["incomplete_mask_entities"] = (
+                        incomplete_mask_entities
+                    )
                 result = qwen.review(
-                    background_phrase=background.phrase,
-                    contact_sheet=sheet_path,
-                    frame_slots=[candidate.frame_slot for candidate in top],
+                    **review_arguments,
                 )
                 reviews = {
                     review.frame_slot: review for review in result.candidates
@@ -654,8 +679,15 @@ def build_background_references(
                     and not candidate.rejection_reasons
                 ]
 
+            clean_candidates = [
+                candidate
+                for candidate in valid
+                if candidate.foreground_area_ratio
+                <= config.background.raw_foreground_area_ratio
+            ]
+            selection_pool = clean_candidates or valid
             selected = min(
-                valid,
+                selection_pool,
                 key=lambda candidate: (
                     -candidate.ranking_score,
                     candidate.frame_slot,
