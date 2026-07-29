@@ -18,6 +18,7 @@ from r2v_data_v2.config import (
 )
 from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.manifest import iter_source_records
+from r2v_data_v2.phrase_alignment import resolve_background_caption_phrase
 from r2v_data_v2.reconciliation import reconcile_final_samples, write_json_atomic
 from r2v_data_v2.reference_binding import (
     ReferenceBindingError,
@@ -45,6 +46,7 @@ class PairingStats:
     fallback_count: int = 0
     failed: int = 0
     skipped_no_ready_reference: int = 0
+    skipped_no_bindable_reference: int = 0
 
 
 CrossPairKey = tuple[str, str, str]
@@ -444,6 +446,7 @@ def _background_target_reference(
         "reference_type": "background",
         "entity_id": None,
         "phrase": reference["phrase"],
+        "source_phrase": reference["source_phrase"],
         "ref_token": "<ref_bg_1>",
         "category": "background",
         "image_path": reference["canonical_path"],
@@ -482,6 +485,7 @@ def build_pairs(
         _qwen_services(config.qwen).cross_pair_judge
     )
     processed = skipped = no_ready = in_pairs = cross_pairs = fallbacks = failed = 0
+    no_bindable = 0
     for clip, annotation in annotations.items():
         if clip in existing:
             skipped += 1
@@ -582,22 +586,53 @@ def build_pairs(
                 if not config.pairing.enable_in_pair:
                     warnings.append("bg1: no permitted in-pair reference")
                 else:
-                    try:
-                        retained_annotation = bind_background_reference(
-                            retained_annotation,
-                            phrase=str(selected_background["phrase"]),
+                    source_phrase = str(selected_background["phrase"])
+                    resolved_phrase = resolve_background_caption_phrase(
+                        retained_annotation.caption,
+                        source_phrase,
+                    )
+                    if resolved_phrase is None:
+                        warning = (
+                            "background_reference_dropped:"
+                            "background_phrase_unresolvable"
                         )
-                    except ReferenceBindingError as exc:
-                        warnings.append(
-                            "background_reference_dropped: "
-                            + ",".join(issue.code for issue in exc.issues)
+                        warnings.append(warning)
+                        _append_jsonl(
+                            output_root
+                            / "logs"
+                            / "background_binding_failed.jsonl",
+                            {
+                                "clip_uid": clip,
+                                "caption": retained_annotation.caption,
+                                "background_phrase": source_phrase,
+                                "entity_reference_count": len(final_references),
+                                "reason": "background_phrase_unresolvable",
+                            },
                         )
                     else:
-                        background_reference = _background_target_reference(
-                            selected_background
-                        )
-                        final_references.append(background_reference)
-                        sample_in_pairs += 1
+                        try:
+                            retained_annotation = bind_background_reference(
+                                retained_annotation,
+                                phrase=resolved_phrase,
+                            )
+                        except ReferenceBindingError as exc:
+                            warnings.append(
+                                "background_reference_dropped:"
+                                + ",".join(issue.code for issue in exc.issues)
+                            )
+                        else:
+                            background_reference = _background_target_reference(
+                                {
+                                    **selected_background,
+                                    "source_phrase": source_phrase,
+                                    "phrase": resolved_phrase,
+                                }
+                            )
+                            final_references.append(background_reference)
+                            sample_in_pairs += 1
+            if not final_references:
+                no_bindable += 1
+                continue
             sample = {
                 "clip_uid": clip,
                 "parent_video_id": annotation["parent_video_id"],
@@ -661,6 +696,7 @@ def build_pairs(
         processed=processed,
         skipped_existing=skipped,
         skipped_no_ready_reference=no_ready,
+        skipped_no_bindable_reference=no_bindable,
         in_pair_count=in_pairs,
         cross_pair_count=cross_pairs,
         fallback_count=fallbacks,

@@ -105,6 +105,10 @@ def run_pipeline(
         "in_pair_count": pairing.get("in_pair_count", 0),
         "cross_pair_count": pairing.get("cross_pair_count", 0),
         "fallback_count": pairing.get("fallback_count", 0),
+        "skipped_no_bindable_reference": pairing.get(
+            "skipped_no_bindable_reference",
+            0,
+        ),
     }
     return results
 

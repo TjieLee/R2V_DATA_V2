@@ -4,6 +4,10 @@ from copy import deepcopy
 
 from prompts.qwen_annotation_prompt import ICL_EXAMPLES
 from r2v_data_v2.caption_validation import validate_annotation
+from r2v_data_v2.phrase_alignment import (
+    resolve_background_caption_phrase,
+    resolve_reference_caption_phrase,
+)
 from r2v_data_v2.schemas import QwenAnnotationResult
 
 
@@ -72,6 +76,39 @@ def test_reference_phrase_does_not_match_inside_longer_word() -> None:
     assert "phrase_missing_from_caption" in _codes(
         QwenAnnotationResult.model_validate(payload)
     )
+
+
+def test_background_phrase_resolution_returns_exact_caption_text() -> None:
+    caption = "A diver moves above rocky underwater terrain."
+    assert (
+        resolve_background_caption_phrase(caption, "rocky underwater terrain")
+        == "rocky underwater terrain"
+    )
+    assert (
+        resolve_background_caption_phrase(caption, "ROCKY   UNDERWATER TERRAIN")
+        == "rocky underwater terrain"
+    )
+    assert (
+        resolve_background_caption_phrase(caption, "the rocky underwater terrain")
+        == "rocky underwater terrain"
+    )
+
+
+def test_phrase_resolution_preserves_conservative_final_word_repair() -> None:
+    caption = "An enemy advances through the ruins."
+    assert (
+        resolve_background_caption_phrase(caption, "an enemy soldier")
+        == "An enemy"
+    )
+    assert (
+        resolve_reference_caption_phrase(caption, "an enemy soldier")
+        == "An enemy"
+    )
+
+
+def test_background_phrase_resolution_rejects_multiple_occurrences() -> None:
+    caption = "Rocky terrain borders another stretch of rocky terrain."
+    assert resolve_background_caption_phrase(caption, "rocky terrain") is None
 
 
 def test_repeated_caption_sentence_is_rejected() -> None:

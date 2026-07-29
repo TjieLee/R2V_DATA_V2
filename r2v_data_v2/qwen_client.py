@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from r2v_data_v2.config import (
     _qwen_services,
 )
 from r2v_data_v2.manifest import iter_source_records
+from r2v_data_v2.phrase_alignment import resolve_reference_caption_phrase
 from r2v_data_v2.reconciliation import reconcile_annotations, write_json_atomic
 from r2v_data_v2.reference_binding import (
     ReferenceBindingError,
@@ -68,70 +68,6 @@ def _video_processor_extra_body(config: QwenConfig) -> dict[str, object]:
     return {"mm_processor_kwargs": processor_kwargs}
 
 
-_ARTICLES = {"a", "an", "the"}
-
-
-def _casefold_phrase_spans(
-    caption: str,
-    phrase: str,
-) -> list[tuple[int, int]]:
-    words = phrase.split()
-    if not words:
-        return []
-
-    pattern = r"\s+".join(re.escape(word) for word in words)
-
-    if words[0][0].isalnum():
-        pattern = rf"(?<!\w){pattern}"
-    if words[-1][-1].isalnum():
-        pattern = rf"{pattern}(?!\w)"
-
-    return [
-        match.span()
-        for match in re.finditer(
-            pattern,
-            caption,
-            flags=re.IGNORECASE,
-        )
-    ]
-
-
-def _unique_caption_phrase(
-    caption: str,
-    phrase: str,
-) -> str | None:
-    """Return a conservative exact phrase copied from the caption."""
-    words = phrase.split()
-    candidates = [phrase]
-
-    # Common model error:
-    # "an enemy soldier" while caption contains "an enemy".
-    if len(words) >= 3:
-        candidates.append(" ".join(words[:-1]))
-
-    # Common article mismatch:
-    # "the red vehicle" while caption contains "red vehicle".
-    if len(words) >= 3 and words[0].casefold() in _ARTICLES:
-        candidates.append(" ".join(words[1:]))
-
-    seen: set[str] = set()
-
-    for candidate in candidates:
-        key = candidate.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        spans = _casefold_phrase_spans(caption, candidate)
-        if len(spans) != 1:
-            continue
-
-        start, end = spans[0]
-        return caption[start:end]
-
-    return None
-
-
 def _align_reference_phrases(
     annotation: QwenAnnotationResult,
 ) -> tuple[QwenAnnotationResult, list[str]]:
@@ -146,7 +82,7 @@ def _align_reference_phrases(
             entities.append(entity)
             continue
 
-        aligned = _unique_caption_phrase(
+        aligned = resolve_reference_caption_phrase(
             annotation.caption,
             entity.phrase,
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -18,9 +19,33 @@ class _NeverCalledJudge:
         raise AssertionError("background references must not reach cross-pair judge")
 
 
-def _semantic_annotation(*, with_entity: bool) -> QwenAnnotationResult:
+def _assert_token_set_invariant(sample: dict[str, object]) -> None:
+    prompt_tokens = re.findall(
+        r"<ref_(?:entity|bg)_\d+>",
+        str(sample["prompt_with_refs"]),
+    )
+    references = sample["references"]
+    assert isinstance(references, list)
+    reference_tokens = [
+        str(reference["ref_token"])
+        for reference in references
+        if isinstance(reference, dict)
+    ]
+    assert sorted(prompt_tokens) == sorted(reference_tokens)
+
+
+def _semantic_annotation(
+    *,
+    with_entity: bool,
+    caption: str | None = None,
+) -> QwenAnnotationResult:
     entities: list[dict[str, object]] = []
-    caption = "A red bicycle stands in a brick courtyard."
+    if caption is None:
+        caption = (
+            "A red bicycle stands in a brick courtyard."
+            if with_entity
+            else "The scene shows a brick courtyard lit by afternoon sun."
+        )
     if with_entity:
         entities.append(
             {
@@ -37,8 +62,6 @@ def _semantic_annotation(*, with_entity: bool) -> QwenAnnotationResult:
                 "selection_reason": "primary subject",
             }
         )
-    else:
-        caption = "The scene shows a brick courtyard lit by afternoon sun."
     return QwenAnnotationResult.model_validate(
         {
             "caption": caption,
@@ -75,12 +98,16 @@ def _write_pair_fixture(
     *,
     with_entity: bool,
     background_phrase: str = "a brick courtyard",
+    caption: str | None = None,
 ) -> tuple[PipelineConfig, Path]:
     output_root = tmp_path / "output"
     manifests = output_root / "manifests"
     manifests.mkdir(parents=True)
     annotation = assign_reference_tokens(
-        _semantic_annotation(with_entity=with_entity)
+        _semantic_annotation(
+            with_entity=with_entity,
+            caption=caption,
+        )
     )
     annotation_record = {
         **annotation.model_dump(mode="json"),
@@ -169,6 +196,30 @@ def test_background_only_clip_produces_valid_sample(tmp_path: Path) -> None:
     assert sample["references"][0]["reference_type"] == "background"
     assert sample["references"][0]["pair_type"] == "in_pair"
     assert "a brick courtyard <ref_bg_1>" in sample["prompt_with_refs"]
+    _assert_token_set_invariant(sample)
+
+
+def test_background_phrase_is_resolved_before_binding(tmp_path: Path) -> None:
+    config, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=False,
+        background_phrase="THE   BRICK COURTYARD",
+    )
+
+    stats = build_pairs(
+        config,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    sample = json.loads(
+        (manifests / "final_samples.jsonl").read_text(encoding="utf-8")
+    )
+    background = sample["references"][0]
+    assert stats.processed == 1
+    assert background["phrase"] == "brick courtyard"
+    assert background["source_phrase"] == "THE   BRICK COURTYARD"
+    assert "brick courtyard <ref_bg_1>" in sample["prompt_with_refs"]
+    _assert_token_set_invariant(sample)
 
 
 def test_entity_and_background_are_emitted_together(tmp_path: Path) -> None:
@@ -188,6 +239,7 @@ def test_entity_and_background_are_emitted_together(tmp_path: Path) -> None:
         "background",
     }
     assert sample["background_reference"]["reference_id"] == "bg1"
+    _assert_token_set_invariant(sample)
 
 
 def test_cross_pair_index_ignores_background() -> None:
@@ -221,11 +273,96 @@ def test_unbindable_background_is_dropped_without_losing_entity(
         (manifests / "final_samples.jsonl").read_text(encoding="utf-8")
     )
     assert stats.processed == 1
+    assert stats.failed == 0
+    assert stats.skipped_no_bindable_reference == 0
     assert [reference["reference_type"] for reference in sample["references"]] == [
         "entity"
     ]
     assert sample["background_reference"] is None
-    assert any(
-        warning.startswith("background_reference_dropped:")
-        for warning in sample["warnings"]
+    assert (
+        "background_reference_dropped:background_phrase_unresolvable"
+        in sample["warnings"]
     )
+    assert "<ref_bg_1>" not in sample["prompt_with_refs"]
+    diagnostics = [
+        json.loads(line)
+        for line in (
+            config.output_root / "logs" / "background_binding_failed.jsonl"
+        )
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert diagnostics == [
+        {
+            "clip_uid": "clip-1",
+            "caption": sample["caption"],
+            "background_phrase": "a beach at sunset",
+            "entity_reference_count": 1,
+            "reason": "background_phrase_unresolvable",
+        }
+    ]
+    _assert_token_set_invariant(sample)
+
+
+def test_unbindable_background_only_clip_is_skipped_without_failure(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=False,
+        background_phrase="a beach at sunset",
+    )
+
+    stats = build_pairs(
+        config,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    assert stats.processed == 0
+    assert stats.failed == 0
+    assert stats.skipped_no_ready_reference == 0
+    assert stats.skipped_no_bindable_reference == 1
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
+    assert not (config.output_root / "samples" / "clip-1.json").exists()
+    assert not (config.output_root / "logs" / "pairing_failed.jsonl").exists()
+    diagnostic = json.loads(
+        (
+            config.output_root / "logs" / "background_binding_failed.jsonl"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic == {
+        "clip_uid": "clip-1",
+        "caption": "The scene shows a brick courtyard lit by afternoon sun.",
+        "background_phrase": "a beach at sunset",
+        "entity_reference_count": 0,
+        "reason": "background_phrase_unresolvable",
+    }
+
+
+def test_repeated_background_phrase_is_not_arbitrarily_bound(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=False,
+        background_phrase="brick courtyard",
+        caption=(
+            "A brick courtyard opens onto another brick courtyard in the distance."
+        ),
+    )
+
+    stats = build_pairs(
+        config,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    assert stats.processed == 0
+    assert stats.failed == 0
+    assert stats.skipped_no_bindable_reference == 1
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
+    diagnostic = json.loads(
+        (
+            config.output_root / "logs" / "background_binding_failed.jsonl"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic["reason"] == "background_phrase_unresolvable"
