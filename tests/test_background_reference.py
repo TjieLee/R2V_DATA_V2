@@ -93,6 +93,28 @@ def _write_fixture(
         json.dumps(encoded),
         encoding="utf-8",
     )
+    (candidate_dir / "tracked_masks.rle.json").write_text(
+        json.dumps(encoded),
+        encoding="utf-8",
+    )
+    (candidate_dir / "mask_coverage.json").write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "entity_id": "e1",
+                "slots": {
+                    f"frame_{slot:02d}": {
+                        "tracked": True,
+                        "mask_available": True,
+                        "candidate_accepted": True,
+                        "filtered_reasons": [],
+                    }
+                    for slot in range(10)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _config(
@@ -281,14 +303,16 @@ def test_clean_raw_candidate_preferred_over_higher_scoring_inpaint_candidate(
     config = _config(tmp_path)
     _write_fixture(config.output_root, foreground_ratio=0.10)
     candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
-    encoded = json.loads(
-        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    tracked = json.loads(
+        (candidate_dir / "tracked_masks.rle.json").read_text(
+            encoding="utf-8"
+        )
     )
     clean_mask = np.zeros((100, 100), dtype=bool)
     clean_mask[:4, :] = True
-    encoded["frame_00"] = encode_mask(clean_mask)
-    (candidate_dir / "top_masks.rle.json").write_text(
-        json.dumps(encoded),
+    tracked["frame_00"] = encode_mask(clean_mask)
+    (candidate_dir / "tracked_masks.rle.json").write_text(
+        json.dumps(tracked),
         encoding="utf-8",
     )
     frame_dir = config.output_root / "frames" / "clip-1"
@@ -369,16 +393,14 @@ def test_disabled_background_stage_is_noop(tmp_path: Path) -> None:
     assert not config.output_root.exists()
 
 
-def test_missing_entity_masks_is_quality_rejection(tmp_path: Path) -> None:
+def test_legacy_candidate_masks_are_disabled_by_default(
+    tmp_path: Path,
+) -> None:
     config = _config(tmp_path)
     _write_fixture(config.output_root, foreground_ratio=0.10)
-    (
-        config.output_root
-        / "candidates"
-        / "clip-1"
-        / "e1"
-        / "top_masks.rle.json"
-    ).unlink()
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    (candidate_dir / "tracked_masks.rle.json").unlink()
+    (candidate_dir / "mask_coverage.json").unlink()
 
     class _NeverDino:
         def encode(self, images: list[object]) -> np.ndarray:
@@ -407,10 +429,62 @@ def test_missing_entity_masks_is_quality_rejection(tmp_path: Path) -> None:
     assert stats.no_valid_candidate == 1
     assert stats.failed == 0
     assert ranking["incomplete_mask_entities"] == ["e1"]
+    assert ranking["incomplete_mask_slots"] == list(range(10))
+    assert all(
+        candidate["foreground_masks_incomplete"]
+        for candidate in ranking["candidates"]
+    )
+    assert ranking["mask_coverage"]["frame_00"][0][
+        "filtered_reasons"
+    ] == ["legacy_candidate_masks_disabled"]
     assert all(
         "incomplete_foreground_masks" in candidate["rejection_reasons"]
         for candidate in ranking["candidates"]
     )
+
+
+def test_enabled_legacy_masks_mark_every_missing_slot_incomplete(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        background=BackgroundConfig(allow_legacy_candidate_masks=True),
+    )
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    (candidate_dir / "tracked_masks.rle.json").unlink()
+    (candidate_dir / "mask_coverage.json").unlink()
+    legacy = json.loads(
+        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    )
+    legacy.pop("frame_00")
+    (candidate_dir / "top_masks.rle.json").write_text(
+        json.dumps(legacy),
+        encoding="utf-8",
+    )
+
+    stats = build_background_references(config)
+    ranking = json.loads(
+        (
+            config.output_root
+            / "background_candidates"
+            / "clip-1"
+            / "ranking_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    frame_zero = next(
+        candidate
+        for candidate in ranking["candidates"]
+        if candidate["frame_slot"] == 0
+    )
+
+    assert stats.processed == 1
+    assert ranking["incomplete_mask_slots"] == [0]
+    assert frame_zero["foreground_masks_incomplete"] is True
+    assert "incomplete_foreground_masks" in frame_zero["rejection_reasons"]
+    assert ranking["mask_coverage"]["frame_00"][0][
+        "filtered_reasons"
+    ] == ["legacy_mask_slot_missing"]
 
 
 def test_missing_entity_masks_require_qwen_review_when_enabled(
@@ -421,13 +495,9 @@ def test_missing_entity_masks_require_qwen_review_when_enabled(
         background=BackgroundConfig(qwen_judge_enabled=True),
     )
     _write_fixture(config.output_root, foreground_ratio=0.10)
-    (
-        config.output_root
-        / "candidates"
-        / "clip-1"
-        / "e1"
-        / "top_masks.rle.json"
-    ).unlink()
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    (candidate_dir / "tracked_masks.rle.json").unlink()
+    (candidate_dir / "mask_coverage.json").unlink()
 
     class _Judge:
         def __init__(self) -> None:
@@ -472,6 +542,76 @@ def test_missing_entity_masks_require_qwen_review_when_enabled(
     assert judge.calls == 1
     assert stats.processed == 1
     assert _metadata(config.output_root)["status"] == "ready"
+
+
+def test_qwen_hard_rejects_distraction_when_masks_are_incomplete(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        background=BackgroundConfig(qwen_judge_enabled=True),
+    )
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    (candidate_dir / "tracked_masks.rle.json").unlink()
+    (candidate_dir / "mask_coverage.json").unlink()
+
+    class _Judge:
+        def review(
+            self,
+            *,
+            background_phrase: str,
+            contact_sheet: Path,
+            frame_slots: list[int],
+            incomplete_mask_entities: tuple[str, ...],
+        ) -> BackgroundJudgeResult:
+            assert background_phrase
+            assert contact_sheet.is_file()
+            assert incomplete_mask_entities == ("e1",)
+            return BackgroundJudgeResult.model_validate(
+                {
+                    "candidates": [
+                        {
+                            "frame_slot": slot,
+                            "scene_completeness": 0.9,
+                            "scene_recognizability": 0.9,
+                            "foreground_distraction": 0.11,
+                            "visual_quality": 0.9,
+                            "reusable_as_background": True,
+                            "rejection_reasons": [],
+                        }
+                        for slot in frame_slots
+                    ],
+                    "best_frame_slot": frame_slots[0],
+                }
+            )
+
+    stats = build_background_references(
+        config,
+        judge=_Judge(),  # type: ignore[arg-type]
+    )
+    ranking = json.loads(
+        (
+            config.output_root
+            / "background_candidates"
+            / "clip-1"
+            / "ranking_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    reviewed = [
+        candidate
+        for candidate in ranking["candidates"]
+        if candidate["visual_review"] is not None
+    ]
+
+    assert stats.no_valid_candidate == 1
+    assert stats.processed == 0
+    assert reviewed
+    assert all(
+        "unmasked_foreground_distraction"
+        in candidate["rejection_reasons"]
+        for candidate in reviewed
+    )
 
 
 def test_background_ranking_uses_dino_and_siglip_semantics(

@@ -1350,6 +1350,17 @@ def rank_manifest_references(
                         failed += 1
                     continue
                 candidate_dir = output_root / "candidates" / clip / entity.entity_id
+                candidate_status_path = candidate_dir / "candidate_status.json"
+                if candidate_status_path.is_file():
+                    candidate_status = json.loads(
+                        candidate_status_path.read_text(encoding="utf-8")
+                    )
+                    if (
+                        not isinstance(candidate_status, dict)
+                        or candidate_status.get("status") != "ready"
+                    ):
+                        no_valid += 1
+                        continue
                 if not (
                     (candidate_dir / "candidates.jsonl").is_file()
                     and (candidate_dir / "top_masks.rle.json").is_file()

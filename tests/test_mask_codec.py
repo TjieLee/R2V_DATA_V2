@@ -7,14 +7,20 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from r2v_data_v2.config import Sam3Config
+from r2v_data_v2.config import PipelineConfig, RankingConfig, Sam3Config
 from r2v_data_v2.mask_utils import (
     decode_mask,
     encode_mask,
     fill_small_enclosed_holes,
     save_mask_contact_sheet,
 )
-from r2v_data_v2.sam3_backend import Sam3Backend, _write_candidates
+from r2v_data_v2.ranking import rank_manifest_references
+from r2v_data_v2.sam3_backend import (
+    Sam3Backend,
+    SamObservation,
+    _write_candidates,
+    extract_manifest_candidates,
+)
 
 
 def test_mask_codec_is_lossless() -> None:
@@ -318,6 +324,157 @@ def test_tracked_masks_preserve_slots_filtered_from_entity_candidates(
     ]
 
 
+def _write_sam_stage_fixture(output_root: Path) -> None:
+    manifest = output_root / "manifests" / "annotations.jsonl"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "caption": "A red bicycle is parked.",
+                "prompt_with_refs": "A red bicycle <ref_subject_1> is parked.",
+                "entities": [
+                    {
+                        "entity_id": "e1",
+                        "phrase": "a red bicycle",
+                        "grounding_prompt": "red bicycle",
+                        "canonical_label": "red bicycle",
+                        "category": "vehicle",
+                        "reference_worthy": True,
+                        "salience": "primary",
+                        "genericity": "descriptive",
+                        "name_evidence": "none",
+                        "separability": "independent",
+                        "selection_reason": "primary subject",
+                        "ref_token": "<ref_subject_1>",
+                    }
+                ],
+                "relations": [],
+                "background": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    frame_dir = output_root / "frames" / "clip-1"
+    frame_dir.mkdir(parents=True)
+    for slot in range(10):
+        Image.new("RGB", (200, 200), (80, 100, 120)).save(
+            frame_dir / f"frame_{slot:02d}.jpg"
+        )
+    (frame_dir / "frames.json").write_text(
+        json.dumps({"sampled_indices": list(range(10))}),
+        encoding="utf-8",
+    )
+
+
+def test_insufficient_visibility_publishes_tracking_only_and_ranking_skips(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        sam3=Sam3Config(minimum_visible_frames=2),
+        ranking=RankingConfig(minimum_effective_short_side=20),
+    )
+    _write_sam_stage_fixture(config.output_root)
+    mask = np.zeros((200, 200), dtype=bool)
+    mask[50:150, 50:150] = True
+
+    class _Backend:
+        def track(
+            self,
+            *,
+            frames_dir: Path,
+            grounding_prompt: str,
+        ) -> list[SamObservation]:
+            assert frames_dir.name == "clip-1"
+            assert grounding_prompt == "red bicycle"
+            return [
+                SamObservation(
+                    frame_slot=0,
+                    mask=mask,
+                    confidence=0.95,
+                    object_id=7,
+                )
+            ]
+
+    extraction = extract_manifest_candidates(
+        config,
+        backend=_Backend(),  # type: ignore[arg-type]
+    )
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    status = json.loads(
+        (candidate_dir / "candidate_status.json").read_text(encoding="utf-8")
+    )
+    tracked = json.loads(
+        (candidate_dir / "tracked_masks.rle.json").read_text(encoding="utf-8")
+    )
+    coverage = json.loads(
+        (candidate_dir / "mask_coverage.json").read_text(encoding="utf-8")
+    )
+
+    assert extraction.no_valid_candidate == 1
+    assert status["status"] == "insufficient_visible_frames"
+    assert status["candidate_count"] == 1
+    assert status["published_candidate_count"] == 0
+    assert (
+        candidate_dir / "candidates.jsonl"
+    ).read_text(encoding="utf-8") == ""
+    assert json.loads(
+        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    ) == {}
+    assert set(tracked) == {"frame_00"}
+    assert coverage["slots"]["frame_00"]["candidate_accepted"] is True
+
+    ranking = rank_manifest_references(config)
+
+    assert ranking.no_valid_candidate == 1
+    assert ranking.failed == 0
+
+
+def test_failed_sam_overwrite_removes_all_stale_candidate_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+    )
+    _write_sam_stage_fixture(config.output_root)
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    selected_dir = candidate_dir / "selected"
+    selected_dir.mkdir(parents=True)
+    for name in (
+        "candidates.jsonl",
+        "top_masks.rle.json",
+        "tracked_masks.rle.json",
+        "mask_coverage.json",
+        "candidate_status.json",
+        "ranking_metadata.json",
+    ):
+        (candidate_dir / name).write_text("stale", encoding="utf-8")
+    (selected_dir / "top_candidates.jpg").write_bytes(b"stale")
+
+    class _FailingBackend:
+        def track(
+            self,
+            *,
+            frames_dir: Path,
+            grounding_prompt: str,
+        ) -> list[SamObservation]:
+            del frames_dir, grounding_prompt
+            raise RuntimeError("tracking failed")
+
+    stats = extract_manifest_candidates(
+        config,
+        overwrite=True,
+        backend=_FailingBackend(),  # type: ignore[arg-type]
+    )
+
+    assert stats.sam_failed == 1
+    assert list(candidate_dir.iterdir()) == []
+
+
 def test_low_margin_multiple_instances_do_not_make_a_valid_anchor(
     tmp_path: Path,
 ) -> None:
@@ -353,7 +510,9 @@ def test_sam_object_id_switch_is_rejected(tmp_path: Path) -> None:
         backend.track(frames_dir=tmp_path, grounding_prompt="tracked person")
 
 
-def test_sam_requires_two_visible_frames(tmp_path: Path) -> None:
+def test_sam_returns_tracking_observations_before_visibility_gate(
+    tmp_path: Path,
+) -> None:
     predictor = _AnchorPredictor(
         anchor_outputs={
             5: _AnchorPredictor.outputs(object_ids=[7], confidences=[0.96])
@@ -362,7 +521,12 @@ def test_sam_requires_two_visible_frames(tmp_path: Path) -> None:
     )
     backend = Sam3Backend(Sam3Config(minimum_visible_frames=2), predictor=predictor)
 
-    assert backend.track(frames_dir=tmp_path, grounding_prompt="single frame") == []
+    observations = backend.track(
+        frames_dir=tmp_path,
+        grounding_prompt="single frame",
+    )
+
+    assert [observation.frame_slot for observation in observations] == [5]
 
 
 def test_sam_tracked_object_survives_with_extra_objects(

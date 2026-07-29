@@ -274,6 +274,65 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["mask_sha256"]) == 64
     assert inpainting_metadata["source_frame_index"] == 17
     assert len(inpainting_metadata["config_fingerprint"]) == 64
+    assert inpainting_metadata["reference_phrase"] == "a brick courtyard"
+    assert inpainting_metadata["canonical_label"] == "background"
+    assert inpainting_metadata["reference_type"] == "background"
+    assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
+    assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
+    assert len(inpainting_metadata["prompt_fingerprint"]) == 64
+    assert inpainting_metadata["source_metadata_version"] == "2"
+    assert len(inpainting_metadata["version_fingerprint"]) == 64
+
+
+def test_reference_semantics_and_prompt_fingerprint_invalidate_inpainting(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+    backend = _WholeImageBackend()
+
+    first = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+    )
+    first_metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    reference["phrase"] = "a covered brick arcade"
+    reference["canonical_label"] = "covered arcade"
+    artifact.write_text(json.dumps(reference), encoding="utf-8")
+
+    second = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+    )
+    second_metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert first.repaired == 1
+    assert second.repaired == 1
+    assert len(backend.prompts) == 2
+    assert first_metadata["prompt_fingerprint"] != second_metadata[
+        "prompt_fingerprint"
+    ]
+    assert second_metadata["reference_phrase"] == "a covered brick arcade"
+    assert second_metadata["canonical_label"] == "covered arcade"
 
 
 def test_repair_area_over_threshold_does_not_call_backend(

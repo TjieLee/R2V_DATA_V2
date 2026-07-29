@@ -53,6 +53,8 @@ ENTITY_INPAINT_PROMPT = (
     "the local damage."
 )
 
+INPAINTING_SOURCE_METADATA_VERSION = "2"
+
 
 class InpaintBackend(Protocol):
     def inpaint(
@@ -541,6 +543,10 @@ def _sha256_path(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _config_fingerprint(config: PipelineConfig) -> str:
     repair_judge = _qwen_services(config.qwen).repair_judge
     payload = {
@@ -570,11 +576,46 @@ def _source_signature(
     source_mask_path: Path,
     config_fingerprint: str,
 ) -> dict[str, object]:
+    reference_phrase = str(reference.get("phrase") or "")
+    canonical_label = str(reference.get("canonical_label") or "")
+    reference_type = str(reference.get("reference_type") or "entity")
+    mode = (
+        "background_hole_fill"
+        if reference_type == "background"
+        else "entity_local_repair"
+    )
+    repair_prompt = _inpainting_prompt(reference, mode)
+    consistency_prompt = INPAINTING_CONSISTENCY_PROMPT.format(
+        reference_phrase=(
+            reference_phrase or canonical_label or "reference image"
+        ),
+        repair_mode=mode,
+    )
+    prompt_payload = json.dumps(
+        {
+            "repair_prompt": repair_prompt,
+            "consistency_prompt": consistency_prompt,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    version_fingerprint = _sha256_text(
+        f"r2v_data_v2.inpainting.source_metadata."
+        f"{INPAINTING_SOURCE_METADATA_VERSION}"
+    )
     return {
         "source_image_sha256": _sha256_path(source_image_path),
         "mask_sha256": _sha256_path(source_mask_path),
         "source_frame_index": reference.get("source_frame_index"),
         "config_fingerprint": config_fingerprint,
+        "reference_phrase": reference_phrase,
+        "canonical_label": canonical_label,
+        "reference_type": reference_type,
+        "inpainting_prompt_sha256": _sha256_text(repair_prompt),
+        "consistency_prompt_sha256": _sha256_text(consistency_prompt),
+        "prompt_fingerprint": _sha256_text(prompt_payload),
+        "source_metadata_version": INPAINTING_SOURCE_METADATA_VERSION,
+        "version_fingerprint": version_fingerprint,
     }
 
 

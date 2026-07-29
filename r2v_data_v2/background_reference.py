@@ -64,6 +64,7 @@ class BackgroundCandidate:
     exposure: float
     ranking_score: float
     rejection_reasons: tuple[str, ...]
+    foreground_masks_incomplete: bool
     visual_review: BackgroundVisualReview | None = None
     dino_representativeness: float | None = None
     siglip_alignment: float | None = None
@@ -96,6 +97,7 @@ def _load_foreground_masks(
     clip_uid: str,
     annotation: AnnotationResult,
     frame_count: int,
+    allow_legacy_candidate_masks: bool,
 ) -> tuple[
     dict[int, list[np.ndarray]],
     tuple[str, ...],
@@ -111,73 +113,95 @@ def _load_foreground_masks(
     for entity in annotation.entities:
         if not requires_foreground_mask(entity):
             continue
-        candidate_dir = (
-            output_root
-            / "candidates"
-            / clip_uid
-            / entity.entity_id
-        )
+        candidate_dir = output_root / "candidates" / clip_uid / entity.entity_id
         tracked_path = candidate_dir / "tracked_masks.rle.json"
-        legacy_path = candidate_dir / "top_masks.rle.json"
-        mask_path = tracked_path if tracked_path.is_file() else legacy_path
-        if not mask_path.is_file():
-            incomplete_entities.append(entity.entity_id)
-            incomplete_slots.update(range(frame_count))
-            for slot in range(frame_count):
-                coverage_by_slot[slot].append(
-                    {
-                        "entity_id": entity.entity_id,
-                        "tracked": False,
-                        "mask_available": False,
-                        "candidate_accepted": False,
-                        "filtered_reasons": [
-                            "missing_tracked_mask_artifact"
-                        ],
-                        "mask_source": "missing",
-                    }
-                )
-            continue
-        encoded = json.loads(mask_path.read_text(encoding="utf-8"))
-        if not isinstance(encoded, dict):
-            raise TypeError(f"foreground mask artifact must be an object: {mask_path}")
-        encoded_slots: set[int] = set()
-        for key, value in encoded.items():
-            if not key.startswith("frame_"):
-                continue
-            slot = int(key.removeprefix("frame_"))
-            encoded_slots.add(slot)
-            masks_by_slot.setdefault(slot, []).append(decode_mask(value))
         coverage_path = candidate_dir / "mask_coverage.json"
-        if coverage_path.is_file():
+        legacy_path = candidate_dir / "top_masks.rle.json"
+
+        def load_encoded(path: Path) -> tuple[dict[str, object], set[int]]:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise TypeError(
+                    f"foreground mask artifact must be an object: {path}"
+                )
+            slots: set[int] = set()
+            for key, value in payload.items():
+                if not key.startswith("frame_"):
+                    continue
+                slot = int(key.removeprefix("frame_"))
+                if not 0 <= slot < frame_count:
+                    raise ValueError(
+                        f"foreground mask slot is out of range: {path}: {slot}"
+                    )
+                slots.add(slot)
+                masks_by_slot.setdefault(slot, []).append(decode_mask(value))
+            return payload, slots
+
+        if tracked_path.is_file() and coverage_path.is_file():
+            _, encoded_slots = load_encoded(tracked_path)
             coverage_payload = json.loads(
                 coverage_path.read_text(encoding="utf-8")
             )
-            slots = coverage_payload.get("slots", {})
-            if not isinstance(slots, dict):
+            if not isinstance(coverage_payload, dict):
+                raise TypeError(
+                    f"mask coverage artifact must be an object: {coverage_path}"
+                )
+            slots_payload = coverage_payload.get("slots")
+            if not isinstance(slots_payload, dict):
                 raise TypeError(
                     f"mask coverage slots must be an object: {coverage_path}"
                 )
+            has_any_tracked_slot = any(
+                isinstance(value, dict) and bool(value.get("tracked"))
+                for value in slots_payload.values()
+            )
             for slot in range(frame_count):
-                value = slots.get(f"frame_{slot:02d}", {})
-                if not isinstance(value, dict):
-                    raise TypeError(
-                        f"mask coverage entry must be an object: {coverage_path}"
-                    )
-                record = {
-                    "entity_id": entity.entity_id,
-                    **value,
-                    "mask_source": "tracked",
-                }
-                coverage_by_slot[slot].append(record)
-                needs_mask = bool(value.get("tracked"))
-                has_mask = (
-                    bool(value.get("mask_available"))
-                    and slot in encoded_slots
-                )
-                if needs_mask and not has_mask:
+                key = f"frame_{slot:02d}"
+                raw_value = slots_payload.get(key)
+                if not isinstance(raw_value, dict):
+                    value: dict[str, object] = {
+                        "tracked": False,
+                        "mask_available": False,
+                        "candidate_accepted": False,
+                        "filtered_reasons": ["missing_mask_coverage_slot"],
+                    }
                     incomplete_entities.append(entity.entity_id)
                     incomplete_slots.add(slot)
-        else:
+                else:
+                    value = dict(raw_value)
+                reasons = [
+                    str(reason)
+                    for reason in value.get("filtered_reasons", [])
+                ]
+                tracked = bool(value.get("tracked"))
+                mask_available = bool(value.get("mask_available"))
+                has_mask = slot in encoded_slots
+                if (
+                    (tracked and not (mask_available and has_mask))
+                    or (mask_available != has_mask)
+                    or (mask_available and not tracked)
+                ):
+                    reasons.append("tracked_mask_coverage_mismatch")
+                    incomplete_entities.append(entity.entity_id)
+                    incomplete_slots.add(slot)
+                if not has_any_tracked_slot:
+                    reasons.append("entity_has_no_tracked_masks")
+                    incomplete_entities.append(entity.entity_id)
+                    incomplete_slots.add(slot)
+                value["filtered_reasons"] = list(dict.fromkeys(reasons))
+                coverage_by_slot[slot].append(
+                    {
+                        "entity_id": entity.entity_id,
+                        **value,
+                        "mask_source": "tracked",
+                    }
+                )
+            continue
+
+        if tracked_path.is_file():
+            _, encoded_slots = load_encoded(tracked_path)
+            incomplete_entities.append(entity.entity_id)
+            incomplete_slots.update(range(frame_count))
             for slot in range(frame_count):
                 has_mask = slot in encoded_slots
                 coverage_by_slot[slot].append(
@@ -185,16 +209,54 @@ def _load_foreground_masks(
                         "entity_id": entity.entity_id,
                         "tracked": has_mask,
                         "mask_available": has_mask,
+                        "candidate_accepted": False,
+                        "filtered_reasons": [
+                            "missing_mask_coverage_artifact"
+                        ],
+                        "mask_source": "tracked_without_coverage",
+                    }
+                )
+            continue
+
+        if allow_legacy_candidate_masks and legacy_path.is_file():
+            _, encoded_slots = load_encoded(legacy_path)
+            for slot in range(frame_count):
+                has_mask = slot in encoded_slots
+                if not has_mask:
+                    incomplete_entities.append(entity.entity_id)
+                    incomplete_slots.add(slot)
+                coverage_by_slot[slot].append(
+                    {
+                        "entity_id": entity.entity_id,
+                        "tracked": has_mask,
+                        "mask_available": has_mask,
                         "candidate_accepted": has_mask,
                         "filtered_reasons": (
-                            [] if has_mask else ["legacy_coverage_unknown"]
+                            [] if has_mask else ["legacy_mask_slot_missing"]
                         ),
                         "mask_source": "legacy_candidate",
                     }
                 )
-        if not encoded and not coverage_path.is_file():
-            incomplete_entities.append(entity.entity_id)
-            incomplete_slots.update(range(frame_count))
+            continue
+
+        reason = (
+            "legacy_candidate_masks_disabled"
+            if legacy_path.is_file()
+            else "missing_tracked_mask_artifact"
+        )
+        incomplete_entities.append(entity.entity_id)
+        incomplete_slots.update(range(frame_count))
+        for slot in range(frame_count):
+            coverage_by_slot[slot].append(
+                {
+                    "entity_id": entity.entity_id,
+                    "tracked": False,
+                    "mask_available": False,
+                    "candidate_accepted": False,
+                    "filtered_reasons": [reason],
+                    "mask_source": "missing",
+                }
+            )
     return (
         masks_by_slot,
         tuple(dict.fromkeys(incomplete_entities)),
@@ -419,6 +481,8 @@ class QwenBackgroundJudge:
 def _apply_visual_reviews(
     candidates: list[BackgroundCandidate],
     reviews: dict[int, BackgroundVisualReview],
+    *,
+    maximum_incomplete_mask_foreground_distraction: float,
 ) -> list[BackgroundCandidate]:
     reviewed: list[BackgroundCandidate] = []
     for candidate in candidates:
@@ -433,6 +497,12 @@ def _apply_visual_reviews(
             reasons.append("scene_unrecognizable")
         if not review.reusable_as_background:
             reasons.append("not_reusable_as_background")
+        if (
+            candidate.foreground_masks_incomplete
+            and review.foreground_distraction
+            > maximum_incomplete_mask_foreground_distraction
+        ):
+            reasons.append("unmasked_foreground_distraction")
         reasons.extend(review.rejection_reasons)
         visual_score = (
             0.30 * review.scene_completeness
@@ -591,6 +661,9 @@ def build_background_references(
                 clip_uid=clip_uid,
                 annotation=annotation,
                 frame_count=config.frames.count,
+                allow_legacy_candidate_masks=(
+                    config.background.allow_legacy_candidate_masks
+                ),
             )
             raw_candidates: list[dict[str, object]] = []
             candidate_dir = output_root / "background_candidates" / clip_uid
@@ -618,6 +691,9 @@ def build_background_references(
                         "hole_area_ratio": foreground_ratio,
                         "sharpness": sharpness,
                         "exposure": exposure,
+                        "foreground_masks_incomplete": (
+                            slot in incomplete_mask_slots
+                        ),
                         "rejection_reasons": _basic_rejection_reasons(
                             foreground_area_ratio=foreground_ratio,
                             hole_area_ratio=foreground_ratio,
@@ -759,7 +835,14 @@ def build_background_references(
                 reviews = {
                     review.frame_slot: review for review in result.candidates
                 }
-                candidates = _apply_visual_reviews(candidates, reviews)
+                candidates = _apply_visual_reviews(
+                    candidates,
+                    reviews,
+                    maximum_incomplete_mask_foreground_distraction=(
+                        config.background
+                        .maximum_incomplete_mask_foreground_distraction
+                    ),
+                )
                 valid = [
                     candidate
                     for candidate in candidates

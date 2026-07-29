@@ -296,6 +296,7 @@ class PairingConfig:
 @dataclass(frozen=True)
 class BackgroundConfig:
     enabled: bool = True
+    allow_legacy_candidate_masks: bool = False
     raw_foreground_area_ratio: float = 0.05
     maximum_foreground_area_ratio: float = 0.25
     maximum_hole_area_ratio: float = 0.25
@@ -303,6 +304,7 @@ class BackgroundConfig:
     minimum_sharpness: float = 0.0
     qwen_judge_enabled: bool = False
     top_k_for_vlm_judge: int = 3
+    maximum_incomplete_mask_foreground_distraction: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -763,6 +765,15 @@ def _validate_config(config: PipelineConfig) -> None:
     if not 1 <= config.background.top_k_for_vlm_judge <= 3:
         raise ValueError(
             "background.top_k_for_vlm_judge must be between 1 and 3"
+        )
+    if not (
+        0.0
+        <= config.background.maximum_incomplete_mask_foreground_distraction
+        <= 0.10
+    ):
+        raise ValueError(
+            "background.maximum_incomplete_mask_foreground_distraction "
+            "must be between 0 and 0.10"
         )
     if config.inpainting.backend not in {"flux1_fill", "noop"}:
         raise ValueError("inpainting.backend must be flux1_fill or noop")

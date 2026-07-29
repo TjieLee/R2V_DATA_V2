@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from r2v_data_v2.mask_utils import (
     save_mask_contact_sheet,
     touches_border,
 )
+from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.schemas import AnnotationResult
 
 
@@ -237,8 +239,6 @@ class Sam3Backend:
         if len(object_ids) > 1:
             raise ValueError("SAM3 object identity switched across sampled frames")
         unique_by_slot = {item.frame_slot: item for item in observations}
-        if len(unique_by_slot) < self.config.minimum_visible_frames:
-            return []
         return [unique_by_slot[slot] for slot in sorted(unique_by_slot)]
 
     def close(self) -> None:
@@ -345,15 +345,35 @@ def _write_candidates(
     masks: dict[int, np.ndarray],
     frame_paths: list[Path],
     save_top_k: int,
+    minimum_visible_frames: int = 1,
     tracked_masks: dict[int, np.ndarray] | None = None,
     mask_coverage: dict[int, dict[str, object]] | None = None,
 ) -> None:
     destination = output_root / "candidates" / clip_uid / entity_id
     destination.mkdir(parents=True, exist_ok=True)
+    candidate_count = len(candidates)
+    candidate_status = (
+        "ready"
+        if candidate_count >= minimum_visible_frames
+        else "insufficient_visible_frames"
+    )
+    write_json_atomic(
+        destination / "candidate_status.json",
+        {
+            "clip_uid": clip_uid,
+            "entity_id": entity_id,
+            "status": "building",
+            "candidate_count": candidate_count,
+            "minimum_visible_frames": minimum_visible_frames,
+            "published_candidate_count": 0,
+        },
+    )
+    published_candidates = candidates if candidate_status == "ready" else []
+    published_masks = masks if candidate_status == "ready" else {}
     ranked_slots = [
         int(candidate["frame_slot"])
         for candidate in sorted(
-            candidates,
+            published_candidates,
             key=lambda item: (
                 float(item["sam_confidence"]),
                 int(item["effective_short_side"]),
@@ -364,13 +384,16 @@ def _write_candidates(
     encoded: dict[str, object] = {}
     for slot in ranked_slots:
         key = f"frame_{slot:02d}"
-        encoded[key] = encode_mask(masks[slot])
-        for candidate in candidates:
+        encoded[key] = encode_mask(published_masks[slot])
+        for candidate in published_candidates:
             if int(candidate["frame_slot"]) == slot:
                 candidate["mask_rle_key"] = key
                 break
     with (destination / "candidates.jsonl").open("w", encoding="utf-8") as handle:
-        for candidate in sorted(candidates, key=lambda item: int(item["frame_slot"])):
+        for candidate in sorted(
+            published_candidates,
+            key=lambda item: int(item["frame_slot"]),
+        ):
             record = {"clip_uid": clip_uid, "entity_id": entity_id, **candidate}
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     (destination / "top_masks.rle.json").write_text(
@@ -412,13 +435,48 @@ def _write_candidates(
         + "\n",
         encoding="utf-8",
     )
-    if candidates:
+    if published_candidates:
         save_mask_contact_sheet(
             frame_paths=frame_paths,
-            candidates=candidates,
-            masks=masks,
+            candidates=published_candidates,
+            masks=published_masks,
             destination=destination / "contact_sheet.jpg",
         )
+    else:
+        (destination / "contact_sheet.jpg").unlink(missing_ok=True)
+    write_json_atomic(
+        destination / "candidate_status.json",
+        {
+            "clip_uid": clip_uid,
+            "entity_id": entity_id,
+            "status": candidate_status,
+            "candidate_count": candidate_count,
+            "minimum_visible_frames": minimum_visible_frames,
+            "published_candidate_count": len(published_candidates),
+        },
+    )
+
+
+def _clear_entity_candidate_artifacts(
+    *,
+    output_root: Path,
+    candidate_dir: Path,
+) -> None:
+    candidate_root = (output_root / "candidates").resolve(strict=False)
+    resolved = candidate_dir.resolve(strict=False)
+    if not resolved.is_relative_to(candidate_root) or resolved == candidate_root:
+        raise ValueError("candidate cleanup path escapes the candidates root")
+    if candidate_dir.is_symlink():
+        raise ValueError("candidate cleanup path must not be a symlink")
+    if not candidate_dir.exists():
+        return
+    for child in candidate_dir.iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
+        else:
+            raise ValueError(f"unsupported candidate artifact: {child}")
 
 
 def _append_failure(path: Path, value: dict[str, object]) -> None:
@@ -454,16 +512,21 @@ def extract_manifest_candidates(
             for entity in annotation.entities:
                 if not requires_foreground_mask(entity):
                     continue
-                destination = (
+                candidate_dir = (
                     output_root
                     / "candidates"
                     / clip
                     / entity.entity_id
-                    / "candidates.jsonl"
                 )
+                destination = candidate_dir / "candidates.jsonl"
                 if destination.is_file() and not overwrite:
                     continue
                 try:
+                    if overwrite:
+                        _clear_entity_candidate_artifacts(
+                            output_root=output_root,
+                            candidate_dir=candidate_dir,
+                        )
                     observations = sam.track(
                         frames_dir=frame_dir,
                         grounding_prompt=entity.grounding_prompt,
@@ -529,6 +592,9 @@ def extract_manifest_candidates(
                         masks=masks,
                         frame_paths=frame_paths,
                         save_top_k=config.ranking.save_top_k_mask_rle,
+                        minimum_visible_frames=(
+                            config.sam3.minimum_visible_frames
+                        ),
                         tracked_masks=tracked_masks,
                         mask_coverage=mask_coverage,
                     )

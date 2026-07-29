@@ -139,6 +139,7 @@ ranking:
 
 background:
   enabled: true
+  allow_legacy_candidate_masks: false
   raw_foreground_area_ratio: 0.05
   maximum_foreground_area_ratio: 0.25
   maximum_hole_area_ratio: 0.25
@@ -146,6 +147,7 @@ background:
   minimum_sharpness: 0.0
   qwen_judge_enabled: false
   top_k_for_vlm_judge: 3
+  maximum_incomplete_mask_foreground_distraction: 0.10
 
 inpainting:
   enabled: false
