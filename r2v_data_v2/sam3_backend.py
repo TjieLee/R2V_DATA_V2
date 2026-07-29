@@ -221,7 +221,11 @@ class Sam3Backend:
                 matching = [
                     item for item in current if item.object_id == tracked_object_id
                 ]
-                if len(matching) != 1 or len(current) != 1:
+                if len(matching) > 1:
+                    raise ValueError(
+                        "SAM3 returned duplicate observations for the tracked object"
+                    )
+                if not matching:
                     raise ValueError(
                         "SAM3 object identity switched across sampled frames"
                     )

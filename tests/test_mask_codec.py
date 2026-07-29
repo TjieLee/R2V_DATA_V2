@@ -287,3 +287,34 @@ def test_sam_requires_two_visible_frames(tmp_path: Path) -> None:
     backend = Sam3Backend(Sam3Config(minimum_visible_frames=2), predictor=predictor)
 
     assert backend.track(frames_dir=tmp_path, grounding_prompt="single frame") == []
+
+
+def test_sam_tracked_object_survives_with_extra_objects(
+    tmp_path: Path,
+) -> None:
+    predictor = _AnchorPredictor(
+        anchor_outputs={
+            5: _AnchorPredictor.outputs(
+                object_ids=[7],
+                confidences=[0.96],
+            )
+        },
+        propagation_outputs={
+            6: _AnchorPredictor.outputs(
+                object_ids=[7, 9],
+                confidences=[0.90, 0.85],
+            )
+        },
+    )
+    backend = Sam3Backend(
+        Sam3Config(minimum_visible_frames=1),
+        predictor=predictor,
+    )
+
+    observations = backend.track(
+        frames_dir=tmp_path,
+        grounding_prompt="target object",
+    )
+
+    assert observations
+    assert {item.object_id for item in observations} == {7}
