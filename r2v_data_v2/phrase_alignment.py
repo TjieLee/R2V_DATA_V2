@@ -85,15 +85,15 @@ def resolve_background_caption_phrase(
 ) -> str | None:
     """Resolve a background phrase to one exact, unique caption substring."""
     exact_spans = exact_phrase_spans(caption, phrase)
+    if len(exact_spans) == 1:
+        start, end = exact_spans[0]
+        return caption[start:end]
     if len(exact_spans) > 1:
         return None
 
     casefold_spans = _casefold_phrase_spans(caption, phrase)
     if len(casefold_spans) > 1:
         return None
-    if len(exact_spans) == 1:
-        start, end = exact_spans[0]
-        return caption[start:end]
     if len(casefold_spans) == 1:
         start, end = casefold_spans[0]
         return caption[start:end]

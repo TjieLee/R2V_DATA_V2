@@ -21,7 +21,7 @@ class _NeverCalledJudge:
 
 def _assert_token_set_invariant(sample: dict[str, object]) -> None:
     prompt_tokens = re.findall(
-        r"<ref_(?:entity|bg)_\d+>",
+        r"<ref_(?:subject|object|group|bg)_\d+>",
         str(sample["prompt_with_refs"]),
     )
     references = sample["references"]
@@ -294,11 +294,11 @@ def test_unbindable_background_is_dropped_without_losing_entity(
     ]
     assert diagnostics == [
         {
+            "original_background_phrase": "a beach at sunset",
+            "issue_codes": ["background_phrase_unresolvable"],
             "clip_uid": "clip-1",
             "caption": sample["caption"],
-            "background_phrase": "a beach at sunset",
             "entity_reference_count": 1,
-            "reason": "background_phrase_unresolvable",
         }
     ]
     _assert_token_set_invariant(sample)
@@ -331,11 +331,11 @@ def test_unbindable_background_only_clip_is_skipped_without_failure(
         ).read_text(encoding="utf-8")
     )
     assert diagnostic == {
+        "original_background_phrase": "a beach at sunset",
+        "issue_codes": ["background_phrase_unresolvable"],
         "clip_uid": "clip-1",
         "caption": "The scene shows a brick courtyard lit by afternoon sun.",
-        "background_phrase": "a beach at sunset",
         "entity_reference_count": 0,
-        "reason": "background_phrase_unresolvable",
     }
 
 
@@ -365,4 +365,45 @@ def test_repeated_background_phrase_is_not_arbitrarily_bound(
             config.output_root / "logs" / "background_binding_failed.jsonl"
         ).read_text(encoding="utf-8")
     )
-    assert diagnostic["reason"] == "background_phrase_unresolvable"
+    assert diagnostic["issue_codes"] == ["background_phrase_unresolvable"]
+
+
+def test_reference_binding_error_uses_standard_background_failure_schema(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=True,
+        background_phrase="red bicycle",
+    )
+
+    stats = build_pairs(
+        config,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    sample = json.loads(
+        (manifests / "final_samples.jsonl").read_text(encoding="utf-8")
+    )
+    assert stats.processed == 1
+    assert stats.failed == 0
+    assert [reference["reference_type"] for reference in sample["references"]] == [
+        "entity"
+    ]
+    assert (
+        "background_reference_dropped:overlapping_phrase_spans"
+        in sample["warnings"]
+    )
+    diagnostic = json.loads(
+        (
+            config.output_root / "logs" / "background_binding_failed.jsonl"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic == {
+        "original_background_phrase": "red bicycle",
+        "issue_codes": ["overlapping_phrase_spans"],
+        "clip_uid": "clip-1",
+        "caption": sample["caption"],
+        "entity_reference_count": 1,
+    }
+    _assert_token_set_invariant(sample)

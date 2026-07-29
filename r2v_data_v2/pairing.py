@@ -395,6 +395,27 @@ def _append_jsonl(path: Path, value: dict[str, object]) -> None:
         handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
+def _append_background_binding_failure(
+    output_root: Path,
+    *,
+    original_background_phrase: str,
+    issue_codes: list[str],
+    clip_uid: str,
+    caption: str,
+    entity_reference_count: int,
+) -> None:
+    _append_jsonl(
+        output_root / "logs" / "background_binding_failed.jsonl",
+        {
+            "original_background_phrase": original_background_phrase,
+            "issue_codes": issue_codes,
+            "clip_uid": clip_uid,
+            "caption": caption,
+            "entity_reference_count": entity_reference_count,
+        },
+    )
+
+
 def _annotation_from_record(record: dict[str, Any]) -> AnnotationResult:
     return AnnotationResult.model_validate(
         {
@@ -597,17 +618,13 @@ def build_pairs(
                             "background_phrase_unresolvable"
                         )
                         warnings.append(warning)
-                        _append_jsonl(
-                            output_root
-                            / "logs"
-                            / "background_binding_failed.jsonl",
-                            {
-                                "clip_uid": clip,
-                                "caption": retained_annotation.caption,
-                                "background_phrase": source_phrase,
-                                "entity_reference_count": len(final_references),
-                                "reason": "background_phrase_unresolvable",
-                            },
+                        _append_background_binding_failure(
+                            output_root,
+                            original_background_phrase=source_phrase,
+                            issue_codes=["background_phrase_unresolvable"],
+                            clip_uid=clip,
+                            caption=retained_annotation.caption,
+                            entity_reference_count=len(final_references),
                         )
                     else:
                         try:
@@ -616,9 +633,18 @@ def build_pairs(
                                 phrase=resolved_phrase,
                             )
                         except ReferenceBindingError as exc:
+                            issue_codes = [issue.code for issue in exc.issues]
                             warnings.append(
                                 "background_reference_dropped:"
-                                + ",".join(issue.code for issue in exc.issues)
+                                + ",".join(issue_codes)
+                            )
+                            _append_background_binding_failure(
+                                output_root,
+                                original_background_phrase=source_phrase,
+                                issue_codes=issue_codes,
+                                clip_uid=clip,
+                                caption=retained_annotation.caption,
+                                entity_reference_count=len(final_references),
                             )
                         else:
                             background_reference = _background_target_reference(

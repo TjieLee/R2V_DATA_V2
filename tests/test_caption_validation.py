@@ -107,8 +107,13 @@ def test_phrase_resolution_preserves_conservative_final_word_repair() -> None:
 
 
 def test_background_phrase_resolution_rejects_multiple_occurrences() -> None:
-    caption = "Rocky terrain borders another stretch of rocky terrain."
+    caption = "rocky terrain borders another stretch of rocky terrain."
     assert resolve_background_caption_phrase(caption, "rocky terrain") is None
+
+
+def test_exact_background_phrase_takes_precedence_over_casefold_ambiguity() -> None:
+    caption = "Ocean borders another ocean."
+    assert resolve_background_caption_phrase(caption, "Ocean") == "Ocean"
 
 
 def test_repeated_caption_sentence_is_rejected() -> None:
