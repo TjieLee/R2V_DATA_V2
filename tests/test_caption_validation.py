@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from prompts.qwen_annotation_prompt import ICL_EXAMPLES
 from r2v_data_v2.caption_validation import validate_annotation
 from r2v_data_v2.phrase_alignment import (
@@ -114,6 +116,81 @@ def test_background_phrase_resolution_rejects_multiple_occurrences() -> None:
 def test_exact_background_phrase_takes_precedence_over_casefold_ambiguity() -> None:
     caption = "Ocean borders another ocean."
     assert resolve_background_caption_phrase(caption, "Ocean") == "Ocean"
+
+
+@pytest.mark.parametrize(
+    ("source_phrase", "caption", "expected"),
+    [
+        (
+            "a vast expanse of deep blue ocean bordered by barren, rocky hills",
+            (
+                "The camera reveals a deep blue ocean shimmering under bright "
+                "sunlight, bordered by arid, rocky hills."
+            ),
+            "deep blue ocean",
+        ),
+        (
+            "a vast green grassland leading up to a towering mountain",
+            (
+                "The camera pans across a vast green grassland, revealing a "
+                "towering mountain."
+            ),
+            "a vast green grassland",
+        ),
+        (
+            "deep blue water with sunlight filtering through",
+            (
+                "A whale glides through deep blue water as sunlight filters "
+                "from above."
+            ),
+            "deep blue water",
+        ),
+        (
+            "a narrow underwater canyon with rugged coral walls",
+            (
+                "A diver moves through a narrow underwater canyon, flanked by "
+                "rugged coral walls."
+            ),
+            "a narrow underwater canyon",
+        ),
+    ],
+)
+def test_background_phrase_recovers_unique_longest_shared_span(
+    source_phrase: str,
+    caption: str,
+    expected: str,
+) -> None:
+    assert resolve_background_caption_phrase(caption, source_phrase) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_phrase", "caption"),
+    [
+        (
+            "a sandy beach lined with tall swaying palm trees",
+            "Gentle waves reach a sandy shore as tall palm trees sway.",
+        ),
+        (
+            "rough stone walls and a ceiling",
+            "Mechanical ports are set into a rough stone wall.",
+        ),
+        (
+            "a vast expanse of the ocean",
+            "Ocean waves roll toward dark rocks.",
+        ),
+    ],
+)
+def test_background_phrase_longest_shared_span_fails_closed(
+    source_phrase: str,
+    caption: str,
+) -> None:
+    assert resolve_background_caption_phrase(caption, source_phrase) is None
+
+
+def test_background_phrase_longest_shared_span_rejects_longest_tie() -> None:
+    source_phrase = "deep blue ocean beside rugged coral walls"
+    caption = "A deep blue ocean lies beyond rugged coral walls."
+    assert resolve_background_caption_phrase(caption, source_phrase) is None
 
 
 def test_repeated_caption_sentence_is_rejected() -> None:

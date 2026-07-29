@@ -20,7 +20,10 @@ from r2v_data_v2.config import (
     _qwen_services,
 )
 from r2v_data_v2.manifest import iter_source_records
-from r2v_data_v2.phrase_alignment import resolve_reference_caption_phrase
+from r2v_data_v2.phrase_alignment import (
+    resolve_background_caption_phrase,
+    resolve_reference_caption_phrase,
+)
 from r2v_data_v2.reconciliation import reconcile_annotations, write_json_atomic
 from r2v_data_v2.reference_binding import (
     ReferenceBindingError,
@@ -71,7 +74,7 @@ def _video_processor_extra_body(config: QwenConfig) -> dict[str, object]:
 def _align_reference_phrases(
     annotation: QwenAnnotationResult,
 ) -> tuple[QwenAnnotationResult, list[str]]:
-    """Align only missing reference phrases to unique caption spans."""
+    """Align entity and background phrases to unique caption spans."""
     entities = []
     warnings: list[str] = []
 
@@ -101,8 +104,26 @@ def _align_reference_phrases(
             f"{entity.phrase!r}->{aligned!r}"
         )
 
+    background = annotation.background
+    if background is not None:
+        aligned = resolve_background_caption_phrase(
+            annotation.caption,
+            background.phrase,
+        )
+        if aligned is not None and aligned != background.phrase:
+            background = background.model_copy(update={"phrase": aligned})
+            warnings.append(
+                "aligned_reference_phrase:"
+                f"background:{annotation.background.phrase!r}->{aligned!r}"
+            )
+
     return (
-        annotation.model_copy(update={"entities": entities}),
+        annotation.model_copy(
+            update={
+                "entities": entities,
+                "background": background,
+            }
+        ),
         warnings,
     )
 

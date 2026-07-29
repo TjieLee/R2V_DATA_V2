@@ -6,6 +6,45 @@ from collections.abc import Iterable
 from r2v_data_v2.caption_validation import exact_phrase_spans
 
 _ARTICLES = {"a", "an", "the"}
+_MIN_SHARED_TOKEN_COUNT = 3
+_MIN_NON_STOPWORD_COUNT = 2
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "between",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "these",
+        "this",
+        "those",
+        "through",
+        "to",
+        "under",
+        "was",
+        "were",
+        "with",
+    }
+)
+_WORD = re.compile(r"[^\W_]+", flags=re.UNICODE)
 
 
 def _casefold_phrase_spans(
@@ -30,6 +69,72 @@ def _casefold_phrase_spans(
             flags=re.IGNORECASE,
         )
     ]
+
+
+def _word_tokens(value: str) -> list[tuple[str, int, int]]:
+    return [
+        (match.group(0).casefold(), *match.span())
+        for match in _WORD.finditer(value)
+    ]
+
+
+def _resolve_longest_shared_token_span(
+    caption: str,
+    phrase: str,
+) -> str | None:
+    source_tokens = _word_tokens(phrase)
+    caption_tokens = _word_tokens(caption)
+    maximum_length = min(len(source_tokens), len(caption_tokens))
+
+    for length in range(
+        maximum_length,
+        _MIN_SHARED_TOKEN_COUNT - 1,
+        -1,
+    ):
+        candidates: dict[tuple[str, ...], tuple[int, int]] = {}
+        checked: set[tuple[str, ...]] = set()
+        for source_start in range(len(source_tokens) - length + 1):
+            candidate = tuple(
+                token
+                for token, _, _ in source_tokens[
+                    source_start : source_start + length
+                ]
+            )
+            if candidate in checked:
+                continue
+            checked.add(candidate)
+            if (
+                sum(token not in _STOPWORDS for token in candidate)
+                < _MIN_NON_STOPWORD_COUNT
+            ):
+                continue
+
+            occurrences: list[tuple[int, int]] = []
+            for caption_start in range(len(caption_tokens) - length + 1):
+                caption_candidate = tuple(
+                    token
+                    for token, _, _ in caption_tokens[
+                        caption_start : caption_start + length
+                    ]
+                )
+                if caption_candidate != candidate:
+                    continue
+                occurrences.append(
+                    (
+                        caption_tokens[caption_start][1],
+                        caption_tokens[caption_start + length - 1][2],
+                    )
+                )
+            if len(occurrences) == 1:
+                candidates[candidate] = occurrences[0]
+
+        if len(candidates) > 1:
+            return None
+        if len(candidates) == 1:
+            start, end = next(iter(candidates.values()))
+            return caption[start:end]
+
+    return None
 
 
 def _resolve_casefold_candidates(
@@ -105,8 +210,16 @@ def resolve_background_caption_phrase(
     if len(words) >= 3:
         variants.append(" ".join(words[:-1]))
 
-    return _resolve_casefold_candidates(
+    resolved = _resolve_casefold_candidates(
         caption,
         variants,
         fail_on_ambiguous=True,
     )
+    if resolved is not None:
+        return resolved
+    if any(
+        len(_casefold_phrase_spans(caption, candidate)) > 1
+        for candidate in variants
+    ):
+        return None
+    return _resolve_longest_shared_token_span(caption, phrase)

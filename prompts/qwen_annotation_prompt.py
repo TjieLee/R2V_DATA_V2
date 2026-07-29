@@ -34,8 +34,11 @@ available in this pipeline.
 
 PHRASES:
 Each reference-worthy entity phrase must be copied exactly from one unique
-location in the caption. Do not generate reference tokens or a second prompt;
-the caller assigns bindings deterministically after validating your JSON.
+location in the caption. If a background is present, background.phrase must be
+copied as one exact, contiguous substring from caption. It must not combine
+separated parts of the caption. Do not generate reference tokens or a second
+prompt; the caller assigns bindings deterministically after validating your
+JSON.
 
 RELATIONS:
 Record visible relations such as holding, wearing, riding, carrying, inside,

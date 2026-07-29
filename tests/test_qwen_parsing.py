@@ -64,8 +64,17 @@ def test_qwen_cannot_supply_tokens_or_final_prompt() -> None:
 
 
 def test_qwen_prompt_and_content_use_complete_video(tmp_path: Path) -> None:
-    assert "complete video" in SYSTEM_PROMPT
-    assert "ten frames" not in SYSTEM_PROMPT
+    normalized_prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "complete video" in normalized_prompt
+    assert "ten frames" not in normalized_prompt
+    assert (
+        "background.phrase must be copied as one exact, contiguous substring"
+        in normalized_prompt
+    )
+    assert (
+        "It must not combine separated parts of the caption."
+        in normalized_prompt
+    )
     video_path = tmp_path / "clip.mp4"
 
     content = _video_content(video_path)
@@ -166,6 +175,38 @@ def test_repair_request_failure_preserves_first_raw_response() -> None:
     assert caught.value.attempt_count == 2
     assert caught.value.raw_responses == ["not json"]
     assert caught.value.issues[0].code == "qwen_request_failed"
+
+
+def test_final_structure_sanitizer_aligns_deferred_background_phrase() -> None:
+    caption = (
+        "The camera reveals a deep blue ocean shimmering under bright sunlight, "
+        "bordered by arid, rocky hills."
+    )
+    source_phrase = (
+        "a vast expanse of deep blue ocean bordered by barren, rocky hills"
+    )
+    semantic = QwenAnnotationResult.model_validate(
+        {
+            "caption": caption,
+            "entities": [],
+            "relations": [],
+            "background": {
+                "phrase": source_phrase,
+                "grounding_prompt": source_phrase,
+                "reference_worthy": False,
+            },
+        }
+    )
+
+    sanitized, warnings = _sanitize_final_structure(semantic)
+
+    assert sanitized.background is not None
+    assert sanitized.background.phrase == "deep blue ocean"
+    assert sanitized.background.reference_worthy is False
+    assert any(
+        warning.startswith("aligned_reference_phrase:background:")
+        for warning in warnings
+    )
 
 
 def test_final_structure_sanitizer_demotes_drops_and_caps() -> None:
