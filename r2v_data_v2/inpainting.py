@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -82,6 +83,7 @@ class InpaintingSemanticJudge(Protocol):
         *,
         original_path: Path,
         repaired_path: Path,
+        repair_mask_path: Path,
         reference_phrase: str,
         mode: str,
     ) -> InpaintingSemanticReview: ...
@@ -229,6 +231,7 @@ class QwenInpaintingConsistencyJudge:
         prompt: str,
         original_path: Path,
         repaired_path: Path,
+        repair_mask_path: Path,
     ) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
@@ -244,6 +247,10 @@ class QwenInpaintingConsistencyJudge:
                         {
                             "type": "image_url",
                             "image_url": {"url": image_data_uri(repaired_path)},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_uri(repair_mask_path)},
                         },
                     ],
                 }
@@ -280,6 +287,7 @@ class QwenInpaintingConsistencyJudge:
         *,
         original_path: Path,
         repaired_path: Path,
+        repair_mask_path: Path,
         reference_phrase: str,
         mode: str,
     ) -> InpaintingSemanticReview:
@@ -292,6 +300,7 @@ class QwenInpaintingConsistencyJudge:
                 prompt=request_text,
                 original_path=original_path,
                 repaired_path=repaired_path,
+                repair_mask_path=repair_mask_path,
             ),
             original_request=prompt,
             model=InpaintingSemanticReview,
@@ -354,7 +363,6 @@ class ProductionConsistencyValidator:
         reference: dict[str, object],
         mode: str,
     ) -> dict[str, object]:
-        del repair_mask
         reasons = self._ensure_models()
         dino_similarity: float | None = None
         raw_siglip: float | None = None
@@ -364,9 +372,22 @@ class ProductionConsistencyValidator:
             or reference.get("canonical_label")
             or "reference image"
         )
+        semantic_original = original
+        semantic_repaired = repaired
+        semantic_input = "full_frame"
+        if mode == "entity_local_repair":
+            semantic_original, semantic_repaired = _entity_neutral_images(
+                original=original,
+                repaired=repaired,
+                repair_mask=repair_mask,
+                reference=reference,
+            )
+            semantic_input = "masked_neutral_crop"
         if self.dino is not None:
             try:
-                embeddings = self.dino.encode([original, repaired])
+                embeddings = self.dino.encode(
+                    [semantic_original, semantic_repaired]
+                )
                 if len(embeddings) != 2:
                     raise RuntimeError("unexpected DINO embedding count")
                 dino_similarity = embedding_cosine_similarity(
@@ -382,7 +403,11 @@ class ProductionConsistencyValidator:
                 reasons.append("dinov3_validation_failed")
         if self.siglip is not None:
             try:
-                scores = self.siglip.score([original, repaired], phrase, [])
+                scores = self.siglip.score(
+                    [semantic_original, semantic_repaired],
+                    phrase,
+                    [],
+                )
                 if len(scores) != 2:
                     raise RuntimeError("unexpected SigLIP score count")
                 raw_siglip = float(scores[0].target_similarity)
@@ -407,12 +432,20 @@ class ProductionConsistencyValidator:
             ).parent
             original_path = temporary_root / ".inpainting_qwen_original.png"
             repaired_path = temporary_root / ".inpainting_qwen_repaired.png"
+            repair_mask_path = (
+                temporary_root / ".inpainting_qwen_repair_mask.png"
+            )
             try:
                 _save_lossless_atomic(original, original_path)
                 _save_lossless_atomic(repaired, repaired_path)
+                _save_lossless_atomic(
+                    repair_mask.convert("L"),
+                    repair_mask_path,
+                )
                 review = self.qwen.review(
                     original_path=original_path,
                     repaired_path=repaired_path,
+                    repair_mask_path=repair_mask_path,
                     reference_phrase=phrase,
                     mode=mode,
                 )
@@ -429,6 +462,7 @@ class ProductionConsistencyValidator:
             finally:
                 original_path.unlink(missing_ok=True)
                 repaired_path.unlink(missing_ok=True)
+                repair_mask_path.unlink(missing_ok=True)
 
         reasons = list(dict.fromkeys(reasons))
         return {
@@ -442,6 +476,7 @@ class ProductionConsistencyValidator:
                 else None
             ),
             "qwen_review": qwen_review,
+            "semantic_input": semantic_input,
             "rejection_reasons": reasons,
         }
 
@@ -498,6 +533,68 @@ def _save_jpeg_atomic(image: Image.Image, destination: Path) -> None:
         raise
 
 
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _config_fingerprint(config: PipelineConfig) -> str:
+    repair_judge = _qwen_services(config.qwen).repair_judge
+    payload = {
+        "inpainting": asdict(config.inpainting),
+        "ranking_evaluators": asdict(config.ranking.evaluators),
+        "dinov3_repo_dir": config.ranking.dinov3_repo_dir,
+        "dinov3_model_path": config.ranking.dinov3_model_path,
+        "dinov3_model_name": config.ranking.dinov3_model_name,
+        "siglip2_model_path": config.ranking.siglip2_model_path,
+        "repair_judge": (
+            asdict(repair_judge) if repair_judge is not None else None
+        ),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_signature(
+    *,
+    reference: dict[str, object],
+    source_image_path: Path,
+    source_mask_path: Path,
+    config_fingerprint: str,
+) -> dict[str, object]:
+    return {
+        "source_image_sha256": _sha256_path(source_image_path),
+        "mask_sha256": _sha256_path(source_mask_path),
+        "source_frame_index": reference.get("source_frame_index"),
+        "config_fingerprint": config_fingerprint,
+    }
+
+
+def _metadata_matches_source(
+    metadata: dict[str, object],
+    signature: dict[str, object],
+    reference: dict[str, object],
+) -> bool:
+    if any(metadata.get(key) != value for key, value in signature.items()):
+        return False
+    if metadata.get("accepted") is True:
+        canonical = reference.get("canonical_path")
+        return (
+            isinstance(canonical, str)
+            and bool(canonical)
+            and Path(canonical).is_file()
+        )
+    return True
+
+
 def _read_mask(path: Path, shape: tuple[int, int]) -> np.ndarray:
     mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
@@ -505,6 +602,34 @@ def _read_mask(path: Path, shape: tuple[int, int]) -> np.ndarray:
     if mask.shape != shape:
         raise ValueError("inpainting mask dimensions must match the raw reference")
     return mask >= 128
+
+
+def _entity_neutral_images(
+    *,
+    original: Image.Image,
+    repaired: Image.Image,
+    repair_mask: Image.Image,
+    reference: dict[str, object],
+) -> tuple[Image.Image, Image.Image]:
+    original_array = np.asarray(original.convert("RGB"))
+    repaired_array = np.asarray(repaired.convert("RGB"))
+    if original_array.shape != repaired_array.shape:
+        raise ValueError("semantic validation images must have matching dimensions")
+    mask_value = reference.get("mask_raw_path") or reference.get("mask_path")
+    if not isinstance(mask_value, str) or not mask_value:
+        raise ValueError("entity semantic validation requires an entity mask")
+    subject_mask = _read_mask(Path(mask_value), original_array.shape[:2])
+    repair = np.asarray(repair_mask.convert("L")) >= 128
+    if repair.shape != subject_mask.shape:
+        raise ValueError("repair mask dimensions must match the entity mask")
+    repaired_subject_mask = subject_mask | repair
+    neutral_original = np.full_like(original_array, 204)
+    neutral_repaired = np.full_like(repaired_array, 204)
+    neutral_original[subject_mask] = original_array[subject_mask]
+    neutral_repaired[repaired_subject_mask] = repaired_array[
+        repaired_subject_mask
+    ]
+    return Image.fromarray(neutral_original), Image.fromarray(neutral_repaired)
 
 
 def _dilate(mask: np.ndarray, pixels: int) -> np.ndarray:
@@ -687,6 +812,130 @@ def _canonical_copy_path(artifact: Path, raw_path: Path) -> Path:
     return artifact.parent / f"canonical{image_extension(raw_path)}"
 
 
+def _ensure_entity_raw_artifacts(
+    *,
+    reference: dict[str, object],
+    artifact: Path,
+) -> None:
+    if reference.get("reference_type", "entity") != "entity":
+        return
+    snapshots = (
+        ("mask.png", "mask_raw.png", "mask_path", "mask_raw_path", True),
+        (
+            "foreground_rgba.png",
+            "foreground_rgba_raw.png",
+            "foreground_rgba_path",
+            "foreground_rgba_raw_path",
+            True,
+        ),
+        (
+            "neutral_background.jpg",
+            "neutral_background_raw.jpg",
+            "neutral_background_path",
+            "neutral_background_raw_path",
+            True,
+        ),
+        (
+            "dinov3_embedding.npy",
+            "dinov3_embedding_raw.npy",
+            "dinov3_embedding_path",
+            "dinov3_embedding_raw_path",
+            False,
+        ),
+    )
+    for (
+        source_name,
+        raw_name,
+        source_key,
+        raw_key,
+        required,
+    ) in snapshots:
+        source_value = reference.get(source_key)
+        source = (
+            Path(source_value)
+            if isinstance(source_value, str) and source_value
+            else artifact.parent / source_name
+        )
+        raw = artifact.parent / raw_name
+        if not raw.is_file():
+            if (
+                not source.is_file()
+                and source_name
+                in {"foreground_rgba.png", "neutral_background.jpg"}
+            ):
+                raw_canonical_value = reference.get("raw_canonical_path")
+                mask_raw = artifact.parent / "mask_raw.png"
+                if (
+                    isinstance(raw_canonical_value, str)
+                    and raw_canonical_value
+                    and Path(raw_canonical_value).is_file()
+                    and mask_raw.is_file()
+                ):
+                    image = np.asarray(
+                        Image.open(raw_canonical_value).convert("RGB")
+                    )
+                    subject_mask = _read_mask(mask_raw, image.shape[:2])
+                    if source_name == "foreground_rgba.png":
+                        rgba = np.dstack(
+                            (image, subject_mask.astype(np.uint8) * 255)
+                        )
+                        _save_lossless_atomic(Image.fromarray(rgba), source)
+                    else:
+                        neutral = np.full_like(image, 204)
+                        neutral[subject_mask] = image[subject_mask]
+                        _save_jpeg_atomic(Image.fromarray(neutral), source)
+            if source.is_file():
+                _copy_atomic(source, raw)
+            elif required:
+                raise FileNotFoundError(
+                    f"entity source artifact is missing: {source}"
+                )
+        reference[raw_key] = str(raw) if raw.is_file() else None
+
+
+def _restore_entity_raw_artifacts(
+    *,
+    reference: dict[str, object],
+    artifact: Path,
+) -> None:
+    if reference.get("reference_type", "entity") != "entity":
+        return
+    snapshots = (
+        ("mask_raw.png", "mask.png", "mask_path", True),
+        (
+            "foreground_rgba_raw.png",
+            "foreground_rgba.png",
+            "foreground_rgba_path",
+            True,
+        ),
+        (
+            "neutral_background_raw.jpg",
+            "neutral_background.jpg",
+            "neutral_background_path",
+            True,
+        ),
+        (
+            "dinov3_embedding_raw.npy",
+            "dinov3_embedding.npy",
+            "dinov3_embedding_path",
+            False,
+        ),
+    )
+    for raw_name, destination_name, metadata_key, required in snapshots:
+        raw = artifact.parent / raw_name
+        destination = artifact.parent / destination_name
+        if raw.is_file():
+            _copy_atomic(raw, destination)
+            reference[metadata_key] = str(destination)
+        else:
+            destination.unlink(missing_ok=True)
+            reference[metadata_key] = None
+            if required:
+                raise FileNotFoundError(
+                    f"immutable entity artifact is missing: {raw}"
+                )
+
+
 def _restore_from_raw(
     *,
     reference: dict[str, object],
@@ -694,6 +943,10 @@ def _restore_from_raw(
     raw_path: Path,
     write_artifact: bool = True,
 ) -> Path:
+    _restore_entity_raw_artifacts(
+        reference=reference,
+        artifact=artifact,
+    )
     canonical_path = _canonical_copy_path(artifact, raw_path)
     for stale in (artifact.parent / "canonical.jpg", artifact.parent / "canonical.png"):
         if stale != canonical_path:
@@ -767,6 +1020,7 @@ def _metadata_base(
     config: InpaintingConfig,
     mode: str | None,
     repair_area_ratio: float,
+    source_signature: dict[str, object],
 ) -> dict[str, object]:
     return {
         "backend": config.backend,
@@ -780,6 +1034,7 @@ def _metadata_base(
         "dino_similarity": None,
         "accepted": False,
         "fallback_to_raw": False,
+        **source_signature,
     }
 
 
@@ -870,26 +1125,13 @@ def run_inpainting(
         )
         active_validator = owned_validator
 
+    config_fingerprint = _config_fingerprint(config)
     processed = skipped = repaired_count = fallback_count = rejected = failed = 0
     for artifact in _reference_artifacts(output_root):
         reference = json.loads(artifact.read_text(encoding="utf-8"))
         if not isinstance(reference, dict):
             raise TypeError(f"reference metadata must be an object: {artifact}")
         reference.setdefault("status", "ready")
-        inpainting_metadata_path = artifact.parent / "inpainting_metadata.json"
-        if inpainting_metadata_path.is_file() and not overwrite:
-            existing = json.loads(
-                inpainting_metadata_path.read_text(encoding="utf-8")
-            )
-            processed += 1
-            if existing.get("accepted") is True:
-                repaired_count += 1
-            elif existing.get("fallback_to_raw") is True:
-                fallback_count += 1
-            continue
-        if reference.get("status") == "rejected" and not overwrite:
-            skipped += 1
-            continue
         raw_path = Path(
             str(reference.get("raw_canonical_path") or reference["canonical_path"])
         )
@@ -902,6 +1144,58 @@ def run_inpainting(
             _copy_atomic(raw_path, new_raw_path)
             raw_path = new_raw_path
             reference["raw_canonical_path"] = str(raw_path)
+        _ensure_entity_raw_artifacts(
+            reference=reference,
+            artifact=artifact,
+        )
+        source_mask_value = (
+            reference.get("mask_raw_path")
+            if reference.get("reference_type", "entity") == "entity"
+            else reference.get("mask_path")
+        )
+        if not isinstance(source_mask_value, str) or not source_mask_value:
+            raise ValueError(f"reference mask path is missing: {artifact}")
+        source_signature = _source_signature(
+            reference=reference,
+            source_image_path=raw_path,
+            source_mask_path=Path(source_mask_value),
+            config_fingerprint=config_fingerprint,
+        )
+        write_json_atomic(artifact, reference)
+        inpainting_metadata_path = artifact.parent / "inpainting_metadata.json"
+        stale_metadata = False
+        if inpainting_metadata_path.is_file() and not overwrite:
+            existing = json.loads(
+                inpainting_metadata_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(existing, dict):
+                raise TypeError(
+                    f"inpainting metadata must be an object: "
+                    f"{inpainting_metadata_path}"
+                )
+            if _metadata_matches_source(existing, source_signature, reference):
+                processed += 1
+                if existing.get("accepted") is True:
+                    repaired_count += 1
+                elif existing.get("fallback_to_raw") is True:
+                    fallback_count += 1
+                else:
+                    rejected += 1
+                continue
+            stale_metadata = True
+            _clear_stale_inpainting_artifacts(artifact)
+            _restore_from_raw(
+                reference=reference,
+                artifact=artifact,
+                raw_path=raw_path,
+            )
+        if (
+            reference.get("status") == "rejected"
+            and not overwrite
+            and not stale_metadata
+        ):
+            skipped += 1
+            continue
         if overwrite:
             _clear_stale_inpainting_artifacts(artifact)
             _restore_from_raw(
@@ -927,6 +1221,7 @@ def run_inpainting(
                             if repair_mask is not None
                             else 0.0
                         ),
+                        source_signature=source_signature,
                     )
                     metadata["rejection_reasons"] = mask_reasons
                     did_fallback = _publish_rejection(
@@ -964,6 +1259,7 @@ def run_inpainting(
                     config=config.inpainting,
                     mode=mode,
                     repair_area_ratio=repair_area_ratio,
+                    source_signature=source_signature,
                 )
                 metadata["rejection_reasons"] = mask_reasons
                 did_fallback = _publish_rejection(
@@ -1057,6 +1353,7 @@ def run_inpainting(
                 config=config.inpainting,
                 mode=mode,
                 repair_area_ratio=repair_area_ratio,
+                source_signature=source_signature,
             )
             metadata.update(
                 {
@@ -1089,7 +1386,12 @@ def run_inpainting(
                         reference=reference,
                         repaired=final,
                         original_mask=_read_mask(
-                            Path(str(reference["mask_path"])),
+                            Path(
+                                str(
+                                    reference.get("mask_raw_path")
+                                    or reference["mask_path"]
+                                )
+                            ),
                             final.shape[:2],
                         ),
                         repair_mask=repair_mask,
@@ -1150,6 +1452,7 @@ def run_inpainting(
                 config=config.inpainting,
                 mode=None,
                 repair_area_ratio=0.0,
+                source_signature=source_signature,
             )
             metadata.update(
                 {

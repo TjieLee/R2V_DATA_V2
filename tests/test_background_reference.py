@@ -186,6 +186,95 @@ def test_non_reference_worthy_separable_entity_is_in_foreground_mask(
     assert metadata["needs_inpainting"] is True
 
 
+def test_composite_candidate_requires_foreground_mask(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    manifest = config.output_root / "manifests" / "annotations.jsonl"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["entities"][0]["reference_worthy"] = False
+    payload["entities"][0]["ref_token"] = None
+    payload["entities"][0]["separability"] = "composite_candidate"
+    manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    stats = build_background_references(config)
+    metadata = _metadata(config.output_root)
+
+    assert stats.processed == 1
+    assert metadata["foreground_area_ratio"] == 0.10
+    assert metadata["needs_inpainting"] is True
+
+
+def test_background_uses_tracked_mask_rejected_by_entity_size_gate(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=0.10)
+    candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
+    accepted = json.loads(
+        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    )
+    tracked = dict(accepted)
+    small_mask = np.zeros((100, 100), dtype=bool)
+    small_mask[:2, :] = True
+    tracked["frame_00"] = encode_mask(small_mask)
+    accepted.pop("frame_00")
+    (candidate_dir / "top_masks.rle.json").write_text(
+        json.dumps(accepted),
+        encoding="utf-8",
+    )
+    (candidate_dir / "tracked_masks.rle.json").write_text(
+        json.dumps(tracked),
+        encoding="utf-8",
+    )
+    (candidate_dir / "mask_coverage.json").write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "entity_id": "e1",
+                "slots": {
+                    f"frame_{slot:02d}": {
+                        "tracked": True,
+                        "mask_available": True,
+                        "candidate_accepted": slot != 0,
+                        "filtered_reasons": (
+                            ["effective_short_side"] if slot == 0 else []
+                        ),
+                    }
+                    for slot in range(10)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stats = build_background_references(config)
+    ranking = json.loads(
+        (
+            config.output_root
+            / "background_candidates"
+            / "clip-1"
+            / "ranking_metadata.json"
+        ).read_text(encoding="utf-8")
+    )
+    frame_zero = next(
+        candidate
+        for candidate in ranking["candidates"]
+        if candidate["frame_slot"] == 0
+    )
+
+    assert stats.processed == 1
+    assert frame_zero["foreground_area_ratio"] == 0.02
+    assert ranking["incomplete_mask_slots"] == []
+    assert ranking["mask_coverage"]["frame_00"][0][
+        "candidate_accepted"
+    ] is False
+    assert ranking["mask_coverage"]["frame_00"][0]["filtered_reasons"] == [
+        "effective_short_side"
+    ]
+
+
 def test_clean_raw_candidate_preferred_over_higher_scoring_inpaint_candidate(
     tmp_path: Path,
 ) -> None:
@@ -440,3 +529,25 @@ def test_background_ranking_uses_dino_and_siglip_semantics(
     assert metadata["frame_slot"] == 9
     assert selected["dino_representativeness"] == 1.0
     assert selected["siglip_alignment"] == 0.95
+
+
+def test_background_overwrite_invalidates_stale_inpainting_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_fixture(config.output_root, foreground_ratio=None)
+    first = build_background_references(config)
+    reference_dir = config.output_root / "references" / "clip-1" / "bg1"
+    stale_names = (
+        "repair_mask.png",
+        "canonical_repaired.png",
+        "inpainting_metadata.json",
+    )
+    for name in stale_names:
+        (reference_dir / name).write_bytes(b"stale")
+
+    second = build_background_references(config, overwrite=True)
+
+    assert first.processed == 1
+    assert second.processed == 1
+    assert all(not (reference_dir / name).exists() for name in stale_names)

@@ -242,6 +242,82 @@ def test_all_ten_valid_candidate_masks_are_saved_as_rle(tmp_path: Path) -> None:
     assert not list(candidate_dir.glob("mask*.png"))
 
 
+def test_tracked_masks_preserve_slots_filtered_from_entity_candidates(
+    tmp_path: Path,
+) -> None:
+    frame_paths: list[Path] = []
+    tracked_masks: dict[int, np.ndarray] = {}
+    for slot in range(2):
+        path = tmp_path / f"frame_{slot:02d}.png"
+        Image.new("RGB", (48, 32), color=(20, 40, 80)).save(path)
+        frame_paths.append(path)
+        mask = np.zeros((32, 48), dtype=bool)
+        if slot == 0:
+            mask[2:4, 4:44] = True
+        else:
+            mask[6:26, 10:38] = True
+        tracked_masks[slot] = mask
+    accepted_mask = tracked_masks[1]
+    candidates = [
+        {
+            "frame_slot": 1,
+            "source_frame_index": 10,
+            "bbox_xyxy": [10, 6, 38, 26],
+            "mask_area_ratio": float(accepted_mask.mean()),
+            "sam_confidence": 0.99,
+            "touches_border": False,
+            "visible": True,
+            "effective_short_side": 20,
+            "mask_rle_key": None,
+        }
+    ]
+
+    _write_candidates(
+        output_root=tmp_path,
+        clip_uid="clip-1",
+        entity_id="e1",
+        candidates=candidates,
+        masks={1: accepted_mask},
+        frame_paths=frame_paths,
+        save_top_k=10,
+        tracked_masks=tracked_masks,
+        mask_coverage={
+            0: {
+                "tracked": True,
+                "mask_available": True,
+                "candidate_accepted": False,
+                "filtered_reasons": ["effective_short_side"],
+            },
+            1: {
+                "tracked": True,
+                "mask_available": True,
+                "candidate_accepted": True,
+                "filtered_reasons": [],
+            },
+        },
+    )
+
+    candidate_dir = tmp_path / "candidates" / "clip-1" / "e1"
+    candidate_masks = json.loads(
+        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
+    )
+    all_tracked_masks = json.loads(
+        (candidate_dir / "tracked_masks.rle.json").read_text(encoding="utf-8")
+    )
+    coverage = json.loads(
+        (candidate_dir / "mask_coverage.json").read_text(encoding="utf-8")
+    )
+    assert set(candidate_masks) == {"frame_01"}
+    assert set(all_tracked_masks) == {"frame_00", "frame_01"}
+    assert np.array_equal(
+        decode_mask(all_tracked_masks["frame_00"]),
+        tracked_masks[0],
+    )
+    assert coverage["slots"]["frame_00"]["filtered_reasons"] == [
+        "effective_short_side"
+    ]
+
+
 def test_low_margin_multiple_instances_do_not_make_a_valid_anchor(
     tmp_path: Path,
 ) -> None:

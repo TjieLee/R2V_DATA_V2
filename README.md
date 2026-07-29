@@ -248,9 +248,18 @@ Every selected reference keeps:
 - `foreground_rgba.png`: original foreground pixels with alpha;
 - `neutral_background.jpg`: original foreground on light gray.
 
-All valid candidate masks from the ten sampled slots are stored as packed,
-zlib-compressed JSON and participate in ranking. The final selected mask is the
+SAM tracking masks from all sampled slots are stored separately from masks that
+pass entity-reference size and area gates. Background removal consumes the
+tracking masks, while entity ranking consumes only the candidate masks.
+Per-slot coverage and filtering reasons are recorded in `mask_coverage.json`.
+Both mask sets use packed, zlib-compressed JSON. The final selected mask is the
 only mandatory PNG mask.
+
+Before entity inpainting, `mask.png`, `foreground_rgba.png`,
+`neutral_background.jpg`, and `dinov3_embedding.npy` are snapshotted to
+corresponding `_raw` artifacts. Overwrite and fallback restore these immutable
+copies. Inpainting metadata binds each result to the source image, source mask,
+source frame index, and effective inpainting configuration.
 Stage 04 also stores per-candidate ranking metadata and float16 DINOv3
 embeddings. The selected reference keeps `dinov3_embedding.npy` for downstream
 reuse. DINOv3 and SigLIP 2 can each be disabled; their score weight is then

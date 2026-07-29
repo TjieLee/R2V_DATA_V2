@@ -1046,6 +1046,53 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
     )
 
 
+def test_ranking_overwrite_invalidates_stale_inpainting_artifacts(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    _write_ranking_fixture(output_root)
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=output_root,
+        qwen=QwenConfig(model="served-model-name"),
+        ranking=RankingConfig(
+            evaluators=RankingEvaluatorsConfig(
+                dinov3=DinoEvaluatorConfig(enabled=True),
+                siglip2=SiglipEvaluatorConfig(enabled=True),
+            ),
+        ),
+    )
+    rank_manifest_references(
+        config,
+        judge=_FakeCandidateJudge(),
+        dino_embedder=_FakeDinoEmbedder(),
+        siglip_aligner=_FakeSiglipAligner(),
+    )
+    reference_dir = output_root / "references" / "clip_1" / "e1"
+    stale_names = (
+        "repair_mask.png",
+        "canonical_repaired.png",
+        "inpainting_metadata.json",
+        "mask_raw.png",
+        "foreground_rgba_raw.png",
+        "neutral_background_raw.jpg",
+        "dinov3_embedding_raw.npy",
+    )
+    for name in stale_names:
+        (reference_dir / name).write_bytes(b"stale")
+
+    stats = rank_manifest_references(
+        config,
+        overwrite=True,
+        judge=_FakeCandidateJudge(),
+        dino_embedder=_FakeDinoEmbedder(),
+        siglip_aligner=_FakeSiglipAligner(),
+    )
+
+    assert stats.processed == 1
+    assert all(not (reference_dir / name).exists() for name in stale_names)
+
+
 def test_disabled_qwen_visual_skips_contact_sheet_and_judge(tmp_path: Path) -> None:
     output_root = tmp_path / "output"
     _write_ranking_fixture(output_root)

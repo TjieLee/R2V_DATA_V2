@@ -24,6 +24,7 @@ from r2v_data_v2.inpainting import (
     ProductionConsistencyValidator,
     run_inpainting,
 )
+from r2v_data_v2.schemas import InpaintingSemanticReview
 
 
 class _WholeImageBackend:
@@ -78,6 +79,28 @@ def _write_reference(
         )
     )
     Image.fromarray(mask.astype(np.uint8) * 255).save(mask_path)
+    foreground_rgba_path: Path | None = None
+    neutral_background_path: Path | None = None
+    dinov3_embedding_path: Path | None = None
+    if reference_type == "entity":
+        raw = np.asarray(Image.open(raw_path).convert("RGB"))
+        foreground_rgba_path = destination / "foreground_rgba.png"
+        Image.fromarray(
+            np.dstack((raw, mask.astype(np.uint8) * 255))
+        ).save(foreground_rgba_path)
+        neutral = np.full_like(raw, 204)
+        neutral[mask] = raw[mask]
+        neutral_background_path = destination / "neutral_background.jpg"
+        Image.fromarray(neutral).save(
+            neutral_background_path,
+            format="JPEG",
+            quality=95,
+        )
+        dinov3_embedding_path = destination / "dinov3_embedding.npy"
+        np.save(
+            dinov3_embedding_path,
+            np.asarray([1.0, 0.0], dtype=np.float16),
+        )
     metadata = {
         "clip_uid": "clip-1",
         "reference_id": reference_id,
@@ -98,6 +121,22 @@ def _write_reference(
         "raw_canonical_path": str(raw_path),
         "canonical_path": str(canonical_path),
         "mask_path": str(mask_path),
+        "foreground_rgba_path": (
+            str(foreground_rgba_path)
+            if foreground_rgba_path is not None
+            else None
+        ),
+        "neutral_background_path": (
+            str(neutral_background_path)
+            if neutral_background_path is not None
+            else None
+        ),
+        "dinov3_embedding_path": (
+            str(dinov3_embedding_path)
+            if dinov3_embedding_path is not None
+            else None
+        ),
+        "source_frame_index": 17,
         "needs_inpainting": needs_inpainting,
         "inpainted": False,
         "status": (
@@ -231,6 +270,10 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
         (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
     )
     assert inpainting_metadata["unmasked_l1_diff"] == 0.0
+    assert len(inpainting_metadata["source_image_sha256"]) == 64
+    assert len(inpainting_metadata["mask_sha256"]) == 64
+    assert inpainting_metadata["source_frame_index"] == 17
+    assert len(inpainting_metadata["config_fingerprint"]) == 64
 
 
 def test_repair_area_over_threshold_does_not_call_backend(
@@ -396,6 +439,82 @@ def test_entity_repair_regenerates_mask_derived_artifacts_and_dino(
     assert rgba[expected_mask, :3].mean() > 0
 
 
+def test_entity_inpaint_overwrite_restores_all_immutable_raw_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, entity_enabled=True)
+    subject_mask = np.zeros((32, 32), dtype=bool)
+    subject_mask[5:27, 5:27] = True
+    subject_mask[14:17, 14:17] = False
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="e1",
+        reference_type="entity",
+        mask=subject_mask,
+        needs_inpainting=False,
+    )
+
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            assert len(images) == 1
+            return np.asarray([[0.0, 3.0]], dtype=np.float32)
+
+    dino = _Dino()
+    first = run_inpainting(
+        config,
+        backend=_WholeImageBackend(),
+        validator=_accept_consistency,
+        dino_embedder=dino,  # type: ignore[arg-type]
+    )
+    raw_names = (
+        "mask_raw.png",
+        "foreground_rgba_raw.png",
+        "neutral_background_raw.jpg",
+        "dinov3_embedding_raw.npy",
+    )
+    raw_bytes = {
+        name: (artifact.parent / name).read_bytes() for name in raw_names
+    }
+    Image.new("L", (32, 32), 255).save(artifact.parent / "mask.png")
+    Image.new("RGBA", (32, 32), (0, 0, 0, 0)).save(
+        artifact.parent / "foreground_rgba.png"
+    )
+    Image.new("RGB", (32, 32), (0, 0, 0)).save(
+        artifact.parent / "neutral_background.jpg"
+    )
+    np.save(
+        artifact.parent / "dinov3_embedding.npy",
+        np.asarray([0.0, 1.0], dtype=np.float16),
+    )
+
+    second = run_inpainting(
+        config,
+        overwrite=True,
+        backend=_WholeImageBackend(),
+        validator=_accept_consistency,
+        dino_embedder=dino,  # type: ignore[arg-type]
+    )
+
+    repair_mask = (
+        np.asarray(Image.open(artifact.parent / "repair_mask.png").convert("L"))
+        >= 128
+    )
+    saved_mask = (
+        np.asarray(Image.open(artifact.parent / "mask.png").convert("L")) >= 128
+    )
+    assert first.repaired == 1
+    assert second.repaired == 1
+    assert np.array_equal(saved_mask, subject_mask | repair_mask)
+    assert {
+        name: (artifact.parent / name).read_bytes() for name in raw_names
+    } == raw_bytes
+    restored_embedding = np.load(
+        artifact.parent / "dinov3_embedding.npy",
+        allow_pickle=False,
+    )
+    assert np.allclose(restored_embedding.astype(np.float32), [0.0, 1.0])
+
+
 def test_flux_pads_non_square_inputs_and_unpads_output() -> None:
     config = InpaintingConfig(enabled=True)
     backend = Flux1FillBackend(config)
@@ -506,6 +625,106 @@ def test_production_validator_uses_dino_and_siglip(tmp_path: Path) -> None:
     assert result["accepted"] is True
     assert result["dino_similarity"] > 0.99
     assert result["repaired_siglip_similarity"] == 0.79
+
+
+def test_entity_semantic_validation_uses_neutral_crops_and_qwen_mask(
+    tmp_path: Path,
+) -> None:
+    subject_mask = np.zeros((13, 17), dtype=bool)
+    subject_mask[3:11, 4:14] = True
+    subject_mask[6:8, 8:10] = False
+    repair_mask = np.zeros_like(subject_mask)
+    repair_mask[6:8, 8:10] = True
+    mask_path = tmp_path / "mask_raw.png"
+    Image.fromarray(subject_mask.astype(np.uint8) * 255).save(mask_path)
+    original = np.full((13, 17, 3), 20, dtype=np.uint8)
+    original[subject_mask] = (90, 100, 110)
+    repaired = original.copy()
+    repaired[repair_mask] = (220, 30, 40)
+    semantic_images: list[np.ndarray] = []
+
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            semantic_images.extend(np.asarray(image) for image in images)
+            return np.asarray([[1.0, 0.0], [0.999, 0.001]])
+
+    class _Siglip:
+        def score(
+            self,
+            images: list[Image.Image],
+            target_text: str,
+            distractor_texts: list[str],
+        ) -> list[object]:
+            assert all(
+                np.array_equal(np.asarray(image), expected)
+                for image, expected in zip(images, semantic_images)
+            )
+            assert target_text == "a red bicycle"
+            assert distractor_texts == []
+            return [
+                SimpleNamespace(target_similarity=0.8),
+                SimpleNamespace(target_similarity=0.8),
+            ]
+
+    class _Qwen:
+        def __init__(self) -> None:
+            self.mask: np.ndarray | None = None
+
+        def review(
+            self,
+            *,
+            original_path: Path,
+            repaired_path: Path,
+            repair_mask_path: Path,
+            reference_phrase: str,
+            mode: str,
+        ) -> InpaintingSemanticReview:
+            assert original_path.is_file()
+            assert repaired_path.is_file()
+            assert reference_phrase == "a red bicycle"
+            assert mode == "entity_local_repair"
+            self.mask = np.asarray(
+                Image.open(repair_mask_path).convert("L")
+            )
+            return InpaintingSemanticReview(
+                same_semantic_content=True,
+                identity_preserved=True,
+                reference_phrase_supported=True,
+                new_salient_objects=False,
+                reason="consistent",
+            )
+
+    qwen = _Qwen()
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+        siglip_aligner=_Siglip(),  # type: ignore[arg-type]
+        qwen_judge=qwen,  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.fromarray(original),
+        repaired=Image.fromarray(repaired),
+        repair_mask=Image.fromarray(repair_mask.astype(np.uint8) * 255),
+        reference={
+            "phrase": "a red bicycle",
+            "mask_raw_path": str(mask_path),
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="entity_local_repair",
+    )
+
+    expected_original = np.full_like(original, 204)
+    expected_original[subject_mask] = original[subject_mask]
+    expected_repaired = np.full_like(repaired, 204)
+    expected_repaired[subject_mask | repair_mask] = repaired[
+        subject_mask | repair_mask
+    ]
+    assert result["accepted"] is True
+    assert result["semantic_input"] == "masked_neutral_crop"
+    assert np.array_equal(semantic_images[0], expected_original)
+    assert np.array_equal(semantic_images[1], expected_repaired)
+    assert qwen.mask is not None
+    assert np.array_equal(qwen.mask >= 128, repair_mask)
 
 
 def test_noop_backend_never_marks_reference_inpainted(tmp_path: Path) -> None:

@@ -300,6 +300,42 @@ def _candidate_from_observation(
     )
 
 
+def _tracked_mask_from_observation(
+    *,
+    observation: SamObservation,
+    frame: np.ndarray,
+    config: PipelineConfig,
+) -> tuple[np.ndarray | None, tuple[str, ...]]:
+    mask = np.asarray(observation.mask, dtype=bool)
+    if mask.shape != frame.shape[:2]:
+        return None, ("mask_shape_mismatch",)
+    if not mask.any():
+        return None, ("empty_mask",)
+    if observation.confidence < config.sam3.minimum_confidence:
+        return None, ("sam_confidence",)
+    return fill_small_enclosed_holes(mask, frame=frame), ()
+
+
+def _candidate_filter_reasons(
+    mask: np.ndarray,
+    *,
+    config: PipelineConfig,
+) -> tuple[str, ...]:
+    bbox = bbox_from_mask(mask)
+    x1, y1, x2, y2 = bbox
+    reasons: list[str] = []
+    if min(x2 - x1, y2 - y1) < config.ranking.minimum_effective_short_side:
+        reasons.append("effective_short_side")
+    area_ratio = float(mask.mean())
+    if not (
+        config.ranking.minimum_mask_area_ratio
+        <= area_ratio
+        <= config.ranking.maximum_mask_area_ratio
+    ):
+        reasons.append("mask_area_ratio")
+    return tuple(reasons)
+
+
 def _write_candidates(
     *,
     output_root: Path,
@@ -309,6 +345,8 @@ def _write_candidates(
     masks: dict[int, np.ndarray],
     frame_paths: list[Path],
     save_top_k: int,
+    tracked_masks: dict[int, np.ndarray] | None = None,
+    mask_coverage: dict[int, dict[str, object]] | None = None,
 ) -> None:
     destination = output_root / "candidates" / clip_uid / entity_id
     destination.mkdir(parents=True, exist_ok=True)
@@ -339,12 +377,48 @@ def _write_candidates(
         json.dumps(encoded),
         encoding="utf-8",
     )
-    save_mask_contact_sheet(
-        frame_paths=frame_paths,
-        candidates=candidates,
-        masks=masks,
-        destination=destination / "contact_sheet.jpg",
+    raw_masks = tracked_masks if tracked_masks is not None else masks
+    (destination / "tracked_masks.rle.json").write_text(
+        json.dumps(
+            {
+                f"frame_{slot:02d}": encode_mask(mask)
+                for slot, mask in sorted(raw_masks.items())
+            }
+        ),
+        encoding="utf-8",
     )
+    coverage = mask_coverage or {
+        slot: {
+            "tracked": slot in raw_masks,
+            "mask_available": slot in raw_masks,
+            "candidate_accepted": slot in masks,
+            "filtered_reasons": [],
+        }
+        for slot in range(len(frame_paths))
+    }
+    (destination / "mask_coverage.json").write_text(
+        json.dumps(
+            {
+                "clip_uid": clip_uid,
+                "entity_id": entity_id,
+                "slots": {
+                    f"frame_{slot:02d}": value
+                    for slot, value in sorted(coverage.items())
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if candidates:
+        save_mask_contact_sheet(
+            frame_paths=frame_paths,
+            candidates=candidates,
+            masks=masks,
+            destination=destination / "contact_sheet.jpg",
+        )
 
 
 def _append_failure(path: Path, value: dict[str, object]) -> None:
@@ -396,10 +470,37 @@ def extract_manifest_candidates(
                     )
                     candidates: list[dict[str, object]] = []
                     masks: dict[int, np.ndarray] = {}
+                    tracked_masks: dict[int, np.ndarray] = {}
+                    mask_coverage: dict[int, dict[str, object]] = {
+                        slot: {
+                            "tracked": False,
+                            "mask_available": False,
+                            "candidate_accepted": False,
+                            "filtered_reasons": ["no_tracked_mask"],
+                        }
+                        for slot in range(config.frames.count)
+                    }
                     for observation in observations:
                         frame = cv2.imread(str(frame_paths[observation.frame_slot]))
                         if frame is None:
                             raise RuntimeError("sampled frame is unreadable")
+                        tracked_mask, tracking_reasons = (
+                            _tracked_mask_from_observation(
+                                observation=observation,
+                                frame=frame,
+                                config=config,
+                            )
+                        )
+                        coverage = {
+                            "tracked": True,
+                            "mask_available": tracked_mask is not None,
+                            "candidate_accepted": False,
+                            "filtered_reasons": list(tracking_reasons),
+                        }
+                        mask_coverage[observation.frame_slot] = coverage
+                        if tracked_mask is None:
+                            continue
+                        tracked_masks[observation.frame_slot] = tracked_mask
                         item = _candidate_from_observation(
                             observation=observation,
                             frame=frame,
@@ -410,10 +511,27 @@ def extract_manifest_candidates(
                             ),
                             config=config,
                         )
+                        filter_reasons = _candidate_filter_reasons(
+                            tracked_mask,
+                            config=config,
+                        )
+                        coverage["filtered_reasons"] = list(filter_reasons)
                         if item is not None:
                             candidate, mask = item
+                            coverage["candidate_accepted"] = True
                             candidates.append(candidate)
                             masks[observation.frame_slot] = mask
+                    _write_candidates(
+                        output_root=output_root,
+                        clip_uid=clip,
+                        entity_id=entity.entity_id,
+                        candidates=candidates,
+                        masks=masks,
+                        frame_paths=frame_paths,
+                        save_top_k=config.ranking.save_top_k_mask_rle,
+                        tracked_masks=tracked_masks,
+                        mask_coverage=mask_coverage,
+                    )
                     if len(candidates) < config.sam3.minimum_visible_frames:
                         no_valid += 1
                         _append_failure(
@@ -425,15 +543,6 @@ def extract_manifest_candidates(
                             },
                         )
                         continue
-                    _write_candidates(
-                        output_root=output_root,
-                        clip_uid=clip,
-                        entity_id=entity.entity_id,
-                        candidates=candidates,
-                        masks=masks,
-                        frame_paths=frame_paths,
-                        save_top_k=config.ranking.save_top_k_mask_rle,
-                    )
                     processed += 1
                 except Exception as exc:  # noqa: BLE001 - continue with other entities
                     _append_failure(

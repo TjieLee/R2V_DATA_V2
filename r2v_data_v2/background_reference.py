@@ -22,6 +22,7 @@ from r2v_data_v2.config import (
 )
 from r2v_data_v2.entity_policy import requires_foreground_mask
 from r2v_data_v2.image_utils import image_data_uri
+from r2v_data_v2.inpainting_lifecycle import invalidate_inpainting_artifacts
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import decode_mask, save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
@@ -94,33 +95,112 @@ def _load_foreground_masks(
     output_root: Path,
     clip_uid: str,
     annotation: AnnotationResult,
-) -> tuple[dict[int, list[np.ndarray]], tuple[str, ...]]:
+    frame_count: int,
+) -> tuple[
+    dict[int, list[np.ndarray]],
+    tuple[str, ...],
+    dict[int, list[dict[str, object]]],
+    frozenset[int],
+]:
     masks_by_slot: dict[int, list[np.ndarray]] = {}
     incomplete_entities: list[str] = []
+    coverage_by_slot: dict[int, list[dict[str, object]]] = {
+        slot: [] for slot in range(frame_count)
+    }
+    incomplete_slots: set[int] = set()
     for entity in annotation.entities:
         if not requires_foreground_mask(entity):
             continue
-        mask_path = (
+        candidate_dir = (
             output_root
             / "candidates"
             / clip_uid
             / entity.entity_id
-            / "top_masks.rle.json"
         )
+        tracked_path = candidate_dir / "tracked_masks.rle.json"
+        legacy_path = candidate_dir / "top_masks.rle.json"
+        mask_path = tracked_path if tracked_path.is_file() else legacy_path
         if not mask_path.is_file():
             incomplete_entities.append(entity.entity_id)
+            incomplete_slots.update(range(frame_count))
+            for slot in range(frame_count):
+                coverage_by_slot[slot].append(
+                    {
+                        "entity_id": entity.entity_id,
+                        "tracked": False,
+                        "mask_available": False,
+                        "candidate_accepted": False,
+                        "filtered_reasons": [
+                            "missing_tracked_mask_artifact"
+                        ],
+                        "mask_source": "missing",
+                    }
+                )
             continue
         encoded = json.loads(mask_path.read_text(encoding="utf-8"))
         if not isinstance(encoded, dict):
             raise TypeError(f"foreground mask artifact must be an object: {mask_path}")
+        encoded_slots: set[int] = set()
         for key, value in encoded.items():
             if not key.startswith("frame_"):
                 continue
             slot = int(key.removeprefix("frame_"))
+            encoded_slots.add(slot)
             masks_by_slot.setdefault(slot, []).append(decode_mask(value))
-        if not encoded:
+        coverage_path = candidate_dir / "mask_coverage.json"
+        if coverage_path.is_file():
+            coverage_payload = json.loads(
+                coverage_path.read_text(encoding="utf-8")
+            )
+            slots = coverage_payload.get("slots", {})
+            if not isinstance(slots, dict):
+                raise TypeError(
+                    f"mask coverage slots must be an object: {coverage_path}"
+                )
+            for slot in range(frame_count):
+                value = slots.get(f"frame_{slot:02d}", {})
+                if not isinstance(value, dict):
+                    raise TypeError(
+                        f"mask coverage entry must be an object: {coverage_path}"
+                    )
+                record = {
+                    "entity_id": entity.entity_id,
+                    **value,
+                    "mask_source": "tracked",
+                }
+                coverage_by_slot[slot].append(record)
+                needs_mask = bool(value.get("tracked"))
+                has_mask = (
+                    bool(value.get("mask_available"))
+                    and slot in encoded_slots
+                )
+                if needs_mask and not has_mask:
+                    incomplete_entities.append(entity.entity_id)
+                    incomplete_slots.add(slot)
+        else:
+            for slot in range(frame_count):
+                has_mask = slot in encoded_slots
+                coverage_by_slot[slot].append(
+                    {
+                        "entity_id": entity.entity_id,
+                        "tracked": has_mask,
+                        "mask_available": has_mask,
+                        "candidate_accepted": has_mask,
+                        "filtered_reasons": (
+                            [] if has_mask else ["legacy_coverage_unknown"]
+                        ),
+                        "mask_source": "legacy_candidate",
+                    }
+                )
+        if not encoded and not coverage_path.is_file():
             incomplete_entities.append(entity.entity_id)
-    return masks_by_slot, tuple(dict.fromkeys(incomplete_entities))
+            incomplete_slots.update(range(frame_count))
+    return (
+        masks_by_slot,
+        tuple(dict.fromkeys(incomplete_entities)),
+        coverage_by_slot,
+        frozenset(incomplete_slots),
+    )
 
 
 def _union_mask(
@@ -387,6 +467,7 @@ def _save_reference(
     raw_path = destination / "canonical_raw.jpg"
     canonical_path = destination / "canonical.jpg"
     mask_path = destination / "foreground_mask.png"
+    invalidate_inpainting_artifacts(destination)
     _copy_atomic(candidate.frame_path, raw_path)
     _copy_atomic(raw_path, canonical_path)
     save_mask_png(mask_path, candidate.foreground_mask)
@@ -486,6 +567,7 @@ def build_background_references(
                 skipped += 1
                 continue
             if overwrite:
+                invalidate_inpainting_artifacts(reference_dir)
                 for filename in (
                     "canonical_raw.jpg",
                     "canonical.jpg",
@@ -499,10 +581,16 @@ def build_background_references(
                 (frame_dir / "frames.json").read_text(encoding="utf-8")
             )
             source_indices = frame_metadata["sampled_indices"]
-            masks_by_slot, incomplete_mask_entities = _load_foreground_masks(
+            (
+                masks_by_slot,
+                incomplete_mask_entities,
+                mask_coverage,
+                incomplete_mask_slots,
+            ) = _load_foreground_masks(
                 output_root=output_root,
                 clip_uid=clip_uid,
                 annotation=annotation,
+                frame_count=config.frames.count,
             )
             raw_candidates: list[dict[str, object]] = []
             candidate_dir = output_root / "background_candidates" / clip_uid
@@ -539,7 +627,7 @@ def build_background_references(
                         )
                         + (
                             ("incomplete_foreground_masks",)
-                            if incomplete_mask_entities
+                            if slot in incomplete_mask_slots
                             and not config.background.qwen_judge_enabled
                             else ()
                         ),
@@ -700,6 +788,11 @@ def build_background_references(
                     "clip_uid": clip_uid,
                     "background_phrase": background.phrase,
                     "incomplete_mask_entities": list(incomplete_mask_entities),
+                    "incomplete_mask_slots": sorted(incomplete_mask_slots),
+                    "mask_coverage": {
+                        f"frame_{slot:02d}": records
+                        for slot, records in sorted(mask_coverage.items())
+                    },
                     "selected_frame_slot": (
                         selected.frame_slot if selected is not None else None
                     ),

@@ -21,6 +21,7 @@ from r2v_data_v2.config import (
     _qwen_services,
 )
 from r2v_data_v2.image_utils import image_data_uri
+from r2v_data_v2.inpainting_lifecycle import invalidate_inpainting_artifacts
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import bbox_from_mask, decode_mask, save_mask_png
 from r2v_data_v2.metrics import (
@@ -1166,6 +1167,7 @@ def _save_reference(
     crop_mask = mask[y1:y2, x1:x2]
     destination = output_root / "references" / clip_uid / entity_id
     destination.mkdir(parents=True, exist_ok=True)
+    invalidate_inpainting_artifacts(destination)
     raw_canonical_path = destination / "canonical_raw.jpg"
     canonical_path = destination / "canonical.jpg"
     Image.fromarray(crop_rgb).save(raw_canonical_path, quality=95)
@@ -1266,6 +1268,7 @@ def rank_manifest_references(
     if overwrite:
         reference_manifest.unlink(missing_ok=True)
         for artifact in (output_root / "references").glob("*/*/metadata.json"):
+            invalidate_inpainting_artifacts(artifact.parent)
             artifact.unlink()
     qwen = (
         judge
