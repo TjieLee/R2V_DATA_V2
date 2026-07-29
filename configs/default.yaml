@@ -1,6 +1,5 @@
 dataset_json: /mnt/workspace/public/dataset/jea-video/zicai_5th_moive/train_zicai_5th_moive.json
 output_root: /mnt/workspace/litengjie/data/r2v_data_v2
-
 qwen:
   base_url: http://localhost:8000/v1
   api_key: EMPTY
@@ -12,21 +11,18 @@ qwen:
   video:
     input_mode: full_video
     fps: 2.0
-    do_sample_frames: true
+    do_sample_frames: false
     max_pixels: null
     total_pixels: null
-
 frames:
   count: 10
   jpeg_quality: 92
   max_side: 1280
-
 sam3:
   code_root: /mnt/workspace/litengjie/data/vendor/sam3
   checkpoint: null
   minimum_confidence: 0.55
   minimum_visible_frames: 2
-
 ranking:
   minimum_effective_short_side: 128
   minimum_mask_area_ratio: 0.005
@@ -37,7 +33,7 @@ ranking:
   minimum_exposure_score: 0.35
   minimum_crop_subject_ratio: 0.08
   maximum_crop_subject_ratio: 0.92
-  maximum_other_mask_overlap: 0.50
+  maximum_other_mask_overlap: 0.5
   evaluators:
     qwen_visual:
       enabled: true
@@ -54,16 +50,16 @@ ranking:
       hard_reject_wrong_entity: false
   preselection_weights:
     dino_representativeness: 0.35
-    siglip_alignment: 0.20
+    siglip_alignment: 0.2
     sharpness: 0.18
-    exposure: 0.10
-    isolation: 0.10
+    exposure: 0.1
+    isolation: 0.1
     sam_confidence: 0.07
   final_weights:
     dino_representativeness: 0.23
     qwen_completeness: 0.17
     qwen_recognizability: 0.14
-    siglip_alignment: 0.10
+    siglip_alignment: 0.1
     qwen_mask_quality: 0.08
     mask_area_continuity: 0.05
     sharpness_exposure: 0.06
@@ -75,7 +71,7 @@ ranking:
   normalization:
     dino_representativeness:
       method: fixed_range
-      minimum: 0.60
+      minimum: 0.6
       maximum: 0.95
     siglip_alignment:
       method: robust_minmax
@@ -105,17 +101,15 @@ ranking:
   dinov3_model_path: null
   dinov3_model_name: dinov3_vits16
   dinov3_batch_size: 16
-  dinov3_cluster_similarity_threshold: 0.70
+  dinov3_cluster_similarity_threshold: 0.7
   siglip2_model_path: /mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex
   siglip2_batch_size: 8
-
 pairing:
   enable_in_pair: true
   enable_same_parent_cross_pair: true
-  cross_pair_minimum_confidence: 0.90
+  cross_pair_minimum_confidence: 0.9
   cross_pair_fallback_to_in_pair: true
   maximum_candidates_per_entity: 10
-
 augmentation:
   enabled: false
   save_rgba: true

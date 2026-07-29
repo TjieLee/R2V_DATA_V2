@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from prompts.qwen_annotation_prompt import ICL_EXAMPLES, SYSTEM_PROMPT
 from prompts.qwen_repair_prompt import build_repair_prompt
 from r2v_data_v2.caption_validation import (
     annotation_warnings,
+    exact_phrase_spans,
     validate_annotation,
 )
 from r2v_data_v2.config import PipelineConfig, QwenConfig
@@ -60,6 +62,109 @@ def _video_processor_extra_body(config: QwenConfig) -> dict[str, object]:
     if config.video.total_pixels is not None:
         processor_kwargs["total_pixels"] = config.video.total_pixels
     return {"mm_processor_kwargs": processor_kwargs}
+
+
+_ARTICLES = {"a", "an", "the"}
+
+
+def _casefold_phrase_spans(
+    caption: str,
+    phrase: str,
+) -> list[tuple[int, int]]:
+    words = phrase.split()
+    if not words:
+        return []
+
+    pattern = r"\s+".join(re.escape(word) for word in words)
+
+    if words[0][0].isalnum():
+        pattern = rf"(?<!\w){pattern}"
+    if words[-1][-1].isalnum():
+        pattern = rf"{pattern}(?!\w)"
+
+    return [
+        match.span()
+        for match in re.finditer(
+            pattern,
+            caption,
+            flags=re.IGNORECASE,
+        )
+    ]
+
+
+def _unique_caption_phrase(
+    caption: str,
+    phrase: str,
+) -> str | None:
+    """Return a conservative exact phrase copied from the caption."""
+    words = phrase.split()
+    candidates = [phrase]
+
+    # Common model error:
+    # "an enemy soldier" while caption contains "an enemy".
+    if len(words) >= 3:
+        candidates.append(" ".join(words[:-1]))
+
+    # Common article mismatch:
+    # "the red vehicle" while caption contains "red vehicle".
+    if len(words) >= 3 and words[0].casefold() in _ARTICLES:
+        candidates.append(" ".join(words[1:]))
+
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        spans = _casefold_phrase_spans(caption, candidate)
+        if len(spans) != 1:
+            continue
+
+        start, end = spans[0]
+        return caption[start:end]
+
+    return None
+
+
+def _align_reference_phrases(
+    annotation: QwenAnnotationResult,
+) -> tuple[QwenAnnotationResult, list[str]]:
+    """Align only missing reference phrases to unique caption spans."""
+    entities = []
+    warnings: list[str] = []
+
+    for entity in annotation.entities:
+        # Preserve valid phrases and multiple-occurrence failures.
+        spans = exact_phrase_spans(annotation.caption, entity.phrase)
+        if not entity.reference_worthy or spans:
+            entities.append(entity)
+            continue
+
+        aligned = _unique_caption_phrase(
+            annotation.caption,
+            entity.phrase,
+        )
+        if aligned is None:
+            entities.append(entity)
+            continue
+
+        entities.append(
+            entity.model_copy(
+                update={"phrase": aligned},
+            )
+        )
+        warnings.append(
+            "aligned_reference_phrase:"
+            f"{entity.entity_id}:"
+            f"{entity.phrase!r}->{aligned!r}"
+        )
+
+    return (
+        annotation.model_copy(update={"entities": entities}),
+        warnings,
+    )
 
 
 class QwenAnnotationClient:
@@ -157,7 +262,7 @@ class QwenAnnotationClient:
     ) -> tuple[AnnotationResult, list[str]]:
         raw_responses: list[str] = []
         issues: list[ValidationIssue] = []
-        for attempt in range(2):
+        for attempt in range(self.config.repair_retries + 1):
             repair_prompt = None
             if attempt:
                 repair_prompt = build_repair_prompt(
@@ -193,7 +298,11 @@ class QwenAnnotationClient:
                 raw_response,
                 QwenAnnotationResult,
             )
+            alignment_warnings: list[str] = []
             if semantic is not None:
+                semantic, alignment_warnings = (
+                    _align_reference_phrases(semantic)
+                )
                 issues = validate_annotation(
                     semantic,
                     caption_raw=caption_raw,
@@ -206,7 +315,10 @@ class QwenAnnotationClient:
                 except ReferenceBindingError as exc:
                     issues = exc.issues
             if result is not None and not issues:
-                warnings = annotation_warnings(semantic)
+                warnings = [
+                    *alignment_warnings,
+                    *annotation_warnings(semantic),
+                ]
                 if semantic.background and semantic.background.reference_worthy:
                     warnings.append("background_reference_deferred")
                 return result, warnings
