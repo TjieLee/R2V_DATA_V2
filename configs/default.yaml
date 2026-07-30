@@ -49,6 +49,7 @@ sam3:
   checkpoint: null
   minimum_confidence: 0.55
   minimum_visible_frames: 2
+  minimum_entity_visible_ratio: 0.80
 ranking:
   minimum_effective_short_side: 128
   minimum_mask_area_ratio: 0.005

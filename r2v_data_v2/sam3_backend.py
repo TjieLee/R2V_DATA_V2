@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from r2v_data_v2.config import PipelineConfig, Sam3Config
+from r2v_data_v2.entity_coverage import temporal_visibility_metrics
 from r2v_data_v2.entity_policy import requires_foreground_mask
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.mask_utils import (
@@ -382,18 +383,29 @@ def _write_candidates(
     masks: dict[int, np.ndarray],
     frame_paths: list[Path],
     save_top_k: int,
-    minimum_visible_frames: int = 1,
+    minimum_entity_visible_ratio: float = 0.80,
     tracked_masks: dict[int, np.ndarray] | None = None,
     mask_coverage: dict[int, dict[str, object]] | None = None,
 ) -> None:
     destination = output_root / "candidates" / clip_uid / entity_id
     destination.mkdir(parents=True, exist_ok=True)
     candidate_count = len(candidates)
-    candidate_status = (
-        "ready"
-        if candidate_count >= minimum_visible_frames
-        else "insufficient_visible_frames"
+    raw_masks = tracked_masks if tracked_masks is not None else masks
+    coverage = mask_coverage or {
+        slot: {
+            "tracked": slot in raw_masks,
+            "mask_available": slot in raw_masks,
+            "candidate_accepted": slot in masks,
+            "filtered_reasons": [],
+        }
+        for slot in range(len(frame_paths))
+    }
+    visibility = temporal_visibility_metrics(
+        coverage,
+        sampled_frame_count=len(frame_paths),
+        minimum_entity_visible_ratio=minimum_entity_visible_ratio,
     )
+    candidate_status = "ready" if candidate_count >= 1 else "no_valid_candidate"
     write_json_atomic(
         destination / "candidate_status.json",
         {
@@ -401,8 +413,8 @@ def _write_candidates(
             "entity_id": entity_id,
             "status": "building",
             "candidate_count": candidate_count,
-            "minimum_visible_frames": minimum_visible_frames,
             "published_candidate_count": 0,
+            **visibility,
         },
     )
     published_candidates = candidates if candidate_status == "ready" else []
@@ -437,7 +449,6 @@ def _write_candidates(
         json.dumps(encoded),
         encoding="utf-8",
     )
-    raw_masks = tracked_masks if tracked_masks is not None else masks
     (destination / "tracked_masks.rle.json").write_text(
         json.dumps(
             {
@@ -447,20 +458,12 @@ def _write_candidates(
         ),
         encoding="utf-8",
     )
-    coverage = mask_coverage or {
-        slot: {
-            "tracked": slot in raw_masks,
-            "mask_available": slot in raw_masks,
-            "candidate_accepted": slot in masks,
-            "filtered_reasons": [],
-        }
-        for slot in range(len(frame_paths))
-    }
     (destination / "mask_coverage.json").write_text(
         json.dumps(
             {
                 "clip_uid": clip_uid,
                 "entity_id": entity_id,
+                **visibility,
                 "slots": {
                     f"frame_{slot:02d}": value
                     for slot, value in sorted(coverage.items())
@@ -488,8 +491,8 @@ def _write_candidates(
             "entity_id": entity_id,
             "status": candidate_status,
             "candidate_count": candidate_count,
-            "minimum_visible_frames": minimum_visible_frames,
             "published_candidate_count": len(published_candidates),
+            **visibility,
         },
     )
 
@@ -558,6 +561,12 @@ def extract_manifest_candidates(
                 destination = candidate_dir / "candidates.jsonl"
                 if destination.is_file() and not overwrite:
                     continue
+                (
+                    output_root
+                    / "candidates"
+                    / clip
+                    / "entity_coverage.json"
+                ).unlink(missing_ok=True)
                 try:
                     if overwrite:
                         _clear_entity_candidate_artifacts(
@@ -629,20 +638,22 @@ def extract_manifest_candidates(
                         masks=masks,
                         frame_paths=frame_paths,
                         save_top_k=config.ranking.save_top_k_mask_rle,
-                        minimum_visible_frames=(
-                            config.sam3.minimum_visible_frames
+                        minimum_entity_visible_ratio=(
+                            config.sam3.minimum_entity_visible_ratio
                         ),
                         tracked_masks=tracked_masks,
                         mask_coverage=mask_coverage,
                     )
-                    if len(candidates) < config.sam3.minimum_visible_frames:
+                    if not candidates:
                         no_valid += 1
                         _append_failure(
                             output_root / "logs" / "sam_failed.jsonl",
                             {
                                 "clip_uid": clip,
                                 "entity_id": entity.entity_id,
-                                "error": "entity is visible in too few sampled frames",
+                                "error": (
+                                    "no strict entity-reference candidate survived"
+                                ),
                             },
                         )
                         continue

@@ -34,7 +34,10 @@ from r2v_data_v2.inpainting import (
     _background_fill_prompt_issues,
     _background_forbidden_texts,
     _background_generation_mask,
+    _foreground_removal_review_issues,
+    _foreground_removal_review_passes,
     _inpainting_prompt,
+    _repaired_entity_grounding_targets,
     run_inpainting,
 )
 from r2v_data_v2.schemas import (
@@ -431,7 +434,7 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "9"
+    assert inpainting_metadata["source_metadata_version"] == "10"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
     assert (
         len(inpainting_metadata["local_consistency_prompt_sha256"]) == 64
@@ -1793,7 +1796,68 @@ def test_qwen_uses_three_dedicated_background_prompts_and_schemas(
     assert all("comparison" not in str(request) for request in captured)
 
 
-def test_qwen_retries_internally_inconsistent_foreground_review(
+def test_original_person_remaining_is_structurally_valid_but_rejects() -> None:
+    review = _foreground_removal_review(
+        original_foreground_still_visible=True,
+        visible_entities=["person"],
+        background_only_inside_mask=False,
+        reason="the original person remains",
+    )
+
+    assert _foreground_removal_review_issues(review) == []
+    assert _foreground_removal_review_passes(review) is False
+
+
+def test_reconstructed_mountain_is_structurally_valid_but_rejects() -> None:
+    review = _foreground_removal_review(
+        original_foreground_reconstructed=True,
+        visible_entities=["mountain slope"],
+        background_only_inside_mask=False,
+        reason="the mountain slope was reconstructed",
+    )
+
+    assert _foreground_removal_review_issues(review) == []
+    assert _foreground_removal_review_passes(review) is False
+
+
+def test_successful_removal_reason_is_diagnostic_only() -> None:
+    review = _foreground_removal_review(
+        reason="the original person and table were removed",
+    )
+
+    assert _foreground_removal_review_issues(review) == []
+    assert _foreground_removal_review_passes(review) is True
+
+
+def test_new_woman_and_child_require_flag_and_visible_entity_list() -> None:
+    valid = _foreground_removal_review(
+        new_salient_entity_visible=True,
+        visible_entities=["woman", "child"],
+        background_only_inside_mask=False,
+        reason="a new woman and child are visible",
+    )
+    missing_state = _foreground_removal_review(
+        visible_entities=["woman", "child"],
+        background_only_inside_mask=False,
+    )
+    missing_entities = _foreground_removal_review(
+        new_salient_entity_visible=True,
+        background_only_inside_mask=False,
+    )
+
+    assert _foreground_removal_review_issues(valid) == []
+    assert _foreground_removal_review_passes(valid) is False
+    assert any(
+        issue.code == "foreground_review_entity_flag_contradiction"
+        for issue in _foreground_removal_review_issues(missing_state)
+    )
+    assert any(
+        issue.code == "foreground_review_entity_list_missing"
+        for issue in _foreground_removal_review_issues(missing_entities)
+    )
+
+
+def test_qwen_retries_visible_entities_without_an_entity_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1801,10 +1865,13 @@ def test_qwen_retries_internally_inconsistent_foreground_review(
     responses = iter(
         [
             _foreground_removal_review(
-                reason="a woman and a child remain inside the mask"
+                visible_entities=["woman"],
+                background_only_inside_mask=False,
             ).model_dump_json(),
             _foreground_removal_review(
-                reason="only continuous water is visible"
+                original_foreground_still_visible=True,
+                visible_entities=["woman"],
+                background_only_inside_mask=False,
             ).model_dump_json(),
         ]
     )
@@ -1822,46 +1889,9 @@ def test_qwen_retries_internally_inconsistent_foreground_review(
         repair_mask_path=tmp_path / "mask.png",
     )
 
-    assert review.background_only_inside_mask is True
+    assert review.original_foreground_still_visible is True
     assert len(requests) == 2
-    assert "foreground_review_reason_entity_missing" in requests[1]
-
-
-@pytest.mark.parametrize(
-    "contradictory_reason",
-    [
-        "the repaired mask contains a woman and a child",
-        "a different person is standing alone inside the mask",
-    ],
-)
-def test_named_people_cannot_pass_as_no_salient_entity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    contradictory_reason: str,
-) -> None:
-    judge = QwenInpaintingConsistencyJudge(QwenConfig())
-    raw = _foreground_removal_review(
-        reason=contradictory_reason
-    ).model_dump_json()
-    monkeypatch.setattr(
-        judge,
-        "_request",
-        lambda **_kwargs: raw,
-    )
-
-    with pytest.raises(StructuredOutputFailure) as caught:
-        judge.review_foreground_removal(
-            original_mask_only_path=tmp_path / "original-mask-only.png",
-            repaired_mask_only_path=tmp_path / "repaired-mask-only.png",
-            repaired_context_path=tmp_path / "repaired-context.png",
-            repair_mask_path=tmp_path / "mask.png",
-        )
-
-    assert caught.value.attempt_count == 2
-    assert any(
-        issue.code == "foreground_review_reason_entity_missing"
-        for issue in caught.value.issues
-    )
+    assert "foreground_review_entity_flag_contradiction" in requests[1]
 
 
 def test_background_three_reviews_pass_with_large_expected_mask_difference(
@@ -2041,6 +2071,48 @@ def test_repaired_entity_grounding_overlap_guard(
         )
     else:
         assert overlap_ratio < 0.20
+
+
+@pytest.mark.parametrize(
+    ("reference", "expected"),
+    [
+        (
+            {
+                "category": "person",
+                "grounding_prompt": "woman wearing a red coat",
+                "phrase": "a woman",
+                "canonical_label": "person",
+            },
+            "woman wearing a red coat",
+        ),
+        (
+            {
+                "category": "person",
+                "phrase": "a woman",
+                "canonical_label": "person",
+            },
+            "a woman",
+        ),
+        (
+            {
+                "category": "person",
+                "canonical_label": "person",
+            },
+            "person",
+        ),
+    ],
+)
+def test_repaired_entity_grounding_text_priority(
+    tmp_path: Path,
+    reference: dict[str, object],
+    expected: str,
+) -> None:
+    targets = _repaired_entity_grounding_targets(
+        reference,
+        output_root=tmp_path,
+    )
+
+    assert targets[0]["grounding_phrase"] == expected
 
 
 @pytest.mark.parametrize(

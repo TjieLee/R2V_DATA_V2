@@ -71,6 +71,114 @@ class _FakeJudge:
         return self.result
 
 
+def test_failed_clip_entity_coverage_filters_ready_references(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    reference_path = output_root / "manifests" / "references.jsonl"
+    reference_path.parent.mkdir(parents=True)
+    reference_path.write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-1",
+                "entity_id": "e1",
+                "reference_type": "entity",
+                "status": "ready",
+                "rejected": False,
+                "canonical_path": str(tmp_path / "canonical.jpg"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    coverage_path = (
+        output_root / "candidates" / "clip-1" / "entity_coverage.json"
+    )
+    coverage_path.parent.mkdir(parents=True)
+    coverage_path.write_text(
+        json.dumps({"entity_coverage_passed": False}),
+        encoding="utf-8",
+    )
+    annotations = {
+        "clip-1": {
+            "parent_video_id": "parent",
+            "clip_suffix": "0",
+            "video_path": str(tmp_path / "clip.mp4"),
+        }
+    }
+
+    references = pairing_module._references_by_clip(
+        reference_path,
+        annotations,
+        output_root=output_root,
+    )
+
+    assert references == {}
+
+
+def test_pairing_keeps_only_qualifying_entity_references(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    reference_path = output_root / "manifests" / "references.jsonl"
+    reference_path.parent.mkdir(parents=True)
+    records = [
+        {
+            "clip_uid": "clip-1",
+            "entity_id": entity_id,
+            "reference_id": entity_id,
+            "reference_type": "entity",
+            "status": "ready",
+            "canonical_path": str(tmp_path / f"{entity_id}.jpg"),
+        }
+        for entity_id in ("qualifying", "short-lived")
+    ]
+    records.append(
+        {
+            "clip_uid": "clip-1",
+            "entity_id": None,
+            "reference_id": "bg1",
+            "reference_type": "background",
+            "status": "ready",
+            "canonical_path": str(tmp_path / "background.jpg"),
+        }
+    )
+    reference_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    coverage_path = (
+        output_root / "candidates" / "clip-1" / "entity_coverage.json"
+    )
+    coverage_path.parent.mkdir(parents=True)
+    coverage_path.write_text(
+        json.dumps(
+            {
+                "entity_coverage_passed": True,
+                "qualifying_entity_ids": ["qualifying"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    annotations = {
+        "clip-1": {
+            "parent_video_id": "parent",
+            "clip_suffix": "0",
+            "video_path": str(tmp_path / "clip.mp4"),
+        }
+    }
+
+    references = pairing_module._references_by_clip(
+        reference_path,
+        annotations,
+        output_root=output_root,
+    )
+
+    assert [
+        reference["reference_id"] for reference in references["clip-1"]
+    ] == ["qualifying", "bg1"]
+
+
 class _FailingJudge:
     def judge(
         self,

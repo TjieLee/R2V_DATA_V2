@@ -871,6 +871,29 @@ def _write_ranking_fixture(
         json.dumps(encoded_masks),
         encoding="utf-8",
     )
+    (candidate_dir / "candidate_status.json").write_text(
+        json.dumps(
+            {
+                "status": "ready" if candidate_count else "no_valid_candidate",
+                "candidate_count": candidate_count,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (candidate_dir / "mask_coverage.json").write_text(
+        json.dumps(
+            {
+                "slots": {
+                    f"frame_{slot:02d}": {
+                        "mask_available": True,
+                        "candidate_accepted": slot < candidate_count,
+                    }
+                    for slot in range(10)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _distractor_entity(
@@ -1033,6 +1056,19 @@ def test_stage_ranking_uses_grounding_prompt_and_saves_dino_embedding(
         assert candidate["raw_scores"]["dino_representativeness"] == pytest.approx(
             candidate["dino"]["dino_representativeness"]
         )
+    coverage = json.loads(
+        (
+            output_root / "candidates" / "clip_1" / "entity_coverage.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert coverage["qualifying_entity_ids"] == ["e1"]
+    assert coverage["required_visible_frames"] == 8
+    assert coverage["entity_visibility_summary"]["e1"][
+        "visible_frame_count"
+    ] == 10
+    assert coverage["entity_coverage_passed"] is True
+    assert stats.entity_coverage_passed == 1
+    assert stats.entity_coverage_failed == 0
     reference_metadata = json.loads(
         (reference_dir / "metadata.json").read_text(encoding="utf-8")
     )

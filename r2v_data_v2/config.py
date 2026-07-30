@@ -166,6 +166,7 @@ class Sam3Config:
     checkpoint: Path | None = None
     minimum_confidence: float = 0.55
     minimum_visible_frames: int = 2
+    minimum_entity_visible_ratio: float = 0.80
 
 
 @dataclass(frozen=True)
@@ -732,6 +733,10 @@ def _validate_config(config: PipelineConfig) -> None:
             )
     if config.sam3.minimum_visible_frames < 1:
         raise ValueError("sam3.minimum_visible_frames must be positive")
+    if not 0.0 < config.sam3.minimum_entity_visible_ratio <= 1.0:
+        raise ValueError(
+            "sam3.minimum_entity_visible_ratio must be greater than 0 and at most 1"
+        )
     if not 0.0 <= config.ranking.minimum_mask_area_ratio:
         raise ValueError("ranking.minimum_mask_area_ratio must be non-negative")
     if config.ranking.maximum_mask_area_ratio > 1.0:

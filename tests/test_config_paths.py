@@ -12,9 +12,28 @@ from r2v_data_v2.config import (
     QwenConfig,
     RankingConfig,
     RankingEvaluatorsConfig,
+    Sam3Config,
     SiglipEvaluatorConfig,
     load_config,
 )
+
+
+@pytest.mark.parametrize("ratio", [0.0, 1.01])
+def test_invalid_minimum_entity_visible_ratio_is_rejected(
+    tmp_path: Path,
+    ratio: float,
+) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        sam3=Sam3Config(minimum_entity_visible_ratio=ratio),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="minimum_entity_visible_ratio",
+    ):
+        config_module._validate_config(config)
 
 
 def test_inpainting_max_sequence_length_above_512_is_rejected(

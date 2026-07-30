@@ -252,11 +252,15 @@ SAM tracking masks from all sampled slots are stored separately from masks that
 pass entity-reference size and area gates. Background removal consumes the
 tracking masks, while entity ranking consumes only the candidate masks.
 Per-slot coverage and filtering reasons are recorded in `mask_coverage.json`.
-Both mask sets use packed, zlib-compressed JSON. `candidate_status.json` is the
-publication gate for ranking; visibility below `sam3.minimum_visible_frames`
-keeps tracking artifacts for background use but publishes empty entity
-candidate artifacts. SAM overwrite clears the entire entity candidate
-directory before tracking.
+Both mask sets use packed, zlib-compressed JSON. A strict candidate is
+published when at least one frame passes reference-quality gates. Temporal
+coverage is calculated independently from `mask_available` across all sampled
+slots, using `sam3.minimum_entity_visible_ratio: 0.80` by default. After
+ranking, `candidates/<clip_uid>/entity_coverage.json` records per-entity
+visibility, ready-canonical status, qualifying IDs, and the clip-level ANY
+gate. One qualifying reference-worthy entity is sufficient; shorter-lived
+entities do not reject the clip. SAM overwrite clears the entire entity
+candidate directory before tracking.
 
 Legacy background fallback from `top_masks.rle.json` is disabled by default.
 It must be explicitly enabled with `background.allow_legacy_candidate_masks`,

@@ -16,6 +16,7 @@ from r2v_data_v2.config import (
     QwenImageConfig,
     _qwen_services,
 )
+from r2v_data_v2.entity_coverage import read_clip_qualifying_entity_ids
 from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.manifest import iter_source_records
 from r2v_data_v2.phrase_alignment import resolve_background_caption_phrase
@@ -276,8 +277,11 @@ def _annotations_by_clip(path: Path) -> dict[str, dict[str, Any]]:
 def _references_by_clip(
     path: Path,
     annotations: dict[str, dict[str, Any]],
+    *,
+    output_root: Path,
 ) -> dict[str, list[dict[str, Any]]]:
     result: dict[str, list[dict[str, Any]]] = {}
+    qualifying_by_clip: dict[str, set[str] | None] = {}
     for reference in iter_source_records(path):
         reference.setdefault("reference_type", "entity")
         reference.setdefault(
@@ -301,6 +305,20 @@ def _references_by_clip(
         ):
             continue
         clip = str(reference["clip_uid"])
+        if clip not in qualifying_by_clip:
+            qualifying_by_clip[clip] = read_clip_qualifying_entity_ids(
+                output_root,
+                clip,
+            )
+        qualifying_entity_ids = qualifying_by_clip[clip]
+        if qualifying_entity_ids == set():
+            continue
+        if (
+            qualifying_entity_ids is not None
+            and reference.get("reference_type", "entity") == "entity"
+            and str(reference.get("entity_id")) not in qualifying_entity_ids
+        ):
+            continue
         annotation = annotations[clip]
         reference.update(
             {
@@ -310,6 +328,16 @@ def _references_by_clip(
             }
         )
         result.setdefault(clip, []).append(reference)
+    for clip in list(result):
+        qualifying_entity_ids = qualifying_by_clip.get(clip)
+        if qualifying_entity_ids is None:
+            continue
+        if not any(
+            reference.get("reference_type", "entity") == "entity"
+            and str(reference.get("entity_id")) in qualifying_entity_ids
+            for reference in result[clip]
+        ):
+            del result[clip]
     return result
 
 
@@ -512,7 +540,11 @@ def build_pairs(
         for artifact in samples_dir.glob("*.json"):
             artifact.unlink()
     annotations = _annotations_by_clip(annotation_path)
-    references = _references_by_clip(reference_path, annotations)
+    references = _references_by_clip(
+        reference_path,
+        annotations,
+        output_root=output_root,
+    )
     if not overwrite:
         _remove_samples_with_non_ready_references(
             samples_dir,

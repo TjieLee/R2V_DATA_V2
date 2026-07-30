@@ -91,6 +91,14 @@ def run_pipeline(
             "no_valid_candidate",
             sam.get("no_valid_candidate", 0),
         ),
+        "entity_coverage_passed": ranking.get(
+            "entity_coverage_passed",
+            0,
+        ),
+        "entity_coverage_failed": ranking.get(
+            "entity_coverage_failed",
+            0,
+        ),
         "background_failed": background.get("failed", 0),
         "raw_background_count": background.get("raw_background_count", 0),
         "needs_inpainting_count": background.get(

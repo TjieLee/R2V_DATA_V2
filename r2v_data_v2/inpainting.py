@@ -117,33 +117,6 @@ BACKGROUND_FILL_FOREGROUND_WORDS = frozenset(
         "whale",
     }
 )
-FOREGROUND_REVIEW_HIGH_RISK_ENTITY_WORDS = frozenset(
-    {
-        "animal",
-        "animals",
-        "boat",
-        "boats",
-        "car",
-        "cars",
-        "chair",
-        "chairs",
-        "child",
-        "children",
-        "man",
-        "men",
-        "people",
-        "person",
-        "persons",
-        "table",
-        "tables",
-        "vehicle",
-        "vehicles",
-        "vessel",
-        "vessels",
-        "woman",
-        "women",
-    }
-)
 REPAIRED_ENTITY_GROUNDING_CATEGORIES = frozenset(
     {
         "animal",
@@ -219,7 +192,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "9"
+INPAINTING_SOURCE_METADATA_VERSION = "10"
 
 
 class InpaintBackend(Protocol):
@@ -559,14 +532,19 @@ def _foreground_removal_review_issues(
                 message="visible_entities entries must be non-empty",
             )
         )
-    if not review.new_salient_entity_visible and visible_entities:
+    has_entity_state = (
+        review.original_foreground_still_visible
+        or review.original_foreground_reconstructed
+        or review.new_salient_entity_visible
+    )
+    if visible_entities and not has_entity_state:
         issues.append(
             ValidationIssue(
                 code="foreground_review_entity_flag_contradiction",
-                field="new_salient_entity_visible",
+                field="visible_entities",
                 message=(
-                    "new_salient_entity_visible cannot be false when "
-                    "visible_entities is non-empty"
+                    "visible_entities requires an original, reconstructed, "
+                    "or new entity state"
                 ),
             )
         )
@@ -591,12 +569,7 @@ def _foreground_removal_review_issues(
                 ),
             )
         )
-    if review.background_only_inside_mask and (
-        review.original_foreground_still_visible
-        or review.original_foreground_reconstructed
-        or review.new_salient_entity_visible
-        or review.uncertain
-    ):
+    if review.background_only_inside_mask and has_entity_state:
         issues.append(
             ValidationIssue(
                 code="foreground_review_passing_state_contradiction",
@@ -607,21 +580,14 @@ def _foreground_removal_review_issues(
                 ),
             )
         )
-    reason_words = {
-        word.casefold()
-        for word in re.findall(r"[A-Za-z]+", review.reason)
-    }
-    named_high_risk = sorted(
-        reason_words & FOREGROUND_REVIEW_HIGH_RISK_ENTITY_WORDS
-    )
-    if named_high_risk and not visible_entities:
+    if review.background_only_inside_mask and review.uncertain:
         issues.append(
             ValidationIssue(
-                code="foreground_review_reason_entity_missing",
-                field="visible_entities",
+                code="foreground_review_background_only_uncertain",
+                field="background_only_inside_mask",
                 message=(
-                    "reason names high-risk entities absent from "
-                    f"visible_entities: {', '.join(named_high_risk)}"
+                    "background_only_inside_mask cannot be true when "
+                    "uncertain is true"
                 ),
             )
         )
@@ -1452,7 +1418,8 @@ def _repaired_entity_grounding_targets(
         if category not in REPAIRED_ENTITY_GROUNDING_CATEGORIES:
             continue
         phrase = str(
-            candidate.get("phrase")
+            candidate.get("grounding_prompt")
+            or candidate.get("phrase")
             or candidate.get("canonical_label")
             or ""
         ).strip()

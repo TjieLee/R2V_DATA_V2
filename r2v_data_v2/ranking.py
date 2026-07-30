@@ -20,6 +20,7 @@ from r2v_data_v2.config import (
     RankingConfig,
     _qwen_services,
 )
+from r2v_data_v2.entity_coverage import build_clip_entity_coverage
 from r2v_data_v2.image_utils import image_data_uri
 from r2v_data_v2.inpainting_lifecycle import invalidate_inpainting_artifacts
 from r2v_data_v2.manifest import iter_source_records
@@ -87,6 +88,8 @@ class RankingStats:
     candidate_count_before_models: int = 0
     candidate_count_after_dino: int = 0
     candidate_count_after_siglip: int = 0
+    entity_coverage_passed: int = 0
+    entity_coverage_failed: int = 0
 
 
 @dataclass
@@ -1786,6 +1789,38 @@ def rank_manifest_references(
             siglip.close()
         if owns_dino and dino is not None:
             dino.close()
+    coverage_passed = coverage_failed = 0
+    for payload in iter_source_records(annotation_manifest):
+        clip = str(payload["clip_uid"])
+        annotation = AnnotationResult.model_validate(
+            {
+                key: payload.get(key)
+                for key in (
+                    "caption",
+                    "prompt_with_refs",
+                    "entities",
+                    "relations",
+                    "background",
+                )
+            }
+        )
+        coverage = build_clip_entity_coverage(
+            output_root=output_root,
+            clip_uid=clip,
+            entities=annotation.entities,
+            sampled_frame_count=config.frames.count,
+            minimum_entity_visible_ratio=(
+                config.sam3.minimum_entity_visible_ratio
+            ),
+        )
+        write_json_atomic(
+            output_root / "candidates" / clip / "entity_coverage.json",
+            coverage,
+        )
+        if coverage["entity_coverage_passed"] is True:
+            coverage_passed += 1
+        else:
+            coverage_failed += 1
     reconcile_references(output_root)
     return RankingStats(
         processed=processed,
@@ -1799,6 +1834,8 @@ def rank_manifest_references(
         candidate_count_before_models=before_models,
         candidate_count_after_dino=after_dino,
         candidate_count_after_siglip=after_siglip,
+        entity_coverage_passed=coverage_passed,
+        entity_coverage_failed=coverage_failed,
     )
 
 

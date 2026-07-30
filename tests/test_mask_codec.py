@@ -14,7 +14,6 @@ from r2v_data_v2.mask_utils import (
     fill_small_enclosed_holes,
     save_mask_contact_sheet,
 )
-from r2v_data_v2.ranking import rank_manifest_references
 from r2v_data_v2.sam3_backend import (
     Sam3Backend,
     SamObservation,
@@ -368,7 +367,7 @@ def _write_sam_stage_fixture(output_root: Path) -> None:
     )
 
 
-def test_insufficient_visibility_publishes_tracking_only_and_ranking_skips(
+def test_single_strict_candidate_is_published_separately_from_coverage(
     tmp_path: Path,
 ) -> None:
     config = PipelineConfig(
@@ -414,23 +413,29 @@ def test_insufficient_visibility_publishes_tracking_only_and_ranking_skips(
         (candidate_dir / "mask_coverage.json").read_text(encoding="utf-8")
     )
 
-    assert extraction.no_valid_candidate == 1
-    assert status["status"] == "insufficient_visible_frames"
+    assert extraction.processed == 1
+    assert extraction.no_valid_candidate == 0
+    assert status["status"] == "ready"
     assert status["candidate_count"] == 1
-    assert status["published_candidate_count"] == 0
-    assert (
-        candidate_dir / "candidates.jsonl"
-    ).read_text(encoding="utf-8") == ""
-    assert json.loads(
-        (candidate_dir / "top_masks.rle.json").read_text(encoding="utf-8")
-    ) == {}
+    assert status["published_candidate_count"] == 1
+    assert status["sampled_frame_count"] == 10
+    assert status["visible_frame_count"] == 1
+    assert status["required_visible_frames"] == 8
+    assert status["temporal_coverage_passed"] is False
+    assert (candidate_dir / "candidates.jsonl").read_text(
+        encoding="utf-8"
+    ).strip()
+    assert set(
+        json.loads(
+            (candidate_dir / "top_masks.rle.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    ) == {"frame_00"}
     assert set(tracked) == {"frame_00"}
     assert coverage["slots"]["frame_00"]["candidate_accepted"] is True
-
-    ranking = rank_manifest_references(config)
-
-    assert ranking.no_valid_candidate == 1
-    assert ranking.failed == 0
+    assert coverage["visible_frame_count"] == 1
+    assert coverage["temporal_coverage_passed"] is False
 
 
 def test_failed_sam_overwrite_removes_all_stale_candidate_artifacts(
@@ -444,6 +449,8 @@ def test_failed_sam_overwrite_removes_all_stale_candidate_artifacts(
     candidate_dir = config.output_root / "candidates" / "clip-1" / "e1"
     selected_dir = candidate_dir / "selected"
     selected_dir.mkdir(parents=True)
+    clip_coverage = candidate_dir.parent / "entity_coverage.json"
+    clip_coverage.write_text("stale", encoding="utf-8")
     for name in (
         "candidates.jsonl",
         "top_masks.rle.json",
@@ -473,6 +480,7 @@ def test_failed_sam_overwrite_removes_all_stale_candidate_artifacts(
 
     assert stats.sam_failed == 1
     assert list(candidate_dir.iterdir()) == []
+    assert not clip_coverage.exists()
 
 
 def test_low_margin_multiple_instances_do_not_make_a_valid_anchor(
