@@ -313,12 +313,6 @@ def _references_by_clip(
         qualifying_entity_ids = qualifying_by_clip[clip]
         if qualifying_entity_ids == set():
             continue
-        if (
-            qualifying_entity_ids is not None
-            and reference.get("reference_type", "entity") == "entity"
-            and str(reference.get("entity_id")) not in qualifying_entity_ids
-        ):
-            continue
         annotation = annotations[clip]
         reference.update(
             {
@@ -570,6 +564,10 @@ def build_pairs(
             no_ready += 1
             continue
         try:
+            qualifying_entity_ids = read_clip_qualifying_entity_ids(
+                output_root,
+                clip,
+            )
             target_references = [
                 reference
                 for reference in clip_references
@@ -580,8 +578,9 @@ def build_pairs(
                 for reference in clip_references
                 if reference.get("reference_type") == "background"
             ]
+            source_annotation = _annotation_from_record(annotation)
             retained_annotation = rebuild_for_retained_entities(
-                _annotation_from_record(annotation),
+                source_annotation,
                 {str(reference["entity_id"]) for reference in target_references},
             )
             retained_by_id = {
@@ -646,6 +645,32 @@ def build_pairs(
                         **structured_failure,
                     },
                 )
+            final_entity_ids = {
+                str(reference["entity_id"])
+                for reference in final_references
+                if reference.get("reference_type") == "entity"
+            }
+            if (
+                qualifying_entity_ids is not None
+                and not final_entity_ids.intersection(qualifying_entity_ids)
+            ):
+                no_bindable += 1
+                continue
+            retained_annotation = rebuild_for_retained_entities(
+                source_annotation,
+                final_entity_ids,
+            )
+            retained_by_id = {
+                entity.entity_id: entity
+                for entity in retained_annotation.entities
+                if entity.reference_worthy
+            }
+            for reference in final_references:
+                if reference.get("reference_type") != "entity":
+                    continue
+                retained = retained_by_id[str(reference["entity_id"])]
+                reference["ref_token"] = retained.ref_token
+                reference["phrase"] = retained.phrase
             background_reference = None
             if background_references:
                 selected_background = min(

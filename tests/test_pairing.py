@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -116,7 +117,7 @@ def test_failed_clip_entity_coverage_filters_ready_references(
     assert references == {}
 
 
-def test_pairing_keeps_only_qualifying_entity_references(
+def test_pairing_keeps_all_ready_references_after_clip_coverage_passes(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "output"
@@ -176,7 +177,236 @@ def test_pairing_keeps_only_qualifying_entity_references(
 
     assert [
         reference["reference_id"] for reference in references["clip-1"]
-    ] == ["qualifying", "bg1"]
+    ] == ["qualifying", "short-lived", "bg1"]
+
+
+def _write_entity_coverage_pair_fixture(
+    tmp_path: Path,
+    *,
+    ready_entity_ids: set[str],
+    qualifying_entity_ids: set[str],
+    entity_coverage_passed: bool,
+) -> tuple[PipelineConfig, Path]:
+    output_root = tmp_path / "output"
+    manifests = output_root / "manifests"
+    manifests.mkdir(parents=True)
+    annotation = assign_reference_tokens(
+        QwenAnnotationResult.model_validate(
+            {
+                "caption": "A woman sits beside a dog.",
+                "entities": [
+                    {
+                        "entity_id": "woman",
+                        "phrase": "A woman",
+                        "grounding_prompt": "woman",
+                        "canonical_label": "woman",
+                        "category": "person",
+                        "reference_worthy": True,
+                        "salience": "primary",
+                        "genericity": "generic",
+                        "name_evidence": "none",
+                        "separability": "independent",
+                        "selection_reason": "primary subject",
+                    },
+                    {
+                        "entity_id": "dog",
+                        "phrase": "a dog",
+                        "grounding_prompt": "dog",
+                        "canonical_label": "dog",
+                        "category": "animal",
+                        "reference_worthy": True,
+                        "salience": "secondary",
+                        "genericity": "generic",
+                        "name_evidence": "none",
+                        "separability": "independent",
+                        "selection_reason": "secondary subject",
+                    },
+                ],
+                "relations": [
+                    {
+                        "subject_id": "woman",
+                        "predicate": "sits beside",
+                        "object_id": "dog",
+                    }
+                ],
+                "background": None,
+            }
+        )
+    )
+    (manifests / "annotations.jsonl").write_text(
+        json.dumps(
+            {
+                **annotation.model_dump(mode="json"),
+                "clip_uid": "clip-1",
+                "video_path": "/read-only/video.mp4",
+                "parent_video_id": "parent",
+                "clip_suffix": "1_0",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    entities_by_id = {entity.entity_id: entity for entity in annotation.entities}
+    references = []
+    for frame_index, entity_id in enumerate(sorted(ready_entity_ids)):
+        entity = entities_by_id[entity_id]
+        image_path = tmp_path / f"{entity_id}.jpg"
+        mask_path = tmp_path / f"{entity_id}.png"
+        assert cv2.imwrite(
+            str(image_path),
+            np.full((32, 48, 3), 128, dtype=np.uint8),
+        )
+        mask = np.zeros((32, 48), dtype=np.uint8)
+        mask[4:28, 8:40] = 255
+        assert cv2.imwrite(str(mask_path), mask)
+        references.append(
+            {
+                "clip_uid": "clip-1",
+                "reference_id": entity_id,
+                "reference_type": "entity",
+                "entity_id": entity_id,
+                "phrase": entity.phrase,
+                "canonical_label": entity.canonical_label,
+                "category": entity.category,
+                "ref_token": entity.ref_token,
+                "genericity": entity.genericity,
+                "name_evidence": entity.name_evidence,
+                "canonical_path": str(image_path),
+                "mask_path": str(mask_path),
+                "source_frame_index": frame_index,
+                "ranking_score": 0.9,
+                "status": "ready",
+                "rejected": False,
+            }
+        )
+    (manifests / "references.jsonl").write_text(
+        "".join(json.dumps(reference) + "\n" for reference in references),
+        encoding="utf-8",
+    )
+    coverage_path = (
+        output_root / "candidates" / "clip-1" / "entity_coverage.json"
+    )
+    coverage_path.parent.mkdir(parents=True)
+    coverage_path.write_text(
+        json.dumps(
+            {
+                "entity_coverage_passed": entity_coverage_passed,
+                "qualifying_entity_ids": sorted(qualifying_entity_ids),
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=output_root,
+        pairing=PairingConfig(enable_same_parent_cross_pair=False),
+    )
+    return config, manifests
+
+
+def _read_only_sample(manifests: Path) -> dict[str, object]:
+    records = [
+        json.loads(line)
+        for line in (manifests / "final_samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line
+    ]
+    assert len(records) == 1
+    return records[0]
+
+
+def test_clip_coverage_keeps_ready_short_lived_entity_reference(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_entity_coverage_pair_fixture(
+        tmp_path,
+        ready_entity_ids={"woman", "dog"},
+        qualifying_entity_ids={"woman"},
+        entity_coverage_passed=True,
+    )
+
+    stats = build_pairs(config)
+
+    sample = _read_only_sample(manifests)
+    references = sample["references"]
+    assert isinstance(references, list)
+    assert {reference["entity_id"] for reference in references} == {"woman", "dog"}
+    assert sample["prompt_with_refs"] == (
+        "A woman <ref_subject_1> sits beside a dog <ref_subject_2>."
+    )
+    bound_entity_ids = {
+        str(reference["entity_id"])
+        for reference in references
+        if reference["reference_type"] == "entity"
+    }
+    assert bound_entity_ids.intersection({"woman"})
+    assert stats.processed == 1
+    assert stats.failed == 0
+
+
+def test_missing_short_lived_reference_removes_only_its_token(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_entity_coverage_pair_fixture(
+        tmp_path,
+        ready_entity_ids={"woman"},
+        qualifying_entity_ids={"woman"},
+        entity_coverage_passed=True,
+    )
+
+    stats = build_pairs(config)
+
+    sample = _read_only_sample(manifests)
+    assert sample["prompt_with_refs"] == (
+        "A woman <ref_subject_1> sits beside a dog."
+    )
+    assert "<ref_subject_2>" not in str(sample["prompt_with_refs"])
+    references = sample["references"]
+    assert isinstance(references, list)
+    assert [reference["entity_id"] for reference in references] == ["woman"]
+    prompt_tokens = re.findall(r"<ref_[^>]+>", str(sample["prompt_with_refs"]))
+    assert prompt_tokens == [references[0]["ref_token"]]
+    assert stats.processed == 1
+    assert stats.failed == 0
+
+
+def test_all_entities_below_temporal_coverage_rejects_clip(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_entity_coverage_pair_fixture(
+        tmp_path,
+        ready_entity_ids={"woman", "dog"},
+        qualifying_entity_ids=set(),
+        entity_coverage_passed=False,
+    )
+
+    stats = build_pairs(config)
+
+    assert stats.processed == 0
+    assert stats.failed == 0
+    assert stats.skipped_no_ready_reference == 1
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
+    assert not (config.output_root / "logs" / "pairing_failed.jsonl").exists()
+
+
+def test_final_sample_requires_bound_qualifying_entity(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_entity_coverage_pair_fixture(
+        tmp_path,
+        ready_entity_ids={"dog"},
+        qualifying_entity_ids={"woman"},
+        entity_coverage_passed=True,
+    )
+
+    stats = build_pairs(config)
+
+    assert stats.processed == 0
+    assert stats.failed == 0
+    assert stats.skipped_no_ready_reference == 1
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
+    assert not (config.output_root / "logs" / "pairing_failed.jsonl").exists()
 
 
 class _FailingJudge:
