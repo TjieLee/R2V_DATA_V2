@@ -327,9 +327,16 @@ with adaptive dilation, capped by
 `inpainting.background.maximum_generation_mask_area_ratio: 0.35`. Both source
 and generation mask paths and ratios remain in metadata. The full-frame Qwen
 review and one context-upscaled local review per generation-mask component
-must all pass. Every generated
-hard-composited result is retained as
-`canonical_repaired_candidate.png`, including rejected candidates.
+must all return the categorical `removed_to_background` outcome with coherent
+continuity and no listed artifact. Each review receives a fourth comparison
+sheet with overlays, masked differences, and a boundary-ring comparison.
+Background FLUX prompts are generated from only the source image and generation
+mask, are validated against foreground and negative-language terms, and never
+include the caption or reference phrase. Configured seeds are evaluated
+independently; every candidate and its diagnostics are retained under
+`inpainting_candidates/`, while only an actually accepted candidate is
+published. `canonical_repaired_candidate.png` remains the compatibility
+inspection path, including after rejection.
 
 ## Qwen Benchmark
 
@@ -348,6 +355,22 @@ python scripts/benchmark_qwen_backends.py \
 Each invocation creates a unique JSON summary and per-clip JSONL record. Prior
 runs are never overwritten. The script only calls endpoints and models supplied
 on the command line; it does not launch services or download weights.
+
+FLUX background-fill sweeps use a separate output root and refuse any path
+inside the production pipeline output:
+
+```bash
+python scripts/benchmark_flux_background_fill.py \
+  --config configs/default.yaml \
+  --output-dir /path/to/benchmarks/flux-background \
+  --prompt-modes empty generic qwen_local \
+  --guidance-scales 20 30 \
+  --steps 50 \
+  --seeds 0 17
+```
+
+The benchmark writes per-candidate images, masks, comparisons, JSONL, CSV, and
+a summary without changing production references, manifests, or samples.
 
 ## Augmentation
 

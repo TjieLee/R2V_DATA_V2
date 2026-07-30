@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,8 +12,9 @@ from typing import Any, Protocol
 import cv2
 import numpy as np
 from openai import BadRequestError, OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw
 
+from prompts.qwen_background_fill_prompt import BACKGROUND_FILL_PROMPT
 from prompts.qwen_background_inpainting_review_prompt import (
     BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT,
     BACKGROUND_INPAINTING_REVIEW_PROMPT,
@@ -35,11 +37,17 @@ from r2v_data_v2.image_utils import (
 from r2v_data_v2.mask_utils import save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
 from r2v_data_v2.schemas import (
+    BackgroundFillPrompt,
     BackgroundInpaintingReview,
     InpaintingSemanticReview,
+    MaskedContentOutcome,
 )
 from r2v_data_v2.semantic_alignment import Siglip2Aligner
-from r2v_data_v2.structured_output import request_structured_output
+from r2v_data_v2.structured_output import (
+    StructuredOutputFailure,
+    ValidationIssue,
+    request_structured_output,
+)
 from r2v_data_v2.visual_embedding import (
     DinoV3Embedder,
     embedding_cosine_similarity,
@@ -47,10 +55,63 @@ from r2v_data_v2.visual_embedding import (
 )
 
 BACKGROUND_INPAINT_PROMPT = (
-    "The masked region is filled entirely with continuous background scenery "
-    "and textures matching the surrounding environment. Match its perspective, "
-    "lighting, color, depth, texture, and camera style."
+    "Continuous background scenery and textures matching the surrounding "
+    "environment, perspective, lighting, color, depth, texture, and camera style"
 )
+BACKGROUND_INPAINT_SUFFIX = (
+    "Seamless natural continuation of the surrounding scene, with consistent "
+    "geometry, perspective, scale, texture, color, lighting, depth, and camera "
+    "characteristics."
+)
+BACKGROUND_FILL_BANNED_WORDS = frozenset(
+    {
+        "remove",
+        "replace",
+        "erase",
+        "without",
+        "no",
+        "empty",
+        "foreground",
+        "object",
+        "mask",
+        "hole",
+    }
+)
+BACKGROUND_FILL_FOREGROUND_WORDS = frozenset(
+    {
+        "animal",
+        "animals",
+        "airplane",
+        "aircraft",
+        "bicycle",
+        "bike",
+        "bird",
+        "body",
+        "boat",
+        "bus",
+        "car",
+        "cat",
+        "child",
+        "dog",
+        "face",
+        "fish",
+        "horse",
+        "logo",
+        "motorcycle",
+        "person",
+        "people",
+        "product",
+        "ship",
+        "sign",
+        "subject",
+        "train",
+        "truck",
+        "vehicle",
+        "vessel",
+        "whale",
+    }
+)
+BACKGROUND_COMPARISON_VERSION = "1"
 
 ENTITY_INPAINT_PROMPT = (
     "Restore only the masked damaged or occluded region of {description}. "
@@ -78,7 +139,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "5"
+INPAINTING_SOURCE_METADATA_VERSION = "6"
 
 
 class InpaintBackend(Protocol):
@@ -111,9 +172,20 @@ class InpaintingSemanticJudge(Protocol):
         original_path: Path,
         repaired_path: Path,
         repair_mask_path: Path,
+        comparison_sheet_path: Path | None = None,
         reference_phrase: str,
         mode: str,
     ) -> InpaintingSemanticReview | BackgroundInpaintingReview: ...
+
+
+class BackgroundFillPromptGenerator(Protocol):
+    def generate(
+        self,
+        *,
+        original_path: Path,
+        generation_mask_path: Path,
+        forbidden_texts: list[str],
+    ) -> tuple[BackgroundFillPrompt, dict[str, object]]: ...
 
 
 class InpaintingDependencyError(RuntimeError):
@@ -234,6 +306,8 @@ class Flux1FillBackend:
             generator=generator,
             num_inference_steps=self.config.num_inference_steps,
             guidance_scale=self.config.guidance_scale,
+            strength=self.config.strength,
+            max_sequence_length=self.config.max_sequence_length,
         )
         if not getattr(result, "images", None):
             raise RuntimeError("FLUX.1 Fill returned no image")
@@ -241,6 +315,186 @@ class Flux1FillBackend:
         if generated.size != (padded_width, padded_height):
             raise ValueError("FLUX.1 Fill returned unexpected padded dimensions")
         return generated.crop((0, 0, width, height))
+
+
+def _background_fill_prompt_issues(
+    result: BackgroundFillPrompt,
+    *,
+    forbidden_texts: list[str],
+) -> list[ValidationIssue]:
+    prompt = result.fill_prompt.strip()
+    words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", prompt)
+    issues: list[ValidationIssue] = []
+    if not 12 <= len(words) <= 35:
+        issues.append(
+            ValidationIssue(
+                code="background_fill_word_count",
+                field="fill_prompt",
+                message="fill_prompt must contain 12-35 English words",
+            )
+        )
+    if re.sub(r"[A-Za-z\s,.;:'-]", "", prompt):
+        issues.append(
+            ValidationIssue(
+                code="background_fill_non_english",
+                field="fill_prompt",
+                message="fill_prompt must use English text only",
+            )
+        )
+    tokens = {word.casefold() for word in words}
+    prohibited = sorted(
+        tokens & (BACKGROUND_FILL_BANNED_WORDS | BACKGROUND_FILL_FOREGROUND_WORDS)
+    )
+    if prohibited:
+        issues.append(
+            ValidationIssue(
+                code="background_fill_prohibited_terms",
+                field="fill_prompt",
+                message=f"prohibited terms: {', '.join(prohibited)}",
+            )
+        )
+    normalized_prompt = " ".join(words).casefold()
+    for forbidden in forbidden_texts:
+        forbidden_words = re.findall(r"[A-Za-z]+", forbidden)
+        normalized_forbidden = " ".join(forbidden_words).casefold()
+        if len(forbidden_words) >= 2 and normalized_forbidden in normalized_prompt:
+            issues.append(
+                ValidationIssue(
+                    code="background_fill_copied_source_text",
+                    field="fill_prompt",
+                    message="fill_prompt copies caption or reference text",
+                )
+            )
+            break
+        forbidden_tokens = [
+            word.casefold() for word in forbidden_words
+        ]
+        if len(forbidden_tokens) >= 4 and any(
+            " ".join(forbidden_tokens[index : index + 4])
+            in normalized_prompt
+            for index in range(len(forbidden_tokens) - 3)
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="background_fill_copied_source_text",
+                    field="fill_prompt",
+                    message="fill_prompt copies caption or reference text",
+                )
+            )
+            break
+        source_tokens = {
+            word.casefold()
+            for word in forbidden_words
+            if len(word) >= 4
+        }
+        copied_foreground = sorted(
+            tokens
+            & source_tokens
+            & BACKGROUND_FILL_FOREGROUND_WORDS
+        )
+        if copied_foreground:
+            issues.append(
+                ValidationIssue(
+                    code="background_fill_copied_foreground",
+                    field="fill_prompt",
+                    message=(
+                        "fill_prompt copied foreground terms: "
+                        f"{', '.join(copied_foreground)}"
+                    ),
+                )
+            )
+            break
+    return issues
+
+
+class QwenBackgroundFillPromptGenerator:
+    def __init__(self, config: QwenConfig) -> None:
+        self.config = config
+        self.client = OpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout_seconds,
+        )
+
+    def _request(
+        self,
+        *,
+        prompt: str,
+        original_path: Path,
+        generation_mask_path: Path,
+    ) -> str:
+        parameters: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_uri(original_path)},
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_data_uri(generation_mask_path)
+                            },
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "max_tokens": min(384, self.config.max_tokens),
+        }
+        try:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": BackgroundFillPrompt.__name__,
+                        "strict": True,
+                        "schema": BackgroundFillPrompt.model_json_schema(),
+                    },
+                },
+            )
+        except BadRequestError:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={"type": "json_object"},
+            )
+        content = response.choices[0].message.content
+        if not content:
+            raise RuntimeError("Qwen returned an empty background fill prompt")
+        return content
+
+    def generate(
+        self,
+        *,
+        original_path: Path,
+        generation_mask_path: Path,
+        forbidden_texts: list[str],
+    ) -> tuple[BackgroundFillPrompt, dict[str, object]]:
+        result = request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                original_path=original_path,
+                generation_mask_path=generation_mask_path,
+            ),
+            original_request=BACKGROUND_FILL_PROMPT,
+            model=BackgroundFillPrompt,
+            validate=lambda value: _background_fill_prompt_issues(
+                value,
+                forbidden_texts=forbidden_texts,
+            ),
+        )
+        return result, {
+            "model": self.config.model,
+            "request_prompt_sha256": _sha256_text(BACKGROUND_FILL_PROMPT),
+            "validation": "passed",
+        }
 
 
 class QwenInpaintingConsistencyJudge:
@@ -259,30 +513,41 @@ class QwenInpaintingConsistencyJudge:
         original_path: Path,
         repaired_path: Path,
         repair_mask_path: Path,
+        comparison_sheet_path: Path | None,
         review_model: (
             type[InpaintingSemanticReview | BackgroundInpaintingReview]
         ),
     ) -> str:
+        content: list[dict[str, object]] = [
+            {"type": "text", "text": prompt},
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_uri(original_path)},
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_uri(repaired_path)},
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": image_data_uri(repair_mask_path)},
+            },
+        ]
+        if comparison_sheet_path is not None:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_data_uri(comparison_sheet_path)
+                    },
+                }
+            )
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_uri(original_path)},
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_uri(repaired_path)},
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_uri(repair_mask_path)},
-                        },
-                    ],
+                    "content": content,
                 }
             ],
             "temperature": 0.0,
@@ -318,6 +583,7 @@ class QwenInpaintingConsistencyJudge:
         original_path: Path,
         repaired_path: Path,
         repair_mask_path: Path,
+        comparison_sheet_path: Path | None = None,
         reference_phrase: str,
         mode: str,
     ) -> InpaintingSemanticReview | BackgroundInpaintingReview:
@@ -334,6 +600,7 @@ class QwenInpaintingConsistencyJudge:
                 original_path=original_path,
                 repaired_path=repaired_path,
                 repair_mask_path=repair_mask_path,
+                comparison_sheet_path=comparison_sheet_path,
                 review_model=review_model,
             ),
             original_request=prompt,
@@ -347,15 +614,178 @@ def _background_review_passes(
     require_reference_phrase: bool = True,
 ) -> bool:
     return (
-        review.background_continuity_preserved
-        and review.masked_foreground_removed
+        review.masked_content_outcome
+        == MaskedContentOutcome.REMOVED_TO_BACKGROUND
+        and review.background_continuity_preserved
         and (
             review.reference_phrase_supported
             or not require_reference_phrase
         )
-        and not review.new_salient_objects
-        and not review.visible_seam_or_artifact
+        and not review.artifact_types
     )
+
+
+def _background_review_payload(
+    review: BackgroundInpaintingReview,
+) -> dict[str, object]:
+    payload = review.model_dump(mode="json")
+    outcome = review.masked_content_outcome
+    payload.update(
+        {
+            "masked_foreground_removed": (
+                outcome == MaskedContentOutcome.REMOVED_TO_BACKGROUND
+            ),
+            "new_salient_objects": (
+                outcome == MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
+            ),
+            "visible_seam_or_artifact": bool(review.artifact_types),
+        }
+    )
+    return payload
+
+
+def _mask_boundary(mask: np.ndarray, pixels: int = 3) -> np.ndarray:
+    source = np.asarray(mask, dtype=bool)
+    kernel_size = max(3, (2 * pixels) + 1)
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    dilated = cv2.dilate(source.astype(np.uint8), kernel).astype(bool)
+    eroded = cv2.erode(source.astype(np.uint8), kernel).astype(bool)
+    return dilated & ~eroded
+
+
+def _red_mask_overlay(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    result = image.astype(np.float32).copy()
+    result[mask] = (0.55 * result[mask]) + (
+        0.45 * np.asarray([255, 0, 0])
+    )
+    return np.rint(result).astype(np.uint8)
+
+
+def _background_comparison_sheet(
+    *,
+    original: Image.Image,
+    repaired: Image.Image,
+    generation_mask: Image.Image,
+) -> Image.Image:
+    original_array = np.asarray(original.convert("RGB"))
+    repaired_array = np.asarray(repaired.convert("RGB"))
+    mask = np.asarray(generation_mask.convert("L")) >= 128
+    if (
+        original_array.shape != repaired_array.shape
+        or original_array.shape[:2] != mask.shape
+    ):
+        raise ValueError("comparison images and mask must have matching sizes")
+    original_overlay = _red_mask_overlay(original_array, mask)
+    repaired_overlay = repaired_array.copy()
+    repaired_overlay[_mask_boundary(mask, pixels=2)] = (255, 0, 0)
+    difference = np.abs(
+        original_array.astype(np.int16) - repaired_array.astype(np.int16)
+    ).mean(axis=2)
+    heatmap = np.zeros_like(original_array)
+    heatmap[..., 0] = np.clip(difference * 3.0, 0, 255).astype(np.uint8)
+    heatmap[..., 1] = np.clip(
+        (difference - 32.0) * 2.0, 0, 255
+    ).astype(np.uint8)
+    heatmap[~mask] = 0
+    boundary = _mask_boundary(mask, pixels=5)
+    height, width = mask.shape
+    coordinates = np.argwhere(boundary)
+    if coordinates.size:
+        y0, x0 = coordinates.min(axis=0)
+        y1, x1 = coordinates.max(axis=0) + 1
+        context = max(2, round(0.15 * max(y1 - y0, x1 - x0)))
+        crop_box = (
+            max(0, int(x0) - context),
+            max(0, int(y0) - context),
+            min(width, int(x1) + context),
+            min(height, int(y1) + context),
+        )
+    else:
+        crop_box = (0, 0, width, height)
+    half_width = max(1, width // 2)
+    boundary_panels = []
+    for image_array in (original_array, repaired_array):
+        overlay = Image.fromarray(_red_mask_overlay(image_array, boundary))
+        boundary_panels.append(
+            overlay.crop(crop_box).resize(
+                (half_width, height),
+                Image.Resampling.NEAREST,
+            )
+        )
+    boundary_comparison = Image.new(
+        "RGB",
+        (half_width * 2, height),
+        (24, 24, 24),
+    )
+    boundary_comparison.paste(boundary_panels[0], (0, 0))
+    boundary_comparison.paste(boundary_panels[1], (half_width, 0))
+    cell_width = width
+    sheet = Image.new("RGB", (cell_width * 2, height * 2), (24, 24, 24))
+    panels = (
+        Image.fromarray(original_overlay),
+        Image.fromarray(repaired_overlay),
+        Image.fromarray(heatmap),
+        boundary_comparison,
+    )
+    for index, panel in enumerate(panels):
+        x = (index % 2) * cell_width
+        y = (index // 2) * height
+        sheet.paste(panel.resize((cell_width, height)), (x, y))
+    draw = ImageDraw.Draw(sheet)
+    labels = (
+        "ORIGINAL + MASK",
+        "REPAIRED + CONTOUR",
+        "MASKED ABS DIFFERENCE",
+        "BOUNDARY RING: ORIGINAL | REPAIRED",
+    )
+    for index, label in enumerate(labels):
+        x = (index % 2) * cell_width + 6
+        y = (index // 2) * height + 5
+        draw.rectangle((x - 3, y - 2, x + 230, y + 12), fill=(0, 0, 0))
+        draw.text((x, y), label, fill=(255, 255, 255))
+    return sheet
+
+
+def _background_pixel_diagnostics(
+    *,
+    original: np.ndarray,
+    repaired: np.ndarray,
+    source_mask: np.ndarray,
+    generation_mask: np.ndarray,
+    destination: Path,
+) -> dict[str, object]:
+    if original.shape != repaired.shape:
+        raise ValueError("diagnostic images must have matching sizes")
+    pixel_l1 = np.abs(
+        original.astype(np.float32) - repaired.astype(np.float32)
+    ).mean(axis=2)
+    source = np.asarray(source_mask, dtype=bool)
+    generation = np.asarray(generation_mask, dtype=bool)
+    boundary = _mask_boundary(generation, pixels=3)
+    heatmap = np.zeros_like(original)
+    heatmap[..., 0] = np.clip(pixel_l1 * 3.0, 0, 255).astype(np.uint8)
+    heatmap[..., 1] = np.clip(
+        (pixel_l1 - 32.0) * 2.0, 0, 255
+    ).astype(np.uint8)
+    heatmap[~generation] = 0
+    _save_lossless_atomic(Image.fromarray(heatmap), destination)
+    return {
+        "masked_mean_l1": (
+            float(pixel_l1[source].mean()) if source.any() else 0.0
+        ),
+        "masked_changed_pixel_ratio": (
+            float((pixel_l1[source] > 12.0).mean()) if source.any() else 0.0
+        ),
+        "generation_mask_changed_pixel_ratio": (
+            float((pixel_l1[generation] > 12.0).mean())
+            if generation.any()
+            else 0.0
+        ),
+        "boundary_ring_mean_l1": (
+            float(pixel_l1[boundary].mean()) if boundary.any() else 0.0
+        ),
+        "difference_heatmap_path": str(destination),
+    }
 
 
 def _background_local_review_images(
@@ -507,6 +937,7 @@ class ProductionConsistencyValidator:
         repair_mask: Image.Image,
         reference: dict[str, object],
         mode: str,
+        diagnostics_dir: Path | None = None,
     ) -> dict[str, object]:
         reasons = self._ensure_models()
         dino_similarity: float | None = None
@@ -575,6 +1006,8 @@ class ProductionConsistencyValidator:
         qwen_local_reviews: list[dict[str, object]] = []
         qwen_local_review: dict[str, object] | None = None
         qwen_local_crop_box: tuple[int, int, int, int] | None = None
+        comparison_sheet_paths: list[str] = []
+        comparison_sheet_fingerprints: list[str] = []
         if self.qwen is not None:
             temporary_root = Path(
                 str(reference.get("raw_canonical_path", "."))
@@ -593,6 +1026,12 @@ class ProductionConsistencyValidator:
             local_mask_path = (
                 temporary_root / ".inpainting_qwen_local_mask.png"
             )
+            full_comparison_path = (
+                diagnostics_dir / "comparison_full.png"
+                if diagnostics_dir is not None
+                else temporary_root / ".inpainting_qwen_comparison.png"
+            )
+            temporary_comparison_paths: list[Path] = []
             try:
                 _save_lossless_atomic(original, original_path)
                 _save_lossless_atomic(repaired, repaired_path)
@@ -601,6 +1040,22 @@ class ProductionConsistencyValidator:
                     repair_mask_path,
                 )
                 if mode == "background_hole_fill":
+                    if diagnostics_dir is not None:
+                        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                    _save_lossless_atomic(
+                        _background_comparison_sheet(
+                            original=original,
+                            repaired=repaired,
+                            generation_mask=repair_mask,
+                        ),
+                        full_comparison_path,
+                    )
+                    comparison_sheet_paths.append(str(full_comparison_path))
+                    comparison_sheet_fingerprints.append(
+                        _sha256_path(full_comparison_path)
+                    )
+                    if diagnostics_dir is None:
+                        temporary_comparison_paths.append(full_comparison_path)
                     full_passes = False
                     local_passes = True
                     try:
@@ -608,6 +1063,7 @@ class ProductionConsistencyValidator:
                             original_path=original_path,
                             repaired_path=repaired_path,
                             repair_mask_path=repair_mask_path,
+                            comparison_sheet_path=full_comparison_path,
                             reference_phrase=phrase,
                             mode=mode,
                         )
@@ -615,8 +1071,8 @@ class ProductionConsistencyValidator:
                             full_review,
                             BackgroundInpaintingReview,
                         ):
-                            qwen_full_review = full_review.model_dump(
-                                mode="json"
+                            qwen_full_review = _background_review_payload(
+                                full_review
                             )
                             full_passes = _background_review_passes(
                                 full_review
@@ -647,6 +1103,16 @@ class ProductionConsistencyValidator:
                             "crop_box": list(crop_box),
                             "review": None,
                         }
+                        local_comparison_path = (
+                            diagnostics_dir
+                            / f"comparison_local_{component_index:02d}.png"
+                            if diagnostics_dir is not None
+                            else temporary_root
+                            / (
+                                ".inpainting_qwen_local_comparison_"
+                                f"{component_index:02d}.png"
+                            )
+                        )
                         try:
                             _save_lossless_atomic(
                                 local_original,
@@ -657,10 +1123,32 @@ class ProductionConsistencyValidator:
                                 local_repaired_path,
                             )
                             _save_lossless_atomic(local_mask, local_mask_path)
+                            _save_lossless_atomic(
+                                _background_comparison_sheet(
+                                    original=local_original,
+                                    repaired=local_repaired,
+                                    generation_mask=local_mask,
+                                ),
+                                local_comparison_path,
+                            )
+                            local_comparison_fingerprint = _sha256_path(
+                                local_comparison_path
+                            )
+                            comparison_sheet_paths.append(
+                                str(local_comparison_path)
+                            )
+                            comparison_sheet_fingerprints.append(
+                                local_comparison_fingerprint
+                            )
+                            if diagnostics_dir is None:
+                                temporary_comparison_paths.append(
+                                    local_comparison_path
+                                )
                             local_review = self.qwen.review(
                                 original_path=local_original_path,
                                 repaired_path=local_repaired_path,
                                 repair_mask_path=local_mask_path,
+                                comparison_sheet_path=local_comparison_path,
                                 reference_phrase=phrase,
                                 mode="background_hole_fill_local",
                             )
@@ -669,7 +1157,7 @@ class ProductionConsistencyValidator:
                                 BackgroundInpaintingReview,
                             ):
                                 local_record["review"] = (
-                                    local_review.model_dump(mode="json")
+                                    _background_review_payload(local_review)
                                 )
                                 if not _background_review_passes(
                                     local_review,
@@ -722,6 +1210,8 @@ class ProductionConsistencyValidator:
                 local_original_path.unlink(missing_ok=True)
                 local_repaired_path.unlink(missing_ok=True)
                 local_mask_path.unlink(missing_ok=True)
+                for path in temporary_comparison_paths:
+                    path.unlink(missing_ok=True)
 
         reasons = list(dict.fromkeys(reasons))
         return {
@@ -739,6 +1229,9 @@ class ProductionConsistencyValidator:
             "qwen_local_reviews": qwen_local_reviews,
             "qwen_local_review": qwen_local_review,
             "qwen_local_crop_box": qwen_local_crop_box,
+            "comparison_sheet_paths": comparison_sheet_paths,
+            "comparison_sheet_fingerprints": comparison_sheet_fingerprints,
+            "comparison_sheet_version": BACKGROUND_COMPARISON_VERSION,
             "semantic_input": semantic_input,
             "rejection_reasons": reasons,
         }
@@ -863,6 +1356,12 @@ def _source_signature(
             "repair_prompt": repair_prompt,
             "consistency_prompt": consistency_prompt,
             "local_consistency_prompt": local_consistency_prompt,
+            "background_fill_prompt_request": (
+                BACKGROUND_FILL_PROMPT
+                if mode == "background_hole_fill"
+                else None
+            ),
+            "background_comparison_version": BACKGROUND_COMPARISON_VERSION,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -887,6 +1386,16 @@ def _source_signature(
             else None
         ),
         "prompt_fingerprint": _sha256_text(prompt_payload),
+        "background_fill_prompt_request_sha256": (
+            _sha256_text(BACKGROUND_FILL_PROMPT)
+            if mode == "background_hole_fill"
+            else None
+        ),
+        "background_comparison_version": (
+            BACKGROUND_COMPARISON_VERSION
+            if mode == "background_hole_fill"
+            else None
+        ),
         "source_metadata_version": INPAINTING_SOURCE_METADATA_VERSION,
         "version_fingerprint": version_fingerprint,
     }
@@ -982,12 +1491,13 @@ def _background_generation_mask(
     source_mask: np.ndarray,
     *,
     mask_dilation_pixels: int,
+    adaptive_mask_dilation_ratio: float = 0.04,
 ) -> np.ndarray:
     source = np.asarray(source_mask, dtype=bool)
     height, width = source.shape
     margin = max(
         mask_dilation_pixels,
-        round(0.04 * min(height, width)),
+        round(adaptive_mask_dilation_ratio * min(height, width)),
     )
     filled = _fill_internal_holes(source)
     closed = cv2.morphologyEx(
@@ -1157,6 +1667,7 @@ def _repair_mask_for_reference(
         generation_mask = _background_generation_mask(
             source_mask,
             mask_dilation_pixels=config.mask_dilation_pixels,
+            adaptive_mask_dilation_ratio=config.adaptive_mask_dilation_ratio,
         )
         generation_mask_area_ratio = float(generation_mask.mean())
         reasons = []
@@ -1248,9 +1759,21 @@ def _hard_composite(
 def _inpainting_prompt(
     reference: dict[str, object],
     mode: str,
+    *,
+    background_fill_prompt: str | None = None,
 ) -> str:
     if mode == "background_hole_fill":
-        return BACKGROUND_INPAINT_PROMPT
+        fill_prompt = (
+            BACKGROUND_INPAINT_PROMPT
+            if background_fill_prompt is None
+            else background_fill_prompt
+        )
+        normalized = fill_prompt.rstrip(" .")
+        return (
+            f"{normalized}. {BACKGROUND_INPAINT_SUFFIX}"
+            if normalized
+            else BACKGROUND_INPAINT_SUFFIX
+        )
     return ENTITY_INPAINT_PROMPT.format(
         description=str(
             reference.get("phrase")
@@ -1258,6 +1781,100 @@ def _inpainting_prompt(
             or "the subject"
         )
     )
+
+
+def _background_forbidden_texts(
+    reference: dict[str, object],
+    output_root: Path,
+) -> list[str]:
+    values = [
+        str(reference.get("phrase") or ""),
+        str(reference.get("canonical_label") or ""),
+    ]
+    clip_uid = str(reference.get("clip_uid") or "")
+    annotation_path = output_root / "annotations" / f"{clip_uid}.json"
+    if annotation_path.is_file():
+        try:
+            annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            annotation = None
+        if isinstance(annotation, dict):
+            values.extend(
+                str(annotation.get(key) or "")
+                for key in ("caption", "video_summary")
+            )
+            entities = annotation.get("entities")
+            if isinstance(entities, list):
+                for entity in entities:
+                    if isinstance(entity, dict):
+                        values.extend(
+                            str(entity.get(key) or "")
+                            for key in (
+                                "canonical_label",
+                                "reference_phrase",
+                                "grounding_prompt",
+                            )
+                        )
+    return list(dict.fromkeys(value for value in values if value.strip()))
+
+
+def _resolve_background_fill_prompt(
+    *,
+    config: PipelineConfig,
+    reference: dict[str, object],
+    original_path: Path,
+    generation_mask_path: Path,
+    generator: BackgroundFillPromptGenerator | None,
+) -> tuple[str, dict[str, object]]:
+    prompt_mode = config.inpainting.background.prompt_mode
+    if prompt_mode == "generic":
+        return BACKGROUND_INPAINT_PROMPT, {
+            "source": "generic",
+            "visible_background_elements": [],
+            "reason": "configured deterministic generic prompt",
+            "validator": {"validation": "not_requested"},
+        }
+    active_generator = generator
+    if active_generator is None:
+        repair_judge = _qwen_services(config.qwen).repair_judge
+        if repair_judge is not None:
+            active_generator = QwenBackgroundFillPromptGenerator(repair_judge)
+    if active_generator is None:
+        return BACKGROUND_INPAINT_PROMPT, {
+            "source": "generic_fallback",
+            "visible_background_elements": [],
+            "reason": "background prompt generator unavailable",
+            "validator": {
+                "validation": "failed",
+                "error": "background_prompt_generator_unavailable",
+            },
+        }
+    forbidden_texts = _background_forbidden_texts(
+        reference,
+        config.output_root,
+    )
+    try:
+        result, validator_metadata = active_generator.generate(
+            original_path=original_path,
+            generation_mask_path=generation_mask_path,
+            forbidden_texts=forbidden_texts,
+        )
+        return result.fill_prompt.strip(), {
+            "source": "qwen_local_background",
+            "visible_background_elements": result.visible_background_elements,
+            "reason": result.reason,
+            "validator": validator_metadata,
+        }
+    except StructuredOutputFailure as exc:
+        error: object = exc.to_dict()
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
+    return BACKGROUND_INPAINT_PROMPT, {
+        "source": "generic_fallback",
+        "visible_background_elements": [],
+        "reason": "Qwen background prompt generation failed validation",
+        "validator": {"validation": "failed", "error": error},
+    }
 
 
 def _reference_artifacts(output_root: Path) -> list[Path]:
@@ -1442,6 +2059,9 @@ def _clear_stale_inpainting_artifacts(artifact: Path) -> None:
         "inpainting_metadata.json",
     ):
         (artifact.parent / filename).unlink(missing_ok=True)
+    candidate_root = artifact.parent / "inpainting_candidates"
+    if candidate_root.is_dir():
+        shutil.rmtree(candidate_root)
 
 
 def _publish_rejection(
@@ -1570,6 +2190,7 @@ def run_inpainting(
     backend: InpaintBackend | None = None,
     validator: ConsistencyValidator | None = None,
     dino_embedder: DinoV3Embedder | None = None,
+    background_prompt_generator: BackgroundFillPromptGenerator | None = None,
 ) -> InpaintingStats:
     if not config.inpainting.enabled:
         return InpaintingStats(skipped_disabled=1)
@@ -1818,70 +2439,288 @@ def run_inpainting(
                 repair_mask_image,
                 artifact.parent / "repair_mask.png",
             )
-            generated_image = engine.inpaint(
-                image=original_image,
-                mask=repair_mask_image,
-                prompt=_inpainting_prompt(reference, mode),
-                seed=config.inpainting.seed,
-            ).convert("RGB")
-            generated = np.asarray(generated_image)
-            final, feather_ring = _hard_composite(
-                original=original,
-                generated=generated,
-                core_mask=repair_mask,
-                feather_pixels=config.inpainting.feather_pixels,
+            fill_prompt: str | None = None
+            fill_prompt_metadata: dict[str, object] | None = None
+            if mode == "background_hole_fill":
+                if generation_mask_path is None:
+                    raise RuntimeError("background generation mask was not saved")
+                fill_prompt, fill_prompt_metadata = (
+                    _resolve_background_fill_prompt(
+                        config=config,
+                        reference=reference,
+                        original_path=raw_path,
+                        generation_mask_path=generation_mask_path,
+                        generator=background_prompt_generator,
+                    )
+                )
+            production_prompt = _inpainting_prompt(
+                reference,
+                mode,
+                background_fill_prompt=fill_prompt,
             )
+            candidate_seeds = (
+                config.inpainting.background.candidate_seeds
+                if mode == "background_hole_fill"
+                else [config.inpainting.seed]
+            )
+            candidate_records: list[dict[str, object]] = []
+            candidate_arrays: dict[int, np.ndarray] = {}
+            selected_candidate_index: int | None = None
+            source_mask = _read_mask(source_mask_path, original.shape[:2])
+            for candidate_index, seed in enumerate(candidate_seeds):
+                candidate_dir = (
+                    artifact.parent
+                    / "inpainting_candidates"
+                    / f"candidate_{candidate_index:02d}_seed_{seed}"
+                )
+                seed_candidate_path = candidate_dir / "candidate.png"
+                record: dict[str, object] = {
+                    "candidate_index": candidate_index,
+                    "seed": seed,
+                    "guidance_scale": config.inpainting.guidance_scale,
+                    "num_inference_steps": config.inpainting.num_inference_steps,
+                    "strength": config.inpainting.strength,
+                    "max_sequence_length": (
+                        config.inpainting.max_sequence_length
+                    ),
+                    "candidate_path": str(seed_candidate_path),
+                    "prompt_sha256": _sha256_text(production_prompt),
+                    "accepted": False,
+                    "rejection_reasons": [],
+                }
+                try:
+                    generated_image = engine.inpaint(
+                        image=original_image,
+                        mask=repair_mask_image,
+                        prompt=production_prompt,
+                        seed=seed,
+                    ).convert("RGB")
+                    generated = np.asarray(generated_image)
+                    final, feather_ring = _hard_composite(
+                        original=original,
+                        generated=generated,
+                        core_mask=repair_mask,
+                        feather_pixels=config.inpainting.feather_pixels,
+                    )
+                    _save_lossless_atomic(
+                        Image.fromarray(final),
+                        seed_candidate_path,
+                    )
+                    protected = ~(repair_mask | feather_ring)
+                    unmasked_l1_diff = (
+                        float(
+                            np.abs(
+                                original[protected].astype(np.float32)
+                                - final[protected].astype(np.float32)
+                            ).mean()
+                        )
+                        if protected.any()
+                        else 0.0
+                    )
+                    diagnostics: dict[str, object] = {}
+                    if mode == "background_hole_fill":
+                        diagnostics = _background_pixel_diagnostics(
+                            original=original,
+                            repaired=final,
+                            source_mask=source_mask,
+                            generation_mask=repair_mask,
+                            destination=candidate_dir
+                            / "difference_heatmap.png",
+                        )
+                    if isinstance(
+                        active_validator,
+                        ProductionConsistencyValidator,
+                    ):
+                        validation = active_validator(
+                            original=original_image,
+                            repaired=Image.fromarray(final),
+                            repair_mask=repair_mask_image,
+                            reference=reference,
+                            mode=mode,
+                            diagnostics_dir=(
+                                candidate_dir
+                                if mode == "background_hole_fill"
+                                else None
+                            ),
+                        )
+                    else:
+                        validation = active_validator(
+                            original=original_image,
+                            repaired=Image.fromarray(final),
+                            repair_mask=repair_mask_image,
+                            reference=reference,
+                            mode=mode,
+                        )
+                    rejection_reasons = [
+                        str(reason)
+                        for reason in validation.get(
+                            "rejection_reasons", []
+                        )
+                    ]
+                    if (
+                        unmasked_l1_diff
+                        > config.inpainting.consistency.maximum_unmasked_l1_diff
+                    ):
+                        rejection_reasons.append(
+                            "unmasked_pixel_difference"
+                        )
+                    dino_similarity_value = validation.get("dino_similarity")
+                    dino_similarity = (
+                        float(dino_similarity_value)
+                        if isinstance(dino_similarity_value, (int, float))
+                        else None
+                    )
+                    if (
+                        mode == "entity_local_repair"
+                        and dino_similarity is not None
+                        and dino_similarity
+                        < config.inpainting.consistency.minimum_dino_similarity
+                    ):
+                        rejection_reasons.append("dino_similarity")
+                    if validation.get("accepted") is not True:
+                        rejection_reasons.append("consistency_validator")
+                    if isinstance(engine, NoOpInpaintBackend):
+                        rejection_reasons.append("noop_backend_test_only")
+                    rejection_reasons = list(
+                        dict.fromkeys(rejection_reasons)
+                    )
+                    record.update(
+                        {
+                            **diagnostics,
+                            "unmasked_l1_diff": unmasked_l1_diff,
+                            "dino_similarity": dino_similarity,
+                            "accepted": not rejection_reasons,
+                            "rejection_reasons": rejection_reasons,
+                            "validator": validation,
+                        }
+                    )
+                    candidate_arrays[candidate_index] = final
+                except InpaintingDependencyError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    record.update(
+                        {
+                            "rejection_reasons": [
+                                "candidate_generation_or_validation_failed"
+                            ],
+                            "error": str(exc),
+                        }
+                    )
+                validator_payload = record.get("validator")
+                record["source_signature"] = {
+                    **source_signature,
+                    "fill_prompt_sha256": (
+                        _sha256_text(fill_prompt)
+                        if fill_prompt is not None
+                        else None
+                    ),
+                    "production_prompt_sha256": _sha256_text(
+                        production_prompt
+                    ),
+                    "prompt_source": (
+                        fill_prompt_metadata.get("source")
+                        if fill_prompt_metadata is not None
+                        else "entity_template"
+                    ),
+                    "seed": seed,
+                    "guidance_scale": config.inpainting.guidance_scale,
+                    "num_inference_steps": (
+                        config.inpainting.num_inference_steps
+                    ),
+                    "candidate_index": candidate_index,
+                    "comparison_sheet_fingerprints": (
+                        validator_payload.get(
+                            "comparison_sheet_fingerprints"
+                        )
+                        if isinstance(validator_payload, dict)
+                        else None
+                    ),
+                    "diagnostics": {
+                        key: record.get(key)
+                        for key in (
+                            "masked_mean_l1",
+                            "masked_changed_pixel_ratio",
+                            "generation_mask_changed_pixel_ratio",
+                            "boundary_ring_mean_l1",
+                        )
+                        if key in record
+                    },
+                }
+                candidate_records.append(record)
+                if record["accepted"] is True and (
+                    mode != "background_hole_fill"
+                    or config.inpainting.background.stop_after_first_accepted
+                ):
+                    selected_candidate_index = candidate_index
+                    break
+            accepted_records = [
+                record
+                for record in candidate_records
+                if record.get("accepted") is True
+            ]
+            if (
+                selected_candidate_index is None
+                and accepted_records
+            ):
+                selected = max(
+                    accepted_records,
+                    key=lambda record: (
+                        float(record.get("dino_similarity") or -1.0),
+                        float(record.get("masked_changed_pixel_ratio") or 0.0),
+                        -int(record["candidate_index"]),
+                    ),
+                )
+                selected_candidate_index = int(
+                    selected["candidate_index"]
+                )
+            debug_record = (
+                next(
+                    (
+                        record
+                        for record in candidate_records
+                        if record["candidate_index"]
+                        == selected_candidate_index
+                    ),
+                    None,
+                )
+                or (candidate_records[-1] if candidate_records else None)
+            )
+            if debug_record is None:
+                raise RuntimeError("inpainting produced no candidate records")
             candidate_destination = (
                 artifact.parent / "canonical_repaired_candidate.png"
             )
-            _save_lossless_atomic(Image.fromarray(final), candidate_destination)
+            debug_candidate_path = Path(str(debug_record["candidate_path"]))
+            if debug_candidate_path.is_file():
+                _copy_atomic(debug_candidate_path, candidate_destination)
             candidate_path = candidate_destination
-            protected = ~(repair_mask | feather_ring)
-            unmasked_l1_diff = (
-                float(
-                    np.abs(
-                        original[protected].astype(np.float32)
-                        - final[protected].astype(np.float32)
-                    ).mean()
+            selected_record = next(
+                (
+                    record
+                    for record in candidate_records
+                    if record["candidate_index"] == selected_candidate_index
+                ),
+                debug_record,
+            )
+            accepted = selected_candidate_index is not None
+            rejection_reasons = (
+                []
+                if accepted
+                else list(
+                    dict.fromkeys(
+                        str(reason)
+                        for record in candidate_records
+                        for reason in record.get("rejection_reasons", [])
+                    )
                 )
-                if protected.any()
-                else 0.0
             )
-            validation = active_validator(
-                original=original_image,
-                repaired=Image.fromarray(final),
-                repair_mask=repair_mask_image,
-                reference=reference,
-                mode=mode,
-            )
-            rejection_reasons = [
-                str(reason)
-                for reason in validation.get("rejection_reasons", [])
-            ]
-            if (
-                unmasked_l1_diff
-                > config.inpainting.consistency.maximum_unmasked_l1_diff
-            ):
-                rejection_reasons.append("unmasked_pixel_difference")
-            dino_similarity_value = validation.get("dino_similarity")
+            final = candidate_arrays.get(int(selected_record["candidate_index"]))
+            dino_similarity_value = selected_record.get("dino_similarity")
             dino_similarity = (
                 float(dino_similarity_value)
                 if isinstance(dino_similarity_value, (int, float))
                 else None
             )
-            if (
-                mode == "entity_local_repair"
-                and dino_similarity is not None
-                and dino_similarity
-                < config.inpainting.consistency.minimum_dino_similarity
-            ):
-                rejection_reasons.append("dino_similarity")
-            if validation.get("accepted") is not True:
-                rejection_reasons.append("consistency_validator")
-            if isinstance(engine, NoOpInpaintBackend):
-                rejection_reasons.append("noop_backend_test_only")
-            rejection_reasons = list(dict.fromkeys(rejection_reasons))
-            accepted = not rejection_reasons
             metadata = _metadata_base(
                 config=config.inpainting,
                 mode=mode,
@@ -1895,15 +2734,107 @@ def run_inpainting(
             metadata.update(
                 {
                     "candidate_path": str(candidate_path),
-                    "unmasked_l1_diff": unmasked_l1_diff,
+                    "candidates": candidate_records,
+                    "selected_candidate_index": selected_candidate_index,
+                    "selected_seed": (
+                        selected_record.get("seed") if accepted else None
+                    ),
+                    "seed": (
+                        selected_record.get("seed")
+                        if accepted
+                        else config.inpainting.seed
+                    ),
+                    "guidance_scale": config.inpainting.guidance_scale,
+                    "num_inference_steps": (
+                        config.inpainting.num_inference_steps
+                    ),
+                    "fill_prompt": fill_prompt,
+                    "production_prompt": production_prompt,
+                    "prompt_source": (
+                        fill_prompt_metadata.get("source")
+                        if fill_prompt_metadata is not None
+                        else "entity_template"
+                    ),
+                    "prompt_metadata": fill_prompt_metadata,
+                    "fill_prompt_sha256": (
+                        _sha256_text(fill_prompt)
+                        if fill_prompt is not None
+                        else None
+                    ),
+                    "unmasked_l1_diff": selected_record.get(
+                        "unmasked_l1_diff", 0.0
+                    ),
                     "dino_similarity": dino_similarity,
                     "accepted": accepted,
                     "rejection_reasons": rejection_reasons,
-                    "validator": validation,
+                    "validator": selected_record.get("validator"),
+                    "diagnostics": {
+                        key: selected_record.get(key)
+                        for key in (
+                            "masked_mean_l1",
+                            "masked_changed_pixel_ratio",
+                            "generation_mask_changed_pixel_ratio",
+                            "boundary_ring_mean_l1",
+                            "difference_heatmap_path",
+                        )
+                        if key in selected_record
+                    },
+                    "selected_candidate_source_signature": (
+                        {
+                            **source_signature,
+                            "fill_prompt_sha256": (
+                                _sha256_text(fill_prompt)
+                                if fill_prompt is not None
+                                else None
+                            ),
+                            "production_prompt_sha256": _sha256_text(
+                                production_prompt
+                            ),
+                            "prompt_source": (
+                                fill_prompt_metadata.get("source")
+                                if fill_prompt_metadata is not None
+                                else "entity_template"
+                            ),
+                            "seed": selected_record.get("seed"),
+                            "guidance_scale": (
+                                config.inpainting.guidance_scale
+                            ),
+                            "num_inference_steps": (
+                                config.inpainting.num_inference_steps
+                            ),
+                            "candidate_index": selected_record.get(
+                                "candidate_index"
+                            ),
+                            "comparison_sheet_fingerprints": (
+                                (
+                                    selected_record.get("validator")
+                                    if isinstance(
+                                        selected_record.get("validator"),
+                                        dict,
+                                    )
+                                    else {}
+                                ).get("comparison_sheet_fingerprints")
+                            ),
+                            "diagnostics": {
+                                key: selected_record.get(key)
+                                for key in (
+                                    "masked_mean_l1",
+                                    "masked_changed_pixel_ratio",
+                                    "generation_mask_changed_pixel_ratio",
+                                    "boundary_ring_mean_l1",
+                                )
+                                if key in selected_record
+                            },
+                        }
+                        if accepted
+                        else None
+                    ),
                     "lossless_storage": True,
                 }
             )
             if accepted:
+                if final is None:
+                    raise RuntimeError("selected inpainting candidate is missing")
                 repaired_path = artifact.parent / "canonical_repaired.png"
                 _copy_atomic(candidate_path, repaired_path)
                 (artifact.parent / "canonical_repaired.jpg").unlink(

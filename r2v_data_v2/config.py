@@ -313,6 +313,11 @@ class InpaintingBackgroundConfig:
     enabled: bool = True
     maximum_hole_area_ratio: float = 0.23
     maximum_generation_mask_area_ratio: float = 0.35
+    prompt_mode: str = "qwen_local_background"
+    candidate_seeds: list[int] = field(
+        default_factory=lambda: [0, 17, 42, 123]
+    )
+    stop_after_first_accepted: bool = True
 
 
 @dataclass(frozen=True)
@@ -342,9 +347,12 @@ class InpaintingConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
     seed: int = 42
-    num_inference_steps: int = 28
+    num_inference_steps: int = 50
     guidance_scale: float = 30.0
-    mask_dilation_pixels: int = 8
+    strength: float = 1.0
+    max_sequence_length: int = 512
+    mask_dilation_pixels: int = 16
+    adaptive_mask_dilation_ratio: float = 0.04
     feather_pixels: int = 4
     top_k_per_reference: int = 2
     background: InpaintingBackgroundConfig = field(
@@ -814,8 +822,16 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("inpainting.num_inference_steps must be positive")
     if config.inpainting.guidance_scale < 0:
         raise ValueError("inpainting.guidance_scale must be non-negative")
+    if not 0.0 < config.inpainting.strength <= 1.0:
+        raise ValueError("inpainting.strength must be between 0 and 1")
+    if config.inpainting.max_sequence_length < 1:
+        raise ValueError("inpainting.max_sequence_length must be positive")
     if config.inpainting.mask_dilation_pixels < 0:
         raise ValueError("inpainting.mask_dilation_pixels must be non-negative")
+    if not 0.0 <= config.inpainting.adaptive_mask_dilation_ratio <= 1.0:
+        raise ValueError(
+            "inpainting.adaptive_mask_dilation_ratio must be between 0 and 1"
+        )
     if config.inpainting.feather_pixels < 0:
         raise ValueError("inpainting.feather_pixels must be non-negative")
     if config.inpainting.top_k_per_reference < 1:
@@ -823,6 +839,32 @@ def _validate_config(config: PipelineConfig) -> None:
     if not config.inpainting.consistency.preserve_unmasked_pixels:
         raise ValueError(
             "inpainting.consistency.preserve_unmasked_pixels must remain true"
+        )
+    if config.inpainting.background.prompt_mode not in {
+        "generic",
+        "qwen_local_background",
+    }:
+        raise ValueError(
+            "inpainting.background.prompt_mode must be generic or "
+            "qwen_local_background"
+        )
+    if not config.inpainting.background.candidate_seeds:
+        raise ValueError(
+            "inpainting.background.candidate_seeds must not be empty"
+        )
+    if any(
+        not isinstance(seed, int) or seed < 0
+        for seed in config.inpainting.background.candidate_seeds
+    ):
+        raise ValueError(
+            "inpainting.background.candidate_seeds must contain "
+            "non-negative integers"
+        )
+    if len(set(config.inpainting.background.candidate_seeds)) != len(
+        config.inpainting.background.candidate_seeds
+    ):
+        raise ValueError(
+            "inpainting.background.candidate_seeds must be unique"
         )
     for field_name, value in (
         (

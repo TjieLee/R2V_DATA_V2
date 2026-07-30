@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -119,10 +120,33 @@ class InpaintingSemanticReview(SchemaModel):
     reason: str
 
 
+class BackgroundFillPrompt(SchemaModel):
+    fill_prompt: str
+    visible_background_elements: list[str]
+    reason: str
+
+
+class MaskedContentOutcome(str, Enum):
+    REMOVED_TO_BACKGROUND = "removed_to_background"
+    FOREGROUND_REMAINS = "foreground_remains"
+    FOREGROUND_RECONSTRUCTED = "foreground_reconstructed"
+    REPLACED_BY_NEW_OBJECT = "replaced_by_new_object"
+    UNCERTAIN = "uncertain"
+
+
+class BackgroundArtifactType(str, Enum):
+    VISIBLE_SEAM = "visible_seam"
+    GHOSTING = "ghosting"
+    DOUBLE_EXPOSURE = "double_exposure"
+    INSET_IMAGE = "inset_image"
+    TEXTURE_DISCONTINUITY = "texture_discontinuity"
+    ARTIFICIAL_BLOB = "artificial_blob"
+    COLOR_OR_EXPOSURE_MISMATCH = "color_or_exposure_mismatch"
+
+
 class BackgroundInpaintingReview(SchemaModel):
+    masked_content_outcome: MaskedContentOutcome
     background_continuity_preserved: bool
-    masked_foreground_removed: bool
     reference_phrase_supported: bool
-    new_salient_objects: bool
-    visible_seam_or_artifact: bool
+    artifact_types: list[BackgroundArtifactType]
     reason: str

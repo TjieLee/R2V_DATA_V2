@@ -156,15 +156,21 @@ inpainting:
   device: cuda
   dtype: bfloat16
   seed: 42
-  num_inference_steps: 28
+  num_inference_steps: 50
   guidance_scale: 30.0
-  mask_dilation_pixels: 8
+  strength: 1.0
+  max_sequence_length: 512
+  mask_dilation_pixels: 16
+  adaptive_mask_dilation_ratio: 0.04
   feather_pixels: 4
   top_k_per_reference: 2
   background:
     enabled: true
     maximum_hole_area_ratio: 0.23
     maximum_generation_mask_area_ratio: 0.35
+    prompt_mode: qwen_local_background
+    candidate_seeds: [0, 17, 42, 123]
+    stop_after_first_accepted: true
   entity:
     enabled: false
     maximum_repair_area_ratio: 0.08

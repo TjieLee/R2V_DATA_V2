@@ -1,41 +1,61 @@
 BACKGROUND_INPAINTING_REVIEW_PROMPT = """
-Review a background hole-fill result using the three supplied images.
-The first image is the original image, which intentionally contains a
-foreground object inside the white mask. The second image is the repaired
-image, where that masked foreground is expected to be removed. The third image
-is the exact repair mask.
+Review a background hole-fill result using four supplied images:
+1. the original full image;
+2. the repaired full image;
+3. the exact white generation mask;
+4. a pixel-aligned comparison sheet with mask overlays, absolute-difference
+   heatmap, and enlarged boundary-ring comparison.
 
-Removal of the masked foreground is expected and is not a semantic
-inconsistency. Inspect whether the repaired region coherently continues the
-surrounding background, including perspective, lighting, color, depth, and
-texture. The repaired background must still support this reference phrase:
+The original intentionally contains foreground content inside the white mask.
+The repaired image must replace that masked content with plausible background
+that continues the surrounding geometry, perspective, texture, color,
+lighting, depth, and atmosphere. The repaired full image must still support
+this global reference phrase:
 {reference_phrase}
 
-Reject the result if the original masked foreground remains, another entity
-replaces it, any new salient object is introduced, or an obvious seam or visual
-artifact is visible.
+A visually similar reconstruction of the original masked content is a failure,
+even when it looks natural in the scene. Reconstructing the same mountain
+slope, tree, person, animal, vehicle, vessel, product, or other salient
+structure is foreground_reconstructed, not foreground removal. A different
+salient entity in the mask is replaced_by_new_object.
+
+Select exactly one masked_content_outcome. Use uncertain when the comparison is
+ambiguous. Record every visible artifact in artifact_types. The categorical
+outcome, artifact_types, and reason must agree with the visual evidence.
 
 Return only the requested JSON structure.
 """.strip()
 
 
 BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT = """
-Review a local crop around a background hole-fill using the three supplied
-images. The first image is the original crop, the second is the repaired crop,
-and the third is the generation mask crop. White mask pixels identify the
-region expected to become coherent background. The full-frame review alone
-determines whether the global reference phrase is supported:
-{reference_phrase}
-Do not reject this local crop merely because that phrase is not visible here.
+Review one connected-component crop from a background hole-fill using four
+supplied images:
+1. the original crop;
+2. the repaired crop;
+3. the component's white generation mask;
+4. a pixel-aligned comparison sheet with mask overlays, absolute-difference
+   heatmap, and enlarged boundary-ring comparison.
 
-Inspect the masked region and its immediate boundary closely. Reject if any
-person, animal, vehicle, vessel, product, face, body silhouette, or other
-distinct foreground object lies inside or meaningfully overlaps the white
-repair mask, or if such an object is newly introduced in the repaired image.
-Do not reject an object that appears only in the surrounding contextual pixels
-and was already present in the original crop. Also reject any blurred ghost,
-repeated texture, inset image, artificial blob, visible boundary, seam, or
-other local artifact inside the repair mask or along its boundary.
+The full-frame review alone determines whether this global reference phrase is
+supported:
+{reference_phrase}
+Do not reject the local crop merely because that phrase is not visible here.
+
+The white component must become plausible background continuing the adjacent
+pixels. A visually similar reconstruction of the original masked content is a
+failure, even when natural-looking. Reconstructing the same mountain slope,
+tree, person, animal, vehicle, vessel, product, or other salient structure is
+foreground_reconstructed. A different salient entity is
+replaced_by_new_object. Do not reject an unchanged object that appears only in
+the surrounding context and does not meaningfully overlap the white mask.
+Inside or meaningfully overlapping the white mask, inspect whether any person,
+animal, vehicle, vessel, product, face, body silhouette, or other distinct
+foreground content remains or newly appears.
+
+Select exactly one masked_content_outcome. Use uncertain when evidence is
+ambiguous. Record every seam, ghost, double exposure, inset image, texture
+discontinuity, artificial blob, or color/exposure mismatch in artifact_types.
+The outcome, artifact_types, and reason must agree with the comparison sheet.
 
 Return only the requested JSON structure.
 """.strip()

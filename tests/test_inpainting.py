@@ -24,18 +24,28 @@ from r2v_data_v2.config import (
     SiglipEvaluatorConfig,
 )
 from r2v_data_v2.inpainting import (
+    BACKGROUND_INPAINT_PROMPT,
     Flux1FillBackend,
     InpaintingDependencyError,
     NoOpInpaintBackend,
     ProductionConsistencyValidator,
+    QwenBackgroundFillPromptGenerator,
     QwenInpaintingConsistencyJudge,
+    _background_fill_prompt_issues,
     _background_generation_mask,
     _inpainting_prompt,
     run_inpainting,
 )
 from r2v_data_v2.schemas import (
+    BackgroundArtifactType,
+    BackgroundFillPrompt,
     BackgroundInpaintingReview,
     InpaintingSemanticReview,
+    MaskedContentOutcome,
+)
+from r2v_data_v2.structured_output import (
+    StructuredOutputFailure,
+    ValidationIssue,
 )
 
 
@@ -175,6 +185,9 @@ def _config(
     maximum_generation_mask_area_ratio: float = 0.35,
     entity_enabled: bool = False,
     enabled: bool = True,
+    prompt_mode: str = "generic",
+    candidate_seeds: list[int] | None = None,
+    stop_after_first_accepted: bool = True,
 ) -> PipelineConfig:
     return PipelineConfig(
         dataset_json=tmp_path / "source.jsonl",
@@ -190,6 +203,9 @@ def _config(
                 maximum_generation_mask_area_ratio=(
                     maximum_generation_mask_area_ratio
                 ),
+                prompt_mode=prompt_mode,
+                candidate_seeds=candidate_seeds or [42],
+                stop_after_first_accepted=stop_after_first_accepted,
             ),
             entity=InpaintingEntityConfig(
                 enabled=entity_enabled,
@@ -267,6 +283,11 @@ def test_background_flux_rejects_dino_siglip_without_repair_judge(
         inpainting=InpaintingConfig(
             enabled=True,
             backend="flux1_fill",
+            mask_dilation_pixels=1,
+            background=InpaintingBackgroundConfig(
+                prompt_mode="generic",
+                candidate_seeds=[42],
+            ),
         ),
     )
 
@@ -293,6 +314,11 @@ def test_background_flux_with_repair_judge_is_allowed(tmp_path: Path) -> None:
         inpainting=InpaintingConfig(
             enabled=True,
             backend="flux1_fill",
+            mask_dilation_pixels=1,
+            background=InpaintingBackgroundConfig(
+                prompt_mode="generic",
+                candidate_seeds=[42],
+            ),
         ),
     )
     mask = np.zeros((32, 32), dtype=bool)
@@ -404,7 +430,7 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "5"
+    assert inpainting_metadata["source_metadata_version"] == "6"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
     assert (
         len(inpainting_metadata["local_consistency_prompt_sha256"]) == 64
@@ -788,10 +814,7 @@ def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
         prompt for prompt in backend.prompts if "background scenery" in prompt
     )
     lowered = background_prompt.casefold()
-    assert background_prompt.startswith(
-        "The masked region is filled entirely with continuous background "
-        "scenery and textures matching the surrounding environment."
-    )
+    assert background_prompt.startswith("Continuous background scenery")
     assert len(background_prompt.split()) < 60
     for prohibited in (
         "remove",
@@ -826,6 +849,252 @@ def test_background_generation_prompt_ignores_reference_phrase() -> None:
         "do not",
     ):
         assert prohibited not in lowered
+
+
+def test_qwen_background_fill_prompt_is_validated_and_uses_only_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = QwenBackgroundFillPromptGenerator(QwenConfig())
+    captured: list[dict[str, object]] = []
+    response = BackgroundFillPrompt(
+        fill_prompt=(
+            "Weathered stone paving continues across the courtyard with soft "
+            "overcast light, shallow perspective, muted gray texture, and "
+            "natural depth"
+        ),
+        visible_background_elements=["stone paving", "overcast light"],
+        reason="The adjacent paving establishes the continuation.",
+    )
+
+    def fake_request(**kwargs: object) -> str:
+        captured.append(dict(kwargs))
+        return response.model_dump_json()
+
+    monkeypatch.setattr(generator, "_request", fake_request)
+    result, metadata = generator.generate(
+        original_path=tmp_path / "original.png",
+        generation_mask_path=tmp_path / "mask.png",
+        forbidden_texts=["a person with a whale near a ship"],
+    )
+
+    assert result == response
+    assert metadata["validation"] == "passed"
+    assert len(captured) == 1
+    assert "a person" not in str(captured[0]["prompt"])
+    assert captured[0]["original_path"] == tmp_path / "original.png"
+    assert captured[0]["generation_mask_path"] == tmp_path / "mask.png"
+
+
+@pytest.mark.parametrize(
+    "fill_prompt",
+    [
+        pytest.param(
+            "Remove the person and leave empty paving across the masked hole",
+            id="negative-and-banned",
+        ),
+        pytest.param(
+            "A whale person ship fish continues across textured blue water "
+            "under soft daylight with realistic depth and perspective",
+            id="foreground-terms",
+        ),
+        pytest.param(
+            "A person beside a ship",
+            id="too-short-and-copied",
+        ),
+    ],
+)
+def test_background_fill_prompt_rejects_prohibited_or_copied_text(
+    fill_prompt: str,
+) -> None:
+    issues = _background_fill_prompt_issues(
+        BackgroundFillPrompt(
+            fill_prompt=fill_prompt,
+            visible_background_elements=[],
+            reason="test",
+        ),
+        forbidden_texts=["a person beside a ship"],
+    )
+
+    assert issues
+
+
+def test_qwen_background_fill_failure_uses_deterministic_generic_fallback(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        prompt_mode="qwen_local_background",
+    )
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    class _FailingPromptGenerator:
+        def generate(self, **kwargs: object) -> object:
+            del kwargs
+            raise StructuredOutputFailure(
+                raw_responses=["bad"],
+                issues=[
+                    ValidationIssue(
+                        code="background_fill_prohibited_terms",
+                        field="fill_prompt",
+                        message="contains person",
+                    )
+                ],
+            )
+
+    backend = _WholeImageBackend()
+    stats = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+        background_prompt_generator=_FailingPromptGenerator(),  # type: ignore[arg-type]
+    )
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert stats.repaired == 1
+    assert backend.prompts == [
+        _inpainting_prompt(
+            {},
+            "background_hole_fill",
+            background_fill_prompt=BACKGROUND_INPAINT_PROMPT,
+        )
+    ]
+    assert metadata["prompt_source"] == "generic_fallback"
+    assert metadata["prompt_metadata"]["validator"]["validation"] == "failed"
+
+
+def test_background_best_of_n_publishes_only_an_accepted_candidate(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, candidate_seeds=[0, 17, 42])
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    class _SeedBackend:
+        def __init__(self) -> None:
+            self.seeds: list[int] = []
+
+        def inpaint(
+            self,
+            *,
+            image: Image.Image,
+            mask: Image.Image,
+            prompt: str,
+            seed: int,
+        ) -> Image.Image:
+            del mask, prompt
+            self.seeds.append(seed)
+            color = {0: 10, 17: 20, 42: 30}[seed]
+            return Image.new("RGB", image.size, (color, color, color))
+
+    def validator(**kwargs: object) -> dict[str, object]:
+        repaired = np.asarray(kwargs["repaired"])
+        accepted = int(repaired[14, 14, 0]) == 30
+        return {
+            "accepted": accepted,
+            "dino_similarity": 0.9 if accepted else 0.1,
+            "rejection_reasons": [] if accepted else ["categorical_review"],
+        }
+
+    backend = _SeedBackend()
+    stats = run_inpainting(
+        config,
+        backend=backend,
+        validator=validator,
+    )
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert stats.repaired == 1
+    assert backend.seeds == [0, 17, 42]
+    assert metadata["selected_seed"] == 42
+    assert metadata["selected_candidate_index"] == 2
+    assert [candidate["accepted"] for candidate in metadata["candidates"]] == [
+        False,
+        False,
+        True,
+    ]
+    assert all(
+        Path(candidate["candidate_path"]).is_file()
+        for candidate in metadata["candidates"]
+    )
+    assert Path(metadata["candidate_path"]).is_file()
+    assert Path(
+        json.loads(artifact.read_text(encoding="utf-8"))["canonical_path"]
+    ).read_bytes() == Path(metadata["candidate_path"]).read_bytes()
+
+
+def test_background_best_of_n_can_rank_all_accepted_candidates(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        candidate_seeds=[0, 17, 42],
+        stop_after_first_accepted=False,
+    )
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    class _SeedBackend:
+        def inpaint(self, **kwargs: object) -> Image.Image:
+            image = kwargs["image"]
+            seed = int(kwargs["seed"])
+            assert isinstance(image, Image.Image)
+            color = {0: 10, 17: 20, 42: 30}[seed]
+            return Image.new("RGB", image.size, (color, color, color))
+
+    def validator(**kwargs: object) -> dict[str, object]:
+        repaired = np.asarray(kwargs["repaired"])
+        return {
+            "accepted": True,
+            "dino_similarity": float(repaired[14, 14, 0]) / 100.0,
+            "rejection_reasons": [],
+        }
+
+    stats = run_inpainting(
+        config,
+        backend=_SeedBackend(),
+        validator=validator,
+    )
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert stats.repaired == 1
+    assert len(metadata["candidates"]) == 3
+    assert all(candidate["accepted"] for candidate in metadata["candidates"])
+    assert metadata["selected_seed"] == 42
 
 
 def test_entity_repair_regenerates_mask_derived_artifacts_and_dino(
@@ -1029,6 +1298,9 @@ def test_flux_pads_non_square_inputs_and_unpads_output() -> None:
     assert pipeline.call["height"] == 32
     assert pipeline.call["image"].size == (48, 32)
     assert pipeline.call["mask_image"].size == (48, 32)
+    assert pipeline.call["strength"] == 1.0
+    assert pipeline.call["max_sequence_length"] == 512
+    assert pipeline.call["num_inference_steps"] == 50
     assert result.size == (37, 23)
 
 
@@ -1099,13 +1371,22 @@ def _background_review(
     **overrides: object,
 ) -> BackgroundInpaintingReview:
     values: dict[str, object] = {
+        "masked_content_outcome": "removed_to_background",
         "background_continuity_preserved": True,
-        "masked_foreground_removed": True,
         "reference_phrase_supported": True,
-        "new_salient_objects": False,
-        "visible_seam_or_artifact": False,
+        "artifact_types": [],
         "reason": "coherent background replacement",
     }
+    if overrides.pop("masked_foreground_removed", True) is False:
+        values["masked_content_outcome"] = (
+            MaskedContentOutcome.FOREGROUND_REMAINS
+        )
+    if overrides.pop("new_salient_objects", False) is True:
+        values["masked_content_outcome"] = (
+            MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
+        )
+    if overrides.pop("visible_seam_or_artifact", False) is True:
+        values["artifact_types"] = [BackgroundArtifactType.VISIBLE_SEAM]
     values.update(overrides)
     return BackgroundInpaintingReview.model_validate(values)
 
@@ -1144,11 +1425,10 @@ def test_qwen_uses_dedicated_background_review_prompt_and_schema(
         for request in captured
     )
     full_prompt = " ".join(str(captured[0]["prompt"]).split())
-    assert "intentionally contains a foreground object" in full_prompt
-    assert "not a semantic inconsistency" in full_prompt
-    assert "original masked foreground remains" in full_prompt
-    assert "another entity replaces it" in full_prompt
-    assert "obvious seam or visual artifact" in full_prompt
+    assert "intentionally contains foreground content" in full_prompt
+    assert "foreground_reconstructed" in full_prompt
+    assert "replaced_by_new_object" in full_prompt
+    assert "artifact_types" in full_prompt
     assert "a brick courtyard" in full_prompt
     local_prompt = " ".join(str(captured[1]["prompt"]).split())
     for expected in (
@@ -1157,23 +1437,16 @@ def test_qwen_uses_dedicated_background_review_prompt_and_schema(
         "vehicle",
         "vessel",
         "product",
-        "face",
-        "body silhouette",
-        "distinct foreground object",
-        "blurred ghost",
-        "repeated texture",
+        "foreground_reconstructed",
         "inset image",
         "artificial blob",
-        "visible boundary",
+        "texture discontinuity",
     ):
         assert expected in local_prompt
     assert "a brick courtyard" in local_prompt
-    assert "full-frame review alone determines" in local_prompt
-    assert "do not reject this local crop" in local_prompt.casefold()
-    assert "inside or meaningfully overlaps the white repair mask" in local_prompt
-    assert "newly introduced in the repaired image" in local_prompt
-    assert "only in the surrounding contextual pixels" in local_prompt
-    assert "already present in the original crop" in local_prompt
+    assert "full-frame review alone determines" in local_prompt.casefold()
+    assert "surrounding context" in local_prompt
+    assert "meaningfully overlap the white mask" in local_prompt
 
 
 def test_background_qwen_accepts_expected_masked_foreground_removal(
@@ -1238,6 +1511,22 @@ def test_background_qwen_accepts_expected_masked_foreground_removal(
                 reason="a replacement entity appears",
             ),
             id="replacement-entity",
+        ),
+        pytest.param(
+            _background_review(
+                masked_content_outcome=(
+                    MaskedContentOutcome.FOREGROUND_RECONSTRUCTED
+                ),
+                reason="the original content was reconstructed",
+            ),
+            id="foreground-reconstructed",
+        ),
+        pytest.param(
+            _background_review(
+                masked_content_outcome=MaskedContentOutcome.UNCERTAIN,
+                reason="the masked outcome is ambiguous",
+            ),
+            id="uncertain-fails-closed",
         ),
         pytest.param(
             _background_review(
@@ -1536,6 +1825,24 @@ def test_inpainting_metadata_stores_both_background_reviews(
     assert only_local["crop_box"] == metadata["validator"][
         "qwen_local_crop_box"
     ]
+    comparison_paths = metadata["validator"]["comparison_sheet_paths"]
+    assert len(comparison_paths) == 2
+    assert all(Path(path).is_file() for path in comparison_paths)
+    assert all(
+        len(fingerprint) == 64
+        for fingerprint in metadata["validator"][
+            "comparison_sheet_fingerprints"
+        ]
+    )
+    diagnostics = metadata["diagnostics"]
+    assert set(diagnostics) == {
+        "masked_mean_l1",
+        "masked_changed_pixel_ratio",
+        "generation_mask_changed_pixel_ratio",
+        "boundary_ring_mean_l1",
+        "difference_heatmap_path",
+    }
+    assert Path(diagnostics["difference_heatmap_path"]).is_file()
 
 
 def test_low_dino_is_diagnostic_only_for_background_hole_fill(
