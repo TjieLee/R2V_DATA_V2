@@ -325,8 +325,9 @@ area is gated before any transformation
 separate hole-filled, closed, component-grouped, per-group convex-hull mask
 with adaptive dilation, capped by
 `inpainting.background.maximum_generation_mask_area_ratio: 0.35`. Both source
-and generation mask paths and ratios remain in metadata. Full-frame and
-context-upscaled local Qwen reviews must both pass. Every generated
+and generation mask paths and ratios remain in metadata. The full-frame Qwen
+review and one context-upscaled local review per generation-mask component
+must all pass. Every generated
 hard-composited result is retained as
 `canonical_repaired_candidate.png`, including rejected candidates.
 

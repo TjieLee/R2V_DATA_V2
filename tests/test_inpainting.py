@@ -404,7 +404,7 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "4"
+    assert inpainting_metadata["source_metadata_version"] == "5"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
     assert (
         len(inpainting_metadata["local_consistency_prompt_sha256"]) == 64
@@ -499,6 +499,7 @@ def test_source_foreground_area_over_threshold_does_not_call_backend(
     stats = run_inpainting(config, backend=backend)
 
     assert backend.prompts == []
+    assert stats.processed == 1
     assert stats.rejected == 1
     assert stats.fallback_to_raw == 0
     reference = json.loads(artifact.read_text(encoding="utf-8"))
@@ -586,6 +587,7 @@ def test_generation_mask_area_has_independent_pre_flux_limit(
         )
     )
     assert stats.rejected == 1
+    assert stats.processed == 1
     assert backend.prompts == []
     assert metadata["source_foreground_area_ratio"] == pytest.approx(
         225 / 1024
@@ -1166,6 +1168,8 @@ def test_qwen_uses_dedicated_background_review_prompt_and_schema(
     ):
         assert expected in local_prompt
     assert "a brick courtyard" in local_prompt
+    assert "full-frame review alone determines" in local_prompt
+    assert "do not reject this local crop" in local_prompt.casefold()
     assert "inside or meaningfully overlaps the white repair mask" in local_prompt
     assert "newly introduced in the repaired image" in local_prompt
     assert "only in the surrounding contextual pixels" in local_prompt
@@ -1208,6 +1212,14 @@ def test_background_qwen_accepts_expected_masked_foreground_removal(
     assert "identity_preserved" not in result["qwen_full_review"]
     assert "same_semantic_content" not in result["qwen_local_review"]
     assert "identity_preserved" not in result["qwen_local_review"]
+    assert result["qwen_local_reviews"] == [
+        {
+            "component_index": 0,
+            "crop_box": [5, 3, 12, 10],
+            "review": result["qwen_local_review"],
+        }
+    ]
+    assert result["qwen_local_crop_box"] == (5, 3, 12, 10)
 
 
 @pytest.mark.parametrize(
@@ -1339,6 +1351,13 @@ def test_background_requires_full_and_local_qwen_reviews(
         "background_hole_fill_local"
     ].reason
     assert result["qwen_local_crop_box"] == (42, 25, 78, 55)
+    assert result["qwen_local_reviews"] == [
+        {
+            "component_index": 0,
+            "crop_box": [42, 25, 78, 55],
+            "review": result["qwen_local_review"],
+        }
+    ]
     assert qwen.image_sizes["background_hole_fill"] == (120, 80)
     assert max(qwen.image_sizes["background_hole_fill_local"]) >= 768
     if expected_accepted:
@@ -1347,6 +1366,127 @@ def test_background_requires_full_and_local_qwen_reviews(
         ]
     else:
         assert "qwen_background_consistency" in result["rejection_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("failed_component", "expected_accepted"),
+    [
+        pytest.param(None, True, id="all-components-pass"),
+        pytest.param(0, False, id="first-component-fails"),
+        pytest.param(1, False, id="second-component-fails"),
+    ],
+)
+def test_background_reviews_each_generation_mask_component(
+    tmp_path: Path,
+    failed_component: int | None,
+    expected_accepted: bool,
+) -> None:
+    class _Qwen:
+        def __init__(self) -> None:
+            self.local_calls = 0
+
+        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
+            if kwargs["mode"] == "background_hole_fill":
+                return _background_review(reason="full pass")
+            component_index = self.local_calls
+            self.local_calls += 1
+            return _background_review(
+                visible_seam_or_artifact=(
+                    component_index == failed_component
+                ),
+                reason=f"component {component_index}",
+            )
+
+    qwen = _Qwen()
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=qwen,  # type: ignore[arg-type]
+    )
+    mask = np.zeros((80, 120), dtype=np.uint8)
+    mask[10:20, 10:20] = 255
+    mask[50:60, 90:100] = 255
+
+    result = validator(
+        original=Image.new("RGB", (120, 80)),
+        repaired=Image.new("RGB", (120, 80)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": "a brick courtyard",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is expected_accepted
+    assert qwen.local_calls == 2
+    assert [
+        review["component_index"]
+        for review in result["qwen_local_reviews"]
+    ] == [0, 1]
+    assert [
+        review["crop_box"] for review in result["qwen_local_reviews"]
+    ] == [
+        [8, 8, 22, 22],
+        [88, 48, 102, 62],
+    ]
+    assert [
+        review["review"]["reason"]
+        for review in result["qwen_local_reviews"]
+    ] == ["component 0", "component 1"]
+    assert result["qwen_local_review"] is None
+    assert result["qwen_local_crop_box"] is None
+    if expected_accepted:
+        assert "qwen_background_consistency" not in result[
+            "rejection_reasons"
+        ]
+    else:
+        assert "qwen_background_consistency" in result["rejection_reasons"]
+
+
+def test_local_background_review_does_not_own_reference_phrase_validation(
+    tmp_path: Path,
+) -> None:
+    class _Qwen:
+        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
+            if kwargs["mode"] == "background_hole_fill":
+                return _background_review(
+                    reference_phrase_supported=True,
+                    reason="full phrase support",
+                )
+            return _background_review(
+                reference_phrase_supported=False,
+                reason="local quality passes",
+            )
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+    )
+    mask = np.zeros((80, 120), dtype=np.uint8)
+    mask[30:50, 48:72] = 255
+
+    result = validator(
+        original=Image.new("RGB", (120, 80)),
+        repaired=Image.new("RGB", (120, 80)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": "a brick courtyard",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is True
+    assert result["qwen_full_review"]["reference_phrase_supported"] is True
+    assert (
+        result["qwen_local_reviews"][0]["review"][
+            "reference_phrase_supported"
+        ]
+        is False
+    )
+    assert "qwen_background_consistency" not in result[
+        "rejection_reasons"
+    ]
 
 
 def test_inpainting_metadata_stores_both_background_reviews(
@@ -1389,6 +1529,13 @@ def test_inpainting_metadata_stores_both_background_reviews(
     assert metadata["validator"]["qwen_local_review"]["reason"] == (
         "background_hole_fill_local passed"
     )
+    assert len(metadata["validator"]["qwen_local_reviews"]) == 1
+    only_local = metadata["validator"]["qwen_local_reviews"][0]
+    assert only_local["component_index"] == 0
+    assert only_local["review"] == metadata["validator"]["qwen_local_review"]
+    assert only_local["crop_box"] == metadata["validator"][
+        "qwen_local_crop_box"
+    ]
 
 
 def test_low_dino_is_diagnostic_only_for_background_hole_fill(
@@ -1685,6 +1832,7 @@ def test_overwrite_clears_stale_repair_and_restores_raw(
 
     restored = json.loads(artifact.read_text(encoding="utf-8"))
     assert stats.skipped_no_repair_needed == 1
+    assert stats.processed == 0
     assert not stale_repaired.exists()
     assert not stale_candidate.exists()
     assert not stale_generation_mask.exists()

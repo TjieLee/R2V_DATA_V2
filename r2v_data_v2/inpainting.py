@@ -78,7 +78,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "4"
+INPAINTING_SOURCE_METADATA_VERSION = "5"
 
 
 class InpaintBackend(Protocol):
@@ -341,11 +341,18 @@ class QwenInpaintingConsistencyJudge:
         )
 
 
-def _background_review_passes(review: BackgroundInpaintingReview) -> bool:
+def _background_review_passes(
+    review: BackgroundInpaintingReview,
+    *,
+    require_reference_phrase: bool = True,
+) -> bool:
     return (
         review.background_continuity_preserved
         and review.masked_foreground_removed
-        and review.reference_phrase_supported
+        and (
+            review.reference_phrase_supported
+            or not require_reference_phrase
+        )
         and not review.new_salient_objects
         and not review.visible_seam_or_artifact
     )
@@ -394,6 +401,55 @@ def _background_local_review_images(
         repaired_crop = repaired_crop.resize(resized, Image.Resampling.LANCZOS)
         mask_crop = mask_crop.resize(resized, Image.Resampling.NEAREST)
     return original_crop, repaired_crop, mask_crop, crop_box
+
+
+def _background_local_review_components(
+    *,
+    original: Image.Image,
+    repaired: Image.Image,
+    generation_mask: Image.Image,
+) -> list[
+    tuple[
+        int,
+        Image.Image,
+        Image.Image,
+        Image.Image,
+        tuple[int, int, int, int],
+    ]
+]:
+    mask_l = generation_mask.convert("L")
+    mask_array = np.asarray(mask_l) >= 128
+    component_count, labels = cv2.connectedComponents(
+        mask_array.astype(np.uint8),
+        connectivity=8,
+    )
+    components = []
+    for component_index, label in enumerate(range(1, component_count)):
+        component_mask = labels == label
+        (
+            local_original,
+            local_repaired,
+            local_mask,
+            crop_box,
+        ) = _background_local_review_images(
+            original=original,
+            repaired=repaired,
+            generation_mask=Image.fromarray(
+                component_mask.astype(np.uint8) * 255
+            ),
+        )
+        components.append(
+            (
+                component_index,
+                local_original,
+                local_repaired,
+                local_mask,
+                crop_box,
+            )
+        )
+    if not components:
+        raise ValueError("background local review requires a non-empty mask")
+    return components
 
 
 class ProductionConsistencyValidator:
@@ -516,6 +572,7 @@ class ProductionConsistencyValidator:
 
         qwen_review: dict[str, object] | None = None
         qwen_full_review: dict[str, object] | None = None
+        qwen_local_reviews: list[dict[str, object]] = []
         qwen_local_review: dict[str, object] | None = None
         qwen_local_crop_box: tuple[int, int, int, int] | None = None
         if self.qwen is not None:
@@ -545,7 +602,7 @@ class ProductionConsistencyValidator:
                 )
                 if mode == "background_hole_fill":
                     full_passes = False
-                    local_passes = False
+                    local_passes = True
                     try:
                         full_review = self.qwen.review(
                             original_path=original_path,
@@ -569,46 +626,72 @@ class ProductionConsistencyValidator:
                     except Exception:  # noqa: BLE001
                         reasons.append("qwen_full_validation_failed")
                     try:
-                        (
-                            local_original,
-                            local_repaired,
-                            local_mask,
-                            qwen_local_crop_box,
-                        ) = _background_local_review_images(
+                        local_components = _background_local_review_components(
                             original=original,
                             repaired=repaired,
                             generation_mask=repair_mask,
                         )
-                        _save_lossless_atomic(
-                            local_original,
-                            local_original_path,
-                        )
-                        _save_lossless_atomic(
-                            local_repaired,
-                            local_repaired_path,
-                        )
-                        _save_lossless_atomic(local_mask, local_mask_path)
-                        local_review = self.qwen.review(
-                            original_path=local_original_path,
-                            repaired_path=local_repaired_path,
-                            repair_mask_path=local_mask_path,
-                            reference_phrase=phrase,
-                            mode="background_hole_fill_local",
-                        )
-                        if isinstance(
-                            local_review,
-                            BackgroundInpaintingReview,
-                        ):
-                            qwen_local_review = local_review.model_dump(
-                                mode="json"
-                            )
-                            local_passes = _background_review_passes(
-                                local_review
-                            )
-                        else:
-                            reasons.append("qwen_local_review_schema")
                     except Exception:  # noqa: BLE001
+                        local_components = []
+                        local_passes = False
                         reasons.append("qwen_local_validation_failed")
+                    for (
+                        component_index,
+                        local_original,
+                        local_repaired,
+                        local_mask,
+                        crop_box,
+                    ) in local_components:
+                        local_record: dict[str, object] = {
+                            "component_index": component_index,
+                            "crop_box": list(crop_box),
+                            "review": None,
+                        }
+                        try:
+                            _save_lossless_atomic(
+                                local_original,
+                                local_original_path,
+                            )
+                            _save_lossless_atomic(
+                                local_repaired,
+                                local_repaired_path,
+                            )
+                            _save_lossless_atomic(local_mask, local_mask_path)
+                            local_review = self.qwen.review(
+                                original_path=local_original_path,
+                                repaired_path=local_repaired_path,
+                                repair_mask_path=local_mask_path,
+                                reference_phrase=phrase,
+                                mode="background_hole_fill_local",
+                            )
+                            if isinstance(
+                                local_review,
+                                BackgroundInpaintingReview,
+                            ):
+                                local_record["review"] = (
+                                    local_review.model_dump(mode="json")
+                                )
+                                if not _background_review_passes(
+                                    local_review,
+                                    require_reference_phrase=False,
+                                ):
+                                    local_passes = False
+                            else:
+                                local_passes = False
+                                reasons.append("qwen_local_review_schema")
+                        except Exception:  # noqa: BLE001
+                            local_passes = False
+                            reasons.append("qwen_local_validation_failed")
+                        qwen_local_reviews.append(local_record)
+                    if len(qwen_local_reviews) == 1:
+                        only_local = qwen_local_reviews[0]
+                        only_review = only_local["review"]
+                        if isinstance(only_review, dict):
+                            qwen_local_review = only_review
+                        qwen_local_crop_box = tuple(
+                            int(value)
+                            for value in only_local["crop_box"]
+                        )
                     if not (full_passes and local_passes):
                         reasons.append("qwen_background_consistency")
                 else:
@@ -653,6 +736,7 @@ class ProductionConsistencyValidator:
             ),
             "qwen_review": qwen_review,
             "qwen_full_review": qwen_full_review,
+            "qwen_local_reviews": qwen_local_reviews,
             "qwen_local_review": qwen_local_review,
             "qwen_local_crop_box": qwen_local_crop_box,
             "semantic_input": semantic_input,
@@ -1628,6 +1712,12 @@ def run_inpainting(
             repair_area_ratio = (
                 float(repair_mask.mean()) if repair_mask is not None else 0.0
             )
+            if mask_reasons or (
+                repair_mask is not None
+                and mode is not None
+                and repair_mask.any()
+            ):
+                processed += 1
             if (
                 mode == "background_hole_fill"
                 and repair_mask is not None
@@ -1685,7 +1775,6 @@ def run_inpainting(
                     )
                     skipped += 1
                 continue
-            processed += 1
             if mask_reasons:
                 metadata = _metadata_base(
                     config=config.inpainting,

@@ -23,8 +23,10 @@ BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT = """
 Review a local crop around a background hole-fill using the three supplied
 images. The first image is the original crop, the second is the repaired crop,
 and the third is the generation mask crop. White mask pixels identify the
-region expected to become coherent background matching this reference phrase:
+region expected to become coherent background. The full-frame review alone
+determines whether the global reference phrase is supported:
 {reference_phrase}
+Do not reject this local crop merely because that phrase is not visible here.
 
 Inspect the masked region and its immediate boundary closely. Reject if any
 person, animal, vehicle, vessel, product, face, body silhouette, or other
