@@ -38,11 +38,12 @@ from r2v_data_v2.inpainting import (
     run_inpainting,
 )
 from r2v_data_v2.schemas import (
-    BackgroundArtifactType,
+    BackgroundContinuityReview,
     BackgroundFillPrompt,
-    BackgroundInpaintingReview,
+    ForegroundOutcome,
+    ForegroundRemovalReview,
+    FullSceneReview,
     InpaintingSemanticReview,
-    MaskedContentOutcome,
 )
 from r2v_data_v2.structured_output import (
     StructuredOutputFailure,
@@ -431,11 +432,18 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "7"
+    assert inpainting_metadata["source_metadata_version"] == "8"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
     assert (
         len(inpainting_metadata["local_consistency_prompt_sha256"]) == 64
     )
+    assert len(
+        inpainting_metadata["foreground_removal_prompt_sha256"]
+    ) == 64
+    assert len(
+        inpainting_metadata["background_continuity_prompt_sha256"]
+    ) == 64
+    assert len(inpainting_metadata["full_scene_prompt_sha256"]) == 64
     assert inpainting_metadata["source_foreground_area_ratio"] == pytest.approx(
         16 / 1024
     )
@@ -1521,31 +1529,125 @@ def test_production_validator_uses_dino_and_siglip(tmp_path: Path) -> None:
     assert result["repaired_siglip_similarity"] == 0.79
 
 
-def _background_review(
+def _foreground_removal_review(
     **overrides: object,
-) -> BackgroundInpaintingReview:
+) -> ForegroundRemovalReview:
     values: dict[str, object] = {
-        "masked_content_outcome": "removed_to_background",
-        "background_continuity_preserved": True,
-        "reference_phrase_supported": True,
-        "artifact_types": [],
-        "reason": "coherent background replacement",
+        "foreground_outcome": "removed",
+        "salient_entity_visible_in_mask": False,
+        "entity_description": "",
+        "reason": "foreground removed into continuous background",
     }
-    if overrides.pop("masked_foreground_removed", True) is False:
-        values["masked_content_outcome"] = (
-            MaskedContentOutcome.FOREGROUND_REMAINS
-        )
-    if overrides.pop("new_salient_objects", False) is True:
-        values["masked_content_outcome"] = (
-            MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
-        )
-    if overrides.pop("visible_seam_or_artifact", False) is True:
-        values["artifact_types"] = [BackgroundArtifactType.VISIBLE_SEAM]
     values.update(overrides)
-    return BackgroundInpaintingReview.model_validate(values)
+    return ForegroundRemovalReview.model_validate(values)
 
 
-def test_qwen_uses_dedicated_background_review_prompt_and_schema(
+def _background_continuity_review(
+    **overrides: object,
+) -> BackgroundContinuityReview:
+    values: dict[str, object] = {
+        "background_continuity_preserved": True,
+        "visible_seam": False,
+        "ghosting": False,
+        "double_exposure": False,
+        "artificial_blob": False,
+        "texture_discontinuity": False,
+        "color_or_exposure_mismatch": False,
+        "uncertain": False,
+        "reason": "background is continuous",
+    }
+    values.update(overrides)
+    return BackgroundContinuityReview.model_validate(values)
+
+
+def _full_scene_review(**overrides: object) -> FullSceneReview:
+    values: dict[str, object] = {
+        "reference_phrase_supported": True,
+        "global_scene_consistent": True,
+        "reason": "global scene remains coherent",
+    }
+    values.update(overrides)
+    return FullSceneReview.model_validate(values)
+
+
+class _BackgroundReviewJudge:
+    def __init__(
+        self,
+        *,
+        foreground_reviews: list[ForegroundRemovalReview] | None = None,
+        continuity_reviews: list[BackgroundContinuityReview] | None = None,
+        full_scene_review: FullSceneReview | None = None,
+    ) -> None:
+        self.foreground_reviews = foreground_reviews or [
+            _foreground_removal_review()
+        ]
+        self.continuity_reviews = continuity_reviews or [
+            _background_continuity_review()
+        ]
+        self.full_scene_result = full_scene_review or _full_scene_review()
+        self.foreground_calls: list[dict[str, object]] = []
+        self.continuity_calls: list[dict[str, object]] = []
+        self.full_scene_calls: list[dict[str, object]] = []
+        self.continuity_inputs: list[dict[str, np.ndarray]] = []
+
+    @staticmethod
+    def _result_for_call(
+        values: list[object],
+        call_index: int,
+    ) -> object:
+        return values[min(call_index, len(values) - 1)]
+
+    def review_foreground_removal(
+        self,
+        **kwargs: object,
+    ) -> ForegroundRemovalReview:
+        call_index = len(self.foreground_calls)
+        self.foreground_calls.append(dict(kwargs))
+        result = self._result_for_call(
+            list(self.foreground_reviews),
+            call_index,
+        )
+        assert isinstance(result, ForegroundRemovalReview)
+        return result
+
+    def review_background_continuity(
+        self,
+        **kwargs: object,
+    ) -> BackgroundContinuityReview:
+        call_index = len(self.continuity_calls)
+        self.continuity_calls.append(dict(kwargs))
+        self.continuity_inputs.append(
+            {
+                "context": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["context_original_path"]))
+                    ).convert("RGB")
+                ),
+                "mask": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["repair_mask_path"]))
+                    ).convert("L")
+                ),
+                "original_boundary": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["original_boundary_path"]))
+                    ).convert("RGB")
+                ),
+            }
+        )
+        result = self._result_for_call(
+            list(self.continuity_reviews),
+            call_index,
+        )
+        assert isinstance(result, BackgroundContinuityReview)
+        return result
+
+    def review_full_scene(self, **kwargs: object) -> FullSceneReview:
+        self.full_scene_calls.append(dict(kwargs))
+        return self.full_scene_result
+
+
+def test_qwen_uses_three_dedicated_background_prompts_and_schemas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1554,77 +1656,81 @@ def test_qwen_uses_dedicated_background_review_prompt_and_schema(
 
     def fake_request(**kwargs: object) -> str:
         captured.append(dict(kwargs))
-        return _background_review().model_dump_json()
+        review_model = kwargs["review_model"]
+        if review_model is ForegroundRemovalReview:
+            return _foreground_removal_review().model_dump_json()
+        if review_model is BackgroundContinuityReview:
+            return _background_continuity_review().model_dump_json()
+        assert review_model is FullSceneReview
+        return _full_scene_review().model_dump_json()
 
     monkeypatch.setattr(judge, "_request", fake_request)
-    full_review = judge.review(
+    foreground_review = judge.review_foreground_removal(
         original_path=tmp_path / "original.png",
         repaired_path=tmp_path / "repaired.png",
         repair_mask_path=tmp_path / "mask.png",
-        reference_phrase="a brick courtyard",
-        mode="background_hole_fill",
     )
-    local_review = judge.review(
-        original_path=tmp_path / "local-original.png",
-        repaired_path=tmp_path / "local-repaired.png",
-        repair_mask_path=tmp_path / "local-mask.png",
+    continuity_review = judge.review_background_continuity(
+        context_original_path=tmp_path / "context.png",
+        repaired_path=tmp_path / "repaired.png",
+        repair_mask_path=tmp_path / "mask.png",
+        original_boundary_path=tmp_path / "original-boundary.png",
+        repaired_boundary_path=tmp_path / "repaired-boundary.png",
+    )
+    full_review = judge.review_full_scene(
+        repaired_path=tmp_path / "repaired.png",
+        context_original_path=tmp_path / "full-context.png",
         reference_phrase="a brick courtyard",
-        mode="background_hole_fill_local",
     )
 
-    assert isinstance(full_review, BackgroundInpaintingReview)
-    assert isinstance(local_review, BackgroundInpaintingReview)
-    assert all(
-        request["review_model"] is BackgroundInpaintingReview
-        for request in captured
-    )
-    full_prompt = " ".join(str(captured[0]["prompt"]).split())
-    assert "intentionally contains foreground content" in full_prompt
-    assert "foreground_reconstructed" in full_prompt
-    assert "replaced_by_new_object" in full_prompt
-    assert "artifact_types" in full_prompt
-    assert "a brick courtyard" in full_prompt
-    local_prompt = " ".join(str(captured[1]["prompt"]).split())
+    assert isinstance(foreground_review, ForegroundRemovalReview)
+    assert isinstance(continuity_review, BackgroundContinuityReview)
+    assert isinstance(full_review, FullSceneReview)
+    assert [request["review_model"] for request in captured] == [
+        ForegroundRemovalReview,
+        BackgroundContinuityReview,
+        FullSceneReview,
+    ]
+    foreground_prompt = " ".join(str(captured[0]["prompt"]).split())
     for expected in (
-        "person",
-        "animal",
-        "vehicle",
-        "vessel",
-        "product",
-        "foreground_reconstructed",
-        "inset image",
-        "artificial blob",
-        "texture discontinuity",
+        "water",
+        "coral",
+        "background, not replacement objects",
+        "distinct bounded shape",
+        "large pixel differences inside the mask are expected",
     ):
-        assert expected in local_prompt
-    assert "a brick courtyard" in local_prompt
-    assert "full-frame review alone determines" in local_prompt.casefold()
-    assert "surrounding context" in local_prompt
-    assert "meaningfully overlap the white mask" in local_prompt
+        assert expected in foreground_prompt.casefold()
+    continuity_prompt = " ".join(str(captured[1]["prompt"]).split())
+    assert "original foreground content is intentionally hidden" in (
+        continuity_prompt.casefold()
+    )
+    assert "large changes inside the white mask are expected" in (
+        continuity_prompt.casefold()
+    )
+    full_prompt = " ".join(str(captured[2]["prompt"]).split())
+    assert "a brick courtyard" in full_prompt
+    assert "do not classify foreground removal" in full_prompt.casefold()
+    assert [len(request["image_paths"]) for request in captured] == [3, 5, 2]
+    assert all("comparison" not in str(request) for request in captured)
 
 
-def test_background_qwen_accepts_expected_masked_foreground_removal(
+def test_background_three_reviews_pass_with_large_expected_mask_difference(
     tmp_path: Path,
 ) -> None:
-    review = _background_review()
-
-    class _Qwen:
-        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
-            assert kwargs["mode"] in {
-                "background_hole_fill",
-                "background_hole_fill_local",
-            }
-            return review
-
+    qwen = _BackgroundReviewJudge()
     validator = ProductionConsistencyValidator(
         _config(tmp_path),
-        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+        qwen_judge=qwen,  # type: ignore[arg-type]
     )
     mask = np.zeros((13, 17), dtype=np.uint8)
     mask[4:9, 6:11] = 255
+    original = np.zeros((13, 17, 3), dtype=np.uint8)
+    repaired = original.copy()
+    original[4:9, 6:11] = (255, 0, 0)
+    repaired[4:9, 6:11] = (0, 80, 255)
     result = validator(
-        original=Image.new("RGB", (17, 13)),
-        repaired=Image.new("RGB", (17, 13)),
+        original=Image.fromarray(original),
+        repaired=Image.fromarray(repaired),
         repair_mask=Image.fromarray(mask),
         reference={
             "phrase": "a brick courtyard",
@@ -1635,84 +1741,47 @@ def test_background_qwen_accepts_expected_masked_foreground_removal(
 
     assert result["accepted"] is True
     assert result["qwen_review"] is None
-    assert "same_semantic_content" not in result["qwen_full_review"]
-    assert "identity_preserved" not in result["qwen_full_review"]
-    assert "same_semantic_content" not in result["qwen_local_review"]
-    assert "identity_preserved" not in result["qwen_local_review"]
-    assert result["qwen_local_reviews"] == [
-        {
-            "component_index": 0,
-            "crop_box": [5, 3, 12, 10],
-            "review": result["qwen_local_review"],
-        }
-    ]
-    assert result["qwen_local_crop_box"] == (5, 3, 12, 10)
+    assert len(qwen.foreground_calls) == 1
+    assert len(qwen.continuity_calls) == 1
+    assert len(qwen.full_scene_calls) == 1
+    assert result["qwen_foreground_removal_reviews"][0]["review"][
+        "foreground_outcome"
+    ] == "removed"
+    assert result["qwen_background_continuity_reviews"][0]["review"][
+        "background_continuity_preserved"
+    ] is True
+    assert result["qwen_full_scene_review"]["global_scene_consistent"] is True
 
 
 @pytest.mark.parametrize(
-    "review",
+    ("outcome", "salient_entity"),
     [
+        pytest.param("remains", True, id="foreground-remains"),
+        pytest.param("reconstructed", True, id="foreground-reconstructed"),
         pytest.param(
-            _background_review(
-                masked_foreground_removed=False,
-                reason="the original foreground remains",
-            ),
-            id="retained-masked-foreground",
-        ),
-        pytest.param(
-            _background_review(
-                new_salient_objects=True,
-                reason="a replacement entity appears",
-            ),
-            id="replacement-entity",
-        ),
-        pytest.param(
-            _background_review(
-                masked_content_outcome=(
-                    MaskedContentOutcome.FOREGROUND_RECONSTRUCTED
-                ),
-                reason="the original content was reconstructed",
-            ),
-            id="foreground-reconstructed",
-        ),
-        pytest.param(
-            _background_review(
-                masked_content_outcome=MaskedContentOutcome.UNCERTAIN,
-                reason="the masked outcome is ambiguous",
-            ),
-            id="uncertain-fails-closed",
-        ),
-        pytest.param(
-            _background_review(
-                new_salient_objects=True,
-                reason="a new salient object was added",
-            ),
-            id="new-salient-object",
-        ),
-        pytest.param(
-            _background_review(
-                visible_seam_or_artifact=True,
-                reason="a visible seam surrounds the fill",
-            ),
-            id="visible-seam",
+            "replaced_by_salient_entity",
+            True,
+            id="new-salient-entity",
         ),
     ],
 )
-def test_background_qwen_rejects_invalid_hole_fills(
+def test_background_foreground_removal_failures_reject(
     tmp_path: Path,
-    review: BackgroundInpaintingReview,
+    outcome: str,
+    salient_entity: bool,
 ) -> None:
-    class _Qwen:
-        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
-            assert kwargs["mode"] in {
-                "background_hole_fill",
-                "background_hole_fill_local",
-            }
-            return review
-
+    qwen = _BackgroundReviewJudge(
+        foreground_reviews=[
+            _foreground_removal_review(
+                foreground_outcome=outcome,
+                salient_entity_visible_in_mask=salient_entity,
+                entity_description="distinct foreground entity",
+            )
+        ]
+    )
     validator = ProductionConsistencyValidator(
         _config(tmp_path),
-        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+        qwen_judge=qwen,  # type: ignore[arg-type]
     )
     mask = np.zeros((13, 17), dtype=np.uint8)
     mask[4:9, 6:11] = 255
@@ -1732,52 +1801,34 @@ def test_background_qwen_rejects_invalid_hole_fills(
 
 
 @pytest.mark.parametrize(
-    ("full_passes", "local_passes", "expected_accepted"),
+    "continuity_overrides",
     [
-        pytest.param(True, False, False, id="local-failure-rejects"),
-        pytest.param(False, True, False, id="full-failure-rejects"),
-        pytest.param(True, True, True, id="both-reviews-pass"),
+        pytest.param({"visible_seam": True}, id="visible-seam"),
+        pytest.param(
+            {"texture_discontinuity": True},
+            id="texture-discontinuity",
+        ),
     ],
 )
-def test_background_requires_full_and_local_qwen_reviews(
+def test_background_continuity_artifacts_reject(
     tmp_path: Path,
-    full_passes: bool,
-    local_passes: bool,
-    expected_accepted: bool,
+    continuity_overrides: dict[str, object],
 ) -> None:
-    reviews = {
-        "background_hole_fill": _background_review(
-            visible_seam_or_artifact=not full_passes,
-            reason="full pass" if full_passes else "full-frame seam",
-        ),
-        "background_hole_fill_local": _background_review(
-            masked_foreground_removed=local_passes,
-            reason="local pass" if local_passes else "local ghost remains",
-        ),
-    }
-
-    class _Qwen:
-        def __init__(self) -> None:
-            self.image_sizes: dict[str, tuple[int, int]] = {}
-
-        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
-            mode = str(kwargs["mode"])
-            self.image_sizes[mode] = Image.open(
-                Path(str(kwargs["original_path"]))
-            ).size
-            return reviews[mode]
-
-    qwen = _Qwen()
+    qwen = _BackgroundReviewJudge(
+        continuity_reviews=[
+            _background_continuity_review(**continuity_overrides)
+        ]
+    )
     validator = ProductionConsistencyValidator(
         _config(tmp_path),
         qwen_judge=qwen,  # type: ignore[arg-type]
     )
-    mask = np.zeros((80, 120), dtype=np.uint8)
-    mask[30:50, 48:72] = 255
+    mask = np.zeros((13, 17), dtype=np.uint8)
+    mask[4:9, 6:11] = 255
 
     result = validator(
-        original=Image.new("RGB", (120, 80)),
-        repaired=Image.new("RGB", (120, 80)),
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
         repair_mask=Image.fromarray(mask),
         reference={
             "phrase": "a brick courtyard",
@@ -1786,61 +1837,107 @@ def test_background_requires_full_and_local_qwen_reviews(
         mode="background_hole_fill",
     )
 
-    assert result["accepted"] is expected_accepted
-    assert result["qwen_full_review"]["reason"] == reviews[
-        "background_hole_fill"
-    ].reason
-    assert result["qwen_local_review"]["reason"] == reviews[
-        "background_hole_fill_local"
-    ].reason
-    assert result["qwen_local_crop_box"] == (42, 25, 78, 55)
-    assert result["qwen_local_reviews"] == [
-        {
-            "component_index": 0,
-            "crop_box": [42, 25, 78, 55],
-            "review": result["qwen_local_review"],
-        }
-    ]
-    assert qwen.image_sizes["background_hole_fill"] == (120, 80)
-    assert max(qwen.image_sizes["background_hole_fill_local"]) >= 768
-    if expected_accepted:
-        assert "qwen_background_consistency" not in result[
-            "rejection_reasons"
-        ]
-    else:
-        assert "qwen_background_consistency" in result["rejection_reasons"]
+    assert result["accepted"] is False
+    assert "qwen_background_consistency" in result["rejection_reasons"]
 
 
 @pytest.mark.parametrize(
-    ("failed_component", "expected_accepted"),
+    ("foreground_review", "continuity_review"),
     [
-        pytest.param(None, True, id="all-components-pass"),
-        pytest.param(0, False, id="first-component-fails"),
-        pytest.param(1, False, id="second-component-fails"),
+        pytest.param(
+            _foreground_removal_review(
+                foreground_outcome=ForegroundOutcome.UNCERTAIN
+            ),
+            _background_continuity_review(),
+            id="foreground-uncertain",
+        ),
+        pytest.param(
+            _foreground_removal_review(),
+            _background_continuity_review(uncertain=True),
+            id="continuity-uncertain",
+        ),
     ],
 )
-def test_background_reviews_each_generation_mask_component(
+def test_background_uncertainty_rejects(
     tmp_path: Path,
-    failed_component: int | None,
-    expected_accepted: bool,
+    foreground_review: ForegroundRemovalReview,
+    continuity_review: BackgroundContinuityReview,
 ) -> None:
-    class _Qwen:
-        def __init__(self) -> None:
-            self.local_calls = 0
+    qwen = _BackgroundReviewJudge(
+        foreground_reviews=[foreground_review],
+        continuity_reviews=[continuity_review],
+    )
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=qwen,  # type: ignore[arg-type]
+    )
+    mask = np.zeros((13, 17), dtype=np.uint8)
+    mask[4:9, 6:11] = 255
 
-        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
-            if kwargs["mode"] == "background_hole_fill":
-                return _background_review(reason="full pass")
-            component_index = self.local_calls
-            self.local_calls += 1
-            return _background_review(
-                visible_seam_or_artifact=(
-                    component_index == failed_component
-                ),
-                reason=f"component {component_index}",
-            )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": "a brick courtyard",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
 
-    qwen = _Qwen()
+    assert result["accepted"] is False
+    assert "qwen_background_consistency" in result["rejection_reasons"]
+
+
+@pytest.mark.parametrize(
+    "full_scene_overrides",
+    [
+        pytest.param(
+            {"reference_phrase_supported": False},
+            id="reference-phrase-unsupported",
+        ),
+        pytest.param(
+            {"global_scene_consistent": False},
+            id="global-scene-inconsistent",
+        ),
+    ],
+)
+def test_background_full_scene_failure_rejects(
+    tmp_path: Path,
+    full_scene_overrides: dict[str, object],
+) -> None:
+    qwen = _BackgroundReviewJudge(
+        full_scene_review=_full_scene_review(**full_scene_overrides)
+    )
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=qwen,  # type: ignore[arg-type]
+    )
+    mask = np.zeros((13, 17), dtype=np.uint8)
+    mask[4:9, 6:11] = 255
+
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": "a brick courtyard",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is False
+    assert "qwen_background_consistency" in result["rejection_reasons"]
+
+
+def test_background_reviews_every_component_and_deduplicates_legacy_enums(
+    tmp_path: Path,
+) -> None:
+    repeated_seam = _background_continuity_review(visible_seam=True)
+    qwen = _BackgroundReviewJudge(
+        continuity_reviews=[repeated_seam, repeated_seam],
+    )
     validator = ProductionConsistencyValidator(
         _config(tmp_path),
         qwen_judge=qwen,  # type: ignore[arg-type]
@@ -1860,79 +1957,131 @@ def test_background_reviews_each_generation_mask_component(
         mode="background_hole_fill",
     )
 
-    assert result["accepted"] is expected_accepted
-    assert qwen.local_calls == 2
+    assert result["accepted"] is False
+    assert len(qwen.foreground_calls) == 2
+    assert len(qwen.continuity_calls) == 2
+    assert len(qwen.full_scene_calls) == 1
     assert [
-        review["component_index"]
-        for review in result["qwen_local_reviews"]
+        record["component_index"]
+        for record in result["qwen_foreground_removal_reviews"]
     ] == [0, 1]
     assert [
-        review["crop_box"] for review in result["qwen_local_reviews"]
-    ] == [
-        [8, 8, 22, 22],
-        [88, 48, 102, 62],
+        record["crop_box"]
+        for record in result["qwen_background_continuity_reviews"]
+    ] == [[8, 8, 22, 22], [88, 48, 102, 62]]
+    assert result["qwen_full_review"]["artifact_types"] == [
+        "visible_seam"
     ]
-    assert [
-        review["review"]["reason"]
-        for review in result["qwen_local_reviews"]
-    ] == ["component 0", "component 1"]
     assert result["qwen_local_review"] is None
-    assert result["qwen_local_crop_box"] is None
-    if expected_accepted:
-        assert "qwen_background_consistency" not in result[
-            "rejection_reasons"
-        ]
-    else:
-        assert "qwen_background_consistency" in result["rejection_reasons"]
 
 
-def test_local_background_review_does_not_own_reference_phrase_validation(
+def test_background_rejects_when_second_component_removal_fails(
     tmp_path: Path,
 ) -> None:
-    class _Qwen:
-        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
-            if kwargs["mode"] == "background_hole_fill":
-                return _background_review(
-                    reference_phrase_supported=True,
-                    reason="full phrase support",
-                )
-            return _background_review(
-                reference_phrase_supported=False,
-                reason="local quality passes",
-            )
-
+    qwen = _BackgroundReviewJudge(
+        foreground_reviews=[
+            _foreground_removal_review(reason="component zero removed"),
+            _foreground_removal_review(
+                foreground_outcome=ForegroundOutcome.REMAINS,
+                salient_entity_visible_in_mask=True,
+                entity_description="remaining vessel",
+                reason="component one still contains a vessel",
+            ),
+        ],
+    )
     validator = ProductionConsistencyValidator(
         _config(tmp_path),
-        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+        qwen_judge=qwen,  # type: ignore[arg-type]
     )
     mask = np.zeros((80, 120), dtype=np.uint8)
-    mask[30:50, 48:72] = 255
+    mask[10:20, 10:20] = 255
+    mask[50:60, 90:100] = 255
 
     result = validator(
         original=Image.new("RGB", (120, 80)),
         repaired=Image.new("RGB", (120, 80)),
         repair_mask=Image.fromarray(mask),
         reference={
-            "phrase": "a brick courtyard",
+            "phrase": "open water",
             "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
         },
         mode="background_hole_fill",
     )
 
-    assert result["accepted"] is True
-    assert result["qwen_full_review"]["reference_phrase_supported"] is True
-    assert (
-        result["qwen_local_reviews"][0]["review"][
-            "reference_phrase_supported"
-        ]
-        is False
+    assert result["accepted"] is False
+    assert len(qwen.foreground_calls) == 2
+    assert result["qwen_foreground_removal_reviews"][1]["review"][
+        "foreground_outcome"
+    ] == "remains"
+    assert "qwen_background_consistency" in result["rejection_reasons"]
+
+
+def test_background_diagnostics_are_saved_but_never_sent_to_qwen(
+    tmp_path: Path,
+) -> None:
+    qwen = _BackgroundReviewJudge()
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=qwen,  # type: ignore[arg-type]
     )
-    assert "qwen_background_consistency" not in result[
-        "rejection_reasons"
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[12:16, 12:16] = 255
+    diagnostics_dir = tmp_path / "diagnostics"
+
+    result = validator(
+        original=Image.new("RGB", (32, 32), (255, 0, 0)),
+        repaired=Image.new("RGB", (32, 32), (0, 0, 255)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": "blue water and coral",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+        diagnostics_dir=diagnostics_dir,
+    )
+
+    comparison_paths = [
+        Path(path) for path in result["comparison_sheet_paths"]
     ]
+    assert {path.name for path in comparison_paths} == {
+        "comparison_full.png",
+        "comparison_local_00.png",
+    }
+    assert all(path.is_file() for path in comparison_paths)
+    sent_paths = [
+        Path(str(path))
+        for call in [
+            *qwen.foreground_calls,
+            *qwen.continuity_calls,
+            *qwen.full_scene_calls,
+        ]
+        for path in call.values()
+        if isinstance(path, Path)
+    ]
+    assert sent_paths
+    assert not set(sent_paths) & set(comparison_paths)
+    assert all(
+        all(
+            forbidden not in path.name.casefold()
+            for forbidden in (
+                "comparison",
+                "difference",
+                "heatmap",
+                "overlay",
+                "contour",
+            )
+        )
+        for path in sent_paths
+    )
+    continuity_input = qwen.continuity_inputs[0]
+    component_mask = continuity_input["mask"] >= 128
+    assert np.all(continuity_input["context"][component_mask] == 128)
+    assert np.all(
+        continuity_input["original_boundary"][component_mask] == 128
+    )
 
 
-def test_inpainting_metadata_stores_both_background_reviews(
+def test_inpainting_metadata_stores_three_background_review_types(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -1945,40 +2094,34 @@ def test_inpainting_metadata_stores_both_background_reviews(
         mask=mask,
         needs_inpainting=True,
     )
-
-    class _Qwen:
-        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
-            return _background_review(reason=f"{kwargs['mode']} passed")
-
+    qwen = _BackgroundReviewJudge()
     validator = ProductionConsistencyValidator(
         config,
-        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+        qwen_judge=qwen,  # type: ignore[arg-type]
     )
     stats = run_inpainting(
         config,
         backend=_WholeImageBackend(),
         validator=validator,
     )
-
     metadata = json.loads(
         (artifact.parent / "inpainting_metadata.json").read_text(
             encoding="utf-8"
         )
     )
     assert stats.repaired == 1
-    assert metadata["validator"]["qwen_full_review"]["reason"] == (
-        "background_hole_fill passed"
-    )
-    assert metadata["validator"]["qwen_local_review"]["reason"] == (
-        "background_hole_fill_local passed"
-    )
+    assert len(
+        metadata["validator"]["qwen_foreground_removal_reviews"]
+    ) == 1
     assert len(metadata["validator"]["qwen_local_reviews"]) == 1
-    only_local = metadata["validator"]["qwen_local_reviews"][0]
-    assert only_local["component_index"] == 0
-    assert only_local["review"] == metadata["validator"]["qwen_local_review"]
-    assert only_local["crop_box"] == metadata["validator"][
-        "qwen_local_crop_box"
-    ]
+    assert len(
+        metadata["validator"]["qwen_background_continuity_reviews"]
+    ) == 1
+    assert metadata["validator"]["qwen_full_scene_review"][
+        "reference_phrase_supported"
+    ] is True
+    assert metadata["validator"]["qwen_full_review"] is not None
+    assert metadata["validator"]["qwen_local_review"] is not None
     comparison_paths = metadata["validator"]["comparison_sheet_paths"]
     assert len(comparison_paths) == 2
     assert all(Path(path).is_file() for path in comparison_paths)
@@ -2000,6 +2143,18 @@ def test_inpainting_metadata_stores_both_background_reviews(
     assert Path(diagnostics["difference_heatmap_path"]).is_file()
     assert diagnostics["inner_boundary_mean_l1"] > 0.0
     assert diagnostics["outer_unmasked_boundary_mean_l1"] == 0.0
+    qwen_input_paths = {
+        str(path)
+        for call in [
+            *qwen.foreground_calls,
+            *qwen.continuity_calls,
+            *qwen.full_scene_calls,
+        ]
+        for path in call.values()
+        if isinstance(path, Path)
+    }
+    assert diagnostics["difference_heatmap_path"] not in qwen_input_paths
+    assert not set(comparison_paths) & qwen_input_paths
 
 
 def test_low_dino_is_diagnostic_only_for_background_hole_fill(

@@ -150,3 +150,36 @@ class BackgroundInpaintingReview(SchemaModel):
     reference_phrase_supported: bool
     artifact_types: list[BackgroundArtifactType]
     reason: str
+
+
+class ForegroundOutcome(str, Enum):
+    REMOVED = "removed"
+    REMAINS = "remains"
+    RECONSTRUCTED = "reconstructed"
+    REPLACED_BY_SALIENT_ENTITY = "replaced_by_salient_entity"
+    UNCERTAIN = "uncertain"
+
+
+class ForegroundRemovalReview(SchemaModel):
+    foreground_outcome: ForegroundOutcome
+    salient_entity_visible_in_mask: bool
+    entity_description: str
+    reason: str
+
+
+class BackgroundContinuityReview(SchemaModel):
+    background_continuity_preserved: bool
+    visible_seam: bool
+    ghosting: bool
+    double_exposure: bool
+    artificial_blob: bool
+    texture_discontinuity: bool
+    color_or_exposure_mismatch: bool
+    uncertain: bool
+    reason: str
+
+
+class FullSceneReview(SchemaModel):
+    reference_phrase_supported: bool
+    global_scene_consistent: bool
+    reason: str

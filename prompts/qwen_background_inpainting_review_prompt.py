@@ -1,61 +1,62 @@
-BACKGROUND_INPAINTING_REVIEW_PROMPT = """
-Review a background hole-fill result using four supplied images:
-1. the original full image;
-2. the repaired full image;
-3. the exact white generation mask;
-4. a pixel-aligned comparison sheet with mask overlays, absolute-difference
-   heatmap, and enlarged boundary-ring comparison.
+FOREGROUND_REMOVAL_REVIEW_PROMPT = """
+Review foreground removal for one connected component using three images:
+1. the original crop;
+2. the repaired crop;
+3. the binary component mask, where white is the evaluated region.
 
-The original intentionally contains foreground content inside the white mask.
-The repaired image must replace that masked content with plausible background
-that continues the surrounding geometry, perspective, texture, color,
-lighting, depth, and atmosphere. The repaired full image must still support
-this global reference phrase:
-{reference_phrase}
+Classify only foreground identity inside or meaningfully overlapping the white
+mask. Uniform or continuous water, sky, grass, soil, rock, coral, cloud, wall,
+pavement, and similar scene materials are background, not replacement objects.
+A replacement salient entity must have a distinct bounded shape and a
+recognizable semantic identity. Large pixel differences inside the mask are
+expected after successful foreground removal and are not evidence of failure.
+Do not reject an unchanged object that appears only in surrounding context.
 
-A visually similar reconstruction of the original masked content is a failure,
-even when it looks natural in the scene. Reconstructing the same mountain
-slope, tree, person, animal, vehicle, vessel, product, or other salient
-structure is foreground_reconstructed, not foreground removal. A different
-salient entity in the mask is replaced_by_new_object.
-
-Select exactly one masked_content_outcome. Use uncertain when the comparison is
-ambiguous. Record every visible artifact in artifact_types. The categorical
-outcome, artifact_types, and reason must agree with the visual evidence.
+Use removed when no foreground identity remains in the mask. Use remains when
+the original foreground is still present, reconstructed when it was recreated,
+and replaced_by_salient_entity only for a new distinct recognizable entity.
+Use uncertain only when a foreground identity cannot be resolved.
 
 Return only the requested JSON structure.
 """.strip()
 
 
-BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT = """
-Review one connected-component crop from a background hole-fill using four
-supplied images:
-1. the original crop;
+BACKGROUND_CONTINUITY_REVIEW_PROMPT = """
+Review background continuity for one connected component using five images:
+1. the context-only original crop, with mask pixels neutral gray;
 2. the repaired crop;
-3. the component's white generation mask;
-4. a pixel-aligned comparison sheet with mask overlays, absolute-difference
-   heatmap, and enlarged boundary-ring comparison.
+3. the binary component mask, where white is the repaired region;
+4. the raw original boundary crop with the foreground hidden;
+5. the raw repaired boundary crop.
 
-The full-frame review alone determines whether this global reference phrase is
-supported:
-{reference_phrase}
-Do not reject the local crop merely because that phrase is not visible here.
+The original foreground content is intentionally hidden and must not be
+inferred or classified. Judge only whether the repaired pixels continue the
+surrounding background with coherent geometry, perspective, depth, texture,
+color, exposure, and lighting. Inspect the raw boundary crops for seams,
+ghosting, double exposure, artificial blobs, texture discontinuity, and
+color/exposure mismatch. Neutral gray pixels are unavailable context, not an
+artifact. Large changes inside the white mask are expected and are not by
+themselves a failure.
 
-The white component must become plausible background continuing the adjacent
-pixels. A visually similar reconstruction of the original masked content is a
-failure, even when natural-looking. Reconstructing the same mountain slope,
-tree, person, animal, vehicle, vessel, product, or other salient structure is
-foreground_reconstructed. A different salient entity is
-replaced_by_new_object. Do not reject an unchanged object that appears only in
-the surrounding context and does not meaningfully overlap the white mask.
-Inside or meaningfully overlapping the white mask, inspect whether any person,
-animal, vehicle, vessel, product, face, body silhouette, or other distinct
-foreground content remains or newly appears.
+Set uncertain only when continuity or an artifact cannot be resolved.
 
-Select exactly one masked_content_outcome. Use uncertain when evidence is
-ambiguous. Record every seam, ghost, double exposure, inset image, texture
-discontinuity, artificial blob, or color/exposure mismatch in artifact_types.
-The outcome, artifact_types, and reason must agree with the comparison sheet.
+Return only the requested JSON structure.
+""".strip()
+
+
+FULL_SCENE_REVIEW_PROMPT = """
+Review global scene semantics using:
+1. the repaired full image;
+2. the optional context-only original full image, with repaired-mask pixels
+   neutral gray.
+
+Reference phrase: {reference_phrase}
+
+Decide only whether the repaired image supports the reference phrase and
+whether the full scene remains globally coherent. Do not classify foreground
+removal, local seams, local artifacts, masked-region pixel differences, or
+object identity inside the repaired region. Those decisions belong to separate
+component reviews.
 
 Return only the requested JSON structure.
 """.strip()

@@ -16,8 +16,9 @@ from PIL import Image, ImageDraw
 
 from prompts.qwen_background_fill_prompt import BACKGROUND_FILL_PROMPT
 from prompts.qwen_background_inpainting_review_prompt import (
-    BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT,
-    BACKGROUND_INPAINTING_REVIEW_PROMPT,
+    BACKGROUND_CONTINUITY_REVIEW_PROMPT,
+    FOREGROUND_REMOVAL_REVIEW_PROMPT,
+    FULL_SCENE_REVIEW_PROMPT,
 )
 from prompts.qwen_inpainting_consistency_prompt import (
     INPAINTING_CONSISTENCY_PROMPT,
@@ -37,8 +38,13 @@ from r2v_data_v2.image_utils import (
 from r2v_data_v2.mask_utils import save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
 from r2v_data_v2.schemas import (
+    BackgroundArtifactType,
+    BackgroundContinuityReview,
     BackgroundFillPrompt,
     BackgroundInpaintingReview,
+    ForegroundOutcome,
+    ForegroundRemovalReview,
+    FullSceneReview,
     InpaintingSemanticReview,
     MaskedContentOutcome,
 )
@@ -123,12 +129,12 @@ ENTITY_INPAINT_PROMPT = (
 
 
 def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
-    if mode == "background_hole_fill":
-        return BACKGROUND_INPAINTING_REVIEW_PROMPT.format(
-            reference_phrase=reference_phrase
-        )
-    if mode == "background_hole_fill_local":
-        return BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT.format(
+    if mode == "background_foreground_removal":
+        return FOREGROUND_REMOVAL_REVIEW_PROMPT
+    if mode == "background_continuity":
+        return BACKGROUND_CONTINUITY_REVIEW_PROMPT
+    if mode == "background_full_scene":
+        return FULL_SCENE_REVIEW_PROMPT.format(
             reference_phrase=reference_phrase
         )
     if mode == "entity_local_repair":
@@ -139,7 +145,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "7"
+INPAINTING_SOURCE_METADATA_VERSION = "8"
 
 
 class InpaintBackend(Protocol):
@@ -172,10 +178,35 @@ class InpaintingSemanticJudge(Protocol):
         original_path: Path,
         repaired_path: Path,
         repair_mask_path: Path,
-        comparison_sheet_path: Path | None = None,
         reference_phrase: str,
         mode: str,
-    ) -> InpaintingSemanticReview | BackgroundInpaintingReview: ...
+    ) -> InpaintingSemanticReview: ...
+
+    def review_foreground_removal(
+        self,
+        *,
+        original_path: Path,
+        repaired_path: Path,
+        repair_mask_path: Path,
+    ) -> ForegroundRemovalReview: ...
+
+    def review_background_continuity(
+        self,
+        *,
+        context_original_path: Path,
+        repaired_path: Path,
+        repair_mask_path: Path,
+        original_boundary_path: Path,
+        repaired_boundary_path: Path,
+    ) -> BackgroundContinuityReview: ...
+
+    def review_full_scene(
+        self,
+        *,
+        repaired_path: Path,
+        context_original_path: Path | None,
+        reference_phrase: str,
+    ) -> FullSceneReview: ...
 
 
 class BackgroundFillPromptGenerator(Protocol):
@@ -528,36 +559,24 @@ class QwenInpaintingConsistencyJudge:
         self,
         *,
         prompt: str,
-        original_path: Path,
-        repaired_path: Path,
-        repair_mask_path: Path,
-        comparison_sheet_path: Path | None,
+        image_paths: list[Path],
         review_model: (
-            type[InpaintingSemanticReview | BackgroundInpaintingReview]
+            type[
+                InpaintingSemanticReview
+                | ForegroundRemovalReview
+                | BackgroundContinuityReview
+                | FullSceneReview
+            ]
         ),
     ) -> str:
         content: list[dict[str, object]] = [
-            {"type": "text", "text": prompt},
-            {
-                "type": "image_url",
-                "image_url": {"url": image_data_uri(original_path)},
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": image_data_uri(repaired_path)},
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": image_data_uri(repair_mask_path)},
-            },
+            {"type": "text", "text": prompt}
         ]
-        if comparison_sheet_path is not None:
+        for image_path in image_paths:
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": image_data_uri(comparison_sheet_path)
-                    },
+                    "image_url": {"url": image_data_uri(image_path)},
                 }
             )
         parameters: dict[str, Any] = {
@@ -601,45 +620,227 @@ class QwenInpaintingConsistencyJudge:
         original_path: Path,
         repaired_path: Path,
         repair_mask_path: Path,
-        comparison_sheet_path: Path | None = None,
         reference_phrase: str,
         mode: str,
-    ) -> InpaintingSemanticReview | BackgroundInpaintingReview:
+    ) -> InpaintingSemanticReview:
+        if mode != "entity_local_repair":
+            raise ValueError(
+                "background inpainting requires dedicated review methods"
+            )
         prompt = _consistency_review_prompt(reference_phrase, mode)
-        review_model = (
-            BackgroundInpaintingReview
-            if mode
-            in {"background_hole_fill", "background_hole_fill_local"}
-            else InpaintingSemanticReview
+        return request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                image_paths=[
+                    original_path,
+                    repaired_path,
+                    repair_mask_path,
+                ],
+                review_model=InpaintingSemanticReview,
+            ),
+            original_request=prompt,
+            model=InpaintingSemanticReview,
+        )
+
+    def review_foreground_removal(
+        self,
+        *,
+        original_path: Path,
+        repaired_path: Path,
+        repair_mask_path: Path,
+    ) -> ForegroundRemovalReview:
+        prompt = _consistency_review_prompt(
+            "",
+            "background_foreground_removal",
         )
         return request_structured_output(
             request=lambda request_text: self._request(
                 prompt=request_text,
-                original_path=original_path,
-                repaired_path=repaired_path,
-                repair_mask_path=repair_mask_path,
-                comparison_sheet_path=comparison_sheet_path,
-                review_model=review_model,
+                image_paths=[
+                    original_path,
+                    repaired_path,
+                    repair_mask_path,
+                ],
+                review_model=ForegroundRemovalReview,
             ),
             original_request=prompt,
-            model=review_model,
+            model=ForegroundRemovalReview,
+        )
+
+    def review_background_continuity(
+        self,
+        *,
+        context_original_path: Path,
+        repaired_path: Path,
+        repair_mask_path: Path,
+        original_boundary_path: Path,
+        repaired_boundary_path: Path,
+    ) -> BackgroundContinuityReview:
+        prompt = _consistency_review_prompt(
+            "",
+            "background_continuity",
+        )
+        return request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                image_paths=[
+                    context_original_path,
+                    repaired_path,
+                    repair_mask_path,
+                    original_boundary_path,
+                    repaired_boundary_path,
+                ],
+                review_model=BackgroundContinuityReview,
+            ),
+            original_request=prompt,
+            model=BackgroundContinuityReview,
+        )
+
+    def review_full_scene(
+        self,
+        *,
+        repaired_path: Path,
+        context_original_path: Path | None,
+        reference_phrase: str,
+    ) -> FullSceneReview:
+        prompt = _consistency_review_prompt(
+            reference_phrase,
+            "background_full_scene",
+        )
+        image_paths = [repaired_path]
+        if context_original_path is not None:
+            image_paths.append(context_original_path)
+        return request_structured_output(
+            request=lambda request_text: self._request(
+                prompt=request_text,
+                image_paths=image_paths,
+                review_model=FullSceneReview,
+            ),
+            original_request=prompt,
+            model=FullSceneReview,
         )
 
 
-def _background_review_passes(
-    review: BackgroundInpaintingReview,
-    *,
-    require_reference_phrase: bool = True,
+def _foreground_removal_review_passes(
+    review: ForegroundRemovalReview,
 ) -> bool:
     return (
-        review.masked_content_outcome
-        == MaskedContentOutcome.REMOVED_TO_BACKGROUND
-        and review.background_continuity_preserved
-        and (
-            review.reference_phrase_supported
-            or not require_reference_phrase
+        review.foreground_outcome == ForegroundOutcome.REMOVED
+        and not review.salient_entity_visible_in_mask
+    )
+
+
+def _background_continuity_review_passes(
+    review: BackgroundContinuityReview,
+) -> bool:
+    return (
+        review.background_continuity_preserved
+        and not review.visible_seam
+        and not review.ghosting
+        and not review.double_exposure
+        and not review.artificial_blob
+        and not review.texture_discontinuity
+        and not review.color_or_exposure_mismatch
+        and not review.uncertain
+    )
+
+
+def _full_scene_review_passes(review: FullSceneReview) -> bool:
+    return (
+        review.reference_phrase_supported
+        and review.global_scene_consistent
+    )
+
+
+def _background_artifact_types(
+    review: BackgroundContinuityReview,
+) -> list[BackgroundArtifactType]:
+    fields = (
+        ("visible_seam", BackgroundArtifactType.VISIBLE_SEAM),
+        ("ghosting", BackgroundArtifactType.GHOSTING),
+        ("double_exposure", BackgroundArtifactType.DOUBLE_EXPOSURE),
+        ("artificial_blob", BackgroundArtifactType.ARTIFICIAL_BLOB),
+        (
+            "texture_discontinuity",
+            BackgroundArtifactType.TEXTURE_DISCONTINUITY,
+        ),
+        (
+            "color_or_exposure_mismatch",
+            BackgroundArtifactType.COLOR_OR_EXPOSURE_MISMATCH,
+        ),
+    )
+    return [
+        artifact
+        for field, artifact in fields
+        if bool(getattr(review, field))
+    ]
+
+
+def _legacy_background_outcome(
+    review: ForegroundRemovalReview,
+) -> MaskedContentOutcome:
+    return {
+        ForegroundOutcome.REMOVED: MaskedContentOutcome.REMOVED_TO_BACKGROUND,
+        ForegroundOutcome.REMAINS: MaskedContentOutcome.FOREGROUND_REMAINS,
+        ForegroundOutcome.RECONSTRUCTED: (
+            MaskedContentOutcome.FOREGROUND_RECONSTRUCTED
+        ),
+        ForegroundOutcome.REPLACED_BY_SALIENT_ENTITY: (
+            MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
+        ),
+        ForegroundOutcome.UNCERTAIN: MaskedContentOutcome.UNCERTAIN,
+    }[review.foreground_outcome]
+
+
+def _legacy_background_review(
+    *,
+    foreground_reviews: list[ForegroundRemovalReview],
+    continuity_reviews: list[BackgroundContinuityReview],
+    full_scene_review: FullSceneReview | None,
+) -> BackgroundInpaintingReview | None:
+    if not foreground_reviews or not continuity_reviews:
+        return None
+    foreground = next(
+        (
+            review
+            for review in foreground_reviews
+            if not _foreground_removal_review_passes(review)
+        ),
+        foreground_reviews[0],
+    )
+    artifacts = list(
+        dict.fromkeys(
+            artifact
+            for review in continuity_reviews
+            for artifact in _background_artifact_types(review)
         )
-        and not review.artifact_types
+    )
+    reasons = list(
+        dict.fromkeys(
+            [
+                *(review.reason for review in foreground_reviews),
+                *(review.reason for review in continuity_reviews),
+                *(
+                    [full_scene_review.reason]
+                    if full_scene_review is not None
+                    else []
+                ),
+            ]
+        )
+    )
+    return BackgroundInpaintingReview(
+        masked_content_outcome=_legacy_background_outcome(foreground),
+        background_continuity_preserved=all(
+            _background_continuity_review_passes(review)
+            for review in continuity_reviews
+        ),
+        reference_phrase_supported=(
+            full_scene_review.reference_phrase_supported
+            if full_scene_review is not None
+            else False
+        ),
+        artifact_types=artifacts,
+        reason="; ".join(reasons),
     )
 
 
@@ -647,6 +848,8 @@ def _background_review_payload(
     review: BackgroundInpaintingReview,
 ) -> dict[str, object]:
     payload = review.model_dump(mode="json")
+    artifact_types = list(dict.fromkeys(payload["artifact_types"]))
+    payload["artifact_types"] = artifact_types
     outcome = review.masked_content_outcome
     payload.update(
         {
@@ -656,10 +859,38 @@ def _background_review_payload(
             "new_salient_objects": (
                 outcome == MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
             ),
-            "visible_seam_or_artifact": bool(review.artifact_types),
+            "visible_seam_or_artifact": bool(artifact_types),
         }
     )
     return payload
+
+
+DEDUPLICATED_METADATA_LIST_FIELDS = frozenset(
+    {
+        "artifact_types",
+        "rejection_reasons",
+    }
+)
+
+
+def _deduplicate_metadata_lists(
+    value: object,
+    *,
+    field_name: str | None = None,
+) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _deduplicate_metadata_lists(item, field_name=key)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        items = [
+            _deduplicate_metadata_lists(item) for item in value
+        ]
+        if field_name in DEDUPLICATED_METADATA_LIST_FIELDS:
+            return list(dict.fromkeys(items))
+        return items
+    return value
 
 
 def _mask_boundary(mask: np.ndarray, pixels: int = 3) -> np.ndarray:
@@ -911,6 +1142,48 @@ def _background_local_review_images(
     return original_crop, repaired_crop, mask_crop, crop_box
 
 
+def _background_context_only_image(
+    image: Image.Image,
+    mask: Image.Image,
+) -> Image.Image:
+    image_array = np.asarray(image.convert("RGB")).copy()
+    mask_array = np.asarray(mask.convert("L")) >= 128
+    if image_array.shape[:2] != mask_array.shape:
+        raise ValueError("background context image and mask must match")
+    image_array[mask_array] = (128, 128, 128)
+    return Image.fromarray(image_array)
+
+
+def _background_boundary_review_images(
+    *,
+    original: Image.Image,
+    repaired: Image.Image,
+    mask: Image.Image,
+) -> tuple[Image.Image, Image.Image]:
+    original_array = np.asarray(original.convert("RGB"))
+    repaired_array = np.asarray(repaired.convert("RGB"))
+    mask_array = np.asarray(mask.convert("L")) >= 128
+    if (
+        original_array.shape != repaired_array.shape
+        or original_array.shape[:2] != mask_array.shape
+    ):
+        raise ValueError("background boundary images and mask must match")
+    boundary_pixels = max(
+        4,
+        round(0.04 * min(mask_array.shape)),
+    )
+    boundary = _mask_boundary(mask_array, pixels=boundary_pixels)
+    original_boundary = np.full_like(original_array, 128)
+    repaired_boundary = np.full_like(repaired_array, 128)
+    original_visible = boundary & ~mask_array
+    original_boundary[original_visible] = original_array[original_visible]
+    repaired_boundary[boundary] = repaired_array[boundary]
+    return (
+        Image.fromarray(original_boundary),
+        Image.fromarray(repaired_boundary),
+    )
+
+
 def _background_local_review_components(
     *,
     original: Image.Image,
@@ -1084,6 +1357,9 @@ class ProductionConsistencyValidator:
         qwen_local_reviews: list[dict[str, object]] = []
         qwen_local_review: dict[str, object] | None = None
         qwen_local_crop_box: tuple[int, int, int, int] | None = None
+        qwen_foreground_removal_reviews: list[dict[str, object]] = []
+        qwen_background_continuity_reviews: list[dict[str, object]] = []
+        qwen_full_scene_review: dict[str, object] | None = None
         comparison_sheet_paths: list[str] = []
         comparison_sheet_fingerprints: list[str] = []
         if self.qwen is not None:
@@ -1103,6 +1379,18 @@ class ProductionConsistencyValidator:
             )
             local_mask_path = (
                 temporary_root / ".inpainting_qwen_local_mask.png"
+            )
+            full_context_original_path = (
+                temporary_root / ".inpainting_qwen_full_context.png"
+            )
+            local_context_original_path = (
+                temporary_root / ".inpainting_qwen_local_context.png"
+            )
+            local_original_boundary_path = (
+                temporary_root / ".inpainting_qwen_original_boundary.png"
+            )
+            local_repaired_boundary_path = (
+                temporary_root / ".inpainting_qwen_repaired_boundary.png"
             )
             full_comparison_path = (
                 diagnostics_dir / "comparison_full.png"
@@ -1134,31 +1422,17 @@ class ProductionConsistencyValidator:
                     )
                     if diagnostics_dir is None:
                         temporary_comparison_paths.append(full_comparison_path)
-                    full_passes = False
-                    local_passes = True
-                    try:
-                        full_review = self.qwen.review(
-                            original_path=original_path,
-                            repaired_path=repaired_path,
-                            repair_mask_path=repair_mask_path,
-                            comparison_sheet_path=full_comparison_path,
-                            reference_phrase=phrase,
-                            mode=mode,
-                        )
-                        if isinstance(
-                            full_review,
-                            BackgroundInpaintingReview,
-                        ):
-                            qwen_full_review = _background_review_payload(
-                                full_review
-                            )
-                            full_passes = _background_review_passes(
-                                full_review
-                            )
-                        else:
-                            reasons.append("qwen_full_review_schema")
-                    except Exception:  # noqa: BLE001
-                        reasons.append("qwen_full_validation_failed")
+                    full_context_original = _background_context_only_image(
+                        original,
+                        repair_mask,
+                    )
+                    _save_lossless_atomic(
+                        full_context_original,
+                        full_context_original_path,
+                    )
+                    foreground_passes = True
+                    continuity_passes = True
+                    full_scene_passes = False
                     try:
                         local_components = _background_local_review_components(
                             original=original,
@@ -1167,8 +1441,17 @@ class ProductionConsistencyValidator:
                         )
                     except Exception:  # noqa: BLE001
                         local_components = []
-                        local_passes = False
+                        foreground_passes = False
+                        continuity_passes = False
                         reasons.append("qwen_local_validation_failed")
+                    component_models: list[
+                        tuple[
+                            int,
+                            tuple[int, int, int, int],
+                            ForegroundRemovalReview | None,
+                            BackgroundContinuityReview | None,
+                        ]
+                    ] = []
                     for (
                         component_index,
                         local_original,
@@ -1176,11 +1459,20 @@ class ProductionConsistencyValidator:
                         local_mask,
                         crop_box,
                     ) in local_components:
-                        local_record: dict[str, object] = {
+                        foreground_record: dict[str, object] = {
                             "component_index": component_index,
                             "crop_box": list(crop_box),
                             "review": None,
                         }
+                        continuity_record: dict[str, object] = {
+                            "component_index": component_index,
+                            "crop_box": list(crop_box),
+                            "review": None,
+                        }
+                        foreground_review: ForegroundRemovalReview | None = None
+                        continuity_review: BackgroundContinuityReview | None = (
+                            None
+                        )
                         local_comparison_path = (
                             diagnostics_dir
                             / f"comparison_local_{component_index:02d}.png"
@@ -1222,43 +1514,196 @@ class ProductionConsistencyValidator:
                                 temporary_comparison_paths.append(
                                     local_comparison_path
                                 )
-                            local_review = self.qwen.review(
-                                original_path=local_original_path,
-                                repaired_path=local_repaired_path,
-                                repair_mask_path=local_mask_path,
-                                comparison_sheet_path=local_comparison_path,
-                                reference_phrase=phrase,
-                                mode="background_hole_fill_local",
+                            foreground_review = (
+                                self.qwen.review_foreground_removal(
+                                    original_path=local_original_path,
+                                    repaired_path=local_repaired_path,
+                                    repair_mask_path=local_mask_path,
+                                )
                             )
                             if isinstance(
-                                local_review,
-                                BackgroundInpaintingReview,
+                                foreground_review,
+                                ForegroundRemovalReview,
                             ):
-                                local_record["review"] = (
-                                    _background_review_payload(local_review)
+                                foreground_record["review"] = (
+                                    foreground_review.model_dump(mode="json")
                                 )
-                                if not _background_review_passes(
-                                    local_review,
-                                    require_reference_phrase=False,
+                                if not _foreground_removal_review_passes(
+                                    foreground_review
                                 ):
-                                    local_passes = False
+                                    foreground_passes = False
                             else:
-                                local_passes = False
-                                reasons.append("qwen_local_review_schema")
+                                foreground_review = None
+                                foreground_passes = False
+                                reasons.append(
+                                    "qwen_foreground_removal_review_schema"
+                                )
                         except Exception:  # noqa: BLE001
-                            local_passes = False
-                            reasons.append("qwen_local_validation_failed")
-                        qwen_local_reviews.append(local_record)
+                            foreground_passes = False
+                            reasons.append(
+                                "qwen_foreground_removal_validation_failed"
+                            )
+                        try:
+                            local_context_original = (
+                                _background_context_only_image(
+                                    local_original,
+                                    local_mask,
+                                )
+                            )
+                            (
+                                local_original_boundary,
+                                local_repaired_boundary,
+                            ) = _background_boundary_review_images(
+                                original=local_original,
+                                repaired=local_repaired,
+                                mask=local_mask,
+                            )
+                            _save_lossless_atomic(
+                                local_context_original,
+                                local_context_original_path,
+                            )
+                            _save_lossless_atomic(
+                                local_original_boundary,
+                                local_original_boundary_path,
+                            )
+                            _save_lossless_atomic(
+                                local_repaired_boundary,
+                                local_repaired_boundary_path,
+                            )
+                            continuity_review = (
+                                self.qwen.review_background_continuity(
+                                    context_original_path=(
+                                        local_context_original_path
+                                    ),
+                                    repaired_path=local_repaired_path,
+                                    repair_mask_path=local_mask_path,
+                                    original_boundary_path=(
+                                        local_original_boundary_path
+                                    ),
+                                    repaired_boundary_path=(
+                                        local_repaired_boundary_path
+                                    ),
+                                )
+                            )
+                            if isinstance(
+                                continuity_review,
+                                BackgroundContinuityReview,
+                            ):
+                                continuity_record["review"] = (
+                                    continuity_review.model_dump(mode="json")
+                                )
+                                if not _background_continuity_review_passes(
+                                    continuity_review
+                                ):
+                                    continuity_passes = False
+                            else:
+                                continuity_review = None
+                                continuity_passes = False
+                                reasons.append(
+                                    "qwen_background_continuity_review_schema"
+                                )
+                        except Exception:  # noqa: BLE001
+                            continuity_passes = False
+                            reasons.append(
+                                "qwen_background_continuity_validation_failed"
+                            )
+                        qwen_foreground_removal_reviews.append(
+                            foreground_record
+                        )
+                        qwen_background_continuity_reviews.append(
+                            continuity_record
+                        )
+                        component_models.append(
+                            (
+                                component_index,
+                                crop_box,
+                                foreground_review,
+                                continuity_review,
+                            )
+                        )
+                    if not local_components:
+                        foreground_passes = False
+                        continuity_passes = False
+                    full_scene_model: FullSceneReview | None = None
+                    try:
+                        full_scene_model = self.qwen.review_full_scene(
+                            repaired_path=repaired_path,
+                            context_original_path=full_context_original_path,
+                            reference_phrase=phrase,
+                        )
+                        if isinstance(full_scene_model, FullSceneReview):
+                            qwen_full_scene_review = (
+                                full_scene_model.model_dump(mode="json")
+                            )
+                            full_scene_passes = _full_scene_review_passes(
+                                full_scene_model
+                            )
+                        else:
+                            full_scene_model = None
+                            reasons.append("qwen_full_scene_review_schema")
+                    except Exception:  # noqa: BLE001
+                        reasons.append("qwen_full_scene_validation_failed")
+                    foreground_models = [
+                        foreground_review
+                        for _, _, foreground_review, _ in component_models
+                        if foreground_review is not None
+                    ]
+                    continuity_models = [
+                        continuity_review
+                        for _, _, _, continuity_review in component_models
+                        if continuity_review is not None
+                    ]
+                    legacy_full_review = _legacy_background_review(
+                        foreground_reviews=foreground_models,
+                        continuity_reviews=continuity_models,
+                        full_scene_review=full_scene_model,
+                    )
+                    if legacy_full_review is not None:
+                        qwen_full_review = _background_review_payload(
+                            legacy_full_review
+                        )
+                    for (
+                        component_index,
+                        crop_box,
+                        foreground_review,
+                        continuity_review,
+                    ) in component_models:
+                        legacy_local_review = (
+                            _legacy_background_review(
+                                foreground_reviews=[foreground_review],
+                                continuity_reviews=[continuity_review],
+                                full_scene_review=full_scene_model,
+                            )
+                            if foreground_review is not None
+                            and continuity_review is not None
+                            else None
+                        )
+                        qwen_local_reviews.append(
+                            {
+                                "component_index": component_index,
+                                "crop_box": list(crop_box),
+                                "review": (
+                                    _background_review_payload(
+                                        legacy_local_review
+                                    )
+                                    if legacy_local_review is not None
+                                    else None
+                                ),
+                            }
+                        )
                     if len(qwen_local_reviews) == 1:
                         only_local = qwen_local_reviews[0]
                         only_review = only_local["review"]
                         if isinstance(only_review, dict):
                             qwen_local_review = only_review
                         qwen_local_crop_box = tuple(
-                            int(value)
-                            for value in only_local["crop_box"]
+                            int(value) for value in only_local["crop_box"]
                         )
-                    if not (full_passes and local_passes):
+                    if not (
+                        foreground_passes
+                        and continuity_passes
+                        and full_scene_passes
+                    ):
                         reasons.append("qwen_background_consistency")
                 else:
                     review = self.qwen.review(
@@ -1288,11 +1733,15 @@ class ProductionConsistencyValidator:
                 local_original_path.unlink(missing_ok=True)
                 local_repaired_path.unlink(missing_ok=True)
                 local_mask_path.unlink(missing_ok=True)
+                full_context_original_path.unlink(missing_ok=True)
+                local_context_original_path.unlink(missing_ok=True)
+                local_original_boundary_path.unlink(missing_ok=True)
+                local_repaired_boundary_path.unlink(missing_ok=True)
                 for path in temporary_comparison_paths:
                     path.unlink(missing_ok=True)
 
         reasons = list(dict.fromkeys(reasons))
-        return {
+        result = {
             "accepted": not reasons,
             "dino_similarity": dino_similarity,
             "raw_siglip_similarity": raw_siglip,
@@ -1307,12 +1756,22 @@ class ProductionConsistencyValidator:
             "qwen_local_reviews": qwen_local_reviews,
             "qwen_local_review": qwen_local_review,
             "qwen_local_crop_box": qwen_local_crop_box,
+            "qwen_foreground_removal_reviews": (
+                qwen_foreground_removal_reviews
+            ),
+            "qwen_background_continuity_reviews": (
+                qwen_background_continuity_reviews
+            ),
+            "qwen_full_scene_review": qwen_full_scene_review,
             "comparison_sheet_paths": comparison_sheet_paths,
             "comparison_sheet_fingerprints": comparison_sheet_fingerprints,
             "comparison_sheet_version": BACKGROUND_COMPARISON_VERSION,
             "semantic_input": semantic_input,
             "rejection_reasons": reasons,
         }
+        deduplicated = _deduplicate_metadata_lists(result)
+        assert isinstance(deduplicated, dict)
+        return deduplicated
 
     def close(self) -> None:
         if self._owns_dino and self.dino is not None:
@@ -1417,14 +1876,44 @@ def _source_signature(
         else "entity_local_repair"
     )
     repair_prompt = _inpainting_prompt(reference, mode)
-    consistency_prompt = _consistency_review_prompt(
-        reference_phrase or canonical_label or "reference image",
-        mode,
+    review_phrase = (
+        reference_phrase or canonical_label or "reference image"
+    )
+    foreground_removal_prompt = (
+        _consistency_review_prompt(
+            review_phrase,
+            "background_foreground_removal",
+        )
+        if mode == "background_hole_fill"
+        else None
+    )
+    background_continuity_prompt = (
+        _consistency_review_prompt(
+            review_phrase,
+            "background_continuity",
+        )
+        if mode == "background_hole_fill"
+        else None
+    )
+    full_scene_prompt = (
+        _consistency_review_prompt(
+            review_phrase,
+            "background_full_scene",
+        )
+        if mode == "background_hole_fill"
+        else None
+    )
+    consistency_prompt = (
+        full_scene_prompt
+        if full_scene_prompt is not None
+        else _consistency_review_prompt(review_phrase, mode)
     )
     local_consistency_prompt = (
-        _consistency_review_prompt(
-            reference_phrase or canonical_label or "reference image",
-            "background_hole_fill_local",
+        "\n\n".join(
+            [
+                str(foreground_removal_prompt),
+                str(background_continuity_prompt),
+            ]
         )
         if mode == "background_hole_fill"
         else None
@@ -1434,6 +1923,9 @@ def _source_signature(
             "repair_prompt": repair_prompt,
             "consistency_prompt": consistency_prompt,
             "local_consistency_prompt": local_consistency_prompt,
+            "foreground_removal_prompt": foreground_removal_prompt,
+            "background_continuity_prompt": background_continuity_prompt,
+            "full_scene_prompt": full_scene_prompt,
             "background_fill_prompt_request": (
                 BACKGROUND_FILL_PROMPT
                 if mode == "background_hole_fill"
@@ -1461,6 +1953,21 @@ def _source_signature(
         "local_consistency_prompt_sha256": (
             _sha256_text(local_consistency_prompt)
             if local_consistency_prompt is not None
+            else None
+        ),
+        "foreground_removal_prompt_sha256": (
+            _sha256_text(foreground_removal_prompt)
+            if foreground_removal_prompt is not None
+            else None
+        ),
+        "background_continuity_prompt_sha256": (
+            _sha256_text(background_continuity_prompt)
+            if background_continuity_prompt is not None
+            else None
+        ),
+        "full_scene_prompt_sha256": (
+            _sha256_text(full_scene_prompt)
+            if full_scene_prompt is not None
             else None
         ),
         "prompt_fingerprint": _sha256_text(prompt_payload),
