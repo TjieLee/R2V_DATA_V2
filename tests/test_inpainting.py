@@ -783,7 +783,7 @@ def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
 
     assert stats.repaired == 2
     background_prompt = next(
-        prompt for prompt in backend.prompts if "Scene description:" in prompt
+        prompt for prompt in backend.prompts if "background scenery" in prompt
     )
     lowered = background_prompt.casefold()
     assert background_prompt.startswith(
@@ -803,23 +803,21 @@ def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
     assert any("exact same entity identity" in prompt for prompt in backend.prompts)
 
 
-def test_background_generation_prompt_is_positive_and_clip_safe() -> None:
+def test_background_generation_prompt_ignores_reference_phrase() -> None:
     prompt = _inpainting_prompt(
-        {
-            "phrase": " ".join(
-                ["brick", "courtyard", "arches", "sunlight"] * 20
-            )
-        },
+        {"phrase": "whale person ship fish"},
         "background_hole_fill",
     )
     lowered = prompt.casefold()
 
     assert len(prompt.split()) < 60
-    assert lowered.count("brick") == 6
     for prohibited in (
+        "whale",
+        "person",
+        "ship",
+        "fish",
         "remove",
         "subject",
-        "person",
         "animal",
         "boat",
         "foreground object",
@@ -1149,6 +1147,7 @@ def test_qwen_uses_dedicated_background_review_prompt_and_schema(
     assert "original masked foreground remains" in full_prompt
     assert "another entity replaces it" in full_prompt
     assert "obvious seam or visual artifact" in full_prompt
+    assert "a brick courtyard" in full_prompt
     local_prompt = " ".join(str(captured[1]["prompt"]).split())
     for expected in (
         "person",
@@ -1166,6 +1165,11 @@ def test_qwen_uses_dedicated_background_review_prompt_and_schema(
         "visible boundary",
     ):
         assert expected in local_prompt
+    assert "a brick courtyard" in local_prompt
+    assert "inside or meaningfully overlaps the white repair mask" in local_prompt
+    assert "newly introduced in the repaired image" in local_prompt
+    assert "only in the surrounding contextual pixels" in local_prompt
+    assert "already present in the original crop" in local_prompt
 
 
 def test_background_qwen_accepts_expected_masked_foreground_removal(

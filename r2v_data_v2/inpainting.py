@@ -1166,9 +1166,7 @@ def _inpainting_prompt(
     mode: str,
 ) -> str:
     if mode == "background_hole_fill":
-        phrase = " ".join(str(reference.get("phrase", "")).split()[:24])
-        suffix = f" Scene description: {phrase}." if phrase else ""
-        return BACKGROUND_INPAINT_PROMPT + suffix
+        return BACKGROUND_INPAINT_PROMPT
     return ENTITY_INPAINT_PROMPT.format(
         description=str(
             reference.get("phrase")

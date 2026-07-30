@@ -28,9 +28,12 @@ region expected to become coherent background matching this reference phrase:
 
 Inspect the masked region and its immediate boundary closely. Reject if any
 person, animal, vehicle, vessel, product, face, body silhouette, or other
-distinct foreground object remains or appears. Also reject any blurred ghost,
+distinct foreground object lies inside or meaningfully overlaps the white
+repair mask, or if such an object is newly introduced in the repaired image.
+Do not reject an object that appears only in the surrounding contextual pixels
+and was already present in the original crop. Also reject any blurred ghost,
 repeated texture, inset image, artificial blob, visible boundary, seam, or
-other local artifact.
+other local artifact inside the repair mask or along its boundary.
 
 Return only the requested JSON structure.
 """.strip()
