@@ -1,21 +1,33 @@
 FOREGROUND_REMOVAL_REVIEW_PROMPT = """
-Review foreground removal for one connected component using three images:
-1. the original crop;
-2. the repaired crop;
-3. the binary component mask, where white is the evaluated region.
+Review foreground removal for one connected component using four images:
+1. original_mask_only, where pixels outside the component are neutral gray;
+2. repaired_mask_only, where pixels outside the component are neutral gray;
+3. repaired_context, the normal repaired crop;
+4. the binary component mask, where white is the evaluated region.
 
-Classify only foreground identity inside or meaningfully overlapping the white
-mask. Uniform or continuous water, sky, grass, soil, rock, coral, cloud, wall,
-pavement, and similar scene materials are background, not replacement objects.
-A replacement salient entity must have a distinct bounded shape and a
-recognizable semantic identity. Large pixel differences inside the mask are
-expected after successful foreground removal and are not evidence of failure.
-Do not reject an unchanged object that appears only in surrounding context.
+Judge only content inside or meaningfully overlapping the white mask. Compare
+the two mask-only images to determine whether original foreground remains or
+was reconstructed. Use repaired_context only to resolve shapes at the mask
+boundary.
 
-Use removed when no foreground identity remains in the mask. Use remains when
-the original foreground is still present, reconstructed when it was recreated,
-and replaced_by_salient_entity only for a new distinct recognizable entity.
-Use uncertain only when a foreground identity cannot be resolved.
+Report each decision independently. List every recognizable person, people,
+man, woman, child, animal, vehicle, car, boat, table, chair, product, face,
+body silhouette, or other distinct bounded entity visible in the repaired
+mask. If any entity is listed, new_salient_entity_visible must be true unless
+it is clearly the original foreground, and background_only_inside_mask must be
+false.
+
+Uniform or continuous water, sky, grass, soil, rock, coral, cloud, wall,
+pavement, and similar scene materials are background, not salient entities.
+Clean water or coral texture may be background_only_inside_mask. However, a
+mountain, forest, tree line, or other large original structure reconstructed
+from original_mask_only must set original_foreground_reconstructed=true even
+when it looks like natural scenery.
+
+Large pixel differences inside the mask are expected after successful
+foreground removal and are not evidence of failure. Use uncertain only when a
+foreground identity cannot be resolved. The booleans, visible_entities, and
+reason must describe the same visual conclusion.
 
 Return only the requested JSON structure.
 """.strip()

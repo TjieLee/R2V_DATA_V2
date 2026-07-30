@@ -326,10 +326,14 @@ separate hole-filled, closed, component-grouped, per-group convex-hull mask
 with adaptive dilation, capped by
 `inpainting.background.maximum_generation_mask_area_ratio: 0.35`. Both source
 and generation mask paths and ratios remain in metadata. The full-frame Qwen
-review and one context-upscaled local review per generation-mask component
-must all return the categorical `removed_to_background` outcome with coherent
-continuity and no listed artifact. Each review receives a fourth comparison
-sheet with overlays, masked differences, and a boundary-ring comparison.
+scene review and the independent foreground-removal and continuity reviews for
+each context-upscaled generation-mask component must all pass. Foreground
+removal compares original/repaired mask-only crops, a repaired context crop,
+and the binary mask. Comparison sheets, overlays, and difference heatmaps are
+retained only for human inspection and are never sent to Qwen. Object-like
+annotation entities also receive a repaired-image SAM3 grounding check; at
+least 20 percent overlap with the generation mask rejects the candidate as
+remaining or reconstructed foreground.
 Background FLUX prompts are generated from a context-only image whose generation
 mask pixels are neutral gray, are validated against foreground and
 negative-language terms, and never include the caption or reference phrase.
@@ -379,6 +383,18 @@ a summary without changing production references, manifests, or samples. It
 reuses one loaded FLUX pipeline across every guidance/step combination.
 `prompt_mode=empty` sends an actual empty string, while Qwen prompt failures
 reject that benchmark candidate instead of substituting a generic prompt.
+
+Existing benchmark candidates can be re-reviewed with the current validator
+without running FLUX or modifying the candidate images:
+
+```bash
+python scripts/revalidate_flux_background_candidates.py \
+  --config configs/default.yaml \
+  --run-dir /path/to/benchmarks/flux-background/flux_background_fill_RUN
+```
+
+Each invocation creates a new versioned revalidation directory beside the
+candidate manifest and records `flux_inference_performed: false` in its summary.
 
 ## Augmentation
 

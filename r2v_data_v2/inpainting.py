@@ -37,12 +37,12 @@ from r2v_data_v2.image_utils import (
 )
 from r2v_data_v2.mask_utils import save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
+from r2v_data_v2.sam3_backend import Sam3Backend
 from r2v_data_v2.schemas import (
     BackgroundArtifactType,
     BackgroundContinuityReview,
     BackgroundFillPrompt,
     BackgroundInpaintingReview,
-    ForegroundOutcome,
     ForegroundRemovalReview,
     FullSceneReview,
     InpaintingSemanticReview,
@@ -117,6 +117,80 @@ BACKGROUND_FILL_FOREGROUND_WORDS = frozenset(
         "whale",
     }
 )
+FOREGROUND_REVIEW_HIGH_RISK_ENTITY_WORDS = frozenset(
+    {
+        "animal",
+        "animals",
+        "boat",
+        "boats",
+        "car",
+        "cars",
+        "chair",
+        "chairs",
+        "child",
+        "children",
+        "man",
+        "men",
+        "people",
+        "person",
+        "persons",
+        "table",
+        "tables",
+        "vehicle",
+        "vehicles",
+        "vessel",
+        "vessels",
+        "woman",
+        "women",
+    }
+)
+REPAIRED_ENTITY_GROUNDING_CATEGORIES = frozenset(
+    {
+        "animal",
+        "character",
+        "object",
+        "person",
+        "product",
+        "vehicle",
+    }
+)
+REPAIRED_ENTITY_GROUNDING_BROAD_SCENE_WORDS = frozenset(
+    {
+        "cloud",
+        "clouds",
+        "forest",
+        "forests",
+        "landscape",
+        "mountain",
+        "mountains",
+        "ocean",
+        "oceans",
+        "sea",
+        "seas",
+        "sky",
+        "terrain",
+        "water",
+        "waters",
+    }
+)
+REPAIRED_ENTITY_GROUNDING_SCENE_MODIFIERS = frozenset(
+    {
+        "a",
+        "an",
+        "blue",
+        "broad",
+        "deep",
+        "dense",
+        "distant",
+        "large",
+        "open",
+        "rocky",
+        "snowy",
+        "the",
+        "vast",
+    }
+)
+REPAIRED_ENTITY_INSIDE_MASK_REJECTION_RATIO = 0.20
 BACKGROUND_COMPARISON_VERSION = "1"
 
 ENTITY_INPAINT_PROMPT = (
@@ -145,7 +219,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "8"
+INPAINTING_SOURCE_METADATA_VERSION = "9"
 
 
 class InpaintBackend(Protocol):
@@ -185,8 +259,9 @@ class InpaintingSemanticJudge(Protocol):
     def review_foreground_removal(
         self,
         *,
-        original_path: Path,
-        repaired_path: Path,
+        original_mask_only_path: Path,
+        repaired_mask_only_path: Path,
+        repaired_context_path: Path,
         repair_mask_path: Path,
     ) -> ForegroundRemovalReview: ...
 
@@ -217,6 +292,17 @@ class BackgroundFillPromptGenerator(Protocol):
         generation_mask_path: Path,
         forbidden_texts: list[str],
     ) -> tuple[BackgroundFillPrompt, dict[str, object]]: ...
+
+
+class RepairedEntityGrounder(Protocol):
+    def ground_image(
+        self,
+        *,
+        image_path: Path,
+        grounding_prompt: str,
+    ) -> np.ndarray | None: ...
+
+    def close(self) -> None: ...
 
 
 class InpaintingDependencyError(RuntimeError):
@@ -456,6 +542,92 @@ def _background_fill_prompt_issues(
     return issues
 
 
+def _foreground_removal_review_issues(
+    review: ForegroundRemovalReview,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    visible_entities = [
+        entity.strip()
+        for entity in review.visible_entities
+        if entity.strip()
+    ]
+    if len(visible_entities) != len(review.visible_entities):
+        issues.append(
+            ValidationIssue(
+                code="foreground_review_empty_entity",
+                field="visible_entities",
+                message="visible_entities entries must be non-empty",
+            )
+        )
+    if not review.new_salient_entity_visible and visible_entities:
+        issues.append(
+            ValidationIssue(
+                code="foreground_review_entity_flag_contradiction",
+                field="new_salient_entity_visible",
+                message=(
+                    "new_salient_entity_visible cannot be false when "
+                    "visible_entities is non-empty"
+                ),
+            )
+        )
+    if review.new_salient_entity_visible and not visible_entities:
+        issues.append(
+            ValidationIssue(
+                code="foreground_review_entity_list_missing",
+                field="visible_entities",
+                message=(
+                    "visible_entities must name every reported salient entity"
+                ),
+            )
+        )
+    if review.background_only_inside_mask and visible_entities:
+        issues.append(
+            ValidationIssue(
+                code="foreground_review_background_only_contradiction",
+                field="background_only_inside_mask",
+                message=(
+                    "background_only_inside_mask cannot be true when "
+                    "visible_entities is non-empty"
+                ),
+            )
+        )
+    if review.background_only_inside_mask and (
+        review.original_foreground_still_visible
+        or review.original_foreground_reconstructed
+        or review.new_salient_entity_visible
+        or review.uncertain
+    ):
+        issues.append(
+            ValidationIssue(
+                code="foreground_review_passing_state_contradiction",
+                field="background_only_inside_mask",
+                message=(
+                    "background_only_inside_mask conflicts with foreground "
+                    "or uncertain fields"
+                ),
+            )
+        )
+    reason_words = {
+        word.casefold()
+        for word in re.findall(r"[A-Za-z]+", review.reason)
+    }
+    named_high_risk = sorted(
+        reason_words & FOREGROUND_REVIEW_HIGH_RISK_ENTITY_WORDS
+    )
+    if named_high_risk and not visible_entities:
+        issues.append(
+            ValidationIssue(
+                code="foreground_review_reason_entity_missing",
+                field="visible_entities",
+                message=(
+                    "reason names high-risk entities absent from "
+                    f"visible_entities: {', '.join(named_high_risk)}"
+                ),
+            )
+        )
+    return issues
+
+
 class QwenBackgroundFillPromptGenerator:
     def __init__(self, config: QwenConfig) -> None:
         self.config = config
@@ -645,8 +817,9 @@ class QwenInpaintingConsistencyJudge:
     def review_foreground_removal(
         self,
         *,
-        original_path: Path,
-        repaired_path: Path,
+        original_mask_only_path: Path,
+        repaired_mask_only_path: Path,
+        repaired_context_path: Path,
         repair_mask_path: Path,
     ) -> ForegroundRemovalReview:
         prompt = _consistency_review_prompt(
@@ -657,14 +830,16 @@ class QwenInpaintingConsistencyJudge:
             request=lambda request_text: self._request(
                 prompt=request_text,
                 image_paths=[
-                    original_path,
-                    repaired_path,
+                    original_mask_only_path,
+                    repaired_mask_only_path,
+                    repaired_context_path,
                     repair_mask_path,
                 ],
                 review_model=ForegroundRemovalReview,
             ),
             original_request=prompt,
             model=ForegroundRemovalReview,
+            validate=_foreground_removal_review_issues,
         )
 
     def review_background_continuity(
@@ -725,8 +900,13 @@ def _foreground_removal_review_passes(
     review: ForegroundRemovalReview,
 ) -> bool:
     return (
-        review.foreground_outcome == ForegroundOutcome.REMOVED
-        and not review.salient_entity_visible_in_mask
+        not _foreground_removal_review_issues(review)
+        and not review.original_foreground_still_visible
+        and not review.original_foreground_reconstructed
+        and not review.new_salient_entity_visible
+        and not review.visible_entities
+        and review.background_only_inside_mask
+        and not review.uncertain
     )
 
 
@@ -779,17 +959,15 @@ def _background_artifact_types(
 def _legacy_background_outcome(
     review: ForegroundRemovalReview,
 ) -> MaskedContentOutcome:
-    return {
-        ForegroundOutcome.REMOVED: MaskedContentOutcome.REMOVED_TO_BACKGROUND,
-        ForegroundOutcome.REMAINS: MaskedContentOutcome.FOREGROUND_REMAINS,
-        ForegroundOutcome.RECONSTRUCTED: (
-            MaskedContentOutcome.FOREGROUND_RECONSTRUCTED
-        ),
-        ForegroundOutcome.REPLACED_BY_SALIENT_ENTITY: (
-            MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
-        ),
-        ForegroundOutcome.UNCERTAIN: MaskedContentOutcome.UNCERTAIN,
-    }[review.foreground_outcome]
+    if review.uncertain:
+        return MaskedContentOutcome.UNCERTAIN
+    if review.original_foreground_still_visible:
+        return MaskedContentOutcome.FOREGROUND_REMAINS
+    if review.original_foreground_reconstructed:
+        return MaskedContentOutcome.FOREGROUND_RECONSTRUCTED
+    if review.new_salient_entity_visible or review.visible_entities:
+        return MaskedContentOutcome.REPLACED_BY_NEW_OBJECT
+    return MaskedContentOutcome.REMOVED_TO_BACKGROUND
 
 
 def _legacy_background_review(
@@ -869,6 +1047,7 @@ DEDUPLICATED_METADATA_LIST_FIELDS = frozenset(
     {
         "artifact_types",
         "rejection_reasons",
+        "visible_entities",
     }
 )
 
@@ -1154,6 +1333,19 @@ def _background_context_only_image(
     return Image.fromarray(image_array)
 
 
+def _background_mask_only_image(
+    image: Image.Image,
+    mask: Image.Image,
+) -> Image.Image:
+    image_array = np.asarray(image.convert("RGB"))
+    mask_array = np.asarray(mask.convert("L")) >= 128
+    if image_array.shape[:2] != mask_array.shape:
+        raise ValueError("background mask-only image and mask must match")
+    result = np.full_like(image_array, 128)
+    result[mask_array] = image_array[mask_array]
+    return Image.fromarray(result)
+
+
 def _background_boundary_review_images(
     *,
     original: Image.Image,
@@ -1233,6 +1425,147 @@ def _background_local_review_components(
     return components
 
 
+def _repaired_entity_grounding_targets(
+    reference: dict[str, object],
+    *,
+    output_root: Path,
+) -> list[dict[str, str]]:
+    candidates: list[dict[str, object]] = [reference]
+    clip_uid = str(reference.get("clip_uid") or "")
+    annotation_path = output_root / "annotations" / f"{clip_uid}.json"
+    if clip_uid and annotation_path.is_file():
+        try:
+            annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            annotation = None
+        if isinstance(annotation, dict):
+            entities = annotation.get("entities")
+            if isinstance(entities, list):
+                candidates.extend(
+                    entity for entity in entities if isinstance(entity, dict)
+                )
+
+    targets: list[dict[str, str]] = []
+    seen_phrases: set[str] = set()
+    for candidate in candidates:
+        category = str(candidate.get("category") or "").casefold()
+        if category not in REPAIRED_ENTITY_GROUNDING_CATEGORIES:
+            continue
+        phrase = str(
+            candidate.get("phrase")
+            or candidate.get("canonical_label")
+            or ""
+        ).strip()
+        if not phrase:
+            continue
+        canonical_label = str(
+            candidate.get("canonical_label") or ""
+        ).strip()
+        scene_descriptor = canonical_label or phrase
+        scene_words = {
+            word.casefold()
+            for word in re.findall(
+                r"[A-Za-z]+",
+                scene_descriptor,
+            )
+        }
+        if scene_words and scene_words <= (
+            REPAIRED_ENTITY_GROUNDING_BROAD_SCENE_WORDS
+            | REPAIRED_ENTITY_GROUNDING_SCENE_MODIFIERS
+        ):
+            continue
+        normalized_phrase = " ".join(phrase.casefold().split())
+        if normalized_phrase in seen_phrases:
+            continue
+        seen_phrases.add(normalized_phrase)
+        targets.append(
+            {
+                "category": category,
+                "entity_id": str(candidate.get("entity_id") or ""),
+                "grounding_phrase": phrase,
+            }
+        )
+    return targets
+
+
+def _repaired_entity_grounding_records(
+    *,
+    grounder: RepairedEntityGrounder,
+    repaired_path: Path,
+    generation_mask: Image.Image,
+    targets: list[dict[str, str]],
+    destination: Path,
+    component_index: int,
+) -> list[dict[str, object]]:
+    generation = np.asarray(generation_mask.convert("L")) >= 128
+    records: list[dict[str, object]] = []
+    destination.mkdir(parents=True, exist_ok=True)
+    for target_index, target in enumerate(targets):
+        phrase = target["grounding_phrase"]
+        record: dict[str, object] = {
+            **target,
+            "component_index": component_index,
+            "repaired_entity_mask_path": None,
+            "repaired_entity_inside_generation_mask_ratio": 0.0,
+            "rejection_threshold": (
+                REPAIRED_ENTITY_INSIDE_MASK_REJECTION_RATIO
+            ),
+            "rejection_result": "not_detected",
+        }
+        try:
+            detected = grounder.ground_image(
+                image_path=repaired_path,
+                grounding_prompt=phrase,
+            )
+            if detected is not None:
+                detected_mask = np.asarray(detected, dtype=bool)
+                if detected_mask.ndim != 2:
+                    raise ValueError("SAM3 repaired entity mask must be H-W")
+                if detected_mask.shape != generation.shape:
+                    detected_mask = cv2.resize(
+                        detected_mask.astype(np.uint8),
+                        (generation.shape[1], generation.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                detected_area = int(detected_mask.sum())
+                if detected_area:
+                    mask_path = destination / (
+                        "repaired_entity_mask_"
+                        f"{component_index:02d}_{target_index:02d}.png"
+                    )
+                    save_mask_png(mask_path, detected_mask)
+                    inside_ratio = float(
+                        np.logical_and(detected_mask, generation).sum()
+                        / detected_area
+                    )
+                    rejected = (
+                        inside_ratio
+                        >= REPAIRED_ENTITY_INSIDE_MASK_REJECTION_RATIO
+                    )
+                    record.update(
+                        {
+                            "repaired_entity_mask_path": str(mask_path),
+                            "repaired_entity_inside_generation_mask_ratio": (
+                                inside_ratio
+                            ),
+                            "rejection_result": (
+                                "foreground_remains_or_reconstructed"
+                                if rejected
+                                else "passed"
+                            ),
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001
+            record.update(
+                {
+                    "rejection_result": "grounding_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        records.append(record)
+    return records
+
+
 class ProductionConsistencyValidator:
     def __init__(
         self,
@@ -1241,13 +1574,29 @@ class ProductionConsistencyValidator:
         dino_embedder: DinoV3Embedder | None = None,
         siglip_aligner: Siglip2Aligner | None = None,
         qwen_judge: InpaintingSemanticJudge | None = None,
+        repaired_entity_grounder: RepairedEntityGrounder | None = None,
     ) -> None:
         self.config = config
         self.dino = dino_embedder
         self.siglip = siglip_aligner
         self.qwen = qwen_judge
+        self.repaired_entity_grounder = repaired_entity_grounder
         self._owns_dino = False
         self._owns_siglip = False
+        self._owns_repaired_entity_grounder = False
+
+    def _ensure_repaired_entity_grounder(self) -> bool:
+        if self.repaired_entity_grounder is not None:
+            return True
+        try:
+            self.repaired_entity_grounder = Sam3Backend(
+                self.config.sam3,
+                frame_count=1,
+            )
+            self._owns_repaired_entity_grounder = True
+        except Exception:  # noqa: BLE001
+            return False
+        return True
 
     def _ensure_models(self) -> list[str]:
         unavailable: list[str] = []
@@ -1362,6 +1711,7 @@ class ProductionConsistencyValidator:
         qwen_full_scene_review: dict[str, object] | None = None
         comparison_sheet_paths: list[str] = []
         comparison_sheet_fingerprints: list[str] = []
+        repaired_entity_grounding_guards: list[dict[str, object]] = []
         if self.qwen is not None:
             temporary_root = Path(
                 str(reference.get("raw_canonical_path", "."))
@@ -1379,6 +1729,14 @@ class ProductionConsistencyValidator:
             )
             local_mask_path = (
                 temporary_root / ".inpainting_qwen_local_mask.png"
+            )
+            local_original_mask_only_path = (
+                temporary_root
+                / ".inpainting_qwen_original_mask_only.png"
+            )
+            local_repaired_mask_only_path = (
+                temporary_root
+                / ".inpainting_qwen_repaired_mask_only.png"
             )
             full_context_original_path = (
                 temporary_root / ".inpainting_qwen_full_context.png"
@@ -1433,6 +1791,22 @@ class ProductionConsistencyValidator:
                     foreground_passes = True
                     continuity_passes = True
                     full_scene_passes = False
+                    grounding_targets = _repaired_entity_grounding_targets(
+                        reference,
+                        output_root=self.config.output_root,
+                    )
+                    grounding_available = (
+                        not grounding_targets
+                        or self._ensure_repaired_entity_grounder()
+                    )
+                    if not grounding_available:
+                        foreground_passes = False
+                        reasons.append("repaired_entity_grounding_failed")
+                    grounding_destination = (
+                        diagnostics_dir
+                        if diagnostics_dir is not None
+                        else temporary_root / "repaired_entity_grounding"
+                    )
                     try:
                         local_components = _background_local_review_components(
                             original=original,
@@ -1463,6 +1837,7 @@ class ProductionConsistencyValidator:
                             "component_index": component_index,
                             "crop_box": list(crop_box),
                             "review": None,
+                            "repaired_entity_grounding_guards": [],
                         }
                         continuity_record: dict[str, object] = {
                             "component_index": component_index,
@@ -1493,6 +1868,64 @@ class ProductionConsistencyValidator:
                                 local_repaired_path,
                             )
                             _save_lossless_atomic(local_mask, local_mask_path)
+                            if grounding_targets:
+                                if (
+                                    grounding_available
+                                    and self.repaired_entity_grounder is not None
+                                ):
+                                    grounding_records = (
+                                        _repaired_entity_grounding_records(
+                                            grounder=(
+                                                self.repaired_entity_grounder
+                                            ),
+                                            repaired_path=local_repaired_path,
+                                            generation_mask=local_mask,
+                                            targets=grounding_targets,
+                                            destination=grounding_destination,
+                                            component_index=component_index,
+                                        )
+                                    )
+                                else:
+                                    grounding_records = [
+                                        {
+                                            **target,
+                                            "component_index": component_index,
+                                            "repaired_entity_mask_path": None,
+                                            "repaired_entity_inside_generation_mask_ratio": (
+                                                None
+                                            ),
+                                            "rejection_threshold": (
+                                                REPAIRED_ENTITY_INSIDE_MASK_REJECTION_RATIO
+                                            ),
+                                            "rejection_result": (
+                                                "grounding_failed"
+                                            ),
+                                        }
+                                        for target in grounding_targets
+                                    ]
+                                foreground_record[
+                                    "repaired_entity_grounding_guards"
+                                ] = grounding_records
+                                repaired_entity_grounding_guards.extend(
+                                    grounding_records
+                                )
+                                grounding_results = {
+                                    str(record["rejection_result"])
+                                    for record in grounding_records
+                                }
+                                if (
+                                    "foreground_remains_or_reconstructed"
+                                    in grounding_results
+                                ):
+                                    foreground_passes = False
+                                    reasons.append(
+                                        "foreground_remains_or_reconstructed"
+                                    )
+                                if "grounding_failed" in grounding_results:
+                                    foreground_passes = False
+                                    reasons.append(
+                                        "repaired_entity_grounding_failed"
+                                    )
                             _save_lossless_atomic(
                                 _background_comparison_sheet(
                                     original=local_original,
@@ -1514,10 +1947,37 @@ class ProductionConsistencyValidator:
                                 temporary_comparison_paths.append(
                                     local_comparison_path
                                 )
+                            local_original_mask_only = (
+                                _background_mask_only_image(
+                                    local_original,
+                                    local_mask,
+                                )
+                            )
+                            local_repaired_mask_only = (
+                                _background_mask_only_image(
+                                    local_repaired,
+                                    local_mask,
+                                )
+                            )
+                            _save_lossless_atomic(
+                                local_original_mask_only,
+                                local_original_mask_only_path,
+                            )
+                            _save_lossless_atomic(
+                                local_repaired_mask_only,
+                                local_repaired_mask_only_path,
+                            )
                             foreground_review = (
                                 self.qwen.review_foreground_removal(
-                                    original_path=local_original_path,
-                                    repaired_path=local_repaired_path,
+                                    original_mask_only_path=(
+                                        local_original_mask_only_path
+                                    ),
+                                    repaired_mask_only_path=(
+                                        local_repaired_mask_only_path
+                                    ),
+                                    repaired_context_path=(
+                                        local_repaired_path
+                                    ),
                                     repair_mask_path=local_mask_path,
                                 )
                             )
@@ -1733,6 +2193,8 @@ class ProductionConsistencyValidator:
                 local_original_path.unlink(missing_ok=True)
                 local_repaired_path.unlink(missing_ok=True)
                 local_mask_path.unlink(missing_ok=True)
+                local_original_mask_only_path.unlink(missing_ok=True)
+                local_repaired_mask_only_path.unlink(missing_ok=True)
                 full_context_original_path.unlink(missing_ok=True)
                 local_context_original_path.unlink(missing_ok=True)
                 local_original_boundary_path.unlink(missing_ok=True)
@@ -1741,6 +2203,22 @@ class ProductionConsistencyValidator:
                     path.unlink(missing_ok=True)
 
         reasons = list(dict.fromkeys(reasons))
+        grounding_summary: dict[str, object] | None = None
+        if repaired_entity_grounding_guards:
+            grounding_summary = max(
+                repaired_entity_grounding_guards,
+                key=lambda record: (
+                    record.get("rejection_result")
+                    == "foreground_remains_or_reconstructed",
+                    record.get("rejection_result") == "grounding_failed",
+                    float(
+                        record.get(
+                            "repaired_entity_inside_generation_mask_ratio"
+                        )
+                        or 0.0
+                    ),
+                ),
+            )
         result = {
             "accepted": not reasons,
             "dino_similarity": dino_similarity,
@@ -1766,6 +2244,31 @@ class ProductionConsistencyValidator:
             "comparison_sheet_paths": comparison_sheet_paths,
             "comparison_sheet_fingerprints": comparison_sheet_fingerprints,
             "comparison_sheet_version": BACKGROUND_COMPARISON_VERSION,
+            "repaired_entity_grounding_guards": (
+                repaired_entity_grounding_guards
+            ),
+            "repaired_entity_mask_path": (
+                grounding_summary.get("repaired_entity_mask_path")
+                if grounding_summary is not None
+                else None
+            ),
+            "repaired_entity_inside_generation_mask_ratio": (
+                grounding_summary.get(
+                    "repaired_entity_inside_generation_mask_ratio"
+                )
+                if grounding_summary is not None
+                else None
+            ),
+            "repaired_entity_grounding_phrase": (
+                grounding_summary.get("grounding_phrase")
+                if grounding_summary is not None
+                else None
+            ),
+            "repaired_entity_grounding_rejection_result": (
+                grounding_summary.get("rejection_result")
+                if grounding_summary is not None
+                else None
+            ),
             "semantic_input": semantic_input,
             "rejection_reasons": reasons,
         }
@@ -1778,6 +2281,11 @@ class ProductionConsistencyValidator:
             self.dino.close()
         if self._owns_siglip and self.siglip is not None:
             self.siglip.close()
+        if (
+            self._owns_repaired_entity_grounder
+            and self.repaired_entity_grounder is not None
+        ):
+            self.repaired_entity_grounder.close()
 
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:

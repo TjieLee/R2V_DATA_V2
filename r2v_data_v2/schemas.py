@@ -152,18 +152,13 @@ class BackgroundInpaintingReview(SchemaModel):
     reason: str
 
 
-class ForegroundOutcome(str, Enum):
-    REMOVED = "removed"
-    REMAINS = "remains"
-    RECONSTRUCTED = "reconstructed"
-    REPLACED_BY_SALIENT_ENTITY = "replaced_by_salient_entity"
-    UNCERTAIN = "uncertain"
-
-
 class ForegroundRemovalReview(SchemaModel):
-    foreground_outcome: ForegroundOutcome
-    salient_entity_visible_in_mask: bool
-    entity_description: str
+    original_foreground_still_visible: bool
+    original_foreground_reconstructed: bool
+    new_salient_entity_visible: bool
+    visible_entities: list[str]
+    background_only_inside_mask: bool
+    uncertain: bool
     reason: str
 
 

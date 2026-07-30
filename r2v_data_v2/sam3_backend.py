@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from r2v_data_v2.config import PipelineConfig, Sam3Config
 from r2v_data_v2.entity_policy import requires_foreground_mask
@@ -240,6 +242,41 @@ class Sam3Backend:
             raise ValueError("SAM3 object identity switched across sampled frames")
         unique_by_slot = {item.frame_slot: item for item in observations}
         return [unique_by_slot[slot] for slot in sorted(unique_by_slot)]
+
+    def ground_image(
+        self,
+        *,
+        image_path: Path,
+        grounding_prompt: str,
+    ) -> np.ndarray | None:
+        with tempfile.TemporaryDirectory(
+            prefix="r2v_sam3_image_grounding_"
+        ) as temporary:
+            frames_dir = Path(temporary)
+            Image.open(image_path).convert("RGB").save(
+                frames_dir / "frame_00.jpg",
+                format="JPEG",
+                quality=95,
+            )
+            session_id = self._start_session(frames_dir)
+            try:
+                prompted = self.predictor.handle_request(
+                    {
+                        "type": "add_prompt",
+                        "session_id": session_id,
+                        "frame_index": 0,
+                        "text": grounding_prompt,
+                    }
+                )
+                observation = self._best_anchor_observation(
+                    int(prompted["frame_index"]),
+                    prompted["outputs"],
+                )
+            finally:
+                self._close_session(session_id)
+        if observation is None:
+            return None
+        return np.asarray(observation.mask, dtype=bool).copy()
 
     def close(self) -> None:
         shutdown = getattr(self.predictor, "shutdown", None)

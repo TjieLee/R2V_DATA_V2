@@ -40,7 +40,6 @@ from r2v_data_v2.inpainting import (
 from r2v_data_v2.schemas import (
     BackgroundContinuityReview,
     BackgroundFillPrompt,
-    ForegroundOutcome,
     ForegroundRemovalReview,
     FullSceneReview,
     InpaintingSemanticReview,
@@ -432,7 +431,7 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "8"
+    assert inpainting_metadata["source_metadata_version"] == "9"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
     assert (
         len(inpainting_metadata["local_consistency_prompt_sha256"]) == 64
@@ -1533,10 +1532,13 @@ def _foreground_removal_review(
     **overrides: object,
 ) -> ForegroundRemovalReview:
     values: dict[str, object] = {
-        "foreground_outcome": "removed",
-        "salient_entity_visible_in_mask": False,
-        "entity_description": "",
-        "reason": "foreground removed into continuous background",
+        "original_foreground_still_visible": False,
+        "original_foreground_reconstructed": False,
+        "new_salient_entity_visible": False,
+        "visible_entities": [],
+        "background_only_inside_mask": True,
+        "uncertain": False,
+        "reason": "continuous background fills the evaluated region",
     }
     values.update(overrides)
     return ForegroundRemovalReview.model_validate(values)
@@ -1588,6 +1590,7 @@ class _BackgroundReviewJudge:
         self.foreground_calls: list[dict[str, object]] = []
         self.continuity_calls: list[dict[str, object]] = []
         self.full_scene_calls: list[dict[str, object]] = []
+        self.foreground_inputs: list[dict[str, np.ndarray]] = []
         self.continuity_inputs: list[dict[str, np.ndarray]] = []
 
     @staticmethod
@@ -1603,6 +1606,30 @@ class _BackgroundReviewJudge:
     ) -> ForegroundRemovalReview:
         call_index = len(self.foreground_calls)
         self.foreground_calls.append(dict(kwargs))
+        self.foreground_inputs.append(
+            {
+                "original_mask_only": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["original_mask_only_path"]))
+                    ).convert("RGB")
+                ),
+                "repaired_mask_only": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["repaired_mask_only_path"]))
+                    ).convert("RGB")
+                ),
+                "repaired_context": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["repaired_context_path"]))
+                    ).convert("RGB")
+                ),
+                "mask": np.asarray(
+                    Image.open(
+                        Path(str(kwargs["repair_mask_path"]))
+                    ).convert("L")
+                ),
+            }
+        )
         result = self._result_for_call(
             list(self.foreground_reviews),
             call_index,
@@ -1647,6 +1674,57 @@ class _BackgroundReviewJudge:
         return self.full_scene_result
 
 
+class _RepairedEntityGrounder:
+    def __init__(self, *, overlaps_component: bool) -> None:
+        self.overlaps_component = overlaps_component
+        self.calls: list[dict[str, object]] = []
+
+    def ground_image(
+        self,
+        *,
+        image_path: Path,
+        grounding_prompt: str,
+    ) -> np.ndarray:
+        self.calls.append(
+            {
+                "image_path": image_path,
+                "grounding_prompt": grounding_prompt,
+            }
+        )
+        width, height = Image.open(image_path).size
+        if self.overlaps_component:
+            return np.ones((height, width), dtype=bool)
+        mask = np.zeros((height, width), dtype=bool)
+        mask[: max(1, height // 10), : max(1, width // 10)] = True
+        return mask
+
+
+def _write_grounding_annotation(
+    config: PipelineConfig,
+    *,
+    phrase: str,
+    canonical_label: str,
+    category: str = "person",
+) -> None:
+    destination = config.output_root / "annotations" / "clip-1.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            {
+                "entities": [
+                    {
+                        "entity_id": "e1",
+                        "phrase": phrase,
+                        "canonical_label": canonical_label,
+                        "category": category,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_qwen_uses_three_dedicated_background_prompts_and_schemas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1666,8 +1744,9 @@ def test_qwen_uses_three_dedicated_background_prompts_and_schemas(
 
     monkeypatch.setattr(judge, "_request", fake_request)
     foreground_review = judge.review_foreground_removal(
-        original_path=tmp_path / "original.png",
-        repaired_path=tmp_path / "repaired.png",
+        original_mask_only_path=tmp_path / "original-mask-only.png",
+        repaired_mask_only_path=tmp_path / "repaired-mask-only.png",
+        repaired_context_path=tmp_path / "repaired-context.png",
         repair_mask_path=tmp_path / "mask.png",
     )
     continuity_review = judge.review_background_continuity(
@@ -1695,8 +1774,8 @@ def test_qwen_uses_three_dedicated_background_prompts_and_schemas(
     for expected in (
         "water",
         "coral",
-        "background, not replacement objects",
-        "distinct bounded shape",
+        "background, not salient entities",
+        "original_foreground_reconstructed=true",
         "large pixel differences inside the mask are expected",
     ):
         assert expected in foreground_prompt.casefold()
@@ -1710,8 +1789,79 @@ def test_qwen_uses_three_dedicated_background_prompts_and_schemas(
     full_prompt = " ".join(str(captured[2]["prompt"]).split())
     assert "a brick courtyard" in full_prompt
     assert "do not classify foreground removal" in full_prompt.casefold()
-    assert [len(request["image_paths"]) for request in captured] == [3, 5, 2]
+    assert [len(request["image_paths"]) for request in captured] == [4, 5, 2]
     assert all("comparison" not in str(request) for request in captured)
+
+
+def test_qwen_retries_internally_inconsistent_foreground_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = QwenInpaintingConsistencyJudge(QwenConfig())
+    responses = iter(
+        [
+            _foreground_removal_review(
+                reason="a woman and a child remain inside the mask"
+            ).model_dump_json(),
+            _foreground_removal_review(
+                reason="only continuous water is visible"
+            ).model_dump_json(),
+        ]
+    )
+    requests: list[str] = []
+
+    def fake_request(**kwargs: object) -> str:
+        requests.append(str(kwargs["prompt"]))
+        return next(responses)
+
+    monkeypatch.setattr(judge, "_request", fake_request)
+    review = judge.review_foreground_removal(
+        original_mask_only_path=tmp_path / "original-mask-only.png",
+        repaired_mask_only_path=tmp_path / "repaired-mask-only.png",
+        repaired_context_path=tmp_path / "repaired-context.png",
+        repair_mask_path=tmp_path / "mask.png",
+    )
+
+    assert review.background_only_inside_mask is True
+    assert len(requests) == 2
+    assert "foreground_review_reason_entity_missing" in requests[1]
+
+
+@pytest.mark.parametrize(
+    "contradictory_reason",
+    [
+        "the repaired mask contains a woman and a child",
+        "a different person is standing alone inside the mask",
+    ],
+)
+def test_named_people_cannot_pass_as_no_salient_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contradictory_reason: str,
+) -> None:
+    judge = QwenInpaintingConsistencyJudge(QwenConfig())
+    raw = _foreground_removal_review(
+        reason=contradictory_reason
+    ).model_dump_json()
+    monkeypatch.setattr(
+        judge,
+        "_request",
+        lambda **_kwargs: raw,
+    )
+
+    with pytest.raises(StructuredOutputFailure) as caught:
+        judge.review_foreground_removal(
+            original_mask_only_path=tmp_path / "original-mask-only.png",
+            repaired_mask_only_path=tmp_path / "repaired-mask-only.png",
+            repaired_context_path=tmp_path / "repaired-context.png",
+            repair_mask_path=tmp_path / "mask.png",
+        )
+
+    assert caught.value.attempt_count == 2
+    assert any(
+        issue.code == "foreground_review_reason_entity_missing"
+        for issue in caught.value.issues
+    )
 
 
 def test_background_three_reviews_pass_with_large_expected_mask_difference(
@@ -1745,37 +1895,191 @@ def test_background_three_reviews_pass_with_large_expected_mask_difference(
     assert len(qwen.continuity_calls) == 1
     assert len(qwen.full_scene_calls) == 1
     assert result["qwen_foreground_removal_reviews"][0]["review"][
-        "foreground_outcome"
-    ] == "removed"
+        "background_only_inside_mask"
+    ] is True
     assert result["qwen_background_continuity_reviews"][0]["review"][
         "background_continuity_preserved"
     ] is True
     assert result["qwen_full_scene_review"]["global_scene_consistent"] is True
 
 
+@pytest.mark.parametrize("material", ["clean blue water", "clean coral texture"])
+def test_background_material_fill_accepts(
+    tmp_path: Path,
+    material: str,
+) -> None:
+    qwen = _BackgroundReviewJudge(
+        foreground_reviews=[
+            _foreground_removal_review(
+                reason=f"the mask contains only {material}"
+            )
+        ]
+    )
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=qwen,  # type: ignore[arg-type]
+    )
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[8:24, 8:24] = 255
+
+    result = validator(
+        original=Image.new("RGB", (32, 32)),
+        repaired=Image.new("RGB", (32, 32)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": material,
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is True
+
+
+def test_reconstructed_mountain_and_forest_reject(
+    tmp_path: Path,
+) -> None:
+    qwen = _BackgroundReviewJudge(
+        foreground_reviews=[
+            _foreground_removal_review(
+                original_foreground_reconstructed=True,
+                background_only_inside_mask=False,
+                reason="the original mountain and forest were reconstructed",
+            )
+        ]
+    )
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=qwen,  # type: ignore[arg-type]
+    )
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[8:24, 8:24] = 255
+
+    result = validator(
+        original=Image.new("RGB", (32, 32)),
+        repaired=Image.new("RGB", (32, 32)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "phrase": "a mountain forest",
+            "canonical_label": "mountain",
+            "category": "object",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is False
+    assert "qwen_background_consistency" in result["rejection_reasons"]
+    assert result["repaired_entity_grounding_guards"] == []
+
+
 @pytest.mark.parametrize(
-    ("outcome", "salient_entity"),
+    ("overlaps_component", "accepted", "expected_result"),
     [
-        pytest.param("remains", True, id="foreground-remains"),
-        pytest.param("reconstructed", True, id="foreground-reconstructed"),
-        pytest.param(
-            "replaced_by_salient_entity",
+        (
             True,
+            False,
+            "foreground_remains_or_reconstructed",
+        ),
+        (False, True, "passed"),
+    ],
+)
+def test_repaired_entity_grounding_overlap_guard(
+    tmp_path: Path,
+    overlaps_component: bool,
+    accepted: bool,
+    expected_result: str,
+) -> None:
+    config = _config(tmp_path)
+    _write_grounding_annotation(
+        config,
+        phrase="a woman in a red coat",
+        canonical_label="woman",
+    )
+    grounder = _RepairedEntityGrounder(
+        overlaps_component=overlaps_component
+    )
+    validator = ProductionConsistencyValidator(
+        config,
+        qwen_judge=_BackgroundReviewJudge(),  # type: ignore[arg-type]
+        repaired_entity_grounder=grounder,
+    )
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    mask[20:60, 20:60] = 255
+
+    result = validator(
+        original=Image.new("RGB", (80, 80)),
+        repaired=Image.new("RGB", (80, 80)),
+        repair_mask=Image.fromarray(mask),
+        reference={
+            "clip_uid": "clip-1",
+            "phrase": "open water",
+            "category": "background",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+        diagnostics_dir=tmp_path / "diagnostics",
+    )
+
+    assert result["accepted"] is accepted
+    assert len(grounder.calls) == 1
+    assert grounder.calls[0]["grounding_prompt"] == "a woman in a red coat"
+    guard = result["repaired_entity_grounding_guards"][0]
+    assert guard["rejection_result"] == expected_result
+    assert result["repaired_entity_grounding_phrase"] == (
+        "a woman in a red coat"
+    )
+    detected_mask_path = Path(str(guard["repaired_entity_mask_path"]))
+    assert detected_mask_path.is_file()
+    overlap_ratio = guard[
+        "repaired_entity_inside_generation_mask_ratio"
+    ]
+    if overlaps_component:
+        assert overlap_ratio >= 0.20
+        assert "foreground_remains_or_reconstructed" in (
+            result["rejection_reasons"]
+        )
+    else:
+        assert overlap_ratio < 0.20
+
+
+@pytest.mark.parametrize(
+    "foreground_overrides",
+    [
+        pytest.param(
+            {
+                "original_foreground_still_visible": True,
+                "visible_entities": ["original foreground entity"],
+                "background_only_inside_mask": False,
+            },
+            id="foreground-remains",
+        ),
+        pytest.param(
+            {
+                "original_foreground_reconstructed": True,
+                "visible_entities": ["reconstructed foreground entity"],
+                "background_only_inside_mask": False,
+            },
+            id="foreground-reconstructed",
+        ),
+        pytest.param(
+            {
+                "new_salient_entity_visible": True,
+                "visible_entities": ["new salient entity"],
+                "background_only_inside_mask": False,
+            },
             id="new-salient-entity",
         ),
     ],
 )
 def test_background_foreground_removal_failures_reject(
     tmp_path: Path,
-    outcome: str,
-    salient_entity: bool,
+    foreground_overrides: dict[str, object],
 ) -> None:
     qwen = _BackgroundReviewJudge(
         foreground_reviews=[
             _foreground_removal_review(
-                foreground_outcome=outcome,
-                salient_entity_visible_in_mask=salient_entity,
-                entity_description="distinct foreground entity",
+                **foreground_overrides,
             )
         ]
     )
@@ -1846,7 +2150,8 @@ def test_background_continuity_artifacts_reject(
     [
         pytest.param(
             _foreground_removal_review(
-                foreground_outcome=ForegroundOutcome.UNCERTAIN
+                background_only_inside_mask=False,
+                uncertain=True,
             ),
             _background_continuity_review(),
             id="foreground-uncertain",
@@ -1982,9 +2287,9 @@ def test_background_rejects_when_second_component_removal_fails(
         foreground_reviews=[
             _foreground_removal_review(reason="component zero removed"),
             _foreground_removal_review(
-                foreground_outcome=ForegroundOutcome.REMAINS,
-                salient_entity_visible_in_mask=True,
-                entity_description="remaining vessel",
+                original_foreground_still_visible=True,
+                visible_entities=["remaining vessel"],
+                background_only_inside_mask=False,
                 reason="component one still contains a vessel",
             ),
         ],
@@ -2011,8 +2316,8 @@ def test_background_rejects_when_second_component_removal_fails(
     assert result["accepted"] is False
     assert len(qwen.foreground_calls) == 2
     assert result["qwen_foreground_removal_reviews"][1]["review"][
-        "foreground_outcome"
-    ] == "remains"
+        "original_foreground_still_visible"
+    ] is True
     assert "qwen_background_consistency" in result["rejection_reasons"]
 
 
@@ -2072,6 +2377,18 @@ def test_background_diagnostics_are_saved_but_never_sent_to_qwen(
             )
         )
         for path in sent_paths
+    )
+    foreground_input = qwen.foreground_inputs[0]
+    component_mask = foreground_input["mask"] >= 128
+    assert np.all(
+        foreground_input["original_mask_only"][~component_mask] == 128
+    )
+    assert np.all(
+        foreground_input["repaired_mask_only"][~component_mask] == 128
+    )
+    assert np.array_equal(
+        foreground_input["repaired_mask_only"][component_mask],
+        foreground_input["repaired_context"][component_mask],
     )
     continuity_input = qwen.continuity_inputs[0]
     component_mask = continuity_input["mask"] >= 128
