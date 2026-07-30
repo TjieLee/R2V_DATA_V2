@@ -117,3 +117,12 @@ class InpaintingSemanticReview(SchemaModel):
     reference_phrase_supported: bool
     new_salient_objects: bool
     reason: str
+
+
+class BackgroundInpaintingReview(SchemaModel):
+    background_continuity_preserved: bool
+    masked_foreground_removed: bool
+    reference_phrase_supported: bool
+    new_salient_objects: bool
+    visible_seam_or_artifact: bool
+    reason: str

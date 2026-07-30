@@ -13,6 +13,9 @@ import numpy as np
 from openai import BadRequestError, OpenAI
 from PIL import Image
 
+from prompts.qwen_background_inpainting_review_prompt import (
+    BACKGROUND_INPAINTING_REVIEW_PROMPT,
+)
 from prompts.qwen_inpainting_consistency_prompt import (
     INPAINTING_CONSISTENCY_PROMPT,
 )
@@ -29,7 +32,10 @@ from r2v_data_v2.image_utils import (
 )
 from r2v_data_v2.mask_utils import save_mask_png
 from r2v_data_v2.reconciliation import reconcile_references, write_json_atomic
-from r2v_data_v2.schemas import InpaintingSemanticReview
+from r2v_data_v2.schemas import (
+    BackgroundInpaintingReview,
+    InpaintingSemanticReview,
+)
 from r2v_data_v2.semantic_alignment import Siglip2Aligner
 from r2v_data_v2.structured_output import request_structured_output
 from r2v_data_v2.visual_embedding import (
@@ -53,7 +59,21 @@ ENTITY_INPAINT_PROMPT = (
     "the local damage."
 )
 
-INPAINTING_SOURCE_METADATA_VERSION = "2"
+
+def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
+    if mode == "background_hole_fill":
+        return BACKGROUND_INPAINTING_REVIEW_PROMPT.format(
+            reference_phrase=reference_phrase
+        )
+    if mode == "entity_local_repair":
+        return INPAINTING_CONSISTENCY_PROMPT.format(
+            reference_phrase=reference_phrase,
+            repair_mode=mode,
+        )
+    raise ValueError(f"unsupported inpainting repair mode: {mode}")
+
+
+INPAINTING_SOURCE_METADATA_VERSION = "3"
 
 
 class InpaintBackend(Protocol):
@@ -88,7 +108,7 @@ class InpaintingSemanticJudge(Protocol):
         repair_mask_path: Path,
         reference_phrase: str,
         mode: str,
-    ) -> InpaintingSemanticReview: ...
+    ) -> InpaintingSemanticReview | BackgroundInpaintingReview: ...
 
 
 class InpaintingDependencyError(RuntimeError):
@@ -234,6 +254,9 @@ class QwenInpaintingConsistencyJudge:
         original_path: Path,
         repaired_path: Path,
         repair_mask_path: Path,
+        review_model: (
+            type[InpaintingSemanticReview | BackgroundInpaintingReview]
+        ),
     ) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
@@ -268,9 +291,9 @@ class QwenInpaintingConsistencyJudge:
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "inpainting_semantic_review",
+                        "name": review_model.__name__,
                         "strict": True,
-                        "schema": InpaintingSemanticReview.model_json_schema(),
+                        "schema": review_model.model_json_schema(),
                     },
                 },
             )
@@ -292,10 +315,12 @@ class QwenInpaintingConsistencyJudge:
         repair_mask_path: Path,
         reference_phrase: str,
         mode: str,
-    ) -> InpaintingSemanticReview:
-        prompt = INPAINTING_CONSISTENCY_PROMPT.format(
-            reference_phrase=reference_phrase,
-            repair_mode=mode,
+    ) -> InpaintingSemanticReview | BackgroundInpaintingReview:
+        prompt = _consistency_review_prompt(reference_phrase, mode)
+        review_model = (
+            BackgroundInpaintingReview
+            if mode == "background_hole_fill"
+            else InpaintingSemanticReview
         )
         return request_structured_output(
             request=lambda request_text: self._request(
@@ -303,9 +328,10 @@ class QwenInpaintingConsistencyJudge:
                 original_path=original_path,
                 repaired_path=repaired_path,
                 repair_mask_path=repair_mask_path,
+                review_model=review_model,
             ),
             original_request=prompt,
-            model=InpaintingSemanticReview,
+            model=review_model,
         )
 
 
@@ -396,7 +422,7 @@ class ProductionConsistencyValidator:
                     embeddings[0],
                     embeddings[1],
                 )
-                if (
+                if mode == "entity_local_repair" and (
                     dino_similarity
                     < self.config.inpainting.consistency.minimum_dino_similarity
                 ):
@@ -414,7 +440,7 @@ class ProductionConsistencyValidator:
                     raise RuntimeError("unexpected SigLIP score count")
                 raw_siglip = float(scores[0].target_similarity)
                 repaired_siglip = float(scores[1].target_similarity)
-                if (
+                if mode == "entity_local_repair" and (
                     repaired_siglip
                     < self.config.inpainting.consistency.minimum_siglip_similarity
                 ):
@@ -452,7 +478,16 @@ class ProductionConsistencyValidator:
                     mode=mode,
                 )
                 qwen_review = review.model_dump(mode="json")
-                if not (
+                if mode == "background_hole_fill":
+                    if not isinstance(review, BackgroundInpaintingReview) or not (
+                        review.background_continuity_preserved
+                        and review.masked_foreground_removed
+                        and review.reference_phrase_supported
+                        and not review.new_salient_objects
+                        and not review.visible_seam_or_artifact
+                    ):
+                        reasons.append("qwen_background_consistency")
+                elif not isinstance(review, InpaintingSemanticReview) or not (
                     review.same_semantic_content
                     and review.identity_preserved
                     and review.reference_phrase_supported
@@ -585,11 +620,9 @@ def _source_signature(
         else "entity_local_repair"
     )
     repair_prompt = _inpainting_prompt(reference, mode)
-    consistency_prompt = INPAINTING_CONSISTENCY_PROMPT.format(
-        reference_phrase=(
-            reference_phrase or canonical_label or "reference image"
-        ),
-        repair_mode=mode,
+    consistency_prompt = _consistency_review_prompt(
+        reference_phrase or canonical_label or "reference image",
+        mode,
     )
     prompt_payload = json.dumps(
         {
@@ -625,6 +658,9 @@ def _metadata_matches_source(
     reference: dict[str, object],
 ) -> bool:
     if any(metadata.get(key) != value for key, value in signature.items()):
+        return False
+    candidate = metadata.get("candidate_path")
+    if isinstance(candidate, str) and candidate and not Path(candidate).is_file():
         return False
     if metadata.get("accepted") is True:
         canonical = reference.get("canonical_path")
@@ -747,22 +783,35 @@ def _repair_mask_for_reference(
     *,
     raw_shape: tuple[int, int],
     config: InpaintingConfig,
-) -> tuple[np.ndarray | None, str | None, list[str]]:
+) -> tuple[np.ndarray | None, str | None, list[str], float | None]:
     reference_type = str(reference.get("reference_type", "entity"))
     mask_path = Path(str(reference["mask_path"]))
     source_mask = _read_mask(mask_path, raw_shape)
     if reference_type == "background":
+        source_foreground_area_ratio = float(source_mask.mean())
         if not config.background.enabled or not reference.get(
             "needs_inpainting", False
         ):
-            return None, None, []
+            return None, None, [], source_foreground_area_ratio
+        if (
+            source_foreground_area_ratio
+            > config.background.maximum_hole_area_ratio
+        ):
+            return (
+                source_mask,
+                "background_hole_fill",
+                ["source_foreground_area_ratio"],
+                source_foreground_area_ratio,
+            )
         repair = _dilate(source_mask, config.mask_dilation_pixels)
-        reasons = []
-        if float(repair.mean()) > config.background.maximum_hole_area_ratio:
-            reasons.append("repair_area_ratio")
-        return repair, "background_hole_fill", reasons
+        return (
+            repair,
+            "background_hole_fill",
+            [],
+            source_foreground_area_ratio,
+        )
     if not config.entity.enabled:
-        return None, None, []
+        return None, None, [], None
     completeness = float(
         (
             reference.get("visual_review")
@@ -771,13 +820,23 @@ def _repair_mask_for_reference(
         ).get("completeness", 1.0)
     )
     if completeness < config.entity.minimum_completeness_before_repair:
-        return None, None, ["entity_completeness_too_low_for_local_repair"]
+        return (
+            None,
+            None,
+            ["entity_completeness_too_low_for_local_repair"],
+            None,
+        )
     repair, reasons = _entity_repair_mask(source_mask, config=config)
     if repair.any():
         repair = _dilate(repair, config.mask_dilation_pixels)
     if float(repair.mean()) > config.entity.maximum_repair_area_ratio:
         reasons.append("repair_area_ratio")
-    return repair, "entity_local_repair", list(dict.fromkeys(reasons))
+    return (
+        repair,
+        "entity_local_repair",
+        list(dict.fromkeys(reasons)),
+        None,
+    )
 
 
 def _hard_composite(
@@ -1016,6 +1075,7 @@ def _clear_stale_inpainting_artifacts(artifact: Path) -> None:
         "repair_mask.png",
         "canonical_repaired.jpg",
         "canonical_repaired.png",
+        "canonical_repaired_candidate.png",
         "inpainting_metadata.json",
     ):
         (artifact.parent / filename).unlink(missing_ok=True)
@@ -1061,6 +1121,7 @@ def _metadata_base(
     config: InpaintingConfig,
     mode: str | None,
     repair_area_ratio: float,
+    source_foreground_area_ratio: float | None,
     source_signature: dict[str, object],
 ) -> dict[str, object]:
     return {
@@ -1070,7 +1131,9 @@ def _metadata_base(
         ),
         "mode": mode,
         "seed": config.seed,
+        "source_foreground_area_ratio": source_foreground_area_ratio,
         "repair_area_ratio": repair_area_ratio,
+        "candidate_path": None,
         "unmasked_l1_diff": 0.0,
         "dino_similarity": None,
         "accepted": False,
@@ -1244,23 +1307,34 @@ def run_inpainting(
                 artifact=artifact,
                 raw_path=raw_path,
             )
+        mode: str | None = None
+        repair_area_ratio = 0.0
+        source_foreground_area_ratio: float | None = None
+        candidate_path: Path | None = None
         try:
             original_image = Image.open(raw_path).convert("RGB")
             original = np.asarray(original_image).copy()
-            repair_mask, mode, mask_reasons = _repair_mask_for_reference(
+            (
+                repair_mask,
+                mode,
+                mask_reasons,
+                source_foreground_area_ratio,
+            ) = _repair_mask_for_reference(
                 reference,
                 raw_shape=original.shape[:2],
                 config=config.inpainting,
+            )
+            repair_area_ratio = (
+                float(repair_mask.mean()) if repair_mask is not None else 0.0
             )
             if repair_mask is None or mode is None or not repair_mask.any():
                 if mask_reasons:
                     metadata = _metadata_base(
                         config=config.inpainting,
                         mode=mode,
-                        repair_area_ratio=(
-                            float(repair_mask.mean())
-                            if repair_mask is not None
-                            else 0.0
+                        repair_area_ratio=repair_area_ratio,
+                        source_foreground_area_ratio=(
+                            source_foreground_area_ratio
                         ),
                         source_signature=source_signature,
                     )
@@ -1294,12 +1368,14 @@ def run_inpainting(
                     skipped += 1
                 continue
             processed += 1
-            repair_area_ratio = float(repair_mask.mean())
             if mask_reasons:
                 metadata = _metadata_base(
                     config=config.inpainting,
                     mode=mode,
                     repair_area_ratio=repair_area_ratio,
+                    source_foreground_area_ratio=(
+                        source_foreground_area_ratio
+                    ),
                     source_signature=source_signature,
                 )
                 metadata["rejection_reasons"] = mask_reasons
@@ -1345,6 +1421,11 @@ def run_inpainting(
                 core_mask=repair_mask,
                 feather_pixels=config.inpainting.feather_pixels,
             )
+            candidate_destination = (
+                artifact.parent / "canonical_repaired_candidate.png"
+            )
+            _save_lossless_atomic(Image.fromarray(final), candidate_destination)
+            candidate_path = candidate_destination
             protected = ~(repair_mask | feather_ring)
             unmasked_l1_diff = (
                 float(
@@ -1379,7 +1460,8 @@ def run_inpainting(
                 else None
             )
             if (
-                dino_similarity is not None
+                mode == "entity_local_repair"
+                and dino_similarity is not None
                 and dino_similarity
                 < config.inpainting.consistency.minimum_dino_similarity
             ):
@@ -1394,10 +1476,12 @@ def run_inpainting(
                 config=config.inpainting,
                 mode=mode,
                 repair_area_ratio=repair_area_ratio,
+                source_foreground_area_ratio=source_foreground_area_ratio,
                 source_signature=source_signature,
             )
             metadata.update(
                 {
+                    "candidate_path": str(candidate_path),
                     "unmasked_l1_diff": unmasked_l1_diff,
                     "dino_similarity": dino_similarity,
                     "accepted": accepted,
@@ -1408,7 +1492,7 @@ def run_inpainting(
             )
             if accepted:
                 repaired_path = artifact.parent / "canonical_repaired.png"
-                _save_lossless_atomic(Image.fromarray(final), repaired_path)
+                _copy_atomic(candidate_path, repaired_path)
                 (artifact.parent / "canonical_repaired.jpg").unlink(
                     missing_ok=True
                 )
@@ -1491,12 +1575,18 @@ def run_inpainting(
             )
             metadata = _metadata_base(
                 config=config.inpainting,
-                mode=None,
-                repair_area_ratio=0.0,
+                mode=mode,
+                repair_area_ratio=repair_area_ratio,
+                source_foreground_area_ratio=source_foreground_area_ratio,
                 source_signature=source_signature,
             )
             metadata.update(
                 {
+                    "candidate_path": (
+                        str(candidate_path)
+                        if candidate_path is not None
+                        else None
+                    ),
                     "rejection_reasons": ["inpainting_runtime_failure"],
                     "error": str(exc),
                 }

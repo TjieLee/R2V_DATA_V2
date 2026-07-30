@@ -16,15 +16,20 @@ from r2v_data_v2.config import (
     InpaintingConsistencyConfig,
     InpaintingEntityConfig,
     PipelineConfig,
+    QwenConfig,
 )
 from r2v_data_v2.inpainting import (
     Flux1FillBackend,
     InpaintingDependencyError,
     NoOpInpaintBackend,
     ProductionConsistencyValidator,
+    QwenInpaintingConsistencyJudge,
     run_inpainting,
 )
-from r2v_data_v2.schemas import InpaintingSemanticReview
+from r2v_data_v2.schemas import (
+    BackgroundInpaintingReview,
+    InpaintingSemanticReview,
+)
 
 
 class _WholeImageBackend:
@@ -280,8 +285,16 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "2"
+    assert inpainting_metadata["source_metadata_version"] == "3"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
+    assert inpainting_metadata["source_foreground_area_ratio"] == pytest.approx(
+        16 / 1024
+    )
+    candidate_path = Path(inpainting_metadata["candidate_path"])
+    assert candidate_path == (
+        artifact.parent / "canonical_repaired_candidate.png"
+    )
+    assert candidate_path.is_file()
 
 
 def test_reference_semantics_and_prompt_fingerprint_invalidate_inpainting(
@@ -335,12 +348,12 @@ def test_reference_semantics_and_prompt_fingerprint_invalidate_inpainting(
     assert second_metadata["canonical_label"] == "covered arcade"
 
 
-def test_repair_area_over_threshold_does_not_call_backend(
+def test_source_foreground_area_over_threshold_does_not_call_backend(
     tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path, maximum_hole_area_ratio=0.02)
+    config = _config(tmp_path, maximum_hole_area_ratio=0.23)
     mask = np.zeros((32, 32), dtype=bool)
-    mask[12:16, 12:16] = True
+    mask[8:24, 8:24] = True
     artifact = _write_reference(
         config.output_root,
         reference_id="bg1",
@@ -361,7 +374,44 @@ def test_repair_area_over_threshold_does_not_call_backend(
     metadata = json.loads(
         (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
     )
-    assert metadata["rejection_reasons"] == ["repair_area_ratio"]
+    assert metadata["rejection_reasons"] == [
+        "source_foreground_area_ratio"
+    ]
+    assert metadata["source_foreground_area_ratio"] == pytest.approx(0.25)
+    assert metadata["repair_area_ratio"] == pytest.approx(0.25)
+
+
+def test_source_mask_ratio_is_checked_before_generation_dilation(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, maximum_hole_area_ratio=0.23)
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[8:23, 8:23] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+    backend = _WholeImageBackend()
+
+    stats = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+    )
+
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
+    )
+    assert stats.repaired == 1
+    assert len(backend.prompts) == 1
+    assert metadata["source_foreground_area_ratio"] == pytest.approx(
+        225 / 1024
+    )
+    assert metadata["repair_area_ratio"] == pytest.approx(289 / 1024)
+    assert metadata["repair_area_ratio"] > 0.23
 
 
 def test_consistency_failure_rejects_background_reference(tmp_path: Path) -> None:
@@ -387,13 +437,92 @@ def test_consistency_failure_rejects_background_reference(tmp_path: Path) -> Non
     )
 
     metadata = json.loads(artifact.read_text(encoding="utf-8"))
+    inpainting_metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
+    )
+    candidate_path = Path(inpainting_metadata["candidate_path"])
     assert stats.fallback_to_raw == 0
     assert metadata["inpainted"] is False
     assert metadata["status"] == "rejected"
     assert metadata["rejected"] is True
+    assert candidate_path == (
+        artifact.parent / "canonical_repaired_candidate.png"
+    )
+    assert candidate_path.is_file()
     assert Path(metadata["canonical_path"]).read_bytes() == Path(
         metadata["raw_canonical_path"]
     ).read_bytes()
+    assert candidate_path.read_bytes() != Path(
+        metadata["raw_canonical_path"]
+    ).read_bytes()
+
+
+def test_run_accepts_low_dino_for_background_hole_fill(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    stats = run_inpainting(
+        config,
+        backend=_WholeImageBackend(),
+        validator=lambda **kwargs: {
+            "accepted": True,
+            "dino_similarity": 0.5,
+            "rejection_reasons": [],
+        },
+    )
+
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
+    )
+    assert stats.repaired == 1
+    assert reference["inpainted"] is True
+    assert metadata["dino_similarity"] == pytest.approx(0.5)
+    assert "dino_similarity" not in metadata["rejection_reasons"]
+
+
+def test_run_still_rejects_low_dino_for_entity_local_repair(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, entity_enabled=True)
+    subject_mask = np.zeros((32, 32), dtype=bool)
+    subject_mask[5:27, 5:27] = True
+    subject_mask[14:17, 14:17] = False
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="e1",
+        reference_type="entity",
+        mask=subject_mask,
+        needs_inpainting=False,
+    )
+
+    stats = run_inpainting(
+        config,
+        backend=_WholeImageBackend(),
+        validator=lambda **kwargs: {
+            "accepted": True,
+            "dino_similarity": 0.5,
+            "rejection_reasons": [],
+        },
+    )
+
+    reference = json.loads(artifact.read_text(encoding="utf-8"))
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(encoding="utf-8")
+    )
+    assert stats.repaired == 0
+    assert stats.fallback_to_raw == 1
+    assert reference["inpainted"] is False
+    assert reference["status"] == "ready"
+    assert "dino_similarity" in metadata["rejection_reasons"]
 
 
 def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
@@ -686,6 +815,263 @@ def test_production_validator_uses_dino_and_siglip(tmp_path: Path) -> None:
     assert result["repaired_siglip_similarity"] == 0.79
 
 
+def _background_review(
+    **overrides: object,
+) -> BackgroundInpaintingReview:
+    values: dict[str, object] = {
+        "background_continuity_preserved": True,
+        "masked_foreground_removed": True,
+        "reference_phrase_supported": True,
+        "new_salient_objects": False,
+        "visible_seam_or_artifact": False,
+        "reason": "coherent background replacement",
+    }
+    values.update(overrides)
+    return BackgroundInpaintingReview.model_validate(values)
+
+
+def test_qwen_uses_dedicated_background_review_prompt_and_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = QwenInpaintingConsistencyJudge(QwenConfig())
+    captured: dict[str, object] = {}
+
+    def fake_request(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return _background_review().model_dump_json()
+
+    monkeypatch.setattr(judge, "_request", fake_request)
+    review = judge.review(
+        original_path=tmp_path / "original.png",
+        repaired_path=tmp_path / "repaired.png",
+        repair_mask_path=tmp_path / "mask.png",
+        reference_phrase="a brick courtyard",
+        mode="background_hole_fill",
+    )
+
+    assert isinstance(review, BackgroundInpaintingReview)
+    assert captured["review_model"] is BackgroundInpaintingReview
+    prompt = " ".join(str(captured["prompt"]).split())
+    assert "intentionally contains a foreground object" in prompt
+    assert "not a semantic inconsistency" in prompt
+    assert "original masked foreground remains" in prompt
+    assert "another entity replaces it" in prompt
+    assert "obvious seam or visual artifact" in prompt
+
+
+def test_background_qwen_accepts_expected_masked_foreground_removal(
+    tmp_path: Path,
+) -> None:
+    review = _background_review()
+
+    class _Qwen:
+        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
+            assert kwargs["mode"] == "background_hole_fill"
+            return review
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.new("L", (17, 13)),
+        reference={
+            "phrase": "a brick courtyard",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is True
+    assert "same_semantic_content" not in result["qwen_review"]
+    assert "identity_preserved" not in result["qwen_review"]
+
+
+@pytest.mark.parametrize(
+    "review",
+    [
+        pytest.param(
+            _background_review(
+                masked_foreground_removed=False,
+                reason="the original foreground remains",
+            ),
+            id="retained-masked-foreground",
+        ),
+        pytest.param(
+            _background_review(
+                new_salient_objects=True,
+                reason="a replacement entity appears",
+            ),
+            id="replacement-entity",
+        ),
+        pytest.param(
+            _background_review(
+                new_salient_objects=True,
+                reason="a new salient object was added",
+            ),
+            id="new-salient-object",
+        ),
+        pytest.param(
+            _background_review(
+                visible_seam_or_artifact=True,
+                reason="a visible seam surrounds the fill",
+            ),
+            id="visible-seam",
+        ),
+    ],
+)
+def test_background_qwen_rejects_invalid_hole_fills(
+    tmp_path: Path,
+    review: BackgroundInpaintingReview,
+) -> None:
+    class _Qwen:
+        def review(self, **kwargs: object) -> BackgroundInpaintingReview:
+            assert kwargs["mode"] == "background_hole_fill"
+            return review
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        qwen_judge=_Qwen(),  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.new("L", (17, 13)),
+        reference={
+            "phrase": "a brick courtyard",
+            "raw_canonical_path": str(tmp_path / "canonical_raw.jpg"),
+        },
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is False
+    assert "qwen_background_consistency" in result["rejection_reasons"]
+
+
+def test_low_dino_is_diagnostic_only_for_background_hole_fill(
+    tmp_path: Path,
+) -> None:
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            assert len(images) == 2
+            return np.asarray([[1.0, 0.0], [0.0, 1.0]])
+
+    class _Siglip:
+        def score(
+            self,
+            images: list[Image.Image],
+            target_text: str,
+            distractor_texts: list[str],
+        ) -> list[object]:
+            del images, target_text, distractor_texts
+            return [
+                SimpleNamespace(target_similarity=0.8),
+                SimpleNamespace(target_similarity=0.8),
+            ]
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+        siglip_aligner=_Siglip(),  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.new("L", (17, 13)),
+        reference={"phrase": "a brick courtyard"},
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is True
+    assert result["dino_similarity"] == pytest.approx(0.0)
+    assert "dino_similarity" not in result["rejection_reasons"]
+
+
+def test_low_dino_still_rejects_entity_local_repair(tmp_path: Path) -> None:
+    mask_path = tmp_path / "mask.png"
+    Image.new("L", (17, 13), 255).save(mask_path)
+
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            assert len(images) == 2
+            return np.asarray([[1.0, 0.0], [0.0, 1.0]])
+
+    class _Siglip:
+        def score(
+            self,
+            images: list[Image.Image],
+            target_text: str,
+            distractor_texts: list[str],
+        ) -> list[object]:
+            del images, target_text, distractor_texts
+            return [
+                SimpleNamespace(target_similarity=0.8),
+                SimpleNamespace(target_similarity=0.8),
+            ]
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+        siglip_aligner=_Siglip(),  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.new("L", (17, 13)),
+        reference={
+            "phrase": "a red bicycle",
+            "mask_path": str(mask_path),
+        },
+        mode="entity_local_repair",
+    )
+
+    assert result["accepted"] is False
+    assert result["dino_similarity"] == pytest.approx(0.0)
+    assert "dino_similarity" in result["rejection_reasons"]
+
+
+def test_negative_siglip_absolute_score_does_not_reject_background(
+    tmp_path: Path,
+) -> None:
+    class _Dino:
+        def encode(self, images: list[Image.Image]) -> np.ndarray:
+            assert len(images) == 2
+            return np.asarray([[1.0, 0.0], [1.0, 0.0]])
+
+    class _Siglip:
+        def score(
+            self,
+            images: list[Image.Image],
+            target_text: str,
+            distractor_texts: list[str],
+        ) -> list[object]:
+            del images, target_text, distractor_texts
+            return [
+                SimpleNamespace(target_similarity=-0.50),
+                SimpleNamespace(target_similarity=-0.51),
+            ]
+
+    validator = ProductionConsistencyValidator(
+        _config(tmp_path),
+        dino_embedder=_Dino(),  # type: ignore[arg-type]
+        siglip_aligner=_Siglip(),  # type: ignore[arg-type]
+    )
+    result = validator(
+        original=Image.new("RGB", (17, 13)),
+        repaired=Image.new("RGB", (17, 13)),
+        repair_mask=Image.new("L", (17, 13)),
+        reference={"phrase": "a brick courtyard"},
+        mode="background_hole_fill",
+    )
+
+    assert result["accepted"] is True
+    assert result["repaired_siglip_similarity"] == pytest.approx(-0.51)
+    assert "siglip_similarity" not in result["rejection_reasons"]
+
+
 def test_entity_semantic_validation_uses_neutral_crops_and_qwen_mask(
     tmp_path: Path,
 ) -> None:
@@ -827,7 +1213,9 @@ def test_overwrite_clears_stale_repair_and_restores_raw(
         needs_inpainting=False,
     )
     stale_repaired = artifact.parent / "canonical_repaired.png"
+    stale_candidate = artifact.parent / "canonical_repaired_candidate.png"
     Image.new("RGB", (32, 32), (255, 0, 0)).save(stale_repaired)
+    Image.new("RGB", (32, 32), (0, 255, 0)).save(stale_candidate)
     Image.new("L", (32, 32), 255).save(artifact.parent / "repair_mask.png")
     (artifact.parent / "inpainting_metadata.json").write_text(
         json.dumps({"accepted": True}),
@@ -856,6 +1244,7 @@ def test_overwrite_clears_stale_repair_and_restores_raw(
     restored = json.loads(artifact.read_text(encoding="utf-8"))
     assert stats.skipped_no_repair_needed == 1
     assert not stale_repaired.exists()
+    assert not stale_candidate.exists()
     assert not (artifact.parent / "repair_mask.png").exists()
     assert not (artifact.parent / "inpainting_metadata.json").exists()
     assert restored["inpainted"] is False

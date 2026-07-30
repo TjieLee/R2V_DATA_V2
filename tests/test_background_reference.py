@@ -681,6 +681,7 @@ def test_background_overwrite_invalidates_stale_inpainting_artifacts(
     stale_names = (
         "repair_mask.png",
         "canonical_repaired.png",
+        "canonical_repaired_candidate.png",
         "inpainting_metadata.json",
     )
     for name in stale_names:

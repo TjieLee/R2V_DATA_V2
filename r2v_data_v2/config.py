@@ -311,7 +311,7 @@ class BackgroundConfig:
 @dataclass(frozen=True)
 class InpaintingBackgroundConfig:
     enabled: bool = True
-    maximum_hole_area_ratio: float = 0.25
+    maximum_hole_area_ratio: float = 0.23
 
 
 @dataclass(frozen=True)

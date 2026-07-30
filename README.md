@@ -317,6 +317,12 @@ falling back to the contaminated raw frame. Enabling production FLUX requires
 configured DINOv3 plus SigLIP2 evaluators or an explicit video-capable
 `qwen.repair_judge`. Successful entity repair rebuilds its mask, RGBA, neutral
 background, and selected DINO embedding so downstream artifacts remain aligned.
+Background hole-fill review verifies foreground removal and coherent scene
+continuation instead of entity identity preservation. Its source foreground
+area is gated before mask dilation (`inpainting.background.maximum_hole_area_ratio:
+0.23`), while both source and dilated repair ratios remain in metadata. Every
+generated hard-composited result is retained as
+`canonical_repaired_candidate.png`, including rejected candidates.
 
 ## Qwen Benchmark
 

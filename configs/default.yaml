@@ -163,7 +163,7 @@ inpainting:
   top_k_per_reference: 2
   background:
     enabled: true
-    maximum_hole_area_ratio: 0.25
+    maximum_hole_area_ratio: 0.23
   entity:
     enabled: false
     maximum_repair_area_ratio: 0.08

@@ -6,6 +6,7 @@ INPAINTING_ARTIFACT_NAMES = (
     "repair_mask.png",
     "canonical_repaired.jpg",
     "canonical_repaired.png",
+    "canonical_repaired_candidate.png",
     "inpainting_metadata.json",
     "mask_raw.png",
     "foreground_rgba_raw.png",
