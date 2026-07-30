@@ -7,6 +7,7 @@ import pytest
 import r2v_data_v2.config as config_module
 from r2v_data_v2.config import (
     DinoEvaluatorConfig,
+    InpaintingConfig,
     PipelineConfig,
     QwenConfig,
     RankingConfig,
@@ -14,6 +15,25 @@ from r2v_data_v2.config import (
     SiglipEvaluatorConfig,
     load_config,
 )
+
+
+def test_inpainting_max_sequence_length_above_512_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(PipelineConfig, "validate_paths", lambda self: None)
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        qwen=QwenConfig(model="served-model"),
+        inpainting=InpaintingConfig(max_sequence_length=513),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="max_sequence_length must be between 1 and 512",
+    ):
+        config_module._validate_config(config)
 
 
 def test_output_and_dataset_must_stay_inside_allowed_roots(

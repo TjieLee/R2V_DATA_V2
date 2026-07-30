@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from r2v_data_v2.config import PipelineConfig, _qwen_services, load_config
 from r2v_data_v2.inpainting import (
     BACKGROUND_INPAINT_PROMPT,
+    BackgroundPromptGenerationError,
     Flux1FillBackend,
     ProductionConsistencyValidator,
     QwenBackgroundFillPromptGenerator,
@@ -95,7 +96,7 @@ def run_benchmark(
         if repair_config is not None
         else None
     )
-    backend_cache: dict[tuple[float, int], Flux1FillBackend] = {}
+    flux_backend = Flux1FillBackend(config.inpainting)
     validator = ProductionConsistencyValidator(config)
 
     for artifact, reference in _reference_artifacts(config, clip_uids):
@@ -187,10 +188,26 @@ def run_benchmark(
                             )
                             if prompt_mode == "empty":
                                 fill_prompt = ""
-                                prompt_metadata = {"source": "empty"}
+                                production_prompt = ""
+                                prompt_metadata = {
+                                    "source": "empty",
+                                    "prompt_mode": "empty",
+                                    "context_image_path": None,
+                                    "context_image_sha256": None,
+                                }
                             elif prompt_mode == "generic":
                                 fill_prompt = BACKGROUND_INPAINT_PROMPT
-                                prompt_metadata = {"source": "generic"}
+                                production_prompt = _inpainting_prompt(
+                                    reference,
+                                    mode,
+                                    background_fill_prompt=fill_prompt,
+                                )
+                                prompt_metadata = {
+                                    "source": "generic",
+                                    "prompt_mode": "generic",
+                                    "context_image_path": None,
+                                    "context_image_sha256": None,
+                                }
                             elif prompt_mode == "qwen_local":
                                 fill_prompt, prompt_metadata = (
                                     _resolve_background_fill_prompt(
@@ -203,28 +220,22 @@ def run_benchmark(
                                         generator=prompt_generator,
                                     )
                                 )
+                                production_prompt = _inpainting_prompt(
+                                    reference,
+                                    mode,
+                                    background_fill_prompt=fill_prompt,
+                                )
                             else:
                                 raise ValueError(
                                     f"unsupported prompt mode: {prompt_mode}"
                                 )
-                            production_prompt = _inpainting_prompt(
-                                reference,
-                                mode,
-                                background_fill_prompt=fill_prompt,
-                            )
-                            backend_key = (
-                                guidance_scale,
-                                inference_steps,
-                            )
-                            flux_backend = backend_cache.setdefault(
-                                backend_key,
-                                Flux1FillBackend(tuned_inpainting),
-                            )
                             generated = flux_backend.inpaint(
                                 image=original_image,
                                 mask=generation_mask_image,
                                 prompt=production_prompt,
                                 seed=seed,
+                                guidance_scale=guidance_scale,
+                                num_inference_steps=inference_steps,
                             )
                             generated_path = candidate_dir / "generated.png"
                             _save_lossless_atomic(generated, generated_path)
@@ -266,7 +277,18 @@ def run_benchmark(
                                     **diagnostics,
                                     "fill_prompt": fill_prompt,
                                     "production_prompt": production_prompt,
+                                    "prompt_source": prompt_metadata["source"],
                                     "prompt_metadata": prompt_metadata,
+                                    "prompt_context_image_path": (
+                                        prompt_metadata.get(
+                                            "context_image_path"
+                                        )
+                                    ),
+                                    "prompt_context_image_sha256": (
+                                        prompt_metadata.get(
+                                            "context_image_sha256"
+                                        )
+                                    ),
                                     "candidate_path": str(final_path),
                                     "validator": validation,
                                     "accepted": (
@@ -275,6 +297,29 @@ def run_benchmark(
                                     "rejection_reasons": validation.get(
                                         "rejection_reasons", []
                                     ),
+                                }
+                            )
+                        except BackgroundPromptGenerationError as exc:
+                            record.update(
+                                {
+                                    "prompt_source": (
+                                        "qwen_local_background"
+                                    ),
+                                    "prompt_metadata": exc.metadata,
+                                    "prompt_context_image_path": (
+                                        exc.metadata.get(
+                                            "context_image_path"
+                                        )
+                                    ),
+                                    "prompt_context_image_sha256": (
+                                        exc.metadata.get(
+                                            "context_image_sha256"
+                                        )
+                                    ),
+                                    "rejection_reasons": [
+                                        "background_prompt_generation_failed"
+                                    ],
+                                    "error": str(exc),
                                 }
                             )
                         except Exception as exc:  # noqa: BLE001
@@ -291,6 +336,9 @@ def run_benchmark(
         "clip_uid",
         "reference_id",
         "prompt_mode",
+        "prompt_source",
+        "prompt_context_image_path",
+        "prompt_context_image_sha256",
         "guidance_scale",
         "num_inference_steps",
         "seed",
@@ -300,7 +348,8 @@ def run_benchmark(
         "masked_mean_l1",
         "masked_changed_pixel_ratio",
         "generation_mask_changed_pixel_ratio",
-        "boundary_ring_mean_l1",
+        "inner_boundary_mean_l1",
+        "outer_unmasked_boundary_mean_l1",
         "candidate_dir",
         "error",
     )

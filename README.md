@@ -330,13 +330,18 @@ review and one context-upscaled local review per generation-mask component
 must all return the categorical `removed_to_background` outcome with coherent
 continuity and no listed artifact. Each review receives a fourth comparison
 sheet with overlays, masked differences, and a boundary-ring comparison.
-Background FLUX prompts are generated from only the source image and generation
-mask, are validated against foreground and negative-language terms, and never
-include the caption or reference phrase. Configured seeds are evaluated
-independently; every candidate and its diagnostics are retained under
-`inpainting_candidates/`, while only an actually accepted candidate is
-published. `canonical_repaired_candidate.png` remains the compatibility
-inspection path, including after rejection.
+Background FLUX prompts are generated from a context-only image whose generation
+mask pixels are neutral gray, are validated against foreground and
+negative-language terms, and never include the caption or reference phrase.
+Qwen prompt generation fails closed; generic prompting is used only when
+`prompt_mode: generic` is explicitly configured. Configured seeds are evaluated
+independently; every candidate and its inner/outer boundary diagnostics are
+retained under `inpainting_candidates/`. When all seeds are evaluated, accepted
+candidates are shown in a contact sheet and the earliest accepted seed is used
+only as a compatibility publication choice, explicitly marked
+`first_accepted_not_quality_ranked`; background DINO scores never rank them.
+`canonical_repaired_candidate.png` remains the compatibility inspection path,
+including after rejection.
 
 ## Qwen Benchmark
 
@@ -370,7 +375,10 @@ python scripts/benchmark_flux_background_fill.py \
 ```
 
 The benchmark writes per-candidate images, masks, comparisons, JSONL, CSV, and
-a summary without changing production references, manifests, or samples.
+a summary without changing production references, manifests, or samples. It
+reuses one loaded FLUX pipeline across every guidance/step combination.
+`prompt_mode=empty` sends an actual empty string, while Qwen prompt failures
+reject that benchmark candidate instead of substituting a generic prompt.
 
 ## Augmentation
 

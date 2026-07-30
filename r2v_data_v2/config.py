@@ -824,8 +824,10 @@ def _validate_config(config: PipelineConfig) -> None:
         raise ValueError("inpainting.guidance_scale must be non-negative")
     if not 0.0 < config.inpainting.strength <= 1.0:
         raise ValueError("inpainting.strength must be between 0 and 1")
-    if config.inpainting.max_sequence_length < 1:
-        raise ValueError("inpainting.max_sequence_length must be positive")
+    if not 1 <= config.inpainting.max_sequence_length <= 512:
+        raise ValueError(
+            "inpainting.max_sequence_length must be between 1 and 512"
+        )
     if config.inpainting.mask_dilation_pixels < 0:
         raise ValueError("inpainting.mask_dilation_pixels must be non-negative")
     if not 0.0 <= config.inpainting.adaptive_mask_dilation_ratio <= 1.0:

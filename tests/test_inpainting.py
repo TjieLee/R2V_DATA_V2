@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -24,7 +25,6 @@ from r2v_data_v2.config import (
     SiglipEvaluatorConfig,
 )
 from r2v_data_v2.inpainting import (
-    BACKGROUND_INPAINT_PROMPT,
     Flux1FillBackend,
     InpaintingDependencyError,
     NoOpInpaintBackend,
@@ -430,7 +430,7 @@ def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
     assert len(inpainting_metadata["inpainting_prompt_sha256"]) == 64
     assert len(inpainting_metadata["consistency_prompt_sha256"]) == 64
     assert len(inpainting_metadata["prompt_fingerprint"]) == 64
-    assert inpainting_metadata["source_metadata_version"] == "6"
+    assert inpainting_metadata["source_metadata_version"] == "7"
     assert len(inpainting_metadata["version_fingerprint"]) == 64
     assert (
         len(inpainting_metadata["local_consistency_prompt_sha256"]) == 64
@@ -919,7 +919,7 @@ def test_background_fill_prompt_rejects_prohibited_or_copied_text(
     assert issues
 
 
-def test_qwen_background_fill_failure_uses_deterministic_generic_fallback(
+def test_qwen_background_fill_failure_rejects_without_generic_fallback(
     tmp_path: Path,
 ) -> None:
     config = _config(
@@ -963,16 +963,113 @@ def test_qwen_background_fill_failure_uses_deterministic_generic_fallback(
         )
     )
 
-    assert stats.repaired == 1
-    assert backend.prompts == [
-        _inpainting_prompt(
-            {},
-            "background_hole_fill",
-            background_fill_prompt=BACKGROUND_INPAINT_PROMPT,
-        )
-    ]
-    assert metadata["prompt_source"] == "generic_fallback"
+    assert stats.repaired == 0
+    assert stats.rejected == 1
+    assert backend.prompts == []
+    assert metadata["prompt_mode"] == "qwen_local_background"
+    assert metadata["prompt_source"] == "qwen_local_background"
     assert metadata["prompt_metadata"]["validator"]["validation"] == "failed"
+    assert metadata["rejection_reasons"] == [
+        "background_prompt_generation_failed"
+    ]
+    assert metadata["candidates"][0]["prompt_mode"] == (
+        "qwen_local_background"
+    )
+    assert metadata["candidates"][0]["accepted"] is False
+    assert "generic" not in json.dumps(metadata).casefold()
+
+
+def test_qwen_background_prompt_context_hides_generation_mask_pixels(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        prompt_mode="qwen_local_background",
+    )
+    source_mask = np.zeros((32, 32), dtype=bool)
+    source_mask[12:16, 12:16] = True
+    artifact = _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=source_mask,
+        needs_inpainting=True,
+    )
+    captured_context: list[np.ndarray] = []
+
+    class _PromptGenerator:
+        def generate(
+            self,
+            *,
+            original_path: Path,
+            generation_mask_path: Path,
+            forbidden_texts: list[str],
+        ) -> tuple[BackgroundFillPrompt, dict[str, object]]:
+            assert generation_mask_path.is_file()
+            assert forbidden_texts
+            captured_context.append(
+                np.asarray(Image.open(original_path).convert("RGB"))
+            )
+            return (
+                BackgroundFillPrompt(
+                    fill_prompt=(
+                        "Weathered stone paving continues naturally with muted "
+                        "gray texture, soft daylight, shallow perspective, and "
+                        "consistent courtyard depth"
+                    ),
+                    visible_background_elements=["stone paving"],
+                    reason="Visible paving surrounds the hidden region.",
+                ),
+                {"model": "fake-qwen", "validation": "passed"},
+            )
+
+    backend = _WholeImageBackend()
+    stats = run_inpainting(
+        config,
+        backend=backend,
+        validator=_accept_consistency,
+        background_prompt_generator=_PromptGenerator(),
+    )
+    metadata = json.loads(
+        (artifact.parent / "inpainting_metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    generation_mask = (
+        np.asarray(
+            Image.open(artifact.parent / "generation_mask.png").convert("L")
+        )
+        >= 128
+    )
+    raw = np.asarray(
+        Image.open(
+            json.loads(artifact.read_text(encoding="utf-8"))[
+                "raw_canonical_path"
+            ]
+        ).convert("RGB")
+    )
+
+    assert stats.repaired == 1
+    assert len(captured_context) == 1
+    assert np.all(captured_context[0][generation_mask] == 128)
+    assert np.array_equal(
+        captured_context[0][~generation_mask],
+        raw[~generation_mask],
+    )
+    assert metadata["prompt_mode"] == "qwen_local_background"
+    assert metadata["prompt_source"] == "qwen_local_background"
+    assert Path(metadata["prompt_context_image_path"]).is_file()
+    assert len(metadata["prompt_context_image_sha256"]) == 64
+    assert (
+        hashlib.sha256(
+            Path(metadata["prompt_context_image_path"]).read_bytes()
+        ).hexdigest()
+        == metadata["prompt_context_image_sha256"]
+    )
+    assert metadata["candidates"][0]["prompt_mode"] == (
+        "qwen_local_background"
+    )
+    assert "generic_fallback" not in json.dumps(metadata)
 
 
 def test_background_best_of_n_publishes_only_an_accepted_candidate(
@@ -1046,7 +1143,7 @@ def test_background_best_of_n_publishes_only_an_accepted_candidate(
     ).read_bytes() == Path(metadata["candidate_path"]).read_bytes()
 
 
-def test_background_best_of_n_can_rank_all_accepted_candidates(
+def test_background_best_of_n_does_not_rank_by_dino_similarity(
     tmp_path: Path,
 ) -> None:
     config = _config(
@@ -1094,7 +1191,13 @@ def test_background_best_of_n_can_rank_all_accepted_candidates(
     assert stats.repaired == 1
     assert len(metadata["candidates"]) == 3
     assert all(candidate["accepted"] for candidate in metadata["candidates"])
-    assert metadata["selected_seed"] == 42
+    assert metadata["selected_seed"] == 0
+    assert (
+        metadata["selection_policy"]
+        == "first_accepted_not_quality_ranked"
+    )
+    assert Path(metadata["accepted_candidate_contact_sheet_path"]).is_file()
+    assert len(metadata["accepted_candidate_contact_sheet_sha256"]) == 64
 
 
 def test_entity_repair_regenerates_mask_derived_artifacts_and_dino(
@@ -1269,10 +1372,10 @@ def test_flux_pads_non_square_inputs_and_unpads_output() -> None:
 
     class _Pipeline:
         def __init__(self) -> None:
-            self.call: dict[str, object] = {}
+            self.calls: list[dict[str, object]] = []
 
         def __call__(self, **kwargs: object) -> object:
-            self.call = kwargs
+            self.calls.append(kwargs)
             return SimpleNamespace(
                 images=[
                     Image.new(
@@ -1293,15 +1396,28 @@ def test_flux_pads_non_square_inputs_and_unpads_output() -> None:
         prompt="repair",
         seed=17,
     )
+    second_result = backend.inpaint(
+        image=Image.new("RGB", (37, 23), (1, 2, 3)),
+        mask=Image.new("L", (37, 23), 255),
+        prompt="repair",
+        seed=42,
+        guidance_scale=20.0,
+        num_inference_steps=28,
+    )
+    first_call, second_call = pipeline.calls
 
-    assert pipeline.call["width"] == 48
-    assert pipeline.call["height"] == 32
-    assert pipeline.call["image"].size == (48, 32)
-    assert pipeline.call["mask_image"].size == (48, 32)
-    assert pipeline.call["strength"] == 1.0
-    assert pipeline.call["max_sequence_length"] == 512
-    assert pipeline.call["num_inference_steps"] == 50
+    assert first_call["width"] == 48
+    assert first_call["height"] == 32
+    assert first_call["image"].size == (48, 32)
+    assert first_call["mask_image"].size == (48, 32)
+    assert first_call["strength"] == 1.0
+    assert first_call["max_sequence_length"] == 512
+    assert first_call["num_inference_steps"] == 50
+    assert first_call["guidance_scale"] == 30.0
+    assert second_call["num_inference_steps"] == 28
+    assert second_call["guidance_scale"] == 20.0
     assert result.size == (37, 23)
+    assert second_result.size == (37, 23)
 
 
 def test_production_default_rejects_without_semantic_models(
@@ -1839,10 +1955,13 @@ def test_inpainting_metadata_stores_both_background_reviews(
         "masked_mean_l1",
         "masked_changed_pixel_ratio",
         "generation_mask_changed_pixel_ratio",
-        "boundary_ring_mean_l1",
+        "inner_boundary_mean_l1",
+        "outer_unmasked_boundary_mean_l1",
         "difference_heatmap_path",
     }
     assert Path(diagnostics["difference_heatmap_path"]).is_file()
+    assert diagnostics["inner_boundary_mean_l1"] > 0.0
+    assert diagnostics["outer_unmasked_boundary_mean_l1"] == 0.0
 
 
 def test_low_dino_is_diagnostic_only_for_background_hole_fill(

@@ -139,7 +139,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "6"
+INPAINTING_SOURCE_METADATA_VERSION = "7"
 
 
 class InpaintBackend(Protocol):
@@ -192,6 +192,12 @@ class InpaintingDependencyError(RuntimeError):
     pass
 
 
+class BackgroundPromptGenerationError(RuntimeError):
+    def __init__(self, metadata: dict[str, object]) -> None:
+        super().__init__("background prompt generation failed")
+        self.metadata = metadata
+
+
 @dataclass(frozen=True)
 class InpaintingStats:
     processed: int = 0
@@ -211,8 +217,10 @@ class NoOpInpaintBackend:
         mask: Image.Image,
         prompt: str,
         seed: int,
+        guidance_scale: float | None = None,
+        num_inference_steps: int | None = None,
     ) -> Image.Image:
-        del mask, prompt, seed
+        del mask, prompt, seed, guidance_scale, num_inference_steps
         return image.copy()
 
 
@@ -259,6 +267,8 @@ class Flux1FillBackend:
         mask: Image.Image,
         prompt: str,
         seed: int,
+        guidance_scale: float | None = None,
+        num_inference_steps: int | None = None,
     ) -> Image.Image:
         self._load()
         if self._pipeline is None or self._torch is None:
@@ -304,8 +314,16 @@ class Flux1FillBackend:
             height=padded_height,
             width=padded_width,
             generator=generator,
-            num_inference_steps=self.config.num_inference_steps,
-            guidance_scale=self.config.guidance_scale,
+            num_inference_steps=(
+                self.config.num_inference_steps
+                if num_inference_steps is None
+                else num_inference_steps
+            ),
+            guidance_scale=(
+                self.config.guidance_scale
+                if guidance_scale is None
+                else guidance_scale
+            ),
             strength=self.config.strength,
             max_sequence_length=self.config.max_sequence_length,
         )
@@ -761,7 +779,17 @@ def _background_pixel_diagnostics(
     ).mean(axis=2)
     source = np.asarray(source_mask, dtype=bool)
     generation = np.asarray(generation_mask, dtype=bool)
-    boundary = _mask_boundary(generation, pixels=3)
+    boundary_kernel = np.ones((7, 7), dtype=np.uint8)
+    eroded_generation = cv2.erode(
+        generation.astype(np.uint8),
+        boundary_kernel,
+    ).astype(bool)
+    dilated_generation = cv2.dilate(
+        generation.astype(np.uint8),
+        boundary_kernel,
+    ).astype(bool)
+    inner_boundary = generation & ~eroded_generation
+    outer_unmasked_boundary = dilated_generation & ~generation
     heatmap = np.zeros_like(original)
     heatmap[..., 0] = np.clip(pixel_l1 * 3.0, 0, 255).astype(np.uint8)
     heatmap[..., 1] = np.clip(
@@ -781,11 +809,61 @@ def _background_pixel_diagnostics(
             if generation.any()
             else 0.0
         ),
-        "boundary_ring_mean_l1": (
-            float(pixel_l1[boundary].mean()) if boundary.any() else 0.0
+        "inner_boundary_mean_l1": (
+            float(pixel_l1[inner_boundary].mean())
+            if inner_boundary.any()
+            else 0.0
+        ),
+        "outer_unmasked_boundary_mean_l1": (
+            float(pixel_l1[outer_unmasked_boundary].mean())
+            if outer_unmasked_boundary.any()
+            else 0.0
         ),
         "difference_heatmap_path": str(destination),
     }
+
+
+def _accepted_candidate_contact_sheet(
+    records: list[dict[str, object]],
+    destination: Path,
+) -> tuple[str, str]:
+    accepted = [
+        record for record in records if record.get("accepted") is True
+    ]
+    if not accepted:
+        raise ValueError("contact sheet requires accepted candidates")
+    cell_width = 320
+    cell_height = 344
+    columns = min(4, len(accepted))
+    rows = (len(accepted) + columns - 1) // columns
+    sheet = Image.new(
+        "RGB",
+        (columns * cell_width, rows * cell_height),
+        (24, 24, 24),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for position, record in enumerate(accepted):
+        candidate_path = Path(str(record["candidate_path"]))
+        candidate = Image.open(candidate_path).convert("RGB")
+        candidate.thumbnail(
+            (cell_width, cell_height - 24),
+            Image.Resampling.LANCZOS,
+        )
+        x = (position % columns) * cell_width
+        y = (position // columns) * cell_height
+        offset_x = x + ((cell_width - candidate.width) // 2)
+        offset_y = y + 24 + ((cell_height - 24 - candidate.height) // 2)
+        sheet.paste(candidate, (offset_x, offset_y))
+        draw.text(
+            (x + 6, y + 6),
+            (
+                f"candidate={record['candidate_index']} "
+                f"seed={record['seed']}"
+            ),
+            fill=(255, 255, 255),
+        )
+    _save_lossless_atomic(sheet, destination)
+    return str(destination), _sha256_path(destination)
 
 
 def _background_local_review_images(
@@ -1408,9 +1486,31 @@ def _metadata_matches_source(
 ) -> bool:
     if any(metadata.get(key) != value for key, value in signature.items()):
         return False
-    candidate = metadata.get("candidate_path")
-    if isinstance(candidate, str) and candidate and not Path(candidate).is_file():
-        return False
+    for path_key in (
+        "candidate_path",
+        "prompt_context_image_path",
+        "accepted_candidate_contact_sheet_path",
+    ):
+        value = metadata.get(path_key)
+        if isinstance(value, str) and value and not Path(value).is_file():
+            return False
+    for path_key, fingerprint_key in (
+        ("prompt_context_image_path", "prompt_context_image_sha256"),
+        (
+            "accepted_candidate_contact_sheet_path",
+            "accepted_candidate_contact_sheet_sha256",
+        ),
+    ):
+        value = metadata.get(path_key)
+        fingerprint = metadata.get(fingerprint_key)
+        if (
+            isinstance(value, str)
+            and value
+            and isinstance(fingerprint, str)
+            and fingerprint
+            and _sha256_path(Path(value)) != fingerprint
+        ):
+            return False
     if metadata.get("accepted") is True:
         canonical = reference.get("canonical_path")
         return (
@@ -1818,6 +1918,28 @@ def _background_forbidden_texts(
     return list(dict.fromkeys(value for value in values if value.strip()))
 
 
+def _background_prompt_context_image(
+    *,
+    original_path: Path,
+    generation_mask_path: Path,
+    destination: Path,
+) -> dict[str, object]:
+    original = Image.open(original_path).convert("RGB")
+    generation_mask = Image.open(generation_mask_path).convert("L")
+    if original.size != generation_mask.size:
+        raise ValueError(
+            "background prompt context image and mask dimensions must match"
+        )
+    context = np.asarray(original).copy()
+    context[np.asarray(generation_mask) >= 128] = (128, 128, 128)
+    _save_lossless_atomic(Image.fromarray(context), destination)
+    return {
+        "context_image_path": str(destination),
+        "context_image_sha256": _sha256_path(destination),
+        "context_fill_rgb": [128, 128, 128],
+    }
+
+
 def _resolve_background_fill_prompt(
     *,
     config: PipelineConfig,
@@ -1830,51 +1952,86 @@ def _resolve_background_fill_prompt(
     if prompt_mode == "generic":
         return BACKGROUND_INPAINT_PROMPT, {
             "source": "generic",
+            "prompt_mode": "generic",
             "visible_background_elements": [],
             "reason": "configured deterministic generic prompt",
             "validator": {"validation": "not_requested"},
+            "context_image_path": None,
+            "context_image_sha256": None,
         }
+    context_path = (
+        generation_mask_path.parent / "background_prompt_context.png"
+    )
+    try:
+        context_metadata = _background_prompt_context_image(
+            original_path=original_path,
+            generation_mask_path=generation_mask_path,
+            destination=context_path,
+        )
+    except Exception as exc:
+        raise BackgroundPromptGenerationError(
+            {
+                "source": "qwen_local_background",
+                "prompt_mode": "qwen_local_background",
+                "validator": {
+                    "validation": "failed",
+                    "error": str(exc),
+                },
+                "context_image_path": str(context_path),
+                "context_image_sha256": None,
+            }
+        ) from exc
     active_generator = generator
     if active_generator is None:
         repair_judge = _qwen_services(config.qwen).repair_judge
         if repair_judge is not None:
             active_generator = QwenBackgroundFillPromptGenerator(repair_judge)
     if active_generator is None:
-        return BACKGROUND_INPAINT_PROMPT, {
-            "source": "generic_fallback",
-            "visible_background_elements": [],
-            "reason": "background prompt generator unavailable",
-            "validator": {
-                "validation": "failed",
-                "error": "background_prompt_generator_unavailable",
-            },
-        }
+        raise BackgroundPromptGenerationError(
+            {
+                "source": "qwen_local_background",
+                "prompt_mode": "qwen_local_background",
+                "visible_background_elements": [],
+                "reason": "background prompt generator unavailable",
+                "validator": {
+                    "validation": "failed",
+                    "error": "background_prompt_generator_unavailable",
+                },
+                **context_metadata,
+            }
+        )
     forbidden_texts = _background_forbidden_texts(
         reference,
         config.output_root,
     )
     try:
         result, validator_metadata = active_generator.generate(
-            original_path=original_path,
+            original_path=context_path,
             generation_mask_path=generation_mask_path,
             forbidden_texts=forbidden_texts,
         )
         return result.fill_prompt.strip(), {
             "source": "qwen_local_background",
+            "prompt_mode": "qwen_local_background",
             "visible_background_elements": result.visible_background_elements,
             "reason": result.reason,
             "validator": validator_metadata,
+            **context_metadata,
         }
     except StructuredOutputFailure as exc:
         error: object = exc.to_dict()
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
-    return BACKGROUND_INPAINT_PROMPT, {
-        "source": "generic_fallback",
-        "visible_background_elements": [],
-        "reason": "Qwen background prompt generation failed validation",
-        "validator": {"validation": "failed", "error": error},
-    }
+    raise BackgroundPromptGenerationError(
+        {
+            "source": "qwen_local_background",
+            "prompt_mode": "qwen_local_background",
+            "visible_background_elements": [],
+            "reason": "Qwen background prompt generation failed validation",
+            "validator": {"validation": "failed", "error": error},
+            **context_metadata,
+        }
+    )
 
 
 def _reference_artifacts(output_root: Path) -> list[Path]:
@@ -2053,6 +2210,7 @@ def _clear_stale_inpainting_artifacts(artifact: Path) -> None:
     for filename in (
         "repair_mask.png",
         "generation_mask.png",
+        "background_prompt_context.png",
         "canonical_repaired.jpg",
         "canonical_repaired.png",
         "canonical_repaired_candidate.png",
@@ -2444,15 +2602,108 @@ def run_inpainting(
             if mode == "background_hole_fill":
                 if generation_mask_path is None:
                     raise RuntimeError("background generation mask was not saved")
-                fill_prompt, fill_prompt_metadata = (
-                    _resolve_background_fill_prompt(
-                        config=config,
-                        reference=reference,
-                        original_path=raw_path,
-                        generation_mask_path=generation_mask_path,
-                        generator=background_prompt_generator,
+                try:
+                    fill_prompt, fill_prompt_metadata = (
+                        _resolve_background_fill_prompt(
+                            config=config,
+                            reference=reference,
+                            original_path=raw_path,
+                            generation_mask_path=generation_mask_path,
+                            generator=background_prompt_generator,
+                        )
                     )
-                )
+                except BackgroundPromptGenerationError as exc:
+                    rejection_reasons = [
+                        "background_prompt_generation_failed"
+                    ]
+                    metadata = _metadata_base(
+                        config=config.inpainting,
+                        mode=mode,
+                        repair_area_ratio=repair_area_ratio,
+                        source_foreground_area_ratio=(
+                            source_foreground_area_ratio
+                        ),
+                        generation_mask_area_ratio=(
+                            generation_mask_area_ratio
+                        ),
+                        source_mask_path=source_mask_path,
+                        generation_mask_path=generation_mask_path,
+                        source_signature=source_signature,
+                    )
+                    metadata.update(
+                        {
+                            "prompt_mode": (
+                                config.inpainting.background.prompt_mode
+                            ),
+                            "prompt_source": "qwen_local_background",
+                            "prompt_metadata": exc.metadata,
+                            "prompt_context_image_path": exc.metadata.get(
+                                "context_image_path"
+                            ),
+                            "prompt_context_image_sha256": exc.metadata.get(
+                                "context_image_sha256"
+                            ),
+                            "fill_prompt": None,
+                            "production_prompt": None,
+                            "candidates": [
+                                {
+                                    "candidate_index": 0,
+                                    "seed": (
+                                        config.inpainting.background.candidate_seeds[
+                                            0
+                                        ]
+                                    ),
+                                    "stage": "prompt_generation",
+                                    "candidate_path": None,
+                                    "prompt_mode": (
+                                        config.inpainting.background.prompt_mode
+                                    ),
+                                    "prompt_source": (
+                                        "qwen_local_background"
+                                    ),
+                                    "prompt_context_image_path": (
+                                        exc.metadata.get(
+                                            "context_image_path"
+                                        )
+                                    ),
+                                    "prompt_context_image_sha256": (
+                                        exc.metadata.get(
+                                            "context_image_sha256"
+                                        )
+                                    ),
+                                    "accepted": False,
+                                    "rejection_reasons": (
+                                        rejection_reasons
+                                    ),
+                                }
+                            ],
+                            "selected_candidate_index": None,
+                            "selection_policy": "no_accepted_candidate",
+                            "accepted": False,
+                            "rejection_reasons": rejection_reasons,
+                        }
+                    )
+                    did_fallback = _publish_rejection(
+                        reference=reference,
+                        artifact=artifact,
+                        raw_path=raw_path,
+                        metadata=metadata,
+                        config=config.inpainting,
+                    )
+                    rejected += 1
+                    if did_fallback:
+                        fallback_count += 1
+                    _append_jsonl(
+                        output_root / "logs" / "inpainting_rejected.jsonl",
+                        {
+                            "clip_uid": reference.get("clip_uid"),
+                            "reference_id": reference.get(
+                                "reference_id", reference.get("entity_id")
+                            ),
+                            "reasons": rejection_reasons,
+                        },
+                    )
+                    continue
             production_prompt = _inpainting_prompt(
                 reference,
                 mode,
@@ -2477,6 +2728,26 @@ def run_inpainting(
                 record: dict[str, object] = {
                     "candidate_index": candidate_index,
                     "seed": seed,
+                    "prompt_mode": (
+                        config.inpainting.background.prompt_mode
+                        if mode == "background_hole_fill"
+                        else "entity_template"
+                    ),
+                    "prompt_source": (
+                        fill_prompt_metadata.get("source")
+                        if fill_prompt_metadata is not None
+                        else "entity_template"
+                    ),
+                    "prompt_context_image_path": (
+                        fill_prompt_metadata.get("context_image_path")
+                        if fill_prompt_metadata is not None
+                        else None
+                    ),
+                    "prompt_context_image_sha256": (
+                        fill_prompt_metadata.get("context_image_sha256")
+                        if fill_prompt_metadata is not None
+                        else None
+                    ),
                     "guidance_scale": config.inpainting.guidance_scale,
                     "num_inference_steps": config.inpainting.num_inference_steps,
                     "strength": config.inpainting.strength,
@@ -2622,6 +2893,16 @@ def run_inpainting(
                         if fill_prompt_metadata is not None
                         else "entity_template"
                     ),
+                    "prompt_mode": (
+                        config.inpainting.background.prompt_mode
+                        if mode == "background_hole_fill"
+                        else "entity_template"
+                    ),
+                    "prompt_context_image_sha256": (
+                        fill_prompt_metadata.get("context_image_sha256")
+                        if fill_prompt_metadata is not None
+                        else None
+                    ),
                     "seed": seed,
                     "guidance_scale": config.inpainting.guidance_scale,
                     "num_inference_steps": (
@@ -2641,7 +2922,8 @@ def run_inpainting(
                             "masked_mean_l1",
                             "masked_changed_pixel_ratio",
                             "generation_mask_changed_pixel_ratio",
-                            "boundary_ring_mean_l1",
+                            "inner_boundary_mean_l1",
+                            "outer_unmasked_boundary_mean_l1",
                         )
                         if key in record
                     },
@@ -2658,21 +2940,33 @@ def run_inpainting(
                 for record in candidate_records
                 if record.get("accepted") is True
             ]
-            if (
-                selected_candidate_index is None
-                and accepted_records
-            ):
-                selected = max(
+            accepted_contact_sheet_path: str | None = None
+            accepted_contact_sheet_sha256: str | None = None
+            selection_policy = (
+                "no_accepted_candidate"
+                if not accepted_records
+                else "single_candidate"
+            )
+            if selected_candidate_index is None and accepted_records:
+                earliest = min(
                     accepted_records,
-                    key=lambda record: (
-                        float(record.get("dino_similarity") or -1.0),
-                        float(record.get("masked_changed_pixel_ratio") or 0.0),
-                        -int(record["candidate_index"]),
-                    ),
+                    key=lambda record: int(record["candidate_index"]),
                 )
                 selected_candidate_index = int(
-                    selected["candidate_index"]
+                    earliest["candidate_index"]
                 )
+            if mode == "background_hole_fill" and accepted_records:
+                selection_policy = "first_accepted_not_quality_ranked"
+                if not config.inpainting.background.stop_after_first_accepted:
+                    (
+                        accepted_contact_sheet_path,
+                        accepted_contact_sheet_sha256,
+                    ) = _accepted_candidate_contact_sheet(
+                        accepted_records,
+                        artifact.parent
+                        / "inpainting_candidates"
+                        / "accepted_contact_sheet.png",
+                    )
             debug_record = (
                 next(
                     (
@@ -2736,6 +3030,13 @@ def run_inpainting(
                     "candidate_path": str(candidate_path),
                     "candidates": candidate_records,
                     "selected_candidate_index": selected_candidate_index,
+                    "selection_policy": selection_policy,
+                    "accepted_candidate_contact_sheet_path": (
+                        accepted_contact_sheet_path
+                    ),
+                    "accepted_candidate_contact_sheet_sha256": (
+                        accepted_contact_sheet_sha256
+                    ),
                     "selected_seed": (
                         selected_record.get("seed") if accepted else None
                     ),
@@ -2755,7 +3056,22 @@ def run_inpainting(
                         if fill_prompt_metadata is not None
                         else "entity_template"
                     ),
+                    "prompt_mode": (
+                        config.inpainting.background.prompt_mode
+                        if mode == "background_hole_fill"
+                        else "entity_template"
+                    ),
                     "prompt_metadata": fill_prompt_metadata,
+                    "prompt_context_image_path": (
+                        fill_prompt_metadata.get("context_image_path")
+                        if fill_prompt_metadata is not None
+                        else None
+                    ),
+                    "prompt_context_image_sha256": (
+                        fill_prompt_metadata.get("context_image_sha256")
+                        if fill_prompt_metadata is not None
+                        else None
+                    ),
                     "fill_prompt_sha256": (
                         _sha256_text(fill_prompt)
                         if fill_prompt is not None
@@ -2774,7 +3090,8 @@ def run_inpainting(
                             "masked_mean_l1",
                             "masked_changed_pixel_ratio",
                             "generation_mask_changed_pixel_ratio",
-                            "boundary_ring_mean_l1",
+                            "inner_boundary_mean_l1",
+                            "outer_unmasked_boundary_mean_l1",
                             "difference_heatmap_path",
                         )
                         if key in selected_record
@@ -2794,6 +3111,18 @@ def run_inpainting(
                                 fill_prompt_metadata.get("source")
                                 if fill_prompt_metadata is not None
                                 else "entity_template"
+                            ),
+                            "prompt_mode": (
+                                config.inpainting.background.prompt_mode
+                                if mode == "background_hole_fill"
+                                else "entity_template"
+                            ),
+                            "prompt_context_image_sha256": (
+                                fill_prompt_metadata.get(
+                                    "context_image_sha256"
+                                )
+                                if fill_prompt_metadata is not None
+                                else None
                             ),
                             "seed": selected_record.get("seed"),
                             "guidance_scale": (
@@ -2821,7 +3150,8 @@ def run_inpainting(
                                     "masked_mean_l1",
                                     "masked_changed_pixel_ratio",
                                     "generation_mask_changed_pixel_ratio",
-                                    "boundary_ring_mean_l1",
+                                    "inner_boundary_mean_l1",
+                                    "outer_unmasked_boundary_mean_l1",
                                 )
                                 if key in selected_record
                             },
