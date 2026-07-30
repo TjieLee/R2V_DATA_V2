@@ -1910,8 +1910,9 @@ def _background_forbidden_texts(
                         values.extend(
                             str(entity.get(key) or "")
                             for key in (
-                                "canonical_label",
+                                "phrase",
                                 "reference_phrase",
+                                "canonical_label",
                                 "grounding_prompt",
                             )
                         )

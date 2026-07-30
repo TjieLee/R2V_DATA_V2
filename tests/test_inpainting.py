@@ -32,6 +32,7 @@ from r2v_data_v2.inpainting import (
     QwenBackgroundFillPromptGenerator,
     QwenInpaintingConsistencyJudge,
     _background_fill_prompt_issues,
+    _background_forbidden_texts,
     _background_generation_mask,
     _inpainting_prompt,
     run_inpainting,
@@ -917,6 +918,43 @@ def test_background_fill_prompt_rejects_prohibited_or_copied_text(
     )
 
     assert issues
+
+
+def test_background_forbidden_texts_include_annotation_entity_phrase(
+    tmp_path: Path,
+) -> None:
+    annotation_dir = tmp_path / "annotations"
+    annotation_dir.mkdir()
+    entity_phrase = "striped rescue helicopter carrying a red bucket"
+    (annotation_dir / "clip-1.json").write_text(
+        json.dumps(
+            {
+                "entities": [
+                    {
+                        "phrase": entity_phrase,
+                        "reference_phrase": "legacy helicopter reference",
+                        "canonical_label": "helicopter",
+                        "grounding_prompt": "yellow aircraft",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    forbidden_texts = _background_forbidden_texts(
+        {
+            "clip_uid": "clip-1",
+            "phrase": "a stone courtyard",
+            "canonical_label": "courtyard",
+        },
+        tmp_path,
+    )
+
+    assert entity_phrase in forbidden_texts
+    assert "helicopter" in forbidden_texts
+    assert "legacy helicopter reference" in forbidden_texts
+    assert "yellow aircraft" in forbidden_texts
 
 
 def test_qwen_background_fill_failure_rejects_without_generic_fallback(

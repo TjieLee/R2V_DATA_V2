@@ -11,7 +11,10 @@ from r2v_data_v2.config import (
     InpaintingBackgroundConfig,
     InpaintingConfig,
     PipelineConfig,
+    QwenConfig,
+    QwenServicesConfig,
 )
+from r2v_data_v2.schemas import BackgroundFillPrompt
 from scripts import benchmark_flux_background_fill as benchmark
 
 
@@ -256,6 +259,123 @@ def test_background_fill_benchmark_qwen_failure_is_fail_closed(
         "background_prompt_generation_failed"
     ]
     assert "generic" not in json.dumps(record).casefold()
+
+
+def test_background_fill_benchmark_caches_qwen_prompt_across_grid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "production"
+    _write_background_reference(output_root)
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=output_root,
+        qwen=QwenServicesConfig(repair_judge=QwenConfig(model="fake-qwen")),
+        inpainting=InpaintingConfig(
+            enabled=True,
+            backend="noop",
+            mask_dilation_pixels=1,
+            background=InpaintingBackgroundConfig(
+                prompt_mode="qwen_local_background",
+                candidate_seeds=[0],
+            ),
+        ),
+    )
+    generator_inputs: list[tuple[Path, Path]] = []
+    flux_prompts: list[str] = []
+
+    class _PromptGenerator:
+        def __init__(self, config: QwenConfig) -> None:
+            assert config.model == "fake-qwen"
+
+        def generate(
+            self,
+            *,
+            original_path: Path,
+            generation_mask_path: Path,
+            forbidden_texts: list[str],
+        ) -> tuple[BackgroundFillPrompt, dict[str, object]]:
+            assert forbidden_texts
+            generator_inputs.append((original_path, generation_mask_path))
+            return (
+                BackgroundFillPrompt(
+                    fill_prompt=(
+                        "Weathered stone paving continues naturally with "
+                        "consistent gray texture, perspective, and daylight"
+                    ),
+                    visible_background_elements=["stone paving"],
+                    reason="Stone paving surrounds the masked area.",
+                ),
+                {"model": "fake-qwen", "validation": "passed"},
+            )
+
+    class _Backend:
+        def __init__(self, config: InpaintingConfig) -> None:
+            del config
+
+        def inpaint(self, **kwargs: object) -> Image.Image:
+            image = kwargs["image"]
+            assert isinstance(image, Image.Image)
+            flux_prompts.append(str(kwargs["prompt"]))
+            return image.copy()
+
+    class _Validator:
+        def __init__(self, config: PipelineConfig) -> None:
+            del config
+
+        def __call__(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            return {"accepted": True, "rejection_reasons": []}
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        benchmark,
+        "QwenBackgroundFillPromptGenerator",
+        _PromptGenerator,
+    )
+    monkeypatch.setattr(benchmark, "Flux1FillBackend", _Backend)
+    monkeypatch.setattr(
+        benchmark,
+        "ProductionConsistencyValidator",
+        _Validator,
+    )
+
+    run_root = benchmark.run_benchmark(
+        config,
+        output_dir=tmp_path / "benchmarks",
+        prompt_modes=["qwen_local"],
+        guidance_scales=[20.0, 30.0],
+        steps=[28, 50],
+        seeds=[0, 17],
+    )
+    records = [
+        json.loads(line)
+        for line in (run_root / "candidates.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert len(generator_inputs) == 1
+    assert len(flux_prompts) == 8
+    assert len(set(flux_prompts)) == 1
+    assert len(records) == 8
+    assert len({record["fill_prompt"] for record in records}) == 1
+    assert len({record["production_prompt"] for record in records}) == 1
+    assert all(
+        record["prompt_metadata"] == records[0]["prompt_metadata"]
+        for record in records
+    )
+    assert {
+        record["prompt_context_image_path"] for record in records
+    } == {str(generator_inputs[0][0])}
+    assert len(
+        {
+            record["prompt_context_image_sha256"]
+            for record in records
+        }
+    ) == 1
 
 
 def test_background_fill_benchmark_rejects_production_output_path(

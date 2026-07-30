@@ -99,7 +99,9 @@ def run_benchmark(
     flux_backend = Flux1FillBackend(config.inpainting)
     validator = ProductionConsistencyValidator(config)
 
-    for artifact, reference in _reference_artifacts(config, clip_uids):
+    for reference_index, (artifact, reference) in enumerate(
+        _reference_artifacts(config, clip_uids)
+    ):
         raw_path = Path(
             str(
                 reference.get("raw_canonical_path")
@@ -109,7 +111,129 @@ def run_benchmark(
         mask_path = Path(str(reference["mask_path"]))
         original_image = Image.open(raw_path).convert("RGB")
         original = np.asarray(original_image)
+        (
+            generation_mask,
+            mode,
+            preflight_reasons,
+            source_ratio,
+            generation_ratio,
+        ) = _repair_mask_for_reference(
+            reference,
+            raw_shape=original.shape[:2],
+            config=config.inpainting,
+        )
+        mask_preflight_failed = (
+            mode != "background_hole_fill"
+            or generation_mask is None
+            or not generation_mask.any()
+            or bool(preflight_reasons)
+        )
+        generation_mask_image = (
+            None
+            if generation_mask is None
+            else Image.fromarray(generation_mask.astype(np.uint8) * 255)
+        )
+        prompt_cache: dict[
+            str,
+            tuple[
+                str | None,
+                str | None,
+                dict[str, object] | None,
+                Exception | None,
+            ],
+        ] = {}
         for prompt_mode in prompt_modes:
+            if prompt_mode not in prompt_cache:
+                fill_prompt: str | None = None
+                production_prompt: str | None = None
+                prompt_metadata: dict[str, object] | None = None
+                prompt_error: Exception | None = None
+                if not mask_preflight_failed:
+                    assert generation_mask_image is not None
+                    prompt_cache_dir = (
+                        run_root
+                        / "prompt_cache"
+                        / f"reference_{reference_index:05d}"
+                        / prompt_mode
+                    )
+                    prompt_cache_dir.mkdir(parents=True, exist_ok=True)
+                    cached_generation_mask_path = (
+                        prompt_cache_dir / "generation_mask.png"
+                    )
+                    _save_lossless_atomic(
+                        generation_mask_image,
+                        cached_generation_mask_path,
+                    )
+                    try:
+                        if prompt_mode == "empty":
+                            fill_prompt = ""
+                            production_prompt = ""
+                            prompt_metadata = {
+                                "source": "empty",
+                                "prompt_mode": "empty",
+                                "context_image_path": None,
+                                "context_image_sha256": None,
+                            }
+                        elif prompt_mode == "generic":
+                            fill_prompt = BACKGROUND_INPAINT_PROMPT
+                            production_prompt = _inpainting_prompt(
+                                reference,
+                                mode,
+                                background_fill_prompt=fill_prompt,
+                            )
+                            prompt_metadata = {
+                                "source": "generic",
+                                "prompt_mode": "generic",
+                                "context_image_path": None,
+                                "context_image_sha256": None,
+                            }
+                        elif prompt_mode == "qwen_local":
+                            prompt_config = replace(
+                                config,
+                                inpainting=replace(
+                                    config.inpainting,
+                                    background=replace(
+                                        config.inpainting.background,
+                                        prompt_mode=(
+                                            "qwen_local_background"
+                                        ),
+                                    ),
+                                ),
+                            )
+                            fill_prompt, prompt_metadata = (
+                                _resolve_background_fill_prompt(
+                                    config=prompt_config,
+                                    reference=reference,
+                                    original_path=raw_path,
+                                    generation_mask_path=(
+                                        cached_generation_mask_path
+                                    ),
+                                    generator=prompt_generator,
+                                )
+                            )
+                            production_prompt = _inpainting_prompt(
+                                reference,
+                                mode,
+                                background_fill_prompt=fill_prompt,
+                            )
+                        else:
+                            raise ValueError(
+                                f"unsupported prompt mode: {prompt_mode}"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        prompt_error = exc
+                prompt_cache[prompt_mode] = (
+                    fill_prompt,
+                    production_prompt,
+                    prompt_metadata,
+                    prompt_error,
+                )
+            (
+                fill_prompt,
+                production_prompt,
+                prompt_metadata,
+                prompt_error,
+            ) = prompt_cache[prompt_mode]
             for guidance_scale in guidance_scales:
                 for inference_steps in steps:
                     for seed in seeds:
@@ -126,31 +250,6 @@ def run_benchmark(
                             config.inpainting,
                             guidance_scale=guidance_scale,
                             num_inference_steps=inference_steps,
-                        )
-                        tuned_config = replace(
-                            config,
-                            inpainting=replace(
-                                tuned_inpainting,
-                                background=replace(
-                                    tuned_inpainting.background,
-                                    prompt_mode=(
-                                        "qwen_local_background"
-                                        if prompt_mode == "qwen_local"
-                                        else "generic"
-                                    ),
-                                ),
-                            ),
-                        )
-                        (
-                            generation_mask,
-                            mode,
-                            preflight_reasons,
-                            source_ratio,
-                            generation_ratio,
-                        ) = _repair_mask_for_reference(
-                            reference,
-                            raw_shape=original.shape[:2],
-                            config=tuned_inpainting,
                         )
                         record: dict[str, object] = {
                             "clip_uid": reference.get("clip_uid"),
@@ -186,49 +285,11 @@ def run_benchmark(
                                 generation_mask_image,
                                 generation_mask_path,
                             )
-                            if prompt_mode == "empty":
-                                fill_prompt = ""
-                                production_prompt = ""
-                                prompt_metadata = {
-                                    "source": "empty",
-                                    "prompt_mode": "empty",
-                                    "context_image_path": None,
-                                    "context_image_sha256": None,
-                                }
-                            elif prompt_mode == "generic":
-                                fill_prompt = BACKGROUND_INPAINT_PROMPT
-                                production_prompt = _inpainting_prompt(
-                                    reference,
-                                    mode,
-                                    background_fill_prompt=fill_prompt,
-                                )
-                                prompt_metadata = {
-                                    "source": "generic",
-                                    "prompt_mode": "generic",
-                                    "context_image_path": None,
-                                    "context_image_sha256": None,
-                                }
-                            elif prompt_mode == "qwen_local":
-                                fill_prompt, prompt_metadata = (
-                                    _resolve_background_fill_prompt(
-                                        config=tuned_config,
-                                        reference=reference,
-                                        original_path=raw_path,
-                                        generation_mask_path=(
-                                            generation_mask_path
-                                        ),
-                                        generator=prompt_generator,
-                                    )
-                                )
-                                production_prompt = _inpainting_prompt(
-                                    reference,
-                                    mode,
-                                    background_fill_prompt=fill_prompt,
-                                )
-                            else:
-                                raise ValueError(
-                                    f"unsupported prompt mode: {prompt_mode}"
-                                )
+                            if prompt_error is not None:
+                                raise prompt_error
+                            assert fill_prompt is not None
+                            assert production_prompt is not None
+                            assert prompt_metadata is not None
                             generated = flux_backend.inpaint(
                                 image=original_image,
                                 mask=generation_mask_image,
