@@ -11,12 +11,17 @@ import pytest
 from PIL import Image
 
 from r2v_data_v2.config import (
+    DinoEvaluatorConfig,
     InpaintingBackgroundConfig,
     InpaintingConfig,
     InpaintingConsistencyConfig,
     InpaintingEntityConfig,
     PipelineConfig,
     QwenConfig,
+    QwenServicesConfig,
+    RankingConfig,
+    RankingEvaluatorsConfig,
+    SiglipEvaluatorConfig,
 )
 from r2v_data_v2.inpainting import (
     Flux1FillBackend,
@@ -24,6 +29,7 @@ from r2v_data_v2.inpainting import (
     NoOpInpaintBackend,
     ProductionConsistencyValidator,
     QwenInpaintingConsistencyJudge,
+    _inpainting_prompt,
     run_inpainting,
 )
 from r2v_data_v2.schemas import (
@@ -201,6 +207,15 @@ def _accept_consistency(**kwargs: object) -> dict[str, object]:
     }
 
 
+def _dino_siglip_ranking() -> RankingConfig:
+    return RankingConfig(
+        evaluators=RankingEvaluatorsConfig(
+            dinov3=DinoEvaluatorConfig(enabled=True),
+            siglip2=SiglipEvaluatorConfig(enabled=True),
+        )
+    )
+
+
 def test_disabled_inpainting_is_complete_noop(tmp_path: Path) -> None:
     config = _config(tmp_path, enabled=False)
 
@@ -210,7 +225,7 @@ def test_disabled_inpainting_is_complete_noop(tmp_path: Path) -> None:
     assert not config.output_root.exists()
 
 
-def test_direct_production_run_rejects_missing_semantic_configuration(
+def test_direct_entity_production_rejects_missing_semantic_configuration(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "flux"
@@ -222,6 +237,8 @@ def test_direct_production_run_rejects_missing_semantic_configuration(
             enabled=True,
             backend="flux1_fill",
             model_path=model_path,
+            background=InpaintingBackgroundConfig(enabled=False),
+            entity=InpaintingEntityConfig(enabled=True),
         ),
     )
 
@@ -233,6 +250,103 @@ def test_direct_production_run_rejects_missing_semantic_configuration(
         )
 
     assert not config.output_root.exists()
+
+
+def test_background_flux_rejects_dino_siglip_without_repair_judge(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        ranking=_dino_siglip_ranking(),
+        inpainting=InpaintingConfig(
+            enabled=True,
+            backend="flux1_fill",
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"background_hole_fill requires qwen\.repair_judge",
+    ):
+        run_inpainting(
+            config,
+            backend=_WholeImageBackend(),
+            validator=_accept_consistency,
+        )
+
+    assert not config.output_root.exists()
+
+
+def test_background_flux_with_repair_judge_is_allowed(tmp_path: Path) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        qwen=QwenServicesConfig(
+            repair_judge=QwenConfig(model="repair-model")
+        ),
+        inpainting=InpaintingConfig(
+            enabled=True,
+            backend="flux1_fill",
+        ),
+    )
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[12:16, 12:16] = True
+    _write_reference(
+        config.output_root,
+        reference_id="bg1",
+        reference_type="background",
+        mask=mask,
+        needs_inpainting=True,
+    )
+
+    stats = run_inpainting(
+        config,
+        backend=_WholeImageBackend(),
+        validator=_accept_consistency,
+    )
+
+    assert stats.repaired == 1
+
+
+def test_entity_only_flux_keeps_dino_siglip_validation_path(
+    tmp_path: Path,
+) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+        ranking=_dino_siglip_ranking(),
+        inpainting=InpaintingConfig(
+            enabled=True,
+            backend="flux1_fill",
+            mask_dilation_pixels=1,
+            feather_pixels=1,
+            background=InpaintingBackgroundConfig(enabled=False),
+            entity=InpaintingEntityConfig(
+                enabled=True,
+                maximum_repair_area_ratio=0.08,
+                maximum_component_area_ratio=0.05,
+            ),
+        ),
+    )
+    subject_mask = np.zeros((32, 32), dtype=bool)
+    subject_mask[5:27, 5:27] = True
+    subject_mask[14:17, 14:17] = False
+    _write_reference(
+        config.output_root,
+        reference_id="e1",
+        reference_type="entity",
+        mask=subject_mask,
+        needs_inpainting=False,
+    )
+
+    stats = run_inpainting(
+        config,
+        backend=_WholeImageBackend(),
+        validator=_accept_consistency,
+    )
+
+    assert stats.repaired == 1
 
 
 def test_generated_whole_image_cannot_change_pixels_outside_repair_mask(
@@ -555,8 +669,49 @@ def test_background_and_entity_use_distinct_prompts(tmp_path: Path) -> None:
     )
 
     assert stats.repaired == 2
-    assert any("foreground subjects" in prompt for prompt in backend.prompts)
+    background_prompt = next(
+        prompt for prompt in backend.prompts if "Scene description:" in prompt
+    )
+    lowered = background_prompt.casefold()
+    assert background_prompt.startswith(
+        "Seamlessly continue the surrounding background"
+    )
+    assert len(background_prompt.split()) < 60
+    for prohibited in (
+        "remove",
+        "subject",
+        "person",
+        "animal",
+        "boat",
+        "foreground object",
+    ):
+        assert prohibited not in lowered
     assert any("exact same entity identity" in prompt for prompt in backend.prompts)
+
+
+def test_background_generation_prompt_is_positive_and_clip_safe() -> None:
+    prompt = _inpainting_prompt(
+        {
+            "phrase": " ".join(
+                ["brick", "courtyard", "arches", "sunlight"] * 20
+            )
+        },
+        "background_hole_fill",
+    )
+    lowered = prompt.casefold()
+
+    assert len(prompt.split()) < 60
+    assert lowered.count("brick") == 6
+    for prohibited in (
+        "remove",
+        "subject",
+        "person",
+        "animal",
+        "boat",
+        "foreground object",
+        "do not",
+    ):
+        assert prohibited not in lowered
 
 
 def test_entity_repair_regenerates_mask_derived_artifacts_and_dino(

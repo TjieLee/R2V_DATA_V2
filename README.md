@@ -313,9 +313,10 @@ Background masking includes every separable visible entity, and a clean raw
 background is preferred over a higher-scoring candidate that requires repair.
 Backgrounds that require repair remain pending until FLUX succeeds and semantic
 consistency checks pass; a failed background repair is rejected instead of
-falling back to the contaminated raw frame. Enabling production FLUX requires
-configured DINOv3 plus SigLIP2 evaluators or an explicit video-capable
-`qwen.repair_judge`. Successful entity repair rebuilds its mask, RGBA, neutral
+falling back to the contaminated raw frame. Production FLUX background hole
+filling requires an explicit video-capable `qwen.repair_judge`; DINOv3 and
+SigLIP2 alone remain sufficient only for entity-only validation when background
+repair is disabled. Successful entity repair rebuilds its mask, RGBA, neutral
 background, and selected DINO embedding so downstream artifacts remain aligned.
 Background hole-fill review verifies foreground removal and coherent scene
 continuation instead of entity identity preservation. Its source foreground

@@ -482,6 +482,10 @@ def has_inpainting_semantic_validator(config: PipelineConfig) -> bool:
     ) or qwen.repair_judge is not None
 
 
+def has_background_inpainting_repair_judge(config: PipelineConfig) -> bool:
+    return _qwen_services(config.qwen).repair_judge is not None
+
+
 def _parse_annotation_config(
     values: dict[str, object],
     *,
@@ -779,6 +783,13 @@ def _validate_config(config: PipelineConfig) -> None:
     if config.inpainting.backend not in {"flux1_fill", "noop"}:
         raise ValueError("inpainting.backend must be flux1_fill or noop")
     if config.inpainting.enabled and config.inpainting.backend == "flux1_fill":
+        if (
+            config.inpainting.background.enabled
+            and not has_background_inpainting_repair_judge(config)
+        ):
+            raise ValueError(
+                "production background_hole_fill requires qwen.repair_judge"
+            )
         if not has_inpainting_semantic_validator(config):
             raise ValueError(
                 "production inpainting requires DINOv3+SigLIP2 or an explicit "

@@ -24,6 +24,7 @@ from r2v_data_v2.config import (
     PipelineConfig,
     QwenConfig,
     _qwen_services,
+    has_background_inpainting_repair_judge,
     has_inpainting_semantic_validator,
 )
 from r2v_data_v2.image_utils import (
@@ -45,10 +46,8 @@ from r2v_data_v2.visual_embedding import (
 )
 
 BACKGROUND_INPAINT_PROMPT = (
-    "Remove the masked foreground subjects and reconstruct the original "
-    "background consistently with the surrounding scene. Preserve the same "
-    "perspective, lighting, color palette, depth, textures, and camera style. "
-    "Do not add new salient objects."
+    "Seamlessly continue the surrounding background through the masked region, "
+    "matching its perspective, lighting, color, depth, texture, and camera style."
 )
 
 ENTITY_INPAINT_PROMPT = (
@@ -886,8 +885,8 @@ def _inpainting_prompt(
     mode: str,
 ) -> str:
     if mode == "background_hole_fill":
-        phrase = str(reference.get("phrase", "")).strip()
-        suffix = f" The original scene is described as: {phrase}." if phrase else ""
+        phrase = " ".join(str(reference.get("phrase", "")).split()[:24])
+        suffix = f" Scene description: {phrase}." if phrase else ""
         return BACKGROUND_INPAINT_PROMPT + suffix
     return ENTITY_INPAINT_PROMPT.format(
         description=str(
@@ -1203,6 +1202,14 @@ def run_inpainting(
     if not config.inpainting.consistency.preserve_unmasked_pixels:
         raise ValueError(
             "inpainting.consistency.preserve_unmasked_pixels must remain true"
+        )
+    if (
+        config.inpainting.backend == "flux1_fill"
+        and config.inpainting.background.enabled
+        and not has_background_inpainting_repair_judge(config)
+    ):
+        raise ValueError(
+            "production background_hole_fill requires qwen.repair_judge"
         )
     if (
         config.inpainting.backend == "flux1_fill"

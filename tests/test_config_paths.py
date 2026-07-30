@@ -254,7 +254,7 @@ def test_unknown_ranking_metric_is_rejected_during_config_load(
         load_config(config_path)
 
 
-def test_production_inpainting_requires_semantic_validator_configuration(
+def test_production_background_inpainting_requires_repair_judge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -269,6 +269,14 @@ def test_production_inpainting_requires_semantic_validator_configuration(
         "qwen:\n"
         "  annotation:\n"
         "    model: annotation-model\n"
+        "ranking:\n"
+        f"  dinov3_repo_dir: {model_root / 'dinov3'}\n"
+        f"  siglip2_model_path: {model_root / 'siglip2'}\n"
+        "  evaluators:\n"
+        "    dinov3:\n"
+        "      enabled: true\n"
+        "    siglip2:\n"
+        "      enabled: true\n"
         "inpainting:\n"
         "  enabled: true\n"
         "  backend: flux1_fill\n"
@@ -278,7 +286,7 @@ def test_production_inpainting_requires_semantic_validator_configuration(
 
     with pytest.raises(
         ValueError,
-        match=r"requires DINOv3\+SigLIP2 or an explicit qwen\.repair_judge",
+        match=r"background_hole_fill requires qwen\.repair_judge",
     ):
         load_config(config_path)
 
@@ -299,6 +307,56 @@ def test_production_inpainting_requires_semantic_validator_configuration(
 
     loaded = load_config(config_path)
     assert loaded.qwen.repair_judge is not None
+
+
+def test_production_entity_only_config_allows_dino_siglip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = (tmp_path / "models").resolve()
+    monkeypatch.setattr(config_module, "ALLOWED_USER_MODEL_ROOT", model_root)
+    flux_path = model_root / "flux-fill"
+    flux_path.mkdir(parents=True)
+    dino_path = model_root / "dinov3-model"
+    dino_path.mkdir()
+    (dino_path / "config.json").write_text("{}", encoding="utf-8")
+    (dino_path / "preprocessor_config.json").write_text(
+        "{}",
+        encoding="utf-8",
+    )
+    (model_root / "siglip2").mkdir()
+    config_path = tmp_path / "entity-inpainting.yaml"
+    config_path.write_text(
+        f"dataset_json: {tmp_path / 'source.jsonl'}\n"
+        f"output_root: {tmp_path / 'output'}\n"
+        "qwen:\n"
+        "  annotation:\n"
+        "    model: annotation-model\n"
+        "ranking:\n"
+        f"  dinov3_repo_dir: {model_root / 'dinov3'}\n"
+        f"  dinov3_model_path: {dino_path}\n"
+        f"  siglip2_model_path: {model_root / 'siglip2'}\n"
+        "  evaluators:\n"
+        "    dinov3:\n"
+        "      enabled: true\n"
+        "    siglip2:\n"
+        "      enabled: true\n"
+        "inpainting:\n"
+        "  enabled: true\n"
+        "  backend: flux1_fill\n"
+        f"  model_path: {flux_path}\n"
+        "  background:\n"
+        "    enabled: false\n"
+        "  entity:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_config(config_path)
+
+    assert loaded.qwen.repair_judge is None
+    assert loaded.inpainting.background.enabled is False
+    assert loaded.inpainting.entity.enabled is True
 
 
 def test_zero_enabled_ranking_weights_are_rejected(tmp_path: Path) -> None:
