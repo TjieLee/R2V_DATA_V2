@@ -17,3 +17,20 @@ artifact is visible.
 
 Return only the requested JSON structure.
 """.strip()
+
+
+BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT = """
+Review a local crop around a background hole-fill using the three supplied
+images. The first image is the original crop, the second is the repaired crop,
+and the third is the generation mask crop. White mask pixels identify the
+region expected to become coherent background matching this reference phrase:
+{reference_phrase}
+
+Inspect the masked region and its immediate boundary closely. Reject if any
+person, animal, vehicle, vessel, product, face, body silhouette, or other
+distinct foreground object remains or appears. Also reject any blurred ghost,
+repeated texture, inset image, artificial blob, visible boundary, seam, or
+other local artifact.
+
+Return only the requested JSON structure.
+""".strip()

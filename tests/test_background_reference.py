@@ -680,6 +680,7 @@ def test_background_overwrite_invalidates_stale_inpainting_artifacts(
     reference_dir = config.output_root / "references" / "clip-1" / "bg1"
     stale_names = (
         "repair_mask.png",
+        "generation_mask.png",
         "canonical_repaired.png",
         "canonical_repaired_candidate.png",
         "inpainting_metadata.json",

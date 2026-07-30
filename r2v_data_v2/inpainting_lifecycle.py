@@ -4,6 +4,7 @@ from pathlib import Path
 
 INPAINTING_ARTIFACT_NAMES = (
     "repair_mask.png",
+    "generation_mask.png",
     "canonical_repaired.jpg",
     "canonical_repaired.png",
     "canonical_repaired_candidate.png",

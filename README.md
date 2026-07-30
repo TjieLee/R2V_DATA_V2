@@ -320,9 +320,14 @@ repair is disabled. Successful entity repair rebuilds its mask, RGBA, neutral
 background, and selected DINO embedding so downstream artifacts remain aligned.
 Background hole-fill review verifies foreground removal and coherent scene
 continuation instead of entity identity preservation. Its source foreground
-area is gated before mask dilation (`inpainting.background.maximum_hole_area_ratio:
-0.23`), while both source and dilated repair ratios remain in metadata. Every
-generated hard-composited result is retained as
+area is gated before any transformation
+(`inpainting.background.maximum_hole_area_ratio: 0.23`). FLUX receives a
+separate hole-filled, closed, component-grouped, per-group convex-hull mask
+with adaptive dilation, capped by
+`inpainting.background.maximum_generation_mask_area_ratio: 0.35`. Both source
+and generation mask paths and ratios remain in metadata. Full-frame and
+context-upscaled local Qwen reviews must both pass. Every generated
+hard-composited result is retained as
 `canonical_repaired_candidate.png`, including rejected candidates.
 
 ## Qwen Benchmark

@@ -1071,6 +1071,7 @@ def test_ranking_overwrite_invalidates_stale_inpainting_artifacts(
     reference_dir = output_root / "references" / "clip_1" / "e1"
     stale_names = (
         "repair_mask.png",
+        "generation_mask.png",
         "canonical_repaired.png",
         "canonical_repaired_candidate.png",
         "inpainting_metadata.json",

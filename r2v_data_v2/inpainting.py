@@ -14,6 +14,7 @@ from openai import BadRequestError, OpenAI
 from PIL import Image
 
 from prompts.qwen_background_inpainting_review_prompt import (
+    BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT,
     BACKGROUND_INPAINTING_REVIEW_PROMPT,
 )
 from prompts.qwen_inpainting_consistency_prompt import (
@@ -46,8 +47,9 @@ from r2v_data_v2.visual_embedding import (
 )
 
 BACKGROUND_INPAINT_PROMPT = (
-    "Seamlessly continue the surrounding background through the masked region, "
-    "matching its perspective, lighting, color, depth, texture, and camera style."
+    "The masked region is filled entirely with continuous background scenery "
+    "and textures matching the surrounding environment. Match its perspective, "
+    "lighting, color, depth, texture, and camera style."
 )
 
 ENTITY_INPAINT_PROMPT = (
@@ -64,6 +66,10 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
         return BACKGROUND_INPAINTING_REVIEW_PROMPT.format(
             reference_phrase=reference_phrase
         )
+    if mode == "background_hole_fill_local":
+        return BACKGROUND_INPAINTING_LOCAL_REVIEW_PROMPT.format(
+            reference_phrase=reference_phrase
+        )
     if mode == "entity_local_repair":
         return INPAINTING_CONSISTENCY_PROMPT.format(
             reference_phrase=reference_phrase,
@@ -72,7 +78,7 @@ def _consistency_review_prompt(reference_phrase: str, mode: str) -> str:
     raise ValueError(f"unsupported inpainting repair mode: {mode}")
 
 
-INPAINTING_SOURCE_METADATA_VERSION = "3"
+INPAINTING_SOURCE_METADATA_VERSION = "4"
 
 
 class InpaintBackend(Protocol):
@@ -318,7 +324,8 @@ class QwenInpaintingConsistencyJudge:
         prompt = _consistency_review_prompt(reference_phrase, mode)
         review_model = (
             BackgroundInpaintingReview
-            if mode == "background_hole_fill"
+            if mode
+            in {"background_hole_fill", "background_hole_fill_local"}
             else InpaintingSemanticReview
         )
         return request_structured_output(
@@ -332,6 +339,61 @@ class QwenInpaintingConsistencyJudge:
             original_request=prompt,
             model=review_model,
         )
+
+
+def _background_review_passes(review: BackgroundInpaintingReview) -> bool:
+    return (
+        review.background_continuity_preserved
+        and review.masked_foreground_removed
+        and review.reference_phrase_supported
+        and not review.new_salient_objects
+        and not review.visible_seam_or_artifact
+    )
+
+
+def _background_local_review_images(
+    *,
+    original: Image.Image,
+    repaired: Image.Image,
+    generation_mask: Image.Image,
+) -> tuple[Image.Image, Image.Image, Image.Image, tuple[int, int, int, int]]:
+    original_rgb = original.convert("RGB")
+    repaired_rgb = repaired.convert("RGB")
+    mask_l = generation_mask.convert("L")
+    if original_rgb.size != repaired_rgb.size or original_rgb.size != mask_l.size:
+        raise ValueError("background review images and mask must have matching sizes")
+    mask_array = np.asarray(mask_l) >= 128
+    coordinates = np.argwhere(mask_array)
+    if coordinates.size == 0:
+        raise ValueError("background local review requires a non-empty mask")
+    y0, x0 = coordinates.min(axis=0)
+    y1, x1 = coordinates.max(axis=0) + 1
+    box_width = int(x1 - x0)
+    box_height = int(y1 - y0)
+    context_x = max(1, round(0.25 * box_width))
+    context_y = max(1, round(0.25 * box_height))
+    width, height = original_rgb.size
+    crop_box = (
+        max(0, int(x0) - context_x),
+        max(0, int(y0) - context_y),
+        min(width, int(x1) + context_x),
+        min(height, int(y1) + context_y),
+    )
+    original_crop = original_rgb.crop(crop_box)
+    repaired_crop = repaired_rgb.crop(crop_box)
+    mask_crop = mask_l.crop(crop_box)
+    crop_width, crop_height = original_crop.size
+    long_side = max(crop_width, crop_height)
+    if long_side < 768:
+        scale = 768 / long_side
+        resized = (
+            max(1, round(crop_width * scale)),
+            max(1, round(crop_height * scale)),
+        )
+        original_crop = original_crop.resize(resized, Image.Resampling.LANCZOS)
+        repaired_crop = repaired_crop.resize(resized, Image.Resampling.LANCZOS)
+        mask_crop = mask_crop.resize(resized, Image.Resampling.NEAREST)
+    return original_crop, repaired_crop, mask_crop, crop_box
 
 
 class ProductionConsistencyValidator:
@@ -453,6 +515,9 @@ class ProductionConsistencyValidator:
                 reasons.append("siglip_validation_failed")
 
         qwen_review: dict[str, object] | None = None
+        qwen_full_review: dict[str, object] | None = None
+        qwen_local_review: dict[str, object] | None = None
+        qwen_local_crop_box: tuple[int, int, int, int] | None = None
         if self.qwen is not None:
             temporary_root = Path(
                 str(reference.get("raw_canonical_path", "."))
@@ -462,6 +527,15 @@ class ProductionConsistencyValidator:
             repair_mask_path = (
                 temporary_root / ".inpainting_qwen_repair_mask.png"
             )
+            local_original_path = (
+                temporary_root / ".inpainting_qwen_local_original.png"
+            )
+            local_repaired_path = (
+                temporary_root / ".inpainting_qwen_local_repaired.png"
+            )
+            local_mask_path = (
+                temporary_root / ".inpainting_qwen_local_mask.png"
+            )
             try:
                 _save_lossless_atomic(original, original_path)
                 _save_lossless_atomic(repaired, repaired_path)
@@ -469,36 +543,102 @@ class ProductionConsistencyValidator:
                     repair_mask.convert("L"),
                     repair_mask_path,
                 )
-                review = self.qwen.review(
-                    original_path=original_path,
-                    repaired_path=repaired_path,
-                    repair_mask_path=repair_mask_path,
-                    reference_phrase=phrase,
-                    mode=mode,
-                )
-                qwen_review = review.model_dump(mode="json")
                 if mode == "background_hole_fill":
-                    if not isinstance(review, BackgroundInpaintingReview) or not (
-                        review.background_continuity_preserved
-                        and review.masked_foreground_removed
+                    full_passes = False
+                    local_passes = False
+                    try:
+                        full_review = self.qwen.review(
+                            original_path=original_path,
+                            repaired_path=repaired_path,
+                            repair_mask_path=repair_mask_path,
+                            reference_phrase=phrase,
+                            mode=mode,
+                        )
+                        if isinstance(
+                            full_review,
+                            BackgroundInpaintingReview,
+                        ):
+                            qwen_full_review = full_review.model_dump(
+                                mode="json"
+                            )
+                            full_passes = _background_review_passes(
+                                full_review
+                            )
+                        else:
+                            reasons.append("qwen_full_review_schema")
+                    except Exception:  # noqa: BLE001
+                        reasons.append("qwen_full_validation_failed")
+                    try:
+                        (
+                            local_original,
+                            local_repaired,
+                            local_mask,
+                            qwen_local_crop_box,
+                        ) = _background_local_review_images(
+                            original=original,
+                            repaired=repaired,
+                            generation_mask=repair_mask,
+                        )
+                        _save_lossless_atomic(
+                            local_original,
+                            local_original_path,
+                        )
+                        _save_lossless_atomic(
+                            local_repaired,
+                            local_repaired_path,
+                        )
+                        _save_lossless_atomic(local_mask, local_mask_path)
+                        local_review = self.qwen.review(
+                            original_path=local_original_path,
+                            repaired_path=local_repaired_path,
+                            repair_mask_path=local_mask_path,
+                            reference_phrase=phrase,
+                            mode="background_hole_fill_local",
+                        )
+                        if isinstance(
+                            local_review,
+                            BackgroundInpaintingReview,
+                        ):
+                            qwen_local_review = local_review.model_dump(
+                                mode="json"
+                            )
+                            local_passes = _background_review_passes(
+                                local_review
+                            )
+                        else:
+                            reasons.append("qwen_local_review_schema")
+                    except Exception:  # noqa: BLE001
+                        reasons.append("qwen_local_validation_failed")
+                    if not (full_passes and local_passes):
+                        reasons.append("qwen_background_consistency")
+                else:
+                    review = self.qwen.review(
+                        original_path=original_path,
+                        repaired_path=repaired_path,
+                        repair_mask_path=repair_mask_path,
+                        reference_phrase=phrase,
+                        mode=mode,
+                    )
+                    qwen_review = review.model_dump(mode="json")
+                    if not isinstance(
+                        review,
+                        InpaintingSemanticReview,
+                    ) or not (
+                        review.same_semantic_content
+                        and review.identity_preserved
                         and review.reference_phrase_supported
                         and not review.new_salient_objects
-                        and not review.visible_seam_or_artifact
                     ):
-                        reasons.append("qwen_background_consistency")
-                elif not isinstance(review, InpaintingSemanticReview) or not (
-                    review.same_semantic_content
-                    and review.identity_preserved
-                    and review.reference_phrase_supported
-                    and not review.new_salient_objects
-                ):
-                    reasons.append("qwen_semantic_consistency")
+                        reasons.append("qwen_semantic_consistency")
             except Exception:  # noqa: BLE001
                 reasons.append("qwen_validation_failed")
             finally:
                 original_path.unlink(missing_ok=True)
                 repaired_path.unlink(missing_ok=True)
                 repair_mask_path.unlink(missing_ok=True)
+                local_original_path.unlink(missing_ok=True)
+                local_repaired_path.unlink(missing_ok=True)
+                local_mask_path.unlink(missing_ok=True)
 
         reasons = list(dict.fromkeys(reasons))
         return {
@@ -512,6 +652,9 @@ class ProductionConsistencyValidator:
                 else None
             ),
             "qwen_review": qwen_review,
+            "qwen_full_review": qwen_full_review,
+            "qwen_local_review": qwen_local_review,
+            "qwen_local_crop_box": qwen_local_crop_box,
             "semantic_input": semantic_input,
             "rejection_reasons": reasons,
         }
@@ -623,10 +766,19 @@ def _source_signature(
         reference_phrase or canonical_label or "reference image",
         mode,
     )
+    local_consistency_prompt = (
+        _consistency_review_prompt(
+            reference_phrase or canonical_label or "reference image",
+            "background_hole_fill_local",
+        )
+        if mode == "background_hole_fill"
+        else None
+    )
     prompt_payload = json.dumps(
         {
             "repair_prompt": repair_prompt,
             "consistency_prompt": consistency_prompt,
+            "local_consistency_prompt": local_consistency_prompt,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -645,6 +797,11 @@ def _source_signature(
         "reference_type": reference_type,
         "inpainting_prompt_sha256": _sha256_text(repair_prompt),
         "consistency_prompt_sha256": _sha256_text(consistency_prompt),
+        "local_consistency_prompt_sha256": (
+            _sha256_text(local_consistency_prompt)
+            if local_consistency_prompt is not None
+            else None
+        ),
         "prompt_fingerprint": _sha256_text(prompt_payload),
         "source_metadata_version": INPAINTING_SOURCE_METADATA_VERSION,
         "version_fingerprint": version_fingerprint,
@@ -719,6 +876,110 @@ def _dilate(mask: np.ndarray, pixels: int) -> np.ndarray:
     ).astype(bool)
 
 
+def _fill_internal_holes(mask: np.ndarray) -> np.ndarray:
+    source = np.asarray(mask, dtype=bool)
+    inverse = (~source).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(inverse, 8)
+    filled = source.copy()
+    height, width = source.shape
+    for label in range(1, count):
+        x, y, component_width, component_height, _ = stats[label]
+        if (
+            x > 0
+            and y > 0
+            and x + component_width < width
+            and y + component_height < height
+        ):
+            filled[labels == label] = True
+    return filled
+
+
+def _background_generation_mask(
+    source_mask: np.ndarray,
+    *,
+    mask_dilation_pixels: int,
+) -> np.ndarray:
+    source = np.asarray(source_mask, dtype=bool)
+    height, width = source.shape
+    margin = max(
+        mask_dilation_pixels,
+        round(0.04 * min(height, width)),
+    )
+    filled = _fill_internal_holes(source)
+    closed = cv2.morphologyEx(
+        filled.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        np.ones((5, 5), dtype=np.uint8),
+    ).astype(bool)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        closed.astype(np.uint8),
+        8,
+    )
+    if count <= 1:
+        return closed
+
+    component_labels = list(range(1, count))
+    parents = {label: label for label in component_labels}
+
+    def find(label: int) -> int:
+        while parents[label] != label:
+            parents[label] = parents[parents[label]]
+            label = parents[label]
+        return label
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    expanded_boxes: dict[int, tuple[int, int, int, int]] = {}
+    for label in component_labels:
+        x, y, component_width, component_height, _ = stats[label]
+        expanded_boxes[label] = (
+            max(0, int(x) - margin),
+            max(0, int(y) - margin),
+            min(width, int(x + component_width) + margin),
+            min(height, int(y + component_height) + margin),
+        )
+    for index, left_label in enumerate(component_labels):
+        left_x0, left_y0, left_x1, left_y1 = expanded_boxes[left_label]
+        for right_label in component_labels[index + 1 :]:
+            right_x0, right_y0, right_x1, right_y1 = expanded_boxes[
+                right_label
+            ]
+            if (
+                left_x0 <= right_x1
+                and right_x0 <= left_x1
+                and left_y0 <= right_y1
+                and right_y0 <= left_y1
+            ):
+                union(left_label, right_label)
+
+    groups: dict[int, list[int]] = {}
+    for label in component_labels:
+        groups.setdefault(find(label), []).append(label)
+
+    generation = np.zeros_like(source)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * margin + 1, 2 * margin + 1),
+    )
+    for group in groups.values():
+        points = np.concatenate(
+            [
+                np.column_stack(np.where(labels == label))[:, ::-1]
+                for label in group
+            ]
+        ).astype(np.int32)
+        hull = cv2.convexHull(points.reshape(-1, 1, 2))
+        component_hull = np.zeros_like(source, dtype=np.uint8)
+        cv2.fillConvexPoly(component_hull, hull, 1)
+        dilated_hull = cv2.dilate(component_hull, kernel, iterations=1)
+        generation |= dilated_hull.astype(bool)
+    return generation
+
+
 def _entity_repair_mask(
     subject_mask: np.ndarray,
     *,
@@ -782,7 +1043,13 @@ def _repair_mask_for_reference(
     *,
     raw_shape: tuple[int, int],
     config: InpaintingConfig,
-) -> tuple[np.ndarray | None, str | None, list[str], float | None]:
+) -> tuple[
+    np.ndarray | None,
+    str | None,
+    list[str],
+    float | None,
+    float | None,
+]:
     reference_type = str(reference.get("reference_type", "entity"))
     mask_path = Path(str(reference["mask_path"]))
     source_mask = _read_mask(mask_path, raw_shape)
@@ -791,26 +1058,38 @@ def _repair_mask_for_reference(
         if not config.background.enabled or not reference.get(
             "needs_inpainting", False
         ):
-            return None, None, [], source_foreground_area_ratio
+            return None, None, [], source_foreground_area_ratio, None
         if (
             source_foreground_area_ratio
             > config.background.maximum_hole_area_ratio
         ):
             return (
-                source_mask,
+                None,
                 "background_hole_fill",
                 ["source_foreground_area_ratio"],
                 source_foreground_area_ratio,
+                None,
             )
-        repair = _dilate(source_mask, config.mask_dilation_pixels)
+        generation_mask = _background_generation_mask(
+            source_mask,
+            mask_dilation_pixels=config.mask_dilation_pixels,
+        )
+        generation_mask_area_ratio = float(generation_mask.mean())
+        reasons = []
+        if (
+            generation_mask_area_ratio
+            > config.background.maximum_generation_mask_area_ratio
+        ):
+            reasons.append("generation_mask_area_ratio")
         return (
-            repair,
+            generation_mask,
             "background_hole_fill",
-            [],
+            reasons,
             source_foreground_area_ratio,
+            generation_mask_area_ratio,
         )
     if not config.entity.enabled:
-        return None, None, [], None
+        return None, None, [], None, None
     completeness = float(
         (
             reference.get("visual_review")
@@ -824,6 +1103,7 @@ def _repair_mask_for_reference(
             None,
             ["entity_completeness_too_low_for_local_repair"],
             None,
+            None,
         )
     repair, reasons = _entity_repair_mask(source_mask, config=config)
     if repair.any():
@@ -834,6 +1114,7 @@ def _repair_mask_for_reference(
         repair,
         "entity_local_repair",
         list(dict.fromkeys(reasons)),
+        None,
         None,
     )
 
@@ -1072,6 +1353,7 @@ def _restore_from_raw(
 def _clear_stale_inpainting_artifacts(artifact: Path) -> None:
     for filename in (
         "repair_mask.png",
+        "generation_mask.png",
         "canonical_repaired.jpg",
         "canonical_repaired.png",
         "canonical_repaired_candidate.png",
@@ -1121,6 +1403,9 @@ def _metadata_base(
     mode: str | None,
     repair_area_ratio: float,
     source_foreground_area_ratio: float | None,
+    generation_mask_area_ratio: float | None,
+    source_mask_path: Path,
+    generation_mask_path: Path | None,
     source_signature: dict[str, object],
 ) -> dict[str, object]:
     return {
@@ -1131,7 +1416,14 @@ def _metadata_base(
         "mode": mode,
         "seed": config.seed,
         "source_foreground_area_ratio": source_foreground_area_ratio,
+        "generation_mask_area_ratio": generation_mask_area_ratio,
         "repair_area_ratio": repair_area_ratio,
+        "source_mask_path": str(source_mask_path),
+        "generation_mask_path": (
+            str(generation_mask_path)
+            if generation_mask_path is not None
+            else None
+        ),
         "candidate_path": None,
         "unmasked_l1_diff": 0.0,
         "dino_similarity": None,
@@ -1266,10 +1558,11 @@ def run_inpainting(
         )
         if not isinstance(source_mask_value, str) or not source_mask_value:
             raise ValueError(f"reference mask path is missing: {artifact}")
+        source_mask_path = Path(source_mask_value)
         source_signature = _source_signature(
             reference=reference,
             source_image_path=raw_path,
-            source_mask_path=Path(source_mask_value),
+            source_mask_path=source_mask_path,
             config_fingerprint=config_fingerprint,
         )
         write_json_atomic(artifact, reference)
@@ -1317,6 +1610,8 @@ def run_inpainting(
         mode: str | None = None
         repair_area_ratio = 0.0
         source_foreground_area_ratio: float | None = None
+        generation_mask_area_ratio: float | None = None
+        generation_mask_path: Path | None = None
         candidate_path: Path | None = None
         try:
             original_image = Image.open(raw_path).convert("RGB")
@@ -1326,6 +1621,7 @@ def run_inpainting(
                 mode,
                 mask_reasons,
                 source_foreground_area_ratio,
+                generation_mask_area_ratio,
             ) = _repair_mask_for_reference(
                 reference,
                 raw_shape=original.shape[:2],
@@ -1334,6 +1630,18 @@ def run_inpainting(
             repair_area_ratio = (
                 float(repair_mask.mean()) if repair_mask is not None else 0.0
             )
+            if (
+                mode == "background_hole_fill"
+                and repair_mask is not None
+                and repair_mask.any()
+            ):
+                generation_mask_path = (
+                    artifact.parent / "generation_mask.png"
+                )
+                _save_lossless_atomic(
+                    Image.fromarray(repair_mask.astype(np.uint8) * 255),
+                    generation_mask_path,
+                )
             if repair_mask is None or mode is None or not repair_mask.any():
                 if mask_reasons:
                     metadata = _metadata_base(
@@ -1343,6 +1651,11 @@ def run_inpainting(
                         source_foreground_area_ratio=(
                             source_foreground_area_ratio
                         ),
+                        generation_mask_area_ratio=(
+                            generation_mask_area_ratio
+                        ),
+                        source_mask_path=source_mask_path,
+                        generation_mask_path=generation_mask_path,
                         source_signature=source_signature,
                     )
                     metadata["rejection_reasons"] = mask_reasons
@@ -1383,6 +1696,9 @@ def run_inpainting(
                     source_foreground_area_ratio=(
                         source_foreground_area_ratio
                     ),
+                    generation_mask_area_ratio=generation_mask_area_ratio,
+                    source_mask_path=source_mask_path,
+                    generation_mask_path=generation_mask_path,
                     source_signature=source_signature,
                 )
                 metadata["rejection_reasons"] = mask_reasons
@@ -1484,6 +1800,9 @@ def run_inpainting(
                 mode=mode,
                 repair_area_ratio=repair_area_ratio,
                 source_foreground_area_ratio=source_foreground_area_ratio,
+                generation_mask_area_ratio=generation_mask_area_ratio,
+                source_mask_path=source_mask_path,
+                generation_mask_path=generation_mask_path,
                 source_signature=source_signature,
             )
             metadata.update(
@@ -1585,6 +1904,9 @@ def run_inpainting(
                 mode=mode,
                 repair_area_ratio=repair_area_ratio,
                 source_foreground_area_ratio=source_foreground_area_ratio,
+                generation_mask_area_ratio=generation_mask_area_ratio,
+                source_mask_path=source_mask_path,
+                generation_mask_path=generation_mask_path,
                 source_signature=source_signature,
             )
             metadata.update(

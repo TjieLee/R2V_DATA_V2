@@ -312,6 +312,7 @@ class BackgroundConfig:
 class InpaintingBackgroundConfig:
     enabled: bool = True
     maximum_hole_area_ratio: float = 0.23
+    maximum_generation_mask_area_ratio: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -827,6 +828,10 @@ def _validate_config(config: PipelineConfig) -> None:
         (
             "inpainting.background.maximum_hole_area_ratio",
             config.inpainting.background.maximum_hole_area_ratio,
+        ),
+        (
+            "inpainting.background.maximum_generation_mask_area_ratio",
+            config.inpainting.background.maximum_generation_mask_area_ratio,
         ),
         (
             "inpainting.entity.maximum_repair_area_ratio",
