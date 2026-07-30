@@ -286,6 +286,7 @@ class RankingConfig:
 
 @dataclass(frozen=True)
 class PairingConfig:
+    require_entity_reference: bool = True
     enable_in_pair: bool = True
     enable_same_parent_cross_pair: bool = True
     cross_pair_minimum_confidence: float = 0.90

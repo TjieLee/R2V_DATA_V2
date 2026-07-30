@@ -47,6 +47,7 @@ class PairingStats:
     failed: int = 0
     skipped_no_ready_reference: int = 0
     skipped_no_bindable_reference: int = 0
+    skipped_background_only_reference: int = 0
 
 
 CrossPairKey = tuple[str, str, str]
@@ -370,6 +371,8 @@ def _existing_sample_uids(samples_dir: Path) -> set[str]:
 def _remove_samples_with_non_ready_references(
     samples_dir: Path,
     references_by_clip: dict[str, list[dict[str, Any]]],
+    *,
+    require_entity_reference: bool,
 ) -> None:
     ready_paths = {
         str(reference["canonical_path"])
@@ -381,10 +384,22 @@ def _remove_samples_with_non_ready_references(
         if not isinstance(sample, dict):
             raise TypeError(f"final sample artifact must be an object: {artifact}")
         sample_references = sample.get("references", [])
-        if not isinstance(sample_references, list) or any(
-            not isinstance(reference, dict)
-            or str(reference.get("image_path")) not in ready_paths
-            for reference in sample_references
+        has_entity_reference = (
+            isinstance(sample_references, list)
+            and any(
+                isinstance(reference, dict)
+                and reference.get("reference_type") == "entity"
+                for reference in sample_references
+            )
+        )
+        if (
+            not isinstance(sample_references, list)
+            or any(
+                not isinstance(reference, dict)
+                or str(reference.get("image_path")) not in ready_paths
+                for reference in sample_references
+            )
+            or (require_entity_reference and not has_entity_reference)
         ):
             artifact.unlink()
 
@@ -499,7 +514,13 @@ def build_pairs(
     annotations = _annotations_by_clip(annotation_path)
     references = _references_by_clip(reference_path, annotations)
     if not overwrite:
-        _remove_samples_with_non_ready_references(samples_dir, references)
+        _remove_samples_with_non_ready_references(
+            samples_dir,
+            references,
+            require_entity_reference=(
+                config.pairing.require_entity_reference
+            ),
+        )
     existing = _existing_sample_uids(samples_dir)
     cross_pair_index = build_cross_pair_index(references)
     qwen = judge or QwenCrossPairJudge(
@@ -507,6 +528,7 @@ def build_pairs(
     )
     processed = skipped = no_ready = in_pairs = cross_pairs = fallbacks = failed = 0
     no_bindable = 0
+    background_only = 0
     for clip, annotation in annotations.items():
         if clip in existing:
             skipped += 1
@@ -659,6 +681,28 @@ def build_pairs(
             if not final_references:
                 no_bindable += 1
                 continue
+            if (
+                config.pairing.require_entity_reference
+                and not any(
+                    reference.get("reference_type") == "entity"
+                    for reference in final_references
+                )
+            ):
+                background_only += 1
+                _append_jsonl(
+                    output_root
+                    / "logs"
+                    / "background_only_sample_skipped.jsonl",
+                    {
+                        "clip_uid": clip,
+                        "reference_ids": [
+                            str(reference.get("reference_id", ""))
+                            for reference in final_references
+                        ],
+                        "reason": "final_sample_requires_entity_reference",
+                    },
+                )
+                continue
             sample = {
                 "clip_uid": clip,
                 "parent_video_id": annotation["parent_video_id"],
@@ -723,6 +767,7 @@ def build_pairs(
         skipped_existing=skipped,
         skipped_no_ready_reference=no_ready,
         skipped_no_bindable_reference=no_bindable,
+        skipped_background_only_reference=background_only,
         in_pair_count=in_pairs,
         cross_pair_count=cross_pairs,
         fallback_count=fallbacks,

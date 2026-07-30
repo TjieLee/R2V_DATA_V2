@@ -109,6 +109,10 @@ def run_pipeline(
             "skipped_no_bindable_reference",
             0,
         ),
+        "skipped_background_only_reference": pairing.get(
+            "skipped_background_only_reference",
+            0,
+        ),
     }
     return results
 

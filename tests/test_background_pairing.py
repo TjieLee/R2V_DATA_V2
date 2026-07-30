@@ -6,9 +6,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
-from r2v_data_v2.config import PipelineConfig
-from r2v_data_v2.pairing import build_cross_pair_index, build_pairs
+import run_pipeline as pipeline_runner
+from r2v_data_v2.config import PairingConfig, PipelineConfig
+from r2v_data_v2.pairing import (
+    PairingStats,
+    build_cross_pair_index,
+    build_pairs,
+)
 from r2v_data_v2.reference_binding import assign_reference_tokens
 from r2v_data_v2.schemas import QwenAnnotationResult
 
@@ -97,6 +103,8 @@ def _write_pair_fixture(
     tmp_path: Path,
     *,
     with_entity: bool,
+    with_background: bool = True,
+    require_entity_reference: bool = True,
     background_phrase: str = "a brick courtyard",
     caption: str | None = None,
 ) -> tuple[PipelineConfig, Path]:
@@ -146,26 +154,27 @@ def _write_pair_fixture(
                 "ranking_score": 0.9,
             }
         )
-    background_image, background_mask = _write_image_and_mask(
-        output_root / "references" / "clip-1" / "bg1",
-        empty_mask=True,
-    )
-    references.append(
-        {
-            "clip_uid": "clip-1",
-            "reference_id": "bg1",
-            "reference_type": "background",
-            "entity_id": None,
-            "phrase": background_phrase,
-            "canonical_label": "background",
-            "category": "background",
-            "ref_token": "<ref_bg_1>",
-            "canonical_path": str(background_image),
-            "mask_path": str(background_mask),
-            "source_frame_index": 5,
-            "ranking_score": 0.8,
-        }
-    )
+    if with_background:
+        background_image, background_mask = _write_image_and_mask(
+            output_root / "references" / "clip-1" / "bg1",
+            empty_mask=True,
+        )
+        references.append(
+            {
+                "clip_uid": "clip-1",
+                "reference_id": "bg1",
+                "reference_type": "background",
+                "entity_id": None,
+                "phrase": background_phrase,
+                "canonical_label": "background",
+                "category": "background",
+                "ref_token": "<ref_bg_1>",
+                "canonical_path": str(background_image),
+                "mask_path": str(background_mask),
+                "source_frame_index": 5,
+                "ranking_score": 0.8,
+            }
+        )
     (manifests / "references.jsonl").write_text(
         "".join(json.dumps(reference) + "\n" for reference in references),
         encoding="utf-8",
@@ -174,13 +183,62 @@ def _write_pair_fixture(
         PipelineConfig(
             dataset_json=tmp_path / "source.jsonl",
             output_root=output_root,
+            pairing=PairingConfig(
+                require_entity_reference=require_entity_reference
+            ),
         ),
         manifests,
     )
 
 
-def test_background_only_clip_produces_valid_sample(tmp_path: Path) -> None:
+def test_background_only_clip_is_skipped_when_entity_reference_required(
+    tmp_path: Path,
+) -> None:
     config, manifests = _write_pair_fixture(tmp_path, with_entity=False)
+
+    stats = build_pairs(
+        config,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    assert stats.processed == 0
+    assert stats.failed == 0
+    assert stats.skipped_background_only_reference == 1
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
+    assert not (config.output_root / "samples" / "clip-1.json").exists()
+    assert not (config.output_root / "logs" / "pairing_failed.jsonl").exists()
+    diagnostic = json.loads(
+        (
+            config.output_root
+            / "logs"
+            / "background_only_sample_skipped.jsonl"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic == {
+        "clip_uid": "clip-1",
+        "reference_ids": ["bg1"],
+        "reason": "final_sample_requires_entity_reference",
+    }
+    references = [
+        json.loads(line)
+        for line in (manifests / "references.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [reference["reference_id"] for reference in references] == ["bg1"]
+    assert (
+        config.output_root / "references" / "clip-1" / "bg1" / "canonical.jpg"
+    ).is_file()
+
+
+def test_background_only_clip_is_emitted_when_entity_requirement_disabled(
+    tmp_path: Path,
+) -> None:
+    config, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=False,
+        require_entity_reference=False,
+    )
 
     stats = build_pairs(
         config,
@@ -192,6 +250,7 @@ def test_background_only_clip_produces_valid_sample(tmp_path: Path) -> None:
     )
     assert stats.processed == 1
     assert stats.in_pair_count == 1
+    assert stats.skipped_background_only_reference == 0
     assert sample["entities"] == []
     assert sample["references"][0]["reference_type"] == "background"
     assert sample["references"][0]["pair_type"] == "in_pair"
@@ -199,10 +258,35 @@ def test_background_only_clip_produces_valid_sample(tmp_path: Path) -> None:
     _assert_token_set_invariant(sample)
 
 
+def test_entity_only_clip_produces_valid_sample(tmp_path: Path) -> None:
+    config, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=True,
+        with_background=False,
+    )
+
+    stats = build_pairs(
+        config,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    sample = json.loads(
+        (manifests / "final_samples.jsonl").read_text(encoding="utf-8")
+    )
+    assert stats.processed == 1
+    assert stats.skipped_background_only_reference == 0
+    assert [reference["reference_type"] for reference in sample["references"]] == [
+        "entity"
+    ]
+    assert sample["background_reference"] is None
+    _assert_token_set_invariant(sample)
+
+
 def test_background_phrase_is_resolved_before_binding(tmp_path: Path) -> None:
     config, manifests = _write_pair_fixture(
         tmp_path,
         with_entity=False,
+        require_entity_reference=False,
         background_phrase="THE   BRICK COURTYARD",
     )
 
@@ -345,6 +429,7 @@ def test_repeated_background_phrase_is_not_arbitrarily_bound(
     config, manifests = _write_pair_fixture(
         tmp_path,
         with_entity=False,
+        require_entity_reference=False,
         background_phrase="brick courtyard",
         caption=(
             "A brick courtyard opens onto another brick courtyard in the distance."
@@ -407,3 +492,59 @@ def test_reference_binding_error_uses_standard_background_failure_schema(
         "entity_reference_count": 1,
     }
     _assert_token_set_invariant(sample)
+
+
+def test_enabling_entity_requirement_removes_existing_background_only_sample(
+    tmp_path: Path,
+) -> None:
+    permissive, manifests = _write_pair_fixture(
+        tmp_path,
+        with_entity=False,
+        require_entity_reference=False,
+    )
+    first_stats = build_pairs(
+        permissive,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+    assert first_stats.processed == 1
+
+    strict = PipelineConfig(
+        dataset_json=permissive.dataset_json,
+        output_root=permissive.output_root,
+        pairing=PairingConfig(require_entity_reference=True),
+    )
+    strict_stats = build_pairs(
+        strict,
+        judge=_NeverCalledJudge(),  # type: ignore[arg-type]
+    )
+
+    assert strict_stats.processed == 0
+    assert strict_stats.skipped_background_only_reference == 1
+    assert not (strict.output_root / "samples" / "clip-1.json").exists()
+    assert (manifests / "final_samples.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_pipeline_summary_includes_background_only_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = PipelineConfig(
+        dataset_json=tmp_path / "source.jsonl",
+        output_root=tmp_path / "output",
+    )
+    monkeypatch.setattr(pipeline_runner, "load_config", lambda _: config)
+    monkeypatch.setattr(
+        pipeline_runner,
+        "build_pairs",
+        lambda _config, *, overwrite: PairingStats(
+            skipped_background_only_reference=3
+        ),
+    )
+
+    result = pipeline_runner.run_pipeline(
+        config_path="unused.yaml",
+        stages=("pair",),
+    )
+
+    assert result["pair"]["skipped_background_only_reference"] == 3
+    assert result["summary"]["skipped_background_only_reference"] == 3

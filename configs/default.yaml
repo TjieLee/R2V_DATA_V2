@@ -179,6 +179,7 @@ inpainting:
     fallback_to_raw: true
 
 pairing:
+  require_entity_reference: true
   enable_in_pair: true
   enable_same_parent_cross_pair: true
   cross_pair_minimum_confidence: 0.9

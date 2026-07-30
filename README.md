@@ -305,6 +305,10 @@ existing local `model_path` is configured. Generated pixels are accepted only
 inside the repair mask; output outside that mask remains exactly equal to the
 raw reference. References have an explicit `ready`, `pending_inpainting`, or
 `rejected` status, and only `ready` records may enter pairing or augmentation.
+Final samples require at least one entity reference by default
+(`pairing.require_entity_reference: true`). Background-only artifacts remain in
+`references.jsonl` and under `references/<clip_uid>/bg1/`, but are excluded from
+`samples/*.json` and `final_samples.jsonl`.
 Background masking includes every separable visible entity, and a clean raw
 background is preferred over a higher-scoring candidate that requires repair.
 Backgrounds that require repair remain pending until FLUX succeeds and semantic
