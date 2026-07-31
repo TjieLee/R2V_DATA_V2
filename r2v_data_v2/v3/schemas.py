@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import re
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CLIP_SCHEMA_VERSION = "r2v.v3.clip.2"
+FRAMES_SCHEMA_VERSION = "r2v.v3.frames.1"
 MASK_SCHEMA_VERSION = "r2v.v3.masks.1"
 RUN_SCHEMA_VERSION = "r2v.v3.run.1"
 DATASET_SCHEMA_VERSION = "r2v.v3.dataset.1"
@@ -122,6 +124,61 @@ class AnnotationState(SchemaModel):
             )
         if len(entity_ids) > 3:
             raise ValueError("annotation supports at most three entities")
+        return self
+
+
+class SampledFrame(SchemaModel):
+    slot: int = Field(ge=0, lt=10)
+    source_frame_index: int = Field(ge=0)
+    timestamp_seconds: float = Field(ge=0)
+    image_path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_frame(self) -> SampledFrame:
+        if not math.isfinite(self.timestamp_seconds):
+            raise ValueError("frame timestamp_seconds must be finite")
+        expected_path = f"frames/{self.slot:02d}.jpg"
+        if self.image_path != expected_path:
+            raise ValueError(
+                f"frame image_path must match its slot: {expected_path}"
+            )
+        return self
+
+
+class SampledFramesArtifact(SchemaModel):
+    schema_version: Literal["r2v.v3.frames.1"] = FRAMES_SCHEMA_VERSION
+    clip_uid: str
+    sampled_frame_count: Literal[10] = 10
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    frames: list[SampledFrame]
+
+    @model_validator(mode="after")
+    def validate_frames(self) -> SampledFramesArtifact:
+        if len(self.frames) != self.sampled_frame_count:
+            raise ValueError("frames artifact must contain exactly 10 frames")
+        slots = [frame.slot for frame in self.frames]
+        if slots != list(range(self.sampled_frame_count)):
+            raise ValueError("frame slots must be ordered from 0 through 9")
+        source_indices = [
+            frame.source_frame_index for frame in self.frames
+        ]
+        if any(
+            source_indices[index] >= source_indices[index + 1]
+            for index in range(len(source_indices) - 1)
+        ):
+            raise ValueError(
+                "source frame indices must be unique and strictly increasing"
+            )
+        timestamps = [frame.timestamp_seconds for frame in self.frames]
+        if any(
+            timestamps[index] >= timestamps[index + 1]
+            for index in range(len(timestamps) - 1)
+        ):
+            raise ValueError(
+                "frame timestamps must be unique and strictly increasing"
+            )
         return self
 
 

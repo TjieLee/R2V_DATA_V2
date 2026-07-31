@@ -174,7 +174,12 @@ Do not generate reference tokens or `r2v_instruction` here.
 
 #### `frames`
 
-Sample exactly ten chronological JPEG frames for SAM3 and ranking. This remains independent from Qwen video sampling.
+Sample exactly ten unique chronological JPEG frames from the complete source
+video for SAM3 and ranking. Selection is deterministic over all decodable
+frames, includes the first and last decoded frame, and records the source frame
+index, real timestamp, relative image path, and SHA-256 in `frames/frames.json`.
+This remains independent from Qwen video sampling. A video with fewer than ten
+distinct decodable frames fails this stage for that clip.
 
 #### `segment`
 
@@ -669,7 +674,8 @@ Required layout:
         ├── frames/
         │   ├── 00.jpg
         │   ├── 01.jpg
-        │   └── ... 09.jpg
+        │   ├── ... 09.jpg
+        │   └── frames.json
         ├── masks.rle.json
         ├── selected/
         │   ├── e1.png
@@ -683,6 +689,8 @@ Rules:
 - One `clip.json` is the authoritative metadata record for the clip.
 - Do not create separate `annotations.json`, `ranking_metadata.json`, `reference_metadata.json`, `inpainting_metadata.json`, per-stage sample JSON, and repeated JSONL records for the same clip.
 - Do not copy the ten sampled frames into additional candidate directories.
+- Publish sampled JPEGs atomically and publish `frames.json` last. Its image
+  paths are relative to the clip directory.
 - Store all tracked masks in one `masks.rle.json` per clip.
 - Store only selected entity images in `selected/`.
 - Store only an accepted removed background in `selected/bg_removed.png`.

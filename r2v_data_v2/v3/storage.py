@@ -30,6 +30,7 @@ from r2v_data_v2.v3.schemas import (
     PairingState,
     ReferencesState,
     RunRecord,
+    SampledFramesArtifact,
     TrackedMasksArtifact,
 )
 
@@ -38,6 +39,7 @@ _EXPORT_TOKEN = re.compile(r"<ref_(subject|object|group|bg)_(\d+)>")
 _UTC = getattr(datetime_module, "UTC", timezone.utc)  # noqa: UP017 - Python 3.9 CI
 _SECTION_INVALIDATIONS = {
     "annotation": ("coverage", "references", "pairing", "instruction", "export"),
+    "frames": ("coverage", "references", "pairing", "instruction", "export"),
     "masks": ("coverage", "references", "pairing", "instruction", "export"),
     "coverage": ("references", "pairing", "instruction", "export"),
     "references": ("pairing", "instruction", "export"),
@@ -260,8 +262,21 @@ class RunStorage:
         }
         updated = current.model_copy(update=updates)
         validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
+        self._invalidate_artifacts_after_change(clip_uid, section)
         write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         return validated
+
+    def _invalidate_artifacts_after_change(
+        self,
+        clip_uid: str,
+        section: str,
+    ) -> None:
+        if section == "annotation":
+            frames_dir = self.frames_dir(clip_uid)
+            if frames_dir.exists():
+                shutil.rmtree(frames_dir)
+        if section in {"annotation", "frames"}:
+            self.masks_path(clip_uid).unlink(missing_ok=True)
 
     def write_annotation(
         self,
@@ -317,6 +332,39 @@ class RunStorage:
             write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         write_json_atomic(destination, _model_dict(value))
         return destination
+
+    def frames_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "frames"
+
+    def frames_manifest_path(self, clip_uid: str) -> Path:
+        return self.frames_dir(clip_uid) / "frames.json"
+
+    def masks_path(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "masks.rle.json"
+
+    def read_frames(self, clip_uid: str) -> SampledFramesArtifact:
+        return SampledFramesArtifact.model_validate_json(
+            self.frames_manifest_path(clip_uid).read_text(encoding="utf-8")
+        )
+
+    def prepare_frames_publication(self, clip_uid: str) -> None:
+        self._require_clip(clip_uid)
+        current = self.read_clip(clip_uid)
+        invalidated = current.model_copy(
+            update=_section_updates_after_change("frames")
+        )
+        validated = ClipRecord.model_validate(
+            invalidated.model_dump(mode="json")
+        )
+        self._invalidate_artifacts_after_change(clip_uid, "frames")
+        self.frames_manifest_path(clip_uid).unlink(missing_ok=True)
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
 
     def frame_path(self, clip_uid: str, frame_slot: int) -> Path:
         self._require_clip(clip_uid)
