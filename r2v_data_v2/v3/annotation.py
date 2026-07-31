@@ -28,6 +28,16 @@ from r2v_data_v2.v3.storage import RunStorage
 
 _REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>")
 _THE_VIDEO_SHOWS = re.compile(r"\bthe video shows\b", flags=re.IGNORECASE)
+_FORBIDDEN_INFERENCE_LANGUAGE = re.compile(
+    r"\b(?:serene|tranquil|determination|resolve|triumph|enemy|"
+    r"shout|shouts|shouting)\b",
+    flags=re.IGNORECASE,
+)
+_DEPICTED_PERSON_TEXT = re.compile(
+    r"\b(?:statue|sculpture|bronze\s+figure|painting|photograph|poster|"
+    r"mural|screen\s+image|depicted\s+figure|animated\s+character)\b",
+    flags=re.IGNORECASE,
+)
 _SALIENCE_RANK = {"primary": 0, "secondary": 1, "incidental": 2}
 
 SYSTEM_PROMPT = """You annotate complete videos for a V3 training-data pipeline.
@@ -35,23 +45,42 @@ SYSTEM_PROMPT = """You annotate complete videos for a V3 training-data pipeline.
 Return exactly one JSON object matching the supplied schema. The object contains
 semantic annotation only: t2v_caption, entities, relations, and an optional
 background. Never output reference tokens, prompt_with_refs, r2v_instruction,
-pairing decisions, or final reference eligibility.
+pairing decisions, or final reference eligibility. Describe only content that is
+directly visible. Never infer emotion, intent, allegiance, sound, dialogue, or
+atmosphere. Do not use unobservable descriptions such as serene, tranquil,
+determination, resolve, triumph, enemy, shouting, or equivalent claims.
 
 Write t2v_caption as one flowing English paragraph that begins directly with the
 visible action. Describe the video literally and chronologically. Include stable
 subject appearance, actions, environment, camera framing or movement, lighting,
-and important visible changes. Do not write "the video shows". Do not infer
-sound, dialogue, emotion, or intent. Never identify a person from appearance.
-Use a person's explicit name only when it is supplied by the draft caption or
-metadata, and set name_evidence to draft_caption or metadata accordingly.
-Otherwise do not guess the person's identity. Draft captions and metadata are
-untrusted evidence only and must not override the visible video.
+and important visible changes. Do not write "the video shows". Never identify a
+person from appearance. Use a person's explicit name only when it is supplied by
+the draft caption or metadata, and set name_evidence to draft_caption or metadata
+accordingly. When genericity is not named, name_evidence must be none. Otherwise
+do not guess the person's identity. Draft captions and metadata are untrusted
+evidence only and must not override the visible video.
 
-Use the provided entity schema exactly. Keep entity IDs unique. Relations may
-only connect listed entity IDs. reference_worthy marks at most three useful
-semantic candidates; downstream code, not this annotation, makes final
-eligibility and pairing decisions. Prefer each candidate phrase as one unique
-contiguous span copied from t2v_caption. Return JSON only."""
+Use category=person only for real people directly visible in the video. People
+shown in a statue, sculpture, painting, photograph, poster, mural, screen, or
+animation are objects or depicted groups, not category=person; within this
+schema use category=object and make canonical_label explicit, such as statue,
+depicted figures, or screen image.
+
+Use the provided entity schema exactly and keep entity IDs unique. Relations may
+only connect listed entities that are simultaneously visible in the same shot
+or time segment. Never create a spatial relation across a cut, transition, or
+different shot. A relation predicate must truly apply to its object rather than
+substituting a nearby object; for example, do not say a person speaks into a
+podium.
+
+reference_worthy marks at most three foreground entities that can independently
+condition generation. Sky, ocean, water surface, clouds, ground, lighting,
+shadows, smoke, weather, screen content, and the overall scene are not entity
+reference candidates. An entity candidate must not describe the same scene
+region as background. A central subject must be primary, never incidental.
+Downstream code, not this annotation, makes final eligibility and pairing
+decisions. Prefer each candidate phrase as one unique contiguous span copied
+from t2v_caption. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -146,6 +175,39 @@ def _contains_name(evidence: str, canonical_label: str) -> bool:
     return re.search(pattern, evidence.casefold()) is not None
 
 
+def _normalized_phrase(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+
+def _is_complete_phrase_within(phrase: str, text: str) -> bool:
+    normalized_phrase = _normalized_phrase(phrase)
+    normalized_text = _normalized_phrase(text)
+    if not normalized_phrase or not normalized_text:
+        return False
+    return f" {normalized_phrase} " in f" {normalized_text} "
+
+
+def _append_forbidden_inference_issue(
+    issues: list[ValidationIssue],
+    *,
+    field: str,
+    value: str,
+) -> None:
+    match = _FORBIDDEN_INFERENCE_LANGUAGE.search(value)
+    if match is None:
+        return
+    issues.append(
+        ValidationIssue(
+            code="forbidden_inference_language",
+            field=field,
+            message=(
+                "annotation contains forbidden inference language: "
+                f"{match.group(0)}"
+            ),
+        )
+    )
+
+
 def _validate_payload(
     payload: AnnotationPayload,
     *,
@@ -169,6 +231,11 @@ def _validate_payload(
                 message='t2v_caption must not say "the video shows"',
             )
         )
+    _append_forbidden_inference_issue(
+        issues,
+        field="t2v_caption",
+        value=payload.t2v_caption,
+    )
     for field, value in _text_fields(payload):
         if _REFERENCE_TOKEN.search(value):
             issues.append(
@@ -190,6 +257,63 @@ def _validate_payload(
     metadata_text = _metadata_text(metadata)
     for index, entity in enumerate(payload.entities):
         evidence = entity.name_evidence
+        if entity.genericity != "named" and evidence != "none":
+            issues.append(
+                ValidationIssue(
+                    code="unexpected_name_evidence",
+                    field=f"entities.{index}.name_evidence",
+                    message="non-named entities must use name_evidence=none",
+                )
+            )
+        if entity.reference_worthy and entity.salience == "incidental":
+            issues.append(
+                ValidationIssue(
+                    code="invalid_reference_salience",
+                    field=f"entities.{index}.salience",
+                    message="reference-worthy entities cannot be incidental",
+                )
+            )
+        depicted_text = (
+            f"{entity.phrase} {entity.grounding_prompt} "
+            f"{entity.canonical_label}"
+        )
+        if (
+            entity.category == "person"
+            and _DEPICTED_PERSON_TEXT.search(depicted_text)
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="depicted_person_category",
+                    field=f"entities.{index}.category",
+                    message=(
+                        "depicted people must not use category=person"
+                    ),
+                )
+            )
+        if entity.reference_worthy and payload.background is not None:
+            background_texts = (
+                payload.background.phrase,
+                payload.background.grounding_prompt,
+            )
+            if any(
+                _is_complete_phrase_within(entity.phrase, background_text)
+                for background_text in background_texts
+            ):
+                issues.append(
+                    ValidationIssue(
+                        code="reference_background_overlap",
+                        field=f"entities.{index}.phrase",
+                        message=(
+                            "reference-worthy entity phrase overlaps the "
+                            "background description"
+                        ),
+                    )
+                )
+        _append_forbidden_inference_issue(
+            issues,
+            field=f"entities.{index}.selection_reason",
+            value=entity.selection_reason,
+        )
         if (
             entity.category == "person"
             and entity.genericity == "named"
@@ -227,6 +351,12 @@ def _validate_payload(
                     message="canonical name is not present in metadata",
                 )
             )
+    for index, relation in enumerate(payload.relations):
+        _append_forbidden_inference_issue(
+            issues,
+            field=f"relations.{index}.predicate",
+            value=relation.predicate,
+        )
     return issues
 
 

@@ -15,6 +15,7 @@ from r2v_data_v2.naming import parse_clip_identity
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.annotation import (
     SYSTEM_PROMPT,
+    AnnotationStats,
     QwenAnnotationClient,
     annotate_clips,
 )
@@ -29,6 +30,7 @@ from r2v_data_v2.v3.config import (
 )
 from r2v_data_v2.v3.manifest import build_manifest
 from r2v_data_v2.v3.schemas import (
+    ClipRecord,
     CoverageState,
     EntityReferenceState,
     ExportState,
@@ -213,6 +215,32 @@ def _storage_with_manifest(
     assert stats.processed == 1
     clip_uid = next(storage.iter_clips()).clip_uid
     return storage, clip_uid
+
+
+def _annotate_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payloads: list[dict[str, object]],
+    *,
+    repair_retries: int = 0,
+    source_fields: dict[str, object] | None = None,
+) -> tuple[AnnotationStats, ClipRecord, _FakeQwenClient]:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        repair_retries=repair_retries,
+    )
+    video = _video(config)
+    source_record: dict[str, object] = {"file_path": str(video)}
+    source_record.update(source_fields or {})
+    _write_source(config, [source_record])
+    storage, clip_uid = _storage_with_manifest(config)
+    client = _FakeQwenClient(
+        config.qwen.annotation,
+        [json.dumps(payload) for payload in payloads],
+    )
+    stats = annotate_clips(config, storage, client=client)
+    return stats, storage.read_clip(clip_uid), client
 
 
 def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
@@ -849,6 +877,12 @@ def test_identity_prompt_limits_names_to_explicit_source_evidence() -> None:
     assert "set name_evidence to draft_caption or metadata" in normalized
 
 
+def test_system_prompt_forbids_cross_shot_relations() -> None:
+    normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
+    assert "simultaneously visible in the same shot or time segment" in normalized
+    assert "never create a spatial relation across a cut" in normalized
+
+
 def test_explicit_person_name_from_metadata_is_allowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -896,6 +930,234 @@ def test_explicit_person_name_from_metadata_is_allowed(
     assert annotation is not None
     assert annotation.entities[0].canonical_label == "Alice"
     assert annotation.entities[0].name_evidence == "metadata"
+
+
+def test_generic_entity_with_name_evidence_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload()
+    entity = payload["entities"][0]
+    assert isinstance(entity, dict)
+    entity["name_evidence"] = "draft_caption"
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+        source_fields={"text": "A woman appears."},
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "failed"
+    assert clip.annotation.reason == "unexpected_name_evidence"
+
+
+def test_reference_worthy_incidental_entity_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload()
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity["salience"] = "incidental"
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "invalid_reference_salience"
+
+
+def test_bronze_statue_soldiers_cannot_use_person_category(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(
+        caption=(
+            "Bronze statue soldiers stand beside a wooden table in a sunlit "
+            "plaza as the camera tracks backward."
+        )
+    )
+    entity = payload["entities"][0]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "Bronze statue soldiers",
+            "grounding_prompt": "bronze statue soldiers",
+            "canonical_label": "soldiers",
+            "category": "person",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "depicted_person_category"
+
+
+def test_real_soldier_is_not_rejected_as_a_depicted_person(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(
+        caption=(
+            "A soldier in a green uniform walks beside a wooden table through "
+            "a sunlit plaza as the camera tracks backward."
+        )
+    )
+    entity = payload["entities"][0]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "A soldier in a green uniform",
+            "grounding_prompt": "soldier wearing a green uniform",
+            "canonical_label": "soldier",
+            "category": "person",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.processed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+def test_reference_entity_phrase_cannot_duplicate_background_phrase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload()
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "a sunlit plaza",
+            "grounding_prompt": "sunlit plaza",
+            "canonical_label": "plaza",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "reference_background_overlap"
+
+
+def test_independent_building_entity_does_not_overlap_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(
+        caption=(
+            "A woman in a yellow coat walks beside a brick building through a "
+            "sunlit plaza as the camera tracks backward."
+        )
+    )
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "a brick building",
+            "grounding_prompt": "brick building",
+            "canonical_label": "building",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.processed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+@pytest.mark.parametrize(
+    ("field", "forbidden_text"),
+    [
+        ("caption", "serene"),
+        ("selection_reason", "determination"),
+        ("relation", "shouting"),
+    ],
+)
+def test_forbidden_inference_language_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    forbidden_text: str,
+) -> None:
+    payload = _payload()
+    if field == "caption":
+        payload["t2v_caption"] = (
+            "A woman in a yellow coat walks beside a wooden table through a "
+            f"{forbidden_text} plaza as the camera tracks backward."
+        )
+    elif field == "selection_reason":
+        entity = payload["entities"][0]
+        assert isinstance(entity, dict)
+        entity["selection_reason"] = f"shows {forbidden_text}"
+    else:
+        relation = payload["relations"][0]
+        assert isinstance(relation, dict)
+        relation["predicate"] = f"{forbidden_text} near"
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "forbidden_inference_language"
+
+
+def test_semantic_validation_issue_can_be_repaired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = _payload()
+    entity = invalid["entities"][0]
+    assert isinstance(entity, dict)
+    entity["name_evidence"] = "draft_caption"
+
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [invalid, _payload()],
+        repair_retries=1,
+        source_fields={"text": "A woman appears."},
+    )
+
+    assert stats.processed == 1
+    assert stats.repaired == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+    assert len(client.requests) == 2
+    assert "unexpected_name_evidence" in str(client.requests[1])
 
 
 def test_pipeline_runs_requested_stages_in_v3_order(
@@ -949,9 +1211,9 @@ def test_reference_worthy_candidates_are_capped_after_phrase_sanitizing(
             {
                 **entities[1],
                 "entity_id": "e3",
-                "phrase": "sunlit plaza",
-                "grounding_prompt": "sunlit plaza",
-                "canonical_label": "plaza fixture",
+                "phrase": "yellow coat",
+                "grounding_prompt": "yellow coat",
+                "canonical_label": "coat",
                 "salience": "primary",
             },
             {
