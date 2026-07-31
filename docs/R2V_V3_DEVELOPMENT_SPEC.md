@@ -281,6 +281,7 @@ The annotation stage returns semantic content only.
       "salience": "primary|secondary|incidental",
       "genericity": "named|descriptive|generic",
       "name_evidence": "none|draft_caption|metadata|visible_text",
+      "visual_scope": "bounded_instance|coherent_group|scene_region|appearance_effect|depicted_content",
       "separability": "independent|attached_accessory|important_independent_object|composite_candidate",
       "selection_reason": "..."
     }
@@ -304,7 +305,22 @@ The annotation stage returns semantic content only.
 - no generation command wording solely to make it look instructional;
 - no unsupported identity, intent, emotion, sound, or dialogue.
 
-### 7.2 Phrase alignment
+### 7.2 Visual structure
+
+Classify `visual_scope` from the visible structure, not from an entity name:
+
+- `bounded_instance`: an independently localizable instance with a boundary;
+- `coherent_group`: a stable, jointly localizable composition of instances;
+- `scene_region`: a broad environmental or spatial region;
+- `appearance_effect`: lighting, shadow, reflection, smoke, weather, or an effect;
+- `depicted_content`: content in sculpture, painting, photograph, screen, poster, or animation.
+
+`reference_worthy: true` requires `visual_scope` to be `bounded_instance` or
+`coherent_group`, and `separability` to be `independent` or
+`important_independent_object`. Scene names and `canonical_label` values do not
+define eligibility.
+
+### 7.3 Phrase alignment
 
 Entity phrases may still be aligned to unique spans in `t2v_caption` for auditability, but token insertion no longer depends on exact caption reconstruction.
 
