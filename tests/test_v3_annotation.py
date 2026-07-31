@@ -38,10 +38,12 @@ from r2v_data_v2.v3.schemas import (
     CoverageState,
     EntityReferenceState,
     ExportState,
+    InstructionLegendEntry,
     InstructionState,
     PairingState,
     RawAnnotationPayload,
     ReferencesState,
+    render_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
 from run_pipeline_v3 import run_pipeline_v3
@@ -267,11 +269,20 @@ def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
             tokens={"e1": "<ref_subject_1>"},
         ),
     )
+    body = "\u4f7f\u7528{{image_1}}\u751f\u6210\u8fde\u7eed\u955c\u5934\u3002"
+    legend = [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description="\u9ec4\u8272\u5916\u5957\u5973\u5b50",
+        )
+    ]
     storage.write_instruction(
         clip_uid,
         InstructionState(
             status="ready",
-            r2v_instruction="Generate a shot using <ref_subject_1>.",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=render_instruction_text(body, legend),
         ),
     )
     storage.write_export(

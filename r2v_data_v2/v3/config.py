@@ -118,6 +118,7 @@ class RemoveConfig:
 @dataclass(frozen=True)
 class InstructionConfig:
     enabled: bool = True
+    repair_retries: int = 1
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,14 @@ class V3Config:
         if self.sam3.minimum_entity_visible_ratio != 0.80:
             raise ValueError(
                 "V3 requires sam3.minimum_entity_visible_ratio to be exactly 0.80"
+            )
+        if (
+            not isinstance(self.instruction.repair_retries, int)
+            or isinstance(self.instruction.repair_retries, bool)
+            or self.instruction.repair_retries < 0
+        ):
+            raise ValueError(
+                "instruction.repair_retries must be a non-negative integer"
             )
         if self.reference_scope.allow_synthetic_completion:
             raise ValueError("V3 does not allow synthetic entity completion")

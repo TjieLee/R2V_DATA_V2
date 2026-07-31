@@ -13,6 +13,11 @@ SAMPLE_SCHEMA_VERSION = "r2v.v3.sample.1"
 
 _REF_TOKEN = re.compile(r"<ref_(?:subject|object|group|bg)_\d+>")
 _ANY_REF_TOKEN = re.compile(r"<ref_[^>]+>")
+_IMAGE_ID = re.compile(r"image_([1-9]\d*)")
+_IMAGE_PLACEHOLDER = re.compile(r"\{\{(image_[1-9]\d*)\}\}")
+_ANY_TEMPLATE_PLACEHOLDER = re.compile(r"\{\{[^{}]*\}\}")
+_DIRECT_CHINESE_IMAGE_LABEL = re.compile(r"\u56fe\s*\d+")
+_CHINESE_IMAGE_INDEX = re.compile(r"\u56fe\s*(\d+)")
 
 
 class SchemaModel(BaseModel):
@@ -300,17 +305,153 @@ class PairingState(SchemaModel):
         return self
 
 
+InstructionReferenceType = Literal["subject", "object", "group", "background"]
+
+
+class InstructionBinding(SchemaModel):
+    image_id: str
+    image_index: int = Field(ge=1)
+    reference_type: InstructionReferenceType
+    entity_id: Optional[str]
+    phrase: str
+    grounding_prompt: str
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> InstructionBinding:
+        match = _IMAGE_ID.fullmatch(self.image_id)
+        if match is None or int(match.group(1)) != self.image_index:
+            raise ValueError("image_id must match image_index")
+        if not self.phrase.strip() or not self.grounding_prompt.strip():
+            raise ValueError("instruction binding text must not be empty")
+        if self.reference_type == "background":
+            if self.entity_id is not None:
+                raise ValueError("background binding entity_id must be null")
+        elif self.entity_id is None:
+            raise ValueError("entity binding requires entity_id")
+        return self
+
+
+class RawInstructionLegend(SchemaModel):
+    image_id: str
+    description: str
+
+
+class RawInstructionOutput(SchemaModel):
+    instruction_body_template: str
+    reference_legend: list[RawInstructionLegend]
+
+
+class InstructionLegendEntry(SchemaModel):
+    image_id: str
+    description: str
+
+    @model_validator(mode="after")
+    def validate_entry(self) -> InstructionLegendEntry:
+        if _IMAGE_ID.fullmatch(self.image_id) is None:
+            raise ValueError("legend image_id must use image_N")
+        if not self.description.strip():
+            raise ValueError("legend description must not be empty")
+        if _ANY_REF_TOKEN.search(self.description):
+            raise ValueError("legend description must not contain reference tokens")
+        if _DIRECT_CHINESE_IMAGE_LABEL.search(self.description):
+            raise ValueError(
+                "raw legend description must not contain Chinese image labels"
+            )
+        return self
+
+
+def render_instruction_text(
+    instruction_body_template: str,
+    reference_legend: list[InstructionLegendEntry],
+) -> str:
+    rendered_body = instruction_body_template.strip()
+    legend_lines: list[str] = []
+    for entry in reference_legend:
+        match = _IMAGE_ID.fullmatch(entry.image_id)
+        if match is None:
+            raise ValueError("legend image_id must use image_N")
+        display_label = f"\u56fe{match.group(1)}"
+        rendered_body = rendered_body.replace(
+            f"{{{{{entry.image_id}}}}}",
+            display_label,
+        )
+        legend_lines.append(f"{display_label}\uff1a{entry.description.strip()}")
+    return f"{rendered_body}\n\n" + "\n".join(legend_lines)
+
+
 class InstructionState(SchemaModel):
     status: Literal["ready", "failed"]
+    instruction_body_template: str = ""
+    reference_legend: list[InstructionLegendEntry] = Field(default_factory=list)
     r2v_instruction: str = ""
     reason: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_state(self) -> InstructionState:
-        if self.status == "ready" and not self.r2v_instruction.strip():
-            raise ValueError("ready instruction requires non-empty text")
-        if self.status == "failed" and not self.reason:
-            raise ValueError("failed instruction requires a reason")
+        if self.status == "failed":
+            if not self.reason:
+                raise ValueError("failed instruction requires a reason")
+            if (
+                self.instruction_body_template
+                or self.reference_legend
+                or self.r2v_instruction
+            ):
+                raise ValueError("failed instruction must clear generated content")
+            return self
+        if self.reason is not None:
+            raise ValueError("ready instruction must not have a failure reason")
+        if not self.instruction_body_template.strip():
+            raise ValueError("ready instruction requires a non-empty body template")
+        if not self.reference_legend:
+            raise ValueError("ready instruction requires a reference legend")
+        raw_text = " ".join(
+            [
+                self.instruction_body_template,
+                *(entry.description for entry in self.reference_legend),
+            ]
+        )
+        if _ANY_REF_TOKEN.search(raw_text):
+            raise ValueError("ready instruction must not contain reference tokens")
+        if _DIRECT_CHINESE_IMAGE_LABEL.search(raw_text):
+            raise ValueError(
+                "raw instruction fields must not contain Chinese image labels"
+            )
+        legend_ids = [entry.image_id for entry in self.reference_legend]
+        expected_ids = [
+            f"image_{index}" for index in range(1, len(legend_ids) + 1)
+        ]
+        if legend_ids != expected_ids:
+            raise ValueError(
+                "reference legend IDs must be contiguous and ordered"
+            )
+        exact_placeholders = _IMAGE_PLACEHOLDER.findall(
+            self.instruction_body_template
+        )
+        all_placeholders = _ANY_TEMPLATE_PLACEHOLDER.findall(
+            self.instruction_body_template
+        )
+        placeholder_remainder = _IMAGE_PLACEHOLDER.sub(
+            "",
+            self.instruction_body_template,
+        )
+        if (
+            len(exact_placeholders) != len(all_placeholders)
+            or "{{" in placeholder_remainder
+            or "}}" in placeholder_remainder
+        ):
+            raise ValueError("instruction contains an invalid image placeholder")
+        if set(exact_placeholders) != set(legend_ids):
+            raise ValueError(
+                "instruction placeholders must exactly match reference legend"
+            )
+        expected_rendered = render_instruction_text(
+            self.instruction_body_template,
+            self.reference_legend,
+        )
+        if self.r2v_instruction != expected_rendered:
+            raise ValueError(
+                "r2v_instruction must match deterministic Chinese rendering"
+            )
         return self
 
 
@@ -396,19 +537,19 @@ class ClipRecord(SchemaModel):
         if self.instruction is not None and self.instruction.status == "ready":
             if self.pairing is None or self.pairing.status != "ready":
                 raise ValueError("ready instruction requires ready pairing")
-            expected_tokens = set(self.pairing.tokens.values())
+            binding_count = len(self.pairing.retained_entity_ids)
             if self.pairing.background_token is not None:
-                expected_tokens.add(self.pairing.background_token)
-            instruction_tokens = _ANY_REF_TOKEN.findall(
-                self.instruction.r2v_instruction
-            )
-            if set(instruction_tokens) != expected_tokens:
+                binding_count += 1
+            expected_image_ids = [
+                f"image_{index}" for index in range(1, binding_count + 1)
+            ]
+            legend_image_ids = [
+                entry.image_id
+                for entry in self.instruction.reference_legend
+            ]
+            if legend_image_ids != expected_image_ids:
                 raise ValueError(
-                    "ready instruction tokens must exactly match pairing tokens"
-                )
-            if len(instruction_tokens) != len(expected_tokens):
-                raise ValueError(
-                    "ready instruction must contain each pairing token exactly once"
+                    "ready instruction legend must match final pairing order"
                 )
         if self.export.accepted:
             if self.annotation is None or self.annotation.status != "ready":
@@ -524,13 +665,24 @@ class DatasetSample(SchemaModel):
         tokens = [reference.token for reference in self.references]
         if len(tokens) != len(set(tokens)):
             raise ValueError("dataset reference tokens must be unique")
-        instruction_tokens = _ANY_REF_TOKEN.findall(self.r2v_instruction)
-        if sorted(instruction_tokens) != sorted(tokens):
+        if _ANY_REF_TOKEN.search(self.r2v_instruction):
             raise ValueError(
-                "r2v_instruction tokens must exactly match dataset references"
+                "r2v_instruction must not expose internal reference tokens"
             )
-        if any(self.r2v_instruction.count(token) != 1 for token in tokens):
-            raise ValueError("each reference token must occur exactly once")
+        if _ANY_TEMPLATE_PLACEHOLDER.search(self.r2v_instruction):
+            raise ValueError(
+                "r2v_instruction must not expose raw image placeholders"
+            )
+        expected_indexes = {
+            str(index) for index in range(1, len(self.references) + 1)
+        }
+        instruction_indexes = set(
+            _CHINESE_IMAGE_INDEX.findall(self.r2v_instruction)
+        )
+        if instruction_indexes != expected_indexes:
+            raise ValueError(
+                "r2v_instruction image labels must match dataset references"
+            )
         return self
 
 

@@ -32,10 +32,12 @@ from r2v_data_v2.v3.schemas import (
     DatasetSample,
     EntityReferenceState,
     ExportState,
+    InstructionLegendEntry,
     InstructionState,
     PairingState,
     ReferencesState,
     TrackedMasksArtifact,
+    render_instruction_text,
 )
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
 from run_pipeline_v3 import run_pipeline_v3
@@ -87,6 +89,37 @@ def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
         reference_type="subject" if entity_id == "e1" else "object",
         phrase=phrase,
         grounding_prompt=phrase.lower(),
+    )
+
+
+def _instruction_state(*, include_background: bool = False) -> InstructionState:
+    body = (
+        "\u4f7f\u7528{{image_1}}\u7684\u7a33\u5b9a\u5916\u89c2\uff0c"
+        "\u5c06\u5176\u7f6e\u4e8e\u753b\u9762\u4e2d\u592e"
+    )
+    legend = [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description="\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u7a33\u5b9a\u5916\u89c2",
+        )
+    ]
+    if include_background:
+        body += (
+            "\uff0c\u5e76\u4ee5{{image_2}}\u4f5c\u4e3a\u6574\u4f53\u80cc\u666f\u3002"
+        )
+        legend.append(
+            InstructionLegendEntry(
+                image_id="image_2",
+                description="\u660e\u4eae\u7684\u5e7f\u573a\u73af\u5883",
+            )
+        )
+    else:
+        body += "\u3002"
+    return InstructionState(
+        status="ready",
+        instruction_body_template=body,
+        reference_legend=legend,
+        r2v_instruction=render_instruction_text(body, legend),
     )
 
 
@@ -204,18 +237,9 @@ def _create_exportable_clip(
             background_token=background_token,
         ),
     )
-    instruction = (
-        "Generate a continuous shot using the visible appearance from "
-        "<ref_subject_1> and the clean setting from <ref_bg_1>."
-        if include_background
-        else (
-            "Generate a continuous shot using the visible appearance from "
-            "<ref_subject_1>."
-        )
-    )
     storage.write_instruction(
         clip_uid,
-        InstructionState(status="ready", r2v_instruction=instruction),
+        _instruction_state(include_background=include_background),
     )
     storage.write_export(
         clip_uid,
@@ -467,14 +491,19 @@ def test_changed_upstream_content_invalidates_only_downstream_sections(
         )
     else:
         assert before.instruction is not None
+        body = (
+            before.instruction.instruction_body_template
+            + "\u4fdd\u6301\u955c\u5934\u7a33\u5b9a\u3002"
+        )
         storage.write_instruction(
             "clip-1",
             before.instruction.model_copy(
                 update={
-                    "r2v_instruction": (
-                        before.instruction.r2v_instruction
-                        + " Keep the camera steady."
-                    )
+                    "instruction_body_template": body,
+                    "r2v_instruction": render_instruction_text(
+                        body,
+                        before.instruction.reference_legend,
+                    ),
                 }
             ),
         )
@@ -594,11 +623,22 @@ def test_clip_cross_section_validator_rejects_inconsistent_bindings(
     storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
     record = storage.read_clip("clip-1")
     payload = record.model_dump(mode="json")
+    payload["instruction"]["instruction_body_template"] = (
+        "\u4f7f\u7528{{image_1}}\u548c{{image_2}}\u751f\u6210\u955c\u5934\u3002"
+    )
+    payload["instruction"]["reference_legend"].append(
+        {
+            "image_id": "image_2",
+            "description": "\u989d\u5916\u53c2\u8003",
+        }
+    )
     payload["instruction"]["r2v_instruction"] = (
-        "Generate a shot using <ref_subject_9>."
+        "\u4f7f\u7528\u56fe1\u548c\u56fe2\u751f\u6210\u955c\u5934\u3002\n\n"
+        "\u56fe1\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u7a33\u5b9a\u5916\u89c2\n"
+        "\u56fe2\uff1a\u989d\u5916\u53c2\u8003"
     )
 
-    with pytest.raises(ValidationError, match="tokens must exactly match"):
+    with pytest.raises(ValidationError, match="legend must match final pairing"):
         ClipRecord.model_validate(payload)
 
 
@@ -634,9 +674,6 @@ def test_clip_cross_section_validator_requires_ready_retained_reference(
     payload = storage.read_clip("clip-1").model_dump(mode="json")
     payload["pairing"]["retained_entity_ids"] = ["e2"]
     payload["pairing"]["tokens"] = {"e2": "<ref_object_1>"}
-    payload["instruction"]["r2v_instruction"] = (
-        "Generate a shot using <ref_object_1>."
-    )
 
     with pytest.raises(ValidationError, match="must have ready references"):
         ClipRecord.model_validate(payload)
@@ -663,9 +700,6 @@ def test_clip_cross_section_validator_requires_retained_qualifying_entity(
     )
     payload["pairing"]["retained_entity_ids"] = ["e2"]
     payload["pairing"]["tokens"] = {"e2": "<ref_object_1>"}
-    payload["instruction"]["r2v_instruction"] = (
-        "Generate a shot using <ref_object_1>."
-    )
 
     with pytest.raises(ValidationError, match="at least one qualifying entity"):
         ClipRecord.model_validate(payload)
@@ -725,12 +759,7 @@ def test_exporter_reads_only_background_output_image_path(
     )
     storage.write_instruction(
         "clip-1",
-        InstructionState(
-            status="ready",
-            r2v_instruction=(
-                "Generate a shot using <ref_subject_1> in <ref_bg_1>."
-            ),
-        ),
+        _instruction_state(include_background=True),
     )
     storage.write_export("clip-1", ExportState(accepted=True, reason=None))
 
@@ -920,7 +949,7 @@ def test_failed_overwrite_build_preserves_existing_dataset(
     assert not list(config.resolved_export_root.parent.glob(".*.tmp-*"))
 
 
-def test_dataset_sample_schema_rejects_unbound_instruction_token() -> None:
+def test_dataset_sample_schema_rejects_unbound_image_label() -> None:
     reference = DatasetReference(
         token="<ref_subject_1>",
         type="entity",
@@ -932,12 +961,12 @@ def test_dataset_sample_schema_rejects_unbound_instruction_token() -> None:
         synthetic=False,
     )
 
-    with pytest.raises(ValidationError, match="tokens must exactly match"):
+    with pytest.raises(ValidationError, match="image labels must match"):
         DatasetSample(
             sample_id="clip-1",
             target_video="/mnt/workspace/public/dataset/video.mp4",
             t2v_caption="A woman walks.",
-            r2v_instruction="Generate a shot with <ref_subject_2>.",
+            r2v_instruction="\u4f7f\u7528\u56fe2\u751f\u6210\u955c\u5934\u3002",
             references=[reference],
             source={"parent_video_id": "parent", "clip_suffix": "1_0"},
         )

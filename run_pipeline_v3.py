@@ -7,6 +7,7 @@ from pathlib import Path
 
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.config import load_config
+from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
 from r2v_data_v2.v3.manifest import build_manifest
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
 
@@ -22,7 +23,9 @@ STAGE_ORDER = (
     "instruct",
     "export",
 )
-_IMPLEMENTED_STAGES = frozenset({"manifest", "annotate", "export"})
+_IMPLEMENTED_STAGES = frozenset(
+    {"manifest", "annotate", "instruct", "export"}
+)
 
 
 def _git_commit() -> str:
@@ -47,6 +50,7 @@ def run_pipeline_v3(
     overwrite: bool = False,
     git_commit: str | None = None,
     annotation_client: AnnotationClient | None = None,
+    instruction_client: InstructionClient | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -55,7 +59,7 @@ def run_pipeline_v3(
     if unavailable:
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
-            "and export only; "
+            "instruct, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)
@@ -82,6 +86,13 @@ def run_pipeline_v3(
                 overwrite=overwrite,
                 client=annotation_client,
             ).to_dict()
+        elif stage == "instruct":
+            results[stage] = instruct_clips(
+                config,
+                storage,
+                overwrite=overwrite,
+                client=instruction_client,
+            ).to_dict()
         else:
             dataset = DatasetExporter(config, storage).export(
                 overwrite=overwrite
@@ -100,8 +111,8 @@ def main() -> None:
         "--stages",
         default="",
         help=(
-            "comma-separated V3 stages; manifest, annotate, and export are "
-            "currently implemented"
+            "comma-separated V3 stages; manifest, annotate, instruct, and "
+            "export are currently implemented"
         ),
     )
     parser.add_argument(
