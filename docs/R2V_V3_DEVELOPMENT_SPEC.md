@@ -245,8 +245,10 @@ qwen:
 ```
 
 `full_video` means that the pipeline submits the complete local video file.
-Qwen3-VL's vLLM media processor must then sample that video internally at the
-configured 2 FPS. The vLLM service therefore requires these media options:
+vLLM's media I/O layer decodes and samples the video at the configured 2 FPS
+before passing the resulting frames to the Transformers processor.
+`do_sample_frames` must remain `false` to prevent the Transformers processor
+from sampling those already sampled frames a second time. The vLLM service therefore requires these media options:
 
 ```text
 --media-io-kwargs '{"video":{"num_frames":-1}}'
