@@ -17,6 +17,7 @@ from r2v_data_v2.v3.config import (
     QwenServicesConfig,
     ReferenceScopeConfig,
     RemoveConfig,
+    SourceConfig,
     V3Config,
     load_config,
 )
@@ -65,6 +66,7 @@ def _config(
         dataset_json=dataset_json,
         run_root=writable / "runs" / "pilot",
         export_root=writable / "datasets" / "pilot-v1",
+        source=SourceConfig(limit=100),
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=str(annotation_model)),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
@@ -101,6 +103,17 @@ def _source_video_path(storage: RunStorage, clip_uid: str) -> str:
     )
 
 
+def _clip_source(storage: RunStorage, clip_uid: str) -> ClipSource:
+    return ClipSource(
+        video_path=_source_video_path(storage, clip_uid),
+        parent_video_id="parent",
+        clip_suffix="1_0",
+        source_index=0,
+        caption_raw="",
+        metadata={},
+    )
+
+
 def _tracked_masks(
     clip_uid: str,
     *,
@@ -126,11 +139,7 @@ def _create_exportable_clip(
 ) -> None:
     storage.create_clip(
         clip_uid=clip_uid,
-        source=ClipSource(
-            video_path=_source_video_path(storage, clip_uid),
-            parent_video_id="parent",
-            clip_suffix="1_0",
-        ),
+        source=_clip_source(storage, clip_uid),
     )
     storage.write_annotation(
         clip_uid,
@@ -233,11 +242,7 @@ def _initialize_storage_with_complete_clip(
     if with_masks:
         storage.create_clip(
             clip_uid="clip-1",
-            source=ClipSource(
-                video_path=_source_video_path(storage, "clip-1"),
-                parent_video_id="parent",
-                clip_suffix="1_0",
-            ),
+            source=_clip_source(storage, "clip-1"),
         )
         storage.write_masks("clip-1", _tracked_masks("clip-1"))
     _create_exportable_clip(storage, include_background=False)
@@ -253,7 +258,9 @@ def test_v3_config_loads_32b_defaults_without_model_access(
     config_path.write_text(
         f"dataset_json: {config.dataset_json}\n"
         f"run_root: {config.run_root}\n"
-        f"export_root: {config.export_root}\n",
+        f"export_root: {config.export_root}\n"
+        "source:\n"
+        "  limit: 100\n",
         encoding="utf-8",
     )
 
@@ -344,11 +351,7 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     config = _config(tmp_path, monkeypatch)
     storage = RunStorage(config)
     storage.initialize(git_commit="abc123", created_at="2026-07-30T00:00:00+00:00")
-    source = ClipSource(
-        video_path=_source_video_path(storage, "clip-1"),
-        parent_video_id="parent",
-        clip_suffix="1_0",
-    )
+    source = _clip_source(storage, "clip-1")
 
     first = storage.create_clip(clip_uid="clip-1", source=source)
     second = storage.create_clip(clip_uid="clip-1", source=source)
@@ -583,6 +586,9 @@ def test_accepted_export_requires_all_cross_section_state() -> None:
                 video_path="/mnt/workspace/public/dataset/video.mp4",
                 parent_video_id="parent",
                 clip_suffix="1_0",
+                source_index=0,
+                caption_raw="",
+                metadata={},
             ),
             export=ExportState(accepted=True, reason=None),
         )
@@ -687,6 +693,9 @@ def test_create_clip_rejects_video_outside_public_dataset(
                 video_path=str((tmp_path / "private" / "video.mp4").resolve()),
                 parent_video_id="parent",
                 clip_suffix="1_0",
+                source_index=0,
+                caption_raw="",
+                metadata={},
             ),
         )
 
@@ -809,10 +818,8 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     _create_exportable_clip(storage)
     storage.create_clip(
         clip_uid="rejected-clip",
-        source=ClipSource(
-            video_path=_source_video_path(storage, "rejected-clip"),
-            parent_video_id="parent",
-            clip_suffix="2_0",
+        source=_clip_source(storage, "rejected-clip").model_copy(
+            update={"clip_suffix": "2_0", "source_index": 1}
         ),
     )
 
@@ -952,7 +959,9 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
     config_path.write_text(
         f"dataset_json: {config.dataset_json}\n"
         f"run_root: {config.run_root}\n"
-        f"export_root: {config.export_root}\n",
+        f"export_root: {config.export_root}\n"
+        "source:\n"
+        "  limit: 100\n",
         encoding="utf-8",
     )
 

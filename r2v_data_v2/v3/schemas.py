@@ -23,6 +23,9 @@ class ClipSource(SchemaModel):
     video_path: str
     parent_video_id: str
     clip_suffix: str
+    source_index: int = Field(ge=0)
+    caption_raw: str
+    metadata: dict[str, object]
 
 
 class AnnotationEntity(SchemaModel):

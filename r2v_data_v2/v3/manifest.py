@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from pathlib import Path
 
 from r2v_data_v2.manifest import iter_source_records, parse_source_record
 from r2v_data_v2.naming import parse_clip_identity
@@ -20,37 +19,18 @@ class ManifestStats:
         return asdict(self)
 
 
-@dataclass(frozen=True)
-class SourceEvidence:
-    caption_raw: str
-    metadata: dict[str, object]
-
-
-def source_evidence_by_video(
-    dataset_json: str | Path,
-) -> dict[str, SourceEvidence]:
-    evidence: dict[str, SourceEvidence] = {}
-    for raw in iter_source_records(dataset_json):
-        try:
-            parsed = parse_source_record(raw)
-        except (TypeError, ValueError):
-            continue
-        evidence.setdefault(
-            str(parsed.video_path),
-            SourceEvidence(
-                caption_raw=parsed.caption_raw,
-                metadata=parsed.metadata,
-            ),
-        )
-    return evidence
-
-
 def build_manifest(
     config: V3Config,
     storage: RunStorage,
 ) -> ManifestStats:
     processed = skipped_existing = failed = 0
+    selected = 0
     for source_index, raw in enumerate(iter_source_records(config.dataset_json)):
+        if source_index < config.source.start_index:
+            continue
+        if config.source.limit is not None and selected >= config.source.limit:
+            break
+        selected += 1
         clip_uid = None
         video_path = None
         try:
@@ -69,6 +49,9 @@ def build_manifest(
                     video_path=str(video_path),
                     parent_video_id=identity.parent_video_id,
                     clip_suffix=identity.clip_suffix,
+                    source_index=source_index,
+                    caption_raw=parsed.caption_raw,
+                    metadata=parsed.metadata,
                 ),
             )
             if existed:

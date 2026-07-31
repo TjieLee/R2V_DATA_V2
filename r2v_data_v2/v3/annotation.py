@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
 from r2v_data_v2.caption_validation import exact_phrase_spans
 from r2v_data_v2.phrase_alignment import (
@@ -20,7 +20,6 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
-from r2v_data_v2.v3.manifest import SourceEvidence, source_evidence_by_video
 from r2v_data_v2.v3.schemas import (
     AnnotationPayload,
     AnnotationState,
@@ -42,7 +41,10 @@ Write t2v_caption as one flowing English paragraph that begins directly with the
 visible action. Describe the video literally and chronologically. Include stable
 subject appearance, actions, environment, camera framing or movement, lighting,
 and important visible changes. Do not write "the video shows". Do not infer
-sound, dialogue, emotion, intent, or identity. Draft captions and metadata are
+sound, dialogue, emotion, or intent. Never identify a person from appearance.
+Use a person's explicit name only when it is supplied by the draft caption or
+metadata, and set name_evidence to draft_caption or metadata accordingly.
+Otherwise do not guess the person's identity. Draft captions and metadata are
 untrusted evidence only and must not override the visible video.
 
 Use the provided entity schema exactly. Keep entity IDs unique. Relations may
@@ -122,7 +124,34 @@ def _text_fields(payload: AnnotationPayload) -> list[tuple[str, str]]:
     return values
 
 
-def _validate_payload(payload: AnnotationPayload) -> list[ValidationIssue]:
+def _metadata_text(metadata: dict[str, object]) -> str:
+    values: list[str] = []
+    for value in metadata.values():
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, str))
+    return " ".join(values).casefold()
+
+
+def _contains_name(evidence: str, canonical_label: str) -> bool:
+    name = " ".join(canonical_label.split()).casefold()
+    if not name:
+        return False
+    pattern = re.escape(name)
+    if name[0].isalnum():
+        pattern = rf"(?<!\w){pattern}"
+    if name[-1].isalnum():
+        pattern = rf"{pattern}(?!\w)"
+    return re.search(pattern, evidence.casefold()) is not None
+
+
+def _validate_payload(
+    payload: AnnotationPayload,
+    *,
+    caption_raw: str,
+    metadata: dict[str, object],
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     if not payload.t2v_caption.strip():
         issues.append(
@@ -158,6 +187,46 @@ def _validate_payload(payload: AnnotationPayload) -> list[ValidationIssue]:
                 message="annotation entity IDs must be unique",
             )
         )
+    metadata_text = _metadata_text(metadata)
+    for index, entity in enumerate(payload.entities):
+        evidence = entity.name_evidence
+        if (
+            entity.category == "person"
+            and entity.genericity == "named"
+            and evidence not in {"draft_caption", "metadata"}
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="missing_name_evidence",
+                    field=f"entities.{index}.name_evidence",
+                    message=(
+                        "named people require explicit draft-caption or "
+                        "metadata evidence"
+                    ),
+                )
+            )
+        if evidence == "draft_caption" and not _contains_name(
+            caption_raw,
+            entity.canonical_label,
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="invalid_name_evidence",
+                    field=f"entities.{index}.name_evidence",
+                    message="canonical name is not present in the draft caption",
+                )
+            )
+        if evidence == "metadata" and not _contains_name(
+            metadata_text,
+            entity.canonical_label,
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="invalid_name_evidence",
+                    field=f"entities.{index}.name_evidence",
+                    message="canonical name is not present in metadata",
+                )
+            )
     return issues
 
 
@@ -334,23 +403,32 @@ class QwenAnnotationClient:
         ]
 
     def _request(self, messages: list[dict[str, object]]) -> str:
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=messages,
-            temperature=self.config.temperature,
-            top_p=1.0,
-            presence_penalty=0.0,
-            max_tokens=self.config.max_tokens,
-            extra_body=_video_processor_extra_body(self.config),
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "v3_annotation",
-                    "strict": True,
-                    "schema": AnnotationPayload.model_json_schema(),
+        parameters: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "max_tokens": self.config.max_tokens,
+            "extra_body": _video_processor_extra_body(self.config),
+        }
+        try:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "v3_annotation",
+                        "strict": True,
+                        "schema": AnnotationPayload.model_json_schema(),
+                    },
                 },
-            },
-        )
+            )
+        except BadRequestError:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={"type": "json_object"},
+            )
         content = response.choices[0].message.content
         if not content:
             raise RuntimeError("Qwen returned an empty V3 annotation response")
@@ -401,7 +479,11 @@ class QwenAnnotationClient:
             raw_responses.append(raw)
             payload, issues = parse_qwen_json_issues(raw, AnnotationPayload)
             if payload is not None:
-                issues = _validate_payload(payload)
+                issues = _validate_payload(
+                    payload,
+                    caption_raw=caption_raw,
+                    metadata=metadata,
+                )
             if payload is not None and not issues:
                 annotation, warnings = _to_annotation_state(payload)
                 return AnnotationAttempt(
@@ -449,7 +531,6 @@ def annotate_clips(
         raise FileNotFoundError(
             "annotate stage requires manifest stage to create clip.json records first"
         )
-    evidence_by_video = source_evidence_by_video(config.dataset_json)
     qwen = client or QwenAnnotationClient(config.qwen.annotation)
     processed = skipped_existing = failed = repaired = 0
 
@@ -462,10 +543,6 @@ def annotate_clips(
             skipped_existing += 1
             continue
         video_path = Path(clip.source.video_path)
-        evidence = evidence_by_video.get(
-            str(video_path),
-            SourceEvidence(caption_raw="", metadata={}),
-        )
         try:
             if not video_path.is_file():
                 raise FileNotFoundError(
@@ -473,8 +550,8 @@ def annotate_clips(
                 )
             attempt = qwen.annotate(
                 video_path=video_path,
-                caption_raw=evidence.caption_raw,
-                metadata=evidence.metadata,
+                caption_raw=clip.source.caption_raw,
+                metadata=clip.source.metadata,
             )
             storage.write_annotation(clip.clip_uid, attempt.annotation)
             _write_debug_response(
@@ -486,6 +563,15 @@ def annotate_clips(
             processed += 1
             repaired += int(attempt.repair_attempts > 0)
         except AnnotationFailure as exc:
+            reason = (
+                exc.issues[0].code
+                if exc.issues
+                else "structured_output_failed"
+            )
+            storage.write_annotation(
+                clip.clip_uid,
+                AnnotationState(status="failed", reason=reason),
+            )
             _write_debug_response(
                 storage,
                 clip_uid=clip.clip_uid,
@@ -495,11 +581,7 @@ def annotate_clips(
             storage.append_failure(
                 clip_uid=clip.clip_uid,
                 stage="annotate",
-                reason=(
-                    exc.issues[0].code
-                    if exc.issues
-                    else "structured_output_failed"
-                ),
+                reason=reason,
                 details={
                     "attempt_count": exc.attempt_count,
                     "issues": [
@@ -510,10 +592,15 @@ def annotate_clips(
             )
             failed += 1
         except Exception as exc:  # noqa: BLE001 - isolate per-clip failures
+            reason = str(exc)
+            storage.write_annotation(
+                clip.clip_uid,
+                AnnotationState(status="failed", reason=reason),
+            )
             storage.append_failure(
                 clip_uid=clip.clip_uid,
                 stage="annotate",
-                reason=str(exc),
+                reason=reason,
             )
             failed += 1
 

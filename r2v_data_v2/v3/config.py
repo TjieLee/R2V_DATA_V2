@@ -75,6 +75,13 @@ class QwenServicesConfig:
 
 
 @dataclass(frozen=True)
+class SourceConfig:
+    start_index: int = 0
+    limit: int | None = None
+    allow_full_run: bool = False
+
+
+@dataclass(frozen=True)
 class FramesConfig:
     count: int = 10
 
@@ -123,6 +130,7 @@ class V3Config:
     dataset_json: Path
     run_root: Path
     export_root: Path
+    source: SourceConfig = field(default_factory=SourceConfig)
     qwen: QwenServicesConfig = field(default_factory=QwenServicesConfig)
     frames: FramesConfig = field(default_factory=FramesConfig)
     sam3: Sam3Config = field(default_factory=Sam3Config)
@@ -152,6 +160,24 @@ class V3Config:
             )
         if dataset.suffix.lower() not in {".json", ".jsonl"}:
             raise ValueError("dataset_json must use .json or .jsonl")
+        if (
+            not isinstance(self.source.start_index, int)
+            or isinstance(self.source.start_index, bool)
+            or self.source.start_index < 0
+        ):
+            raise ValueError("source.start_index must be a non-negative integer")
+        if self.source.limit is not None and (
+            not isinstance(self.source.limit, int)
+            or isinstance(self.source.limit, bool)
+            or self.source.limit < 1
+        ):
+            raise ValueError("source.limit must be a positive integer")
+        if not isinstance(self.source.allow_full_run, bool):
+            raise TypeError("source.allow_full_run must be a boolean")
+        if self.source.limit is None and not self.source.allow_full_run:
+            raise ValueError(
+                "source.limit is required unless source.allow_full_run is true"
+            )
         for field_name, path in (
             ("run_root", run_root),
             ("export_root", export_root),
@@ -354,6 +380,7 @@ def load_config(path: str | Path) -> V3Config:
         "dataset_json",
         "run_root",
         "export_root",
+        "source",
         "qwen",
         "frames",
         "sam3",
@@ -430,6 +457,11 @@ def load_config(path: str | Path) -> V3Config:
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
         run_root=Path(str(raw["run_root"])).expanduser(),
         export_root=Path(str(raw["export_root"])).expanduser(),
+        source=_build(
+            SourceConfig,
+            _mapping(raw.get("source"), "source"),
+            "source",
+        ),
         qwen=qwen,
         frames=_build(
             FramesConfig,
