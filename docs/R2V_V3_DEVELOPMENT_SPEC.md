@@ -225,7 +225,7 @@ qwen:
     video:
       input_mode: full_video
       fps: 2.0
-      do_sample_frames: false
+      do_sample_frames: true
 
   instruction_writer:
     base_url: http://127.0.0.1:8000/v1
@@ -243,6 +243,18 @@ qwen:
   cross_pair_judge:
     # independently configurable
 ```
+
+`full_video` means that the pipeline submits the complete local video file.
+Qwen3-VL's vLLM media processor must then sample that video internally at the
+configured 2 FPS. The vLLM service therefore requires these media options:
+
+```text
+--media-io-kwargs '{"video":{"num_frames":-1}}'
+--allowed-local-media-path /mnt/workspace/public/dataset
+```
+
+Choose `tensor-parallel-size` at deployment time based on the GPUs actually
+assigned to the service; V3 does not prescribe a fixed value.
 
 The instruction writer may use a text-only request built from the validated annotation and final bindings. It does not need to resubmit the video unless a later benchmark proves that video input materially improves instruction quality.
 
