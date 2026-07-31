@@ -303,28 +303,32 @@ class Sam3SegmentationBackend:
             ] = {
                 (item.slot, item.object_id): item for item in anchored
             }
-            for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
-                {
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "propagation_direction": "both",
-                }
-            ):
-                slot = int(response["frame_index"])
-                if not 0 <= slot < len(frame_paths):
-                    raise ValueError(
-                        "SAM3 returned a frame slot outside sampled frames"
-                    )
-                current = self._observations(slot, response["outputs"])
-                unexpected_ids = {
-                    item.object_id for item in current
-                } - tracked_ids
-                if unexpected_ids:
-                    raise ValueError(
-                        "SAM3 object identity changed during propagation"
-                    )
-                for item in current:
-                    observations[(item.slot, item.object_id)] = item
+            for direction in ("forward", "backward"):
+                for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
+                    {
+                        "type": "propagate_in_video",
+                        "session_id": session_id,
+                        "propagation_direction": direction,
+                    }
+                ):
+                    slot = int(response["frame_index"])
+                    if not 0 <= slot < len(frame_paths):
+                        raise ValueError(
+                            "SAM3 returned a frame slot outside sampled frames"
+                        )
+                    current = self._observations(slot, response["outputs"])
+                    unexpected_ids = {
+                        item.object_id for item in current
+                    } - tracked_ids
+                    if unexpected_ids:
+                        raise ValueError(
+                            "SAM3 object identity changed during propagation"
+                        )
+                    for item in current:
+                        observations.setdefault(
+                            (item.slot, item.object_id),
+                            item,
+                        )
         finally:
             self._close_session(predictor, session_id)
 
