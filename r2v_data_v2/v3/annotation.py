@@ -8,79 +8,95 @@ from typing import Any, Protocol
 
 from openai import BadRequestError, OpenAI
 
-from r2v_data_v2.caption_validation import exact_phrase_spans
-from r2v_data_v2.phrase_alignment import (
-    resolve_background_caption_phrase,
-    resolve_reference_caption_phrase,
-)
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.structured_output import (
     StructuredOutputFailure,
     ValidationIssue,
-    parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
 from r2v_data_v2.v3.schemas import (
-    AnnotationPayload,
+    AnnotationEntity,
     AnnotationState,
+    BackgroundAnnotation,
+    RawAnnotationPayload,
 )
 from r2v_data_v2.v3.storage import RunStorage
 
-_REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>")
-_THE_VIDEO_SHOWS = re.compile(r"\bthe video shows\b", flags=re.IGNORECASE)
-_FORBIDDEN_INFERENCE_LANGUAGE = re.compile(
-    r"\b(?:serene|tranquil|determination|resolve|triumph|enemy|"
-    r"shout|shouts|shouting)\b",
+_REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>", flags=re.IGNORECASE)
+_UNSUPPORTED_CAPTION_INFERENCE = re.compile(
+    r"\b(?:breeze|wind-induced|suggesting|indicating|possibly|probably|likely|"
+    r"enemy|determination|resolve|triumph)\b|"
+    r"\b(?:wind\s+causes|caused\s+by\s+wind)\b",
     flags=re.IGNORECASE,
 )
-_DEPICTED_PERSON_TEXT = re.compile(
-    r"\b(?:statue|sculpture|bronze\s+figure|painting|photograph|poster|"
-    r"mural|screen\s+image|depicted\s+figure|animated\s+character)\b",
+_JSON_FENCE = re.compile(
+    r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```",
     flags=re.IGNORECASE,
 )
-_SALIENCE_RANK = {"primary": 0, "secondary": 1, "incidental": 2}
+_PHRASE_EDGE_PUNCTUATION = (
+    " \t\r\n.,;:!?\"'`()[]{}"
+    "\u2018\u2019\u201c\u201d"
+    "\uff0c\u3002\uff1b\uff1a\uff01\uff1f"
+)
+_ENTITY_FIELDS = frozenset(
+    {"reference_type", "phrase", "grounding_prompt"}
+)
+_BACKGROUND_FIELDS = frozenset({"phrase", "grounding_prompt"})
+_REFERENCE_TYPES = frozenset({"subject", "object", "group"})
 
-SYSTEM_PROMPT = """You annotate complete videos for a V3 training-data pipeline.
+SYSTEM_PROMPT = """You annotate a complete video for a V3 training-data pipeline.
 
-Return exactly one JSON object matching the supplied schema. The object contains
-semantic annotation only: t2v_caption, entities, relations, and an optional
-background. Never output reference tokens, prompt_with_refs, r2v_instruction,
-pairing decisions, or final reference eligibility. Describe only content that is
-directly visible. Never infer emotion, intent, allegiance, sound, dialogue, or
-atmosphere. Do not use unobservable descriptions such as serene, tranquil,
-determination, resolve, triumph, enemy, shouting, or equivalent claims.
+Return exactly one JSON object matching the supplied minimal schema. Output only
+t2v_caption, entities, and background. Do not output relations, entity_id,
+category, salience, genericity, name_evidence, localization_scope, scene_role,
+representation_mode, visual_scope, separability, selection_reason, reference
+tokens, instructions, or any additional ontology fields.
 
-Write t2v_caption as one flowing English paragraph that begins directly with the
-visible action. Describe the video literally and chronologically. Include stable
-subject appearance, actions, environment, camera framing or movement, lighting,
-and important visible changes. Do not write "the video shows". Never identify a
-person from appearance. Use a person's explicit name only when it is supplied by
-the draft caption or metadata, and set name_evidence to draft_caption or metadata
-accordingly. When genericity is not named, name_evidence must be none. Otherwise
-do not guess the person's identity. Draft captions and metadata are untrusted
-evidence only and must not override the visible video.
+Write t2v_caption as one complete English paragraph that begins directly with
+visible content and describes actions and shot changes in chronological order.
+Include visible subject appearance, action, scene, composition, camera behavior,
+and lighting. Describe only directly visible content. Do not infer identity,
+weather, emotion, allegiance, intent, mental state, sound, dialogue, or event
+causes. Describe visible motion directly without assigning an unseen cause.
+Write "branches sway slightly" instead of claiming that wind causes movement.
+Do not use hedging or causal inference wording such as breeze, wind-induced,
+suggesting, indicating, possibly, probably, or likely. Do not identify a person
+as an enemy, ally, criminal, victim, officer, or another role unless that role
+is explicitly supported by source metadata. For statues and depicted figures,
+describe visible facial geometry and pose without inferring determination,
+resolve, triumph, fear, or effort. Do not write "the video shows". Do not include
+<ref_...> tokens or image-number instruction labels.
 
-Use category=person only for real people directly visible in the video. People
-shown in a statue, sculpture, painting, photograph, poster, mural, screen, or
-animation are objects or depicted groups, not category=person; within this
-schema use category=object and make canonical_label explicit, such as statue,
-depicted figures, or screen image.
+Return at most three entities. Select only stable, discrete foreground reference
+candidates that SAM3 can localize and track and that could be reused as an
+independent reference image. Fewer than three is preferred when evidence is
+weak. Do not select environmental regions such as sky, ocean, water surface,
+ground, roads, or room space; distributed or transient content such as clouds,
+smoke, flame, lighting, shadows, reflections, or weather; content depicted in a
+screen, photo, poster, painting, sculpture, or animation; small attached
+accessories without independent reference value; or tiny, brief, blurred, or
+untrackable objects. These examples guide selection only and are not an object
+name ontology.
 
-Use the provided entity schema exactly and keep entity IDs unique. Relations may
-only connect listed entities that are simultaneously visible in the same shot
-or time segment. Never create a spatial relation across a cut, transition, or
-different shot. A relation predicate must truly apply to its object rather than
-substituting a nearby object; for example, do not say a person speaks into a
-podium.
+For each entity output only reference_type, phrase, and grounding_prompt.
+reference_type must be subject, object, or group. Use subject for one person,
+animal, or character whose identity or appearance should be retained; object for
+one independently referenceable product, vehicle, prop, device, piece of
+furniture, or other object; and group for multiple subjects or objects whose
+stable composition should be retained together. phrase briefly identifies the
+candidate for binding and review. entity.phrase should normally be a stable noun
+phrase rather than an action: prefer "man in a light gray military uniform" over
+"military officer speaking at podium". grounding_prompt describes visible
+appearance and may include location or current pose only when needed to
+distinguish the target for SAM3. Both fields must be non-empty and must not
+contain reference tokens.
 
-reference_worthy marks at most three foreground entities that can independently
-condition generation. Sky, ocean, water surface, clouds, ground, lighting,
-shadows, smoke, weather, screen content, and the overall scene are not entity
-reference candidates. An entity candidate must not describe the same scene
-region as background. A central subject must be primary, never incidental.
-Downstream code, not this annotation, makes final eligibility and pairing
-decisions. Prefer each candidate phrase as one unique contiguous span copied
-from t2v_caption. Return JSON only."""
+background is optional. When reliable, describe the overall environment after
+the principal foreground subjects are removed, using only phrase and
+grounding_prompt. Return background only when one stable environment persists
+through most of the clip. When the video contains a major scene transition
+between different environments, return background=null. Do not repeat the main
+foreground subject. Otherwise return null. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -127,336 +143,209 @@ def _video_processor_extra_body(
     }
 
 
-def _text_fields(payload: AnnotationPayload) -> list[tuple[str, str]]:
-    values = [("t2v_caption", payload.t2v_caption)]
-    for index, entity in enumerate(payload.entities):
-        values.extend(
-            (
-                (f"entities.{index}.phrase", entity.phrase),
-                (f"entities.{index}.grounding_prompt", entity.grounding_prompt),
-                (f"entities.{index}.canonical_label", entity.canonical_label),
-                (f"entities.{index}.selection_reason", entity.selection_reason),
+def _strip_json_fence(raw: str) -> str:
+    stripped = raw.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    match = _JSON_FENCE.fullmatch(stripped)
+    if match is None:
+        raise ValueError("response must be one complete JSON object")
+    return match.group(1).strip()
+
+
+def _parse_raw_payload(
+    raw: str,
+) -> tuple[dict[str, object] | None, list[ValidationIssue]]:
+    try:
+        value = json.loads(_strip_json_fence(raw))
+    except json.JSONDecodeError as exc:
+        return None, [
+            ValidationIssue(
+                code="invalid_json",
+                field=None,
+                message=f"{exc.msg} at line {exc.lineno} column {exc.colno}",
             )
-        )
-    for index, relation in enumerate(payload.relations):
-        values.append((f"relations.{index}.predicate", relation.predicate))
-    if payload.background is not None:
-        values.extend(
-            (
-                ("background.phrase", payload.background.phrase),
-                (
-                    "background.grounding_prompt",
-                    payload.background.grounding_prompt,
-                ),
+        ]
+    except ValueError as exc:
+        return None, [
+            ValidationIssue(
+                code="invalid_json_object",
+                field=None,
+                message=str(exc),
             )
-        )
-    return values
+        ]
+    if not isinstance(value, dict):
+        return None, [
+            ValidationIssue(
+                code="invalid_json_object",
+                field=None,
+                message="Qwen response must be one JSON object",
+            )
+        ]
+    return value, []
 
 
-def _metadata_text(metadata: dict[str, object]) -> str:
-    values: list[str] = []
-    for value in metadata.values():
-        if isinstance(value, str):
-            values.append(value)
-        elif isinstance(value, list):
-            values.extend(item for item in value if isinstance(item, str))
-    return " ".join(values).casefold()
-
-
-def _contains_name(evidence: str, canonical_label: str) -> bool:
-    name = " ".join(canonical_label.split()).casefold()
-    if not name:
-        return False
-    pattern = re.escape(name)
-    if name[0].isalnum():
-        pattern = rf"(?<!\w){pattern}"
-    if name[-1].isalnum():
-        pattern = rf"{pattern}(?!\w)"
-    return re.search(pattern, evidence.casefold()) is not None
+def _clean_text(value: object, *, trim_phrase_punctuation: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if trim_phrase_punctuation:
+        cleaned = cleaned.strip(_PHRASE_EDGE_PUNCTUATION)
+    return cleaned or None
 
 
 def _normalized_phrase(value: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+    return " ".join(value.casefold().split()).strip(_PHRASE_EDGE_PUNCTUATION)
 
 
-def _is_complete_phrase_within(phrase: str, text: str) -> bool:
-    normalized_phrase = _normalized_phrase(phrase)
-    normalized_text = _normalized_phrase(text)
-    if not normalized_phrase or not normalized_text:
-        return False
-    return f" {normalized_phrase} " in f" {normalized_text} "
+def sanitize_entity_candidates(
+    raw_entities: object,
+) -> tuple[list[AnnotationEntity], tuple[str, ...]]:
+    if not isinstance(raw_entities, list):
+        return [], ("dropped_invalid_entities_collection",)
 
-
-def _append_forbidden_inference_issue(
-    issues: list[ValidationIssue],
-    *,
-    field: str,
-    value: str,
-) -> None:
-    match = _FORBIDDEN_INFERENCE_LANGUAGE.search(value)
-    if match is None:
-        return
-    issues.append(
-        ValidationIssue(
-            code="forbidden_inference_language",
-            field=field,
-            message=(
-                "annotation contains forbidden inference language: "
-                f"{match.group(0)}"
-            ),
+    accepted: list[tuple[str, str, str]] = []
+    seen_phrases: set[str] = set()
+    warnings: list[str] = []
+    for index, candidate in enumerate(raw_entities):
+        if not isinstance(candidate, dict):
+            warnings.append(f"dropped_entity_not_object:{index}")
+            continue
+        if set(candidate) != _ENTITY_FIELDS:
+            warnings.append(f"dropped_entity_fields:{index}")
+            continue
+        reference_type = _clean_text(candidate.get("reference_type"))
+        phrase = _clean_text(
+            candidate.get("phrase"),
+            trim_phrase_punctuation=True,
         )
+        grounding_prompt = _clean_text(candidate.get("grounding_prompt"))
+        normalized_type = reference_type.casefold() if reference_type else ""
+        if normalized_type not in _REFERENCE_TYPES:
+            warnings.append(f"dropped_entity_reference_type:{index}")
+            continue
+        if phrase is None:
+            warnings.append(f"dropped_entity_phrase:{index}")
+            continue
+        if grounding_prompt is None:
+            warnings.append(f"dropped_entity_grounding_prompt:{index}")
+            continue
+        if _REFERENCE_TOKEN.search(phrase) or _REFERENCE_TOKEN.search(
+            grounding_prompt
+        ):
+            warnings.append(f"dropped_entity_reference_token:{index}")
+            continue
+        phrase_key = _normalized_phrase(phrase)
+        if not phrase_key:
+            warnings.append(f"dropped_entity_phrase:{index}")
+            continue
+        if phrase_key in seen_phrases:
+            warnings.append(f"dropped_duplicate_entity_phrase:{index}")
+            continue
+        seen_phrases.add(phrase_key)
+        accepted.append((normalized_type, phrase, grounding_prompt))
+        if len(accepted) == 3:
+            if index + 1 < len(raw_entities):
+                warnings.append("truncated_entity_candidates:3")
+            break
+
+    entities = [
+        AnnotationEntity(
+            entity_id=f"e{index}",
+            reference_type=reference_type,
+            phrase=phrase,
+            grounding_prompt=grounding_prompt,
+        )
+        for index, (reference_type, phrase, grounding_prompt) in enumerate(
+            accepted,
+            start=1,
+        )
+    ]
+    return entities, tuple(warnings)
+
+
+def sanitize_background(
+    raw_background: object,
+) -> tuple[BackgroundAnnotation | None, tuple[str, ...]]:
+    if raw_background is None:
+        return None, ()
+    if not isinstance(raw_background, dict):
+        return None, ("dropped_invalid_background",)
+    if set(raw_background) != _BACKGROUND_FIELDS:
+        return None, ("dropped_invalid_background_fields",)
+    phrase = _clean_text(
+        raw_background.get("phrase"),
+        trim_phrase_punctuation=True,
+    )
+    grounding_prompt = _clean_text(raw_background.get("grounding_prompt"))
+    if (
+        phrase is None
+        or grounding_prompt is None
+        or _REFERENCE_TOKEN.search(phrase)
+        or _REFERENCE_TOKEN.search(grounding_prompt)
+    ):
+        return None, ("dropped_invalid_background",)
+    return (
+        BackgroundAnnotation(
+            phrase=phrase,
+            grounding_prompt=grounding_prompt,
+        ),
+        (),
     )
 
 
-def _validate_payload(
-    payload: AnnotationPayload,
-    *,
-    caption_raw: str,
-    metadata: dict[str, object],
-) -> list[ValidationIssue]:
+def sanitize_annotation_payload(
+    raw_payload: dict[str, object],
+) -> tuple[AnnotationState | None, list[ValidationIssue], tuple[str, ...]]:
+    caption = _clean_text(raw_payload.get("t2v_caption"))
     issues: list[ValidationIssue] = []
-    if not payload.t2v_caption.strip():
+    if caption is None:
         issues.append(
             ValidationIssue(
                 code="empty_t2v_caption",
                 field="t2v_caption",
-                message="t2v_caption must not be empty",
+                message="t2v_caption must be a non-empty string",
             )
         )
-    if _THE_VIDEO_SHOWS.search(payload.t2v_caption):
+    elif _REFERENCE_TOKEN.search(caption):
         issues.append(
             ValidationIssue(
-                code="forbidden_caption_intro",
+                code="reference_token_in_annotation",
                 field="t2v_caption",
-                message='t2v_caption must not say "the video shows"',
+                message="t2v_caption must not contain reference tokens",
             )
         )
-    _append_forbidden_inference_issue(
-        issues,
-        field="t2v_caption",
-        value=payload.t2v_caption,
-    )
-    for field, value in _text_fields(payload):
-        if _REFERENCE_TOKEN.search(value):
+    else:
+        inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(caption)
+        if inference_match is not None:
             issues.append(
                 ValidationIssue(
-                    code="reference_token_in_annotation",
-                    field=field,
-                    message="annotation semantic fields must not contain reference tokens",
-                )
-            )
-    entity_ids = [entity.entity_id for entity in payload.entities]
-    if len(entity_ids) != len(set(entity_ids)):
-        issues.append(
-            ValidationIssue(
-                code="duplicate_entity_id",
-                field="entities",
-                message="annotation entity IDs must be unique",
-            )
-        )
-    metadata_text = _metadata_text(metadata)
-    for index, entity in enumerate(payload.entities):
-        evidence = entity.name_evidence
-        if entity.genericity != "named" and evidence != "none":
-            issues.append(
-                ValidationIssue(
-                    code="unexpected_name_evidence",
-                    field=f"entities.{index}.name_evidence",
-                    message="non-named entities must use name_evidence=none",
-                )
-            )
-        if entity.reference_worthy and entity.salience == "incidental":
-            issues.append(
-                ValidationIssue(
-                    code="invalid_reference_salience",
-                    field=f"entities.{index}.salience",
-                    message="reference-worthy entities cannot be incidental",
-                )
-            )
-        depicted_text = (
-            f"{entity.phrase} {entity.grounding_prompt} "
-            f"{entity.canonical_label}"
-        )
-        if (
-            entity.category == "person"
-            and _DEPICTED_PERSON_TEXT.search(depicted_text)
-        ):
-            issues.append(
-                ValidationIssue(
-                    code="depicted_person_category",
-                    field=f"entities.{index}.category",
+                    code="unsupported_caption_inference",
+                    field="t2v_caption",
                     message=(
-                        "depicted people must not use category=person"
+                        "t2v_caption contains unsupported inference language: "
+                        f"{inference_match.group(0)}"
                     ),
                 )
             )
-        if entity.reference_worthy and payload.background is not None:
-            background_texts = (
-                payload.background.phrase,
-                payload.background.grounding_prompt,
-            )
-            if any(
-                _is_complete_phrase_within(entity.phrase, background_text)
-                for background_text in background_texts
-            ):
-                issues.append(
-                    ValidationIssue(
-                        code="reference_background_overlap",
-                        field=f"entities.{index}.phrase",
-                        message=(
-                            "reference-worthy entity phrase overlaps the "
-                            "background description"
-                        ),
-                    )
-                )
-        _append_forbidden_inference_issue(
-            issues,
-            field=f"entities.{index}.selection_reason",
-            value=entity.selection_reason,
-        )
-        if (
-            entity.category == "person"
-            and entity.genericity == "named"
-            and evidence not in {"draft_caption", "metadata"}
-        ):
-            issues.append(
-                ValidationIssue(
-                    code="missing_name_evidence",
-                    field=f"entities.{index}.name_evidence",
-                    message=(
-                        "named people require explicit draft-caption or "
-                        "metadata evidence"
-                    ),
-                )
-            )
-        if evidence == "draft_caption" and not _contains_name(
-            caption_raw,
-            entity.canonical_label,
-        ):
-            issues.append(
-                ValidationIssue(
-                    code="invalid_name_evidence",
-                    field=f"entities.{index}.name_evidence",
-                    message="canonical name is not present in the draft caption",
-                )
-            )
-        if evidence == "metadata" and not _contains_name(
-            metadata_text,
-            entity.canonical_label,
-        ):
-            issues.append(
-                ValidationIssue(
-                    code="invalid_name_evidence",
-                    field=f"entities.{index}.name_evidence",
-                    message="canonical name is not present in metadata",
-                )
-            )
-    for index, relation in enumerate(payload.relations):
-        _append_forbidden_inference_issue(
-            issues,
-            field=f"relations.{index}.predicate",
-            value=relation.predicate,
-        )
-    return issues
+    if issues:
+        return None, issues, ()
 
-
-def _align_reference_phrases(
-    payload: AnnotationPayload,
-) -> tuple[AnnotationPayload, list[str]]:
-    caption = " ".join(payload.t2v_caption.split())
-    warnings: list[str] = []
-    entities = []
-    for entity in payload.entities:
-        if not entity.reference_worthy:
-            entities.append(entity)
-            continue
-        if len(exact_phrase_spans(caption, entity.phrase)) == 1:
-            entities.append(entity)
-            continue
-        aligned = resolve_reference_caption_phrase(caption, entity.phrase)
-        if (
-            aligned is not None
-            and len(exact_phrase_spans(caption, aligned)) == 1
-        ):
-            entities.append(entity.model_copy(update={"phrase": aligned}))
-            warnings.append(f"aligned_reference_phrase:{entity.entity_id}")
-            continue
-        entities.append(entity.model_copy(update={"reference_worthy": False}))
-        warnings.append(f"demoted_unalignable_reference:{entity.entity_id}")
-
-    known_ids = {entity.entity_id for entity in entities}
-    relations = []
-    for index, relation in enumerate(payload.relations):
-        if (
-            relation.subject_id not in known_ids
-            or relation.object_id not in known_ids
-        ):
-            warnings.append(f"dropped_invalid_relation:{index}")
-            continue
-        relations.append(relation)
-
-    selected_indexes = {
-        index
-        for index, entity in sorted(
-            enumerate(entities),
-            key=lambda item: (_SALIENCE_RANK[item[1].salience], item[0]),
-        )
-        if entity.reference_worthy
-    }
-    selected_indexes = set(
-        sorted(
-            selected_indexes,
-            key=lambda index: (_SALIENCE_RANK[entities[index].salience], index),
-        )[:3]
+    entities, entity_warnings = sanitize_entity_candidates(
+        raw_payload.get("entities", [])
     )
-    capped_entities = []
-    for index, entity in enumerate(entities):
-        if entity.reference_worthy and index not in selected_indexes:
-            capped_entities.append(
-                entity.model_copy(update={"reference_worthy": False})
-            )
-            warnings.append(f"demoted_reference_cap:{entity.entity_id}")
-        else:
-            capped_entities.append(entity)
-
-    background = payload.background
-    if background is not None and background.reference_worthy:
-        aligned = resolve_background_caption_phrase(caption, background.phrase)
-        if aligned is None:
-            background = background.model_copy(
-                update={"reference_worthy": False}
-            )
-            warnings.append("demoted_unalignable_reference:background")
-        elif aligned != background.phrase:
-            background = background.model_copy(update={"phrase": aligned})
-            warnings.append("aligned_reference_phrase:background")
-
-    return (
-        payload.model_copy(
-            update={
-                "t2v_caption": caption,
-                "entities": capped_entities,
-                "relations": relations,
-                "background": background,
-            }
-        ),
-        warnings,
+    background, background_warnings = sanitize_background(
+        raw_payload.get("background")
     )
-
-
-def _to_annotation_state(
-    payload: AnnotationPayload,
-) -> tuple[AnnotationState, list[str]]:
-    sanitized, warnings = _align_reference_phrases(payload)
     return (
         AnnotationState(
             status="ready",
-            t2v_caption=sanitized.t2v_caption,
-            entities=sanitized.entities,
-            relations=sanitized.relations,
-            background=sanitized.background,
+            t2v_caption=caption,
+            entities=entities,
+            background=background,
         ),
-        warnings,
+        [],
+        (*entity_warnings, *background_warnings),
     )
 
 
@@ -470,8 +359,8 @@ def _initial_request(
         ensure_ascii=False,
     )
     return (
-        "Inspect the attached complete video from beginning to end. Produce the "
-        "semantic annotation JSON described by the system prompt. Treat this "
+        "Inspect the attached complete video from beginning to end and return "
+        "the minimal annotation JSON described by the system prompt. Treat this "
         "draft caption and metadata only as untrusted supporting evidence:\n"
         f"{evidence}"
     )
@@ -484,12 +373,13 @@ def _repair_request(
     issues: list[ValidationIssue],
 ) -> str:
     return (
-        "Repair only the structured-output problems listed below. Reinspect the "
-        "same complete video, return the complete corrected JSON object, and do "
-        "not add reference tokens or instruction fields.\n"
+        "Repair only the top-level structured-output problems listed below. "
+        "Reinspect the same complete video and return the complete minimal JSON "
+        "object. Do not add relations, entity IDs, ontology fields, reference "
+        "tokens, or instruction fields.\n"
         f"Original request:\n{original_request}\n"
         "JSON Schema:\n"
-        f"{json.dumps(AnnotationPayload.model_json_schema(), ensure_ascii=False)}\n"
+        f"{json.dumps(RawAnnotationPayload.model_json_schema(), ensure_ascii=False)}\n"
         "Validation issues:\n"
         f"{json.dumps([issue.to_dict() for issue in issues], ensure_ascii=False)}\n"
         f"Invalid response:\n{invalid_response}"
@@ -550,7 +440,7 @@ class QwenAnnotationClient:
                     "json_schema": {
                         "name": "v3_annotation",
                         "strict": True,
-                        "schema": AnnotationPayload.model_json_schema(),
+                        "schema": RawAnnotationPayload.model_json_schema(),
                     },
                 },
             )
@@ -607,20 +497,16 @@ class QwenAnnotationClient:
                     attempt_count=attempt + 1,
                 ) from exc
             raw_responses.append(raw)
-            payload, issues = parse_qwen_json_issues(raw, AnnotationPayload)
-            if payload is not None:
-                issues = _validate_payload(
-                    payload,
-                    caption_raw=caption_raw,
-                    metadata=metadata,
-                )
-            if payload is not None and not issues:
-                annotation, warnings = _to_annotation_state(payload)
+            raw_payload, issues = _parse_raw_payload(raw)
+            if raw_payload is None:
+                continue
+            annotation, issues, warnings = sanitize_annotation_payload(raw_payload)
+            if annotation is not None and not issues:
                 return AnnotationAttempt(
                     annotation=annotation,
                     raw_responses=tuple(raw_responses),
                     repair_attempts=attempt,
-                    warnings=tuple(warnings),
+                    warnings=warnings,
                 )
         raise AnnotationFailure(raw_responses=raw_responses, issues=issues)
 
@@ -640,10 +526,7 @@ def _write_debug_response(
         destination,
         {
             "raw_responses": list(raw_responses),
-            "issues": [
-                issue.to_dict()
-                for issue in (issues or [])
-            ],
+            "issues": [issue.to_dict() for issue in (issues or [])],
             "warnings": list(warnings),
         },
     )
@@ -714,10 +597,7 @@ def annotate_clips(
                 reason=reason,
                 details={
                     "attempt_count": exc.attempt_count,
-                    "issues": [
-                        issue.to_dict()
-                        for issue in exc.issues
-                    ],
+                    "issues": [issue.to_dict() for issue in exc.issues],
                 },
             )
             failed += 1

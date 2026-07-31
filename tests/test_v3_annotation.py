@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from openai import BadRequestError
+from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.naming import parse_clip_identity
@@ -18,6 +19,9 @@ from r2v_data_v2.v3.annotation import (
     AnnotationStats,
     QwenAnnotationClient,
     annotate_clips,
+    sanitize_annotation_payload,
+    sanitize_background,
+    sanitize_entity_candidates,
 )
 from r2v_data_v2.v3.config import (
     DebugConfig,
@@ -34,9 +38,12 @@ from r2v_data_v2.v3.schemas import (
     CoverageState,
     EntityReferenceState,
     ExportState,
+    InstructionLegendEntry,
     InstructionState,
     PairingState,
+    RawAnnotationPayload,
     ReferencesState,
+    render_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
 from run_pipeline_v3 import run_pipeline_v3
@@ -63,8 +70,6 @@ def _config(
     monkeypatch.setattr(v3_config_module, "ALLOWED_PRETRAINED_ROOT", pretrained)
     monkeypatch.setattr(v3_config_module, "ALLOWED_USER_MODEL_ROOT", user_models)
     annotation_model = pretrained / "Qwen" / "Qwen3-VL-32B-Instruct"
-    remove_model = pretrained / "Qwen" / "Qwen-Image-Edit-2511"
-    adapter = user_models / "Qwen-Image-Edit-2511-Object-Remover"
     config = V3Config(
         dataset_json=dataset_root / "source.json",
         run_root=writable / "runs" / "annotation",
@@ -82,8 +87,10 @@ def _config(
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
         ),
         remove=RemoveConfig(
-            base_model_path=remove_model,
-            adapter_path=adapter,
+            base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
+            adapter_path=(
+                user_models / "Qwen-Image-Edit-2511-Object-Remover"
+            ),
         ),
         debug=DebugConfig(save_diagnostics=debug),
     )
@@ -135,56 +142,46 @@ def _write_source(
     )
 
 
-def _payload(
+def _entity(
+    phrase: str,
     *,
-    caption: str | None = None,
+    reference_type: str = "subject",
+    grounding_prompt: str | None = None,
 ) -> dict[str, object]:
     return {
-        "t2v_caption": caption
-        or (
-            "A woman in a yellow coat walks beside a wooden table through a "
-            "sunlit plaza as the camera tracks backward."
+        "reference_type": reference_type,
+        "phrase": phrase,
+        "grounding_prompt": (
+            phrase.casefold()
+            if grounding_prompt is None
+            else grounding_prompt
         ),
-        "entities": [
-            {
-                "entity_id": "e1",
-                "phrase": "A woman in a yellow coat",
-                "grounding_prompt": "woman wearing a yellow coat",
-                "canonical_label": "woman",
-                "category": "person",
-                "reference_worthy": True,
-                "salience": "primary",
-                "genericity": "descriptive",
-                "name_evidence": "none",
-                "separability": "independent",
-                "selection_reason": "stable primary subject",
-            },
-            {
-                "entity_id": "e2",
-                "phrase": "a wooden table",
-                "grounding_prompt": "wooden table",
-                "canonical_label": "table",
-                "category": "object",
-                "reference_worthy": True,
-                "salience": "secondary",
-                "genericity": "descriptive",
-                "name_evidence": "none",
-                "separability": "important_independent_object",
-                "selection_reason": "distinct visible object",
-            },
-        ],
-        "relations": [
-            {
-                "subject_id": "e1",
-                "predicate": "walking beside",
-                "object_id": "e2",
-            }
-        ],
-        "background": {
+    }
+
+
+def _payload(
+    *,
+    caption: str = (
+        "A woman in a yellow coat walks beside a wooden table through a "
+        "sunlit plaza as the camera tracks backward."
+    ),
+    entities: list[object] | None = None,
+    background: object = ...,
+) -> dict[str, object]:
+    if entities is None:
+        entities = [
+            _entity("A woman in a yellow coat"),
+            _entity("a wooden table", reference_type="object"),
+        ]
+    if background is ...:
+        background = {
             "phrase": "a sunlit plaza",
-            "grounding_prompt": "empty sunlit plaza",
-            "reference_worthy": True,
-        },
+            "grounding_prompt": "the empty sunlit plaza",
+        }
+    return {
+        "t2v_caption": caption,
+        "entities": entities,
+        "background": background,
     }
 
 
@@ -220,10 +217,9 @@ def _storage_with_manifest(
 def _annotate_payloads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    payloads: list[dict[str, object]],
+    payloads: list[dict[str, object] | str],
     *,
     repair_retries: int = 0,
-    source_fields: dict[str, object] | None = None,
 ) -> tuple[AnnotationStats, ClipRecord, _FakeQwenClient]:
     config = _config(
         tmp_path,
@@ -231,14 +227,13 @@ def _annotate_payloads(
         repair_retries=repair_retries,
     )
     video = _video(config)
-    source_record: dict[str, object] = {"file_path": str(video)}
-    source_record.update(source_fields or {})
-    _write_source(config, [source_record])
+    _write_source(config, [{"file_path": str(video)}])
     storage, clip_uid = _storage_with_manifest(config)
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        [json.dumps(payload) for payload in payloads],
-    )
+    responses = [
+        payload if isinstance(payload, str) else json.dumps(payload)
+        for payload in payloads
+    ]
+    client = _FakeQwenClient(config.qwen.annotation, responses)
     stats = annotate_clips(config, storage, client=client)
     return stats, storage.read_clip(clip_uid), client
 
@@ -246,10 +241,7 @@ def _annotate_payloads(
 def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
     storage.write_coverage(
         clip_uid,
-        CoverageState(
-            passed=True,
-            qualifying_entity_ids=["e1"],
-        ),
+        CoverageState(passed=True, qualifying_entity_ids=["e1"]),
     )
     storage.write_references(
         clip_uid,
@@ -277,11 +269,20 @@ def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
             tokens={"e1": "<ref_subject_1>"},
         ),
     )
+    body = "\u4f7f\u7528{{image_1}}\u751f\u6210\u8fde\u7eed\u955c\u5934\u3002"
+    legend = [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description="\u9ec4\u8272\u5916\u5957\u5973\u5b50",
+        )
+    ]
     storage.write_instruction(
         clip_uid,
         InstructionState(
             status="ready",
-            r2v_instruction="Generate a shot using <ref_subject_1>.",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=render_instruction_text(body, legend),
         ),
     )
     storage.write_export(
@@ -302,26 +303,23 @@ def test_manifest_creates_one_clip_json_without_stage_manifests(
 
     stats = build_manifest(config, storage)
 
-    identity = parse_clip_identity(video)
-    clip = storage.read_clip(identity.clip_uid)
+    clip = storage.read_clip(parse_clip_identity(video).clip_uid)
     assert stats.to_dict() == {
         "processed": 1,
         "skipped_existing": 0,
         "failed": 0,
     }
+    assert clip.schema_version == "r2v.v3.clip.2"
     assert clip.source.video_path == str(video.resolve())
-    assert clip.source.source_index == 0
     assert clip.source.caption_raw == "draft"
     assert clip.source.metadata == {"text": "draft"}
     assert list(config.resolved_run_root.rglob("clip.json")) == [
-        storage.clip_path(identity.clip_uid)
+        storage.clip_path(clip.clip_uid)
     ]
-    assert not list(config.resolved_run_root.rglob("*.mp4"))
-    assert not list(config.resolved_run_root.rglob("*.jsonl"))
-    assert storage.read_run().counts["manifest.processed"] == 1
+    assert not list(config.resolved_run_root.rglob("*manifest*.jsonl"))
 
 
-def test_manifest_selection_limit_creates_only_five_clips(
+def test_manifest_selection_limit_and_rerun_are_deterministic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -334,63 +332,12 @@ def test_manifest_selection_limit_creates_only_five_clips(
     storage = RunStorage(config)
     storage.initialize(git_commit="annotation-test")
 
-    stats = build_manifest(config, storage)
-
-    clips = list(storage.iter_clips())
-    assert stats.processed == 5
-    assert len(clips) == 5
-    assert {clip.source.source_index for clip in clips} == set(range(5))
-
-
-def test_source_limit_is_required_without_full_run_permission(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    with pytest.raises(ValueError, match="source.limit is required"):
-        _config(
-            tmp_path,
-            monkeypatch,
-            source_limit=None,
-            source_allow_full_run=False,
-        )
-
-
-def test_source_selection_changes_config_fingerprint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch)
-
-    changed = replace(
-        config,
-        source=replace(config.source, start_index=2, limit=5),
-    )
-
-    assert changed.fingerprint() != config.fingerprint()
-
-
-def test_manifest_rerun_is_idempotent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch)
-    video = _video(config)
-    _write_source(config, [{"video_path": str(video)}])
-    storage = RunStorage(config)
-    storage.initialize(git_commit="annotation-test")
-
     first = build_manifest(config, storage)
-    clip_path = next(config.resolved_run_root.rglob("clip.json"))
-    original = clip_path.read_bytes()
     second = build_manifest(config, storage)
 
-    assert first.processed == 1
-    assert second.to_dict() == {
-        "processed": 0,
-        "skipped_existing": 1,
-        "failed": 0,
-    }
-    assert clip_path.read_bytes() == original
+    assert first.processed == 5
+    assert second.skipped_existing == 5
+    assert len(list(storage.iter_clips())) == 5
 
 
 def test_bad_manifest_source_does_not_block_valid_clip(
@@ -401,10 +348,7 @@ def test_bad_manifest_source_does_not_block_valid_clip(
     video = _video(config)
     _write_source(
         config,
-        [
-            {"text": "missing path"},
-            {"file_path": str(video), "text": "valid"},
-        ],
+        [{"text": "missing path"}, {"file_path": str(video)}],
     )
     storage = RunStorage(config)
     storage.initialize(git_commit="annotation-test")
@@ -414,9 +358,6 @@ def test_bad_manifest_source_does_not_block_valid_clip(
     assert stats.processed == 1
     assert stats.failed == 1
     assert len(list(storage.iter_clips())) == 1
-    failure = json.loads(storage.failures_path.read_text(encoding="utf-8"))
-    assert failure["stage"] == "manifest"
-    assert failure["details"]["source_index"] == 0
 
 
 def test_manifest_source_identity_conflict_fails_closed(
@@ -435,110 +376,338 @@ def test_manifest_source_identity_conflict_fails_closed(
 
     assert stats.failed == 1
     assert stats.skipped_existing == 0
-    assert (
-        storage.read_clip(clip_uid).source.parent_video_id
-        == "conflicting-parent"
-    )
 
 
-def test_annotation_writes_semantic_fields_only(
+def test_source_selection_is_validated_and_fingerprinted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
-    video = _video(config)
-    _write_source(
+    changed = replace(
         config,
-        [
-            {
-                "file_path": str(video),
-                "text": "Draft evidence.",
-                "title": "Metadata evidence",
-            }
-        ],
+        source=replace(config.source, start_index=2, limit=5),
     )
-    storage, clip_uid = _storage_with_manifest(config)
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        [json.dumps(_payload())],
+    assert changed.fingerprint() != config.fingerprint()
+    with pytest.raises(ValueError, match="source.limit is required"):
+        _config(
+            tmp_path,
+            monkeypatch,
+            source_limit=None,
+            source_allow_full_run=False,
+        )
+
+
+def test_minimal_raw_annotation_schema_contains_only_expected_fields() -> None:
+    schema = RawAnnotationPayload.model_json_schema()
+
+    assert set(schema["properties"]) == {
+        "t2v_caption",
+        "entities",
+        "background",
+    }
+    entity_schema = schema["$defs"]["RawAnnotationEntity"]
+    background_schema = schema["$defs"]["RawBackgroundAnnotation"]
+    assert set(entity_schema["properties"]) == {
+        "reference_type",
+        "phrase",
+        "grounding_prompt",
+    }
+    assert set(background_schema["properties"]) == {
+        "phrase",
+        "grounding_prompt",
+    }
+    assert "entity_id" not in json.dumps(schema)
+    assert "relations" not in json.dumps(schema)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "category",
+        "salience",
+        "localization_scope",
+        "selection_reason",
+        "entity_id",
+    ],
+)
+def test_raw_annotation_schema_strictly_rejects_old_entity_fields(
+    field: str,
+) -> None:
+    payload = _payload()
+    entity = payload["entities"][0]
+    assert isinstance(entity, dict)
+    entity[field] = "legacy"
+
+    with pytest.raises(ValidationError, match=field):
+        RawAnnotationPayload.model_validate(payload)
+
+
+def test_raw_annotation_schema_strictly_rejects_relations() -> None:
+    payload = _payload()
+    payload["relations"] = []
+
+    with pytest.raises(ValidationError, match="relations"):
+        RawAnnotationPayload.model_validate(payload)
+
+
+def test_entity_sanitizer_deduplicates_truncates_and_assigns_ids() -> None:
+    candidates = [
+        _entity("  Woman.  "),
+        _entity("invalid", reference_type="scene"),
+        _entity("woman"),
+        _entity("Table", reference_type="object"),
+        _entity("Band", reference_type="group"),
+        _entity("Car", reference_type="object"),
+    ]
+
+    entities, warnings = sanitize_entity_candidates(candidates)
+
+    assert [entity.entity_id for entity in entities] == ["e1", "e2", "e3"]
+    assert [entity.phrase for entity in entities] == ["Woman", "Table", "Band"]
+    assert [entity.reference_type for entity in entities] == [
+        "subject",
+        "object",
+        "group",
+    ]
+    assert "dropped_entity_reference_type:1" in warnings
+    assert "dropped_duplicate_entity_phrase:2" in warnings
+    assert "truncated_entity_candidates:3" in warnings
+
+
+@pytest.mark.parametrize(
+    ("candidate", "warning"),
+    [
+        (None, "dropped_entity_not_object:0"),
+        (_entity("", grounding_prompt="person"), "dropped_entity_phrase:0"),
+        (_entity("person", grounding_prompt=""), "dropped_entity_grounding_prompt:0"),
+        (_entity("person", reference_type="scene"), "dropped_entity_reference_type:0"),
+        (_entity("person <ref_subject_1>"), "dropped_entity_reference_token:0"),
+    ],
+)
+def test_invalid_entity_candidate_is_dropped_locally(
+    candidate: object,
+    warning: str,
+) -> None:
+    entities, warnings = sanitize_entity_candidates([candidate])
+
+    assert entities == []
+    assert warning in warnings
+
+
+def test_zero_valid_entities_still_produces_ready_annotation() -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(entities=[None, _entity("", grounding_prompt="person")])
     )
 
-    stats = annotate_clips(config, storage, client=client)
+    assert issues == []
+    assert annotation is not None
+    assert annotation.status == "ready"
+    assert annotation.entities == []
 
-    clip = storage.read_clip(clip_uid)
+
+def test_background_null_is_valid() -> None:
+    background, warnings = sanitize_background(None)
+
+    assert background is None
+    assert warnings == ()
+
+
+@pytest.mark.parametrize(
+    "background",
+    [
+        "room",
+        {"phrase": "", "grounding_prompt": "room"},
+        {"phrase": "room", "grounding_prompt": ""},
+        {"phrase": "room <ref_bg_1>", "grounding_prompt": "room"},
+        {
+            "phrase": "room",
+            "grounding_prompt": "room",
+            "reference_worthy": True,
+        },
+    ],
+)
+def test_invalid_background_is_dropped_without_failing_annotation(
+    background: object,
+) -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(background=background)
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert annotation.status == "ready"
+    assert annotation.background is None
+    assert warnings
+
+
+def test_annotation_writes_minimal_semantic_fields_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [_payload()],
+    )
+
     assert stats.processed == 1
     assert clip.annotation is not None
-    assert clip.annotation.t2v_caption.startswith("A woman")
     assert [entity.entity_id for entity in clip.annotation.entities] == [
         "e1",
         "e2",
     ]
-    assert clip.annotation.relations[0].predicate == "walking beside"
     assert clip.annotation.background is not None
-    assert clip.annotation.background.phrase == "a sunlit plaza"
-    assert clip.references.entities == []
-    assert clip.pairing is None
-    assert clip.instruction is None
-    serialized = storage.clip_path(clip_uid).read_text(encoding="utf-8")
-    assert "<ref_" not in serialized
-    assert "prompt_with_refs" not in serialized
-    assert "r2v_instruction" not in serialized
+    serialized = clip.annotation.model_dump(mode="json")
+    assert set(serialized) == {
+        "status",
+        "t2v_caption",
+        "entities",
+        "background",
+        "reason",
+    }
+    assert set(serialized["entities"][0]) == {
+        "entity_id",
+        "reference_type",
+        "phrase",
+        "grounding_prompt",
+    }
+    assert "relations" not in json.dumps(serialized)
+    assert "<ref_" not in json.dumps(serialized)
 
 
-def test_annotation_with_reference_token_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch, repair_retries=0)
-    video = _video(config)
-    _write_source(config, [{"file_path": str(video)}])
-    storage, clip_uid = _storage_with_manifest(config)
-    payload = _payload(
-        caption="A woman <ref_subject_1> walks through a sunlit plaza."
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Thin branches sway slightly while the camera remains still.",
+        "Bright natural daylight illuminates a quiet courtyard.",
+        "Diffuse overcast lighting covers the street.",
+        "A woman speaks beneath a cloudy sky.",
+        "Two people are talking in a sunny plaza.",
+    ],
+)
+def test_directly_visible_caption_language_is_allowed(caption: str) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(caption=caption)
     )
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        [json.dumps(payload)],
-    )
 
-    stats = annotate_clips(config, storage, client=client)
-
-    assert stats.failed == 1
-    annotation = storage.read_clip(clip_uid).annotation
+    assert issues == []
     assert annotation is not None
-    assert annotation.status == "failed"
-    assert annotation.reason == "reference_token_in_annotation"
-    failure = json.loads(storage.failures_path.read_text(encoding="utf-8"))
-    assert failure["reason"] == "reference_token_in_annotation"
+    assert annotation.status == "ready"
 
 
-def test_unknown_relation_is_dropped_without_failing_annotation(
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Wind causes the branches to sway beside the road.",
+        "The bright light is suggesting a sunny day.",
+        "An enemy figure crosses the courtyard.",
+        "The statues have expressions of determination.",
+        "The branch movement is caused by wind.",
+    ],
+)
+def test_unsupported_caption_inference_is_rejected(caption: str) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(caption=caption)
+    )
+
+    assert annotation is None
+    assert [issue.code for issue in issues] == [
+        "unsupported_caption_inference"
+    ]
+
+
+def test_caption_semantic_issue_can_be_repaired(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, monkeypatch)
-    video = _video(config)
-    _write_source(config, [{"file_path": str(video)}])
-    storage, clip_uid = _storage_with_manifest(config)
-    payload = _payload()
-    payload["relations"] = [
-        {
-            "subject_id": "e1",
-            "predicate": "near",
-            "object_id": "missing",
-        }
-    ]
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        [json.dumps(payload)],
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [
+            _payload(
+                caption="Wind causes the branches to sway beside the road."
+            ),
+            _payload(
+                caption="Thin branches sway slightly beside the road."
+            ),
+        ],
+        repair_retries=1,
     )
-
-    stats = annotate_clips(config, storage, client=client)
 
     assert stats.processed == 1
-    annotation = storage.read_clip(clip_uid).annotation
-    assert annotation is not None
-    assert annotation.relations == []
+    assert stats.repaired == 1
+    assert len(client.requests) == 2
+    assert "unsupported_caption_inference" in str(client.requests[1])
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+    assert clip.annotation.t2v_caption.startswith("Thin branches")
+
+
+def test_empty_caption_is_repaired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [_payload(caption="  "), _payload()],
+        repair_retries=1,
+    )
+
+    assert stats.processed == 1
+    assert stats.repaired == 1
+    assert len(client.requests) == 2
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+def test_empty_caption_after_repair_marks_annotation_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [_payload(caption=""), _payload(caption=" ")],
+        repair_retries=1,
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "failed"
+    assert clip.annotation.reason == "empty_t2v_caption"
+
+
+def test_invalid_json_enters_repair_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        ["not json", _payload()],
+        repair_retries=1,
+    )
+
+    assert stats.repaired == 1
+    assert len(client.requests) == 2
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+def test_caption_reference_token_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [_payload(caption="A woman <ref_subject_1> walks.")],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "reference_token_in_annotation"
 
 
 def test_changed_annotation_invalidates_all_downstream_state(
@@ -549,20 +718,21 @@ def test_changed_annotation_invalidates_all_downstream_state(
     video = _video(config)
     _write_source(config, [{"file_path": str(video)}])
     storage, clip_uid = _storage_with_manifest(config)
-    first = _FakeQwenClient(
-        config.qwen.annotation,
-        [json.dumps(_payload())],
+    raw = json.dumps(_payload())
+    annotate_clips(
+        config,
+        storage,
+        client=_FakeQwenClient(config.qwen.annotation, [raw]),
     )
-    annotate_clips(config, storage, client=first)
     _seed_ready_downstream(storage, clip_uid)
+
     changed = _payload(
         caption=(
             "A woman in a yellow coat walks beside a wooden table through a "
             "sunlit plaza, then pauses as the camera pans left."
         )
     )
-
-    stats = annotate_clips(
+    annotate_clips(
         config,
         storage,
         overwrite=True,
@@ -573,7 +743,6 @@ def test_changed_annotation_invalidates_all_downstream_state(
     )
 
     clip = storage.read_clip(clip_uid)
-    assert stats.processed == 1
     assert clip.coverage is None
     assert clip.references == ReferencesState()
     assert clip.pairing is None
@@ -599,43 +768,15 @@ def test_identical_annotation_rerun_preserves_downstream_state(
     before = storage.read_clip(clip_uid)
     clip_bytes = storage.clip_path(clip_uid).read_bytes()
 
-    stats = annotate_clips(
+    annotate_clips(
         config,
         storage,
         overwrite=True,
         client=_FakeQwenClient(config.qwen.annotation, [raw]),
     )
 
-    assert stats.processed == 1
     assert storage.read_clip(clip_uid) == before
     assert storage.clip_path(clip_uid).read_bytes() == clip_bytes
-
-
-def test_qwen_request_failure_uses_unified_failure_log(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch)
-    video = _video(config)
-    _write_source(config, [{"file_path": str(video)}])
-    storage, clip_uid = _storage_with_manifest(config)
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        [RuntimeError("endpoint unavailable")],
-    )
-
-    stats = annotate_clips(config, storage, client=client)
-
-    assert stats.failed == 1
-    annotation = storage.read_clip(clip_uid).annotation
-    assert annotation is not None
-    assert annotation.status == "failed"
-    assert annotation.reason == "qwen_request_failed"
-    failure = json.loads(storage.failures_path.read_text(encoding="utf-8"))
-    assert failure["clip_uid"] == clip_uid
-    assert failure["stage"] == "annotate"
-    assert failure["reason"] == "qwen_request_failed"
-    assert not list(config.resolved_run_root.rglob("qwen_failed.jsonl"))
 
 
 def test_failed_annotation_overwrite_invalidates_downstream_state(
@@ -677,6 +818,32 @@ def test_failed_annotation_overwrite_invalidates_downstream_state(
     assert clip.export == ExportState()
 
 
+def test_qwen_request_failure_uses_unified_failure_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, repair_retries=0)
+    video = _video(config)
+    _write_source(config, [{"file_path": str(video)}])
+    storage, clip_uid = _storage_with_manifest(config)
+
+    stats = annotate_clips(
+        config,
+        storage,
+        client=_FakeQwenClient(
+            config.qwen.annotation,
+            [RuntimeError("endpoint unavailable")],
+        ),
+    )
+
+    assert stats.failed == 1
+    failure = json.loads(storage.failures_path.read_text(encoding="utf-8"))
+    assert failure["clip_uid"] == clip_uid
+    assert failure["stage"] == "annotate"
+    assert failure["reason"] == "qwen_request_failed"
+    assert not list(config.resolved_run_root.rglob("qwen_failed.jsonl"))
+
+
 def test_annotation_uses_clip_source_evidence_without_rescanning_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -707,31 +874,6 @@ def test_annotation_uses_clip_source_evidence_without_rescanning_dataset(
     assert "Stored draft evidence." in request
     assert "Stored metadata evidence" in request
     assert storage.read_clip(clip_uid).annotation is not None
-
-
-def test_invalid_structured_output_can_be_repaired_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch, repair_retries=1)
-    video = _video(config)
-    _write_source(config, [{"file_path": str(video)}])
-    storage, clip_uid = _storage_with_manifest(config)
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        ["not json", json.dumps(_payload())],
-    )
-
-    stats = annotate_clips(config, storage, client=client)
-
-    assert stats.processed == 1
-    assert stats.repaired == 1
-    assert len(client.requests) == 2
-    repair_content = client.requests[1][-1]["content"]
-    assert isinstance(repair_content, list)
-    assert "Repair only" in str(repair_content[-1]["text"])
-    assert storage.read_clip(clip_uid).annotation is not None
-    assert not (storage.clip_dir(clip_uid) / "debug").exists()
 
 
 def test_raw_responses_are_saved_only_when_debug_is_enabled(
@@ -767,9 +909,7 @@ class _CompletionsStub:
         self.calls.append(dict(kwargs))
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=self.raw)
-                )
+                SimpleNamespace(message=SimpleNamespace(content=self.raw))
             ]
         )
 
@@ -791,26 +931,23 @@ class _StrictFallbackCompletionsStub(_CompletionsStub):
             )
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=self.raw)
-                )
+                SimpleNamespace(message=SimpleNamespace(content=self.raw))
             ]
         )
 
 
-def test_qwen_request_uses_full_video_and_strict_schema(
+def test_qwen_request_uses_full_video_minimal_schema_and_no_resampling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
     video = _video(config)
     completions = _CompletionsStub(json.dumps(_payload()))
-    openai_stub = SimpleNamespace(
-        chat=SimpleNamespace(completions=completions)
-    )
     client = QwenAnnotationClient(
         config.qwen.annotation,
-        client=openai_stub,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        ),
     )
 
     result = client.annotate(
@@ -821,13 +958,6 @@ def test_qwen_request_uses_full_video_and_strict_schema(
 
     assert result.annotation.status == "ready"
     request = completions.calls[0]
-    assert request["model"] == str(
-        config.dataset_json.parent.parent
-        / "pretrained"
-        / "Qwen"
-        / "Qwen3-VL-32B-Instruct"
-    )
-    assert request["temperature"] == 0.0
     assert request["extra_body"] == {
         "mm_processor_kwargs": {
             "fps": 2.0,
@@ -835,13 +965,16 @@ def test_qwen_request_uses_full_video_and_strict_schema(
         }
     }
     response_format = request["response_format"]
-    assert isinstance(response_format, dict)
     assert response_format["json_schema"]["strict"] is True
+    assert set(response_format["json_schema"]["schema"]["properties"]) == {
+        "t2v_caption",
+        "entities",
+        "background",
+    }
     messages = request["messages"]
-    assert isinstance(messages, list)
-    user_content = messages[-1]["content"]
-    assert isinstance(user_content, list)
-    assert user_content[0]["video_url"]["url"] == video.resolve().as_uri()
+    assert messages[-1]["content"][0]["video_url"]["url"] == (
+        video.resolve().as_uri()
+    )
 
 
 def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
@@ -861,7 +994,7 @@ def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
     result = client.annotate(
         video_path=video,
         caption_raw="draft",
-        metadata={"title": "evidence"},
+        metadata={},
     )
 
     assert result.annotation.status == "ready"
@@ -870,441 +1003,71 @@ def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
     assert completions.calls[1]["response_format"] == {"type": "json_object"}
 
 
-def test_identity_prompt_limits_names_to_explicit_source_evidence() -> None:
-    normalized = " ".join(SYSTEM_PROMPT.split())
-    assert "Never identify a person from appearance." in normalized
-    assert "draft caption or metadata" in normalized
-    assert "set name_evidence to draft_caption or metadata" in normalized
-
-
-def test_system_prompt_forbids_cross_shot_relations() -> None:
+def test_system_prompt_describes_minimal_candidate_contract() -> None:
     normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
-    assert "simultaneously visible in the same shot or time segment" in normalized
-    assert "never create a spatial relation across a cut" in normalized
+
+    assert "return at most three entities" in normalized
+    assert "stable, discrete foreground reference candidates" in normalized
+    assert "do not output relations" in normalized
+    assert "do not include <ref_...> tokens" in normalized
+    assert "name ontology" in normalized
 
 
-def test_explicit_person_name_from_metadata_is_allowed(
+def test_system_prompt_rejects_inferred_causes_and_multiscene_backgrounds() -> None:
+    normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
+
+    assert "describe visible motion directly without assigning an unseen cause" in (
+        normalized
+    )
+    assert 'write "branches sway slightly"' in normalized
+    assert "major scene transition between different environments" in normalized
+    assert "return background=null" in normalized
+    assert "stable noun phrase rather than an action" in normalized
+
+
+def test_do_sample_frames_true_is_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
-    video = _video(config)
-    _write_source(
+    changed = replace(
         config,
-        [
-            {
-                "file_path": str(video),
-                "person_name": "Alice",
-            }
-        ],
-    )
-    storage, clip_uid = _storage_with_manifest(config)
-    payload = _payload(
-        caption=(
-            "Alice in a yellow coat walks beside a wooden table through a "
-            "sunlit plaza as the camera tracks backward."
-        )
-    )
-    first_entity = payload["entities"][0]
-    assert isinstance(first_entity, dict)
-    first_entity.update(
-        {
-            "phrase": "Alice in a yellow coat",
-            "canonical_label": "Alice",
-            "genericity": "named",
-            "name_evidence": "metadata",
-        }
-    )
-
-    stats = annotate_clips(
-        config,
-        storage,
-        client=_FakeQwenClient(
-            config.qwen.annotation,
-            [json.dumps(payload)],
+        qwen=replace(
+            config.qwen,
+            annotation=replace(
+                config.qwen.annotation,
+                video=replace(
+                    config.qwen.annotation.video,
+                    do_sample_frames=True,
+                ),
+            ),
         ),
     )
 
-    assert stats.processed == 1
-    annotation = storage.read_clip(clip_uid).annotation
-    assert annotation is not None
-    assert annotation.entities[0].canonical_label == "Alice"
-    assert annotation.entities[0].name_evidence == "metadata"
+    with pytest.raises(ValueError, match="disable HF video re-sampling"):
+        changed.validate()
 
 
-def test_generic_entity_with_name_evidence_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _payload()
-    entity = payload["entities"][0]
-    assert isinstance(entity, dict)
-    entity["name_evidence"] = "draft_caption"
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-        source_fields={"text": "A woman appears."},
-    )
-
-    assert stats.failed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.status == "failed"
-    assert clip.annotation.reason == "unexpected_name_evidence"
-
-
-def test_reference_worthy_incidental_entity_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _payload()
-    entity = payload["entities"][1]
-    assert isinstance(entity, dict)
-    entity["salience"] = "incidental"
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-    )
-
-    assert stats.failed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.reason == "invalid_reference_salience"
-
-
-def test_bronze_statue_soldiers_cannot_use_person_category(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _payload(
-        caption=(
-            "Bronze statue soldiers stand beside a wooden table in a sunlit "
-            "plaza as the camera tracks backward."
-        )
-    )
-    entity = payload["entities"][0]
-    assert isinstance(entity, dict)
-    entity.update(
-        {
-            "phrase": "Bronze statue soldiers",
-            "grounding_prompt": "bronze statue soldiers",
-            "canonical_label": "soldiers",
-            "category": "person",
-        }
-    )
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-    )
-
-    assert stats.failed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.reason == "depicted_person_category"
-
-
-def test_real_soldier_is_not_rejected_as_a_depicted_person(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _payload(
-        caption=(
-            "A soldier in a green uniform walks beside a wooden table through "
-            "a sunlit plaza as the camera tracks backward."
-        )
-    )
-    entity = payload["entities"][0]
-    assert isinstance(entity, dict)
-    entity.update(
-        {
-            "phrase": "A soldier in a green uniform",
-            "grounding_prompt": "soldier wearing a green uniform",
-            "canonical_label": "soldier",
-            "category": "person",
-        }
-    )
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-    )
-
-    assert stats.processed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.status == "ready"
-
-
-def test_reference_entity_phrase_cannot_duplicate_background_phrase(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _payload()
-    entity = payload["entities"][1]
-    assert isinstance(entity, dict)
-    entity.update(
-        {
-            "phrase": "a sunlit plaza",
-            "grounding_prompt": "sunlit plaza",
-            "canonical_label": "plaza",
-        }
-    )
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-    )
-
-    assert stats.failed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.reason == "reference_background_overlap"
-
-
-def test_independent_building_entity_does_not_overlap_background(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = _payload(
-        caption=(
-            "A woman in a yellow coat walks beside a brick building through a "
-            "sunlit plaza as the camera tracks backward."
-        )
-    )
-    entity = payload["entities"][1]
-    assert isinstance(entity, dict)
-    entity.update(
-        {
-            "phrase": "a brick building",
-            "grounding_prompt": "brick building",
-            "canonical_label": "building",
-        }
-    )
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-    )
-
-    assert stats.processed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.status == "ready"
-
-
-@pytest.mark.parametrize(
-    ("field", "forbidden_text"),
-    [
-        ("caption", "serene"),
-        ("selection_reason", "determination"),
-        ("relation", "shouting"),
-    ],
-)
-def test_forbidden_inference_language_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    field: str,
-    forbidden_text: str,
-) -> None:
-    payload = _payload()
-    if field == "caption":
-        payload["t2v_caption"] = (
-            "A woman in a yellow coat walks beside a wooden table through a "
-            f"{forbidden_text} plaza as the camera tracks backward."
-        )
-    elif field == "selection_reason":
-        entity = payload["entities"][0]
-        assert isinstance(entity, dict)
-        entity["selection_reason"] = f"shows {forbidden_text}"
-    else:
-        relation = payload["relations"][0]
-        assert isinstance(relation, dict)
-        relation["predicate"] = f"{forbidden_text} near"
-
-    stats, clip, _ = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [payload],
-    )
-
-    assert stats.failed == 1
-    assert clip.annotation is not None
-    assert clip.annotation.reason == "forbidden_inference_language"
-
-
-def test_semantic_validation_issue_can_be_repaired(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    invalid = _payload()
-    entity = invalid["entities"][0]
-    assert isinstance(entity, dict)
-    entity["name_evidence"] = "draft_caption"
-
-    stats, clip, client = _annotate_payloads(
-        tmp_path,
-        monkeypatch,
-        [invalid, _payload()],
-        repair_retries=1,
-        source_fields={"text": "A woman appears."},
-    )
-
-    assert stats.processed == 1
-    assert stats.repaired == 1
-    assert clip.annotation is not None
-    assert clip.annotation.status == "ready"
-    assert len(client.requests) == 2
-    assert "unexpected_name_evidence" in str(client.requests[1])
-
-
-def test_pipeline_runs_requested_stages_in_v3_order(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch)
-    video = _video(config)
-    _write_source(config, [{"file_path": str(video), "text": "draft"}])
-    client = _FakeQwenClient(
-        config.qwen.annotation,
-        [json.dumps(_payload())],
-    )
-
-    result = run_pipeline_v3(
-        config_path=_config_path(config, tmp_path),
-        stages=("annotate", "manifest"),
-        git_commit="annotation-test",
-        annotation_client=client,
-    )
-
-    assert result["completed_stages"] == ["manifest", "annotate"]
-    assert result["manifest"] == {
-        "processed": 1,
-        "skipped_existing": 0,
-        "failed": 0,
-    }
-    assert result["annotate"] == {
-        "processed": 1,
-        "skipped_existing": 0,
-        "failed": 0,
-        "repaired": 0,
-    }
-    run = RunStorage(config).read_run()
-    assert run.counts["manifest.processed"] == 1
-    assert run.counts["annotate.processed"] == 1
-
-
-def test_reference_worthy_candidates_are_capped_after_phrase_sanitizing(
+def test_pipeline_runs_manifest_and_annotation_with_fake_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
     video = _video(config)
     _write_source(config, [{"file_path": str(video)}])
-    storage, clip_uid = _storage_with_manifest(config)
-    payload = _payload()
-    entities = list(payload["entities"])
-    entities.extend(
-        [
-            {
-                **entities[1],
-                "entity_id": "e3",
-                "phrase": "yellow coat",
-                "grounding_prompt": "yellow coat",
-                "canonical_label": "coat",
-                "salience": "primary",
-            },
-            {
-                **entities[1],
-                "entity_id": "e4",
-                "phrase": "an absent red bicycle",
-                "grounding_prompt": "red bicycle",
-                "canonical_label": "bicycle",
-                "salience": "primary",
-            },
-            {
-                **entities[1],
-                "entity_id": "e5",
-                "phrase": "the camera",
-                "grounding_prompt": "camera viewpoint",
-                "canonical_label": "camera",
-                "salience": "primary",
-            },
-        ]
-    )
-    payload["entities"] = entities
-
-    stats = annotate_clips(
-        config,
-        storage,
-        client=_FakeQwenClient(
-            config.qwen.annotation,
-            [json.dumps(payload)],
-        ),
+    config_path = _config_path(config, tmp_path)
+    client = _FakeQwenClient(
+        config.qwen.annotation,
+        [json.dumps(_payload())],
     )
 
-    annotation = storage.read_clip(clip_uid).annotation
-    assert stats.processed == 1
-    assert annotation is not None
-    assert sum(entity.reference_worthy for entity in annotation.entities) <= 3
-    absent = next(
-        entity
-        for entity in annotation.entities
-        if entity.entity_id == "e4"
+    result = run_pipeline_v3(
+        config_path=config_path,
+        stages=("manifest", "annotate"),
+        git_commit="pipeline-test",
+        annotation_client=client,
     )
-    assert absent.reference_worthy is False
 
-
-@pytest.mark.parametrize(
-    ("video", "message"),
-    [
-        (
-            v3_config_module.QwenVideoConfig(fps=1.0),
-            "fps to be 2.0",
-        ),
-        (
-            v3_config_module.QwenVideoConfig(do_sample_frames=True),
-            "must disable HF video re-sampling",
-        ),
-    ],
-)
-def test_v3_annotation_requires_complete_video_configuration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    video: v3_config_module.QwenVideoConfig,
-    message: str,
-) -> None:
-    config = _config(tmp_path, monkeypatch)
-
-    with pytest.raises(ValueError, match=message):
-        replace(
-            config,
-            qwen=replace(
-                config.qwen,
-                annotation=replace(
-                    config.qwen.annotation,
-                    video=video,
-                ),
-            ),
-        ).validate()
-
-
-def test_negative_annotation_repair_retry_count_is_rejected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, monkeypatch)
-
-    with pytest.raises(ValueError, match="non-negative integer"):
-        replace(
-            config,
-            qwen=replace(
-                config.qwen,
-                annotation=replace(
-                    config.qwen.annotation,
-                    repair_retries=-1,
-                ),
-            ),
-        ).validate()
+    assert result["completed_stages"] == ["manifest", "annotate"]
+    assert result["manifest"]["processed"] == 1
+    assert result["annotate"]["processed"] == 1

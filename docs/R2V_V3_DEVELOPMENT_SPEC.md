@@ -80,9 +80,12 @@ V3 does not synthesize missing entity parts.
 Every accepted sample has two distinct text fields:
 
 - `t2v_caption`: literal, chronological, complete video description;
-- `r2v_instruction`: generation-oriented instruction containing the final reference tokens.
+- `r2v_instruction`: generation-oriented Chinese instruction using rendered
+  image labels such as `图1`.
 
-The R2V instruction must not be produced by mechanically inserting tokens into the T2V caption. Removing tokens from `r2v_instruction` is not required to reproduce `t2v_caption`.
+The R2V instruction must not be produced by mechanically inserting internal
+pairing tokens into the T2V caption. Pairing tokens remain internal metadata and
+never appear in the final instruction.
 
 ---
 
@@ -164,8 +167,7 @@ Create source clip records only. Do not copy source videos.
 Use full-video input with the 32B annotation model. Produce:
 
 - `t2v_caption`;
-- structured entities;
-- relations;
+- up to three provisional entity candidates;
 - optional background semantics.
 
 Do not generate reference tokens or `r2v_instruction` here.
@@ -267,32 +269,36 @@ The instruction writer may use a text-only request built from the validated anno
 
 The annotation stage returns semantic content only.
 
+Qwen's raw response contains no entity IDs:
+
 ```json
 {
   "t2v_caption": "...",
   "entities": [
     {
-      "entity_id": "e1",
+      "reference_type": "subject",
       "phrase": "...",
-      "grounding_prompt": "...",
-      "canonical_label": "...",
-      "category": "person|animal|character|object|product|vehicle",
-      "reference_worthy": true,
-      "salience": "primary|secondary|incidental",
-      "genericity": "named|descriptive|generic",
-      "name_evidence": "none|draft_caption|metadata|visible_text",
-      "separability": "independent|attached_accessory|important_independent_object|composite_candidate",
-      "selection_reason": "..."
+      "grounding_prompt": "..."
     }
   ],
-  "relations": [],
   "background": {
     "phrase": "...",
-    "grounding_prompt": "...",
-    "reference_worthy": true
+    "grounding_prompt": "..."
   }
 }
 ```
+
+`reference_type` is limited to `subject`, `object`, or `group`. After local
+candidate validation, phrase deduplication, and truncation to three candidates,
+code assigns contiguous IDs `e1`, `e2`, and `e3`. Invalid candidates are
+dropped without discarding a valid caption. An invalid background is normalized
+to `null`. A valid caption with zero retained entities is still a ready
+annotation; later stages own reference eligibility and clip rejection.
+
+The persisted entity schema contains only `entity_id`, `reference_type`,
+`phrase`, and `grounding_prompt`. Relations and the previous category,
+salience, genericity, evidence, visual-scope, separability, and selection-reason
+ontology are not part of V3 annotation schema version 2.
 
 ### 7.1 `t2v_caption` requirements
 
@@ -302,19 +308,39 @@ The annotation stage returns semantic content only.
 - actions, camera behavior, environment, lighting, and stable appearance details;
 - no reference tokens;
 - no generation command wording solely to make it look instructional;
-- no unsupported identity, intent, emotion, sound, or dialogue.
+- describe visible motion without assigning an unseen cause;
+- no unsupported identity, weather cause, allegiance, intent, mental state,
+  emotion, sound, or dialogue;
+- no hedging or causal inference wording such as `breeze`, `wind-induced`,
+  `suggesting`, `indicating`, `possibly`, `probably`, or `likely`;
+- no unsupported role labels such as enemy, ally, criminal, victim, or officer;
+- describe statue and depicted-figure geometry and pose without inferring
+  determination, resolve, triumph, fear, or effort.
 
-### 7.2 Phrase alignment
+Code applies a deliberately small, case-insensitive word-boundary check to
+`t2v_caption` only. It rejects the listed inference words plus `wind causes`
+and `caused by wind` with `unsupported_caption_inference`, which enters the
+existing repair lifecycle. This is not an entity ontology or object-name
+blacklist. Directly visible wording such as `branches sway slightly`, `sunny`,
+`overcast`, `cloudy`, `speaks`, and `talking` remains valid.
 
-Entity phrases may still be aligned to unique spans in `t2v_caption` for auditability, but token insertion no longer depends on exact caption reconstruction.
+### 7.2 Candidate sanitation
 
-The code remains responsible for:
+Entity candidates are processed in model order. Code strips and normalizes
+candidate text, drops invalid candidates, deduplicates normalized phrases while
+keeping the first occurrence, retains at most three, and assigns entity IDs
+after all filtering. Phrase text is not required to match one exact contiguous
+caption span. Annotation remains separate from final reference eligibility.
+Entity phrases should normally be stable noun phrases rather than actions.
+Grounding prompts may add location or current pose only when needed to
+distinguish a SAM3 target.
 
-- entity caps;
-- deduplication;
-- invalid relation removal;
-- phrase normalization;
-- final reference eligibility.
+### 7.3 Background stability
+
+Return background semantics only when one stable environment persists through
+most of the clip. A major transition between different environments requires
+`background=null`. Invalid background output still degrades locally to `null`
+without failing an otherwise valid caption.
 
 ---
 
@@ -522,49 +548,95 @@ Generate `r2v_instruction` after pairing. At this point the exact final referenc
 
 ### 11.2 Instruction input
 
-The instruction writer receives:
+Code assigns one deterministic English image binding per final reference. Entity
+references retain pairing order and an accepted background is last:
 
-- validated `t2v_caption`;
-- retained entities and relations;
-- final reference tokens;
-- each reference scope and visible region;
-- optional accepted background reference;
-- code-generated binding descriptions.
+```json
+{
+  "t2v_caption": "...",
+  "bindings": [
+    {
+      "image_id": "image_1",
+      "image_index": 1,
+      "reference_type": "subject",
+      "entity_id": "e1",
+      "phrase": "...",
+      "grounding_prompt": "..."
+    },
+    {
+      "image_id": "image_2",
+      "image_index": 2,
+      "reference_type": "background",
+      "entity_id": null,
+      "phrase": "...",
+      "grounding_prompt": "..."
+    }
+  ],
+  "source_transcript": null
+}
+```
 
-The model must not choose token names or reference IDs.
+All JSON field names, enum values, identifiers, and placeholders are English.
+The model cannot change binding IDs, indexes, order, types, or entity IDs.
+`source_transcript` is supplied only when source metadata contains explicit
+transcript or dialogue text.
 
-### 11.3 Instruction requirements
+### 11.3 Structured output and rendering
 
-`r2v_instruction` must:
+The instruction writer returns:
 
-- be generation-oriented, normally beginning with `Generate`, `Create`, or `Render`;
-- preserve the complete important semantics of `t2v_caption`;
-- retain chronology, action, environment, camera, and lighting information;
-- place every final reference token exactly once;
-- explain naturally which appearance should be preserved from each reference;
-- respect local reference scope and never imply unavailable full-body or full-object information;
-- avoid unsupported details;
-- avoid repeating the full caption verbatim;
-- contain no token without a final reference.
+```json
+{
+  "instruction_body_template": "... {{image_1}} ...",
+  "reference_legend": [
+    {
+      "image_id": "image_1",
+      "description": "..."
+    }
+  ]
+}
+```
 
-Example:
+`instruction_body_template` is Chinese, preserves chronology, action,
+environment, camera, composition, and lighting, and may use the same image
+placeholder multiple times. It must use every final binding at least once.
+Without `source_transcript`, it cannot invent quoted dialogue.
+
+Code performs the only presentation-layer conversion:
 
 ```text
-Generate a continuous outdoor shot where the seated man <ref_subject_1> speaks across a blue picnic table <ref_object_1>. Preserve the man's visible face, upper-body appearance, and burgundy shirt from the local reference, while retaining the table's blue perforated metal structure from the full object reference. The camera holds a wide view beside the industrial building under clear daylight as the conversation continues.
+{{image_1}} -> 图1
+{{image_2}} -> 图2
 ```
+
+It then appends the legend in binding order:
+
+```text
+<rendered instruction body>
+
+图1：<description>
+图2：<description>
+```
+
+Chinese image labels are never schema identifiers, enum values, binding IDs, or
+raw model placeholders. Internal `<ref_...>` pairing tokens remain separate and
+do not appear in the structured instruction output or rendered instruction.
 
 ### 11.4 Instruction validation
 
-Code must validate:
+Validate raw structured output before Chinese rendering:
 
-- `t2v_caption` contains no reference tokens;
-- each final token occurs exactly once in `r2v_instruction`;
-- no other `<ref_...>` token exists;
-- local references are not described as full references;
-- all final references have a token and all tokens have a reference;
-- instruction is not empty and is not identical to `t2v_caption` after whitespace normalization.
+- the body template is non-empty and uses only exact `{{image_N}}` placeholders;
+- every binding appears at least once; repeated placeholders are allowed;
+- no unknown placeholder or `<ref_...>` token appears;
+- raw output contains no direct Chinese image label matching `图` plus a number;
+- legend count, IDs, and order exactly match bindings;
+- every legend description is non-empty;
+- without a source transcript, quoted dialogue is forbidden;
+- the body is not a verbatim copy of `t2v_caption`.
 
-Semantic completeness should be evaluated by a configurable judge in the pilot, but deterministic binding invariants must never depend on a judge.
+Validation failures enter one structured repair attempt. Exhausted repair writes
+`InstructionState(status="failed")` without changing the ready annotation.
 
 ---
 
@@ -624,7 +696,7 @@ Rules:
 
 ```json
 {
-  "schema_version": "r2v.v3.clip.1",
+  "schema_version": "r2v.v3.clip.2",
   "clip_uid": "...",
   "source": {
     "video_path": "...",
@@ -635,7 +707,6 @@ Rules:
     "status": "ready|failed",
     "t2v_caption": "...",
     "entities": [],
-    "relations": [],
     "background": null
   },
   "coverage": {
@@ -653,6 +724,13 @@ Rules:
   },
   "instruction": {
     "status": "ready|failed",
+    "instruction_body_template": "... {{image_1}} ...",
+    "reference_legend": [
+      {
+        "image_id": "image_1",
+        "description": "..."
+      }
+    ],
     "r2v_instruction": "..."
   },
   "export": {
@@ -663,6 +741,10 @@ Rules:
 ```
 
 This is a simple consolidated record, not a generic workflow engine. Each stage updates only its owned section using atomic file replacement.
+
+`r2v.v3.clip.2` is intentionally incompatible with annotation smoke runs
+written using `r2v.v3.clip.1`. Start a new run root instead of migrating or
+overwriting an older run.
 
 ### 12.3 Run-level files
 
@@ -745,7 +827,7 @@ Each line is one compact training record:
   "sample_id": "<clip_uid>",
   "target_video": "/mnt/workspace/public/dataset/.../clip.mp4",
   "t2v_caption": "...",
-  "r2v_instruction": "...",
+  "r2v_instruction": "以图2作为整体背景，图1向前行走。\\n\\n图1：...\\n图2：...",
   "references": [
     {
       "token": "<ref_subject_1>",
@@ -775,7 +857,9 @@ Each line is one compact training record:
 }
 ```
 
-Keep the final schema minimal. Entity scores, judge reasons, masks, relations, and removal metadata remain in `clip.json` unless a downstream training consumer explicitly requires them.
+Keep the final schema minimal. Entity scores, judge reasons, masks, and removal
+metadata remain in `clip.json` unless a downstream training consumer explicitly
+requires them.
 
 ### 13.3 Reference file format
 
@@ -833,6 +917,7 @@ remove:
 
 instruction:
   enabled: true
+  repair_retries: 1
 
 debug:
   save_diagnostics: false
@@ -914,10 +999,12 @@ python -m ruff check .
 
 - `t2v_caption` contains no tokens;
 - `r2v_instruction` differs from `t2v_caption`;
-- every final token appears exactly once in the instruction;
-- no unbound token appears;
-- local scope wording does not claim full-body/full-object availability;
-- entity removal from the final reference list removes its token but keeps unrelated natural-language semantics.
+- every final `image_N` binding appears in the raw body template;
+- repeated image placeholders are allowed;
+- no unknown placeholder or internal `<ref_...>` token appears;
+- legend IDs exactly match final binding order;
+- Chinese `图N` labels are introduced only by deterministic rendering;
+- quoted dialogue requires an explicit source transcript.
 
 ### 16.3 Reference-scope tests
 
@@ -944,7 +1031,7 @@ Include fixtures for:
 - clip-level 8/10 gate uses ANY semantics;
 - shorter-lived ready references remain after another entity qualifies the clip;
 - every accepted sample binds at least one qualifying entity;
-- final reference tokens and instruction tokens match exactly;
+- final reference order and instruction image bindings match exactly;
 - only accepted references are copied to the final dataset;
 - final reference count matches files on disk.
 
@@ -1020,7 +1107,8 @@ After annotation and removal benchmarks pass, run a 40-80 clip V3 pilot into new
 Final acceptance requires:
 
 - zero pipeline failures caused by storage lifecycle errors;
-- zero dangling instruction tokens;
+- zero dangling instruction image bindings;
+- zero internal pairing tokens in rendered instructions;
 - zero exported rejected references;
 - zero contaminated raw backgrounds;
 - manual approval of every exported removed background;
