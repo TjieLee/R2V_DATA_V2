@@ -12,6 +12,7 @@ from pathlib import Path
 
 from PIL import Image
 
+import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.schemas import (
@@ -35,6 +36,14 @@ from r2v_data_v2.v3.schemas import (
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _EXPORT_TOKEN = re.compile(r"<ref_(subject|object|group|bg)_(\d+)>")
 _UTC = getattr(datetime_module, "UTC", timezone.utc)  # noqa: UP017 - Python 3.9 CI
+_SECTION_INVALIDATIONS = {
+    "annotation": ("coverage", "references", "pairing", "instruction", "export"),
+    "masks": ("coverage", "references", "pairing", "instruction", "export"),
+    "coverage": ("references", "pairing", "instruction", "export"),
+    "references": ("pairing", "instruction", "export"),
+    "pairing": ("instruction", "export"),
+    "instruction": ("export",),
+}
 
 
 def utc_now() -> str:
@@ -45,6 +54,21 @@ def _safe_component(value: str, field_name: str) -> str:
     if _SAFE_COMPONENT.fullmatch(value) is None or value in {".", ".."}:
         raise ValueError(f"{field_name} must be a safe path component")
     return value
+
+
+def _cleared_section_value(section: str) -> object:
+    if section == "references":
+        return ReferencesState()
+    if section == "export":
+        return ExportState()
+    return None
+
+
+def _section_updates_after_change(section: str) -> dict[str, object]:
+    return {
+        downstream: _cleared_section_value(downstream)
+        for downstream in _SECTION_INVALIDATIONS.get(section, ())
+    }
 
 
 def _model_dict(value: object) -> dict[str, object]:
@@ -166,13 +190,26 @@ class RunStorage:
 
     def create_clip(self, *, clip_uid: str, source: ClipSource) -> ClipRecord:
         self._require_initialized()
-        record = ClipRecord(clip_uid=clip_uid, source=source)
+        source_path = Path(source.video_path).expanduser()
+        if not source_path.is_absolute():
+            raise ValueError("source.video_path must be an absolute path")
+        resolved_source_path = source_path.resolve(strict=False)
+        dataset_root = v3_config_module.ALLOWED_DATASET_ROOT.resolve(strict=False)
+        if dataset_root not in resolved_source_path.parents:
+            raise ValueError(
+                "source.video_path must be inside "
+                "/mnt/workspace/public/dataset"
+            )
+        normalized_source = source.model_copy(
+            update={"video_path": str(resolved_source_path)}
+        )
+        record = ClipRecord(clip_uid=clip_uid, source=normalized_source)
         path = self.clip_path(clip_uid)
         if path.is_file():
             existing = self.read_clip(clip_uid)
             if existing.clip_uid != clip_uid:
                 raise ValueError(f"clip.json identity mismatch for {clip_uid}")
-            if existing.source != source:
+            if existing.source != normalized_source:
                 raise ValueError(
                     f"existing clip source does not match for {clip_uid}"
                 )
@@ -199,7 +236,13 @@ class RunStorage:
         value: object,
     ) -> ClipRecord:
         current = self.read_clip(clip_uid)
-        updated = current.model_copy(update={section: value})
+        if getattr(current, section) == value:
+            return current
+        updates = {
+            section: value,
+            **_section_updates_after_change(section),
+        }
+        updated = current.model_copy(update=updates)
         validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
         write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         return validated
@@ -243,6 +286,19 @@ class RunStorage:
         if value.clip_uid != clip_uid:
             raise ValueError("mask artifact clip_uid does not match destination")
         destination = self.clip_dir(clip_uid) / "masks.rle.json"
+        if destination.is_file():
+            existing = TrackedMasksArtifact.model_validate_json(
+                destination.read_text(encoding="utf-8")
+            )
+            if existing == value:
+                return destination
+        current = self.read_clip(clip_uid)
+        invalidated = current.model_copy(
+            update=_section_updates_after_change("masks")
+        )
+        validated = ClipRecord.model_validate(invalidated.model_dump(mode="json"))
+        if validated != current:
+            write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         write_json_atomic(destination, _model_dict(value))
         return destination
 
@@ -462,7 +518,7 @@ class DatasetExporter:
             Path("references") / clip_uid / self._filename_for_token(token)
         )
         self._copy_png(
-            self._resolve_run_artifact(background.image_path),
+            self._resolve_run_artifact(background.output_image_path),
             temporary / relative_path,
             background=True,
         )

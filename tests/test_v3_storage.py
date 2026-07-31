@@ -24,6 +24,7 @@ from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
     BackgroundReferenceState,
+    ClipRecord,
     ClipSource,
     CoverageState,
     DatasetReference,
@@ -94,6 +95,29 @@ def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
     )
 
 
+def _source_video_path(storage: RunStorage, clip_uid: str) -> str:
+    return str(
+        storage.config.dataset_json.parent / "videos" / f"{clip_uid}.mp4"
+    )
+
+
+def _tracked_masks(
+    clip_uid: str,
+    *,
+    counts: str = "encoded",
+) -> TrackedMasksArtifact:
+    return TrackedMasksArtifact(
+        clip_uid=clip_uid,
+        entities={
+            "e1": {
+                "slots": {
+                    "0": {"mask_available": True, "counts": counts}
+                }
+            }
+        },
+    )
+
+
 def _create_exportable_clip(
     storage: RunStorage,
     *,
@@ -103,7 +127,7 @@ def _create_exportable_clip(
     storage.create_clip(
         clip_uid=clip_uid,
         source=ClipSource(
-            video_path="/mnt/workspace/public/dataset/video.mp4",
+            video_path=_source_video_path(storage, clip_uid),
             parent_video_id="parent",
             clip_suffix="1_0",
         ),
@@ -159,7 +183,9 @@ def _create_exportable_clip(
         )
         background = BackgroundReferenceState(
             status="clean_raw",
-            image_path=storage.relative_artifact_path(frame_path),
+            source_image_path=storage.relative_artifact_path(frame_path),
+            output_image_path=storage.relative_artifact_path(frame_path),
+            source_frame_slot=3,
             source_frame_index=3,
         )
         background_token = "<ref_bg_1>"
@@ -193,6 +219,29 @@ def _create_exportable_clip(
         clip_uid,
         ExportState(accepted=True, reason=None),
     )
+
+
+def _initialize_storage_with_complete_clip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_masks: bool = False,
+) -> RunStorage:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    if with_masks:
+        storage.create_clip(
+            clip_uid="clip-1",
+            source=ClipSource(
+                video_path=_source_video_path(storage, "clip-1"),
+                parent_video_id="parent",
+                clip_suffix="1_0",
+            ),
+        )
+        storage.write_masks("clip-1", _tracked_masks("clip-1"))
+    _create_exportable_clip(storage, include_background=False)
+    return storage
 
 
 def test_v3_config_loads_32b_defaults_without_model_access(
@@ -272,7 +321,7 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     storage = RunStorage(config)
     storage.initialize(git_commit="abc123", created_at="2026-07-30T00:00:00+00:00")
     source = ClipSource(
-        video_path="/mnt/workspace/public/dataset/video.mp4",
+        video_path=_source_video_path(storage, "clip-1"),
         parent_video_id="parent",
         clip_suffix="1_0",
     )
@@ -293,16 +342,7 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     )
     masks_path = storage.write_masks(
         "clip-1",
-        TrackedMasksArtifact(
-            clip_uid="clip-1",
-            entities={
-                "e1": {
-                    "slots": {
-                        "0": {"mask_available": True, "counts": "encoded"}
-                    }
-                }
-            },
-        ),
+        _tracked_masks("clip-1"),
     )
 
     assert first == second
@@ -323,6 +363,361 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     assert not (storage.clip_dir("clip-1") / "debug").exists()
     with pytest.raises(RuntimeError, match="debug artifact saving is disabled"):
         storage.debug_path("clip-1", "candidate.png")
+
+
+@pytest.mark.parametrize(
+    ("upstream", "cleared_sections"),
+    [
+        (
+            "annotation",
+            {"coverage", "references", "pairing", "instruction", "export"},
+        ),
+        (
+            "masks",
+            {"coverage", "references", "pairing", "instruction", "export"},
+        ),
+        (
+            "coverage",
+            {"references", "pairing", "instruction", "export"},
+        ),
+        ("references", {"pairing", "instruction", "export"}),
+        ("pairing", {"instruction", "export"}),
+        ("instruction", {"export"}),
+    ],
+)
+def test_changed_upstream_content_invalidates_only_downstream_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    upstream: str,
+    cleared_sections: set[str],
+) -> None:
+    storage = _initialize_storage_with_complete_clip(
+        tmp_path,
+        monkeypatch,
+        with_masks=upstream == "masks",
+    )
+    before = storage.read_clip("clip-1")
+
+    if upstream == "annotation":
+        assert before.annotation is not None
+        storage.write_annotation(
+            "clip-1",
+            before.annotation.model_copy(
+                update={
+                    "t2v_caption": (
+                        before.annotation.t2v_caption + " The shot then ends."
+                    )
+                }
+            ),
+        )
+    elif upstream == "masks":
+        storage.write_masks(
+            "clip-1",
+            _tracked_masks("clip-1", counts="changed"),
+        )
+    elif upstream == "coverage":
+        assert before.coverage is not None
+        storage.write_coverage(
+            "clip-1",
+            before.coverage.model_copy(
+                update={
+                    "entity_visibility_summary": {
+                        "e1": {"visible_frame_count": 9}
+                    }
+                }
+            ),
+        )
+    elif upstream == "references":
+        ready = before.references.entities[0].model_copy(
+            update={"scope_reason": "updated local scope"}
+        )
+        storage.write_references(
+            "clip-1",
+            before.references.model_copy(
+                update={"entities": [ready, *before.references.entities[1:]]}
+            ),
+        )
+    elif upstream == "pairing":
+        assert before.pairing is not None
+        storage.write_pairing(
+            "clip-1",
+            before.pairing.model_copy(
+                update={"tokens": {"e1": "<ref_subject_2>"}}
+            ),
+        )
+    else:
+        assert before.instruction is not None
+        storage.write_instruction(
+            "clip-1",
+            before.instruction.model_copy(
+                update={
+                    "r2v_instruction": (
+                        before.instruction.r2v_instruction
+                        + " Keep the camera steady."
+                    )
+                }
+            ),
+        )
+
+    after = storage.read_clip("clip-1")
+    for section in cleared_sections:
+        if section == "references":
+            assert after.references == ReferencesState()
+        elif section == "export":
+            assert after.export == ExportState()
+        else:
+            assert getattr(after, section) is None
+    if upstream == "masks":
+        masks = TrackedMasksArtifact.model_validate_json(
+            (storage.clip_dir("clip-1") / "masks.rle.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert masks == _tracked_masks("clip-1", counts="changed")
+    else:
+        assert getattr(after, upstream) != getattr(before, upstream)
+
+
+def test_repeated_identical_writes_preserve_all_downstream_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(
+        tmp_path,
+        monkeypatch,
+        with_masks=True,
+    )
+    before = storage.read_clip("clip-1")
+    clip_bytes = storage.clip_path("clip-1").read_bytes()
+    masks = _tracked_masks("clip-1")
+
+    assert before.annotation is not None
+    assert before.coverage is not None
+    assert before.pairing is not None
+    assert before.instruction is not None
+    storage.write_annotation("clip-1", before.annotation)
+    storage.write_masks("clip-1", masks)
+    storage.write_coverage("clip-1", before.coverage)
+    storage.write_references("clip-1", before.references)
+    storage.write_pairing("clip-1", before.pairing)
+    storage.write_instruction("clip-1", before.instruction)
+    storage.write_export("clip-1", before.export)
+
+    assert storage.read_clip("clip-1") == before
+    assert storage.clip_path("clip-1").read_bytes() == clip_bytes
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["source_image_path", "source_frame_slot", "source_frame_index"],
+)
+def test_pending_remove_requires_complete_source_provenance(
+    missing_field: str,
+) -> None:
+    values: dict[str, object] = {
+        "status": "pending_remove",
+        "source_image_path": "clips/clip-1/frames/03.jpg",
+        "source_frame_slot": 3,
+        "source_frame_index": 30,
+        "source_mask_path": "clips/clip-1/masks.rle.json",
+    }
+    del values[missing_field]
+
+    with pytest.raises(ValidationError, match="requires source_image_path"):
+        BackgroundReferenceState.model_validate(values)
+
+
+def test_ready_pairing_cannot_be_empty() -> None:
+    with pytest.raises(ValidationError, match="at least one retained entity"):
+        PairingState(status="ready")
+
+
+def test_rejected_pairing_cannot_retain_tokens() -> None:
+    with pytest.raises(ValidationError, match="must clear retained IDs and tokens"):
+        PairingState(
+            status="rejected",
+            retained_entity_ids=["e1"],
+            tokens={"e1": "<ref_subject_1>"},
+            reason="no usable pair",
+        )
+
+
+def test_entity_pairing_token_cannot_use_background_token() -> None:
+    with pytest.raises(ValidationError, match="entity tokens cannot use"):
+        PairingState(
+            status="ready",
+            retained_entity_ids=["e1"],
+            tokens={"e1": "<ref_bg_1>"},
+        )
+
+
+def test_accepted_export_requires_all_cross_section_state() -> None:
+    with pytest.raises(ValidationError, match="requires ready annotation"):
+        ClipRecord(
+            clip_uid="clip-1",
+            source=ClipSource(
+                video_path="/mnt/workspace/public/dataset/video.mp4",
+                parent_video_id="parent",
+                clip_suffix="1_0",
+            ),
+            export=ExportState(accepted=True, reason=None),
+        )
+
+
+def test_clip_cross_section_validator_rejects_inconsistent_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    record = storage.read_clip("clip-1")
+    payload = record.model_dump(mode="json")
+    payload["instruction"]["r2v_instruction"] = (
+        "Generate a shot using <ref_subject_9>."
+    )
+
+    with pytest.raises(ValidationError, match="tokens must exactly match"):
+        ClipRecord.model_validate(payload)
+
+
+def test_clip_cross_section_validator_rejects_unknown_qualifying_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    payload = storage.read_clip("clip-1").model_dump(mode="json")
+    payload["coverage"]["qualifying_entity_ids"] = ["missing"]
+
+    with pytest.raises(ValidationError, match="must exist in annotation"):
+        ClipRecord.model_validate(payload)
+
+
+def test_clip_cross_section_validator_rejects_unknown_reference_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    payload = storage.read_clip("clip-1").model_dump(mode="json")
+    payload["references"]["entities"][0]["entity_id"] = "missing"
+
+    with pytest.raises(ValidationError, match="correspond to annotation"):
+        ClipRecord.model_validate(payload)
+
+
+def test_clip_cross_section_validator_requires_ready_retained_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    payload = storage.read_clip("clip-1").model_dump(mode="json")
+    payload["pairing"]["retained_entity_ids"] = ["e2"]
+    payload["pairing"]["tokens"] = {"e2": "<ref_object_1>"}
+    payload["instruction"]["r2v_instruction"] = (
+        "Generate a shot using <ref_object_1>."
+    )
+
+    with pytest.raises(ValidationError, match="must have ready references"):
+        ClipRecord.model_validate(payload)
+
+
+def test_clip_cross_section_validator_requires_retained_qualifying_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    payload = storage.read_clip("clip-1").model_dump(mode="json")
+    ready_path = payload["references"]["entities"][0]["image_path"]
+    second = payload["references"]["entities"][1]
+    second.update(
+        {
+            "status": "ready",
+            "reference_scope": "local",
+            "visible_region": "central",
+            "identity_features_visible": True,
+            "scope_reason": "coherent local object region",
+            "image_path": ready_path,
+            "source_frame_index": 2,
+        }
+    )
+    payload["pairing"]["retained_entity_ids"] = ["e2"]
+    payload["pairing"]["tokens"] = {"e2": "<ref_object_1>"}
+    payload["instruction"]["r2v_instruction"] = (
+        "Generate a shot using <ref_object_1>."
+    )
+
+    with pytest.raises(ValidationError, match="at least one qualifying entity"):
+        ClipRecord.model_validate(payload)
+
+
+def test_create_clip_rejects_video_outside_public_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+
+    with pytest.raises(ValueError, match="source.video_path must be inside"):
+        storage.create_clip(
+            clip_uid="clip-1",
+            source=ClipSource(
+                video_path=str((tmp_path / "private" / "video.mp4").resolve()),
+                parent_video_id="parent",
+                clip_suffix="1_0",
+            ),
+        )
+
+
+def test_exporter_reads_only_background_output_image_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    output_path = storage.selected_path("clip-1", "bg_removed.png")
+    Image.new("RGB", (9, 7), (70, 80, 90)).save(output_path)
+    background = BackgroundReferenceState(
+        status="ready_removed",
+        source_image_path="clips/clip-1/frames/missing-source.jpg",
+        output_image_path=storage.relative_artifact_path(output_path),
+        source_frame_slot=3,
+        source_frame_index=30,
+        source_mask_path="clips/clip-1/source-mask.png",
+        generation_mask_path="clips/clip-1/generation-mask.png",
+    )
+    storage.write_references(
+        "clip-1",
+        clip.references.model_copy(update={"background": background}),
+    )
+    storage.write_pairing(
+        "clip-1",
+        PairingState(
+            status="ready",
+            retained_entity_ids=["e1"],
+            tokens={"e1": "<ref_subject_1>"},
+            background_token="<ref_bg_1>",
+        ),
+    )
+    storage.write_instruction(
+        "clip-1",
+        InstructionState(
+            status="ready",
+            r2v_instruction=(
+                "Generate a shot using <ref_subject_1> in <ref_bg_1>."
+            ),
+        ),
+    )
+    storage.write_export("clip-1", ExportState(accepted=True, reason=None))
+
+    dataset = DatasetExporter(storage.config, storage).export()
+
+    assert dataset.reference_count == 2
+    exported_background = (
+        storage.config.resolved_export_root
+        / "references"
+        / "clip-1"
+        / "background_1.png"
+    )
+    assert exported_background.is_file()
 
 
 def test_run_metadata_is_resumable_and_mismatch_fails_closed(
@@ -391,7 +786,7 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     storage.create_clip(
         clip_uid="rejected-clip",
         source=ClipSource(
-            video_path="/mnt/workspace/public/dataset/rejected.mp4",
+            video_path=_source_video_path(storage, "rejected-clip"),
             parent_video_id="parent",
             clip_suffix="2_0",
         ),

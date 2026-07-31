@@ -154,7 +154,9 @@ class BackgroundReferenceState(SchemaModel):
         "ready_removed",
         "rejected",
     ]
-    image_path: Optional[str] = None
+    source_image_path: Optional[str] = None
+    output_image_path: Optional[str] = None
+    source_frame_slot: Optional[int] = Field(default=None, ge=0, lt=10)
     source_frame_index: Optional[int] = Field(default=None, ge=0)
     source_mask_path: Optional[str] = None
     generation_mask_path: Optional[str] = None
@@ -164,15 +166,47 @@ class BackgroundReferenceState(SchemaModel):
     def validate_reference_state(self) -> BackgroundReferenceState:
         if self.status in {
             "clean_raw",
+            "pending_remove",
             "ready_removed",
-        } and (self.image_path is None or self.source_frame_index is None):
+        } and (
+            self.source_image_path is None
+            or self.source_frame_slot is None
+            or self.source_frame_index is None
+        ):
             raise ValueError(
-                f"{self.status} background requires image_path and source_frame_index"
+                f"{self.status} background requires source_image_path, "
+                "source_frame_slot, and source_frame_index"
             )
-        if self.status == "pending_remove" and self.source_mask_path is None:
-            raise ValueError("pending_remove background requires source_mask_path")
-        if self.status == "rejected" and not self.reason:
-            raise ValueError("rejected background requires a reason")
+        if self.status == "clean_raw":
+            if self.output_image_path is None:
+                raise ValueError("clean_raw background requires output_image_path")
+            if self.output_image_path != self.source_image_path:
+                raise ValueError(
+                    "clean_raw output_image_path must equal source_image_path"
+                )
+        if self.status == "pending_remove":
+            if self.source_mask_path is None:
+                raise ValueError("pending_remove background requires source_mask_path")
+            if self.output_image_path is not None:
+                raise ValueError(
+                    "pending_remove background cannot publish output_image_path"
+                )
+        if self.status == "ready_removed" and (
+            self.output_image_path is None
+            or self.source_mask_path is None
+            or self.generation_mask_path is None
+        ):
+            raise ValueError(
+                "ready_removed background requires output_image_path, "
+                "source_mask_path, and generation_mask_path"
+            )
+        if self.status == "rejected":
+            if not self.reason:
+                raise ValueError("rejected background requires a reason")
+            if self.output_image_path is not None:
+                raise ValueError(
+                    "rejected background cannot publish output_image_path"
+                )
         return self
 
 
@@ -200,7 +234,17 @@ class PairingState(SchemaModel):
         if self.status == "rejected":
             if not self.reason:
                 raise ValueError("rejected pairing requires a reason")
+            if (
+                self.retained_entity_ids
+                or self.tokens
+                or self.background_token is not None
+            ):
+                raise ValueError(
+                    "rejected pairing must clear retained IDs and tokens"
+                )
             return self
+        if not self.retained_entity_ids:
+            raise ValueError("ready pairing requires at least one retained entity")
         if set(self.tokens) != set(self.retained_entity_ids):
             raise ValueError("ready pairing tokens must match retained_entity_ids")
         if len(self.retained_entity_ids) != len(set(self.retained_entity_ids)):
@@ -212,6 +256,8 @@ class PairingState(SchemaModel):
             raise ValueError("pairing tokens must be unique")
         if any(_REF_TOKEN.fullmatch(token) is None for token in all_tokens):
             raise ValueError("pairing contains an invalid reference token")
+        if any(token.startswith("<ref_bg_") for token in self.tokens.values()):
+            raise ValueError("entity tokens cannot use background reference tokens")
         if self.background_token is not None and not self.background_token.startswith(
             "<ref_bg_"
         ):
@@ -256,6 +302,89 @@ class ClipRecord(SchemaModel):
     pairing: Optional[PairingState] = None
     instruction: Optional[InstructionState] = None
     export: ExportState = Field(default_factory=ExportState)
+
+    @model_validator(mode="after")
+    def validate_section_consistency(self) -> ClipRecord:
+        annotation_ids = (
+            {entity.entity_id for entity in self.annotation.entities}
+            if self.annotation is not None
+            else set()
+        )
+        if self.coverage is not None:
+            unknown_qualifying = (
+                set(self.coverage.qualifying_entity_ids) - annotation_ids
+            )
+            if unknown_qualifying:
+                raise ValueError(
+                    "coverage qualifying entity IDs must exist in annotation"
+                )
+        reference_ids = {
+            reference.entity_id for reference in self.references.entities
+        }
+        if reference_ids - annotation_ids:
+            raise ValueError(
+                "entity references must correspond to annotation entities"
+            )
+        if self.pairing is not None and self.pairing.status == "ready":
+            ready_reference_ids = {
+                reference.entity_id
+                for reference in self.references.entities
+                if reference.status == "ready"
+            }
+            retained_ids = set(self.pairing.retained_entity_ids)
+            if not retained_ids:
+                raise ValueError(
+                    "ready pairing requires at least one retained entity"
+                )
+            if not retained_ids.issubset(ready_reference_ids):
+                raise ValueError(
+                    "ready pairing retained IDs must have ready references"
+                )
+            qualifying_ids = (
+                set(self.coverage.qualifying_entity_ids)
+                if self.coverage is not None and self.coverage.passed
+                else set()
+            )
+            if not retained_ids.intersection(qualifying_ids):
+                raise ValueError(
+                    "ready pairing must retain at least one qualifying entity"
+                )
+            if self.pairing.background_token is not None:
+                background = self.references.background
+                if background is None or background.status not in {
+                    "clean_raw",
+                    "ready_removed",
+                }:
+                    raise ValueError(
+                        "ready pairing background token requires a ready background"
+                    )
+        if self.instruction is not None and self.instruction.status == "ready":
+            if self.pairing is None or self.pairing.status != "ready":
+                raise ValueError("ready instruction requires ready pairing")
+            expected_tokens = set(self.pairing.tokens.values())
+            if self.pairing.background_token is not None:
+                expected_tokens.add(self.pairing.background_token)
+            instruction_tokens = _ANY_REF_TOKEN.findall(
+                self.instruction.r2v_instruction
+            )
+            if set(instruction_tokens) != expected_tokens:
+                raise ValueError(
+                    "ready instruction tokens must exactly match pairing tokens"
+                )
+            if len(instruction_tokens) != len(expected_tokens):
+                raise ValueError(
+                    "ready instruction must contain each pairing token exactly once"
+                )
+        if self.export.accepted:
+            if self.annotation is None or self.annotation.status != "ready":
+                raise ValueError("accepted export requires ready annotation")
+            if self.coverage is None or not self.coverage.passed:
+                raise ValueError("accepted export requires passed coverage")
+            if self.pairing is None or self.pairing.status != "ready":
+                raise ValueError("accepted export requires ready pairing")
+            if self.instruction is None or self.instruction.status != "ready":
+                raise ValueError("accepted export requires ready instruction")
+        return self
 
 
 class TrackedMasksArtifact(SchemaModel):
