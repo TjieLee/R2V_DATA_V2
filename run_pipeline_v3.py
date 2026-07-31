@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
+from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.config import load_config
 from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
 from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
@@ -34,6 +35,7 @@ _IMPLEMENTED_STAGES = frozenset(
         "frames",
         "segment",
         "rank",
+        "background",
         "instruct",
         "export",
     }
@@ -73,7 +75,7 @@ def run_pipeline_v3(
     if unavailable:
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
-            "frames, segment, rank, instruct, and export only; "
+            "frames, segment, rank, background, instruct, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)
@@ -120,6 +122,12 @@ def run_pipeline_v3(
                 storage,
                 overwrite=overwrite,
             ).to_dict()
+        elif stage == "background":
+            results[stage] = build_background_candidates(
+                config,
+                storage,
+                overwrite=overwrite,
+            ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
                 config,
@@ -146,7 +154,7 @@ def main() -> None:
         default="",
         help=(
             "comma-separated V3 stages; manifest, annotate, frames, segment, "
-            "rank, instruct, and export are currently implemented"
+            "rank, background, instruct, and export are currently implemented"
         ),
     )
     parser.add_argument(

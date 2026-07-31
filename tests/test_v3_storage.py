@@ -281,6 +281,8 @@ def _create_exportable_clip(
             output_image_path=storage.relative_artifact_path(frame_path),
             source_frame_slot=3,
             source_frame_index=3,
+            source_foreground_area_pixels=0,
+            source_foreground_area_ratio=0.0,
         )
         background_token = "<ref_bg_1>"
     storage.write_references(
@@ -348,6 +350,7 @@ def test_v3_config_loads_32b_defaults_without_model_access(
     assert loaded.frames.count == 10
     assert loaded.coverage.required_visible_frames == 7
     assert loaded.background.raw_foreground_area_ratio == 0.0
+    assert loaded.background.max_pending_remove_area_ratio == 0.50
     assert loaded.remove.fallback_to_raw is False
 
 
@@ -433,14 +436,14 @@ def test_v3_config_rejects_sam3_model_path_outside_allowed_roots(
         ).validate()
 
 
-def test_unimplemented_stage_message_lists_rank(tmp_path: Path) -> None:
+def test_unimplemented_stage_message_lists_background(tmp_path: Path) -> None:
     with pytest.raises(NotImplementedError) as error:
         run_pipeline_v3(
             config_path=tmp_path / "unused.yaml",
-            stages=("background",),
+            stages=("remove",),
         )
 
-    assert "segment, rank, instruct" in str(error.value)
+    assert "rank, background, instruct" in str(error.value)
 
 
 @pytest.mark.parametrize("required", [0, 11])
@@ -710,6 +713,8 @@ def test_pending_remove_requires_complete_source_provenance(
         "source_frame_slot": 3,
         "source_frame_index": 30,
         "source_mask_path": "clips/clip-1/masks.rle.json",
+        "source_foreground_area_pixels": 2,
+        "source_foreground_area_ratio": 0.02,
     }
     del values[missing_field]
 
@@ -887,6 +892,8 @@ def test_exporter_reads_only_background_output_image_path(
         source_frame_index=30,
         source_mask_path="clips/clip-1/source-mask.png",
         generation_mask_path="clips/clip-1/generation-mask.png",
+        source_foreground_area_pixels=2,
+        source_foreground_area_ratio=0.02,
     )
     storage.write_references(
         "clip-1",

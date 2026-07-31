@@ -216,11 +216,24 @@ those separate reference-quality decisions.
 
 #### `background`
 
-Select a background source frame and construct the union foreground mask.
+This stage performs only deterministic source selection and construction of the
+exact union foreground mask. It does not call a generation model, rerun SAM3,
+dilate a mask, or create a generation mask. For every valid slot, ready entity
+masks are combined with logical OR. The source frame has the smallest union
+area, with the fixed center-first slot order used as the deterministic
+tie-break.
 
-- empty mask: clean raw background candidate;
-- non-empty mask: pending object removal;
-- excessively large or invalid mask: reject background candidate.
+- zero union area: `clean_raw`, directly reusing the sampled JPEG without a copy;
+- union area ratio in `(0, max_pending_remove_area_ratio]`: `pending_remove`
+  with an exact, binary source mask under `clip/background/`;
+- union area ratio above `max_pending_remove_area_ratio`: reject the background
+  with `foreground_mask_too_large`;
+- any non-ready entity track: reject only the background reference with
+  `incomplete_foreground_tracking`, while preserving the clip and entity refs.
+
+The raw foreground threshold is fixed at zero. The pending-removal maximum
+defaults to `0.50`. Dilation, generation masks, and image editing belong to the
+later `remove` stage, which is fail-closed and has no raw fallback.
 
 #### `remove`
 
@@ -701,6 +714,8 @@ Required layout:
 └── clips/
     └── <clip_uid>/
         ├── clip.json
+        ├── background/
+        │   └── source_mask_<sha256>.png
         ├── frames/
         │   ├── 00.jpg
         │   ├── 01.jpg
@@ -727,6 +742,12 @@ Rules:
   validated two-dimensional binary run-length encoding at the sampled frame
   dimensions.
 - Store only selected entity images in `selected/`.
+- `background/source_mask_<sha256>.png` is the exact, single-channel 0/255
+  union mask used by `pending_remove` and oversized audit states.
+- Background source masks are content-addressed and atomically published; stale
+  hashes are removed only after `clip.json` successfully references the new state.
+- Pending source masks never belong in `selected/`.
+- Mask dilation and generation masks are owned by the later `remove` stage.
 - Store only an accepted removed background in `selected/bg_removed.png`.
 - A clean raw background points to its selected sampled frame and does not require a duplicate image in `selected/`.
 - Rejected removal candidates and contact sheets are written only under `debug/` when `debug.save_diagnostics: true`.
@@ -969,6 +990,7 @@ reference_scope:
 background:
   enabled: true
   raw_foreground_area_ratio: 0.0
+  max_pending_remove_area_ratio: 0.50
 
 remove:
   enabled: true
@@ -1088,7 +1110,11 @@ Include fixtures for:
 ### 16.4 Background tests
 
 - empty union mask -> `clean_raw`;
-- any non-empty union mask -> `pending_remove`;
+- a non-empty union mask at or below the configured maximum -> `pending_remove`;
+- an oversized union mask -> `rejected`;
+- equal-area candidates use the fixed center-first ordering;
+- non-ready entity tracking rejects the background reference without rejecting
+  the clip;
 - rejected removal -> no background export;
 - accepted removal -> `ready_removed`;
 - outside-mask pixels remain identical;
