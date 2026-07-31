@@ -45,7 +45,7 @@ def _is_strictly_below(path: Path, root: Path) -> bool:
 class QwenVideoConfig:
     input_mode: str = "full_video"
     fps: float = 2.0
-    do_sample_frames: bool = True
+    do_sample_frames: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,9 +214,10 @@ class V3Config:
             raise ValueError("qwen.annotation.video.input_mode must be full_video")
         if self.qwen.annotation.video.fps != 2.0:
             raise ValueError("V3 annotation requires qwen video fps to be 2.0")
-        if not self.qwen.annotation.video.do_sample_frames:
+        if self.qwen.annotation.video.do_sample_frames:
             raise ValueError(
-                "V3 annotation requires vLLM to sample the full video input"
+                "V3 annotation must disable HF video re-sampling because "
+                "vLLM already samples the decoded video at the requested fps"
             )
         if (
             not isinstance(self.qwen.annotation.repair_retries, int)
