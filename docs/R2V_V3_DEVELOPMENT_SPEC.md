@@ -225,7 +225,7 @@ qwen:
     video:
       input_mode: full_video
       fps: 2.0
-      do_sample_frames: true
+      do_sample_frames: false
 
   instruction_writer:
     base_url: http://127.0.0.1:8000/v1
