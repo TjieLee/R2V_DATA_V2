@@ -129,6 +129,7 @@ def _config(
     monkeypatch: pytest.MonkeyPatch,
     *,
     debug_overlays: bool = False,
+    with_sam3_model: bool = True,
 ) -> V3Config:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -161,7 +162,11 @@ def _config(
             instruction_writer=QwenServiceConfig(model=str(model)),
         ),
         sam3=Sam3Config(
-            model_path=user_models / "sam3" / "checkpoint.pt",
+            model_path=(
+                user_models / "sam3" / "checkpoint.pt"
+                if with_sam3_model
+                else None
+            ),
             save_debug_overlays=debug_overlays,
         ),
         remove=RemoveConfig(
@@ -195,12 +200,14 @@ def _storage_with_frames(
     *,
     entities: list[AnnotationEntity],
     debug_overlays: bool = False,
+    with_sam3_model: bool = True,
 ) -> tuple[RunStorage, list[Path]]:
     storage = RunStorage(
         _config(
             tmp_path,
             monkeypatch,
             debug_overlays=debug_overlays,
+            with_sam3_model=with_sam3_model,
         )
     )
     storage.initialize(git_commit="segment-test")
@@ -650,6 +657,49 @@ def test_segment_does_not_close_injected_backend(
     segment_clips(storage.config, storage, backend=backend)
 
     assert backend.close_calls == 0
+
+
+def test_segment_requires_model_path_when_creating_real_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+        with_sam3_model=False,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="sam3.model_path must be configured before segment runs",
+    ):
+        segment_clips(storage.config, storage)
+
+
+def test_segment_fake_backend_allows_missing_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+        with_sam3_model=False,
+    )
+    backend = FakeSegmentationBackend(
+        {
+            "e1": _ready(
+                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
+            )
+        }
+    )
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+
+    assert storage.config.sam3.model_path is None
+    assert stats.processed == 1
+    assert storage.read_masks("clip-1").entities["e1"].status == "ready"
 
 
 @pytest.mark.parametrize("enabled", [False, True])

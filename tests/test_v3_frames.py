@@ -13,7 +13,6 @@ from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     QwenServicesConfig,
     RemoveConfig,
-    Sam3Config,
     SourceConfig,
     V3Config,
 )
@@ -117,9 +116,6 @@ def _config(
             annotation=QwenAnnotationConfig(model=str(annotation_model)),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
         ),
-        sam3=Sam3Config(
-            model_path=user_models / "sam3" / "checkpoint.pt"
-        ),
         remove=RemoveConfig(
             base_model_path=pretrained
             / "Qwen"
@@ -202,6 +198,7 @@ def test_frames_stage_writes_ten_chronological_hashed_jpegs(
     stats = sample_frames(storage.config, storage, decoder=decoder)
     artifact = storage.read_frames("clip-1")
 
+    assert storage.config.sam3.model_path is None
     assert stats.processed == 1
     assert artifact.sampled_frame_count == 10
     assert len(artifact.frames) == 10

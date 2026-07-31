@@ -119,8 +119,6 @@ def _config_path(config: V3Config, tmp_path: Path) -> Path:
         f"{source_limit}"
         "  allow_full_run: "
         f"{str(config.source.allow_full_run).lower()}\n"
-        "sam3:\n"
-        f"  model_path: {config.sam3.model_path}\n"
         "qwen:\n"
         "  annotation:\n"
         f"    model: {config.qwen.annotation.model}\n"
@@ -1087,6 +1085,7 @@ def test_pipeline_runs_manifest_and_annotation_with_fake_client(
     video = _video(config)
     _write_source(config, [{"file_path": str(video)}])
     config_path = _config_path(config, tmp_path)
+    assert "sam3:" not in config_path.read_text(encoding="utf-8")
     client = _FakeQwenClient(
         config.qwen.annotation,
         [json.dumps(_payload())],

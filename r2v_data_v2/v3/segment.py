@@ -511,6 +511,10 @@ def segment_clips(
             backend=backend,
         )
 
+    if config.sam3.model_path is None:
+        raise ValueError(
+            "sam3.model_path must be configured before segment runs"
+        )
     owned_backend = Sam3SegmentationBackend(config.sam3)
     try:
         return _segment_clips_with_backend(

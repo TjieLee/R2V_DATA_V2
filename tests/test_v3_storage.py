@@ -402,7 +402,20 @@ def test_v3_config_rejects_unknown_sam3_backend(
         ).validate()
 
 
-def test_v3_config_requires_sam3_model_path_for_sam3_backend(
+def test_v3_config_allows_missing_sam3_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    changed = replace(
+        config,
+        sam3=v3_config_module.Sam3Config(model_path=None),
+    )
+
+    changed.validate()
+
+
+def test_v3_config_rejects_sam3_model_path_outside_allowed_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,11 +423,13 @@ def test_v3_config_requires_sam3_model_path_for_sam3_backend(
 
     with pytest.raises(
         ValueError,
-        match="sam3.model_path is required",
+        match="sam3.model_path must be inside an allowed model root",
     ):
         replace(
             config,
-            sam3=v3_config_module.Sam3Config(model_path=None),
+            sam3=v3_config_module.Sam3Config(
+                model_path=tmp_path / "outside-model.pt"
+            ),
         ).validate()
 
 
@@ -1112,9 +1127,7 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
         f"run_root: {config.run_root}\n"
         f"export_root: {config.export_root}\n"
         "source:\n"
-        "  limit: 100\n"
-        "sam3:\n"
-        f"  model_path: {config.sam3.model_path}\n",
+        "  limit: 100\n",
         encoding="utf-8",
     )
 
