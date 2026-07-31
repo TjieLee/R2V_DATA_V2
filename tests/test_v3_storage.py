@@ -92,7 +92,9 @@ def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
         salience="primary" if entity_id == "e1" else "secondary",
         genericity="generic",
         name_evidence="none",
-        visual_scope="bounded_instance",
+        localization_scope="bounded_instance",
+        scene_role="foreground",
+        representation_mode="real",
         separability="independent",
         selection_reason="visible entity",
     )

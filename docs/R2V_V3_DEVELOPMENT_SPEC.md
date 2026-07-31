@@ -281,12 +281,21 @@ The annotation stage returns semantic content only.
       "salience": "primary|secondary|incidental",
       "genericity": "named|descriptive|generic",
       "name_evidence": "none|draft_caption|metadata|visible_text",
-      "visual_scope": "bounded_instance|coherent_group|scene_region|appearance_effect|depicted_content",
+      "localization_scope": "bounded_instance|coherent_group|unbounded_region|distributed_effect",
+      "scene_role": "foreground|background|embedded_content",
+      "representation_mode": "real|depicted",
       "separability": "independent|attached_accessory|important_independent_object|composite_candidate",
       "selection_reason": "..."
     }
   ],
-  "relations": [],
+  "relations": [
+    {
+      "subject_id": "e1",
+      "predicate": "...",
+      "object_id": "e2",
+      "evidence_phrase": "..."
+    }
+  ],
   "background": {
     "phrase": "...",
     "grounding_prompt": "...",
@@ -307,16 +316,18 @@ The annotation stage returns semantic content only.
 
 ### 7.2 Visual structure
 
-Classify `visual_scope` from the visible structure, not from an entity name:
+Classify three independent questions from the current shot, not from an entity
+name or `canonical_label`:
 
-- `bounded_instance`: an independently localizable instance with a boundary;
-- `coherent_group`: a stable, jointly localizable composition of instances;
-- `scene_region`: a broad environmental or spatial region;
-- `appearance_effect`: lighting, shadow, reflection, smoke, weather, or an effect;
-- `depicted_content`: content in sculpture, painting, photograph, screen, poster, or animation.
+- `localization_scope`: whether the entity is a `bounded_instance`,
+  `coherent_group`, `unbounded_region`, or `distributed_effect`;
+- `scene_role`: whether it is `foreground`, `background`, or
+  `embedded_content`;
+- `representation_mode`: whether it is `real` in the shot or `depicted`
+  through another medium.
 
-`reference_worthy: true` requires `visual_scope` to be `bounded_instance` or
-`coherent_group`, and `separability` to be `independent` or
+`reference_worthy: true` requires bounded localization, `foreground`,
+`real`, and `separability` of `independent` or
 `important_independent_object`. Scene names and `canonical_label` values do not
 define eligibility.
 

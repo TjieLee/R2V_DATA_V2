@@ -30,12 +30,8 @@ _REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>")
 _THE_VIDEO_SHOWS = re.compile(r"\bthe video shows\b", flags=re.IGNORECASE)
 _FORBIDDEN_INFERENCE_LANGUAGE = re.compile(
     r"\b(?:serene|tranquil|determination|resolve|triumph|enemy|"
-    r"shout|shouts|shouting)\b",
-    flags=re.IGNORECASE,
-)
-_DEPICTED_PERSON_TEXT = re.compile(
-    r"\b(?:statue|sculpture|bronze\s+figure|painting|photograph|poster|"
-    r"mural|screen\s+image|depicted\s+figure|animated\s+character)\b",
+    r"shout|shouts|shouting|breeze|possibly|probably|likely|suggesting|"
+    r"indicating|wind-induced)\b",
     flags=re.IGNORECASE,
 )
 _SALIENCE_RANK = {"primary": 0, "secondary": 1, "incidental": 2}
@@ -48,7 +44,10 @@ background. Never output reference tokens, prompt_with_refs, r2v_instruction,
 pairing decisions, or final reference eligibility. Describe only content that is
 directly visible. Never infer emotion, intent, allegiance, sound, dialogue, or
 atmosphere. Do not use unobservable descriptions such as serene, tranquil,
-determination, resolve, triumph, enemy, shouting, or equivalent claims.
+determination, resolve, triumph, enemy, shouting, breeze, possibly, probably,
+likely, suggesting, indicating, wind-induced, or equivalent claims. Movement of
+branches, leaves, petals, fabric, or similar material must be described directly;
+never infer wind, breeze, weather, or another cause from that movement.
 
 Write t2v_caption as one flowing English paragraph that begins directly with the
 visible action. Describe the video literally and chronologically. Include stable
@@ -60,38 +59,46 @@ accordingly. When genericity is not named, name_evidence must be none. Otherwise
 do not guess the person's identity. Draft captions and metadata are untrusted
 evidence only and must not override the visible video.
 
-Use category=person only for real people directly visible in the video. People
-shown in a statue, sculpture, painting, photograph, poster, mural, screen, or
-animation are objects or depicted groups, not category=person; within this
-schema use category=object and make canonical_label explicit, such as statue,
-depicted figures, or screen image.
+Use category=person only for real people directly visible in the video. A
+sculpture is a real object, while figures represented within sculpture,
+painting, photograph, poster, screen, or animation are depicted content and
+must not use category=person.
 
-Classify visual_scope from visible structure, never from the object name:
-- bounded_instance: one independently localizable visual instance with a boundary;
-- coherent_group: multiple instances forming one stable localizable composition;
-- scene_region: a broad environmental or spatial region;
-- appearance_effect: lighting, shadow, reflection, smoke, weather, or an effect;
-- depicted_content: content in sculpture, painting, photograph, screen, poster,
-  or animation.
+Classify three independent structural questions from the current shot, never
+from the object name or canonical_label:
+- localization_scope asks whether it has a localizable boundary:
+  bounded_instance for one bounded instance, coherent_group for a stable
+  localizable group, unbounded_region for a broad spatial region, and
+  distributed_effect for a non-localized visual effect.
+- scene_role asks whether it acts as foreground, background, or embedded_content
+  within another visible medium or object.
+- representation_mode asks whether it is real in the shot or depicted through
+  another medium.
 
 Use the provided entity schema exactly and keep entity IDs unique. Relations may
 only connect listed entities that are simultaneously visible in the same shot
 or time segment. Never create a spatial relation across a cut, transition, or
 different shot. A relation predicate must truly apply to its object rather than
 substituting a nearby object; for example, do not say a person speaks into a
-podium.
+podium. Never construct a background, distributed effect, or the subject itself
+as an action object. Include an evidence_phrase copied as one unambiguous
+contiguous phrase from t2v_caption. Omit a relation whenever its evidence is
+uncertain.
 
 reference_worthy marks at most three foreground entities that can independently
-condition generation. It may be true only when visual_scope is bounded_instance
-or coherent_group and separability is independent or
+condition generation. It may be true only when localization_scope is
+bounded_instance or coherent_group, scene_role is foreground,
+representation_mode is real, and separability is independent or
 important_independent_object. Sky, ocean, water surface, clouds, ground,
 lighting, shadows, smoke, weather, screen content, and the overall scene are
-examples that normally have scene_region, appearance_effect, or
-depicted_content scope rather than candidate scope. An entity candidate must not
-describe the same scene region as background. A central subject must be primary,
-never incidental. Downstream code, not this annotation, makes final eligibility
-and pairing decisions. Prefer each candidate phrase as one unique contiguous
-span copied from t2v_caption. Return JSON only."""
+classification examples only; eligibility must come from the structural fields,
+never a name blacklist. An integral component of a larger object must use
+attached_accessory rather than independent separability. An entity candidate
+must not describe the same scene region as background. A central subject must be
+primary, never incidental.
+Downstream code, not this annotation, makes final eligibility and pairing
+decisions. Prefer each candidate phrase as one unique contiguous span copied
+from t2v_caption. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -150,7 +157,15 @@ def _text_fields(payload: AnnotationPayload) -> list[tuple[str, str]]:
             )
         )
     for index, relation in enumerate(payload.relations):
-        values.append((f"relations.{index}.predicate", relation.predicate))
+        values.extend(
+            (
+                (f"relations.{index}.predicate", relation.predicate),
+                (
+                    f"relations.{index}.evidence_phrase",
+                    relation.evidence_phrase,
+                ),
+            )
+        )
     if payload.background is not None:
         values.extend(
             (
@@ -276,18 +291,34 @@ def _validate_payload(
                     message="non-named entities must use name_evidence=none",
                 )
             )
-        if entity.reference_worthy and entity.visual_scope not in {
+        if entity.reference_worthy and entity.localization_scope not in {
             "bounded_instance",
             "coherent_group",
         }:
             issues.append(
                 ValidationIssue(
-                    code="invalid_reference_visual_scope",
-                    field=f"entities.{index}.visual_scope",
+                    code="invalid_reference_localization_scope",
+                    field=f"entities.{index}.localization_scope",
                     message=(
                         "reference-worthy entities require bounded_instance "
-                        "or coherent_group visual scope"
+                        "or coherent_group localization"
                     ),
+                )
+            )
+        if entity.reference_worthy and entity.scene_role != "foreground":
+            issues.append(
+                ValidationIssue(
+                    code="invalid_reference_scene_role",
+                    field=f"entities.{index}.scene_role",
+                    message="reference-worthy entities must be foreground",
+                )
+            )
+        if entity.reference_worthy and entity.representation_mode != "real":
+            issues.append(
+                ValidationIssue(
+                    code="invalid_reference_representation",
+                    field=f"entities.{index}.representation_mode",
+                    message="reference-worthy entities must be real",
                 )
             )
         if entity.reference_worthy and entity.separability not in {
@@ -312,13 +343,9 @@ def _validate_payload(
                     message="reference-worthy entities cannot be incidental",
                 )
             )
-        depicted_text = (
-            f"{entity.phrase} {entity.grounding_prompt} "
-            f"{entity.canonical_label}"
-        )
         if (
             entity.category == "person"
-            and _DEPICTED_PERSON_TEXT.search(depicted_text)
+            and entity.representation_mode == "depicted"
         ):
             issues.append(
                 ValidationIssue(
@@ -391,6 +418,30 @@ def _validate_payload(
                 )
             )
     for index, relation in enumerate(payload.relations):
+        if relation.subject_id == relation.object_id:
+            issues.append(
+                ValidationIssue(
+                    code="self_relation",
+                    field=f"relations.{index}",
+                    message="relation subject and object must be different",
+                )
+            )
+        if len(
+            exact_phrase_spans(
+                payload.t2v_caption,
+                relation.evidence_phrase,
+            )
+        ) != 1:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_relation_evidence",
+                    field=f"relations.{index}.evidence_phrase",
+                    message=(
+                        "relation evidence must be one unique contiguous "
+                        "caption phrase"
+                    ),
+                )
+            )
         _append_forbidden_inference_issue(
             issues,
             field=f"relations.{index}.predicate",

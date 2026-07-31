@@ -38,13 +38,14 @@ class AnnotationEntity(SchemaModel):
     salience: Literal["primary", "secondary", "incidental"]
     genericity: Literal["named", "descriptive", "generic"]
     name_evidence: Literal["none", "draft_caption", "metadata", "visible_text"]
-    visual_scope: Literal[
+    localization_scope: Literal[
         "bounded_instance",
         "coherent_group",
-        "scene_region",
-        "appearance_effect",
-        "depicted_content",
+        "unbounded_region",
+        "distributed_effect",
     ]
+    scene_role: Literal["foreground", "background", "embedded_content"]
+    representation_mode: Literal["real", "depicted"]
     separability: Literal[
         "independent",
         "attached_accessory",
@@ -58,6 +59,7 @@ class EntityRelation(SchemaModel):
     subject_id: str
     predicate: str
     object_id: str
+    evidence_phrase: str
 
 
 class BackgroundAnnotation(SchemaModel):
