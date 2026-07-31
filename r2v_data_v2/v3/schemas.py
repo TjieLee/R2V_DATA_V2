@@ -23,6 +23,9 @@ class ClipSource(SchemaModel):
     video_path: str
     parent_video_id: str
     clip_suffix: str
+    source_index: int = Field(ge=0)
+    caption_raw: str
+    metadata: dict[str, object]
 
 
 class AnnotationEntity(SchemaModel):
@@ -54,6 +57,13 @@ class BackgroundAnnotation(SchemaModel):
     phrase: str
     grounding_prompt: str
     reference_worthy: bool
+
+
+class AnnotationPayload(SchemaModel):
+    t2v_caption: str
+    entities: list[AnnotationEntity] = Field(default_factory=list)
+    relations: list[EntityRelation] = Field(default_factory=list)
+    background: Optional[BackgroundAnnotation] = None
 
 
 class AnnotationState(SchemaModel):

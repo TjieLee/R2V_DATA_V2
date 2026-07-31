@@ -27,6 +27,13 @@ class ManifestBuildStats:
     missing_videos: int = 0
 
 
+@dataclass(frozen=True)
+class ParsedSourceRecord:
+    video_path: Path
+    caption_raw: str
+    metadata: dict[str, object]
+
+
 def _first_non_whitespace(path: Path) -> str:
     with path.open("rb") as handle:
         while chunk := handle.read(4096):
@@ -76,28 +83,31 @@ def iter_source_records(path: str | Path) -> Iterator[dict[str, Any]]:
     raise ValueError("source JSON object must contain a records or data array")
 
 
-def _record_video_path(raw: dict[str, Any]) -> Path:
+def parse_source_record(raw: dict[str, Any]) -> ParsedSourceRecord:
+    video_path = None
     for key in ("video_path", "source_video_path", "file_path", "video"):
         value = raw.get(key)
         if isinstance(value, str) and value:
-            return Path(value).expanduser().resolve(strict=False)
-    raise ValueError("source record has no video path")
-
-
-def _record_caption(raw: dict[str, Any]) -> str:
+            video_path = Path(value).expanduser().resolve(strict=False)
+            break
+    if video_path is None:
+        raise ValueError("source record has no video path")
+    caption_raw = ""
     for key in ("caption_raw", "caption", "text"):
         value = raw.get(key)
         if isinstance(value, str):
-            return value
-    return ""
-
-
-def _record_identity_metadata(raw: dict[str, Any]) -> dict[str, object]:
-    return {
+            caption_raw = value
+            break
+    metadata = {
         key: raw[key]
         for key in _IDENTITY_METADATA_FIELDS
         if isinstance(raw.get(key), (str, list))
     }
+    return ParsedSourceRecord(
+        video_path=video_path,
+        caption_raw=caption_raw,
+        metadata=metadata,
+    )
 
 
 def _existing_clip_uids(path: Path) -> set[str]:
@@ -147,7 +157,8 @@ def build_manifest(
             break
         selected += 1
         try:
-            video_path = _record_video_path(raw)
+            parsed = parse_source_record(raw)
+            video_path = parsed.video_path
             identity = parse_clip_identity(video_path)
         except ValueError as exc:
             _append_jsonl(
@@ -178,8 +189,8 @@ def build_manifest(
             "source_index": source_index,
             "clip_uid": identity.clip_uid,
             "video_path": str(video_path),
-            "caption_raw": _record_caption(raw),
-            "metadata": _record_identity_metadata(raw),
+            "caption_raw": parsed.caption_raw,
+            "metadata": parsed.metadata,
             "parent_video_id": identity.parent_video_id,
             "clip_suffix": identity.clip_suffix,
             "clip_order": list(identity.clip_order),

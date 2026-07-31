@@ -45,7 +45,7 @@ def _is_strictly_below(path: Path, root: Path) -> bool:
 class QwenVideoConfig:
     input_mode: str = "full_video"
     fps: float = 2.0
-    do_sample_frames: bool = False
+    do_sample_frames: bool = True
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,7 @@ class QwenServiceConfig:
 @dataclass(frozen=True)
 class QwenAnnotationConfig(QwenServiceConfig):
     max_tokens: int = 4096
+    repair_retries: int = 1
     video: QwenVideoConfig = field(default_factory=QwenVideoConfig)
 
 
@@ -71,6 +72,13 @@ class QwenServicesConfig:
     candidate_judge: QwenServiceConfig | None = None
     background_remove_judge: QwenServiceConfig | None = None
     cross_pair_judge: QwenServiceConfig | None = None
+
+
+@dataclass(frozen=True)
+class SourceConfig:
+    start_index: int = 0
+    limit: int | None = None
+    allow_full_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,7 @@ class V3Config:
     dataset_json: Path
     run_root: Path
     export_root: Path
+    source: SourceConfig = field(default_factory=SourceConfig)
     qwen: QwenServicesConfig = field(default_factory=QwenServicesConfig)
     frames: FramesConfig = field(default_factory=FramesConfig)
     sam3: Sam3Config = field(default_factory=Sam3Config)
@@ -151,6 +160,24 @@ class V3Config:
             )
         if dataset.suffix.lower() not in {".json", ".jsonl"}:
             raise ValueError("dataset_json must use .json or .jsonl")
+        if (
+            not isinstance(self.source.start_index, int)
+            or isinstance(self.source.start_index, bool)
+            or self.source.start_index < 0
+        ):
+            raise ValueError("source.start_index must be a non-negative integer")
+        if self.source.limit is not None and (
+            not isinstance(self.source.limit, int)
+            or isinstance(self.source.limit, bool)
+            or self.source.limit < 1
+        ):
+            raise ValueError("source.limit must be a positive integer")
+        if not isinstance(self.source.allow_full_run, bool):
+            raise TypeError("source.allow_full_run must be a boolean")
+        if self.source.limit is None and not self.source.allow_full_run:
+            raise ValueError(
+                "source.limit is required unless source.allow_full_run is true"
+            )
         for field_name, path in (
             ("run_root", run_root),
             ("export_root", export_root),
@@ -185,8 +212,20 @@ class V3Config:
                 )
         if self.qwen.annotation.video.input_mode != "full_video":
             raise ValueError("qwen.annotation.video.input_mode must be full_video")
-        if self.qwen.annotation.video.fps <= 0:
-            raise ValueError("qwen.annotation.video.fps must be positive")
+        if self.qwen.annotation.video.fps != 2.0:
+            raise ValueError("V3 annotation requires qwen video fps to be 2.0")
+        if not self.qwen.annotation.video.do_sample_frames:
+            raise ValueError(
+                "V3 annotation requires vLLM to sample the full video input"
+            )
+        if (
+            not isinstance(self.qwen.annotation.repair_retries, int)
+            or isinstance(self.qwen.annotation.repair_retries, bool)
+            or self.qwen.annotation.repair_retries < 0
+        ):
+            raise ValueError(
+                "qwen.annotation.repair_retries must be a non-negative integer"
+            )
         if self.frames.count != 10:
             raise ValueError("V3 requires exactly 10 sampled frames")
         if self.sam3.minimum_entity_visible_ratio != 0.80:
@@ -341,6 +380,7 @@ def load_config(path: str | Path) -> V3Config:
         "dataset_json",
         "run_root",
         "export_root",
+        "source",
         "qwen",
         "frames",
         "sam3",
@@ -417,6 +457,11 @@ def load_config(path: str | Path) -> V3Config:
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
         run_root=Path(str(raw["run_root"])).expanduser(),
         export_root=Path(str(raw["export_root"])).expanduser(),
+        source=_build(
+            SourceConfig,
+            _mapping(raw.get("source"), "source"),
+            "source",
+        ),
         qwen=qwen,
         frames=_build(
             FramesConfig,

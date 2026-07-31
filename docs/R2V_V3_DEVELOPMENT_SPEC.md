@@ -225,7 +225,7 @@ qwen:
     video:
       input_mode: full_video
       fps: 2.0
-      do_sample_frames: false
+      do_sample_frames: true
 
   instruction_writer:
     base_url: http://127.0.0.1:8000/v1
@@ -243,6 +243,18 @@ qwen:
   cross_pair_judge:
     # independently configurable
 ```
+
+`full_video` means that the pipeline submits the complete local video file.
+Qwen3-VL's vLLM media processor must then sample that video internally at the
+configured 2 FPS. The vLLM service therefore requires these media options:
+
+```text
+--media-io-kwargs '{"video":{"num_frames":-1}}'
+--allowed-local-media-path /mnt/workspace/public/dataset
+```
+
+Choose `tensor-parallel-size` at deployment time based on the GPUs actually
+assigned to the service; V3 does not prescribe a fixed value.
 
 The instruction writer may use a text-only request built from the validated annotation and final bindings. It does not need to resubmit the video unless a later benchmark proves that video input materially improves instruction quality.
 
@@ -787,6 +799,11 @@ dataset_json: /mnt/workspace/public/dataset/jea-video/zicai_5th_moive/train_zica
 run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/pilot40
 export_root: /mnt/workspace/litengjie/data/r2v_v3_datasets/pilot40-v1
 
+source:
+  start_index: 0
+  limit: 5
+  allow_full_run: false
+
 frames:
   count: 10
 
@@ -825,6 +842,9 @@ Validation must reject:
 - `allow_synthetic_completion: true` in the initial V3 implementation;
 - `remove.fallback_to_raw: true`;
 - nonzero `background.raw_foreground_area_ratio` for V3;
+- an empty `source.limit` unless `source.allow_full_run` is `true`;
+- a non-positive or non-integer `source.limit`;
+- a negative `source.start_index`;
 - `frames.count` other than ten unless the user explicitly starts a new experiment.
 
 ---
@@ -930,6 +950,10 @@ Include fixtures for:
 ## 17. Server pilot plan
 
 Do not run full data immediately.
+
+The first annotation smoke run must use `source.limit: 5`. Set
+`source.allow_full_run: true` only for an explicitly authorized full production
+run. Do not default `allow_full_run` to `true` for convenience.
 
 ### 17.1 Annotation A/B
 

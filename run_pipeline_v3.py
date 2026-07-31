@@ -5,7 +5,9 @@ import json
 import subprocess
 from pathlib import Path
 
+from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.config import load_config
+from r2v_data_v2.v3.manifest import build_manifest
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
 
 STAGE_ORDER = (
@@ -20,7 +22,7 @@ STAGE_ORDER = (
     "instruct",
     "export",
 )
-_IMPLEMENTED_STAGES = frozenset({"export"})
+_IMPLEMENTED_STAGES = frozenset({"manifest", "annotate", "export"})
 
 
 def _git_commit() -> str:
@@ -44,6 +46,7 @@ def run_pipeline_v3(
     stages: tuple[str, ...] = (),
     overwrite: bool = False,
     git_commit: str | None = None,
+    annotation_client: AnnotationClient | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -51,9 +54,14 @@ def run_pipeline_v3(
     unavailable = [stage for stage in stages if stage not in _IMPLEMENTED_STAGES]
     if unavailable:
         raise NotImplementedError(
-            "Commit 1 provides storage and export scaffolding only; "
+            "this V3 implementation currently provides manifest, annotate, "
+            "and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
+    requested = set(stages)
+    ordered_stages = tuple(
+        stage for stage in STAGE_ORDER if stage in requested
+    )
     config = load_config(config_path)
     storage = RunStorage(config)
     run = storage.initialize(git_commit=git_commit or _git_commit())
@@ -64,10 +72,22 @@ def run_pipeline_v3(
             "config_hash": run.config_hash,
         }
     }
-    if "export" in stages:
-        dataset = DatasetExporter(config, storage).export(overwrite=overwrite)
-        results["export"] = dataset.model_dump(mode="json")
-    results["completed_stages"] = list(stages)
+    for stage in ordered_stages:
+        if stage == "manifest":
+            results[stage] = build_manifest(config, storage).to_dict()
+        elif stage == "annotate":
+            results[stage] = annotate_clips(
+                config,
+                storage,
+                overwrite=overwrite,
+                client=annotation_client,
+            ).to_dict()
+        else:
+            dataset = DatasetExporter(config, storage).export(
+                overwrite=overwrite
+            )
+            results[stage] = dataset.model_dump(mode="json")
+    results["completed_stages"] = list(ordered_stages)
     return results
 
 
@@ -80,8 +100,8 @@ def main() -> None:
         "--stages",
         default="",
         help=(
-            "comma-separated V3 stages; Commit 1 implements only the export "
-            "storage skeleton"
+            "comma-separated V3 stages; manifest, annotate, and export are "
+            "currently implemented"
         ),
     )
     parser.add_argument(
