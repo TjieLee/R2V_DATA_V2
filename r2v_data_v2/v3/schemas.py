@@ -38,6 +38,13 @@ class AnnotationEntity(SchemaModel):
     salience: Literal["primary", "secondary", "incidental"]
     genericity: Literal["named", "descriptive", "generic"]
     name_evidence: Literal["none", "draft_caption", "metadata", "visible_text"]
+    visual_scope: Literal[
+        "bounded_instance",
+        "coherent_group",
+        "scene_region",
+        "appearance_effect",
+        "depicted_content",
+    ]
     separability: Literal[
         "independent",
         "attached_accessory",

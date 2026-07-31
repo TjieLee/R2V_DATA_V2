@@ -156,6 +156,7 @@ def _payload(
                 "salience": "primary",
                 "genericity": "descriptive",
                 "name_evidence": "none",
+                "visual_scope": "bounded_instance",
                 "separability": "independent",
                 "selection_reason": "stable primary subject",
             },
@@ -169,6 +170,7 @@ def _payload(
                 "salience": "secondary",
                 "genericity": "descriptive",
                 "name_evidence": "none",
+                "visual_scope": "bounded_instance",
                 "separability": "important_independent_object",
                 "selection_reason": "distinct visible object",
             },
@@ -883,6 +885,14 @@ def test_system_prompt_forbids_cross_shot_relations() -> None:
     assert "never create a spatial relation across a cut" in normalized
 
 
+def test_system_prompt_classifies_visual_scope_by_structure() -> None:
+    normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
+    assert "classify visual_scope from visible structure" in normalized
+    assert "never from the object name" in normalized
+    assert "bounded_instance" in normalized
+    assert "depicted_content" in normalized
+
+
 def test_explicit_person_name_from_metadata_is_allowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -992,6 +1002,8 @@ def test_bronze_statue_soldiers_cannot_use_person_category(
             "grounding_prompt": "bronze statue soldiers",
             "canonical_label": "soldiers",
             "category": "person",
+            "reference_worthy": False,
+            "visual_scope": "depicted_content",
         }
     )
 
@@ -1081,6 +1093,7 @@ def test_independent_building_entity_does_not_overlap_background(
             "phrase": "a brick building",
             "grounding_prompt": "brick building",
             "canonical_label": "building",
+            "visual_scope": "bounded_instance",
         }
     )
 
@@ -1093,6 +1106,194 @@ def test_independent_building_entity_does_not_overlap_background(
     assert stats.processed == 1
     assert clip.annotation is not None
     assert clip.annotation.status == "ready"
+
+
+@pytest.mark.parametrize(
+    ("phrase", "canonical_label"),
+    [
+        ("the ocean", "ocean"),
+        ("an alien crystalline landscape", "alien crystalline landscape"),
+    ],
+)
+def test_scene_region_cannot_be_reference_worthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phrase: str,
+    canonical_label: str,
+) -> None:
+    payload = _payload(
+        caption=(
+            f"A woman in a yellow coat walks beside {phrase} as the camera "
+            "tracks backward."
+        )
+    )
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": phrase,
+            "grounding_prompt": phrase,
+            "canonical_label": canonical_label,
+            "visual_scope": "scene_region",
+            "separability": "independent",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "invalid_reference_visual_scope"
+
+
+def test_ocean_patterned_dress_is_allowed_as_bounded_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(
+        caption=(
+            "A woman in a yellow coat walks beside an ocean-patterned dress "
+            "through a sunlit plaza as the camera tracks backward."
+        )
+    )
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "an ocean-patterned dress",
+            "grounding_prompt": "ocean-patterned dress",
+            "canonical_label": "ocean-patterned dress",
+            "category": "product",
+            "visual_scope": "bounded_instance",
+            "separability": "independent",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.processed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+def test_attached_microphone_cannot_be_reference_worthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(
+        caption=(
+            "A woman in a yellow coat holds a microphone in a sunlit plaza as "
+            "the camera tracks backward."
+        )
+    )
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "a microphone",
+            "grounding_prompt": "microphone",
+            "canonical_label": "microphone",
+            "visual_scope": "bounded_instance",
+            "separability": "attached_accessory",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.failed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.reason == "invalid_reference_separability"
+
+
+def test_new_independent_device_is_allowed_as_bounded_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(
+        caption=(
+            "A woman in a yellow coat walks beside a phase lattice calibrator "
+            "through a sunlit plaza as the camera tracks backward."
+        )
+    )
+    entity = payload["entities"][1]
+    assert isinstance(entity, dict)
+    entity.update(
+        {
+            "phrase": "a phase lattice calibrator",
+            "grounding_prompt": "phase lattice calibrator device",
+            "canonical_label": "phase lattice calibrator",
+            "category": "object",
+            "visual_scope": "bounded_instance",
+            "separability": "independent",
+        }
+    )
+
+    stats, clip, _ = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [payload],
+    )
+
+    assert stats.processed == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+@pytest.mark.parametrize("repair_mode", ["visual_scope", "reference_worthy"])
+def test_repair_can_fix_invalid_reference_visual_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repair_mode: str,
+) -> None:
+    invalid = _payload(
+        caption=(
+            "A woman in a yellow coat walks beside a crystalline structure "
+            "through a sunlit plaza as the camera tracks backward."
+        )
+    )
+    invalid_entity = invalid["entities"][1]
+    assert isinstance(invalid_entity, dict)
+    invalid_entity.update(
+        {
+            "phrase": "a crystalline structure",
+            "grounding_prompt": "crystalline structure",
+            "canonical_label": "crystalline structure",
+            "visual_scope": "scene_region",
+            "separability": "independent",
+        }
+    )
+    repaired = json.loads(json.dumps(invalid))
+    repaired_entity = repaired["entities"][1]
+    assert isinstance(repaired_entity, dict)
+    if repair_mode == "visual_scope":
+        repaired_entity["visual_scope"] = "bounded_instance"
+    else:
+        repaired_entity["reference_worthy"] = False
+
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [invalid, repaired],
+        repair_retries=1,
+    )
+
+    assert stats.processed == 1
+    assert stats.repaired == 1
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+    assert "invalid_reference_visual_scope" in str(client.requests[1])
 
 
 @pytest.mark.parametrize(

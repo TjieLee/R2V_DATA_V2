@@ -66,6 +66,14 @@ animation are objects or depicted groups, not category=person; within this
 schema use category=object and make canonical_label explicit, such as statue,
 depicted figures, or screen image.
 
+Classify visual_scope from visible structure, never from the object name:
+- bounded_instance: one independently localizable visual instance with a boundary;
+- coherent_group: multiple instances forming one stable localizable composition;
+- scene_region: a broad environmental or spatial region;
+- appearance_effect: lighting, shadow, reflection, smoke, weather, or an effect;
+- depicted_content: content in sculpture, painting, photograph, screen, poster,
+  or animation.
+
 Use the provided entity schema exactly and keep entity IDs unique. Relations may
 only connect listed entities that are simultaneously visible in the same shot
 or time segment. Never create a spatial relation across a cut, transition, or
@@ -74,13 +82,16 @@ substituting a nearby object; for example, do not say a person speaks into a
 podium.
 
 reference_worthy marks at most three foreground entities that can independently
-condition generation. Sky, ocean, water surface, clouds, ground, lighting,
-shadows, smoke, weather, screen content, and the overall scene are not entity
-reference candidates. An entity candidate must not describe the same scene
-region as background. A central subject must be primary, never incidental.
-Downstream code, not this annotation, makes final eligibility and pairing
-decisions. Prefer each candidate phrase as one unique contiguous span copied
-from t2v_caption. Return JSON only."""
+condition generation. It may be true only when visual_scope is bounded_instance
+or coherent_group and separability is independent or
+important_independent_object. Sky, ocean, water surface, clouds, ground,
+lighting, shadows, smoke, weather, screen content, and the overall scene are
+examples that normally have scene_region, appearance_effect, or
+depicted_content scope rather than candidate scope. An entity candidate must not
+describe the same scene region as background. A central subject must be primary,
+never incidental. Downstream code, not this annotation, makes final eligibility
+and pairing decisions. Prefer each candidate phrase as one unique contiguous
+span copied from t2v_caption. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -263,6 +274,34 @@ def _validate_payload(
                     code="unexpected_name_evidence",
                     field=f"entities.{index}.name_evidence",
                     message="non-named entities must use name_evidence=none",
+                )
+            )
+        if entity.reference_worthy and entity.visual_scope not in {
+            "bounded_instance",
+            "coherent_group",
+        }:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_reference_visual_scope",
+                    field=f"entities.{index}.visual_scope",
+                    message=(
+                        "reference-worthy entities require bounded_instance "
+                        "or coherent_group visual scope"
+                    ),
+                )
+            )
+        if entity.reference_worthy and entity.separability not in {
+            "independent",
+            "important_independent_object",
+        }:
+            issues.append(
+                ValidationIssue(
+                    code="invalid_reference_separability",
+                    field=f"entities.{index}.separability",
+                    message=(
+                        "reference-worthy entities require independent "
+                        "separability"
+                    ),
                 )
             )
         if entity.reference_worthy and entity.salience == "incidental":
