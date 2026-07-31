@@ -799,6 +799,11 @@ dataset_json: /mnt/workspace/public/dataset/jea-video/zicai_5th_moive/train_zica
 run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/pilot40
 export_root: /mnt/workspace/litengjie/data/r2v_v3_datasets/pilot40-v1
 
+source:
+  start_index: 0
+  limit: 5
+  allow_full_run: false
+
 frames:
   count: 10
 
@@ -837,6 +842,9 @@ Validation must reject:
 - `allow_synthetic_completion: true` in the initial V3 implementation;
 - `remove.fallback_to_raw: true`;
 - nonzero `background.raw_foreground_area_ratio` for V3;
+- an empty `source.limit` unless `source.allow_full_run` is `true`;
+- a non-positive or non-integer `source.limit`;
+- a negative `source.start_index`;
 - `frames.count` other than ten unless the user explicitly starts a new experiment.
 
 ---
@@ -942,6 +950,10 @@ Include fixtures for:
 ## 17. Server pilot plan
 
 Do not run full data immediately.
+
+The first annotation smoke run must use `source.limit: 5`. Set
+`source.allow_full_run: true` only for an explicitly authorized full production
+run. Do not default `allow_full_run` to `true` for convenience.
 
 ### 17.1 Annotation A/B
 
