@@ -12,6 +12,7 @@ import numpy as np
 from r2v_data_v2.v3.config import Sam3Config
 
 TrackStatus = Literal["ready", "not_found", "failed"]
+_ANCHOR_PROBE_ORDER = (5, 2, 7, 0, 9)
 
 
 @dataclass(frozen=True)
@@ -193,33 +194,28 @@ class Sam3SegmentationBackend:
         frame_count: int,
         reference_type: str,
         grounding_prompt: str,
-    ) -> tuple[int | None, bool]:
-        candidates: list[
-            tuple[tuple[int, float, int], int]
-        ] = []
+    ) -> tuple[int | None, str | None]:
         ambiguous_instance = False
-        for slot in range(frame_count):
+        for slot in _ANCHOR_PROBE_ORDER:
+            if slot >= frame_count:
+                continue
             observations = self._prompt_frame(
                 predictor,
                 frames_dir=frames_dir,
                 slot=slot,
                 grounding_prompt=grounding_prompt,
             )
-            if reference_type != "group" and len(observations) > 1:
+            if len(observations) > 1:
+                if reference_type == "group":
+                    return None, "unverified_multi_object_group"
                 ambiguous_instance = True
                 continue
             if not observations:
                 continue
-            score = (
-                len(observations),
-                min(item.confidence for item in observations),
-                sum(int(item.mask.sum()) for item in observations),
-            )
-            candidates.append((score, slot))
-        if not candidates:
-            return None, ambiguous_instance
-        candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        return candidates[0][1], ambiguous_instance
+            return slot, None
+        if ambiguous_instance:
+            return None, "ambiguous_multi_object_instance"
+        return None, None
 
     def track(
         self,
@@ -242,7 +238,7 @@ class Sam3SegmentationBackend:
             )
         frames_dir = self._frames_dir(frame_paths)
         predictor = self._load_predictor()
-        anchor_slot, ambiguous_instance = self._find_anchor(
+        anchor_slot, anchor_failure = self._find_anchor(
             predictor,
             frames_dir=frames_dir,
             frame_count=len(frame_paths),
@@ -250,7 +246,12 @@ class Sam3SegmentationBackend:
             grounding_prompt=grounding_prompt,
         )
         if anchor_slot is None:
-            if ambiguous_instance:
+            if anchor_failure == "unverified_multi_object_group":
+                return EntityTrackResult(
+                    status="failed",
+                    reason=anchor_failure,
+                )
+            if anchor_failure == "ambiguous_multi_object_instance":
                 return EntityTrackResult(
                     status="failed",
                     reason=(
@@ -277,7 +278,12 @@ class Sam3SegmentationBackend:
                 int(prompted["frame_index"]),
                 prompted["outputs"],
             )
-            if reference_type != "group" and len(anchored) != 1:
+            if reference_type == "group" and len(anchored) > 1:
+                return EntityTrackResult(
+                    status="failed",
+                    reason="unverified_multi_object_group",
+                )
+            if len(anchored) != 1:
                 return EntityTrackResult(
                     status="failed",
                     reason=(
@@ -329,7 +335,7 @@ class Sam3SegmentationBackend:
         return EntityTrackResult(
             status="ready",
             observations=ordered,
-            group_tracks_verified=reference_type == "group",
+            group_tracks_verified=False,
         )
 
     def close(self) -> None:

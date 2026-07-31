@@ -78,6 +78,9 @@ def _config(
             annotation=QwenAnnotationConfig(model=str(annotation_model)),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
         ),
+        sam3=v3_config_module.Sam3Config(
+            model_path=user_models / "sam3" / "checkpoint.pt"
+        ),
         remove=RemoveConfig(
             base_model_path=remove_model,
             adapter_path=adapter,
@@ -333,7 +336,9 @@ def test_v3_config_loads_32b_defaults_without_model_access(
         f"run_root: {config.run_root}\n"
         f"export_root: {config.export_root}\n"
         "source:\n"
-        "  limit: 100\n",
+        "  limit: 100\n"
+        "sam3:\n"
+        f"  model_path: {config.sam3.model_path}\n",
         encoding="utf-8",
     )
 
@@ -395,6 +400,32 @@ def test_v3_config_rejects_unknown_sam3_backend(
             config,
             sam3=v3_config_module.Sam3Config(backend="unknown"),
         ).validate()
+
+
+def test_v3_config_requires_sam3_model_path_for_sam3_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        ValueError,
+        match="sam3.model_path is required",
+    ):
+        replace(
+            config,
+            sam3=v3_config_module.Sam3Config(model_path=None),
+        ).validate()
+
+
+def test_unimplemented_stage_message_lists_rank(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError) as error:
+        run_pipeline_v3(
+            config_path=tmp_path / "unused.yaml",
+            stages=("background",),
+        )
+
+    assert "segment, rank, instruct" in str(error.value)
 
 
 @pytest.mark.parametrize("required", [0, 11])
@@ -1081,7 +1112,9 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
         f"run_root: {config.run_root}\n"
         f"export_root: {config.export_root}\n"
         "source:\n"
-        "  limit: 100\n",
+        "  limit: 100\n"
+        "sam3:\n"
+        f"  model_path: {config.sam3.model_path}\n",
         encoding="utf-8",
     )
 

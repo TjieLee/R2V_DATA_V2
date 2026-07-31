@@ -29,6 +29,7 @@ from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     QwenServicesConfig,
     RemoveConfig,
+    Sam3Config,
     SourceConfig,
     V3Config,
 )
@@ -87,6 +88,9 @@ def _config(
             ),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
         ),
+        sam3=Sam3Config(
+            model_path=user_models / "sam3" / "checkpoint.pt"
+        ),
         remove=RemoveConfig(
             base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
             adapter_path=(
@@ -115,6 +119,8 @@ def _config_path(config: V3Config, tmp_path: Path) -> Path:
         f"{source_limit}"
         "  allow_full_run: "
         f"{str(config.source.allow_full_run).lower()}\n"
+        "sam3:\n"
+        f"  model_path: {config.sam3.model_path}\n"
         "qwen:\n"
         "  annotation:\n"
         f"    model: {config.qwen.annotation.model}\n"

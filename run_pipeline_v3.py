@@ -73,7 +73,7 @@ def run_pipeline_v3(
     if unavailable:
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
-            "frames, segment, instruct, and export only; "
+            "frames, segment, rank, instruct, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)

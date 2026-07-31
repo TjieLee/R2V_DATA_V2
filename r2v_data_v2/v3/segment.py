@@ -171,16 +171,12 @@ def _entity_masks_from_result(
                 "subject or object"
             ),
         )
-    if (
-        entity.reference_type == "group"
-        and len(all_object_ids) > 1
-        and not result.group_tracks_verified
-    ):
+    if entity.reference_type == "group" and len(all_object_ids) > 1:
         return _failed_entity(
             entity,
             height=height,
             width=width,
-            reason="multiple group tracks were not verified by the backend",
+            reason="unverified_multi_object_group",
         )
 
     frames: list[TrackedMaskFrame] = []
@@ -386,16 +382,15 @@ def _write_debug_overlays(
         )
 
 
-def segment_clips(
+def _segment_clips_with_backend(
     config: V3Config,
     storage: RunStorage,
     *,
-    overwrite: bool = False,
-    backend: SegmentationBackend | None = None,
+    overwrite: bool,
+    backend: SegmentationBackend,
 ) -> SegmentStats:
     processed = skipped_existing = skipped_not_ready = failed = 0
     ready_count = not_found_count = entity_failed_count = 0
-    segmentation_backend = backend
     for clip in storage.iter_clips():
         annotation = clip.annotation
         if annotation is None or annotation.status != "ready":
@@ -429,12 +424,8 @@ def segment_clips(
             storage.prepare_masks_publication(clip.clip_uid)
             tracked_entities: dict[str, TrackedEntityMasks] = {}
             for entity in annotation.entities:
-                if segmentation_backend is None:
-                    segmentation_backend = Sam3SegmentationBackend(
-                        config.sam3
-                    )
                 try:
-                    result = segmentation_backend.track(
+                    result = backend.track(
                         frame_paths=frame_paths,
                         entity_id=entity.entity_id,
                         reference_type=entity.reference_type,
@@ -503,3 +494,30 @@ def segment_clips(
     )
     storage.update_stage_counts("segment", stats.to_dict())
     return stats
+
+
+def segment_clips(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    overwrite: bool = False,
+    backend: SegmentationBackend | None = None,
+) -> SegmentStats:
+    if backend is not None:
+        return _segment_clips_with_backend(
+            config,
+            storage,
+            overwrite=overwrite,
+            backend=backend,
+        )
+
+    owned_backend = Sam3SegmentationBackend(config.sam3)
+    try:
+        return _segment_clips_with_backend(
+            config,
+            storage,
+            overwrite=overwrite,
+            backend=owned_backend,
+        )
+    finally:
+        owned_backend.close()

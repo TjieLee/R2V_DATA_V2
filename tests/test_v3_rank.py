@@ -15,6 +15,7 @@ from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     QwenServicesConfig,
     RemoveConfig,
+    Sam3Config,
     SourceConfig,
     V3Config,
     load_config,
@@ -75,6 +76,9 @@ def _config(
         ),
         coverage=CoverageConfig(
             required_visible_frames=required_visible_frames
+        ),
+        sam3=Sam3Config(
+            model_path=user_models / "sam3" / "checkpoint.pt"
         ),
         remove=RemoveConfig(
             base_model_path=pretrained
@@ -433,6 +437,8 @@ def test_coverage_threshold_loads_from_yaml(
         f"export_root: {config.export_root}\n"
         "source:\n"
         "  limit: 10\n"
+        "sam3:\n"
+        f"  model_path: {config.sam3.model_path}\n"
         "coverage:\n"
         "  required_visible_frames: 8\n",
         encoding="utf-8",

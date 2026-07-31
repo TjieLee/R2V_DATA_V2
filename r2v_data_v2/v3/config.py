@@ -241,21 +241,22 @@ class V3Config:
             raise ValueError("V3 requires exactly 10 sampled frames")
         if self.sam3.backend != "sam3":
             raise ValueError(f"unsupported V3 SAM3 backend: {self.sam3.backend}")
+        if self.sam3.model_path is None:
+            raise ValueError(
+                "sam3.model_path is required when sam3.backend is sam3"
+            )
         if not isinstance(self.sam3.device, str) or not self.sam3.device.strip():
             raise ValueError("sam3.device must be a non-empty string")
         if not isinstance(self.sam3.save_debug_overlays, bool):
             raise TypeError("sam3.save_debug_overlays must be a boolean")
-        if self.sam3.model_path is not None:
-            sam3_model = self.sam3.model_path.expanduser().resolve(
-                strict=False
+        sam3_model = self.sam3.model_path.expanduser().resolve(strict=False)
+        if not (
+            _is_at_or_below(sam3_model, ALLOWED_PRETRAINED_ROOT)
+            or _is_at_or_below(sam3_model, ALLOWED_USER_MODEL_ROOT)
+        ):
+            raise ValueError(
+                "sam3.model_path must be inside an allowed model root"
             )
-            if not (
-                _is_at_or_below(sam3_model, ALLOWED_PRETRAINED_ROOT)
-                or _is_at_or_below(sam3_model, ALLOWED_USER_MODEL_ROOT)
-            ):
-                raise ValueError(
-                    "sam3.model_path must be inside an allowed model root"
-                )
         if (
             not isinstance(self.coverage.required_visible_frames, int)
             or isinstance(self.coverage.required_visible_frames, bool)

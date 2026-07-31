@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as v3_config_module
+import r2v_data_v2.v3.segment as v3_segment_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import (
     QwenAnnotationConfig,
@@ -27,6 +29,7 @@ from r2v_data_v2.v3.mask_codec import (
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
+    Sam3SegmentationBackend,
 )
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -45,6 +48,7 @@ from run_pipeline_v3 import run_pipeline_v3
 class FakeSegmentationBackend:
     results: dict[str, EntityTrackResult | Exception]
     calls: list[dict[str, object]] = field(default_factory=list)
+    close_calls: int = 0
 
     def track(
         self,
@@ -66,6 +70,58 @@ class FakeSegmentationBackend:
         if isinstance(result, Exception):
             raise result
         return result
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+@dataclass
+class FakeSam3Predictor:
+    outputs_by_slot: dict[int, dict[str, object]]
+    prompt_slots: list[int] = field(default_factory=list)
+    next_session_id: int = 0
+
+    def handle_request(self, request: dict[str, object]) -> dict[str, object]:
+        request_type = request["type"]
+        if request_type == "start_session":
+            self.next_session_id += 1
+            return {"session_id": f"session-{self.next_session_id}"}
+        if request_type == "close_session":
+            return {}
+        if request_type == "add_prompt":
+            slot = int(request["frame_index"])
+            self.prompt_slots.append(slot)
+            return {
+                "frame_index": slot,
+                "outputs": self.outputs_by_slot.get(slot, _sam_outputs()),
+            }
+        raise AssertionError(f"unexpected predictor request: {request_type}")
+
+    def handle_stream_request(
+        self,
+        request: dict[str, object],
+    ) -> list[dict[str, object]]:
+        assert request["type"] == "propagate_in_video"
+        return []
+
+
+def _sam_outputs(
+    *masks: np.ndarray,
+) -> dict[str, object]:
+    if not masks:
+        binary_masks = np.zeros((0, 1, 12, 16), dtype=np.uint8)
+    else:
+        binary_masks = np.stack(masks, axis=0)[:, None].astype(np.uint8)
+    return {
+        "out_binary_masks": binary_masks,
+        "out_probs": np.asarray(
+            [0.95 - (index * 0.05) for index in range(len(masks))],
+            dtype=np.float32,
+        ),
+        "out_obj_ids": np.asarray(
+            [f"object-{index}" for index in range(len(masks))]
+        ),
+    }
 
 
 def _config(
@@ -104,7 +160,10 @@ def _config(
             annotation=QwenAnnotationConfig(model=str(model)),
             instruction_writer=QwenServiceConfig(model=str(model)),
         ),
-        sam3=Sam3Config(save_debug_overlays=debug_overlays),
+        sam3=Sam3Config(
+            model_path=user_models / "sam3" / "checkpoint.pt",
+            save_debug_overlays=debug_overlays,
+        ),
         remove=RemoveConfig(
             base_model_path=pretrained
             / "Qwen"
@@ -385,7 +444,7 @@ def test_subject_masks_do_not_union_multiple_backend_instances(
     assert not any(frame.present for frame in result.frames)
 
 
-def test_group_can_union_backend_verified_group_tracks(
+def test_multi_object_group_is_unverified_and_never_unioned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,13 +470,186 @@ def test_group_can_union_backend_verified_group_tracks(
     segment_clips(storage.config, storage, backend=backend)
 
     result = storage.read_masks("clip-1").entities["e1"]
-    frame = result.frames[3]
+    assert result.status == "failed"
+    assert result.reason == "unverified_multi_object_group"
+    assert result.backend_object_ids == []
+    assert not any(frame.present for frame in result.frames)
+
+
+def test_sam3_anchor_probe_order_stops_at_first_valid_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    predictor = FakeSam3Predictor({2: _sam_outputs(_mask())})
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
     assert result.status == "ready"
-    assert result.backend_object_ids == ["member-a", "member-b"]
-    assert frame.backend_object_ids == ["member-a", "member-b"]
-    assert frame.backend_confidences == [0.91, 0.86]
-    assert frame.confidence == 0.86
-    assert frame.area_pixels == int(np.logical_or(first, second).sum())
+    assert predictor.prompt_slots == [5, 2, 2]
+    assert not {7, 0, 9}.intersection(predictor.prompt_slots)
+
+
+def test_sam3_anchor_probe_order_uses_only_configured_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    predictor = FakeSam3Predictor({})
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "not_found"
+    assert predictor.prompt_slots == [5, 2, 7, 0, 9]
+
+
+def test_sam3_multi_object_group_fails_without_propagation_or_union(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1", reference_type="group")],
+    )
+    predictor = FakeSam3Predictor(
+        {5: _sam_outputs(_mask(), _mask(x1=9, x2=12))}
+    )
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="group",
+        grounding_prompt="two visible people",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "unverified_multi_object_group"
+    assert result.group_tracks_verified is False
+    assert predictor.prompt_slots == [5]
+
+
+def test_sam3_single_track_group_is_not_marked_group_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1", reference_type="group")],
+    )
+    predictor = FakeSam3Predictor({5: _sam_outputs(_mask())})
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="group",
+        grounding_prompt="a compact group",
+    )
+
+    assert result.status == "ready"
+    assert result.group_tracks_verified is False
+
+
+def test_segment_closes_only_its_owned_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+
+    class FakeOwnedBackend:
+        instances: ClassVar[list[FakeOwnedBackend]] = []
+
+        def __init__(self, config: Sam3Config) -> None:
+            assert config == storage.config.sam3
+            self.closed = False
+            self.instances.append(self)
+
+        def track(
+            self,
+            *,
+            frame_paths: list[Path],
+            entity_id: str,
+            reference_type: str,
+            grounding_prompt: str,
+        ) -> EntityTrackResult:
+            return _ready(
+                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        v3_segment_module,
+        "Sam3SegmentationBackend",
+        FakeOwnedBackend,
+    )
+
+    segment_clips(storage.config, storage)
+
+    assert len(FakeOwnedBackend.instances) == 1
+    assert FakeOwnedBackend.instances[0].closed is True
+
+
+def test_segment_does_not_close_injected_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    backend = FakeSegmentationBackend(
+        {
+            "e1": _ready(
+                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
+            )
+        }
+    )
+
+    segment_clips(storage.config, storage, backend=backend)
+
+    assert backend.close_calls == 0
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -482,7 +714,9 @@ def test_pipeline_accepts_fake_segment_backend_and_runs_rank(
         f"run_root: {storage.config.run_root}\n"
         f"export_root: {storage.config.export_root}\n"
         "source:\n"
-        "  limit: 10\n",
+        "  limit: 10\n"
+        "sam3:\n"
+        f"  model_path: {storage.config.sam3.model_path}\n",
         encoding="utf-8",
     )
 
