@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-CLIP_SCHEMA_VERSION = "r2v.v3.clip.1"
+CLIP_SCHEMA_VERSION = "r2v.v3.clip.2"
 MASK_SCHEMA_VERSION = "r2v.v3.masks.1"
 RUN_SCHEMA_VERSION = "r2v.v3.run.1"
 DATASET_SCHEMA_VERSION = "r2v.v3.dataset.1"
@@ -28,41 +28,63 @@ class ClipSource(SchemaModel):
     metadata: dict[str, object]
 
 
-class AnnotationEntity(SchemaModel):
-    entity_id: str
+ReferenceType = Literal["subject", "object", "group"]
+
+
+class RawAnnotationEntity(SchemaModel):
+    reference_type: str
     phrase: str
     grounding_prompt: str
-    canonical_label: str
-    category: Literal["person", "animal", "character", "object", "product", "vehicle"]
-    reference_worthy: bool
-    salience: Literal["primary", "secondary", "incidental"]
-    genericity: Literal["named", "descriptive", "generic"]
-    name_evidence: Literal["none", "draft_caption", "metadata", "visible_text"]
-    separability: Literal[
-        "independent",
-        "attached_accessory",
-        "important_independent_object",
-        "composite_candidate",
-    ]
-    selection_reason: str
 
 
-class EntityRelation(SchemaModel):
-    subject_id: str
-    predicate: str
-    object_id: str
+class RawBackgroundAnnotation(SchemaModel):
+    phrase: str
+    grounding_prompt: str
+
+
+class RawAnnotationPayload(SchemaModel):
+    t2v_caption: str
+    entities: list[RawAnnotationEntity]
+    background: Optional[RawBackgroundAnnotation]
+
+
+class AnnotationEntity(SchemaModel):
+    entity_id: str
+    reference_type: ReferenceType
+    phrase: str
+    grounding_prompt: str
+
+    @model_validator(mode="after")
+    def validate_text(self) -> AnnotationEntity:
+        if not self.phrase.strip() or not self.grounding_prompt.strip():
+            raise ValueError("annotation entity text must not be empty")
+        if _ANY_REF_TOKEN.search(self.phrase) or _ANY_REF_TOKEN.search(
+            self.grounding_prompt
+        ):
+            raise ValueError("annotation entity text must not contain reference tokens")
+        return self
 
 
 class BackgroundAnnotation(SchemaModel):
     phrase: str
     grounding_prompt: str
-    reference_worthy: bool
+
+    @model_validator(mode="after")
+    def validate_text(self) -> BackgroundAnnotation:
+        if not self.phrase.strip() or not self.grounding_prompt.strip():
+            raise ValueError("background annotation text must not be empty")
+        if _ANY_REF_TOKEN.search(self.phrase) or _ANY_REF_TOKEN.search(
+            self.grounding_prompt
+        ):
+            raise ValueError(
+                "background annotation text must not contain reference tokens"
+            )
+        return self
 
 
 class AnnotationPayload(SchemaModel):
     t2v_caption: str
     entities: list[AnnotationEntity] = Field(default_factory=list)
-    relations: list[EntityRelation] = Field(default_factory=list)
     background: Optional[BackgroundAnnotation] = None
 
 
@@ -70,7 +92,6 @@ class AnnotationState(SchemaModel):
     status: Literal["ready", "failed"]
     t2v_caption: str = ""
     entities: list[AnnotationEntity] = Field(default_factory=list)
-    relations: list[EntityRelation] = Field(default_factory=list)
     background: Optional[BackgroundAnnotation] = None
     reason: Optional[str] = None
 
@@ -82,16 +103,20 @@ class AnnotationState(SchemaModel):
             raise ValueError("ready annotation requires a non-empty t2v_caption")
         if self.status == "failed" and not self.reason:
             raise ValueError("failed annotation requires a reason")
-        entity_ids = [entity.entity_id for entity in self.entities]
-        if len(entity_ids) != len(set(entity_ids)):
-            raise ValueError("annotation entity_id values must be unique")
-        known_ids = set(entity_ids)
-        if any(
-            relation.subject_id not in known_ids
-            or relation.object_id not in known_ids
-            for relation in self.relations
+        if self.status == "failed" and (
+            self.t2v_caption or self.entities or self.background is not None
         ):
-            raise ValueError("annotation relations must reference known entities")
+            raise ValueError("failed annotation must not publish semantic content")
+        entity_ids = [entity.entity_id for entity in self.entities]
+        expected_entity_ids = [
+            f"e{index}" for index in range(1, len(entity_ids) + 1)
+        ]
+        if entity_ids != expected_entity_ids:
+            raise ValueError(
+                "annotation entity_id values must be contiguous and ordered"
+            )
+        if len(entity_ids) > 3:
+            raise ValueError("annotation supports at most three entities")
         return self
 
 
@@ -303,7 +328,7 @@ class ExportState(SchemaModel):
 
 
 class ClipRecord(SchemaModel):
-    schema_version: Literal["r2v.v3.clip.1"] = CLIP_SCHEMA_VERSION
+    schema_version: Literal["r2v.v3.clip.2"] = CLIP_SCHEMA_VERSION
     clip_uid: str
     source: ClipSource
     annotation: Optional[AnnotationState] = None

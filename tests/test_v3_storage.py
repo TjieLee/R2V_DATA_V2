@@ -84,16 +84,9 @@ def _config(
 def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
     return AnnotationEntity(
         entity_id=entity_id,
+        reference_type="subject" if entity_id == "e1" else "object",
         phrase=phrase,
         grounding_prompt=phrase.lower(),
-        canonical_label=phrase.lower(),
-        category="person" if entity_id == "e1" else "object",
-        reference_worthy=True,
-        salience="primary" if entity_id == "e1" else "secondary",
-        genericity="generic",
-        name_evidence="none",
-        separability="independent",
-        selection_reason="visible entity",
     )
 
 

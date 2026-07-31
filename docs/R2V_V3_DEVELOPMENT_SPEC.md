@@ -164,8 +164,7 @@ Create source clip records only. Do not copy source videos.
 Use full-video input with the 32B annotation model. Produce:
 
 - `t2v_caption`;
-- structured entities;
-- relations;
+- up to three provisional entity candidates;
 - optional background semantics.
 
 Do not generate reference tokens or `r2v_instruction` here.
@@ -267,32 +266,36 @@ The instruction writer may use a text-only request built from the validated anno
 
 The annotation stage returns semantic content only.
 
+Qwen's raw response contains no entity IDs:
+
 ```json
 {
   "t2v_caption": "...",
   "entities": [
     {
-      "entity_id": "e1",
+      "reference_type": "subject",
       "phrase": "...",
-      "grounding_prompt": "...",
-      "canonical_label": "...",
-      "category": "person|animal|character|object|product|vehicle",
-      "reference_worthy": true,
-      "salience": "primary|secondary|incidental",
-      "genericity": "named|descriptive|generic",
-      "name_evidence": "none|draft_caption|metadata|visible_text",
-      "separability": "independent|attached_accessory|important_independent_object|composite_candidate",
-      "selection_reason": "..."
+      "grounding_prompt": "..."
     }
   ],
-  "relations": [],
   "background": {
     "phrase": "...",
-    "grounding_prompt": "...",
-    "reference_worthy": true
+    "grounding_prompt": "..."
   }
 }
 ```
+
+`reference_type` is limited to `subject`, `object`, or `group`. After local
+candidate validation, phrase deduplication, and truncation to three candidates,
+code assigns contiguous IDs `e1`, `e2`, and `e3`. Invalid candidates are
+dropped without discarding a valid caption. An invalid background is normalized
+to `null`. A valid caption with zero retained entities is still a ready
+annotation; later stages own reference eligibility and clip rejection.
+
+The persisted entity schema contains only `entity_id`, `reference_type`,
+`phrase`, and `grounding_prompt`. Relations and the previous category,
+salience, genericity, evidence, visual-scope, separability, and selection-reason
+ontology are not part of V3 annotation schema version 2.
 
 ### 7.1 `t2v_caption` requirements
 
@@ -304,17 +307,13 @@ The annotation stage returns semantic content only.
 - no generation command wording solely to make it look instructional;
 - no unsupported identity, intent, emotion, sound, or dialogue.
 
-### 7.2 Phrase alignment
+### 7.2 Candidate sanitation
 
-Entity phrases may still be aligned to unique spans in `t2v_caption` for auditability, but token insertion no longer depends on exact caption reconstruction.
-
-The code remains responsible for:
-
-- entity caps;
-- deduplication;
-- invalid relation removal;
-- phrase normalization;
-- final reference eligibility.
+Entity candidates are processed in model order. Code strips and normalizes
+candidate text, drops invalid candidates, deduplicates normalized phrases while
+keeping the first occurrence, retains at most three, and assigns entity IDs
+after all filtering. Phrase text is not required to match one exact contiguous
+caption span. Annotation remains separate from final reference eligibility.
 
 ---
 
@@ -624,7 +623,7 @@ Rules:
 
 ```json
 {
-  "schema_version": "r2v.v3.clip.1",
+  "schema_version": "r2v.v3.clip.2",
   "clip_uid": "...",
   "source": {
     "video_path": "...",
@@ -635,7 +634,6 @@ Rules:
     "status": "ready|failed",
     "t2v_caption": "...",
     "entities": [],
-    "relations": [],
     "background": null
   },
   "coverage": {
@@ -663,6 +661,10 @@ Rules:
 ```
 
 This is a simple consolidated record, not a generic workflow engine. Each stage updates only its owned section using atomic file replacement.
+
+`r2v.v3.clip.2` is intentionally incompatible with annotation smoke runs
+written using `r2v.v3.clip.1`. Start a new run root instead of migrating or
+overwriting an older run.
 
 ### 12.3 Run-level files
 
@@ -775,7 +777,9 @@ Each line is one compact training record:
 }
 ```
 
-Keep the final schema minimal. Entity scores, judge reasons, masks, relations, and removal metadata remain in `clip.json` unless a downstream training consumer explicitly requires them.
+Keep the final schema minimal. Entity scores, judge reasons, masks, and removal
+metadata remain in `clip.json` unless a downstream training consumer explicitly
+requires them.
 
 ### 13.3 Reference file format
 
