@@ -38,6 +38,7 @@ from r2v_data_v2.v3.schemas import (
 )
 from r2v_data_v2.v3.segment import segment_clips
 from r2v_data_v2.v3.storage import RunStorage
+from run_pipeline_v3 import run_pipeline_v3
 
 
 @dataclass
@@ -448,3 +449,52 @@ def test_segment_debug_overlays_follow_configuration(
         assert len(list(debug_dir.glob("e1_*.jpg"))) == 10
         assert (debug_dir / "contact_sheet_e1.jpg").is_file()
     assert {path.name: path.read_bytes() for path in frame_paths} == frame_bytes
+
+
+def test_pipeline_accepts_fake_segment_backend_and_runs_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1")
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+    )
+    backend = FakeSegmentationBackend(
+        {
+            "e1": _ready(
+                [
+                    BackendMaskObservation(
+                        slot=slot,
+                        mask=_mask(),
+                        confidence=0.9,
+                        object_id="track-1",
+                    )
+                    for slot in range(7)
+                ]
+            )
+        }
+    )
+    config_path = tmp_path / "v3.yaml"
+    config_path.write_text(
+        f"dataset_json: {storage.config.dataset_json}\n"
+        f"run_root: {storage.config.run_root}\n"
+        f"export_root: {storage.config.export_root}\n"
+        "source:\n"
+        "  limit: 10\n",
+        encoding="utf-8",
+    )
+
+    result = run_pipeline_v3(
+        config_path=config_path,
+        stages=("segment", "rank"),
+        overwrite=True,
+        git_commit="segment-test",
+        segmentation_backend=backend,
+    )
+
+    assert result["completed_stages"] == ["segment", "rank"]
+    coverage = storage.read_clip("clip-1").coverage
+    assert coverage is not None
+    assert coverage.passed is True

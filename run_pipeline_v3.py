@@ -10,6 +10,7 @@ from r2v_data_v2.v3.config import load_config
 from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
 from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
 from r2v_data_v2.v3.manifest import build_manifest
+from r2v_data_v2.v3.rank import rank_temporal_coverage
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.segment import segment_clips
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
@@ -27,7 +28,15 @@ STAGE_ORDER = (
     "export",
 )
 _IMPLEMENTED_STAGES = frozenset(
-    {"manifest", "annotate", "frames", "segment", "instruct", "export"}
+    {
+        "manifest",
+        "annotate",
+        "frames",
+        "segment",
+        "rank",
+        "instruct",
+        "export",
+    }
 )
 
 
@@ -105,6 +114,12 @@ def run_pipeline_v3(
                 overwrite=overwrite,
                 backend=segmentation_backend,
             ).to_dict()
+        elif stage == "rank":
+            results[stage] = rank_temporal_coverage(
+                config,
+                storage,
+                overwrite=overwrite,
+            ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
                 config,
@@ -131,7 +146,7 @@ def main() -> None:
         default="",
         help=(
             "comma-separated V3 stages; manifest, annotate, frames, segment, "
-            "instruct, and export are currently implemented"
+            "rank, instruct, and export are currently implemented"
         ),
     )
     parser.add_argument(

@@ -182,11 +182,91 @@ class SampledFramesArtifact(SchemaModel):
         return self
 
 
+class EntityVisibilitySummary(SchemaModel):
+    status: Literal["ready", "not_found", "failed"]
+    visible_frame_slots: list[int] = Field(default_factory=list)
+    visible_frame_count: int = Field(ge=0, le=10)
+    coverage_ratio: float = Field(ge=0, le=1)
+    qualifies: bool
+    per_frame_area_ratio: list[float]
+    per_frame_confidence: list[Optional[float]]
+
+    @model_validator(mode="after")
+    def validate_visibility(self) -> EntityVisibilitySummary:
+        if (
+            len(self.per_frame_area_ratio) != 10
+            or len(self.per_frame_confidence) != 10
+        ):
+            raise ValueError(
+                "entity visibility diagnostics must contain ten frame slots"
+            )
+        if self.visible_frame_slots != sorted(
+            set(self.visible_frame_slots)
+        ) or any(
+            not 0 <= slot < 10 for slot in self.visible_frame_slots
+        ):
+            raise ValueError(
+                "visible frame slots must be unique, ordered, and in range"
+            )
+        if self.visible_frame_count != len(self.visible_frame_slots):
+            raise ValueError(
+                "visible_frame_count must match visible_frame_slots"
+            )
+        if not math.isclose(
+            self.coverage_ratio,
+            self.visible_frame_count / 10,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "coverage_ratio must match visible_frame_count"
+            )
+        diagnostics = [
+            *self.per_frame_area_ratio,
+            *(
+                value
+                for value in self.per_frame_confidence
+                if value is not None
+            ),
+        ]
+        if any(not math.isfinite(value) for value in diagnostics):
+            raise ValueError("entity visibility diagnostics must be finite")
+        visible_slots = set(self.visible_frame_slots)
+        if any(
+            self.per_frame_confidence[slot] is None
+            for slot in visible_slots
+        ):
+            raise ValueError(
+                "visible frame slots require confidence diagnostics"
+            )
+        if any(
+            self.per_frame_area_ratio[slot] <= 0
+            for slot in visible_slots
+        ):
+            raise ValueError(
+                "visible frame slots require positive area diagnostics"
+            )
+        hidden_slots = set(range(10)) - visible_slots
+        if any(
+            self.per_frame_confidence[slot] is not None
+            or self.per_frame_area_ratio[slot] != 0
+            for slot in hidden_slots
+        ):
+            raise ValueError(
+                "non-visible frame slots must have empty diagnostics"
+            )
+        if self.status != "ready" and self.visible_frame_count:
+            raise ValueError(
+                "non-ready tracked entities cannot have visible frames"
+            )
+        return self
+
+
 class CoverageState(SchemaModel):
     passed: bool
     qualifying_entity_ids: list[str] = Field(default_factory=list)
-    required_visible_frames: Literal[8] = 8
-    entity_visibility_summary: dict[str, dict[str, object]] = Field(
+    required_visible_frames: int = Field(default=7, ge=1, le=10)
+    entity_visibility_summary: dict[str, EntityVisibilitySummary] = Field(
         default_factory=dict
     )
 
@@ -198,6 +278,28 @@ class CoverageState(SchemaModel):
             )
         if len(self.qualifying_entity_ids) != len(set(self.qualifying_entity_ids)):
             raise ValueError("qualifying_entity_ids must be unique")
+        if self.qualifying_entity_ids and not self.entity_visibility_summary:
+            raise ValueError(
+                "qualifying entities require visible-frame summaries"
+            )
+        if self.entity_visibility_summary:
+            expected_qualifying: list[str] = []
+            for entity_id, summary in self.entity_visibility_summary.items():
+                expected = (
+                    summary.status == "ready"
+                    and summary.visible_frame_count
+                    >= self.required_visible_frames
+                )
+                if summary.qualifies != expected:
+                    raise ValueError(
+                        "entity qualifies must match required visible frames"
+                    )
+                if summary.qualifies:
+                    expected_qualifying.append(entity_id)
+            if self.qualifying_entity_ids != expected_qualifying:
+                raise ValueError(
+                    "qualifying entity IDs must match visibility summaries"
+                )
         return self
 
 
@@ -550,6 +652,10 @@ class ClipRecord(SchemaModel):
             if unknown_qualifying:
                 raise ValueError(
                     "coverage qualifying entity IDs must exist in annotation"
+                )
+            if set(self.coverage.entity_visibility_summary) != annotation_ids:
+                raise ValueError(
+                    "coverage visibility summaries must match annotation entities"
                 )
         reference_ids = {
             reference.entity_id for reference in self.references.entities

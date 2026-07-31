@@ -288,6 +288,23 @@ class RunStorage:
     def write_coverage(self, clip_uid: str, value: CoverageState) -> ClipRecord:
         return self._replace_section(clip_uid, "coverage", value)
 
+    def clear_coverage(self, clip_uid: str) -> ClipRecord:
+        current = self.read_clip(clip_uid)
+        updates = {
+            "coverage": None,
+            **_section_updates_after_change("coverage"),
+        }
+        updated = current.model_copy(update=updates)
+        validated = ClipRecord.model_validate(
+            updated.model_dump(mode="json")
+        )
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
+        return validated
+
     def write_references(
         self,
         clip_uid: str,

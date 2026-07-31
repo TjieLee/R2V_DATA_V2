@@ -33,6 +33,7 @@ from r2v_data_v2.v3.schemas import (
     DatasetReference,
     DatasetSample,
     EntityReferenceState,
+    EntityVisibilitySummary,
     ExportState,
     InstructionLegendEntry,
     InstructionState,
@@ -93,6 +94,28 @@ def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
         reference_type="subject" if entity_id == "e1" else "object",
         phrase=phrase,
         grounding_prompt=phrase.lower(),
+    )
+
+
+def _visibility_summary(
+    visible_frame_count: int,
+    *,
+    qualifies: bool,
+) -> EntityVisibilitySummary:
+    return EntityVisibilitySummary(
+        status="ready" if visible_frame_count else "not_found",
+        visible_frame_slots=list(range(visible_frame_count)),
+        visible_frame_count=visible_frame_count,
+        coverage_ratio=visible_frame_count / 10,
+        qualifies=qualifies,
+        per_frame_area_ratio=[
+            0.1 if slot < visible_frame_count else 0.0
+            for slot in range(10)
+        ],
+        per_frame_confidence=[
+            0.9 if slot < visible_frame_count else None
+            for slot in range(10)
+        ],
     )
 
 
@@ -212,7 +235,11 @@ def _create_exportable_clip(
         CoverageState(
             passed=True,
             qualifying_entity_ids=["e1"],
-            required_visible_frames=8,
+            required_visible_frames=7,
+            entity_visibility_summary={
+                "e1": _visibility_summary(7, qualifies=True),
+                "e2": _visibility_summary(3, qualifies=False),
+            },
         ),
     )
     entity_path = storage.selected_path(clip_uid, "e1.png")
@@ -314,6 +341,7 @@ def test_v3_config_loads_32b_defaults_without_model_access(
 
     assert loaded.qwen.annotation.model.endswith("Qwen3-VL-32B-Instruct")
     assert loaded.frames.count == 10
+    assert loaded.coverage.required_visible_frames == 7
     assert loaded.background.raw_foreground_area_ratio == 0.0
     assert loaded.remove.fallback_to_raw is False
 
@@ -369,12 +397,40 @@ def test_v3_config_rejects_unknown_sam3_backend(
         ).validate()
 
 
-def test_coverage_requires_exactly_eight_visible_frames() -> None:
-    with pytest.raises(ValidationError, match="Input should be 8"):
+@pytest.mark.parametrize("required", [0, 11])
+def test_coverage_required_visible_frames_must_be_in_range(
+    required: int,
+) -> None:
+    with pytest.raises(ValidationError, match="greater than or equal|less than"):
+        CoverageState(
+            passed=False,
+            required_visible_frames=required,
+        )
+
+
+def test_coverage_default_is_seven_and_eight_is_also_valid() -> None:
+    assert CoverageState(passed=False).required_visible_frames == 7
+    assert (
         CoverageState(
             passed=True,
             qualifying_entity_ids=["e1"],
-            required_visible_frames=7,
+            required_visible_frames=8,
+            entity_visibility_summary={
+                "e1": _visibility_summary(8, qualifies=True)
+            },
+        ).required_visible_frames
+        == 8
+    )
+
+
+def test_qualifying_coverage_requires_visible_frame_counts() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="visible-frame summaries",
+    ):
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
         )
 
 
@@ -409,7 +465,13 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     )
     storage.write_coverage(
         "clip-1",
-        CoverageState(passed=True, qualifying_entity_ids=["e1"]),
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
+            entity_visibility_summary={
+                "e1": _visibility_summary(7, qualifies=True)
+            },
+        ),
     )
     masks_path = storage.write_masks(
         "clip-1",
@@ -488,12 +550,18 @@ def test_changed_upstream_content_invalidates_only_downstream_sections(
         )
     elif upstream == "coverage":
         assert before.coverage is not None
+        summary = before.coverage.entity_visibility_summary["e1"]
+        confidence = list(summary.per_frame_confidence)
+        confidence[0] = 0.85
         storage.write_coverage(
             "clip-1",
             before.coverage.model_copy(
                 update={
                     "entity_visibility_summary": {
-                        "e1": {"visible_frame_count": 9}
+                        **before.coverage.entity_visibility_summary,
+                        "e1": summary.model_copy(
+                            update={"per_frame_confidence": confidence}
+                        ),
                     }
                 }
             ),
@@ -676,6 +744,9 @@ def test_clip_cross_section_validator_rejects_unknown_qualifying_entity(
     storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
     payload = storage.read_clip("clip-1").model_dump(mode="json")
     payload["coverage"]["qualifying_entity_ids"] = ["missing"]
+    payload["coverage"]["entity_visibility_summary"]["missing"] = (
+        payload["coverage"]["entity_visibility_summary"].pop("e1")
+    )
 
     with pytest.raises(ValidationError, match="must exist in annotation"):
         ClipRecord.model_validate(payload)

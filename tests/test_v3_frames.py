@@ -28,6 +28,7 @@ from r2v_data_v2.v3.schemas import (
     ClipSource,
     CoverageState,
     EntityReferenceState,
+    EntityVisibilitySummary,
     ExportState,
     InstructionState,
     PairingState,
@@ -309,7 +310,19 @@ def test_overwrite_frames_invalidates_masks_and_all_downstream_state(
     )
     storage.write_coverage(
         "clip-1",
-        CoverageState(passed=False),
+        CoverageState(
+            passed=False,
+            entity_visibility_summary={
+                "e1": EntityVisibilitySummary(
+                    status="not_found",
+                    visible_frame_count=0,
+                    coverage_ratio=0.0,
+                    qualifies=False,
+                    per_frame_area_ratio=[0.0] * 10,
+                    per_frame_confidence=[None] * 10,
+                )
+            },
+        ),
     )
     storage.write_references(
         "clip-1",

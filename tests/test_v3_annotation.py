@@ -37,6 +37,7 @@ from r2v_data_v2.v3.schemas import (
     ClipRecord,
     CoverageState,
     EntityReferenceState,
+    EntityVisibilitySummary,
     ExportState,
     InstructionLegendEntry,
     InstructionState,
@@ -239,9 +240,33 @@ def _annotate_payloads(
 
 
 def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    summaries = {}
+    for index, entity in enumerate(clip.annotation.entities):
+        visible_frame_count = 7 if index == 0 else 3
+        summaries[entity.entity_id] = EntityVisibilitySummary(
+            status="ready",
+            visible_frame_slots=list(range(visible_frame_count)),
+            visible_frame_count=visible_frame_count,
+            coverage_ratio=visible_frame_count / 10,
+            qualifies=index == 0,
+            per_frame_area_ratio=(
+                [0.1] * visible_frame_count
+                + [0.0] * (10 - visible_frame_count)
+            ),
+            per_frame_confidence=(
+                [0.9] * visible_frame_count
+                + [None] * (10 - visible_frame_count)
+            ),
+        )
     storage.write_coverage(
         clip_uid,
-        CoverageState(passed=True, qualifying_entity_ids=["e1"]),
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
+            entity_visibility_summary=summaries,
+        ),
     )
     storage.write_references(
         clip_uid,

@@ -95,6 +95,11 @@ class Sam3Config:
 
 
 @dataclass(frozen=True)
+class CoverageConfig:
+    required_visible_frames: int = 7
+
+
+@dataclass(frozen=True)
 class ReferenceScopeConfig:
     enabled: bool = True
     allow_local: bool = True
@@ -138,6 +143,7 @@ class V3Config:
     qwen: QwenServicesConfig = field(default_factory=QwenServicesConfig)
     frames: FramesConfig = field(default_factory=FramesConfig)
     sam3: Sam3Config = field(default_factory=Sam3Config)
+    coverage: CoverageConfig = field(default_factory=CoverageConfig)
     reference_scope: ReferenceScopeConfig = field(
         default_factory=ReferenceScopeConfig
     )
@@ -250,6 +256,19 @@ class V3Config:
                 raise ValueError(
                     "sam3.model_path must be inside an allowed model root"
                 )
+        if (
+            not isinstance(self.coverage.required_visible_frames, int)
+            or isinstance(self.coverage.required_visible_frames, bool)
+            or not (
+                1
+                <= self.coverage.required_visible_frames
+                <= self.frames.count
+            )
+        ):
+            raise ValueError(
+                "coverage.required_visible_frames must be between 1 and "
+                "frames.count"
+            )
         if (
             not isinstance(self.instruction.repair_retries, int)
             or isinstance(self.instruction.repair_retries, bool)
@@ -417,6 +436,7 @@ def load_config(path: str | Path) -> V3Config:
         "qwen",
         "frames",
         "sam3",
+        "coverage",
         "reference_scope",
         "background",
         "remove",
@@ -513,6 +533,11 @@ def load_config(path: str | Path) -> V3Config:
             Sam3Config,
             sam3_values,
             "sam3",
+        ),
+        coverage=_build(
+            CoverageConfig,
+            _mapping(raw.get("coverage"), "coverage"),
+            "coverage",
         ),
         reference_scope=_build(
             ReferenceScopeConfig,
