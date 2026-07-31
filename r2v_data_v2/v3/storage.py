@@ -30,6 +30,7 @@ from r2v_data_v2.v3.schemas import (
     PairingState,
     ReferencesState,
     RunRecord,
+    SampledFramesArtifact,
     TrackedMasksArtifact,
 )
 
@@ -38,6 +39,7 @@ _EXPORT_TOKEN = re.compile(r"<ref_(subject|object|group|bg)_(\d+)>")
 _UTC = getattr(datetime_module, "UTC", timezone.utc)  # noqa: UP017 - Python 3.9 CI
 _SECTION_INVALIDATIONS = {
     "annotation": ("coverage", "references", "pairing", "instruction", "export"),
+    "frames": ("coverage", "references", "pairing", "instruction", "export"),
     "masks": ("coverage", "references", "pairing", "instruction", "export"),
     "coverage": ("references", "pairing", "instruction", "export"),
     "references": ("pairing", "instruction", "export"),
@@ -260,8 +262,21 @@ class RunStorage:
         }
         updated = current.model_copy(update=updates)
         validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
+        self._invalidate_artifacts_after_change(clip_uid, section)
         write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         return validated
+
+    def _invalidate_artifacts_after_change(
+        self,
+        clip_uid: str,
+        section: str,
+    ) -> None:
+        if section == "annotation":
+            frames_dir = self.frames_dir(clip_uid)
+            if frames_dir.exists():
+                shutil.rmtree(frames_dir)
+        if section in {"annotation", "frames"}:
+            self.masks_path(clip_uid).unlink(missing_ok=True)
 
     def write_annotation(
         self,
@@ -272,6 +287,23 @@ class RunStorage:
 
     def write_coverage(self, clip_uid: str, value: CoverageState) -> ClipRecord:
         return self._replace_section(clip_uid, "coverage", value)
+
+    def clear_coverage(self, clip_uid: str) -> ClipRecord:
+        current = self.read_clip(clip_uid)
+        updates = {
+            "coverage": None,
+            **_section_updates_after_change("coverage"),
+        }
+        updated = current.model_copy(update=updates)
+        validated = ClipRecord.model_validate(
+            updated.model_dump(mode="json")
+        )
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
+        return validated
 
     def write_references(
         self,
@@ -301,7 +333,7 @@ class RunStorage:
         self._require_clip(clip_uid)
         if value.clip_uid != clip_uid:
             raise ValueError("mask artifact clip_uid does not match destination")
-        destination = self.clip_dir(clip_uid) / "masks.rle.json"
+        destination = self.masks_path(clip_uid)
         if destination.is_file():
             existing = TrackedMasksArtifact.model_validate_json(
                 destination.read_text(encoding="utf-8")
@@ -317,6 +349,60 @@ class RunStorage:
             write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         write_json_atomic(destination, _model_dict(value))
         return destination
+
+    def frames_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "frames"
+
+    def frames_manifest_path(self, clip_uid: str) -> Path:
+        return self.frames_dir(clip_uid) / "frames.json"
+
+    def masks_path(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "masks.rle.json"
+
+    def read_frames(self, clip_uid: str) -> SampledFramesArtifact:
+        return SampledFramesArtifact.model_validate_json(
+            self.frames_manifest_path(clip_uid).read_text(encoding="utf-8")
+        )
+
+    def read_masks(self, clip_uid: str) -> TrackedMasksArtifact:
+        return TrackedMasksArtifact.model_validate_json(
+            self.masks_path(clip_uid).read_text(encoding="utf-8")
+        )
+
+    def prepare_frames_publication(self, clip_uid: str) -> None:
+        self._require_clip(clip_uid)
+        current = self.read_clip(clip_uid)
+        invalidated = current.model_copy(
+            update=_section_updates_after_change("frames")
+        )
+        validated = ClipRecord.model_validate(
+            invalidated.model_dump(mode="json")
+        )
+        self._invalidate_artifacts_after_change(clip_uid, "frames")
+        self.frames_manifest_path(clip_uid).unlink(missing_ok=True)
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
+
+    def prepare_masks_publication(self, clip_uid: str) -> None:
+        self._require_clip(clip_uid)
+        current = self.read_clip(clip_uid)
+        invalidated = current.model_copy(
+            update=_section_updates_after_change("masks")
+        )
+        validated = ClipRecord.model_validate(
+            invalidated.model_dump(mode="json")
+        )
+        self.masks_path(clip_uid).unlink(missing_ok=True)
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
 
     def frame_path(self, clip_uid: str, frame_slot: int) -> Path:
         self._require_clip(clip_uid)
@@ -340,6 +426,17 @@ class RunStorage:
         safe_name = _safe_component(filename, "debug filename")
         destination = self.clip_dir(clip_uid) / "debug" / safe_name
         destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def segment_debug_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        if not (
+            self.config.debug.save_diagnostics
+            or self.config.sam3.save_debug_overlays
+        ):
+            raise RuntimeError("segment debug artifact saving is disabled")
+        destination = self.clip_dir(clip_uid) / "debug" / "segment"
+        destination.mkdir(parents=True, exist_ok=True)
         return destination
 
     def relative_artifact_path(self, path: Path) -> str:

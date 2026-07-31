@@ -174,15 +174,45 @@ Do not generate reference tokens or `r2v_instruction` here.
 
 #### `frames`
 
-Sample exactly ten chronological JPEG frames for SAM3 and ranking. This remains independent from Qwen video sampling.
+Sample exactly ten unique chronological JPEG frames from the complete source
+video for SAM3 and ranking. Selection is deterministic over all decodable
+frames, includes the first and last decoded frame, and records the source frame
+index, real timestamp, relative image path, and SHA-256 in `frames/frames.json`.
+This remains independent from Qwen video sampling. A video with fewer than ten
+distinct decodable frames fails this stage for that clip.
 
 #### `segment`
 
-Run SAM3 tracking and store all tracked masks in one clip-level mask artifact.
+Run each annotation entity independently through the lazily loaded SAM3
+text-grounded video predictor and store all ten slots in one strongly typed
+clip-level `masks.rle.json`. After selecting an anchor, run forward and backward
+propagation in independent sessions, reapplying the same prompt at the anchor in
+each session. SAM3 object IDs are session-local: validate the two anchor masks
+with IoU before remapping the backward track to the forward canonical ID. Merge
+anchor, forward, and backward masks deterministically without allowing a lower
+priority duplicate to overwrite an earlier result. The published anchor mask
+comes exclusively from `add_prompt`; forward propagation owns only frames after
+the anchor, and backward propagation owns only frames before it. Propagation
+responses at the anchor are ignored because SAM3 may re-estimate a slightly
+different boundary for the same frame. The independent forward and backward
+`add_prompt` anchor masks are still checked for identity consistency at IoU
+`>= 0.95`. A failed entity is recorded without blocking other entities; a clip
+with zero entities publishes an empty, ready mask artifact without loading
+SAM3. Single-subject, single-object, and current first-pass group tracking
+retain exactly one identity rather than unioning unrelated detections.
+Multi-object groups remain unverified and are rejected.
+
+SAM3 `out_probs` values are published object-score diagnostics propagated with
+the track. They are not independently estimated per-frame tracking confidence,
+and temporal visibility must not threshold on them. Visibility continues to
+depend only on a ready entity, a present non-empty mask, and `track_valid`.
 
 #### `rank`
 
-Evaluate candidates, temporal coverage, full/local/reject scope, and selected canonical entity references.
+The current implementation computes temporal coverage only from
+`masks.rle.json`. It does not rerun SAM3, select canonical frames, classify
+full/local/reject scope, or publish references. Later ranking work may add
+those separate reference-quality decisions.
 
 #### `background`
 
@@ -198,7 +228,9 @@ Remove foreground entities from pending backgrounds using the configured Qwen Im
 
 #### `pair`
 
-Choose the final retained references and assign deterministic tokens. The clip-level 8/10 coverage semantics remain unchanged from the corrected V2 behavior.
+Choose the final retained references and assign deterministic tokens. The
+clip-level coverage gate uses ANY-entity semantics and defaults to 7/10, with
+the integer threshold configurable independently from SAM3.
 
 #### `instruct`
 
@@ -530,7 +562,10 @@ Do not integrate the backend into full-data execution before this benchmark is r
 V3 preserves the corrected clip-level coverage semantics:
 
 - sample ten frames;
-- a clip passes when at least one reference-worthy entity is visible in at least eight of ten frames;
+- a clip passes when at least one annotated entity reaches
+  `coverage.required_visible_frames`;
+- the default is seven of ten frames, and the integer threshold may be changed
+  from 1 through 10 without rerunning SAM3;
 - once a clip passes, other shorter-lived entities may remain if they have ready references;
 - the final sample must bind at least one qualifying entity;
 - an entity without a final reference remains in natural language but has no token;
@@ -669,13 +704,15 @@ Required layout:
         ├── frames/
         │   ├── 00.jpg
         │   ├── 01.jpg
-        │   └── ... 09.jpg
+        │   ├── ... 09.jpg
+        │   └── frames.json
         ├── masks.rle.json
         ├── selected/
         │   ├── e1.png
         │   ├── e2.png
         │   └── bg_removed.png
         └── debug/                 # created only when debug saving is enabled
+            └── segment/           # per-slot overlays and entity contact sheets
 ```
 
 Rules:
@@ -683,7 +720,12 @@ Rules:
 - One `clip.json` is the authoritative metadata record for the clip.
 - Do not create separate `annotations.json`, `ranking_metadata.json`, `reference_metadata.json`, `inpainting_metadata.json`, per-stage sample JSON, and repeated JSONL records for the same clip.
 - Do not copy the ten sampled frames into additional candidate directories.
+- Publish sampled JPEGs atomically and publish `frames.json` last. Its image
+  paths are relative to the clip directory.
 - Store all tracked masks in one `masks.rle.json` per clip.
+- `masks.rle.json` stores every ordered slot, including absent masks, and uses
+  validated two-dimensional binary run-length encoding at the sampled frame
+  dimensions.
 - Store only selected entity images in `selected/`.
 - Store only an accepted removed background in `selected/bg_removed.png`.
 - A clean raw background points to its selected sampled frame and does not require a duplicate image in `selected/`.
@@ -711,7 +753,19 @@ Rules:
   },
   "coverage": {
     "passed": true,
-    "qualifying_entity_ids": ["e1"]
+    "qualifying_entity_ids": ["e1"],
+    "required_visible_frames": 7,
+    "entity_visibility_summary": {
+      "e1": {
+        "status": "ready",
+        "visible_frame_slots": [0, 1, 2, 3, 4, 5, 6],
+        "visible_frame_count": 7,
+        "coverage_ratio": 0.7,
+        "qualifies": true,
+        "per_frame_area_ratio": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.0, 0.0, 0.0],
+        "per_frame_confidence": [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, null, null, null]
+      }
+    }
   },
   "references": {
     "entities": [],
@@ -739,6 +793,10 @@ Rules:
   }
 }
 ```
+
+`per_frame_confidence` is a compatibility field name in the current schema. For
+SAM3 masks it stores the per-frame published object-score diagnostic described
+above, not an independent tracking-confidence estimate.
 
 This is a simple consolidated record, not a generic workflow engine. Each stage updates only its owned section using atomic file replacement.
 
@@ -895,7 +953,13 @@ frames:
   count: 10
 
 sam3:
-  minimum_entity_visible_ratio: 0.80
+  backend: sam3
+  model_path: /mnt/workspace/litengjie/data/models/sam3/checkpoint.pt
+  device: cuda
+  save_debug_overlays: false
+
+coverage:
+  required_visible_frames: 7
 
 reference_scope:
   enabled: true
@@ -923,10 +987,16 @@ debug:
   save_diagnostics: false
 ```
 
+The SAM3 checkpoint path above is an example within the writable model root.
+Verify the installed SAM3 package and checkpoint path on the server before the
+first real run. The adapter imports and loads the model only when `segment`
+needs it and passes only arguments exposed by the installed builder API.
+
 Validation must reject:
 
 - writable output roots outside `/mnt/workspace/litengjie/data/**`;
 - model downloads into public paths;
+- `coverage.required_visible_frames` outside 1 through `frames.count`;
 - `allow_synthetic_completion: true` in the initial V3 implementation;
 - `remove.fallback_to_raw: true`;
 - nonzero `background.raw_foreground_area_ratio` for V3;
@@ -1028,7 +1098,8 @@ Include fixtures for:
 
 ### 16.5 Pairing and export tests
 
-- clip-level 8/10 gate uses ANY semantics;
+- clip-level coverage defaults to 7/10, is configurable, and uses ANY
+  semantics;
 - shorter-lived ready references remain after another entity qualifies the clip;
 - every accepted sample binds at least one qualifying entity;
 - final reference order and instruction image bindings match exactly;
@@ -1043,6 +1114,9 @@ Do not run full data immediately.
 
 The first annotation smoke run must use `source.limit: 5`. Set
 `source.allow_full_run: true` only for an explicitly authorized full production
+run. For the first real SAM3 smoke, enable segment overlays and inspect every
+per-slot overlay and contact sheet manually; mask counts alone are not
+sufficient validation.
 run. Do not default `allow_full_run` to `true` for convenience.
 
 ### 17.1 Annotation A/B

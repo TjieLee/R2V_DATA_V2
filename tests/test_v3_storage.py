@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ from r2v_data_v2.v3.config import (
     V3Config,
     load_config,
 )
+from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
@@ -31,11 +33,14 @@ from r2v_data_v2.v3.schemas import (
     DatasetReference,
     DatasetSample,
     EntityReferenceState,
+    EntityVisibilitySummary,
     ExportState,
     InstructionLegendEntry,
     InstructionState,
     PairingState,
     ReferencesState,
+    TrackedEntityMasks,
+    TrackedMaskFrame,
     TrackedMasksArtifact,
     render_instruction_text,
 )
@@ -73,6 +78,9 @@ def _config(
             annotation=QwenAnnotationConfig(model=str(annotation_model)),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
         ),
+        sam3=v3_config_module.Sam3Config(
+            model_path=user_models / "sam3" / "checkpoint.pt"
+        ),
         remove=RemoveConfig(
             base_model_path=remove_model,
             adapter_path=adapter,
@@ -89,6 +97,28 @@ def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
         reference_type="subject" if entity_id == "e1" else "object",
         phrase=phrase,
         grounding_prompt=phrase.lower(),
+    )
+
+
+def _visibility_summary(
+    visible_frame_count: int,
+    *,
+    qualifies: bool,
+) -> EntityVisibilitySummary:
+    return EntityVisibilitySummary(
+        status="ready" if visible_frame_count else "not_found",
+        visible_frame_slots=list(range(visible_frame_count)),
+        visible_frame_count=visible_frame_count,
+        coverage_ratio=visible_frame_count / 10,
+        qualifies=qualifies,
+        per_frame_area_ratio=[
+            0.1 if slot < visible_frame_count else 0.0
+            for slot in range(10)
+        ],
+        per_frame_confidence=[
+            0.9 if slot < visible_frame_count else None
+            for slot in range(10)
+        ],
     )
 
 
@@ -145,14 +175,39 @@ def _tracked_masks(
     *,
     counts: str = "encoded",
 ) -> TrackedMasksArtifact:
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[1:3, 2:4] = True
+    confidence = 0.9 if counts == "encoded" else 0.8
+    empty = encode_binary_mask(np.zeros_like(mask))
     return TrackedMasksArtifact(
         clip_uid=clip_uid,
+        height=4,
+        width=5,
         entities={
-            "e1": {
-                "slots": {
-                    "0": {"mask_available": True, "counts": counts}
-                }
-            }
+            "e1": TrackedEntityMasks(
+                status="ready",
+                reference_type="subject",
+                grounding_prompt="a woman",
+                backend_object_ids=["7"],
+                frames=[
+                    TrackedMaskFrame(
+                        slot=slot,
+                        present=slot == 0,
+                        confidence=confidence if slot == 0 else None,
+                        backend_confidences=(
+                            [confidence] if slot == 0 else []
+                        ),
+                        backend_object_ids=["7"] if slot == 0 else [],
+                        area_pixels=int(mask.sum()) if slot == 0 else 0,
+                        area_ratio=(
+                            float(mask.mean()) if slot == 0 else 0.0
+                        ),
+                        bbox_xyxy=(2, 1, 4, 3) if slot == 0 else None,
+                        rle=encode_binary_mask(mask) if slot == 0 else empty,
+                    )
+                    for slot in range(10)
+                ],
+            )
         },
     )
 
@@ -183,7 +238,11 @@ def _create_exportable_clip(
         CoverageState(
             passed=True,
             qualifying_entity_ids=["e1"],
-            required_visible_frames=8,
+            required_visible_frames=7,
+            entity_visibility_summary={
+                "e1": _visibility_summary(7, qualifies=True),
+                "e2": _visibility_summary(3, qualifies=False),
+            },
         ),
     )
     entity_path = storage.selected_path(clip_uid, "e1.png")
@@ -277,7 +336,9 @@ def test_v3_config_loads_32b_defaults_without_model_access(
         f"run_root: {config.run_root}\n"
         f"export_root: {config.export_root}\n"
         "source:\n"
-        "  limit: 100\n",
+        "  limit: 100\n"
+        "sam3:\n"
+        f"  model_path: {config.sam3.model_path}\n",
         encoding="utf-8",
     )
 
@@ -285,6 +346,7 @@ def test_v3_config_loads_32b_defaults_without_model_access(
 
     assert loaded.qwen.annotation.model.endswith("Qwen3-VL-32B-Instruct")
     assert loaded.frames.count == 10
+    assert loaded.coverage.required_visible_frames == 7
     assert loaded.background.raw_foreground_area_ratio == 0.0
     assert loaded.remove.fallback_to_raw is False
 
@@ -327,27 +389,94 @@ def test_v3_config_rejects_non_negotiable_policy_changes(
         replace(config, **{field: value}).validate()
 
 
-def test_v3_config_rejects_nonstandard_entity_visible_ratio(
+def test_v3_config_rejects_unknown_sam3_backend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
 
-    with pytest.raises(ValueError, match="exactly 0.80"):
+    with pytest.raises(ValueError, match="unsupported V3 SAM3 backend"):
+        replace(
+            config,
+            sam3=v3_config_module.Sam3Config(backend="unknown"),
+        ).validate()
+
+
+def test_v3_config_allows_missing_sam3_model_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    changed = replace(
+        config,
+        sam3=v3_config_module.Sam3Config(model_path=None),
+    )
+
+    changed.validate()
+
+
+def test_v3_config_rejects_sam3_model_path_outside_allowed_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        ValueError,
+        match="sam3.model_path must be inside an allowed model root",
+    ):
         replace(
             config,
             sam3=v3_config_module.Sam3Config(
-                minimum_entity_visible_ratio=0.5
+                model_path=tmp_path / "outside-model.pt"
             ),
         ).validate()
 
 
-def test_coverage_requires_exactly_eight_visible_frames() -> None:
-    with pytest.raises(ValidationError, match="Input should be 8"):
+def test_unimplemented_stage_message_lists_rank(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError) as error:
+        run_pipeline_v3(
+            config_path=tmp_path / "unused.yaml",
+            stages=("background",),
+        )
+
+    assert "segment, rank, instruct" in str(error.value)
+
+
+@pytest.mark.parametrize("required", [0, 11])
+def test_coverage_required_visible_frames_must_be_in_range(
+    required: int,
+) -> None:
+    with pytest.raises(ValidationError, match="greater than or equal|less than"):
+        CoverageState(
+            passed=False,
+            required_visible_frames=required,
+        )
+
+
+def test_coverage_default_is_seven_and_eight_is_also_valid() -> None:
+    assert CoverageState(passed=False).required_visible_frames == 7
+    assert (
         CoverageState(
             passed=True,
             qualifying_entity_ids=["e1"],
-            required_visible_frames=7,
+            required_visible_frames=8,
+            entity_visibility_summary={
+                "e1": _visibility_summary(8, qualifies=True)
+            },
+        ).required_visible_frames
+        == 8
+    )
+
+
+def test_qualifying_coverage_requires_visible_frame_counts() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="visible-frame summaries",
+    ):
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
         )
 
 
@@ -382,7 +511,13 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     )
     storage.write_coverage(
         "clip-1",
-        CoverageState(passed=True, qualifying_entity_ids=["e1"]),
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
+            entity_visibility_summary={
+                "e1": _visibility_summary(7, qualifies=True)
+            },
+        ),
     )
     masks_path = storage.write_masks(
         "clip-1",
@@ -461,12 +596,18 @@ def test_changed_upstream_content_invalidates_only_downstream_sections(
         )
     elif upstream == "coverage":
         assert before.coverage is not None
+        summary = before.coverage.entity_visibility_summary["e1"]
+        confidence = list(summary.per_frame_confidence)
+        confidence[0] = 0.85
         storage.write_coverage(
             "clip-1",
             before.coverage.model_copy(
                 update={
                     "entity_visibility_summary": {
-                        "e1": {"visible_frame_count": 9}
+                        **before.coverage.entity_visibility_summary,
+                        "e1": summary.model_copy(
+                            update={"per_frame_confidence": confidence}
+                        ),
                     }
                 }
             ),
@@ -649,6 +790,9 @@ def test_clip_cross_section_validator_rejects_unknown_qualifying_entity(
     storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
     payload = storage.read_clip("clip-1").model_dump(mode="json")
     payload["coverage"]["qualifying_entity_ids"] = ["missing"]
+    payload["coverage"]["entity_visibility_summary"]["missing"] = (
+        payload["coverage"]["entity_visibility_summary"].pop("e1")
+    )
 
     with pytest.raises(ValidationError, match="must exist in annotation"):
         ClipRecord.model_validate(payload)

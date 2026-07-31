@@ -7,8 +7,12 @@ from pathlib import Path
 
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.config import load_config
+from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
 from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
 from r2v_data_v2.v3.manifest import build_manifest
+from r2v_data_v2.v3.rank import rank_temporal_coverage
+from r2v_data_v2.v3.sam3_backend import SegmentationBackend
+from r2v_data_v2.v3.segment import segment_clips
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
 
 STAGE_ORDER = (
@@ -24,7 +28,15 @@ STAGE_ORDER = (
     "export",
 )
 _IMPLEMENTED_STAGES = frozenset(
-    {"manifest", "annotate", "instruct", "export"}
+    {
+        "manifest",
+        "annotate",
+        "frames",
+        "segment",
+        "rank",
+        "instruct",
+        "export",
+    }
 )
 
 
@@ -50,6 +62,8 @@ def run_pipeline_v3(
     overwrite: bool = False,
     git_commit: str | None = None,
     annotation_client: AnnotationClient | None = None,
+    frame_decoder: FrameDecoder | None = None,
+    segmentation_backend: SegmentationBackend | None = None,
     instruction_client: InstructionClient | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
@@ -59,7 +73,7 @@ def run_pipeline_v3(
     if unavailable:
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
-            "instruct, and export only; "
+            "frames, segment, rank, instruct, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)
@@ -86,6 +100,26 @@ def run_pipeline_v3(
                 overwrite=overwrite,
                 client=annotation_client,
             ).to_dict()
+        elif stage == "frames":
+            results[stage] = sample_frames(
+                config,
+                storage,
+                overwrite=overwrite,
+                decoder=frame_decoder,
+            ).to_dict()
+        elif stage == "segment":
+            results[stage] = segment_clips(
+                config,
+                storage,
+                overwrite=overwrite,
+                backend=segmentation_backend,
+            ).to_dict()
+        elif stage == "rank":
+            results[stage] = rank_temporal_coverage(
+                config,
+                storage,
+                overwrite=overwrite,
+            ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
                 config,
@@ -111,8 +145,8 @@ def main() -> None:
         "--stages",
         default="",
         help=(
-            "comma-separated V3 stages; manifest, annotate, instruct, and "
-            "export are currently implemented"
+            "comma-separated V3 stages; manifest, annotate, frames, segment, "
+            "rank, instruct, and export are currently implemented"
         ),
     )
     parser.add_argument(

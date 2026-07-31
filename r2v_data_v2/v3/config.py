@@ -88,7 +88,15 @@ class FramesConfig:
 
 @dataclass(frozen=True)
 class Sam3Config:
-    minimum_entity_visible_ratio: float = 0.80
+    backend: str = "sam3"
+    model_path: Path | None = None
+    device: str = "cuda"
+    save_debug_overlays: bool = False
+
+
+@dataclass(frozen=True)
+class CoverageConfig:
+    required_visible_frames: int = 7
 
 
 @dataclass(frozen=True)
@@ -135,6 +143,7 @@ class V3Config:
     qwen: QwenServicesConfig = field(default_factory=QwenServicesConfig)
     frames: FramesConfig = field(default_factory=FramesConfig)
     sam3: Sam3Config = field(default_factory=Sam3Config)
+    coverage: CoverageConfig = field(default_factory=CoverageConfig)
     reference_scope: ReferenceScopeConfig = field(
         default_factory=ReferenceScopeConfig
     )
@@ -230,9 +239,35 @@ class V3Config:
             )
         if self.frames.count != 10:
             raise ValueError("V3 requires exactly 10 sampled frames")
-        if self.sam3.minimum_entity_visible_ratio != 0.80:
+        if self.sam3.backend != "sam3":
+            raise ValueError(f"unsupported V3 SAM3 backend: {self.sam3.backend}")
+        if not isinstance(self.sam3.device, str) or not self.sam3.device.strip():
+            raise ValueError("sam3.device must be a non-empty string")
+        if not isinstance(self.sam3.save_debug_overlays, bool):
+            raise TypeError("sam3.save_debug_overlays must be a boolean")
+        if self.sam3.model_path is not None:
+            sam3_model = self.sam3.model_path.expanduser().resolve(
+                strict=False
+            )
+            if not (
+                _is_at_or_below(sam3_model, ALLOWED_PRETRAINED_ROOT)
+                or _is_at_or_below(sam3_model, ALLOWED_USER_MODEL_ROOT)
+            ):
+                raise ValueError(
+                    "sam3.model_path must be inside an allowed model root"
+                )
+        if (
+            not isinstance(self.coverage.required_visible_frames, int)
+            or isinstance(self.coverage.required_visible_frames, bool)
+            or not (
+                1
+                <= self.coverage.required_visible_frames
+                <= self.frames.count
+            )
+        ):
             raise ValueError(
-                "V3 requires sam3.minimum_entity_visible_ratio to be exactly 0.80"
+                "coverage.required_visible_frames must be between 1 and "
+                "frames.count"
             )
         if (
             not isinstance(self.instruction.repair_retries, int)
@@ -305,6 +340,13 @@ class V3Config:
                 if self.remove.adapter_path is not None
                 else None
             ),
+            "sam3.backend": self.sam3.backend,
+            "sam3.model": (
+                str(self.sam3.model_path)
+                if self.sam3.model_path is not None
+                else None
+            ),
+            "sam3.device": self.sam3.device,
         }
 
     def fingerprint(self) -> str:
@@ -394,6 +436,7 @@ def load_config(path: str | Path) -> V3Config:
         "qwen",
         "frames",
         "sam3",
+        "coverage",
         "reference_scope",
         "background",
         "remove",
@@ -448,6 +491,14 @@ def load_config(path: str | Path) -> V3Config:
         ),
     )
     remove_values = _mapping(raw.get("remove"), "remove")
+    sam3_values = _mapping(raw.get("sam3"), "sam3")
+    if "model_path" in sam3_values:
+        model_path = sam3_values["model_path"]
+        sam3_values["model_path"] = (
+            None
+            if model_path in (None, "")
+            else Path(str(model_path)).expanduser()
+        )
     if "base_model_path" in remove_values:
         remove_values["base_model_path"] = Path(
             str(remove_values["base_model_path"])
@@ -480,8 +531,13 @@ def load_config(path: str | Path) -> V3Config:
         ),
         sam3=_build(
             Sam3Config,
-            _mapping(raw.get("sam3"), "sam3"),
+            sam3_values,
             "sam3",
+        ),
+        coverage=_build(
+            CoverageConfig,
+            _mapping(raw.get("coverage"), "coverage"),
+            "coverage",
         ),
         reference_scope=_build(
             ReferenceScopeConfig,

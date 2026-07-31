@@ -12,6 +12,7 @@ from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     QwenServicesConfig,
     RemoveConfig,
+    Sam3Config,
     SourceConfig,
     V3Config,
 )
@@ -30,6 +31,7 @@ from r2v_data_v2.v3.schemas import (
     ClipSource,
     CoverageState,
     EntityReferenceState,
+    EntityVisibilitySummary,
     PairingState,
     RawInstructionOutput,
     ReferencesState,
@@ -62,6 +64,9 @@ def _config(
             annotation=QwenAnnotationConfig(model=str(model)),
             instruction_writer=QwenServiceConfig(model=str(model)),
         ),
+        sam3=Sam3Config(
+            model_path=user_models / "sam3" / "checkpoint.pt"
+        ),
         remove=RemoveConfig(
             base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
             adapter_path=(
@@ -81,6 +86,8 @@ def _config_path(config: V3Config, tmp_path: Path) -> Path:
         f"export_root: {config.export_root}\n"
         "source:\n"
         "  limit: 5\n"
+        "sam3:\n"
+        f"  model_path: {config.sam3.model_path}\n"
         "qwen:\n"
         "  annotation:\n"
         f"    model: {config.qwen.annotation.model}\n"
@@ -140,7 +147,30 @@ def _ready_storage(
     )
     storage.write_coverage(
         clip_uid,
-        CoverageState(passed=True, qualifying_entity_ids=["e1"]),
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
+            entity_visibility_summary={
+                "e1": EntityVisibilitySummary(
+                    status="ready",
+                    visible_frame_slots=list(range(7)),
+                    visible_frame_count=7,
+                    coverage_ratio=0.7,
+                    qualifies=True,
+                    per_frame_area_ratio=[0.1] * 7 + [0.0] * 3,
+                    per_frame_confidence=[0.9] * 7 + [None] * 3,
+                ),
+                "e2": EntityVisibilitySummary(
+                    status="ready",
+                    visible_frame_slots=list(range(3)),
+                    visible_frame_count=3,
+                    coverage_ratio=0.3,
+                    qualifies=False,
+                    per_frame_area_ratio=[0.1] * 3 + [0.0] * 7,
+                    per_frame_confidence=[0.9] * 3 + [None] * 7,
+                ),
+            },
+        ),
     )
     references = [
         EntityReferenceState(
