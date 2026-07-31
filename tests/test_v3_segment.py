@@ -31,6 +31,7 @@ from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
     Sam3SegmentationBackend,
+    mask_iou,
 )
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -80,6 +81,9 @@ class FakeSegmentationBackend:
 @dataclass
 class FakeSam3Predictor:
     outputs_by_slot: dict[int, dict[str, object]]
+    anchor_outputs_by_session: dict[str, dict[str, object]] = field(
+        default_factory=dict
+    )
     propagation_by_direction: dict[
         str,
         list[dict[str, object]],
@@ -88,6 +92,7 @@ class FakeSam3Predictor:
     prompt_session_ids: list[str] = field(default_factory=list)
     propagation_directions: list[str] = field(default_factory=list)
     propagation_session_ids: list[str] = field(default_factory=list)
+    closed_session_ids: list[str] = field(default_factory=list)
     next_session_id: int = 0
 
     def handle_request(self, request: dict[str, object]) -> dict[str, object]:
@@ -96,14 +101,19 @@ class FakeSam3Predictor:
             self.next_session_id += 1
             return {"session_id": f"session-{self.next_session_id}"}
         if request_type == "close_session":
+            self.closed_session_ids.append(str(request["session_id"]))
             return {}
         if request_type == "add_prompt":
             slot = int(request["frame_index"])
+            session_id = str(request["session_id"])
             self.prompt_slots.append(slot)
-            self.prompt_session_ids.append(str(request["session_id"]))
+            self.prompt_session_ids.append(session_id)
             return {
                 "frame_index": slot,
-                "outputs": self.outputs_by_slot.get(slot, _sam_outputs()),
+                "outputs": self.anchor_outputs_by_session.get(
+                    session_id,
+                    self.outputs_by_slot.get(slot, _sam_outputs()),
+                ),
             }
         raise AssertionError(f"unexpected predictor request: {request_type}")
 
@@ -550,7 +560,7 @@ def test_sam3_anchor_probe_order_stops_at_first_valid_anchor(
     )
 
     assert result.status == "ready"
-    assert predictor.prompt_slots == [5, 2, 2]
+    assert predictor.prompt_slots == [5, 2, 2, 2]
     assert not {7, 0, 9}.intersection(predictor.prompt_slots)
 
 
@@ -673,10 +683,13 @@ def test_sam3_collects_forward_and_backward_tracks_for_coverage(
     assert result.status == "ready"
     assert [item.slot for item in result.observations] == list(range(10))
     assert predictor.propagation_directions == ["forward", "backward"]
-    assert predictor.propagation_session_ids == [
-        predictor.prompt_session_ids[-1],
-        predictor.prompt_session_ids[-1],
-    ]
+    assert predictor.propagation_session_ids == predictor.prompt_session_ids[-2:]
+    assert len(set(predictor.propagation_session_ids)) == 2
+    assert all(
+        session_id in predictor.closed_session_ids
+        for session_id in predictor.propagation_session_ids
+    )
+    assert predictor.prompt_slots[-2:] == [5, 5]
     tracked = v3_segment_module._entity_masks_from_result(
         entity,
         result,
@@ -698,6 +711,97 @@ def test_sam3_collects_forward_and_backward_tracks_for_coverage(
 
     assert coverage.required_visible_frames == 7
     assert coverage.entity_visibility_summary["e1"].visible_frame_count == 10
+
+
+def test_mask_iou_rejects_shape_mismatch_and_empty_union() -> None:
+    mask = _mask()
+
+    assert mask_iou(mask, mask.copy()) == pytest.approx(1.0)
+    assert mask_iou(
+        np.zeros_like(mask),
+        np.zeros_like(mask),
+    ) == 0.0
+    with pytest.raises(ValueError, match="equal mask shapes"):
+        mask_iou(mask, np.zeros((8, 8), dtype=bool))
+
+
+def test_sam3_session_local_object_ids_are_canonicalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    mask = _mask()
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(mask, object_id="probe-0")},
+        anchor_outputs_by_session={
+            "session-2": _sam_output(mask, object_id="forward-0"),
+            "session-3": _sam_output(mask, object_id="backward-7"),
+        },
+        propagation_by_direction={
+            "forward": [
+                _stream_response(6, mask, object_id="forward-0")
+            ],
+            "backward": [
+                _stream_response(4, mask, object_id="backward-7")
+            ],
+        },
+    )
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "ready"
+    assert {item.object_id for item in result.observations} == {"forward-0"}
+    assert [item.slot for item in result.observations] == [4, 5, 6]
+
+
+def test_sam3_anchor_identity_mismatch_between_sessions_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    left = _mask(x1=1, y1=2, x2=5, y2=8)
+    right = _mask(x1=10, y1=2, x2=14, y2=8)
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(left)},
+        anchor_outputs_by_session={
+            "session-2": _sam_output(left, object_id="forward-0"),
+            "session-3": _sam_output(right, object_id="backward-0"),
+        },
+    )
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "anchor_identity_mismatch_between_directions"
+    assert set(predictor.propagation_session_ids).issubset(
+        predictor.closed_session_ids
+    )
 
 
 @pytest.mark.parametrize(
@@ -744,11 +848,12 @@ def test_sam3_empty_direction_preserves_other_direction(
         grounding_prompt="distinct subject",
     )
 
+    assert result.status == "ready"
     assert [item.slot for item in result.observations] == expected_slots
     assert predictor.propagation_directions == ["forward", "backward"]
 
 
-def test_sam3_duplicate_slot_and_object_id_keeps_first_observation(
+def test_sam3_consistent_duplicate_keeps_anchor_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -758,13 +863,15 @@ def test_sam3_duplicate_slot_and_object_id_keeps_first_observation(
         entities=[_entity("e1")],
     )
     anchor_mask = _mask()
-    first_mask = _mask(x1=1, y1=1, x2=4, y2=4)
-    duplicate_mask = _mask(x1=10, y1=7, x2=14, y2=11)
     predictor = FakeSam3Predictor(
         {5: _sam_output(anchor_mask)},
         propagation_by_direction={
-            "forward": [_stream_response(4, first_mask)],
-            "backward": [_stream_response(4, duplicate_mask)],
+            "forward": [
+                _stream_response(5, anchor_mask, confidence=0.8)
+            ],
+            "backward": [
+                _stream_response(5, anchor_mask, confidence=0.7)
+            ],
         },
     )
     backend = Sam3SegmentationBackend(
@@ -779,16 +886,65 @@ def test_sam3_duplicate_slot_and_object_id_keeps_first_observation(
         grounding_prompt="distinct subject",
     )
 
-    slot_four = [item for item in result.observations if item.slot == 4]
-    assert len(slot_four) == 1
-    assert np.array_equal(slot_four[0].mask, first_mask)
+    assert result.status == "ready"
+    slot_five = [item for item in result.observations if item.slot == 5]
+    assert len(slot_five) == 1
+    assert slot_five[0].confidence == pytest.approx(0.9)
+    assert np.array_equal(slot_five[0].mask, anchor_mask)
 
 
-@pytest.mark.parametrize("changed_direction", ["forward", "backward"])
+def test_sam3_conflicting_bidirectional_duplicate_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    anchor_mask = _mask()
+    conflict_mask = _mask(x1=10, y1=7, x2=14, y2=11)
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(anchor_mask)},
+        propagation_by_direction={
+            "forward": [_stream_response(5, anchor_mask)],
+            "backward": [_stream_response(5, conflict_mask)],
+        },
+    )
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "conflicting_bidirectional_mask"
+
+
+@pytest.mark.parametrize(
+    ("changed_direction", "expected_reason"),
+    [
+        (
+            "forward",
+            "sam3_object_identity_changed_during_forward_propagation",
+        ),
+        (
+            "backward",
+            "sam3_object_identity_changed_during_backward_propagation",
+        ),
+    ],
+)
 def test_sam3_object_id_change_in_either_direction_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     changed_direction: str,
+    expected_reason: str,
 ) -> None:
     storage, frame_paths = _storage_with_frames(
         tmp_path,
@@ -813,16 +969,18 @@ def test_sam3_object_id_change_in_either_direction_fails(
         predictor=predictor,
     )
 
-    with pytest.raises(
-        ValueError,
-        match="SAM3 object identity changed during propagation",
-    ):
-        backend.track(
-            frame_paths=frame_paths,
-            entity_id="e1",
-            reference_type="subject",
-            grounding_prompt="distinct subject",
-        )
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == expected_reason
+    assert set(predictor.propagation_session_ids).issubset(
+        predictor.closed_session_ids
+    )
 
 
 def test_segment_closes_only_its_owned_backend(

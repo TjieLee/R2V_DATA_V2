@@ -185,12 +185,22 @@ distinct decodable frames fails this stage for that clip.
 
 Run each annotation entity independently through the lazily loaded SAM3
 text-grounded video predictor and store all ten slots in one strongly typed
-clip-level `masks.rle.json`. Preserve backend confidence and object/track IDs.
-A failed entity is recorded without blocking other entities; a clip with zero
-entities publishes an empty, ready mask artifact without loading SAM3.
-Single-subject and single-object masks must retain one tracked identity rather
-than unioning unrelated detections. A group may union multiple tracks only when
-the backend verifies that they came from the group prompt.
+clip-level `masks.rle.json`. After selecting an anchor, run forward and backward
+propagation in independent sessions, reapplying the same prompt at the anchor in
+each session. SAM3 object IDs are session-local: validate the two anchor masks
+with IoU before remapping the backward track to the forward canonical ID. Merge
+anchor, forward, and backward masks deterministically without allowing a lower
+priority duplicate to overwrite an earlier result. A failed entity is recorded
+without blocking other entities; a clip with zero entities publishes an empty,
+ready mask artifact without loading SAM3. Single-subject, single-object, and
+current first-pass group tracking retain exactly one identity rather than
+unioning unrelated detections. Multi-object groups remain unverified and are
+rejected.
+
+SAM3 `out_probs` values are published object-score diagnostics propagated with
+the track. They are not independently estimated per-frame tracking confidence,
+and temporal visibility must not threshold on them. Visibility continues to
+depend only on a ready entity, a present non-empty mask, and `track_valid`.
 
 #### `rank`
 
@@ -778,6 +788,10 @@ Rules:
   }
 }
 ```
+
+`per_frame_confidence` is a compatibility field name in the current schema. For
+SAM3 masks it stores the per-frame published object-score diagnostic described
+above, not an independent tracking-confidence estimate.
 
 This is a simple consolidated record, not a generic workflow engine. Each stage updates only its owned section using atomic file replacement.
 

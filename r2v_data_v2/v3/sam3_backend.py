@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -12,16 +12,36 @@ import numpy as np
 from r2v_data_v2.v3.config import Sam3Config
 
 TrackStatus = Literal["ready", "not_found", "failed"]
+PropagationDirection = Literal["forward", "backward"]
 _ANCHOR_PROBE_ORDER = (5, 2, 7, 0, 9)
+_MINIMUM_MATCHING_MASK_IOU = 0.95
 
 
 @dataclass(frozen=True)
 class BackendMaskObservation:
+    """A SAM3 mask plus its propagated object score diagnostic.
+
+    ``confidence`` retains the existing internal and artifact-facing name for
+    compatibility. This field stores the SAM3 object score propagated with the
+    track. It is not an independently estimated per-frame tracking confidence.
+    """
+
     slot: int
     mask: np.ndarray
     confidence: float
     object_id: str
     valid: bool = True
+
+    @property
+    def object_score(self) -> float:
+        return self.confidence
+
+
+@dataclass(frozen=True)
+class DirectionalTrackResult:
+    direction: PropagationDirection
+    anchor: BackendMaskObservation
+    observations: tuple[BackendMaskObservation, ...]
 
 
 @dataclass(frozen=True)
@@ -38,6 +58,84 @@ class EntityTrackResult:
             raise ValueError("non-ready entity track cannot publish observations")
         if self.status == "failed" and not self.reason:
             raise ValueError("failed entity track requires a reason")
+
+
+class _TrackValidationError(ValueError):
+    pass
+
+
+def mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    first = np.asarray(mask_a, dtype=bool)
+    second = np.asarray(mask_b, dtype=bool)
+    if first.ndim != 2 or second.ndim != 2:
+        raise ValueError("mask IoU requires two-dimensional masks")
+    if first.shape != second.shape:
+        raise ValueError("mask IoU requires equal mask shapes")
+    union = np.logical_or(first, second)
+    union_area = int(union.sum())
+    if union_area == 0:
+        return 0.0
+    value = float(np.logical_and(first, second).sum() / union_area)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError("mask IoU must be finite and between zero and one")
+    return value
+
+
+def _masks_match(mask_a: np.ndarray, mask_b: np.ndarray) -> bool:
+    try:
+        return mask_iou(mask_a, mask_b) >= _MINIMUM_MATCHING_MASK_IOU
+    except ValueError:
+        return False
+
+
+def _validate_anchor_consistency(
+    forward: DirectionalTrackResult,
+    backward: DirectionalTrackResult,
+) -> None:
+    if (
+        forward.anchor.slot != backward.anchor.slot
+        or not forward.anchor.mask.any()
+        or not backward.anchor.mask.any()
+        or not _masks_match(forward.anchor.mask, backward.anchor.mask)
+    ):
+        raise _TrackValidationError(
+            "anchor_identity_mismatch_between_directions"
+        )
+
+
+def _remap_direction_object_id(
+    track: DirectionalTrackResult,
+    canonical_object_id: str,
+) -> tuple[BackendMaskObservation, ...]:
+    return tuple(
+        replace(observation, object_id=canonical_object_id)
+        for observation in track.observations
+    )
+
+
+def _merge_directional_tracks(
+    forward: DirectionalTrackResult,
+    backward: DirectionalTrackResult,
+) -> tuple[BackendMaskObservation, ...]:
+    canonical_object_id = forward.anchor.object_id
+    merged: dict[tuple[int, str], BackendMaskObservation] = {}
+    sources = (
+        (replace(forward.anchor, object_id=canonical_object_id),),
+        _remap_direction_object_id(forward, canonical_object_id),
+        _remap_direction_object_id(backward, canonical_object_id),
+    )
+    for source in sources:
+        for observation in source:
+            key = (observation.slot, observation.object_id)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = observation
+                continue
+            if not _masks_match(existing.mask, observation.mask):
+                raise _TrackValidationError(
+                    "conflicting_bidirectional_mask"
+                )
+    return tuple(merged[key] for key in sorted(merged))
 
 
 class SegmentationBackend(Protocol):
@@ -113,10 +211,10 @@ class Sam3SegmentationBackend:
         if not np.isin(raw_masks, (0, 1)).all():
             raise ValueError("SAM3 returned a non-binary mask")
 
-        probabilities = np.asarray(outputs.get("out_probs", [])).reshape(-1)
+        object_scores = np.asarray(outputs.get("out_probs", [])).reshape(-1)
         object_ids = np.asarray(outputs.get("out_obj_ids", [])).reshape(-1)
-        if len(probabilities) != len(raw_masks):
-            raise ValueError("SAM3 confidence count does not match mask count")
+        if len(object_scores) != len(raw_masks):
+            raise ValueError("SAM3 object score count does not match mask count")
         if len(object_ids) != len(raw_masks):
             raise ValueError("SAM3 object ID count does not match mask count")
 
@@ -125,14 +223,14 @@ class Sam3SegmentationBackend:
             mask = np.asarray(raw_mask, dtype=bool)
             if not mask.any():
                 continue
-            confidence = float(probabilities[index])
-            if not math.isfinite(confidence):
-                raise ValueError("SAM3 returned a non-finite confidence")
+            object_score = float(object_scores[index])
+            if not math.isfinite(object_score):
+                raise ValueError("SAM3 returned a non-finite object score")
             observations.append(
                 BackendMaskObservation(
                     slot=slot,
                     mask=mask.copy(),
-                    confidence=confidence,
+                    confidence=object_score,
                     object_id=str(object_ids[index]),
                 )
             )
@@ -217,6 +315,72 @@ class Sam3SegmentationBackend:
             return None, "ambiguous_multi_object_instance"
         return None, None
 
+    def _run_direction(
+        self,
+        predictor: object,
+        *,
+        frames_dir: Path,
+        frame_count: int,
+        anchor_slot: int,
+        reference_type: str,
+        grounding_prompt: str,
+        direction: PropagationDirection,
+    ) -> DirectionalTrackResult:
+        session_id = self._start_session(predictor, frames_dir)
+        try:
+            prompted = predictor.handle_request(  # type: ignore[attr-defined]
+                {
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": anchor_slot,
+                    "text": grounding_prompt,
+                }
+            )
+            anchored = self._observations(
+                int(prompted["frame_index"]),
+                prompted["outputs"],
+            )
+            if reference_type == "group" and len(anchored) > 1:
+                raise _TrackValidationError(
+                    "unverified_multi_object_group"
+                )
+            if len(anchored) != 1:
+                raise _TrackValidationError(
+                    "SAM3 did not resolve one stable tracked identity for "
+                    "the entity"
+                )
+            anchor = anchored[0]
+            observations: list[BackendMaskObservation] = []
+            for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
+                {
+                    "type": "propagate_in_video",
+                    "session_id": session_id,
+                    "propagation_direction": direction,
+                }
+            ):
+                slot = int(response["frame_index"])
+                if not 0 <= slot < frame_count:
+                    raise ValueError(
+                        "SAM3 returned a frame slot outside sampled frames"
+                    )
+                current = self._observations(slot, response["outputs"])
+                if any(
+                    observation.object_id != anchor.object_id
+                    for observation in current
+                ):
+                    raise _TrackValidationError(
+                        "sam3_object_identity_changed_during_"
+                        f"{direction}_propagation"
+                    )
+                observations.extend(current)
+            return DirectionalTrackResult(
+                direction=direction,
+                anchor=anchor,
+                observations=tuple(observations),
+            )
+        finally:
+            self._close_session(predictor, session_id)
+
     def track(
         self,
         *,
@@ -264,81 +428,34 @@ class Sam3SegmentationBackend:
                 reason="SAM3 did not find the prompted entity",
             )
 
-        session_id = self._start_session(predictor, frames_dir)
         try:
-            prompted = predictor.handle_request(  # type: ignore[attr-defined]
-                {
-                    "type": "add_prompt",
-                    "session_id": session_id,
-                    "frame_index": anchor_slot,
-                    "text": grounding_prompt,
-                }
+            forward = self._run_direction(
+                predictor,
+                frames_dir=frames_dir,
+                frame_count=len(frame_paths),
+                anchor_slot=anchor_slot,
+                reference_type=reference_type,
+                grounding_prompt=grounding_prompt,
+                direction="forward",
             )
-            anchored = self._observations(
-                int(prompted["frame_index"]),
-                prompted["outputs"],
+            backward = self._run_direction(
+                predictor,
+                frames_dir=frames_dir,
+                frame_count=len(frame_paths),
+                anchor_slot=anchor_slot,
+                reference_type=reference_type,
+                grounding_prompt=grounding_prompt,
+                direction="backward",
             )
-            if reference_type == "group" and len(anchored) > 1:
-                return EntityTrackResult(
-                    status="failed",
-                    reason="unverified_multi_object_group",
-                )
-            if len(anchored) != 1:
-                return EntityTrackResult(
-                    status="failed",
-                    reason=(
-                        "SAM3 did not resolve one stable tracked identity for "
-                        "the entity"
-                    ),
-                )
-            if not anchored:
-                return EntityTrackResult(
-                    status="not_found",
-                    reason="SAM3 anchor disappeared before propagation",
-                )
-            tracked_ids = {item.object_id for item in anchored}
-            observations: dict[
-                tuple[int, str],
-                BackendMaskObservation,
-            ] = {
-                (item.slot, item.object_id): item for item in anchored
-            }
-            for direction in ("forward", "backward"):
-                for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
-                    {
-                        "type": "propagate_in_video",
-                        "session_id": session_id,
-                        "propagation_direction": direction,
-                    }
-                ):
-                    slot = int(response["frame_index"])
-                    if not 0 <= slot < len(frame_paths):
-                        raise ValueError(
-                            "SAM3 returned a frame slot outside sampled frames"
-                        )
-                    current = self._observations(slot, response["outputs"])
-                    unexpected_ids = {
-                        item.object_id for item in current
-                    } - tracked_ids
-                    if unexpected_ids:
-                        raise ValueError(
-                            "SAM3 object identity changed during propagation"
-                        )
-                    for item in current:
-                        observations.setdefault(
-                            (item.slot, item.object_id),
-                            item,
-                        )
-        finally:
-            self._close_session(predictor, session_id)
-
-        ordered = tuple(
-            observations[key]
-            for key in sorted(observations, key=lambda item: (item[0], item[1]))
-        )
+            _validate_anchor_consistency(forward, backward)
+            # SAM3 object IDs are session-local. The backward session ID is
+            # remapped to the forward anchor ID after anchor-mask validation.
+            observations = _merge_directional_tracks(forward, backward)
+        except _TrackValidationError as exc:
+            return EntityTrackResult(status="failed", reason=str(exc))
         return EntityTrackResult(
             status="ready",
-            observations=ordered,
+            observations=observations,
             group_tracks_verified=False,
         )
 
