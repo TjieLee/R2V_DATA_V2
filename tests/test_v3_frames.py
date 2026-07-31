@@ -301,7 +301,11 @@ def test_overwrite_frames_invalidates_masks_and_all_downstream_state(
     sample_frames(storage.config, storage, decoder=decoder)
     storage.write_masks(
         "clip-1",
-        TrackedMasksArtifact(clip_uid="clip-1"),
+        TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=12,
+            width=18,
+        ),
     )
     storage.write_coverage(
         "clip-1",
@@ -382,7 +386,11 @@ def test_changed_annotation_removes_frames_and_masks(
     )
     storage.write_masks(
         "clip-1",
-        TrackedMasksArtifact(clip_uid="clip-1"),
+        TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=12,
+            width=18,
+        ),
     )
     annotation = storage.read_clip("clip-1").annotation
     assert annotation is not None

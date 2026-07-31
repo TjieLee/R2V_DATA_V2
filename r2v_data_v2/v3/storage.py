@@ -316,7 +316,7 @@ class RunStorage:
         self._require_clip(clip_uid)
         if value.clip_uid != clip_uid:
             raise ValueError("mask artifact clip_uid does not match destination")
-        destination = self.clip_dir(clip_uid) / "masks.rle.json"
+        destination = self.masks_path(clip_uid)
         if destination.is_file():
             existing = TrackedMasksArtifact.model_validate_json(
                 destination.read_text(encoding="utf-8")
@@ -349,6 +349,11 @@ class RunStorage:
             self.frames_manifest_path(clip_uid).read_text(encoding="utf-8")
         )
 
+    def read_masks(self, clip_uid: str) -> TrackedMasksArtifact:
+        return TrackedMasksArtifact.model_validate_json(
+            self.masks_path(clip_uid).read_text(encoding="utf-8")
+        )
+
     def prepare_frames_publication(self, clip_uid: str) -> None:
         self._require_clip(clip_uid)
         current = self.read_clip(clip_uid)
@@ -360,6 +365,22 @@ class RunStorage:
         )
         self._invalidate_artifacts_after_change(clip_uid, "frames")
         self.frames_manifest_path(clip_uid).unlink(missing_ok=True)
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
+
+    def prepare_masks_publication(self, clip_uid: str) -> None:
+        self._require_clip(clip_uid)
+        current = self.read_clip(clip_uid)
+        invalidated = current.model_copy(
+            update=_section_updates_after_change("masks")
+        )
+        validated = ClipRecord.model_validate(
+            invalidated.model_dump(mode="json")
+        )
+        self.masks_path(clip_uid).unlink(missing_ok=True)
         if validated != current:
             write_json_atomic(
                 self.clip_path(clip_uid),
@@ -388,6 +409,17 @@ class RunStorage:
         safe_name = _safe_component(filename, "debug filename")
         destination = self.clip_dir(clip_uid) / "debug" / safe_name
         destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def segment_debug_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        if not (
+            self.config.debug.save_diagnostics
+            or self.config.sam3.save_debug_overlays
+        ):
+            raise RuntimeError("segment debug artifact saving is disabled")
+        destination = self.clip_dir(clip_uid) / "debug" / "segment"
+        destination.mkdir(parents=True, exist_ok=True)
         return destination
 
     def relative_artifact_path(self, path: Path) -> str:

@@ -183,7 +183,14 @@ distinct decodable frames fails this stage for that clip.
 
 #### `segment`
 
-Run SAM3 tracking and store all tracked masks in one clip-level mask artifact.
+Run each annotation entity independently through the lazily loaded SAM3
+text-grounded video predictor and store all ten slots in one strongly typed
+clip-level `masks.rle.json`. Preserve backend confidence and object/track IDs.
+A failed entity is recorded without blocking other entities; a clip with zero
+entities publishes an empty, ready mask artifact without loading SAM3.
+Single-subject and single-object masks must retain one tracked identity rather
+than unioning unrelated detections. A group may union multiple tracks only when
+the backend verifies that they came from the group prompt.
 
 #### `rank`
 
@@ -682,6 +689,7 @@ Required layout:
         │   ├── e2.png
         │   └── bg_removed.png
         └── debug/                 # created only when debug saving is enabled
+            └── segment/           # per-slot overlays and entity contact sheets
 ```
 
 Rules:
@@ -692,6 +700,9 @@ Rules:
 - Publish sampled JPEGs atomically and publish `frames.json` last. Its image
   paths are relative to the clip directory.
 - Store all tracked masks in one `masks.rle.json` per clip.
+- `masks.rle.json` stores every ordered slot, including absent masks, and uses
+  validated two-dimensional binary run-length encoding at the sampled frame
+  dimensions.
 - Store only selected entity images in `selected/`.
 - Store only an accepted removed background in `selected/bg_removed.png`.
 - A clean raw background points to its selected sampled frame and does not require a duplicate image in `selected/`.
@@ -903,7 +914,10 @@ frames:
   count: 10
 
 sam3:
-  minimum_entity_visible_ratio: 0.80
+  backend: sam3
+  model_path: /mnt/workspace/litengjie/data/models/sam3/checkpoint.pt
+  device: cuda
+  save_debug_overlays: false
 
 reference_scope:
   enabled: true
@@ -930,6 +944,11 @@ instruction:
 debug:
   save_diagnostics: false
 ```
+
+The SAM3 checkpoint path above is an example within the writable model root.
+Verify the installed SAM3 package and checkpoint path on the server before the
+first real run. The adapter imports and loads the model only when `segment`
+needs it and passes only arguments exposed by the installed builder API.
 
 Validation must reject:
 
@@ -1051,6 +1070,9 @@ Do not run full data immediately.
 
 The first annotation smoke run must use `source.limit: 5`. Set
 `source.allow_full_run: true` only for an explicitly authorized full production
+run. For the first real SAM3 smoke, enable segment overlays and inspect every
+per-slot overlay and contact sheet manually; mask counts alone are not
+sufficient validation.
 run. Do not default `allow_full_run` to `true` for convenience.
 
 ### 17.1 Annotation A/B

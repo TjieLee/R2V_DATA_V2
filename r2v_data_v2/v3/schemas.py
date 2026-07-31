@@ -620,11 +620,161 @@ class ClipRecord(SchemaModel):
         return self
 
 
+class MaskRle(SchemaModel):
+    size: tuple[int, int]
+    counts: list[int]
+
+    @model_validator(mode="after")
+    def validate_rle(self) -> MaskRle:
+        height, width = self.size
+        if height < 1 or width < 1:
+            raise ValueError("mask RLE dimensions must be positive")
+        if not self.counts:
+            raise ValueError("mask RLE counts must not be empty")
+        if self.counts[0] < 0 or any(
+            count < 1 for count in self.counts[1:]
+        ):
+            raise ValueError("mask RLE counts must contain valid run lengths")
+        if sum(self.counts) != height * width:
+            raise ValueError("mask RLE counts do not match its dimensions")
+        return self
+
+
+class TrackedMaskFrame(SchemaModel):
+    slot: int = Field(ge=0, lt=10)
+    present: bool
+    track_valid: bool = True
+    confidence: Optional[float] = None
+    backend_confidences: list[float] = Field(default_factory=list)
+    backend_object_ids: list[str] = Field(default_factory=list)
+    area_pixels: int = Field(ge=0)
+    area_ratio: float = Field(ge=0, le=1)
+    bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    rle: MaskRle
+
+    @model_validator(mode="after")
+    def validate_frame(self) -> TrackedMaskFrame:
+        confidence_values = [
+            *self.backend_confidences,
+            *(() if self.confidence is None else (self.confidence,)),
+        ]
+        if any(not math.isfinite(value) for value in confidence_values):
+            raise ValueError("tracked mask confidence must be finite")
+        if len(self.backend_object_ids) != len(self.backend_confidences):
+            raise ValueError(
+                "backend object IDs and confidences must have equal lengths"
+            )
+        if len(self.backend_object_ids) != len(
+            set(self.backend_object_ids)
+        ):
+            raise ValueError("backend object IDs must be unique per frame")
+        encoded_area = sum(self.rle.counts[1::2])
+        if self.area_pixels != encoded_area:
+            raise ValueError("tracked mask area_pixels must match its RLE")
+        height, width = self.rle.size
+        expected_ratio = encoded_area / (height * width)
+        if not math.isclose(
+            self.area_ratio,
+            expected_ratio,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("tracked mask area_ratio must match its RLE")
+        if self.present:
+            if (
+                encoded_area == 0
+                or not self.track_valid
+                or self.confidence is None
+                or not self.backend_object_ids
+                or self.bbox_xyxy is None
+            ):
+                raise ValueError(
+                    "present tracked mask requires valid non-empty evidence"
+                )
+            if self.confidence != min(self.backend_confidences):
+                raise ValueError(
+                    "tracked mask confidence must preserve the minimum "
+                    "backend confidence"
+                )
+            x1, y1, x2, y2 = self.bbox_xyxy
+            if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                raise ValueError("tracked mask bbox is outside mask dimensions")
+        elif (
+            encoded_area != 0
+            or self.confidence is not None
+            or self.backend_confidences
+            or self.backend_object_ids
+            or self.bbox_xyxy is not None
+        ):
+            raise ValueError("absent tracked mask must not publish mask evidence")
+        return self
+
+
+class TrackedEntityMasks(SchemaModel):
+    status: Literal["ready", "not_found", "failed"]
+    reference_type: ReferenceType
+    grounding_prompt: str
+    backend_object_ids: list[str] = Field(default_factory=list)
+    frames: list[TrackedMaskFrame]
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_entity(self) -> TrackedEntityMasks:
+        if not self.grounding_prompt.strip():
+            raise ValueError("tracked entity grounding_prompt must not be empty")
+        if len(self.backend_object_ids) != len(
+            set(self.backend_object_ids)
+        ):
+            raise ValueError("tracked entity backend object IDs must be unique")
+        if len(self.frames) != 10 or [
+            frame.slot for frame in self.frames
+        ] != list(range(10)):
+            raise ValueError(
+                "tracked entity must contain ten ordered frame slots"
+            )
+        present_frames = [frame for frame in self.frames if frame.present]
+        if self.status == "ready" and not present_frames:
+            raise ValueError("ready tracked entity requires a present mask")
+        if self.status != "ready" and present_frames:
+            raise ValueError(
+                "not-found or failed tracked entity cannot publish masks"
+            )
+        if self.status == "failed" and not self.reason:
+            raise ValueError("failed tracked entity requires a reason")
+        published_ids = {
+            object_id
+            for frame in present_frames
+            for object_id in frame.backend_object_ids
+        }
+        if published_ids != set(self.backend_object_ids):
+            raise ValueError(
+                "tracked entity backend IDs must match published frame IDs"
+            )
+        return self
+
+
 class TrackedMasksArtifact(SchemaModel):
     schema_version: Literal["r2v.v3.masks.1"] = MASK_SCHEMA_VERSION
     clip_uid: str
     sampled_frame_count: Literal[10] = 10
-    entities: dict[str, dict[str, object]] = Field(default_factory=dict)
+    height: int = Field(gt=0)
+    width: int = Field(gt=0)
+    entities: dict[str, TrackedEntityMasks] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_masks(self) -> TrackedMasksArtifact:
+        expected_size = (self.height, self.width)
+        for entity_id, entity in self.entities.items():
+            if not entity_id.strip():
+                raise ValueError("tracked mask entity IDs must not be empty")
+            if any(
+                frame.rle.size != expected_size
+                for frame in entity.frames
+            ):
+                raise ValueError(
+                    "tracked masks must match artifact dimensions"
+                )
+        return self
 
 
 class RunRecord(SchemaModel):

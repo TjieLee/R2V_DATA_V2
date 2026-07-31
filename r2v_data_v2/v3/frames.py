@@ -200,7 +200,7 @@ def _save_jpeg(image: Image.Image, path: Path) -> None:
     )
 
 
-def _validate_existing_frames(
+def validate_sampled_frames(
     storage: RunStorage,
     clip_uid: str,
 ) -> SampledFramesArtifact:
@@ -308,7 +308,7 @@ def sample_frames(
         manifest_path = storage.frames_manifest_path(clip.clip_uid)
         if manifest_path.is_file() and not overwrite:
             try:
-                _validate_existing_frames(storage, clip.clip_uid)
+                validate_sampled_frames(storage, clip.clip_uid)
             except Exception as exc:  # noqa: BLE001 - isolate corrupt clip artifacts
                 storage.append_failure(
                     clip_uid=clip.clip_uid,

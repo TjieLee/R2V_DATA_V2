@@ -4,6 +4,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ from r2v_data_v2.v3.config import (
     V3Config,
     load_config,
 )
+from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
@@ -36,6 +38,8 @@ from r2v_data_v2.v3.schemas import (
     InstructionState,
     PairingState,
     ReferencesState,
+    TrackedEntityMasks,
+    TrackedMaskFrame,
     TrackedMasksArtifact,
     render_instruction_text,
 )
@@ -145,14 +149,39 @@ def _tracked_masks(
     *,
     counts: str = "encoded",
 ) -> TrackedMasksArtifact:
+    mask = np.zeros((4, 5), dtype=bool)
+    mask[1:3, 2:4] = True
+    confidence = 0.9 if counts == "encoded" else 0.8
+    empty = encode_binary_mask(np.zeros_like(mask))
     return TrackedMasksArtifact(
         clip_uid=clip_uid,
+        height=4,
+        width=5,
         entities={
-            "e1": {
-                "slots": {
-                    "0": {"mask_available": True, "counts": counts}
-                }
-            }
+            "e1": TrackedEntityMasks(
+                status="ready",
+                reference_type="subject",
+                grounding_prompt="a woman",
+                backend_object_ids=["7"],
+                frames=[
+                    TrackedMaskFrame(
+                        slot=slot,
+                        present=slot == 0,
+                        confidence=confidence if slot == 0 else None,
+                        backend_confidences=(
+                            [confidence] if slot == 0 else []
+                        ),
+                        backend_object_ids=["7"] if slot == 0 else [],
+                        area_pixels=int(mask.sum()) if slot == 0 else 0,
+                        area_ratio=(
+                            float(mask.mean()) if slot == 0 else 0.0
+                        ),
+                        bbox_xyxy=(2, 1, 4, 3) if slot == 0 else None,
+                        rle=encode_binary_mask(mask) if slot == 0 else empty,
+                    )
+                    for slot in range(10)
+                ],
+            )
         },
     )
 
@@ -327,18 +356,16 @@ def test_v3_config_rejects_non_negotiable_policy_changes(
         replace(config, **{field: value}).validate()
 
 
-def test_v3_config_rejects_nonstandard_entity_visible_ratio(
+def test_v3_config_rejects_unknown_sam3_backend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
 
-    with pytest.raises(ValueError, match="exactly 0.80"):
+    with pytest.raises(ValueError, match="unsupported V3 SAM3 backend"):
         replace(
             config,
-            sam3=v3_config_module.Sam3Config(
-                minimum_entity_visible_ratio=0.5
-            ),
+            sam3=v3_config_module.Sam3Config(backend="unknown"),
         ).validate()
 
 
