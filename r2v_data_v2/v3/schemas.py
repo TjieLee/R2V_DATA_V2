@@ -359,10 +359,42 @@ class BackgroundReferenceState(SchemaModel):
     source_frame_index: Optional[int] = Field(default=None, ge=0)
     source_mask_path: Optional[str] = None
     generation_mask_path: Optional[str] = None
+    source_foreground_area_pixels: Optional[int] = Field(default=None, ge=0)
+    source_foreground_area_ratio: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
     reason: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_reference_state(self) -> BackgroundReferenceState:
+        source_fields = (
+            self.source_image_path,
+            self.source_frame_slot,
+            self.source_frame_index,
+        )
+        diagnostics = (
+            self.source_foreground_area_pixels,
+            self.source_foreground_area_ratio,
+        )
+        if (diagnostics[0] is None) != (diagnostics[1] is None):
+            raise ValueError(
+                "background foreground-area diagnostics must be set together"
+            )
+        if self.status == "none":
+            if any(
+                value is not None
+                for value in (
+                    *source_fields,
+                    self.output_image_path,
+                    self.source_mask_path,
+                    self.generation_mask_path,
+                    *diagnostics,
+                )
+            ):
+                raise ValueError("none background cannot reference artifacts")
+            return self
         if self.status in {
             "clean_raw",
             "pending_remove",
@@ -383,12 +415,36 @@ class BackgroundReferenceState(SchemaModel):
                 raise ValueError(
                     "clean_raw output_image_path must equal source_image_path"
                 )
+            if diagnostics != (0, 0.0):
+                raise ValueError(
+                    "clean_raw background requires zero foreground area"
+                )
+            if (
+                self.source_mask_path is not None
+                or self.generation_mask_path is not None
+            ):
+                raise ValueError(
+                    "clean_raw background cannot reference mask artifacts"
+                )
         if self.status == "pending_remove":
             if self.source_mask_path is None:
                 raise ValueError("pending_remove background requires source_mask_path")
             if self.output_image_path is not None:
                 raise ValueError(
                     "pending_remove background cannot publish output_image_path"
+                )
+            if self.generation_mask_path is not None:
+                raise ValueError(
+                    "pending_remove background cannot publish generation_mask_path"
+                )
+            if (
+                self.source_foreground_area_pixels is None
+                or self.source_foreground_area_pixels <= 0
+                or self.source_foreground_area_ratio is None
+                or self.source_foreground_area_ratio <= 0
+            ):
+                raise ValueError(
+                    "pending_remove background requires positive foreground area"
                 )
         if self.status == "ready_removed" and (
             self.output_image_path is None
@@ -399,12 +455,39 @@ class BackgroundReferenceState(SchemaModel):
                 "ready_removed background requires output_image_path, "
                 "source_mask_path, and generation_mask_path"
             )
+        if self.status == "ready_removed" and (
+            self.source_foreground_area_pixels is None
+            or self.source_foreground_area_pixels <= 0
+            or self.source_foreground_area_ratio is None
+            or self.source_foreground_area_ratio <= 0
+        ):
+            raise ValueError(
+                "ready_removed background requires positive foreground area"
+            )
         if self.status == "rejected":
             if not self.reason:
                 raise ValueError("rejected background requires a reason")
             if self.output_image_path is not None:
                 raise ValueError(
                     "rejected background cannot publish output_image_path"
+                )
+            if self.generation_mask_path is not None:
+                raise ValueError(
+                    "rejected background cannot publish generation_mask_path"
+                )
+            if any(value is not None for value in source_fields) and any(
+                value is None for value in source_fields
+            ):
+                raise ValueError(
+                    "rejected background source provenance must be complete"
+                )
+            if all(value is None for value in source_fields) and (
+                self.source_mask_path is not None
+                or any(value is not None for value in diagnostics)
+            ):
+                raise ValueError(
+                    "rejected background without a source cannot reference "
+                    "source artifacts"
                 )
         return self
 

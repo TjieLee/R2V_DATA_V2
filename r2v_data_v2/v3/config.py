@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
@@ -110,6 +111,7 @@ class ReferenceScopeConfig:
 class BackgroundConfig:
     enabled: bool = True
     raw_foreground_area_ratio: float = 0.0
+    max_pending_remove_area_ratio: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -281,6 +283,16 @@ class V3Config:
             raise ValueError("V3 does not allow synthetic entity completion")
         if self.background.raw_foreground_area_ratio != 0.0:
             raise ValueError("V3 background.raw_foreground_area_ratio must be 0.0")
+        max_pending_ratio = self.background.max_pending_remove_area_ratio
+        if (
+            not isinstance(max_pending_ratio, float)
+            or not math.isfinite(max_pending_ratio)
+            or not 0 < max_pending_ratio <= 1
+        ):
+            raise ValueError(
+                "background.max_pending_remove_area_ratio must be a finite "
+                "float greater than 0 and at most 1"
+            )
         if self.remove.backend != REMOVE_BACKEND:
             raise ValueError(f"unsupported V3 remove backend: {self.remove.backend}")
         if self.remove.fallback_to_raw:

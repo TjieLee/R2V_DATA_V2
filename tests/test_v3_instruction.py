@@ -196,6 +196,8 @@ def _ready_storage(
                 output_image_path=f"clips/{clip_uid}/frames/03.jpg",
                 source_frame_slot=3,
                 source_frame_index=30,
+                source_foreground_area_pixels=0,
+                source_foreground_area_ratio=0.0,
             ),
         ),
     )

@@ -419,6 +419,49 @@ class RunStorage:
         destination.parent.mkdir(parents=True, exist_ok=True)
         return destination
 
+    def background_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "background"
+
+    def prepare_background_publication(self, clip_uid: str) -> Path:
+        destination = self.background_dir(clip_uid)
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def background_source_mask_path(
+        self,
+        clip_uid: str,
+        sha256: str,
+    ) -> Path:
+        if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+            raise ValueError("background source mask sha256 must be lowercase hex")
+        return (
+            self.prepare_background_publication(clip_uid)
+            / f"source_mask_{sha256}.png"
+        )
+
+    def cleanup_background_artifacts(
+        self,
+        clip_uid: str,
+        *,
+        keep: Path | None = None,
+    ) -> None:
+        directory = self.background_dir(clip_uid)
+        if not directory.is_dir():
+            return
+        resolved_keep = None if keep is None else keep.resolve(strict=False)
+        if resolved_keep is not None and resolved_keep.parent != directory.resolve():
+            raise ValueError(
+                "kept background artifact must be inside background_dir"
+            )
+        for path in directory.glob("source_mask_*.png"):
+            if path.resolve(strict=False) != resolved_keep:
+                path.unlink(missing_ok=True)
+        for path in directory.glob(".tmp-*.png"):
+            path.unlink(missing_ok=True)
+        if not any(directory.iterdir()):
+            directory.rmdir()
+
     def debug_path(self, clip_uid: str, filename: str) -> Path:
         self._require_clip(clip_uid)
         if not self.config.debug.save_diagnostics:
@@ -631,7 +674,10 @@ class DatasetExporter:
             Path("references") / clip_uid / self._filename_for_token(token)
         )
         self._copy_png(
-            self._resolve_run_artifact(background.output_image_path),
+            self._resolve_background_artifact(
+                clip_uid,
+                background.output_image_path,
+            ),
             temporary / relative_path,
             background=True,
         )
@@ -645,6 +691,27 @@ class DatasetExporter:
             source_frame_index=background.source_frame_index,
             synthetic=background.status == "ready_removed",
         )
+
+    def _resolve_background_artifact(
+        self,
+        clip_uid: str,
+        value: str | None,
+    ) -> Path:
+        if value is None:
+            raise ValueError("ready background is missing output_image_path")
+        path = Path(value).expanduser()
+        if not path.is_absolute() and path.parts[:1] == ("frames",):
+            candidate = self.storage.clip_dir(clip_uid) / path
+        else:
+            candidate = path if path.is_absolute() else self.storage.root / path
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(self.storage.root)
+        except ValueError as exc:
+            raise ValueError("background image must remain inside run_root") from exc
+        if not resolved.is_file():
+            raise FileNotFoundError(f"background image is missing: {resolved}")
+        return resolved
 
     def _resolve_run_artifact(self, value: str | None) -> Path:
         if value is None:
