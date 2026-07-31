@@ -56,6 +56,13 @@ class BackgroundAnnotation(SchemaModel):
     reference_worthy: bool
 
 
+class AnnotationPayload(SchemaModel):
+    t2v_caption: str
+    entities: list[AnnotationEntity] = Field(default_factory=list)
+    relations: list[EntityRelation] = Field(default_factory=list)
+    background: Optional[BackgroundAnnotation] = None
+
+
 class AnnotationState(SchemaModel):
     status: Literal["ready", "failed"]
     t2v_caption: str = ""

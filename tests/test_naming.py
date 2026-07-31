@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 from r2v_data_v2.config import load_config
-from r2v_data_v2.manifest import build_manifest, iter_source_records
+from r2v_data_v2.manifest import (
+    build_manifest,
+    iter_source_records,
+    parse_source_record,
+)
 from r2v_data_v2.naming import clip_uid, parse_clip_identity
 
 
@@ -33,6 +37,26 @@ def test_clip_uid_uses_normalized_absolute_path(tmp_path: Path) -> None:
     equivalent = video.parent / ".." / "clips" / video.name
     assert clip_uid(video) == clip_uid(equivalent)
     assert len(clip_uid(video)) == 24
+
+
+def test_shared_source_record_parser_preserves_v2_fields(tmp_path: Path) -> None:
+    video = tmp_path / "scene_1_0.mp4"
+
+    parsed = parse_source_record(
+        {
+            "file_path": str(video),
+            "text": "A draft caption.",
+            "title": "Visible title evidence",
+            "ignored": {"nested": "value"},
+        }
+    )
+
+    assert parsed.video_path == video.resolve()
+    assert parsed.caption_raw == "A draft caption."
+    assert parsed.metadata == {
+        "title": "Visible title evidence",
+        "text": "A draft caption.",
+    }
 
 
 def test_streaming_manifest_build_skips_missing_and_existing(tmp_path: Path) -> None:

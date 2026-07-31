@@ -965,7 +965,10 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
     assert result["completed_stages"] == []
     assert (config.resolved_run_root / "run.json").is_file()
     assert not (config.resolved_run_root / "clips").exists()
-    with pytest.raises(NotImplementedError, match="Commit 1"):
+    with pytest.raises(
+        FileNotFoundError,
+        match="requires manifest stage",
+    ):
         run_pipeline_v3(
             config_path=config_path,
             stages=("annotate",),

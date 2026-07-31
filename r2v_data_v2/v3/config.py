@@ -61,6 +61,7 @@ class QwenServiceConfig:
 @dataclass(frozen=True)
 class QwenAnnotationConfig(QwenServiceConfig):
     max_tokens: int = 4096
+    repair_retries: int = 1
     video: QwenVideoConfig = field(default_factory=QwenVideoConfig)
 
 
@@ -185,8 +186,20 @@ class V3Config:
                 )
         if self.qwen.annotation.video.input_mode != "full_video":
             raise ValueError("qwen.annotation.video.input_mode must be full_video")
-        if self.qwen.annotation.video.fps <= 0:
-            raise ValueError("qwen.annotation.video.fps must be positive")
+        if self.qwen.annotation.video.fps != 2.0:
+            raise ValueError("V3 annotation requires qwen video fps to be 2.0")
+        if self.qwen.annotation.video.do_sample_frames:
+            raise ValueError(
+                "V3 annotation requires complete video input without sampled frames"
+            )
+        if (
+            not isinstance(self.qwen.annotation.repair_retries, int)
+            or isinstance(self.qwen.annotation.repair_retries, bool)
+            or self.qwen.annotation.repair_retries < 0
+        ):
+            raise ValueError(
+                "qwen.annotation.repair_retries must be a non-negative integer"
+            )
         if self.frames.count != 10:
             raise ValueError("V3 requires exactly 10 sampled frames")
         if self.sam3.minimum_entity_visible_ratio != 0.80:

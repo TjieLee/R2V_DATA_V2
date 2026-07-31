@@ -182,6 +182,22 @@ class RunStorage:
         write_json_atomic(self.run_path, _model_dict(updated))
         return updated
 
+    def update_stage_counts(
+        self,
+        stage: str,
+        counts: dict[str, int],
+    ) -> RunRecord:
+        _safe_component(stage, "stage")
+        current = self.read_run()
+        merged = dict(current.counts)
+        merged.update(
+            {
+                f"{stage}.{name}": value
+                for name, value in counts.items()
+            }
+        )
+        return self.update_run_counts(merged)
+
     def clip_dir(self, clip_uid: str) -> Path:
         return self.root / "clips" / _safe_component(clip_uid, "clip_uid")
 
