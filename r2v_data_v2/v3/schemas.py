@@ -4,7 +4,14 @@ import math
 import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 CLIP_SCHEMA_VERSION = "r2v.v3.clip.2"
 FRAMES_SCHEMA_VERSION = "r2v.v3.frames.1"
@@ -345,6 +352,75 @@ class EntityReferenceState(SchemaModel):
         return self
 
 
+class BackgroundRemovalReview(SchemaModel):
+    verdict: Literal["accept", "reject"]
+    foreground_absent: StrictBool
+    foreground_not_reconstructed: StrictBool
+    no_new_salient_entity: StrictBool
+    background_only_in_repaired_region: StrictBool
+    background_continuity_ok: StrictBool
+    no_visible_artifacts: StrictBool
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_review(self) -> BackgroundRemovalReview:
+        if not self.reason.strip():
+            raise ValueError("background removal review reason must not be empty")
+        all_passed = all(
+            (
+                self.foreground_absent,
+                self.foreground_not_reconstructed,
+                self.no_new_salient_entity,
+                self.background_only_in_repaired_region,
+                self.background_continuity_ok,
+                self.no_visible_artifacts,
+            )
+        )
+        expected = "accept" if all_passed else "reject"
+        if self.verdict != expected:
+            raise ValueError(
+                "background removal verdict must accept if and only if all checks pass"
+            )
+        return self
+
+
+class BackgroundRemovalAttempt(SchemaModel):
+    seed: int = Field(ge=0)
+    status: Literal["accepted", "rejected", "failed"]
+    runtime_seconds: float = Field(ge=0)
+    candidate_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    reason: Optional[str] = None
+    review: Optional[BackgroundRemovalReview] = None
+
+    @model_validator(mode="after")
+    def validate_attempt(self) -> BackgroundRemovalAttempt:
+        if not math.isfinite(self.runtime_seconds):
+            raise ValueError("background removal runtime_seconds must be finite")
+        if self.status == "accepted":
+            if self.candidate_sha256 is None:
+                raise ValueError("accepted removal attempt requires candidate_sha256")
+            if self.review is None or self.review.verdict != "accept":
+                raise ValueError("accepted removal attempt requires an accepted review")
+            if self.reason is not None:
+                raise ValueError("accepted removal attempt cannot have a reason")
+        elif self.status == "rejected":
+            if self.candidate_sha256 is None:
+                raise ValueError("rejected removal attempt requires candidate_sha256")
+            if self.review is None or self.review.verdict != "reject":
+                raise ValueError("rejected removal attempt requires a rejected review")
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("rejected removal attempt requires a reason")
+        else:
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("failed removal attempt requires a reason")
+            if self.review is not None:
+                raise ValueError("failed removal attempt cannot publish a review")
+        return self
+
+
 class BackgroundReferenceState(SchemaModel):
     status: Literal[
         "none",
@@ -364,6 +440,22 @@ class BackgroundReferenceState(SchemaModel):
         default=None,
         ge=0,
         le=1,
+    )
+    removal_backend: Optional[str] = None
+    removal_seed: Optional[int] = Field(default=None, ge=0)
+    generation_mask_dilation_pixels: Optional[int] = Field(default=None, ge=0)
+    generation_mask_area_pixels: Optional[int] = Field(default=None, ge=0)
+    generation_mask_area_ratio: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+    output_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    removal_attempts: list[BackgroundRemovalAttempt] = Field(
+        default_factory=list,
     )
     reason: Optional[str] = None
 
@@ -490,6 +582,110 @@ class BackgroundReferenceState(SchemaModel):
                     "source artifacts"
                 )
         return self
+
+    @model_validator(mode="after")
+    def validate_removal_metadata(self) -> BackgroundReferenceState:
+        generation_diagnostics = (
+            self.generation_mask_dilation_pixels,
+            self.generation_mask_area_pixels,
+            self.generation_mask_area_ratio,
+        )
+        if any(value is not None for value in generation_diagnostics) and any(
+            value is None for value in generation_diagnostics
+        ):
+            raise ValueError(
+                "background generation-mask diagnostics must be set together"
+            )
+        if (
+            self.generation_mask_area_ratio is not None
+            and not math.isfinite(self.generation_mask_area_ratio)
+        ):
+            raise ValueError("background generation-mask ratio must be finite")
+        if self.removal_backend is not None and not self.removal_backend.strip():
+            raise ValueError("removal_backend must not be empty")
+
+        if self.status in {"none", "clean_raw", "pending_remove"}:  # noqa: SIM102
+            if (
+                self.removal_backend is not None
+                or self.removal_seed is not None
+                or any(value is not None for value in generation_diagnostics)
+                or self.output_sha256 is not None
+                or self.removal_attempts
+            ):
+                raise ValueError(
+                    f"{self.status} background cannot publish removal metadata"
+                )
+
+        if self.status == "ready_removed":
+            if (
+                self.removal_backend is None
+                or self.removal_seed is None
+                or self.generation_mask_dilation_pixels is None
+                or self.generation_mask_area_pixels is None
+                or self.generation_mask_area_pixels <= 0
+                or self.generation_mask_area_ratio is None
+                or self.generation_mask_area_ratio <= 0
+                or self.output_sha256 is None
+                or not self.removal_attempts
+            ):
+                raise ValueError(
+                    "ready_removed background requires complete removal metadata"
+                )
+            accepted = [
+                attempt
+                for attempt in self.removal_attempts
+                if attempt.status == "accepted"
+            ]
+            if len(accepted) != 1:
+                raise ValueError(
+                    "ready_removed background requires exactly one accepted attempt"
+                )
+            if (
+                accepted[0].seed != self.removal_seed
+                or accepted[0].candidate_sha256 != self.output_sha256
+            ):
+                raise ValueError(
+                    "accepted removal attempt must match published seed and hash"
+                )
+            if self.reason is not None:
+                raise ValueError("ready_removed background cannot have a reason")
+
+        if self.status == "rejected":
+            if self.output_sha256 is not None:
+                raise ValueError("rejected background cannot publish output_sha256")
+            if self.removal_seed is not None:
+                raise ValueError("rejected background cannot publish removal_seed")
+            if self.removal_attempts:
+                if self.removal_backend is None:
+                    raise ValueError(
+                        "remove-stage rejection requires removal_backend"
+                    )
+                if (
+                    self.source_image_path is None
+                    or self.source_frame_slot is None
+                    or self.source_frame_index is None
+                    or self.source_mask_path is None
+                    or self.source_foreground_area_pixels is None
+                    or self.source_foreground_area_pixels <= 0
+                    or self.source_foreground_area_ratio is None
+                    or self.source_foreground_area_ratio <= 0
+                ):
+                    raise ValueError(
+                        "remove-stage rejection requires source provenance"
+                    )
+                if any(
+                    attempt.status == "accepted"
+                    for attempt in self.removal_attempts
+                ):
+                    raise ValueError(
+                        "rejected background cannot contain an accepted attempt"
+                    )
+            elif self.removal_backend is not None:
+                raise ValueError(
+                    "background-stage rejection cannot publish removal_backend"
+                )
+        return self
+
 
 
 class ReferencesState(SchemaModel):

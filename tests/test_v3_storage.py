@@ -27,6 +27,8 @@ from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
     BackgroundReferenceState,
+    BackgroundRemovalAttempt,
+    BackgroundRemovalReview,
     ClipRecord,
     ClipSource,
     CoverageState,
@@ -436,14 +438,14 @@ def test_v3_config_rejects_sam3_model_path_outside_allowed_roots(
         ).validate()
 
 
-def test_unimplemented_stage_message_lists_background(tmp_path: Path) -> None:
+def test_unimplemented_stage_message_lists_remove(tmp_path: Path) -> None:
     with pytest.raises(NotImplementedError) as error:
         run_pipeline_v3(
             config_path=tmp_path / "unused.yaml",
-            stages=("remove",),
+            stages=("pair",),
         )
 
-    assert "rank, background, instruct" in str(error.value)
+    assert "rank, background, remove, instruct" in str(error.value)
 
 
 @pytest.mark.parametrize("required", [0, 11])
@@ -894,6 +896,30 @@ def test_exporter_reads_only_background_output_image_path(
         generation_mask_path="clips/clip-1/generation-mask.png",
         source_foreground_area_pixels=2,
         source_foreground_area_ratio=0.02,
+        removal_backend="qwen_image_edit_2511_object_remover",
+        removal_seed=0,
+        generation_mask_dilation_pixels=0,
+        generation_mask_area_pixels=2,
+        generation_mask_area_ratio=0.02,
+        output_sha256="a" * 64,
+        removal_attempts=[
+            BackgroundRemovalAttempt(
+                seed=0,
+                status="accepted",
+                runtime_seconds=1.0,
+                candidate_sha256="a" * 64,
+                review=BackgroundRemovalReview(
+                    verdict="accept",
+                    foreground_absent=True,
+                    foreground_not_reconstructed=True,
+                    no_new_salient_entity=True,
+                    background_only_in_repaired_region=True,
+                    background_continuity_ok=True,
+                    no_visible_artifacts=True,
+                    reason="accepted for exporter path test",
+                ),
+            )
+        ],
     )
     storage.write_references(
         "clip-1",

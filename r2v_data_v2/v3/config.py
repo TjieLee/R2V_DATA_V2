@@ -123,6 +123,16 @@ class RemoveConfig:
     candidate_seeds: tuple[int, ...] = (0, 17)
     fallback_to_raw: bool = False
     preserve_unmasked_pixels: bool = True
+    device: str = "cuda"
+    dtype: str = "bfloat16"
+    num_inference_steps: int = 40
+    true_cfg_scale: float = 4.0
+    guidance_scale: float = 1.0
+    negative_prompt: str = " "
+    generation_mask_dilation_pixels: int = 16
+    max_generation_mask_area_ratio: float = 0.65
+    adapter_weight_name: str | None = None
+    save_rejected_candidates: bool = False
 
 
 @dataclass(frozen=True)
@@ -299,8 +309,8 @@ class V3Config:
             raise ValueError("V3 remove.fallback_to_raw must be false")
         if not self.remove.preserve_unmasked_pixels:
             raise ValueError("V3 remove.preserve_unmasked_pixels must be true")
-        if not self.remove.candidate_seeds:
-            raise ValueError("remove.candidate_seeds must not be empty")
+        if len(self.remove.candidate_seeds) not in {1, 2}:
+            raise ValueError("remove.candidate_seeds must contain one or two seeds")
         if any(
             not isinstance(seed, int) or isinstance(seed, bool)
             for seed in self.remove.candidate_seeds
@@ -310,6 +320,58 @@ class V3Config:
             raise ValueError("remove.candidate_seeds must be unique")
         if any(seed < 0 for seed in self.remove.candidate_seeds):
             raise ValueError("remove.candidate_seeds must be non-negative")
+        if not isinstance(self.remove.device, str) or not self.remove.device.strip():
+            raise ValueError("remove.device must be a non-empty string")
+        if self.remove.dtype not in {"bfloat16", "float16", "float32"}:
+            raise ValueError(
+                "remove.dtype must be bfloat16, float16, or float32"
+            )
+        if (
+            not isinstance(self.remove.num_inference_steps, int)
+            or isinstance(self.remove.num_inference_steps, bool)
+            or self.remove.num_inference_steps < 1
+        ):
+            raise ValueError("remove.num_inference_steps must be a positive integer")
+        for name, value in (
+            ("true_cfg_scale", self.remove.true_cfg_scale),
+            ("guidance_scale", self.remove.guidance_scale),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"remove.{name} must be finite and non-negative")
+        dilation = self.remove.generation_mask_dilation_pixels
+        if (
+            not isinstance(dilation, int)
+            or isinstance(dilation, bool)
+            or dilation < 0
+        ):
+            raise ValueError(
+                "remove.generation_mask_dilation_pixels must be a non-negative integer"
+            )
+        maximum_ratio = self.remove.max_generation_mask_area_ratio
+        if (
+            not isinstance(maximum_ratio, float)
+            or not math.isfinite(maximum_ratio)
+            or not 0 < maximum_ratio <= 1
+        ):
+            raise ValueError(
+                "remove.max_generation_mask_area_ratio must be a finite float "
+                "greater than 0 and at most 1"
+            )
+        if not isinstance(self.remove.save_rejected_candidates, bool):
+            raise TypeError("remove.save_rejected_candidates must be a boolean")
+        if self.remove.adapter_weight_name is not None and (
+            not isinstance(self.remove.adapter_weight_name, str)
+            or not self.remove.adapter_weight_name.strip()
+        ):
+            raise ValueError(
+                "remove.adapter_weight_name must be a non-empty string or null"
+            )
+
         remove_model = self.remove.base_model_path.expanduser().resolve(strict=False)
         if not _is_at_or_below(remove_model, ALLOWED_PRETRAINED_ROOT):
             raise ValueError(
@@ -352,6 +414,22 @@ class V3Config:
                 if self.remove.adapter_path is not None
                 else None
             ),
+            "remove.adapter_weight_name": self.remove.adapter_weight_name,
+            "remove.device": self.remove.device,
+            "remove.dtype": self.remove.dtype,
+            "remove.num_inference_steps": str(self.remove.num_inference_steps),
+            "remove.true_cfg_scale": str(self.remove.true_cfg_scale),
+            "remove.guidance_scale": str(self.remove.guidance_scale),
+            "remove.negative_prompt": self.remove.negative_prompt,
+            "remove.generation_mask_dilation_pixels": str(
+                self.remove.generation_mask_dilation_pixels
+            ),
+            "remove.max_generation_mask_area_ratio": str(
+                self.remove.max_generation_mask_area_ratio
+            ),
+            "remove.save_rejected_candidates": str(
+                self.remove.save_rejected_candidates
+            ).lower(),
             "sam3.backend": self.sam3.backend,
             "sam3.model": (
                 str(self.sam3.model_path)

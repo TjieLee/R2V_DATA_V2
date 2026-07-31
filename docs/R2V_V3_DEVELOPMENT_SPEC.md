@@ -63,7 +63,10 @@ LoRA adapter:
 /mnt/workspace/litengjie/data/models/Qwen-Image-Edit-2511-Object-Remover
 ```
 
-The LoRA is an optional user-provisioned asset. The pipeline must not download it automatically.
+The remove stage uses Qwen-Image-Edit-2511 with the required Object-Remover LoRA. The adapter is mandatory: a missing path, unsupported
+format, load failure, inactive adapter, or unexpected active adapter fails
+closed before inference. The pipeline never runs the base model alone, selects
+a similarly named adapter, or downloads either component.
 
 ### 2.3 Entity completion policy
 
@@ -499,8 +502,8 @@ class BackgroundRemovalBackend(Protocol):
         self,
         *,
         image: Image.Image,
-        mask: Image.Image,
         removal_phrases: list[str],
+        background_phrase: str,
         prompt: str,
         seed: int,
     ) -> Image.Image: ...
@@ -512,7 +515,27 @@ The first backend identifier is:
 qwen_image_edit_2511_object_remover
 ```
 
-The backend must load lazily only in the `remove` stage.
+The backend is Qwen-Image-Edit-2511 with the required Object-Remover LoRA and
+loads lazily only after the `remove` stage encounters work. It loads the local
+base pipeline with `local_files_only=True`, loads the verified adapter as
+`object_remover`, activates it, queries active adapters, and allows inference
+only when `object_remover` is active. A single adapter file is loaded from its
+parent with an explicit `weight_name`; an ambiguous directory requires
+`remove.adapter_weight_name`. There is no base-only, FLUX, CPU, or Hub
+fallback.
+
+Each source mask is deterministically dilated by
+`remove.generation_mask_dilation_pixels` to form a distinct generation mask.
+The generation mask must contain the source mask, remain within
+`remove.max_generation_mask_area_ratio`, and is stored as a content-addressed
+single-channel PNG. Whole-image model output is always locally composited so
+pixels outside the generation mask remain exactly equal to source pixels.
+
+At most two configured seeds are tried in order. The first candidate passing
+hard local checks and the configured Qwen background-removal judge wins.
+Malformed judge output fails that candidate; no configured or injected judge
+fails the clip explicitly. If no candidate is accepted, the background becomes
+`rejected` with all attempts recorded. There is no raw fallback.
 
 ### 9.3 Prompt contract
 
@@ -550,8 +573,8 @@ Accept only when all conditions pass:
 - the edited region contains background scenery only;
 - background continuity passes;
 - no visible seam, ghosting, double exposure, artificial blob, or major texture/color discontinuity;
-- SAM3 or another configured guard does not redetect a removed entity in the repaired region;
 - pixels outside the effective generation mask are identical to the source image.
+- the Qwen judge accepts all six strict review booleans.
 
 No condition may be bypassed to increase recall. There is no raw fallback.
 
@@ -715,7 +738,8 @@ Required layout:
     └── <clip_uid>/
         ├── clip.json
         ├── background/
-        │   └── source_mask_<sha256>.png
+        │   ├── source_mask_<sha256>.png
+        │   └── generation_mask_<sha256>.png
         ├── frames/
         │   ├── 00.jpg
         │   ├── 01.jpg
@@ -727,7 +751,11 @@ Required layout:
         │   ├── e2.png
         │   └── bg_removed.png
         └── debug/                 # created only when debug saving is enabled
-            └── segment/           # per-slot overlays and entity contact sheets
+            ├── segment/           # per-slot overlays and entity contact sheets
+            └── remove/
+                ├── candidate_seed_0.png
+                └── review_seed_0.json
+
 ```
 
 Rules:
@@ -747,10 +775,14 @@ Rules:
 - Background source masks are content-addressed and atomically published; stale
   hashes are removed only after `clip.json` successfully references the new state.
 - Pending source masks never belong in `selected/`.
-- Mask dilation and generation masks are owned by the later `remove` stage.
+- The `remove` stage owns deterministic mask dilation and stores only the
+  accepted content-addressed `generation_mask_<sha256>.png`.
+- Successful publication is transactional: output replacement, generation
+  mask publication, and `clip.json` update roll back together on failure.
 - Store only an accepted removed background in `selected/bg_removed.png`.
 - A clean raw background points to its selected sampled frame and does not require a duplicate image in `selected/`.
-- Rejected removal candidates and contact sheets are written only under `debug/` when `debug.save_diagnostics: true`.
+- Rejected removal candidates and reviews are written under `debug/remove/`
+  only when `debug.save_diagnostics` or `remove.save_rejected_candidates` is true.
 - Default production runs must not create `debug/`.
 
 ### 12.2 `clip.json`
@@ -1000,6 +1032,16 @@ remove:
   candidate_seeds: [0, 17]
   fallback_to_raw: false
   preserve_unmasked_pixels: true
+  device: cuda
+  dtype: bfloat16
+  num_inference_steps: 40
+  true_cfg_scale: 4.0
+  guidance_scale: 1.0
+  negative_prompt: " "
+  generation_mask_dilation_pixels: 16
+  max_generation_mask_area_ratio: 0.65
+  adapter_weight_name: null
+  save_rejected_candidates: false
 
 instruction:
   enabled: true
@@ -1021,6 +1063,10 @@ Validation must reject:
 - `coverage.required_visible_frames` outside 1 through `frames.count`;
 - `allow_synthetic_completion: true` in the initial V3 implementation;
 - `remove.fallback_to_raw: true`;
+- remove candidate seed lists other than one or two unique non-negative integers;
+- unsupported remove dtypes, non-finite guidance values, or invalid mask limits;
+- an empty `remove.adapter_weight_name`; adapter existence is checked lazily by
+  the real backend, where a missing required adapter fails closed.
 - nonzero `background.raw_foreground_area_ratio` for V3;
 - an empty `source.limit` unless `source.allow_full_run` is `true`;
 - a non-positive or non-integer `source.limit`;
@@ -1041,7 +1087,9 @@ r2v_data_v2/v3/
 ├── annotation.py
 ├── reference_scope.py
 ├── background.py
-├── object_removal.py
+├── remove.py
+├── qwen_image_edit_backend.py
+├── removal_judge.py
 ├── pairing.py
 ├── instruction.py
 ├── export.py

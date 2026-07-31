@@ -440,6 +440,74 @@ class RunStorage:
             / f"source_mask_{sha256}.png"
         )
 
+    def background_generation_mask_path(
+        self,
+        clip_uid: str,
+        sha256: str,
+    ) -> Path:
+        if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+            raise ValueError("background generation mask sha256 must be lowercase hex")
+        return (
+            self.prepare_background_publication(clip_uid)
+            / f"generation_mask_{sha256}.png"
+        )
+
+    def selected_background_output_path(self, clip_uid: str) -> Path:
+        return self.selected_path(clip_uid, "bg_removed.png")
+
+    def remove_output_temporary_path(self, clip_uid: str) -> Path:
+        directory = self.selected_background_output_path(clip_uid).parent
+        return directory / f".tmp-remove-{uuid.uuid4().hex}.png"
+
+    def remove_output_backup_path(self, clip_uid: str) -> Path:
+        directory = self.selected_background_output_path(clip_uid).parent
+        return directory / f".backup-bg_removed-{uuid.uuid4().hex}.png"
+
+    def remove_debug_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        if not (
+            self.config.debug.save_diagnostics
+            or self.config.remove.save_rejected_candidates
+        ):
+            raise RuntimeError("remove debug artifact saving is disabled")
+        destination = self.clip_dir(clip_uid) / "debug" / "remove"
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def cleanup_remove_artifacts(
+        self,
+        clip_uid: str,
+        *,
+        keep_generation_mask: Path | None = None,
+    ) -> None:
+        background = self.background_dir(clip_uid)
+        resolved_keep = (
+            None
+            if keep_generation_mask is None
+            else keep_generation_mask.resolve(strict=False)
+        )
+        if resolved_keep is not None and (
+            resolved_keep.parent != background.resolve(strict=False)
+            or not resolved_keep.name.startswith("generation_mask_")
+        ):
+            raise ValueError(
+                "kept generation mask must be inside background_dir"
+            )
+        if background.is_dir():
+            for path in background.glob("generation_mask_*.png"):
+                if path.resolve(strict=False) != resolved_keep:
+                    path.unlink(missing_ok=True)
+            for path in background.glob(".tmp-remove-*.png"):
+                path.unlink(missing_ok=True)
+        selected = self.clip_dir(clip_uid) / "selected"
+        if selected.is_dir():
+            for pattern in (
+                ".tmp-remove-*.png",
+                ".backup-bg_removed-*.png",
+            ):
+                for path in selected.glob(pattern):
+                    path.unlink(missing_ok=True)
+
     def cleanup_background_artifacts(
         self,
         clip_uid: str,
