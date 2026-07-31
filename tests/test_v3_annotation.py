@@ -831,7 +831,7 @@ def test_qwen_request_uses_full_video_and_strict_schema(
     assert request["extra_body"] == {
         "mm_processor_kwargs": {
             "fps": 2.0,
-            "do_sample_frames": True,
+            "do_sample_frames": False,
         }
     }
     response_format = request["response_format"]
@@ -1265,8 +1265,8 @@ def test_reference_worthy_candidates_are_capped_after_phrase_sanitizing(
             "fps to be 2.0",
         ),
         (
-            v3_config_module.QwenVideoConfig(do_sample_frames=False),
-            "sample the full video input",
+            v3_config_module.QwenVideoConfig(do_sample_frames=True),
+            "must disable HF video re-sampling",
         ),
     ],
 )
