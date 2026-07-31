@@ -23,6 +23,12 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 _REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>", flags=re.IGNORECASE)
+_UNSUPPORTED_CAPTION_INFERENCE = re.compile(
+    r"\b(?:breeze|wind-induced|suggesting|indicating|possibly|probably|likely|"
+    r"enemy|determination|resolve|triumph)\b|"
+    r"\b(?:wind\s+causes|caused\s+by\s+wind)\b",
+    flags=re.IGNORECASE,
+)
 _JSON_FENCE = re.compile(
     r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```",
     flags=re.IGNORECASE,
@@ -50,8 +56,16 @@ Write t2v_caption as one complete English paragraph that begins directly with
 visible content and describes actions and shot changes in chronological order.
 Include visible subject appearance, action, scene, composition, camera behavior,
 and lighting. Describe only directly visible content. Do not infer identity,
-emotion, intent, sound, dialogue, or event causes. Do not write "the video
-shows". Do not include <ref_...> tokens or image-number instruction labels.
+weather, emotion, allegiance, intent, mental state, sound, dialogue, or event
+causes. Describe visible motion directly without assigning an unseen cause.
+Write "branches sway slightly" instead of claiming that wind causes movement.
+Do not use hedging or causal inference wording such as breeze, wind-induced,
+suggesting, indicating, possibly, probably, or likely. Do not identify a person
+as an enemy, ally, criminal, victim, officer, or another role unless that role
+is explicitly supported by source metadata. For statues and depicted figures,
+describe visible facial geometry and pose without inferring determination,
+resolve, triumph, fear, or effort. Do not write "the video shows". Do not include
+<ref_...> tokens or image-number instruction labels.
 
 Return at most three entities. Select only stable, discrete foreground reference
 candidates that SAM3 can localize and track and that could be reused as an
@@ -70,14 +84,19 @@ animal, or character whose identity or appearance should be retained; object for
 one independently referenceable product, vehicle, prop, device, piece of
 furniture, or other object; and group for multiple subjects or objects whose
 stable composition should be retained together. phrase briefly identifies the
-candidate for binding and review. grounding_prompt describes visible appearance
-and only the positional detail needed to distinguish it for SAM3. Both fields
-must be non-empty and must not contain reference tokens.
+candidate for binding and review. entity.phrase should normally be a stable noun
+phrase rather than an action: prefer "man in a light gray military uniform" over
+"military officer speaking at podium". grounding_prompt describes visible
+appearance and may include location or current pose only when needed to
+distinguish the target for SAM3. Both fields must be non-empty and must not
+contain reference tokens.
 
 background is optional. When reliable, describe the overall environment after
 the principal foreground subjects are removed, using only phrase and
-grounding_prompt. Do not repeat the main foreground subject. Otherwise return
-null. Return JSON only."""
+grounding_prompt. Return background only when one stable environment persists
+through most of the clip. When the video contains a major scene transition
+between different environments, return background=null. Do not repeat the main
+foreground subject. Otherwise return null. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -296,6 +315,19 @@ def sanitize_annotation_payload(
                 message="t2v_caption must not contain reference tokens",
             )
         )
+    else:
+        inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(caption)
+        if inference_match is not None:
+            issues.append(
+                ValidationIssue(
+                    code="unsupported_caption_inference",
+                    field="t2v_caption",
+                    message=(
+                        "t2v_caption contains unsupported inference language: "
+                        f"{inference_match.group(0)}"
+                    ),
+                )
+            )
     if issues:
         return None, issues, ()
 

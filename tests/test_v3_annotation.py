@@ -575,6 +575,74 @@ def test_annotation_writes_minimal_semantic_fields_only(
     assert "<ref_" not in json.dumps(serialized)
 
 
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Thin branches sway slightly while the camera remains still.",
+        "Bright natural daylight illuminates a quiet courtyard.",
+        "Diffuse overcast lighting covers the street.",
+        "A woman speaks beneath a cloudy sky.",
+        "Two people are talking in a sunny plaza.",
+    ],
+)
+def test_directly_visible_caption_language_is_allowed(caption: str) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(caption=caption)
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert annotation.status == "ready"
+
+
+@pytest.mark.parametrize(
+    "caption",
+    [
+        "Wind causes the branches to sway beside the road.",
+        "The bright light is suggesting a sunny day.",
+        "An enemy figure crosses the courtyard.",
+        "The statues have expressions of determination.",
+        "The branch movement is caused by wind.",
+    ],
+)
+def test_unsupported_caption_inference_is_rejected(caption: str) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(caption=caption)
+    )
+
+    assert annotation is None
+    assert [issue.code for issue in issues] == [
+        "unsupported_caption_inference"
+    ]
+
+
+def test_caption_semantic_issue_can_be_repaired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [
+            _payload(
+                caption="Wind causes the branches to sway beside the road."
+            ),
+            _payload(
+                caption="Thin branches sway slightly beside the road."
+            ),
+        ],
+        repair_retries=1,
+    )
+
+    assert stats.processed == 1
+    assert stats.repaired == 1
+    assert len(client.requests) == 2
+    assert "unsupported_caption_inference" in str(client.requests[1])
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+    assert clip.annotation.t2v_caption.startswith("Thin branches")
+
+
 def test_empty_caption_is_repaired(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -943,6 +1011,18 @@ def test_system_prompt_describes_minimal_candidate_contract() -> None:
     assert "do not output relations" in normalized
     assert "do not include <ref_...> tokens" in normalized
     assert "name ontology" in normalized
+
+
+def test_system_prompt_rejects_inferred_causes_and_multiscene_backgrounds() -> None:
+    normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
+
+    assert "describe visible motion directly without assigning an unseen cause" in (
+        normalized
+    )
+    assert 'write "branches sway slightly"' in normalized
+    assert "major scene transition between different environments" in normalized
+    assert "return background=null" in normalized
+    assert "stable noun phrase rather than an action" in normalized
 
 
 def test_do_sample_frames_true_is_rejected(

@@ -308,7 +308,21 @@ ontology are not part of V3 annotation schema version 2.
 - actions, camera behavior, environment, lighting, and stable appearance details;
 - no reference tokens;
 - no generation command wording solely to make it look instructional;
-- no unsupported identity, intent, emotion, sound, or dialogue.
+- describe visible motion without assigning an unseen cause;
+- no unsupported identity, weather cause, allegiance, intent, mental state,
+  emotion, sound, or dialogue;
+- no hedging or causal inference wording such as `breeze`, `wind-induced`,
+  `suggesting`, `indicating`, `possibly`, `probably`, or `likely`;
+- no unsupported role labels such as enemy, ally, criminal, victim, or officer;
+- describe statue and depicted-figure geometry and pose without inferring
+  determination, resolve, triumph, fear, or effort.
+
+Code applies a deliberately small, case-insensitive word-boundary check to
+`t2v_caption` only. It rejects the listed inference words plus `wind causes`
+and `caused by wind` with `unsupported_caption_inference`, which enters the
+existing repair lifecycle. This is not an entity ontology or object-name
+blacklist. Directly visible wording such as `branches sway slightly`, `sunny`,
+`overcast`, `cloudy`, `speaks`, and `talking` remains valid.
 
 ### 7.2 Candidate sanitation
 
@@ -317,6 +331,16 @@ candidate text, drops invalid candidates, deduplicates normalized phrases while
 keeping the first occurrence, retains at most three, and assigns entity IDs
 after all filtering. Phrase text is not required to match one exact contiguous
 caption span. Annotation remains separate from final reference eligibility.
+Entity phrases should normally be stable noun phrases rather than actions.
+Grounding prompts may add location or current pose only when needed to
+distinguish a SAM3 target.
+
+### 7.3 Background stability
+
+Return background semantics only when one stable environment persists through
+most of the clip. A major transition between different environments requires
+`background=null`. Invalid background output still degrades locally to `null`
+without failing an otherwise valid caption.
 
 ---
 
