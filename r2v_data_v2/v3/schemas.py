@@ -88,7 +88,7 @@ class AnnotationState(SchemaModel):
 class CoverageState(SchemaModel):
     passed: bool
     qualifying_entity_ids: list[str] = Field(default_factory=list)
-    required_visible_frames: int = Field(default=8, ge=1)
+    required_visible_frames: Literal[8] = 8
     entity_visibility_summary: dict[str, dict[str, object]] = Field(
         default_factory=dict
     )

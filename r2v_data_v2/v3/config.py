@@ -189,9 +189,9 @@ class V3Config:
             raise ValueError("qwen.annotation.video.fps must be positive")
         if self.frames.count != 10:
             raise ValueError("V3 requires exactly 10 sampled frames")
-        if not 0.0 < self.sam3.minimum_entity_visible_ratio <= 1.0:
+        if self.sam3.minimum_entity_visible_ratio != 0.80:
             raise ValueError(
-                "sam3.minimum_entity_visible_ratio must be greater than 0 and at most 1"
+                "V3 requires sam3.minimum_entity_visible_ratio to be exactly 0.80"
             )
         if self.reference_scope.allow_synthetic_completion:
             raise ValueError("V3 does not allow synthetic entity completion")

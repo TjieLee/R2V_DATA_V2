@@ -303,6 +303,30 @@ def test_v3_config_rejects_non_negotiable_policy_changes(
         replace(config, **{field: value}).validate()
 
 
+def test_v3_config_rejects_nonstandard_entity_visible_ratio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="exactly 0.80"):
+        replace(
+            config,
+            sam3=v3_config_module.Sam3Config(
+                minimum_entity_visible_ratio=0.5
+            ),
+        ).validate()
+
+
+def test_coverage_requires_exactly_eight_visible_frames() -> None:
+    with pytest.raises(ValidationError, match="Input should be 8"):
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
+            required_visible_frames=7,
+        )
+
+
 def test_v3_config_rejects_output_outside_writable_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -841,6 +865,19 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     )
     assert "127.0.0.1" not in dataset_text
     assert str(config.resolved_run_root) not in dataset_text
+
+
+def test_entity_la_png_export_preserves_alpha(tmp_path: Path) -> None:
+    source = tmp_path / "entity-la.png"
+    destination = tmp_path / "exported" / "entity.png"
+    Image.new("LA", (2, 1), (120, 37)).save(source)
+
+    DatasetExporter._copy_png(source, destination, background=False)
+
+    with Image.open(destination) as image:
+        assert image.mode == "LA"
+        assert image.getbands() == ("L", "A")
+        assert list(image.getchannel("A").getdata()) == [37, 37]
 
 
 def test_export_refuses_to_destroy_existing_dataset_without_overwrite(

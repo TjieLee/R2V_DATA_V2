@@ -562,7 +562,7 @@ class DatasetExporter:
             opened.load()
             if background:
                 image = opened.convert("RGB")
-            elif opened.mode in {"RGB", "RGBA"}:
+            elif "A" in opened.getbands() or opened.mode == "RGB":
                 image = opened.copy()
             elif "transparency" in opened.info:
                 image = opened.convert("RGBA")
