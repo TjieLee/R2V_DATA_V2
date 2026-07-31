@@ -661,7 +661,7 @@ def test_sam3_collects_forward_and_backward_tracks_for_coverage(
         {5: _sam_output(mask)},
         propagation_by_direction={
             "forward": [
-                _stream_response(slot, mask) for slot in range(5, 10)
+                _stream_response(slot, mask) for slot in range(6, 10)
             ],
             "backward": [
                 _stream_response(slot, mask) for slot in range(4, -1, -1)
@@ -825,7 +825,7 @@ def test_sam3_empty_direction_preserves_other_direction(
     mask = _mask()
     streams = {
         "forward": [
-            _stream_response(slot, mask) for slot in range(5, 10)
+            _stream_response(slot, mask) for slot in range(6, 10)
         ],
         "backward": [
             _stream_response(slot, mask) for slot in range(4, -1, -1)
@@ -853,7 +853,7 @@ def test_sam3_empty_direction_preserves_other_direction(
     assert predictor.propagation_directions == ["forward", "backward"]
 
 
-def test_sam3_consistent_duplicate_keeps_anchor_observation(
+def test_sam3_propagation_anchor_duplicates_are_ignored(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -863,14 +863,28 @@ def test_sam3_consistent_duplicate_keeps_anchor_observation(
         entities=[_entity("e1")],
     )
     anchor_mask = _mask()
+    forward_anchor_copy = anchor_mask.copy()
+    forward_anchor_copy[3, 2:4] = False
+    backward_anchor_copy = anchor_mask.copy()
+    backward_anchor_copy[8, 5:7] = False
+    assert mask_iou(anchor_mask, forward_anchor_copy) < 0.95
+    assert mask_iou(anchor_mask, backward_anchor_copy) < 0.95
     predictor = FakeSam3Predictor(
         {5: _sam_output(anchor_mask)},
         propagation_by_direction={
             "forward": [
-                _stream_response(5, anchor_mask, confidence=0.8)
+                _stream_response(5, forward_anchor_copy),
+                *[
+                    _stream_response(slot, anchor_mask)
+                    for slot in range(6, 10)
+                ],
             ],
             "backward": [
-                _stream_response(5, anchor_mask, confidence=0.7)
+                _stream_response(5, backward_anchor_copy),
+                *[
+                    _stream_response(slot, anchor_mask)
+                    for slot in range(4, -1, -1)
+                ],
             ],
         },
     )
@@ -887,10 +901,56 @@ def test_sam3_consistent_duplicate_keeps_anchor_observation(
     )
 
     assert result.status == "ready"
+    assert [item.slot for item in result.observations] == list(range(10))
     slot_five = [item for item in result.observations if item.slot == 5]
     assert len(slot_five) == 1
     assert slot_five[0].confidence == pytest.approx(0.9)
     assert np.array_equal(slot_five[0].mask, anchor_mask)
+
+
+def test_sam3_propagation_uses_strict_directional_slot_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    mask = _mask()
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(mask)},
+        propagation_by_direction={
+            "forward": [
+                _stream_response(4, mask, confidence=0.11),
+                _stream_response(5, mask, confidence=0.12),
+                _stream_response(6, mask, confidence=0.86),
+            ],
+            "backward": [
+                _stream_response(6, mask, confidence=0.13),
+                _stream_response(5, mask, confidence=0.14),
+                _stream_response(4, mask, confidence=0.84),
+            ],
+        },
+    )
+    backend = Sam3SegmentationBackend(
+        storage.config.sam3,
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "ready"
+    by_slot = {item.slot: item for item in result.observations}
+    assert sorted(by_slot) == [4, 5, 6]
+    assert by_slot[4].confidence == pytest.approx(0.84)
+    assert by_slot[5].confidence == pytest.approx(0.9)
+    assert by_slot[6].confidence == pytest.approx(0.86)
 
 
 def test_sam3_conflicting_bidirectional_duplicate_fails(
@@ -907,8 +967,8 @@ def test_sam3_conflicting_bidirectional_duplicate_fails(
     predictor = FakeSam3Predictor(
         {5: _sam_output(anchor_mask)},
         propagation_by_direction={
-            "forward": [_stream_response(5, anchor_mask)],
-            "backward": [_stream_response(5, conflict_mask)],
+            "forward": [_stream_response(4, anchor_mask)],
+            "backward": [_stream_response(4, conflict_mask)],
         },
     )
     backend = Sam3SegmentationBackend(

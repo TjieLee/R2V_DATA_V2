@@ -42,6 +42,7 @@ class DirectionalTrackResult:
     direction: PropagationDirection
     anchor: BackendMaskObservation
     observations: tuple[BackendMaskObservation, ...]
+    non_owned_observations: tuple[BackendMaskObservation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,12 +105,12 @@ def _validate_anchor_consistency(
 
 
 def _remap_direction_object_id(
-    track: DirectionalTrackResult,
+    observations: tuple[BackendMaskObservation, ...],
     canonical_object_id: str,
 ) -> tuple[BackendMaskObservation, ...]:
     return tuple(
         replace(observation, object_id=canonical_object_id)
-        for observation in track.observations
+        for observation in observations
     )
 
 
@@ -118,11 +119,38 @@ def _merge_directional_tracks(
     backward: DirectionalTrackResult,
 ) -> tuple[BackendMaskObservation, ...]:
     canonical_object_id = forward.anchor.object_id
+    propagation_observations = (
+        *forward.observations,
+        *forward.non_owned_observations,
+        *backward.observations,
+        *backward.non_owned_observations,
+    )
+    propagation_by_key: dict[
+        tuple[int, str], BackendMaskObservation
+    ] = {}
+    for observation in _remap_direction_object_id(
+        propagation_observations,
+        canonical_object_id,
+    ):
+        key = (observation.slot, observation.object_id)
+        existing = propagation_by_key.get(key)
+        if existing is None:
+            propagation_by_key[key] = observation
+            continue
+        if not _masks_match(existing.mask, observation.mask):
+            raise _TrackValidationError("conflicting_bidirectional_mask")
+
     merged: dict[tuple[int, str], BackendMaskObservation] = {}
     sources = (
         (replace(forward.anchor, object_id=canonical_object_id),),
-        _remap_direction_object_id(forward, canonical_object_id),
-        _remap_direction_object_id(backward, canonical_object_id),
+        _remap_direction_object_id(
+            forward.observations,
+            canonical_object_id,
+        ),
+        _remap_direction_object_id(
+            backward.observations,
+            canonical_object_id,
+        ),
     )
     for source in sources:
         for observation in source:
@@ -351,6 +379,7 @@ class Sam3SegmentationBackend:
                 )
             anchor = anchored[0]
             observations: list[BackendMaskObservation] = []
+            non_owned_observations: list[BackendMaskObservation] = []
             for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
                 {
                     "type": "propagate_in_video",
@@ -363,6 +392,8 @@ class Sam3SegmentationBackend:
                     raise ValueError(
                         "SAM3 returned a frame slot outside sampled frames"
                     )
+                if slot == anchor_slot:
+                    continue
                 current = self._observations(slot, response["outputs"])
                 if any(
                     observation.object_id != anchor.object_id
@@ -372,11 +403,24 @@ class Sam3SegmentationBackend:
                         "sam3_object_identity_changed_during_"
                         f"{direction}_propagation"
                     )
-                observations.extend(current)
+                owns_slot = (
+                    direction == "forward" and slot > anchor_slot
+                ) or (
+                    direction == "backward" and slot < anchor_slot
+                )
+                # Retain anomalous cross-direction responses only to validate
+                # duplicate masks; they are never published by the track.
+                destination = (
+                    observations
+                    if owns_slot
+                    else non_owned_observations
+                )
+                destination.extend(current)
             return DirectionalTrackResult(
                 direction=direction,
                 anchor=anchor,
                 observations=tuple(observations),
+                non_owned_observations=tuple(non_owned_observations),
             )
         finally:
             self._close_session(predictor, session_id)

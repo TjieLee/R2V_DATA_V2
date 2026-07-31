@@ -190,12 +190,17 @@ propagation in independent sessions, reapplying the same prompt at the anchor in
 each session. SAM3 object IDs are session-local: validate the two anchor masks
 with IoU before remapping the backward track to the forward canonical ID. Merge
 anchor, forward, and backward masks deterministically without allowing a lower
-priority duplicate to overwrite an earlier result. A failed entity is recorded
-without blocking other entities; a clip with zero entities publishes an empty,
-ready mask artifact without loading SAM3. Single-subject, single-object, and
-current first-pass group tracking retain exactly one identity rather than
-unioning unrelated detections. Multi-object groups remain unverified and are
-rejected.
+priority duplicate to overwrite an earlier result. The published anchor mask
+comes exclusively from `add_prompt`; forward propagation owns only frames after
+the anchor, and backward propagation owns only frames before it. Propagation
+responses at the anchor are ignored because SAM3 may re-estimate a slightly
+different boundary for the same frame. The independent forward and backward
+`add_prompt` anchor masks are still checked for identity consistency at IoU
+`>= 0.95`. A failed entity is recorded without blocking other entities; a clip
+with zero entities publishes an empty, ready mask artifact without loading
+SAM3. Single-subject, single-object, and current first-pass group tracking
+retain exactly one identity rather than unioning unrelated detections.
+Multi-object groups remain unverified and are rejected.
 
 SAM3 `out_probs` values are published object-score diagnostics propagated with
 the track. They are not independently estimated per-frame tracking confidence,
