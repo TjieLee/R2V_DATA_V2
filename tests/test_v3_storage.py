@@ -126,27 +126,25 @@ def _visibility_summary(
 
 def _instruction_state(*, include_background: bool = False) -> InstructionState:
     body = (
-        "\u4f7f\u7528{{image_1}}\u7684\u7a33\u5b9a\u5916\u89c2\uff0c"
-        "\u5c06\u5176\u7f6e\u4e8e\u753b\u9762\u4e2d\u592e"
+        "Use the stable appearance of {{image_1}} and place it at the center "
+        "of the frame"
     )
     legend = [
         InstructionLegendEntry(
             image_id="image_1",
-            description="\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u7a33\u5b9a\u5916\u89c2",
+            description="the stable appearance of the woman in a yellow coat",
         )
     ]
     if include_background:
-        body += (
-            "\uff0c\u5e76\u4ee5{{image_2}}\u4f5c\u4e3a\u6574\u4f53\u80cc\u666f\u3002"
-        )
+        body += " while using {{image_2}} as the overall background."
         legend.append(
             InstructionLegendEntry(
                 image_id="image_2",
-                description="\u660e\u4eae\u7684\u5e7f\u573a\u73af\u5883",
+                description="the bright plaza environment",
             )
         )
     else:
-        body += "\u3002"
+        body += "."
     return InstructionState(
         status="ready",
         instruction_body_template=body,
@@ -628,7 +626,7 @@ def test_changed_upstream_content_invalidates_only_downstream_sections(
         assert before.instruction is not None
         body = (
             before.instruction.instruction_body_template
-            + "\u4fdd\u6301\u955c\u5934\u7a33\u5b9a\u3002"
+            + " Keep the camera steady."
         )
         storage.write_instruction(
             "clip-1",
@@ -761,18 +759,18 @@ def test_clip_cross_section_validator_rejects_inconsistent_bindings(
     record = storage.read_clip("clip-1")
     payload = record.model_dump(mode="json")
     payload["instruction"]["instruction_body_template"] = (
-        "\u4f7f\u7528{{image_1}}\u548c{{image_2}}\u751f\u6210\u955c\u5934\u3002"
+        "Use {{image_1}} and {{image_2}} to generate the shot."
     )
     payload["instruction"]["reference_legend"].append(
         {
             "image_id": "image_2",
-            "description": "\u989d\u5916\u53c2\u8003",
+            "description": "an extra reference",
         }
     )
     payload["instruction"]["r2v_instruction"] = (
-        "\u4f7f\u7528\u56fe1\u548c\u56fe2\u751f\u6210\u955c\u5934\u3002\n\n"
-        "\u56fe1\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u7a33\u5b9a\u5916\u89c2\n"
-        "\u56fe2\uff1a\u989d\u5916\u53c2\u8003"
+        "Use Image 1 and Image 2 to generate the shot.\n\n"
+        "Image 1: the stable appearance of the woman in a yellow coat\n"
+        "Image 2: an extra reference"
     )
 
     with pytest.raises(ValidationError, match="legend must match final pairing"):
@@ -1145,7 +1143,7 @@ def test_dataset_sample_schema_rejects_unbound_image_label() -> None:
             sample_id="clip-1",
             target_video="/mnt/workspace/public/dataset/video.mp4",
             t2v_caption="A woman walks.",
-            r2v_instruction="\u4f7f\u7528\u56fe2\u751f\u6210\u955c\u5934\u3002",
+            r2v_instruction="Use Image 2 to generate the shot.",
             references=[reference],
             source={"parent_video_id": "parent", "clip_suffix": "1_0"},
         )

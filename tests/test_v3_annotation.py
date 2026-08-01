@@ -298,11 +298,11 @@ def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
             tokens={"e1": "<ref_subject_1>"},
         ),
     )
-    body = "\u4f7f\u7528{{image_1}}\u751f\u6210\u8fde\u7eed\u955c\u5934\u3002"
+    body = "Use {{image_1}} to generate a continuous shot."
     legend = [
         InstructionLegendEntry(
             image_id="image_1",
-            description="\u9ec4\u8272\u5916\u5957\u5973\u5b50",
+            description="the woman in a yellow coat",
         )
     ]
     storage.write_instruction(

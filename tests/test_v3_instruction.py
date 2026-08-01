@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.v3.config import (
@@ -32,9 +33,12 @@ from r2v_data_v2.v3.schemas import (
     CoverageState,
     EntityReferenceState,
     EntityVisibilitySummary,
+    InstructionLegendEntry,
+    InstructionState,
     PairingState,
     RawInstructionOutput,
     ReferencesState,
+    render_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
 from run_pipeline_v3 import run_pipeline_v3
@@ -224,16 +228,16 @@ def _raw_output(
 ) -> RawInstructionOutput:
     ids = legend_ids or ["image_1", "image_2", "image_3"]
     values = descriptions or [
-        "\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u5916\u89c2",
-        "\u7ea2\u8272\u81ea\u884c\u8f66\u7684\u5916\u89c2",
-        "\u660e\u4eae\u7684\u5e7f\u573a\u73af\u5883",
+        "the stable appearance of the woman in a yellow coat",
+        "the stable appearance of the red bicycle",
+        "the bright plaza environment",
     ]
     return RawInstructionOutput(
         instruction_body_template=body
         or (
-            "\u4ee5{{image_3}}\u4f5c\u4e3a\u6574\u4f53\u80cc\u666f\uff0c"
-            "{{image_1}}\u63a8\u7740{{image_2}}\u5411\u524d\u884c\u8d70\uff0c"
-            "\u955c\u5934\u7a33\u5b9a\u540e\u9000\u3002"
+            "Use {{image_3}} as the overall background while {{image_1}} "
+            "walks forward pushing {{image_2}}, and the camera tracks "
+            "steadily backward."
         ),
         reference_legend=[
             {"image_id": image_id, "description": description}
@@ -339,12 +343,42 @@ def test_instruction_output_schema_uses_english_identifiers_only() -> None:
     assert "\u56fe1" not in serialized
 
 
+def test_english_body_and_legend_are_accepted() -> None:
+    output = _raw_output(
+        body=(
+            "At dusk—{{image_1}} walks beside {{image_2}} in {{image_3}}, "
+            "while the camera tracks backward."
+        )
+    )
+
+    assert _issue_codes(output) == set()
+
+
+def test_chinese_body_is_rejected() -> None:
+    output = _raw_output(
+        body="\u5728{{image_3}}\u4e2d\uff0c{{image_1}}\u63a8\u7740{{image_2}}\u524d\u8fdb\u3002"
+    )
+
+    assert "non_english_instruction_text" in _issue_codes(output)
+
+
+def test_chinese_legend_description_is_rejected() -> None:
+    output = _raw_output(
+        descriptions=[
+            "\u9ec4\u8272\u5916\u5957\u5973\u5b50",
+            "the red bicycle",
+            "the bright plaza",
+        ]
+    )
+
+    assert "non_english_legend_description" in _issue_codes(output)
+
+
 def test_repeated_placeholder_is_allowed() -> None:
     output = _raw_output(
         body=(
-            "{{image_1}}\u4f4d\u4e8e{{image_2}}\u65c1\u8fb9\uff0c"
-            "\u955c\u5934\u518d\u6b21\u5bf9\u51c6{{image_1}}\uff0c"
-            "\u5e76\u4ee5{{image_3}}\u4e3a\u80cc\u666f\u3002"
+            "{{image_1}} stands beside {{image_2}}; the camera returns to "
+            "{{image_1}} with {{image_3}} in the background."
         )
     )
 
@@ -357,18 +391,14 @@ def test_repeated_placeholder_is_allowed() -> None:
         (
             _raw_output(
                 body=(
-                    "{{image_1}}\u548c{{image_2}}\u4f4d\u4e8e"
-                    "{{image_3}}\u4e2d\uff0c{{image_4}}\u51fa\u73b0\u3002"
+                    "{{image_1}} and {{image_2}} stand in {{image_3}}, while "
+                    "{{image_4}} appears."
                 )
             ),
             "unknown_image_placeholder",
         ),
         (
-            _raw_output(
-                body=(
-                    "{{image_1}}\u4f4d\u4e8e{{image_3}}\u4e2d\u3002"
-                )
-            ),
+            _raw_output(body="{{image_1}} stands in {{image_3}}."),
             "missing_image_placeholder",
         ),
         (
@@ -383,38 +413,38 @@ def test_repeated_placeholder_is_allowed() -> None:
         ),
         (
             _raw_output(
-                descriptions=[
-                    "",
-                    "\u9ec4\u8272\u5916\u5957\u5973\u5b50",
-                    "\u5e7f\u573a",
-                ]
+                descriptions=["", "the red bicycle", "the bright plaza"]
             ),
             "empty_legend_description",
         ),
         (
             _raw_output(
                 body=(
-                    "{{image_1}}\u548c{{image_2}}\u4f4d\u4e8e"
-                    "{{image_3}}\u4e2d\uff0c\u4f7f\u7528"
-                    "<ref_subject_1>\u3002"
+                    "{{image_1}} and {{image_2}} stand in {{image_3}} beside "
+                    "<ref_subject_1>."
                 )
             ),
             "reference_token_in_instruction",
         ),
         (
             _raw_output(
-                body=(
-                    "\u56fe1\u548c{{image_2}}\u4f4d\u4e8e"
-                    "{{image_3}}\u4e2d\u3002"
-                )
+                body="\u56fe1 stands beside {{image_2}} in {{image_3}}."
             ),
             "direct_chinese_image_label",
         ),
         (
             _raw_output(
                 body=(
-                    "{{ image_1 }}\u548c{{image_2}}\u4f4d\u4e8e"
-                    "{{image_3}}\u4e2d\u3002"
+                    "Image 1 stands beside {{image_1}} and {{image_2}} in "
+                    "{{image_3}}."
+                )
+            ),
+            "direct_english_image_label",
+        ),
+        (
+            _raw_output(
+                body=(
+                    "{{ image_1 }} stands beside {{image_2}} in {{image_3}}."
                 )
             ),
             "invalid_image_placeholder",
@@ -431,13 +461,77 @@ def test_instruction_validation_rejects_invalid_structured_output(
 def test_quoted_dialogue_requires_source_transcript() -> None:
     output = _raw_output(
         body=(
-            "{{image_2}}\u5bf9{{image_1}}\u8bf4\uff1a\u300c\u8ddf\u6211\u6765\u3002\u300d"
-            "\uff0c{{image_3}}\u4f5c\u4e3a\u80cc\u666f\u3002"
+            "{{image_2}} tells {{image_1}}, \u201cFollow me.\u201d while "
+            "{{image_3}} remains behind them."
         )
     )
 
     assert "quoted_dialogue_without_transcript" in _issue_codes(output)
-    assert _issue_codes(output, transcript="\u8ddf\u6211\u6765\u3002") == set()
+    assert _issue_codes(output, transcript="Follow me.") == set()
+
+
+def test_renderer_uses_english_labels() -> None:
+    legend = [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description="the stable appearance of a red bicycle",
+        )
+    ]
+
+    rendered = render_instruction_text("Move {{image_1}} forward.", legend)
+
+    assert rendered == (
+        "Move Image 1 forward.\n\n"
+        "Image 1: the stable appearance of a red bicycle"
+    )
+    assert "\u56fe1" not in rendered
+
+
+def test_legacy_chinese_instruction_state_can_be_loaded() -> None:
+    state = InstructionState.model_validate(
+        {
+            "status": "ready",
+            "instruction_body_template": "\u8ba9{{image_1}}\u5411\u524d\u79fb\u52a8\u3002",
+            "reference_legend": [
+                {
+                    "image_id": "image_1",
+                    "description": "\u9ec4\u8272\u5916\u5957\u5973\u5b50",
+                }
+            ],
+            "r2v_instruction": (
+                "\u8ba9\u56fe1\u5411\u524d\u79fb\u52a8\u3002\n\n"
+                "\u56fe1\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50"
+            ),
+        }
+    )
+
+    assert state.status == "ready"
+    assert state.r2v_instruction.startswith("\u8ba9\u56fe1")
+
+
+def test_new_instruction_state_requires_english_rendering() -> None:
+    body = "Move {{image_1}} forward."
+    legend = [
+        InstructionLegendEntry(image_id="image_1", description="a red bicycle")
+    ]
+
+    state = InstructionState(
+        status="ready",
+        instruction_body_template=body,
+        reference_legend=legend,
+        r2v_instruction=render_instruction_text(body, legend),
+    )
+
+    assert state.r2v_instruction == "Move Image 1 forward.\n\nImage 1: a red bicycle"
+    with pytest.raises(ValidationError, match="deterministic English rendering"):
+        InstructionState(
+            status="ready",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=(
+                "Move \u56fe1 forward.\n\n\u56fe1\uff1aa red bicycle"
+            ),
+        )
 
 
 def test_source_transcript_reads_only_explicit_metadata_fields() -> None:
@@ -455,8 +549,8 @@ def test_unknown_placeholder_can_be_repaired_and_rendered(
     storage, clip_uid = _ready_storage(config)
     invalid = _raw_output(
         body=(
-            "{{image_1}}\u548c{{image_2}}\u4f4d\u4e8e"
-            "{{image_3}}\u4e2d\uff0c{{image_4}}\u51fa\u73b0\u3002"
+            "{{image_1}} and {{image_2}} stand in {{image_3}}, while "
+            "{{image_4}} appears."
         )
     )
     valid = _raw_output()
@@ -478,12 +572,11 @@ def test_unknown_placeholder_can_be_repaired_and_rendered(
     assert instruction is not None
     assert instruction.reference_legend[0].image_id == "image_1"
     assert instruction.r2v_instruction == (
-        "\u4ee5\u56fe3\u4f5c\u4e3a\u6574\u4f53\u80cc\u666f\uff0c"
-        "\u56fe1\u63a8\u7740\u56fe2\u5411\u524d\u884c\u8d70\uff0c"
-        "\u955c\u5934\u7a33\u5b9a\u540e\u9000\u3002\n\n"
-        "\u56fe1\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u5916\u89c2\n"
-        "\u56fe2\uff1a\u7ea2\u8272\u81ea\u884c\u8f66\u7684\u5916\u89c2\n"
-        "\u56fe3\uff1a\u660e\u4eae\u7684\u5e7f\u573a\u73af\u5883"
+        "Use Image 3 as the overall background while Image 1 walks forward "
+        "pushing Image 2, and the camera tracks steadily backward.\n\n"
+        "Image 1: the stable appearance of the woman in a yellow coat\n"
+        "Image 2: the stable appearance of the red bicycle\n"
+        "Image 3: the bright plaza environment"
     )
 
 
@@ -494,11 +587,7 @@ def test_instruction_failure_preserves_ready_annotation(
     config = _config(tmp_path, monkeypatch)
     storage, clip_uid = _ready_storage(config)
     before = storage.read_clip(clip_uid).annotation
-    invalid = _raw_output(
-        body=(
-            "{{image_1}}\u4f4d\u4e8e{{image_3}}\u4e2d\u3002"
-        )
-    )
+    invalid = _raw_output(body="{{image_1}} stands in {{image_3}}.")
     client = _FakeInstructionClient(
         config.qwen.instruction_writer,
         [invalid.model_dump(mode="json")],
@@ -540,6 +629,60 @@ def test_instruction_input_uses_english_ids_and_explicit_transcript(
     assert '"entity_id": null' in request
     assert '"source_transcript": "\u8ddf\u6211\u6765\u3002"' in request
     assert "\u56fe1" not in request
+
+
+def test_overwrite_replaces_legacy_chinese_instruction_with_english(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage, clip_uid = _ready_storage(config)
+    legacy = InstructionState.model_validate(
+        {
+            "status": "ready",
+            "instruction_body_template": (
+                "\u4ee5{{image_3}}\u4e3a\u80cc\u666f\uff0c{{image_1}}\u63a8\u7740"
+                "{{image_2}}\u524d\u8fdb\u3002"
+            ),
+            "reference_legend": [
+                {"image_id": "image_1", "description": "\u9ec4\u8272\u5916\u5957\u5973\u5b50"},
+                {"image_id": "image_2", "description": "\u7ea2\u8272\u81ea\u884c\u8f66"},
+                {"image_id": "image_3", "description": "\u660e\u4eae\u5e7f\u573a"},
+            ],
+            "r2v_instruction": (
+                "\u4ee5\u56fe3\u4e3a\u80cc\u666f\uff0c\u56fe1\u63a8\u7740\u56fe2\u524d\u8fdb\u3002\n\n"
+                "\u56fe1\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50\n"
+                "\u56fe2\uff1a\u7ea2\u8272\u81ea\u884c\u8f66\n"
+                "\u56fe3\uff1a\u660e\u4eae\u5e7f\u573a"
+            ),
+        }
+    )
+    storage.write_instruction(clip_uid, legacy)
+    client = _FakeInstructionClient(
+        config.qwen.instruction_writer,
+        [_raw_output().model_dump(mode="json")],
+    )
+
+    stats = instruct_clips(
+        config,
+        storage,
+        overwrite=True,
+        client=client,
+    )
+
+    instruction = storage.read_clip(clip_uid).instruction
+    assert stats.processed == 1
+    assert stats.skipped_existing == 0
+    assert instruction is not None
+    assert instruction.instruction_body_template == (
+        _raw_output().instruction_body_template
+    )
+    assert instruction.r2v_instruction == render_instruction_text(
+        instruction.instruction_body_template,
+        instruction.reference_legend,
+    )
+    assert "Image 1" in instruction.r2v_instruction
+    assert "\u56fe1" not in instruction.r2v_instruction
 
 
 def test_pipeline_runs_instruct_stage_with_fake_client(

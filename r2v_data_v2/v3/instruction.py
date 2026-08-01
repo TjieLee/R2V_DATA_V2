@@ -28,7 +28,14 @@ _REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>", flags=re.IGNORECASE)
 _EXACT_PLACEHOLDER = re.compile(r"\{\{(image_[1-9]\d*)\}\}")
 _ANY_PLACEHOLDER = re.compile(r"\{\{[^{}]*\}\}")
 _DIRECT_CHINESE_IMAGE_LABEL = re.compile(r"\u56fe\s*\d+")
-_CHINESE_TEXT = re.compile(r"[\u3400-\u9fff]")
+_DIRECT_ENGLISH_IMAGE_LABEL = re.compile(
+    r"\bImage\s+[1-9]\d*\b",
+    flags=re.IGNORECASE,
+)
+_CJK_TEXT = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\U00020000-\U0002fa1f]"
+)
 _QUOTED_DIALOGUE = re.compile(
     r"(?:\u300c[^\u300d\n]+\u300d|"
     r"\u300e[^\u300f\n]+\u300f|"
@@ -36,29 +43,29 @@ _QUOTED_DIALOGUE = re.compile(
     r'"[^"\n]+")'
 )
 
-SYSTEM_PROMPT = """You write a Chinese reference-conditioned video instruction.
+SYSTEM_PROMPT = """You write an English reference-conditioned video instruction.
 
 Return exactly one JSON object matching the supplied schema. The input bindings
 are final and immutable. Do not add, remove, reorder, rename, or reinterpret any
 binding. All schema field names, identifiers, and placeholders remain English.
 
-Write instruction_body_template in Chinese and describe the scene, lighting,
-camera, composition, initial positions, spatial relationships, visible actions,
-and shot changes in chronological order. Use each exact English placeholder,
-such as {{image_1}}, at least once. Placeholders may be repeated. Do not output
-direct Chinese image labels such as image labels written with the Chinese
-character for image followed by a number. Do not output <ref_...> tokens. Do not
-invent shot changes for a single continuous shot.
+Write instruction_body_template in English. Accurately describe the scene,
+lighting, camera, composition, initial positions, spatial relationships, visible
+actions, and shot changes in chronological order. Use each exact placeholder,
+such as {{image_1}}, at least once. Placeholders may be repeated. In raw output,
+never replace placeholders with rendered labels such as Image 1 or Chinese
+image-number labels. Do not output <ref_...> tokens. Do not invent shot changes
+for a single continuous shot.
 
 Without source_transcript, do not invent quoted dialogue. Visible speaking
 motion may be described without supplying words. When source_transcript is
 present, only dialogue supported by that transcript may be quoted.
 
 reference_legend must contain exactly one entry for each binding in the same
-order. Copy each binding image_id exactly. Each Chinese description summarizes
-stable visual appearance that the corresponding reference image must preserve.
-A background description covers the environment and must not invent subject
-actions. Return JSON only."""
+order. Copy each binding image_id exactly. Each description must be in English
+and summarize the stable visual appearance that the corresponding reference
+image must preserve. A background description covers the environment and must
+not invent subject actions. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -172,12 +179,14 @@ def validate_instruction_output(
                 message="instruction_body_template must not be empty",
             )
         )
-    elif _CHINESE_TEXT.search(body) is None:
+    elif _CJK_TEXT.search(body):
         issues.append(
             ValidationIssue(
-                code="instruction_body_not_chinese",
+                code="non_english_instruction_text",
                 field="instruction_body_template",
-                message="instruction_body_template must be Chinese",
+                message=(
+                    "instruction_body_template must not contain CJK characters"
+                ),
             )
         )
     if _REFERENCE_TOKEN.search(raw_text):
@@ -196,6 +205,14 @@ def validate_instruction_output(
                 message=(
                     "raw instruction output must use English image placeholders"
                 ),
+            )
+        )
+    if _DIRECT_ENGLISH_IMAGE_LABEL.search(raw_text):
+        issues.append(
+            ValidationIssue(
+                code="direct_english_image_label",
+                field=None,
+                message="raw instruction output must use {{image_N}} placeholders",
             )
         )
 
@@ -261,6 +278,14 @@ def validate_instruction_output(
                     code="empty_legend_description",
                     field=f"reference_legend.{index}.description",
                     message="legend description must not be empty",
+                )
+            )
+        elif _CJK_TEXT.search(entry.description):
+            issues.append(
+                ValidationIssue(
+                    code="non_english_legend_description",
+                    field=f"reference_legend.{index}.description",
+                    message="legend description must not contain CJK characters",
                 )
             )
         if _ANY_PLACEHOLDER.search(entry.description):
@@ -337,7 +362,7 @@ def _initial_request(
         source_transcript=source_transcript,
     )
     return (
-        "Write the structured instruction for this immutable input:\n"
+        "Write the structured English instruction for this immutable input:\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -349,9 +374,10 @@ def _repair_request(
     issues: list[ValidationIssue],
 ) -> str:
     return (
-        "Repair only the structured-output problems listed below. Preserve all "
-        "English image IDs and return the complete corrected JSON object. Do "
-        "not output direct Chinese image-number labels in raw JSON.\n"
+        "Repair only the structured-output problems listed below. Return the "
+        "complete corrected JSON object with an English body and English legend "
+        "descriptions. Preserve all image IDs and exact {{image_N}} placeholders; "
+        "do not output rendered image-number labels in raw JSON.\n"
         f"Original request:\n{original_request}\n"
         "JSON Schema:\n"
         f"{json.dumps(RawInstructionOutput.model_json_schema(), ensure_ascii=False)}\n"
