@@ -4,6 +4,7 @@ import inspect
 from pathlib import Path
 from typing import Any, Protocol
 
+import numpy as np
 from PIL import Image
 
 from r2v_data_v2.v3.config import RemoveConfig
@@ -45,6 +46,50 @@ def build_background_removal_prompt(
         "animal, vehicle, product, text, sign, or any other salient object. "
         "Do not alter unrelated image regions."
     )
+
+
+def pad_image_to_multiple(
+    image: Image.Image,
+    *,
+    multiple: int,
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    if not isinstance(image, Image.Image):
+        raise TypeError("image must be a PIL image")
+    if not isinstance(multiple, int) or isinstance(multiple, bool):
+        raise TypeError("multiple must be a positive integer")
+    if multiple <= 0:
+        raise ValueError("multiple must be a positive integer")
+
+    rgb_image = image.convert("RGB")
+    original_width, original_height = rgb_image.size
+    target_width = (
+        (original_width + multiple - 1) // multiple
+    ) * multiple
+    target_height = (
+        (original_height + multiple - 1) // multiple
+    ) * multiple
+    horizontal_padding = target_width - original_width
+    vertical_padding = target_height - original_height
+    left = horizontal_padding // 2
+    right = horizontal_padding - left
+    top = vertical_padding // 2
+    bottom = vertical_padding - top
+    crop_box = (
+        left,
+        top,
+        left + original_width,
+        top + original_height,
+    )
+
+    if not any((left, right, top, bottom)):
+        return rgb_image.copy(), crop_box
+
+    padded = np.pad(
+        np.asarray(rgb_image),
+        ((top, bottom), (left, right), (0, 0)),
+        mode="edge",
+    )
+    return Image.fromarray(padded, mode="RGB"), crop_box
 
 
 def _supports_parameter(callable_object: Any, name: str) -> bool:
@@ -219,6 +264,12 @@ class QwenImageEditRemovalBackend:
         )
 
         import torch
+        from diffusers.utils import USE_PEFT_BACKEND
+
+        if not USE_PEFT_BACKEND:
+            raise RuntimeError(
+                "PEFT backend is required for the Object-Remover LoRA"
+            )
         from diffusers import QwenImageEditPlusPipeline
 
         dtype = getattr(torch, self.config.dtype, None)
@@ -345,11 +396,19 @@ class QwenImageEditRemovalBackend:
         ):
             raise RuntimeError("Object-Remover LoRA backend is not active")
 
+        original_size = image.size
+        multiple = int(self._pipeline.vae_scale_factor) * 2
+        padded_image, crop_box = pad_image_to_multiple(
+            image,
+            multiple=multiple,
+        )
         generator = self._torch.Generator(
             device=self.config.device
         ).manual_seed(seed)
         parameters = {
-            "image": [image.convert("RGB")],
+            "image": [padded_image],
+            "height": padded_image.height,
+            "width": padded_image.width,
             "prompt": prompt,
             "generator": generator,
             "true_cfg_scale": self.config.true_cfg_scale,
@@ -371,7 +430,19 @@ class QwenImageEditRemovalBackend:
             or not isinstance(images[0], Image.Image)
         ):
             raise TypeError("Qwen removal backend did not return a PIL image")
-        return images[0]
+        edited = images[0]
+        if edited.size != padded_image.size:
+            raise RuntimeError(
+                "Qwen removal output dimensions do not match requested padded "
+                f"dimensions: expected={padded_image.size}, actual={edited.size}"
+            )
+        cropped = edited.crop(crop_box).convert("RGB")
+        if cropped.size != original_size:
+            raise RuntimeError(
+                "Qwen removal cropped dimensions do not match source dimensions: "
+                f"expected={original_size}, actual={cropped.size}"
+            )
+        return cropped
 
     def close(self) -> None:
         pipeline = self._pipeline
