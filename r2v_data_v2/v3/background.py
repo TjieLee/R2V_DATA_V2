@@ -319,6 +319,102 @@ def _validate_source_frame(
     return frame
 
 
+def _validate_ready_removed(
+    storage: RunStorage,
+    clip_uid: str,
+    state: BackgroundReferenceState,
+    *,
+    frames: SampledFramesArtifact,
+    frame: SampledFrame,
+    source_mask: np.ndarray,
+) -> None:
+    from r2v_data_v2.v3.remove import build_generation_mask
+
+    if (
+        state.output_image_path is None
+        or state.generation_mask_path is None
+        or state.generation_mask_area_pixels is None
+        or state.generation_mask_area_ratio is None
+        or state.generation_mask_dilation_pixels is None
+        or state.output_sha256 is None
+    ):
+        raise ValueError("ready removed background metadata is incomplete")
+
+    output_path = _resolve_run_artifact(storage, state.output_image_path)
+    expected_output = (
+        storage.clip_dir(clip_uid) / "selected" / "bg_removed.png"
+    ).resolve(strict=False)
+    if output_path != expected_output:
+        raise ValueError("ready removed output path must be selected/bg_removed.png")
+    if not output_path.is_file():
+        raise FileNotFoundError("ready removed background output is missing")
+    if _sha256(output_path) != state.output_sha256:
+        raise ValueError("ready removed background output hash is invalid")
+
+    generation_path = _resolve_run_artifact(storage, state.generation_mask_path)
+    background_dir = storage.background_dir(clip_uid).resolve(strict=False)
+    if generation_path.parent != background_dir:
+        raise ValueError("background generation mask is outside background_dir")
+    prefix = "generation_mask_"
+    if (
+        not generation_path.name.startswith(prefix)
+        or not generation_path.name.endswith(".png")
+        or _sha256(generation_path)
+        != generation_path.name[len(prefix) : -len(".png")]
+    ):
+        raise ValueError("background generation mask content hash is invalid")
+    generation_mask = _validate_mask_png(
+        generation_path,
+        width=frames.width,
+        height=frames.height,
+        expected_area=state.generation_mask_area_pixels,
+    )
+    expected_ratio = state.generation_mask_area_pixels / (
+        frames.width * frames.height
+    )
+    if not math.isclose(
+        state.generation_mask_area_ratio,
+        expected_ratio,
+        rel_tol=0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("background generation mask ratio does not match state")
+    if not np.all(generation_mask[source_mask]):
+        raise ValueError("background generation mask does not contain source mask")
+    expected_generation = build_generation_mask(
+        source_mask,
+        dilation_pixels=state.generation_mask_dilation_pixels,
+    )
+    if not np.array_equal(generation_mask, expected_generation):
+        raise ValueError(
+            "background generation mask does not match recorded dilation"
+        )
+
+    source_path = (storage.clip_dir(clip_uid) / frame.image_path).resolve(
+        strict=False
+    )
+    if not source_path.is_file():
+        raise FileNotFoundError("ready removed source image is missing")
+    with Image.open(source_path) as opened:
+        opened.load()
+        source = np.asarray(opened.convert("RGB"))
+    with Image.open(output_path) as opened:
+        opened.load()
+        if opened.format != "PNG":
+            raise ValueError("ready removed background output must be a PNG")
+        if opened.size != (frames.width, frames.height):
+            raise ValueError("ready removed background output dimensions are invalid")
+        output = np.asarray(opened.convert("RGB"))
+    if not np.array_equal(output[~generation_mask], source[~generation_mask]):
+        raise ValueError(
+            "ready removed background changed pixels outside generation mask"
+        )
+    if not np.any(output[generation_mask] != source[generation_mask]):
+        raise ValueError(
+            "ready removed background did not change the generation mask"
+        )
+
+
 def validate_background_reference(
     storage: RunStorage,
     clip_uid: str,
@@ -331,7 +427,8 @@ def validate_background_reference(
     validated_frames = frames or validate_sampled_frames(storage, clip_uid)
     if state.status == "rejected" and state.source_image_path is None:
         return
-    _validate_source_frame(storage, clip_uid, state, validated_frames)
+    frame = _validate_source_frame(storage, clip_uid, state, validated_frames)
+    source_mask: np.ndarray | None = None
     if state.status == "clean_raw":
         return
     if state.source_mask_path is not None:
@@ -348,7 +445,7 @@ def validate_background_reference(
             raise ValueError("background source mask content hash is invalid")
         if state.source_foreground_area_pixels is None:
             raise ValueError("background source mask is missing area diagnostics")
-        _validate_mask_png(
+        source_mask = _validate_mask_png(
             mask_path,
             width=validated_frames.width,
             height=validated_frames.height,
@@ -365,9 +462,16 @@ def validate_background_reference(
         ):
             raise ValueError("background source mask ratio does not match state")
     if state.status == "ready_removed":
-        for value in (state.output_image_path, state.generation_mask_path):
-            if value is None or not _resolve_run_artifact(storage, value).is_file():
-                raise FileNotFoundError("ready removed background artifact is missing")
+        if source_mask is None:
+            raise ValueError("ready removed background source mask is missing")
+        _validate_ready_removed(
+            storage,
+            clip_uid,
+            state,
+            frames=validated_frames,
+            frame=frame,
+            source_mask=source_mask,
+        )
 
 
 def _publish_state(

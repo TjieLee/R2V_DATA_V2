@@ -953,15 +953,11 @@ def test_pipeline_executes_background_stage_without_models(
     assert result["background"]["processed"] == 0
 
 
-@pytest.mark.parametrize("stage", ["remove", "pair"])
-def test_remove_and_pair_remain_unimplemented(
-    tmp_path: Path,
-    stage: str,
-) -> None:
-    with pytest.raises(NotImplementedError, match=stage):
+def test_pair_remains_unimplemented(tmp_path: Path) -> None:
+    with pytest.raises(NotImplementedError, match="pair"):
         run_pipeline_v3(
             config_path=tmp_path / "unused.yaml",
-            stages=(stage,),
+            stages=("pair",),
         )
 
 
