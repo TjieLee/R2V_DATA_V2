@@ -953,8 +953,8 @@ def test_pipeline_executes_background_stage_without_models(
     assert result["background"]["processed"] == 0
 
 
-def test_pair_remains_unimplemented(tmp_path: Path) -> None:
-    with pytest.raises(NotImplementedError, match="pair"):
+def test_pair_stage_loads_configuration(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
         run_pipeline_v3(
             config_path=tmp_path / "unused.yaml",
             stages=("pair",),

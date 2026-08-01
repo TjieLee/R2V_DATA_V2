@@ -214,8 +214,8 @@ depend only on a ready entity, a present non-empty mask, and `track_valid`.
 
 The current implementation computes temporal coverage only from
 `masks.rle.json`. It does not rerun SAM3, select canonical frames, classify
-full/local/reject scope, or publish references. Later ranking work may add
-those separate reference-quality decisions.
+full/local/reject scope, or publish references. The later `pair` stage owns
+candidate selection and Qwen owns the semantic full/local/reject decision.
 
 #### `background`
 
@@ -244,9 +244,14 @@ Remove foreground entities from pending backgrounds using the configured Qwen Im
 
 #### `pair`
 
-Choose the final retained references and assign deterministic tokens. The
-clip-level coverage gate uses ANY-entity semantics and defaults to 7/10, with
-the integer threshold configurable independently from SAM3.
+Select deterministic in-pair entity candidates from the ten sampled frames and
+validated tracked masks, then ask the configured Qwen candidate judge for the
+semantic full/local/reject decision. Code owns mask integrity, geometry, crop
+publication, final retained filtering, optional ready-background binding, and
+deterministic per-type tokens. Every ready entity reference is retained in
+annotation order, and at least one retained entity must pass temporal coverage.
+The stage does not rerun SAM3, resize references, synthesize missing content, or
+perform same-parent/cross-parent pairing.
 
 #### `instruct`
 
@@ -435,10 +440,13 @@ Examples:
 
 For a local reference:
 
-- crop only the coherent selected region;
-- remove disconnected irrelevant fragments from the reference mask;
+- crop the exact selected tracked-mask bbox plus deterministic padding;
+- preserve natural holes, thin structures, and disconnected mask components;
 - store the visible region explicitly;
 - never describe the result as a full-body or complete-object reference.
+
+The current pair stage performs no semantic component pruning. Qwen rejects
+obvious fragmentation or segmentation errors.
 
 ### 8.3 `reject`
 
@@ -607,7 +615,9 @@ V3 preserves the corrected clip-level coverage semantics:
 - an entity without a final reference remains in natural language but has no token;
 - token assignment and final reference filtering happen together.
 
-Same-parent cross-pair remains optional and conservative. A failed cross-pair judgment falls back to in-pair when configured.
+The current implementation is in-pair only. It does not invoke
+`qwen.cross_pair_judge`, search same-parent clips, search cross-parent clips, or
+fall back from any cross-pair attempt.
 
 ---
 
@@ -752,6 +762,7 @@ Required layout:
         │   └── bg_removed.png
         └── debug/                 # created only when debug saving is enabled
             ├── segment/           # per-slot overlays and entity contact sheets
+            ├── pair/              # optional requests, responses, and contact sheets
             └── remove/
                 ├── candidate_seed_0.png
                 └── review_seed_0.json
@@ -769,7 +780,13 @@ Rules:
 - `masks.rle.json` stores every ordered slot, including absent masks, and uses
   validated two-dimensional binary run-length encoding at the sampled frame
   dimensions.
-- Store only selected entity images in `selected/`.
+- Store only selected entity images in `selected/`. Each ready entity uses the
+  fixed `selected/eN.png` path and is an RGBA PNG cropped without resize. Alpha
+  is the exact binary tracked-mask crop; opaque RGB equals the sampled source,
+  and transparent RGB is white.
+- Pair publication validates temporary PNGs, backs up only entity PNGs, updates
+  references and pairing in one atomic clip write, and restores the old files
+  and state on failure. It never deletes `bg_removed.png` or other selected files.
 - `background/source_mask_<sha256>.png` is the exact, single-channel 0/255
   union mask used by `pending_remove` and oversized audit states.
 - Background source masks are content-addressed and atomically published; stale
@@ -1019,6 +1036,12 @@ reference_scope:
   allow_local: true
   allow_synthetic_completion: false
 
+pair:
+  enabled: true
+  max_candidates_per_entity: 3
+  crop_padding_ratio: 0.08
+  repair_retries: 1
+
 background:
   enabled: true
   raw_foreground_area_ratio: 0.0
@@ -1062,6 +1085,9 @@ Validation must reject:
 - model downloads into public paths;
 - `coverage.required_visible_frames` outside 1 through `frames.count`;
 - `allow_synthetic_completion: true` in the initial V3 implementation;
+- non-boolean `pair.enabled`, candidate limits outside 1 through 10,
+  non-finite/non-float crop padding outside 0 through 0.5, or negative/non-integer
+  pair repair retries;
 - `remove.fallback_to_raw: true`;
 - remove candidate seed lists other than one or two unique non-negative integers;
 - unsupported remove dtypes, non-finite guidance values, or invalid mask limits;
@@ -1085,12 +1111,12 @@ r2v_data_v2/v3/
 ├── schemas.py
 ├── storage.py
 ├── annotation.py
-├── reference_scope.py
+├── pair.py
+├── reference_judge.py
 ├── background.py
 ├── remove.py
 ├── qwen_image_edit_backend.py
 ├── removal_judge.py
-├── pairing.py
 ├── instruction.py
 ├── export.py
 └── pipeline.py

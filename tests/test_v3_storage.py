@@ -438,15 +438,6 @@ def test_v3_config_rejects_sam3_model_path_outside_allowed_roots(
         ).validate()
 
 
-def test_unimplemented_stage_message_lists_remove(tmp_path: Path) -> None:
-    with pytest.raises(NotImplementedError) as error:
-        run_pipeline_v3(
-            config_path=tmp_path / "unused.yaml",
-            stages=("pair",),
-        )
-
-    assert "rank, background, remove, instruct" in str(error.value)
-
 
 @pytest.mark.parametrize("required", [0, 11])
 def test_coverage_required_visible_frames_must_be_in_range(
@@ -631,9 +622,7 @@ def test_changed_upstream_content_invalidates_only_downstream_sections(
         assert before.pairing is not None
         storage.write_pairing(
             "clip-1",
-            before.pairing.model_copy(
-                update={"tokens": {"e1": "<ref_subject_2>"}}
-            ),
+            PairingState(status="rejected", reason="updated pairing"),
         )
     else:
         assert before.instruction is not None
@@ -826,7 +815,7 @@ def test_clip_cross_section_validator_requires_ready_retained_reference(
     payload["pairing"]["retained_entity_ids"] = ["e2"]
     payload["pairing"]["tokens"] = {"e2": "<ref_object_1>"}
 
-    with pytest.raises(ValidationError, match="must have ready references"):
+    with pytest.raises(ValidationError, match="retain every ready"):
         ClipRecord.model_validate(payload)
 
 
@@ -836,16 +825,29 @@ def test_clip_cross_section_validator_requires_retained_qualifying_entity(
 ) -> None:
     storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
     payload = storage.read_clip("clip-1").model_dump(mode="json")
-    ready_path = payload["references"]["entities"][0]["image_path"]
+    first = payload["references"]["entities"][0]
+    first.update(
+        {
+            "status": "rejected",
+            "reference_scope": "reject",
+            "visible_region": "custom",
+            "whole_entity_recognizable": False,
+            "identity_features_visible": False,
+            "scope_reason": "not reusable",
+            "image_path": None,
+            "source_frame_index": None,
+        }
+    )
     second = payload["references"]["entities"][1]
     second.update(
         {
             "status": "ready",
             "reference_scope": "local",
             "visible_region": "central",
+            "whole_entity_recognizable": False,
             "identity_features_visible": True,
             "scope_reason": "coherent local object region",
-            "image_path": ready_path,
+            "image_path": "clips/clip-1/selected/e2.png",
             "source_frame_index": 2,
         }
     )

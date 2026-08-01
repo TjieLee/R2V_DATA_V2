@@ -1065,7 +1065,7 @@ def test_ready_validation_detects_output_outside_mask_change(
     assert stats.failed == 1
 
 
-def test_pipeline_executes_remove_and_pair_remains_unimplemented(
+def test_pipeline_executes_remove_and_pair_without_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1096,9 +1096,9 @@ def test_pipeline_executes_remove_and_pair_remains_unimplemented(
         background_removal_judge=_Judge(),
     )
     assert result["remove"]["processed"] == 0
-    with pytest.raises(NotImplementedError):
-        run_pipeline_v3(
-            config_path=config_path,
-            stages=("pair",),
-            git_commit="abc123",
-        )
+    pair_result = run_pipeline_v3(
+        config_path=config_path,
+        stages=("pair",),
+        git_commit="abc123",
+    )
+    assert pair_result["pair"]["processed"] == 0

@@ -178,7 +178,7 @@ def _ready_storage(
             status="ready",
             reference_scope="local",
             visible_region="central",
-            whole_entity_recognizable=True,
+            whole_entity_recognizable=False,
             identity_features_visible=True,
             scope_reason="clear reference",
             image_path=f"clips/{clip_uid}/selected/{entity_id}.png",
@@ -205,10 +205,10 @@ def _ready_storage(
         clip_uid,
         PairingState(
             status="ready",
-            retained_entity_ids=["e2", "e1"],
+            retained_entity_ids=["e1", "e2"],
             tokens={
-                "e2": "<ref_object_1>",
                 "e1": "<ref_subject_1>",
+                "e2": "<ref_object_1>",
             },
             background_token="<ref_bg_1>",
         ),
@@ -224,15 +224,15 @@ def _raw_output(
 ) -> RawInstructionOutput:
     ids = legend_ids or ["image_1", "image_2", "image_3"]
     values = descriptions or [
-        "\u7ea2\u8272\u81ea\u884c\u8f66\u7684\u5916\u89c2",
         "\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u5916\u89c2",
+        "\u7ea2\u8272\u81ea\u884c\u8f66\u7684\u5916\u89c2",
         "\u660e\u4eae\u7684\u5e7f\u573a\u73af\u5883",
     ]
     return RawInstructionOutput(
         instruction_body_template=body
         or (
             "\u4ee5{{image_3}}\u4f5c\u4e3a\u6574\u4f53\u80cc\u666f\uff0c"
-            "{{image_2}}\u63a8\u7740{{image_1}}\u5411\u524d\u884c\u8d70\uff0c"
+            "{{image_1}}\u63a8\u7740{{image_2}}\u5411\u524d\u884c\u8d70\uff0c"
             "\u955c\u5934\u7a33\u5b9a\u540e\u9000\u3002"
         ),
         reference_legend=[
@@ -314,10 +314,10 @@ def test_bindings_follow_pairing_order_and_put_background_last(
         "image_3",
     ]
     assert [binding.image_index for binding in bindings] == [1, 2, 3]
-    assert [binding.entity_id for binding in bindings] == ["e2", "e1", None]
+    assert [binding.entity_id for binding in bindings] == ["e1", "e2", None]
     assert [binding.reference_type for binding in bindings] == [
-        "object",
         "subject",
+        "object",
         "background",
     ]
 
@@ -479,10 +479,10 @@ def test_unknown_placeholder_can_be_repaired_and_rendered(
     assert instruction.reference_legend[0].image_id == "image_1"
     assert instruction.r2v_instruction == (
         "\u4ee5\u56fe3\u4f5c\u4e3a\u6574\u4f53\u80cc\u666f\uff0c"
-        "\u56fe2\u63a8\u7740\u56fe1\u5411\u524d\u884c\u8d70\uff0c"
+        "\u56fe1\u63a8\u7740\u56fe2\u5411\u524d\u884c\u8d70\uff0c"
         "\u955c\u5934\u7a33\u5b9a\u540e\u9000\u3002\n\n"
-        "\u56fe1\uff1a\u7ea2\u8272\u81ea\u884c\u8f66\u7684\u5916\u89c2\n"
-        "\u56fe2\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u5916\u89c2\n"
+        "\u56fe1\uff1a\u9ec4\u8272\u5916\u5957\u5973\u5b50\u7684\u5916\u89c2\n"
+        "\u56fe2\uff1a\u7ea2\u8272\u81ea\u884c\u8f66\u7684\u5916\u89c2\n"
         "\u56fe3\uff1a\u660e\u4eae\u7684\u5e7f\u573a\u73af\u5883"
     )
 
