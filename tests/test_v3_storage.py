@@ -543,18 +543,41 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     [
         (
             "annotation",
-            {"coverage", "references", "pairing", "instruction", "export"},
+            {
+                "coverage",
+                "references",
+                "pairing",
+                "reference_finalization",
+                "instruction",
+                "export",
+            },
         ),
         (
             "masks",
-            {"coverage", "references", "pairing", "instruction", "export"},
+            {
+                "coverage",
+                "references",
+                "pairing",
+                "reference_finalization",
+                "instruction",
+                "export",
+            },
         ),
         (
             "coverage",
-            {"references", "pairing", "instruction", "export"},
+            {
+                "references",
+                "pairing",
+                "reference_finalization",
+                "instruction",
+                "export",
+            },
         ),
-        ("references", {"pairing", "instruction", "export"}),
-        ("pairing", {"instruction", "export"}),
+        (
+            "references",
+            {"pairing", "reference_finalization", "instruction", "export"},
+        ),
+        ("pairing", {"reference_finalization", "instruction", "export"}),
         ("instruction", {"export"}),
     ],
 )

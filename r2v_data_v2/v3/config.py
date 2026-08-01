@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
@@ -19,6 +20,7 @@ REMOVE_MODEL_RELATIVE_PATH = Path("Qwen/Qwen-Image-Edit-2511")
 REMOVE_ADAPTER_NAME = "Qwen-Image-Edit-2511-Object-Remover"
 REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
 
+_SAFE_PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _T = TypeVar("_T")
 
 
@@ -115,6 +117,15 @@ class PairConfig:
 
 
 @dataclass(frozen=True)
+class ReferenceFinalizeConfig:
+    enabled: bool = True
+    entity_canvas_size: int = 1024
+    entity_content_max_side: int = 896
+    entity_max_upscale: float = 2.0
+    normalization_profile: str = "entity_1024_v1"
+
+
+@dataclass(frozen=True)
 class BackgroundConfig:
     enabled: bool = True
     raw_foreground_area_ratio: float = 0.0
@@ -167,6 +178,9 @@ class V3Config:
         default_factory=ReferenceScopeConfig
     )
     pair: PairConfig = field(default_factory=PairConfig)
+    reference_finalize: ReferenceFinalizeConfig = field(
+        default_factory=ReferenceFinalizeConfig
+    )
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     remove: RemoveConfig = field(default_factory=RemoveConfig)
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
@@ -323,6 +337,48 @@ class V3Config:
             or self.pair.repair_retries < 0
         ):
             raise ValueError("pair.repair_retries must be a non-negative integer")
+        finalization = self.reference_finalize
+        if not isinstance(finalization.enabled, bool):
+            raise TypeError("reference_finalize.enabled must be a boolean")
+        if (
+            not isinstance(finalization.entity_canvas_size, int)
+            or isinstance(finalization.entity_canvas_size, bool)
+            or finalization.entity_canvas_size < 1
+        ):
+            raise ValueError(
+                "reference_finalize.entity_canvas_size must be a positive integer"
+            )
+        if (
+            not isinstance(finalization.entity_content_max_side, int)
+            or isinstance(finalization.entity_content_max_side, bool)
+            or not 1
+            <= finalization.entity_content_max_side
+            <= finalization.entity_canvas_size
+        ):
+            raise ValueError(
+                "reference_finalize.entity_content_max_side must be a positive "
+                "integer no greater than entity_canvas_size"
+            )
+        if (
+            not isinstance(finalization.entity_max_upscale, (int, float))
+            or isinstance(finalization.entity_max_upscale, bool)
+            or not math.isfinite(finalization.entity_max_upscale)
+            or finalization.entity_max_upscale <= 0
+        ):
+            raise ValueError(
+                "reference_finalize.entity_max_upscale must be finite and positive"
+            )
+        if (
+            not isinstance(finalization.normalization_profile, str)
+            or _SAFE_PROFILE.fullmatch(
+                finalization.normalization_profile
+            )
+            is None
+        ):
+            raise ValueError(
+                "reference_finalize.normalization_profile must be a safe "
+                "non-empty string"
+            )
         if self.background.raw_foreground_area_ratio != 0.0:
             raise ValueError("V3 background.raw_foreground_area_ratio must be 0.0")
         max_pending_ratio = self.background.max_pending_remove_area_ratio
@@ -561,6 +617,7 @@ def load_config(path: str | Path) -> V3Config:
         "coverage",
         "reference_scope",
         "pair",
+        "reference_finalize",
         "background",
         "remove",
         "instruction",
@@ -671,6 +728,11 @@ def load_config(path: str | Path) -> V3Config:
             PairConfig,
             _mapping(raw.get("pair"), "pair"),
             "pair",
+        ),
+        reference_finalize=_build(
+            ReferenceFinalizeConfig,
+            _mapping(raw.get("reference_finalize"), "reference_finalize"),
+            "reference_finalize",
         ),
         background=_build(
             BackgroundConfig,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as datetime_module
+import hashlib
 import json
 import os
 import re
@@ -26,8 +27,11 @@ from r2v_data_v2.v3.schemas import (
     DatasetSample,
     ExportState,
     FailureRecord,
+    FinalizedBackgroundReference,
+    FinalizedEntityReference,
     InstructionState,
     PairingState,
+    ReferenceFinalizationState,
     ReferencesState,
     RunRecord,
     SampledFramesArtifact,
@@ -38,12 +42,45 @@ _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _EXPORT_TOKEN = re.compile(r"<ref_(subject|object|group|bg)_(\d+)>")
 _UTC = getattr(datetime_module, "UTC", timezone.utc)  # noqa: UP017 - Python 3.9 CI
 _SECTION_INVALIDATIONS = {
-    "annotation": ("coverage", "references", "pairing", "instruction", "export"),
-    "frames": ("coverage", "references", "pairing", "instruction", "export"),
-    "masks": ("coverage", "references", "pairing", "instruction", "export"),
-    "coverage": ("references", "pairing", "instruction", "export"),
-    "references": ("pairing", "instruction", "export"),
-    "pairing": ("instruction", "export"),
+    "annotation": (
+        "coverage",
+        "references",
+        "pairing",
+        "reference_finalization",
+        "instruction",
+        "export",
+    ),
+    "frames": (
+        "coverage",
+        "references",
+        "pairing",
+        "reference_finalization",
+        "instruction",
+        "export",
+    ),
+    "masks": (
+        "coverage",
+        "references",
+        "pairing",
+        "reference_finalization",
+        "instruction",
+        "export",
+    ),
+    "coverage": (
+        "references",
+        "pairing",
+        "reference_finalization",
+        "instruction",
+        "export",
+    ),
+    "references": (
+        "pairing",
+        "reference_finalization",
+        "instruction",
+        "export",
+    ),
+    "pairing": ("reference_finalization", "instruction", "export"),
+    "reference_finalization": ("export",),
     "instruction": ("export",),
 }
 
@@ -88,6 +125,14 @@ def _append_jsonl(path: Path, value: dict[str, object]) -> None:
         )
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_jsonl_atomic(path: Path, records: list[dict[str, object]]) -> None:
@@ -277,6 +322,10 @@ class RunStorage:
                 shutil.rmtree(frames_dir)
         if section in {"annotation", "frames"}:
             self.masks_path(clip_uid).unlink(missing_ok=True)
+        if "reference_finalization" in _SECTION_INVALIDATIONS.get(section, ()):
+            finalized = self.clip_dir(clip_uid) / "finalized"
+            if finalized.exists():
+                shutil.rmtree(finalized)
 
     def write_annotation(
         self,
@@ -299,6 +348,7 @@ class RunStorage:
             updated.model_dump(mode="json")
         )
         if validated != current:
+            self._invalidate_artifacts_after_change(clip_uid, "coverage")
             write_json_atomic(
                 self.clip_path(clip_uid),
                 _model_dict(validated),
@@ -332,6 +382,7 @@ class RunStorage:
             update={
                 "references": validated_references,
                 "pairing": validated_pairing,
+                "reference_finalization": None,
                 "instruction": None,
                 "export": ExportState(),
             }
@@ -340,11 +391,23 @@ class RunStorage:
             updated.model_dump(mode="json")
         )
         if validated != current:
+            self._invalidate_artifacts_after_change(clip_uid, "pairing")
             write_json_atomic(
                 self.clip_path(clip_uid),
                 _model_dict(validated),
             )
         return validated
+
+    def write_reference_finalization(
+        self,
+        clip_uid: str,
+        value: ReferenceFinalizationState,
+    ) -> ClipRecord:
+        return self._replace_section(
+            clip_uid,
+            "reference_finalization",
+            value,
+        )
 
     def write_instruction(
         self,
@@ -377,6 +440,7 @@ class RunStorage:
         )
         validated = ClipRecord.model_validate(invalidated.model_dump(mode="json"))
         if validated != current:
+            self._invalidate_artifacts_after_change(clip_uid, "masks")
             write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         write_json_atomic(destination, _model_dict(value))
         return destination
@@ -428,6 +492,7 @@ class RunStorage:
         validated = ClipRecord.model_validate(
             invalidated.model_dump(mode="json")
         )
+        self._invalidate_artifacts_after_change(clip_uid, "masks")
         self.masks_path(clip_uid).unlink(missing_ok=True)
         if validated != current:
             write_json_atomic(
@@ -473,6 +538,37 @@ class RunStorage:
         directory = self.selected_entity_path(clip_uid, entity_id).parent
         return directory / (
             f".backup-pair-{entity_id}-{uuid.uuid4().hex}.png"
+        )
+
+    def finalized_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "finalized"
+
+    def finalized_entity_path(self, clip_uid: str, entity_id: str) -> Path:
+        if re.fullmatch(r"e[1-9]\d*", entity_id) is None:
+            raise ValueError("entity_id must match e[1-9]\\d*")
+        destination = self.finalized_dir(clip_uid) / f"{entity_id}.png"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def finalize_output_temporary_path(
+        self,
+        clip_uid: str,
+        entity_id: str,
+    ) -> Path:
+        directory = self.finalized_entity_path(clip_uid, entity_id).parent
+        return directory / (
+            f".tmp-reference-finalize-{entity_id}-{uuid.uuid4().hex}.png"
+        )
+
+    def finalize_output_backup_path(
+        self,
+        clip_uid: str,
+        entity_id: str,
+    ) -> Path:
+        directory = self.finalized_entity_path(clip_uid, entity_id).parent
+        return directory / (
+            f".backup-reference-finalize-{entity_id}-{uuid.uuid4().hex}.png"
         )
 
     def pair_debug_dir(self, clip_uid: str, entity_id: str) -> Path:
@@ -584,6 +680,27 @@ class RunStorage:
         ):
             for path in selected.glob(pattern):
                 path.unlink(missing_ok=True)
+
+    def cleanup_reference_finalize_artifacts(
+        self,
+        clip_uid: str,
+        *,
+        remove_published: bool = False,
+    ) -> None:
+        directory = self.finalized_dir(clip_uid)
+        if not directory.is_dir():
+            return
+        if remove_published:
+            shutil.rmtree(directory)
+            return
+        for pattern in (
+            ".tmp-reference-finalize-*.png",
+            ".backup-reference-finalize-*.png",
+        ):
+            for path in directory.glob(pattern):
+                path.unlink(missing_ok=True)
+        if not any(directory.iterdir()):
+            directory.rmdir()
 
     def cleanup_background_artifacts(
         self,
@@ -742,6 +859,17 @@ class DatasetExporter:
             for reference in clip.references.entities
             if reference.status == "ready"
         }
+        finalization = clip.reference_finalization
+        if finalization is not None and finalization.status != "ready":
+            raise ValueError(
+                f"accepted clip finalization is not ready: {clip.clip_uid}"
+            )
+        finalized_by_id = {
+            entity.entity_id: entity
+            for entity in (
+                finalization.entities if finalization is not None else []
+            )
+        }
         destination_dir = temporary / "references" / _safe_component(
             clip.clip_uid,
             "sample_id",
@@ -754,18 +882,18 @@ class DatasetExporter:
                     f"retained entity has no ready reference: {entity_id}"
                 )
             token = clip.pairing.tokens[entity_id]
-            relative_path = (
-                Path("references")
-                / clip.clip_uid
-                / self._filename_for_token(token)
-            )
-            self._copy_png(
-                self._resolve_run_artifact(reference.image_path),
-                temporary / relative_path,
-                background=False,
-            )
-            dataset_references.append(
-                DatasetReference(
+            if finalization is None:
+                relative_path = (
+                    Path("references")
+                    / clip.clip_uid
+                    / self._filename_for_token(token)
+                )
+                self._copy_png(
+                    self._resolve_run_artifact(reference.image_path),
+                    temporary / relative_path,
+                    background=False,
+                )
+                dataset_reference = DatasetReference(
                     token=token,
                     type="entity",
                     entity_id=entity_id,
@@ -775,7 +903,19 @@ class DatasetExporter:
                     source_frame_index=reference.source_frame_index,
                     synthetic=False,
                 )
-            )
+            else:
+                finalized = finalized_by_id.get(entity_id)
+                if finalized is None:
+                    raise ValueError(
+                        f"retained entity has no finalized reference: {entity_id}"
+                    )
+                dataset_reference = self._export_finalized_entity(
+                    clip_uid=clip.clip_uid,
+                    source_frame_index=reference.source_frame_index,
+                    metadata=finalized,
+                    temporary=temporary,
+                )
+            dataset_references.append(dataset_reference)
         if clip.pairing.background_token is not None:
             background = clip.references.background
             if background is None or background.status not in {
@@ -790,6 +930,11 @@ class DatasetExporter:
                     clip_uid=clip.clip_uid,
                     token=clip.pairing.background_token,
                     background=background,
+                    finalized=(
+                        finalization.background
+                        if finalization is not None
+                        else None
+                    ),
                     temporary=temporary,
                 )
             )
@@ -807,25 +952,83 @@ class DatasetExporter:
             },
         )
 
+    def _export_finalized_entity(
+        self,
+        *,
+        clip_uid: str,
+        source_frame_index: int | None,
+        metadata: FinalizedEntityReference,
+        temporary: Path,
+    ) -> DatasetReference:
+        if metadata.status != "ready":
+            raise ValueError("export requires a ready finalized entity")
+        if source_frame_index is None:
+            raise ValueError("ready entity reference is missing source frame index")
+        filename = self._filename_for_token(metadata.token)
+        relative_path = Path("references") / clip_uid / filename
+        source_relative_path = relative_path.with_name(
+            f"{relative_path.stem}.source.png"
+        )
+        self._copy_exact_png(
+            self._resolve_run_artifact(metadata.source_image_path),
+            temporary / source_relative_path,
+            expected_sha256=metadata.source_sha256,
+        )
+        self._copy_exact_png(
+            self._resolve_run_artifact(metadata.normalized_image_path),
+            temporary / relative_path,
+            expected_sha256=metadata.normalized_sha256,
+        )
+        return DatasetReference(
+            token=metadata.token,
+            type="entity",
+            entity_id=metadata.entity_id,
+            scope=metadata.reference_scope,
+            visible_region=metadata.visible_region,
+            image_path=relative_path.as_posix(),
+            source_frame_index=source_frame_index,
+            synthetic=False,
+            source_image_path=source_relative_path.as_posix(),
+            width=metadata.normalized_width,
+            height=metadata.normalized_height,
+            source_width=metadata.source_width,
+            source_height=metadata.source_height,
+            content_bbox_xyxy=metadata.normalized_content_bbox_xyxy,
+            source_content_bbox_xyxy=metadata.source_content_bbox_xyxy,
+            scale_factor=metadata.scale_factor,
+            foreground_ratio=metadata.normalized_foreground_ratio,
+            source_foreground_ratio=metadata.source_foreground_ratio,
+            quality_tier=metadata.quality_tier,
+            quality_flags=list(metadata.quality_flags),
+            normalization_profile=metadata.normalization_profile,
+            sha256=metadata.normalized_sha256,
+            source_sha256=metadata.source_sha256,
+        )
+
     def _export_background(
         self,
         *,
         clip_uid: str,
         token: str,
         background: BackgroundReferenceState,
+        finalized: FinalizedBackgroundReference | None,
         temporary: Path,
     ) -> DatasetReference:
         relative_path = (
             Path("references") / clip_uid / self._filename_for_token(token)
         )
-        self._copy_png(
-            self._resolve_background_artifact(
-                clip_uid,
-                background.output_image_path,
-            ),
-            temporary / relative_path,
-            background=True,
+        source = self._resolve_background_artifact(
+            clip_uid,
+            background.output_image_path,
         )
+        if finalized is not None and (
+            self.storage.relative_artifact_path(source) != finalized.image_path
+            or _sha256_file(source) != finalized.sha256
+        ):
+            raise ValueError("background finalization metadata is stale")
+        destination = temporary / relative_path
+        self._copy_png(source, destination, background=True)
+        exported_sha256 = _sha256_file(destination)
         return DatasetReference(
             token=token,
             type="background",
@@ -835,6 +1038,9 @@ class DatasetExporter:
             image_path=relative_path.as_posix(),
             source_frame_index=background.source_frame_index,
             synthetic=background.status == "ready_removed",
+            width=finalized.width if finalized is not None else None,
+            height=finalized.height if finalized is not None else None,
+            sha256=exported_sha256 if finalized is not None else None,
         )
 
     def _resolve_background_artifact(
@@ -881,6 +1087,26 @@ class DatasetExporter:
         return f"{kind}_{match.group(2)}.png"
 
     @staticmethod
+    def _copy_exact_png(
+        source: Path,
+        destination: Path,
+        *,
+        expected_sha256: str | None,
+    ) -> None:
+        if expected_sha256 is None:
+            raise ValueError("finalized PNG is missing SHA256 metadata")
+        if _sha256_file(source) != expected_sha256:
+            raise ValueError("finalized PNG source SHA256 does not match metadata")
+        with Image.open(source) as opened:
+            opened.load()
+            if opened.format != "PNG":
+                raise ValueError("finalized entity artifact must be PNG")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        if _sha256_file(destination) != expected_sha256:
+            raise ValueError("exact PNG export changed source bytes")
+
+    @staticmethod
     def _copy_png(source: Path, destination: Path, *, background: bool) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(source) as opened:
@@ -907,9 +1133,11 @@ class DatasetExporter:
         }:
             raise ValueError("dataset root contains unexpected top-level artifacts")
         expected = {
-            reference.image_path
+            path
             for sample in samples
             for reference in sample.references
+            for path in (reference.image_path, reference.source_image_path)
+            if path is not None
         }
         actual = {
             path.relative_to(root).as_posix()
@@ -924,6 +1152,24 @@ class DatasetExporter:
                 resolved.relative_to(root.resolve())
             except ValueError as exc:
                 raise ValueError("exported reference path escapes dataset root") from exc
+        for sample in samples:
+            for reference in sample.references:
+                if (
+                    reference.sha256 is not None
+                    and _sha256_file(root / reference.image_path)
+                    != reference.sha256
+                ):
+                    raise ValueError("exported reference SHA256 is invalid")
+                if reference.source_image_path is not None:
+                    if reference.source_sha256 is None:
+                        raise ValueError(
+                            "source reference path requires source SHA256"
+                        )
+                    if (
+                        _sha256_file(root / reference.source_image_path)
+                        != reference.source_sha256
+                    ):
+                        raise ValueError("exported source reference SHA256 is invalid")
 
     def _publish(self, temporary: Path, *, overwrite: bool) -> None:
         if not self.destination.exists():

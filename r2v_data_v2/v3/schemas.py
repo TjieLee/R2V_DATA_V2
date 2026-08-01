@@ -40,6 +40,7 @@ _PLAIN_ENGLISH_IMAGE_INDEX = re.compile(
     r"(?<!<)\bImage\s+([1-9]\d*)\b(?!>)",
     flags=re.IGNORECASE,
 )
+_SAFE_PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class SchemaModel(BaseModel):
@@ -816,6 +817,283 @@ class PairingState(SchemaModel):
         return self
 
 
+ReferenceQualityTier = Literal["A", "B", "reject"]
+ReferenceQualityFlag = Literal[
+    "local_reference",
+    "non_whole_visible_region",
+    "low_resolution",
+    "border_contact",
+]
+_REFERENCE_QUALITY_FLAG_ORDER = {
+    "local_reference": 0,
+    "non_whole_visible_region": 1,
+    "low_resolution": 2,
+    "border_contact": 3,
+}
+
+
+def _validate_image_metrics(
+    *,
+    label: str,
+    width: int | None,
+    height: int | None,
+    bbox_xyxy: tuple[int, int, int, int] | None,
+    content_width: int | None,
+    content_height: int | None,
+    foreground_area_pixels: int | None,
+    foreground_ratio: float | None,
+) -> None:
+    values = (
+        width,
+        height,
+        bbox_xyxy,
+        content_width,
+        content_height,
+        foreground_area_pixels,
+        foreground_ratio,
+    )
+    if all(value is None for value in values):
+        return
+    if any(value is None for value in values):
+        raise ValueError(f"{label} image metrics must be complete")
+    assert width is not None
+    assert height is not None
+    assert bbox_xyxy is not None
+    assert content_width is not None
+    assert content_height is not None
+    assert foreground_area_pixels is not None
+    assert foreground_ratio is not None
+    x1, y1, x2, y2 = bbox_xyxy
+    if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+        raise ValueError(f"{label} content bbox is outside image dimensions")
+    if (x2 - x1, y2 - y1) != (content_width, content_height):
+        raise ValueError(f"{label} content dimensions must match its bbox")
+    if not 0 < foreground_area_pixels <= content_width * content_height:
+        raise ValueError(f"{label} foreground area is invalid")
+    expected_ratio = foreground_area_pixels / (width * height)
+    if not math.isclose(
+        foreground_ratio,
+        expected_ratio,
+        rel_tol=0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(f"{label} foreground ratio must match its pixel count")
+
+
+def _validate_run_relative_image_path(value: str, field_name: str) -> None:
+    if (
+        value.startswith("/")
+        or not value.startswith("clips/")
+        or ".." in value.split("/")
+    ):
+        raise ValueError(f"{field_name} must be relative to run_root")
+
+
+class FinalizedEntityReference(SchemaModel):
+    entity_id: str
+    token: str
+    status: Literal["ready", "rejected"]
+    source_image_path: str
+    normalized_image_path: Optional[str] = None
+    source_width: Optional[int] = Field(default=None, gt=0)
+    source_height: Optional[int] = Field(default=None, gt=0)
+    normalized_width: Optional[int] = Field(default=None, gt=0)
+    normalized_height: Optional[int] = Field(default=None, gt=0)
+    source_content_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    normalized_content_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    source_content_width: Optional[int] = Field(default=None, gt=0)
+    source_content_height: Optional[int] = Field(default=None, gt=0)
+    normalized_content_width: Optional[int] = Field(default=None, gt=0)
+    normalized_content_height: Optional[int] = Field(default=None, gt=0)
+    source_foreground_area_pixels: Optional[int] = Field(default=None, ge=0)
+    normalized_foreground_area_pixels: Optional[int] = Field(default=None, ge=0)
+    source_foreground_ratio: Optional[float] = Field(default=None, ge=0, le=1)
+    normalized_foreground_ratio: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+    scale_factor: Optional[float] = Field(default=None, gt=0)
+    source_border_contact_count: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=4,
+    )
+    reference_scope: Literal["full", "local"]
+    visible_region: VisibleRegion
+    whole_entity_recognizable: StrictBool
+    identity_features_visible: StrictBool
+    quality_tier: ReferenceQualityTier
+    quality_flags: list[ReferenceQualityFlag] = Field(default_factory=list)
+    normalization_profile: str
+    source_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    normalized_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_metrics_and_quality(self) -> FinalizedEntityReference:
+        if re.fullmatch(r"e[1-9]\d*", self.entity_id) is None:
+            raise ValueError("finalized entity_id must match eN")
+        if (
+            _REF_TOKEN.fullmatch(self.token) is None
+            or self.token.startswith("<ref_bg_")
+        ):
+            raise ValueError("finalized entity token must be an entity token")
+        if self.status == "ready":
+            _validate_run_relative_image_path(
+                self.source_image_path,
+                "source_image_path",
+            )
+        elif not self.source_image_path.strip():
+            raise ValueError("rejected source_image_path must not be empty")
+        if self.normalized_image_path is not None:
+            _validate_run_relative_image_path(
+                self.normalized_image_path,
+                "normalized_image_path",
+            )
+        if _SAFE_PROFILE.fullmatch(self.normalization_profile) is None:
+            raise ValueError("normalization_profile must be a safe non-empty string")
+        if (
+            self.status == "ready"
+            and self.normalization_profile == "entity_1024_v1"
+            and (self.normalized_width, self.normalized_height) != (1024, 1024)
+        ):
+            raise ValueError(
+                "entity_1024_v1 requires a 1024x1024 normalized image"
+            )
+        if len(self.quality_flags) != len(set(self.quality_flags)):
+            raise ValueError("quality_flags must not contain duplicates")
+        if self.quality_flags != sorted(
+            self.quality_flags,
+            key=_REFERENCE_QUALITY_FLAG_ORDER.__getitem__,
+        ):
+            raise ValueError("quality_flags must use stable canonical order")
+        _validate_image_metrics(
+            label="source",
+            width=self.source_width,
+            height=self.source_height,
+            bbox_xyxy=self.source_content_bbox_xyxy,
+            content_width=self.source_content_width,
+            content_height=self.source_content_height,
+            foreground_area_pixels=self.source_foreground_area_pixels,
+            foreground_ratio=self.source_foreground_ratio,
+        )
+        _validate_image_metrics(
+            label="normalized",
+            width=self.normalized_width,
+            height=self.normalized_height,
+            bbox_xyxy=self.normalized_content_bbox_xyxy,
+            content_width=self.normalized_content_width,
+            content_height=self.normalized_content_height,
+            foreground_area_pixels=self.normalized_foreground_area_pixels,
+            foreground_ratio=self.normalized_foreground_ratio,
+        )
+        source_metrics = (
+            self.source_width,
+            self.source_height,
+            self.source_content_bbox_xyxy,
+            self.source_content_width,
+            self.source_content_height,
+            self.source_foreground_area_pixels,
+            self.source_foreground_ratio,
+            self.source_border_contact_count,
+            self.source_sha256,
+        )
+        normalized_metrics = (
+            self.normalized_image_path,
+            self.normalized_width,
+            self.normalized_height,
+            self.normalized_content_bbox_xyxy,
+            self.normalized_content_width,
+            self.normalized_content_height,
+            self.normalized_foreground_area_pixels,
+            self.normalized_foreground_ratio,
+            self.scale_factor,
+            self.normalized_sha256,
+        )
+        if self.status == "ready":
+            if any(value is None for value in (*source_metrics, *normalized_metrics)):
+                raise ValueError("ready finalized entity requires complete metrics")
+            if self.reason is not None:
+                raise ValueError("ready finalized entity cannot have a reason")
+            if self.quality_tier not in {"A", "B"}:
+                raise ValueError("ready finalized entity quality tier must be A or B")
+            if self.normalized_width != self.normalized_height:
+                raise ValueError("normalized entity image must use a square canvas")
+
+            if self.scale_factor is None or not math.isfinite(self.scale_factor):
+                raise ValueError("scale_factor must be finite")
+            qualifies_for_a = (
+                self.reference_scope == "full"
+                and self.visible_region == "whole"
+                and self.whole_entity_recognizable
+                and self.identity_features_visible
+                and not self.quality_flags
+            )
+            if (self.quality_tier == "A") != qualifies_for_a:
+                raise ValueError("quality tier A must match conservative criteria")
+            if self.quality_tier == "B" and not self.identity_features_visible:
+                raise ValueError("quality tier B requires visible identity features")
+        else:
+            if self.quality_tier != "reject":
+                raise ValueError("rejected finalized entity requires reject tier")
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("rejected finalized entity requires a reason")
+            if any(value is not None for value in normalized_metrics):
+                raise ValueError("rejected finalized entity cannot publish normalized data")
+            if any(value is not None for value in source_metrics) and any(
+                value is None for value in source_metrics
+            ):
+                raise ValueError("rejected source metrics must be complete or absent")
+        return self
+
+
+class FinalizedBackgroundReference(SchemaModel):
+    token: Literal["<ref_bg_1>"] = "<ref_bg_1>"
+    image_path: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    mode: Literal["RGB"] = "RGB"
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_frame_index: int = Field(ge=0)
+    synthetic: StrictBool
+
+    @field_validator("image_path")
+    @classmethod
+    def validate_image_path(cls, value: str) -> str:
+        _validate_run_relative_image_path(value, "background image_path")
+        return value
+
+
+class ReferenceFinalizationState(SchemaModel):
+    status: Literal["ready", "failed"]
+    entities: list[FinalizedEntityReference] = Field(default_factory=list)
+    background: Optional[FinalizedBackgroundReference] = None
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> ReferenceFinalizationState:
+        entity_ids = [entity.entity_id for entity in self.entities]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("finalized entity IDs must be unique")
+        if self.status == "ready":
+            if self.reason is not None:
+                raise ValueError("ready reference finalization cannot have a reason")
+            if not self.entities:
+                raise ValueError("ready reference finalization requires entities")
+            if any(entity.status != "ready" for entity in self.entities):
+                raise ValueError("ready reference finalization requires ready entities")
+        elif self.reason is None or not self.reason.strip():
+            raise ValueError("failed reference finalization requires a reason")
+        return self
+
+
 InstructionReferenceType = Literal["subject", "object", "group", "background"]
 
 
@@ -1038,6 +1316,7 @@ class ClipRecord(SchemaModel):
     coverage: Optional[CoverageState] = None
     references: ReferencesState = Field(default_factory=ReferencesState)
     pairing: Optional[PairingState] = None
+    reference_finalization: Optional[ReferenceFinalizationState] = None
     instruction: Optional[InstructionState] = None
     export: ExportState = Field(default_factory=ExportState)
 
@@ -1133,6 +1412,65 @@ class ClipRecord(SchemaModel):
                     raise ValueError(
                         "ready pairing background token requires a ready background"
                     )
+        if self.reference_finalization is not None:
+            if self.pairing is None or self.pairing.status != "ready":
+                raise ValueError(
+                    "reference finalization requires ready pairing"
+                )
+            finalization = self.reference_finalization
+            if finalization.entities:
+                finalized_ids = [
+                    entity.entity_id for entity in finalization.entities
+                ]
+                if finalized_ids != self.pairing.retained_entity_ids:
+                    raise ValueError(
+                        "finalized entities must match retained pairing order"
+                    )
+                finalized_tokens = {
+                    entity.entity_id: entity.token
+                    for entity in finalization.entities
+                }
+                if finalized_tokens != self.pairing.tokens:
+                    raise ValueError(
+                        "finalized entity tokens must match pairing tokens"
+                    )
+                references_by_id = {
+                    reference.entity_id: reference
+                    for reference in self.references.entities
+                }
+                for entity in finalization.entities:
+                    reference = references_by_id[entity.entity_id]
+                    if (
+                        entity.source_image_path != reference.image_path
+                        or entity.reference_scope != reference.reference_scope
+                        or entity.visible_region != reference.visible_region
+                        or entity.whole_entity_recognizable
+                        != reference.whole_entity_recognizable
+                        or entity.identity_features_visible
+                        != reference.identity_features_visible
+                    ):
+                        raise ValueError(
+                            "finalized entity metadata must match source reference"
+                        )
+            if finalization.status == "ready" and not finalization.entities:
+                raise ValueError(
+                    "ready reference finalization must match retained entities"
+                )
+            if finalization.background is not None:
+                if (
+                    self.pairing.background_token
+                    != finalization.background.token
+                ):
+                    raise ValueError(
+                        "finalized background token must match pairing"
+                    )
+            elif (
+                finalization.status == "ready"
+                and self.pairing.background_token is not None
+            ):
+                raise ValueError(
+                    "ready reference finalization requires paired background metadata"
+                )
         if self.instruction is not None and self.instruction.status == "ready":
             if self.pairing is None or self.pairing.status != "ready":
                 raise ValueError("ready instruction requires ready pairing")
@@ -1159,6 +1497,13 @@ class ClipRecord(SchemaModel):
                 raise ValueError("accepted export requires ready pairing")
             if self.instruction is None or self.instruction.status != "ready":
                 raise ValueError("accepted export requires ready instruction")
+            if (
+                self.reference_finalization is not None
+                and self.reference_finalization.status != "ready"
+            ):
+                raise ValueError(
+                    "accepted export requires ready reference finalization when present"
+                )
         return self
 
 
@@ -1349,6 +1694,28 @@ class DatasetReference(SchemaModel):
     image_path: str
     source_frame_index: int = Field(ge=0)
     synthetic: bool
+    source_image_path: Optional[str] = None
+    width: Optional[int] = Field(default=None, gt=0)
+    height: Optional[int] = Field(default=None, gt=0)
+    source_width: Optional[int] = Field(default=None, gt=0)
+    source_height: Optional[int] = Field(default=None, gt=0)
+    content_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    source_content_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    scale_factor: Optional[float] = Field(default=None, gt=0)
+    foreground_ratio: Optional[float] = Field(default=None, ge=0, le=1)
+    source_foreground_ratio: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
+    quality_tier: Optional[Literal["A", "B"]] = None
+    quality_flags: list[ReferenceQualityFlag] = Field(default_factory=list)
+    normalization_profile: Optional[str] = None
+    sha256: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @field_validator("token")
     @classmethod
@@ -1357,9 +1724,11 @@ class DatasetReference(SchemaModel):
             raise ValueError("invalid reference token")
         return value
 
-    @field_validator("image_path")
+    @field_validator("image_path", "source_image_path")
     @classmethod
-    def validate_relative_image_path(cls, value: str) -> str:
+    def validate_relative_image_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if value.startswith("/") or not value.startswith("references/"):
             raise ValueError("dataset reference image_path must be relative")
         if ".." in value.split("/"):
@@ -1368,6 +1737,29 @@ class DatasetReference(SchemaModel):
 
     @model_validator(mode="after")
     def validate_type_fields(self) -> DatasetReference:
+        entity_metadata = (
+            self.source_image_path,
+            self.source_width,
+            self.source_height,
+            self.content_bbox_xyxy,
+            self.source_content_bbox_xyxy,
+            self.scale_factor,
+            self.foreground_ratio,
+            self.source_foreground_ratio,
+            self.quality_tier,
+            self.normalization_profile,
+            self.source_sha256,
+        )
+        common_metadata = (self.width, self.height, self.sha256)
+        if len(self.quality_flags) != len(set(self.quality_flags)):
+            raise ValueError("dataset quality_flags must not contain duplicates")
+        if self.quality_flags != sorted(
+            self.quality_flags,
+            key=_REFERENCE_QUALITY_FLAG_ORDER.__getitem__,
+        ):
+            raise ValueError("dataset quality_flags must use stable canonical order")
+        if self.scale_factor is not None and not math.isfinite(self.scale_factor):
+            raise ValueError("dataset scale_factor must be finite")
         if self.type == "entity":
             if self.entity_id is None:
                 raise ValueError("entity reference requires entity_id")
@@ -1377,11 +1769,57 @@ class DatasetReference(SchemaModel):
                 raise ValueError("entity reference scope must be full or local")
             if self.synthetic:
                 raise ValueError("V3 entity references must not be synthetic")
+            metadata = (*common_metadata, *entity_metadata)
+            if any(value is not None for value in metadata) and any(
+                value is None for value in metadata
+            ):
+                raise ValueError(
+                    "finalized dataset entity metadata must be complete"
+                )
+            if all(value is None for value in metadata) and self.quality_flags:
+                raise ValueError(
+                    "legacy dataset entity cannot publish quality_flags"
+                )
+            if self.width is not None and self.height is not None:
+                assert self.content_bbox_xyxy is not None
+                x1, y1, x2, y2 = self.content_bbox_xyxy
+                if not (
+                    0 <= x1 < x2 <= self.width
+                    and 0 <= y1 < y2 <= self.height
+                ):
+                    raise ValueError("dataset content bbox is outside image")
+            if self.source_width is not None and self.source_height is not None:
+                assert self.source_content_bbox_xyxy is not None
+                x1, y1, x2, y2 = self.source_content_bbox_xyxy
+                if not (
+                    0 <= x1 < x2 <= self.source_width
+                    and 0 <= y1 < y2 <= self.source_height
+                ):
+                    raise ValueError("dataset source content bbox is outside image")
+            if (
+                self.normalization_profile is not None
+                and _SAFE_PROFILE.fullmatch(self.normalization_profile) is None
+            ):
+                raise ValueError(
+                    "dataset normalization_profile must be a safe string"
+                )
         else:
             if self.entity_id is not None or self.scope != "scene":
-                raise ValueError("background reference must use scene scope and no entity_id")
+                raise ValueError(
+                    "background reference must use scene scope and no entity_id"
+                )
             if not self.token.startswith("<ref_bg_"):
                 raise ValueError("background reference must use a background token")
+            if any(value is not None for value in entity_metadata):
+                raise ValueError(
+                    "background reference cannot publish entity normalization metadata"
+                )
+            if self.quality_flags:
+                raise ValueError("background reference cannot publish quality_flags")
+            if any(value is not None for value in common_metadata) and any(
+                value is None for value in common_metadata
+            ):
+                raise ValueError("background image metadata must be complete")
         return self
 
 
