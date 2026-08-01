@@ -32,13 +32,13 @@ _DIRECT_ENGLISH_IMAGE_LABEL = re.compile(
     flags=re.IGNORECASE,
 )
 _CHINESE_IMAGE_INDEX = re.compile(r"\u56fe\s*(\d+)")
-_ENGLISH_IMAGE_INDEX = re.compile(
-    r"\bImage\s+([1-9]\d*)\b",
+_ANGLE_ENGLISH_IMAGE_INDEX = re.compile(
+    r"<Image\s+([1-9]\d*)>",
     flags=re.IGNORECASE,
 )
-_CJK_TEXT = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
-    r"\U00020000-\U0002fa1f]"
+_PLAIN_ENGLISH_IMAGE_INDEX = re.compile(
+    r"(?<!<)\bImage\s+([1-9]\d*)\b(?!>)",
+    flags=re.IGNORECASE,
 )
 
 
@@ -881,6 +881,25 @@ def render_instruction_text(
         match = _IMAGE_ID.fullmatch(entry.image_id)
         if match is None:
             raise ValueError("legend image_id must use image_N")
+        display_label = f"<Image {match.group(1)}>"
+        rendered_body = rendered_body.replace(
+            f"{{{{{entry.image_id}}}}}",
+            display_label,
+        )
+        legend_lines.append(f"{display_label}: {entry.description.strip()}")
+    return f"{rendered_body}\n\n" + "\n".join(legend_lines)
+
+
+def _render_legacy_english_instruction_text(
+    instruction_body_template: str,
+    reference_legend: list[InstructionLegendEntry],
+) -> str:
+    rendered_body = instruction_body_template.strip()
+    legend_lines: list[str] = []
+    for entry in reference_legend:
+        match = _IMAGE_ID.fullmatch(entry.image_id)
+        if match is None:
+            raise ValueError("legend image_id must use image_N")
         display_label = f"Image {match.group(1)}"
         rendered_body = rendered_body.replace(
             f"{{{{{entry.image_id}}}}}",
@@ -978,19 +997,22 @@ class InstructionState(SchemaModel):
             raise ValueError(
                 "instruction placeholders must exactly match reference legend"
             )
-        renderer = (
-            _render_legacy_instruction_text
-            if _CJK_TEXT.search(raw_text)
-            else render_instruction_text
-        )
-        expected_rendered = renderer(
-            self.instruction_body_template,
-            self.reference_legend,
-        )
-        if self.r2v_instruction != expected_rendered:
+        expected_renderings = {
+            renderer(
+                self.instruction_body_template,
+                self.reference_legend,
+            )
+            for renderer in (
+                render_instruction_text,
+                _render_legacy_english_instruction_text,
+                _render_legacy_instruction_text,
+            )
+        }
+        if self.r2v_instruction not in expected_renderings:
             raise ValueError(
-                "r2v_instruction must match deterministic English rendering or "
-                "exact legacy Chinese rendering"
+                "r2v_instruction must match deterministic angle-bracket English "
+                "rendering, exact legacy plain English rendering, or exact "
+                "legacy Chinese rendering"
             )
         return self
 
@@ -1403,15 +1425,31 @@ class DatasetSample(SchemaModel):
         expected_indexes = {
             str(index) for index in range(1, len(self.references) + 1)
         }
-        english_indexes = set(
-            _ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
+        angle_english_indexes = set(
+            _ANGLE_ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
+        )
+        plain_english_indexes = set(
+            _PLAIN_ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
         )
         legacy_indexes = set(
             _CHINESE_IMAGE_INDEX.findall(self.r2v_instruction)
         )
         if not (
-            (english_indexes == expected_indexes and not legacy_indexes)
-            or (legacy_indexes == expected_indexes and not english_indexes)
+            (
+                angle_english_indexes == expected_indexes
+                and not plain_english_indexes
+                and not legacy_indexes
+            )
+            or (
+                plain_english_indexes == expected_indexes
+                and not angle_english_indexes
+                and not legacy_indexes
+            )
+            or (
+                legacy_indexes == expected_indexes
+                and not angle_english_indexes
+                and not plain_english_indexes
+            )
         ):
             raise ValueError(
                 "r2v_instruction image labels must match dataset references"

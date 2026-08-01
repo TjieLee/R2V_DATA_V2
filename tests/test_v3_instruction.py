@@ -435,7 +435,7 @@ def test_repeated_placeholder_is_allowed() -> None:
         (
             _raw_output(
                 body=(
-                    "Image 1 stands beside {{image_1}} and {{image_2}} in "
+                    "<Image 1> stands beside {{image_1}} and {{image_2}} in "
                     "{{image_3}}."
                 )
             ),
@@ -470,7 +470,7 @@ def test_quoted_dialogue_requires_source_transcript() -> None:
     assert _issue_codes(output, transcript="Follow me.") == set()
 
 
-def test_renderer_uses_english_labels() -> None:
+def test_renderer_uses_angle_bracket_english_labels() -> None:
     legend = [
         InstructionLegendEntry(
             image_id="image_1",
@@ -481,10 +481,32 @@ def test_renderer_uses_english_labels() -> None:
     rendered = render_instruction_text("Move {{image_1}} forward.", legend)
 
     assert rendered == (
-        "Move Image 1 forward.\n\n"
-        "Image 1: the stable appearance of a red bicycle"
+        "Move <Image 1> forward.\n\n"
+        "<Image 1>: the stable appearance of a red bicycle"
     )
+    assert "\nImage 1:" not in rendered
     assert "\u56fe1" not in rendered
+
+
+def test_legacy_plain_english_instruction_state_can_be_loaded() -> None:
+    state = InstructionState.model_validate(
+        {
+            "status": "ready",
+            "instruction_body_template": "Move {{image_1}} forward.",
+            "reference_legend": [
+                {
+                    "image_id": "image_1",
+                    "description": "a red bicycle",
+                }
+            ],
+            "r2v_instruction": (
+                "Move Image 1 forward.\n\nImage 1: a red bicycle"
+            ),
+        }
+    )
+
+    assert state.status == "ready"
+    assert state.r2v_instruction.startswith("Move Image 1")
 
 
 def test_legacy_chinese_instruction_state_can_be_loaded() -> None:
@@ -509,7 +531,7 @@ def test_legacy_chinese_instruction_state_can_be_loaded() -> None:
     assert state.r2v_instruction.startswith("\u8ba9\u56fe1")
 
 
-def test_new_instruction_state_requires_english_rendering() -> None:
+def test_new_instruction_state_requires_angle_bracket_rendering() -> None:
     body = "Move {{image_1}} forward."
     legend = [
         InstructionLegendEntry(image_id="image_1", description="a red bicycle")
@@ -522,14 +544,16 @@ def test_new_instruction_state_requires_english_rendering() -> None:
         r2v_instruction=render_instruction_text(body, legend),
     )
 
-    assert state.r2v_instruction == "Move Image 1 forward.\n\nImage 1: a red bicycle"
-    with pytest.raises(ValidationError, match="deterministic English rendering"):
+    assert state.r2v_instruction == (
+        "Move <Image 1> forward.\n\n<Image 1>: a red bicycle"
+    )
+    with pytest.raises(ValidationError, match="angle-bracket English rendering"):
         InstructionState(
             status="ready",
             instruction_body_template=body,
             reference_legend=legend,
             r2v_instruction=(
-                "Move \u56fe1 forward.\n\n\u56fe1\uff1aa red bicycle"
+                "Move <Image 1> forward.\n\nImage 1: a red bicycle"
             ),
         )
 
@@ -572,11 +596,12 @@ def test_unknown_placeholder_can_be_repaired_and_rendered(
     assert instruction is not None
     assert instruction.reference_legend[0].image_id == "image_1"
     assert instruction.r2v_instruction == (
-        "Use Image 3 as the overall background while Image 1 walks forward "
-        "pushing Image 2, and the camera tracks steadily backward.\n\n"
-        "Image 1: the stable appearance of the woman in a yellow coat\n"
-        "Image 2: the stable appearance of the red bicycle\n"
-        "Image 3: the bright plaza environment"
+        "Use <Image 3> as the overall background while <Image 1> walks "
+        "forward pushing <Image 2>, and the camera tracks steadily "
+        "backward.\n\n"
+        "<Image 1>: the stable appearance of the woman in a yellow coat\n"
+        "<Image 2>: the stable appearance of the red bicycle\n"
+        "<Image 3>: the bright plaza environment"
     )
 
 
@@ -631,14 +656,34 @@ def test_instruction_input_uses_english_ids_and_explicit_transcript(
     assert "\u56fe1" not in request
 
 
-def test_overwrite_replaces_legacy_chinese_instruction_with_english(
+@pytest.mark.parametrize("legacy_style", ["plain_english", "chinese"])
+def test_overwrite_replaces_legacy_instruction_with_angle_brackets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_style: str,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
     storage, clip_uid = _ready_storage(config)
-    legacy = InstructionState.model_validate(
-        {
+    if legacy_style == "plain_english":
+        raw = _raw_output()
+        legacy_payload = {
+            "status": "ready",
+            "instruction_body_template": raw.instruction_body_template,
+            "reference_legend": [
+                entry.model_dump(mode="json")
+                for entry in raw.reference_legend
+            ],
+            "r2v_instruction": (
+                "Use Image 3 as the overall background while Image 1 walks "
+                "forward pushing Image 2, and the camera tracks steadily "
+                "backward.\n\n"
+                "Image 1: the stable appearance of the woman in a yellow coat\n"
+                "Image 2: the stable appearance of the red bicycle\n"
+                "Image 3: the bright plaza environment"
+            ),
+        }
+    else:
+        legacy_payload = {
             "status": "ready",
             "instruction_body_template": (
                 "\u4ee5{{image_3}}\u4e3a\u80cc\u666f\uff0c{{image_1}}\u63a8\u7740"
@@ -656,8 +701,10 @@ def test_overwrite_replaces_legacy_chinese_instruction_with_english(
                 "\u56fe3\uff1a\u660e\u4eae\u5e7f\u573a"
             ),
         }
+    storage.write_instruction(
+        clip_uid,
+        InstructionState.model_validate(legacy_payload),
     )
-    storage.write_instruction(clip_uid, legacy)
     client = _FakeInstructionClient(
         config.qwen.instruction_writer,
         [_raw_output().model_dump(mode="json")],
@@ -681,7 +728,8 @@ def test_overwrite_replaces_legacy_chinese_instruction_with_english(
         instruction.instruction_body_template,
         instruction.reference_legend,
     )
-    assert "Image 1" in instruction.r2v_instruction
+    assert "<Image 1>" in instruction.r2v_instruction
+    assert "\nImage 1:" not in instruction.r2v_instruction
     assert "\u56fe1" not in instruction.r2v_instruction
 
 

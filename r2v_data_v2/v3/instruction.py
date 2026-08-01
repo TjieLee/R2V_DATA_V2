@@ -53,9 +53,9 @@ Write instruction_body_template in English. Accurately describe the scene,
 lighting, camera, composition, initial positions, spatial relationships, visible
 actions, and shot changes in chronological order. Use each exact placeholder,
 such as {{image_1}}, at least once. Placeholders may be repeated. In raw output,
-never replace placeholders with rendered labels such as Image 1 or Chinese
-image-number labels. Do not output <ref_...> tokens. Do not invent shot changes
-for a single continuous shot.
+never replace placeholders with rendered labels such as <Image 1>, Image 1, or
+Chinese image-number labels. Do not output <ref_...> tokens. Do not invent shot
+changes for a single continuous shot.
 
 Without source_transcript, do not invent quoted dialogue. Visible speaking
 motion may be described without supplying words. When source_transcript is
