@@ -106,6 +106,13 @@ class ReferenceScopeConfig:
     allow_local: bool = True
     allow_synthetic_completion: bool = False
 
+@dataclass(frozen=True)
+class PairConfig:
+    enabled: bool = True
+    max_candidates_per_entity: int = 3
+    crop_padding_ratio: float = 0.08
+    repair_retries: int = 1
+
 
 @dataclass(frozen=True)
 class BackgroundConfig:
@@ -159,6 +166,7 @@ class V3Config:
     reference_scope: ReferenceScopeConfig = field(
         default_factory=ReferenceScopeConfig
     )
+    pair: PairConfig = field(default_factory=PairConfig)
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     remove: RemoveConfig = field(default_factory=RemoveConfig)
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
@@ -291,6 +299,30 @@ class V3Config:
             )
         if self.reference_scope.allow_synthetic_completion:
             raise ValueError("V3 does not allow synthetic entity completion")
+        if not isinstance(self.pair.enabled, bool):
+            raise TypeError("pair.enabled must be a boolean")
+        if (
+            not isinstance(self.pair.max_candidates_per_entity, int)
+            or isinstance(self.pair.max_candidates_per_entity, bool)
+            or not 1 <= self.pair.max_candidates_per_entity <= 10
+        ):
+            raise ValueError(
+                "pair.max_candidates_per_entity must be an integer between 1 and 10"
+            )
+        if (
+            not isinstance(self.pair.crop_padding_ratio, float)
+            or not math.isfinite(self.pair.crop_padding_ratio)
+            or not 0 <= self.pair.crop_padding_ratio <= 0.5
+        ):
+            raise ValueError(
+                "pair.crop_padding_ratio must be a finite float between 0 and 0.5"
+            )
+        if (
+            not isinstance(self.pair.repair_retries, int)
+            or isinstance(self.pair.repair_retries, bool)
+            or self.pair.repair_retries < 0
+        ):
+            raise ValueError("pair.repair_retries must be a non-negative integer")
         if self.background.raw_foreground_area_ratio != 0.0:
             raise ValueError("V3 background.raw_foreground_area_ratio must be 0.0")
         max_pending_ratio = self.background.max_pending_remove_area_ratio
@@ -528,6 +560,7 @@ def load_config(path: str | Path) -> V3Config:
         "sam3",
         "coverage",
         "reference_scope",
+        "pair",
         "background",
         "remove",
         "instruction",
@@ -633,6 +666,11 @@ def load_config(path: str | Path) -> V3Config:
             ReferenceScopeConfig,
             _mapping(raw.get("reference_scope"), "reference_scope"),
             "reference_scope",
+        ),
+        pair=_build(
+            PairConfig,
+            _mapping(raw.get("pair"), "pair"),
+            "pair",
         ),
         background=_build(
             BackgroundConfig,

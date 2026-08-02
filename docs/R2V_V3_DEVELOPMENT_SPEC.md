@@ -78,13 +78,16 @@ V3 does not synthesize missing entity parts.
 - Convert a semantically useful but incomplete entity into an honest local reference.
 - Reject unusably fragmented references.
 
+`full`, `local`, and `reject` are the only entity-reference quality
+classifications. V3 does not add a second normalization-specific quality tier.
+
 ### 2.4 Caption policy
 
 Every accepted sample has two distinct text fields:
 
 - `t2v_caption`: literal, chronological, complete video description;
-- `r2v_instruction`: generation-oriented Chinese instruction using rendered
-  image labels such as `图1`.
+- `r2v_instruction`: generation-oriented English instruction using rendered
+  image labels such as `<Image 1>`.
 
 The R2V instruction must not be produced by mechanically inserting internal
 pairing tokens into the T2V caption. Pairing tokens remain internal metadata and
@@ -159,6 +162,9 @@ manifest
 -> export
 ```
 
+There is no `reference_finalize` stage. Pairing publishes the final
+source-faithful entity references consumed directly by instruction and export.
+
 ### 5.1 Stage responsibilities
 
 #### `manifest`
@@ -214,8 +220,8 @@ depend only on a ready entity, a present non-empty mask, and `track_valid`.
 
 The current implementation computes temporal coverage only from
 `masks.rle.json`. It does not rerun SAM3, select canonical frames, classify
-full/local/reject scope, or publish references. Later ranking work may add
-those separate reference-quality decisions.
+full/local/reject scope, or publish references. The later `pair` stage owns
+candidate selection and Qwen owns the semantic full/local/reject decision.
 
 #### `background`
 
@@ -244,9 +250,16 @@ Remove foreground entities from pending backgrounds using the configured Qwen Im
 
 #### `pair`
 
-Choose the final retained references and assign deterministic tokens. The
-clip-level coverage gate uses ANY-entity semantics and defaults to 7/10, with
-the integer threshold configurable independently from SAM3.
+Select deterministic in-pair entity candidates from the ten sampled frames and
+validated tracked masks, then ask the configured Qwen candidate judge for the
+semantic full/local/reject decision. Code owns mask integrity, geometry, crop
+publication, final retained filtering, optional ready-background binding, and
+deterministic per-type tokens. Every ready entity reference is retained in
+annotation order, and at least one retained entity must pass temporal coverage.
+The stage does not rerun SAM3, resize references, synthesize missing content, or
+perform same-parent/cross-parent pairing. Each retained entity remains a
+variable-size, source-faithful RGBA mask-bbox crop; pairing does not create a
+fixed canvas or a second normalized artifact.
 
 #### `instruct`
 
@@ -435,10 +448,13 @@ Examples:
 
 For a local reference:
 
-- crop only the coherent selected region;
-- remove disconnected irrelevant fragments from the reference mask;
+- crop the exact selected tracked-mask bbox plus deterministic padding;
+- preserve natural holes, thin structures, and disconnected mask components;
 - store the visible region explicitly;
 - never describe the result as a full-body or complete-object reference.
+
+The current pair stage performs no semantic component pruning. Qwen rejects
+obvious fragmentation or segmentation errors.
 
 ### 8.3 `reject`
 
@@ -607,7 +623,9 @@ V3 preserves the corrected clip-level coverage semantics:
 - an entity without a final reference remains in natural language but has no token;
 - token assignment and final reference filtering happen together.
 
-Same-parent cross-pair remains optional and conservative. A failed cross-pair judgment falls back to in-pair when configured.
+The current implementation is in-pair only. It does not invoke
+`qwen.cross_pair_judge`, search same-parent clips, search cross-parent clips, or
+fall back from any cross-pair attempt.
 
 ---
 
@@ -668,16 +686,17 @@ The instruction writer returns:
 }
 ```
 
-`instruction_body_template` is Chinese, preserves chronology, action,
-environment, camera, composition, and lighting, and may use the same image
-placeholder multiple times. It must use every final binding at least once.
-Without `source_transcript`, it cannot invent quoted dialogue.
+`instruction_body_template` and every legend description are English. The body
+preserves chronology, action, environment, camera, composition, and lighting,
+and may use the same image placeholder multiple times. It must use every final
+binding at least once. Without `source_transcript`, it cannot invent quoted
+dialogue.
 
 Code performs the only presentation-layer conversion:
 
 ```text
-{{image_1}} -> 图1
-{{image_2}} -> 图2
+{{image_1}} -> <Image 1>
+{{image_2}} -> <Image 2>
 ```
 
 It then appends the legend in binding order:
@@ -685,22 +704,24 @@ It then appends the legend in binding order:
 ```text
 <rendered instruction body>
 
-图1：<description>
-图2：<description>
+<Image 1>: <description>
+<Image 2>: <description>
 ```
 
-Chinese image labels are never schema identifiers, enum values, binding IDs, or
-raw model placeholders. Internal `<ref_...>` pairing tokens remain separate and
-do not appear in the structured instruction output or rendered instruction.
+Rendered image labels are never schema identifiers, enum values, binding IDs,
+or raw model placeholders. Internal `<ref_...>` pairing tokens remain separate
+and do not appear in the structured instruction output or rendered instruction.
 
 ### 11.4 Instruction validation
 
-Validate raw structured output before Chinese rendering:
+Validate raw structured output before deterministic English rendering:
 
 - the body template is non-empty and uses only exact `{{image_N}}` placeholders;
 - every binding appears at least once; repeated placeholders are allowed;
 - no unknown placeholder or `<ref_...>` token appears;
-- raw output contains no direct Chinese image label matching `图` plus a number;
+- raw output contains no rendered `<Image N>`, plain `Image N`, or Chinese `图N`
+  label;
+- the body and every legend description contain no CJK characters;
 - legend count, IDs, and order exactly match bindings;
 - every legend description is non-empty;
 - without a source transcript, quoted dialogue is forbidden;
@@ -752,6 +773,7 @@ Required layout:
         │   └── bg_removed.png
         └── debug/                 # created only when debug saving is enabled
             ├── segment/           # per-slot overlays and entity contact sheets
+            ├── pair/              # optional requests, responses, and contact sheets
             └── remove/
                 ├── candidate_seed_0.png
                 └── review_seed_0.json
@@ -769,7 +791,16 @@ Rules:
 - `masks.rle.json` stores every ordered slot, including absent masks, and uses
   validated two-dimensional binary run-length encoding at the sampled frame
   dimensions.
-- Store only selected entity images in `selected/`.
+- Store only selected entity images in `selected/`. Each ready entity uses the
+  fixed `selected/eN.png` path and is an RGBA PNG cropped without resize. Alpha
+  is the exact binary tracked-mask crop; opaque RGB equals the sampled source,
+  and transparent RGB is white.
+- Entity reference dimensions remain the variable mask-bbox crop dimensions.
+  Do not upscale, resize, place them on a 1024-by-1024 canvas, or create a
+  second normalized entity artifact.
+- Pair publication validates temporary PNGs, backs up only entity PNGs, updates
+  references and pairing in one atomic clip write, and restores the old files
+  and state on failure. It never deletes `bg_removed.png` or other selected files.
 - `background/source_mask_<sha256>.png` is the exact, single-channel 0/255
   union mask used by `pending_remove` and oversized audit states.
 - Background source masks are content-addressed and atomically published; stale
@@ -892,12 +923,14 @@ The final training dataset contains only three elements:
 ```
 
 Only files referenced by an accepted sample may exist under `references/`.
+Each retained entity and background is exported exactly once. Do not create
+separate source and normalized copies such as `*.source.png` plus `*.png`.
 
 Do not export:
 
 - sampled frames;
 - masks;
-- raw source reference images;
+- duplicate source/normalized reference variants;
 - rejected images;
 - candidate images;
 - contact sheets;
@@ -938,7 +971,7 @@ Each line is one compact training record:
   "sample_id": "<clip_uid>",
   "target_video": "/mnt/workspace/public/dataset/.../clip.mp4",
   "t2v_caption": "...",
-  "r2v_instruction": "以图2作为整体背景，图1向前行走。\\n\\n图1：...\\n图2：...",
+  "r2v_instruction": "Use <Image 2> as the background while <Image 1> walks forward.\\n\\n<Image 1>: ...\\n<Image 2>: ...",
   "references": [
     {
       "token": "<ref_subject_1>",
@@ -975,7 +1008,10 @@ requires them.
 ### 13.3 Reference file format
 
 - Export references as lossless PNG.
-- Preserve alpha for entity cutouts when the selected entity artifact is mask-backed.
+- Export each retained entity as the single source-faithful, variable-size RGBA
+  PNG produced by pairing.
+- Preserve the exact crop geometry, source RGB under the binary mask, white RGB
+  where alpha is zero, and binary alpha; do not resize or normalize entities.
 - Export backgrounds as RGB PNG.
 - The exporter must not silently alter crop geometry, colors, or alpha semantics.
 - Reference paths in `samples.jsonl` are relative to `dataset_root`.
@@ -1018,6 +1054,12 @@ reference_scope:
   enabled: true
   allow_local: true
   allow_synthetic_completion: false
+
+pair:
+  enabled: true
+  max_candidates_per_entity: 3
+  crop_padding_ratio: 0.08
+  repair_retries: 1
 
 background:
   enabled: true
@@ -1062,6 +1104,9 @@ Validation must reject:
 - model downloads into public paths;
 - `coverage.required_visible_frames` outside 1 through `frames.count`;
 - `allow_synthetic_completion: true` in the initial V3 implementation;
+- non-boolean `pair.enabled`, candidate limits outside 1 through 10,
+  non-finite/non-float crop padding outside 0 through 0.5, or negative/non-integer
+  pair repair retries;
 - `remove.fallback_to_raw: true`;
 - remove candidate seed lists other than one or two unique non-negative integers;
 - unsupported remove dtypes, non-finite guidance values, or invalid mask limits;
@@ -1085,12 +1130,12 @@ r2v_data_v2/v3/
 ├── schemas.py
 ├── storage.py
 ├── annotation.py
-├── reference_scope.py
+├── pair.py
+├── reference_judge.py
 ├── background.py
 ├── remove.py
 ├── qwen_image_edit_backend.py
 ├── removal_judge.py
-├── pairing.py
 ├── instruction.py
 ├── export.py
 └── pipeline.py
@@ -1143,7 +1188,9 @@ python -m ruff check .
 - repeated image placeholders are allowed;
 - no unknown placeholder or internal `<ref_...>` token appears;
 - legend IDs exactly match final binding order;
-- Chinese `图N` labels are introduced only by deterministic rendering;
+- raw body and legend descriptions are English and contain no CJK characters;
+- raw output rejects `<Image N>`, plain `Image N`, and Chinese `图N` labels;
+- deterministic rendering introduces `<Image N>` labels and an English legend;
 - quoted dialogue requires an explicit source transcript.
 
 ### 16.3 Reference-scope tests
@@ -1325,7 +1372,11 @@ V3 is complete only when all statements are true:
 - V3 uses Qwen3-VL-32B-Instruct for production annotation.
 - V3 has separate `t2v_caption` and `r2v_instruction`.
 - The instruction is generated after final references are known.
+- New instructions use English raw text with `{{image_N}}` placeholders and
+  deterministic `<Image N>` rendered labels.
 - Entity references are explicitly full, local, or rejected.
+- Entity references remain variable-size source-faithful RGBA crops and are
+  exported once, without normalization or duplicated source files.
 - No synthetic entity completion exists.
 - Non-empty background masks always require removal.
 - FLUX is not the V3 production backend.

@@ -315,6 +315,37 @@ class RunStorage:
     def write_pairing(self, clip_uid: str, value: PairingState) -> ClipRecord:
         return self._replace_section(clip_uid, "pairing", value)
 
+    def write_references_and_pairing(
+        self,
+        clip_uid: str,
+        references: ReferencesState,
+        pairing: PairingState,
+    ) -> ClipRecord:
+        current = self.read_clip(clip_uid)
+        validated_references = ReferencesState.model_validate(
+            references.model_dump(mode="json")
+        )
+        validated_pairing = PairingState.model_validate(
+            pairing.model_dump(mode="json")
+        )
+        updated = current.model_copy(
+            update={
+                "references": validated_references,
+                "pairing": validated_pairing,
+                "instruction": None,
+                "export": ExportState(),
+            }
+        )
+        validated = ClipRecord.model_validate(
+            updated.model_dump(mode="json")
+        )
+        if validated != current:
+            write_json_atomic(
+                self.clip_path(clip_uid),
+                _model_dict(validated),
+            )
+        return validated
+
     def write_instruction(
         self,
         clip_uid: str,
@@ -419,6 +450,41 @@ class RunStorage:
         destination.parent.mkdir(parents=True, exist_ok=True)
         return destination
 
+    def selected_entity_path(self, clip_uid: str, entity_id: str) -> Path:
+        if re.fullmatch(r"e[1-9]\d*", entity_id) is None:
+            raise ValueError("entity_id must match e[1-9]\\d*")
+        return self.selected_path(clip_uid, f"{entity_id}.png")
+
+    def pair_output_temporary_path(
+        self,
+        clip_uid: str,
+        entity_id: str,
+    ) -> Path:
+        directory = self.selected_entity_path(clip_uid, entity_id).parent
+        return directory / (
+            f".tmp-pair-{entity_id}-{uuid.uuid4().hex}.png"
+        )
+
+    def pair_output_backup_path(
+        self,
+        clip_uid: str,
+        entity_id: str,
+    ) -> Path:
+        directory = self.selected_entity_path(clip_uid, entity_id).parent
+        return directory / (
+            f".backup-pair-{entity_id}-{uuid.uuid4().hex}.png"
+        )
+
+    def pair_debug_dir(self, clip_uid: str, entity_id: str) -> Path:
+        if not self.config.debug.save_diagnostics:
+            raise RuntimeError("pair debug artifact saving is disabled")
+        self.selected_entity_path(clip_uid, entity_id)
+        destination = (
+            self.clip_dir(clip_uid) / "debug" / "pair" / entity_id
+        )
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
     def background_dir(self, clip_uid: str) -> Path:
         self._require_clip(clip_uid)
         return self.clip_dir(clip_uid) / "background"
@@ -507,6 +573,17 @@ class RunStorage:
             ):
                 for path in selected.glob(pattern):
                     path.unlink(missing_ok=True)
+
+    def cleanup_pair_artifacts(self, clip_uid: str) -> None:
+        selected = self.clip_dir(clip_uid) / "selected"
+        if not selected.is_dir():
+            return
+        for pattern in (
+            ".tmp-pair-*.png",
+            ".backup-pair-*.png",
+        ):
+            for path in selected.glob(pattern):
+                path.unlink(missing_ok=True)
 
     def cleanup_background_artifacts(
         self,

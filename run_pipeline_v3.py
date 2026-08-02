@@ -11,8 +11,10 @@ from r2v_data_v2.v3.config import load_config
 from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
 from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
 from r2v_data_v2.v3.manifest import build_manifest
+from r2v_data_v2.v3.pair import pair_clips
 from r2v_data_v2.v3.qwen_image_edit_backend import BackgroundRemovalBackend
 from r2v_data_v2.v3.rank import rank_temporal_coverage
+from r2v_data_v2.v3.reference_judge import EntityReferenceJudge
 from r2v_data_v2.v3.removal_judge import BackgroundRemovalJudge
 from r2v_data_v2.v3.remove import remove_backgrounds
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
@@ -39,6 +41,7 @@ _IMPLEMENTED_STAGES = frozenset(
         "segment",
         "rank",
         "background",
+        "pair",
         "instruct",
         "remove",
         "export",
@@ -73,6 +76,7 @@ def run_pipeline_v3(
     instruction_client: InstructionClient | None = None,
     background_removal_backend: BackgroundRemovalBackend | None = None,
     background_removal_judge: BackgroundRemovalJudge | None = None,
+    entity_reference_judge: EntityReferenceJudge | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -81,7 +85,7 @@ def run_pipeline_v3(
     if unavailable:
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
-            "frames, segment, rank, background, remove, instruct, and export only; "
+            "frames, segment, rank, background, remove, pair, instruct, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)
@@ -142,6 +146,13 @@ def run_pipeline_v3(
                 backend=background_removal_backend,
                 judge=background_removal_judge,
             ).to_dict()
+        elif stage == "pair":
+            results[stage] = pair_clips(
+                config,
+                storage,
+                overwrite=overwrite,
+                judge=entity_reference_judge,
+            ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
                 config,
@@ -168,7 +179,7 @@ def main() -> None:
         default="",
         help=(
             "comma-separated V3 stages; manifest, annotate, frames, segment, "
-            "rank, background, remove, instruct, and export are currently implemented"
+            "rank, background, remove, pair, instruct, and export are currently implemented"
         ),
     )
     parser.add_argument(

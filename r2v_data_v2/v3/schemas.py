@@ -23,10 +23,23 @@ SAMPLE_SCHEMA_VERSION = "r2v.v3.sample.1"
 _REF_TOKEN = re.compile(r"<ref_(?:subject|object|group|bg)_\d+>")
 _ANY_REF_TOKEN = re.compile(r"<ref_[^>]+>")
 _IMAGE_ID = re.compile(r"image_([1-9]\d*)")
+_CANDIDATE_ID = re.compile(r"candidate_[1-9]\d*")
 _IMAGE_PLACEHOLDER = re.compile(r"\{\{(image_[1-9]\d*)\}\}")
 _ANY_TEMPLATE_PLACEHOLDER = re.compile(r"\{\{[^{}]*\}\}")
 _DIRECT_CHINESE_IMAGE_LABEL = re.compile(r"\u56fe\s*\d+")
+_DIRECT_ENGLISH_IMAGE_LABEL = re.compile(
+    r"\bImage\s+[1-9]\d*\b",
+    flags=re.IGNORECASE,
+)
 _CHINESE_IMAGE_INDEX = re.compile(r"\u56fe\s*(\d+)")
+_ANGLE_ENGLISH_IMAGE_INDEX = re.compile(
+    r"<Image\s+([1-9]\d*)>",
+    flags=re.IGNORECASE,
+)
+_PLAIN_ENGLISH_IMAGE_INDEX = re.compile(
+    r"(?<!<)\bImage\s+([1-9]\d*)\b(?!>)",
+    flags=re.IGNORECASE,
+)
 
 
 class SchemaModel(BaseModel):
@@ -324,6 +337,37 @@ VisibleRegion = Literal[
 ]
 
 
+class RawEntityReferenceDecision(SchemaModel):
+    selected_candidate_id: Optional[str]
+    reference_scope: ReferenceScope
+    visible_region: VisibleRegion
+    whole_entity_recognizable: StrictBool
+    identity_features_visible: StrictBool
+    scope_reason: str
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> RawEntityReferenceDecision:
+        if not self.scope_reason.strip():
+            raise ValueError("entity reference scope_reason must not be empty")
+        if (
+            self.selected_candidate_id is not None
+            and _CANDIDATE_ID.fullmatch(self.selected_candidate_id) is None
+        ):
+            raise ValueError(
+                "selected_candidate_id must use candidate_N"
+            )
+        if self.reference_scope == "reject":
+            if self.selected_candidate_id is not None:
+                raise ValueError(
+                    "reject decision must not select a candidate"
+                )
+        elif self.selected_candidate_id is None:
+            raise ValueError(
+                "full or local decision requires selected_candidate_id"
+            )
+        return self
+
+
 class EntityReferenceState(SchemaModel):
     entity_id: str
     status: Literal["ready", "rejected"]
@@ -338,17 +382,46 @@ class EntityReferenceState(SchemaModel):
 
     @model_validator(mode="after")
     def validate_reference_state(self) -> EntityReferenceState:
+        if not self.scope_reason.strip():
+            raise ValueError("entity reference scope_reason must not be empty")
         if self.status == "ready":
-            if self.reference_scope == "reject":
+            if self.reference_scope == "full":
+                if (
+                    self.visible_region != "whole"
+                    or not self.whole_entity_recognizable
+                    or not self.identity_features_visible
+                ):
+                    raise ValueError(
+                        "ready full reference requires whole visible, "
+                        "recognizable identity"
+                    )
+            elif self.reference_scope == "local":
+                if (
+                    self.visible_region == "whole"
+                    or self.whole_entity_recognizable
+                    or not self.identity_features_visible
+                ):
+                    raise ValueError(
+                        "ready local reference requires a non-whole "
+                        "identity-visible region"
+                    )
+            else:
                 raise ValueError("ready entity reference cannot use reject scope")
-            if self.image_path is None or self.source_frame_index is None:
+            if (
+                self.image_path is None
+                or not self.image_path.strip()
+                or self.source_frame_index is None
+            ):
                 raise ValueError(
                     "ready entity reference requires image_path and source_frame_index"
                 )
-        if self.reference_scope == "reject" and self.status != "rejected":
-            raise ValueError("reject scope requires rejected status")
-        if self.status == "rejected" and self.image_path is not None:
-            raise ValueError("rejected entity reference cannot publish an image_path")
+        else:
+            if self.reference_scope != "reject":
+                raise ValueError("rejected entity reference requires reject scope")
+            if self.image_path is not None or self.source_frame_index is not None:
+                raise ValueError(
+                    "rejected entity reference cannot publish image provenance"
+                )
         return self
 
 
@@ -710,7 +783,7 @@ class PairingState(SchemaModel):
     @model_validator(mode="after")
     def validate_bindings(self) -> PairingState:
         if self.status == "rejected":
-            if not self.reason:
+            if self.reason is None or not self.reason.strip():
                 raise ValueError("rejected pairing requires a reason")
             if (
                 self.retained_entity_ids
@@ -721,25 +794,25 @@ class PairingState(SchemaModel):
                     "rejected pairing must clear retained IDs and tokens"
                 )
             return self
+        if self.reason is not None:
+            raise ValueError("ready pairing reason must be null")
         if not self.retained_entity_ids:
             raise ValueError("ready pairing requires at least one retained entity")
         if set(self.tokens) != set(self.retained_entity_ids):
             raise ValueError("ready pairing tokens must match retained_entity_ids")
         if len(self.retained_entity_ids) != len(set(self.retained_entity_ids)):
             raise ValueError("retained_entity_ids must be unique")
-        all_tokens = [*self.tokens.values()]
-        if self.background_token is not None:
-            all_tokens.append(self.background_token)
-        if len(all_tokens) != len(set(all_tokens)):
+        entity_tokens = list(self.tokens.values())
+        if len(entity_tokens) != len(set(entity_tokens)):
             raise ValueError("pairing tokens must be unique")
-        if any(_REF_TOKEN.fullmatch(token) is None for token in all_tokens):
+        if any(_REF_TOKEN.fullmatch(token) is None for token in entity_tokens):
             raise ValueError("pairing contains an invalid reference token")
-        if any(token.startswith("<ref_bg_") for token in self.tokens.values()):
+        if any(token.startswith("<ref_bg_") for token in entity_tokens):
             raise ValueError("entity tokens cannot use background reference tokens")
-        if self.background_token is not None and not self.background_token.startswith(
-            "<ref_bg_"
-        ):
-            raise ValueError("background_token must use a background reference token")
+        if self.background_token not in {None, "<ref_bg_1>"}:
+            raise ValueError(
+                'background_token must be null or "<ref_bg_1>"'
+            )
         return self
 
 
@@ -808,6 +881,44 @@ def render_instruction_text(
         match = _IMAGE_ID.fullmatch(entry.image_id)
         if match is None:
             raise ValueError("legend image_id must use image_N")
+        display_label = f"<Image {match.group(1)}>"
+        rendered_body = rendered_body.replace(
+            f"{{{{{entry.image_id}}}}}",
+            display_label,
+        )
+        legend_lines.append(f"{display_label}: {entry.description.strip()}")
+    return f"{rendered_body}\n\n" + "\n".join(legend_lines)
+
+
+def _render_legacy_english_instruction_text(
+    instruction_body_template: str,
+    reference_legend: list[InstructionLegendEntry],
+) -> str:
+    rendered_body = instruction_body_template.strip()
+    legend_lines: list[str] = []
+    for entry in reference_legend:
+        match = _IMAGE_ID.fullmatch(entry.image_id)
+        if match is None:
+            raise ValueError("legend image_id must use image_N")
+        display_label = f"Image {match.group(1)}"
+        rendered_body = rendered_body.replace(
+            f"{{{{{entry.image_id}}}}}",
+            display_label,
+        )
+        legend_lines.append(f"{display_label}: {entry.description.strip()}")
+    return f"{rendered_body}\n\n" + "\n".join(legend_lines)
+
+
+def _render_legacy_instruction_text(
+    instruction_body_template: str,
+    reference_legend: list[InstructionLegendEntry],
+) -> str:
+    rendered_body = instruction_body_template.strip()
+    legend_lines: list[str] = []
+    for entry in reference_legend:
+        match = _IMAGE_ID.fullmatch(entry.image_id)
+        if match is None:
+            raise ValueError("legend image_id must use image_N")
         display_label = f"\u56fe{match.group(1)}"
         rendered_body = rendered_body.replace(
             f"{{{{{entry.image_id}}}}}",
@@ -850,9 +961,13 @@ class InstructionState(SchemaModel):
         )
         if _ANY_REF_TOKEN.search(raw_text):
             raise ValueError("ready instruction must not contain reference tokens")
-        if _DIRECT_CHINESE_IMAGE_LABEL.search(raw_text):
+        if (
+            _DIRECT_CHINESE_IMAGE_LABEL.search(raw_text)
+            or _DIRECT_ENGLISH_IMAGE_LABEL.search(raw_text)
+        ):
             raise ValueError(
-                "raw instruction fields must not contain Chinese image labels"
+                "raw instruction fields must use image_N placeholders instead "
+                "of rendered image labels"
             )
         legend_ids = [entry.image_id for entry in self.reference_legend]
         expected_ids = [
@@ -882,13 +997,22 @@ class InstructionState(SchemaModel):
             raise ValueError(
                 "instruction placeholders must exactly match reference legend"
             )
-        expected_rendered = render_instruction_text(
-            self.instruction_body_template,
-            self.reference_legend,
-        )
-        if self.r2v_instruction != expected_rendered:
+        expected_renderings = {
+            renderer(
+                self.instruction_body_template,
+                self.reference_legend,
+            )
+            for renderer in (
+                render_instruction_text,
+                _render_legacy_english_instruction_text,
+                _render_legacy_instruction_text,
+            )
+        }
+        if self.r2v_instruction not in expected_renderings:
             raise ValueError(
-                "r2v_instruction must match deterministic Chinese rendering"
+                "r2v_instruction must match deterministic angle-bracket English "
+                "rendering, exact legacy plain English rendering, or exact "
+                "legacy Chinese rendering"
             )
         return self
 
@@ -919,11 +1043,16 @@ class ClipRecord(SchemaModel):
 
     @model_validator(mode="after")
     def validate_section_consistency(self) -> ClipRecord:
-        annotation_ids = (
-            {entity.entity_id for entity in self.annotation.entities}
-            if self.annotation is not None
-            else set()
+        annotation_entities = (
+            self.annotation.entities if self.annotation is not None else []
         )
+        annotation_order = [
+            entity.entity_id for entity in annotation_entities
+        ]
+        annotation_by_id = {
+            entity.entity_id: entity for entity in annotation_entities
+        }
+        annotation_ids = set(annotation_order)
         if self.coverage is not None:
             unknown_qualifying = (
                 set(self.coverage.qualifying_entity_ids) - annotation_ids
@@ -936,27 +1065,43 @@ class ClipRecord(SchemaModel):
                 raise ValueError(
                     "coverage visibility summaries must match annotation entities"
                 )
-        reference_ids = {
+        reference_order = [
             reference.entity_id for reference in self.references.entities
-        }
+        ]
+        reference_ids = set(reference_order)
         if reference_ids - annotation_ids:
             raise ValueError(
                 "entity references must correspond to annotation entities"
             )
+        expected_reference_order = [
+            entity_id
+            for entity_id in annotation_order
+            if entity_id in reference_ids
+        ]
+        if reference_order != expected_reference_order:
+            raise ValueError(
+                "entity references must follow annotation entity order"
+            )
         if self.pairing is not None and self.pairing.status == "ready":
-            ready_reference_ids = {
+            retained = self.pairing.retained_entity_ids
+            retained_ids = set(retained)
+            expected_retained_order = [
+                entity_id
+                for entity_id in annotation_order
+                if entity_id in retained_ids
+            ]
+            if retained != expected_retained_order:
+                raise ValueError(
+                    "ready pairing retained IDs must follow annotation order"
+                )
+            ready_reference_order = [
                 reference.entity_id
                 for reference in self.references.entities
                 if reference.status == "ready"
-            }
-            retained_ids = set(self.pairing.retained_entity_ids)
-            if not retained_ids:
+            ]
+            if retained != ready_reference_order:
                 raise ValueError(
-                    "ready pairing requires at least one retained entity"
-                )
-            if not retained_ids.issubset(ready_reference_ids):
-                raise ValueError(
-                    "ready pairing retained IDs must have ready references"
+                    "ready pairing must retain every ready entity reference"
                 )
             qualifying_ids = (
                 set(self.coverage.qualifying_entity_ids)
@@ -966,6 +1111,18 @@ class ClipRecord(SchemaModel):
             if not retained_ids.intersection(qualifying_ids):
                 raise ValueError(
                     "ready pairing must retain at least one qualifying entity"
+                )
+            counters = {"subject": 0, "object": 0, "group": 0}
+            expected_tokens: dict[str, str] = {}
+            for entity_id in retained:
+                reference_type = annotation_by_id[entity_id].reference_type
+                counters[reference_type] += 1
+                expected_tokens[entity_id] = (
+                    f"<ref_{reference_type}_{counters[reference_type]}>"
+                )
+            if self.pairing.tokens != expected_tokens:
+                raise ValueError(
+                    "ready pairing tokens must use deterministic per-type numbering"
                 )
             if self.pairing.background_token is not None:
                 background = self.references.background
@@ -1268,10 +1425,32 @@ class DatasetSample(SchemaModel):
         expected_indexes = {
             str(index) for index in range(1, len(self.references) + 1)
         }
-        instruction_indexes = set(
+        angle_english_indexes = set(
+            _ANGLE_ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
+        )
+        plain_english_indexes = set(
+            _PLAIN_ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
+        )
+        legacy_indexes = set(
             _CHINESE_IMAGE_INDEX.findall(self.r2v_instruction)
         )
-        if instruction_indexes != expected_indexes:
+        if not (
+            (
+                angle_english_indexes == expected_indexes
+                and not plain_english_indexes
+                and not legacy_indexes
+            )
+            or (
+                plain_english_indexes == expected_indexes
+                and not angle_english_indexes
+                and not legacy_indexes
+            )
+            or (
+                legacy_indexes == expected_indexes
+                and not angle_english_indexes
+                and not plain_english_indexes
+            )
+        ):
             raise ValueError(
                 "r2v_instruction image labels must match dataset references"
             )
