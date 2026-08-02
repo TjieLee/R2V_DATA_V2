@@ -226,6 +226,7 @@ def _create_exportable_clip(
     clip_uid: str = "clip-1",
     include_background: bool = True,
     preaccepted: bool = False,
+    source_provenance: tuple[str, str] | None = None,
 ) -> None:
     storage.create_clip(
         clip_uid=clip_uid,
@@ -266,6 +267,12 @@ def _create_exportable_clip(
         scope_reason="coherent upper body",
         image_path=storage.relative_artifact_path(entity_path),
         source_frame_index=2,
+        source_clip_uid=(
+            source_provenance[0] if source_provenance is not None else None
+        ),
+        source_entity_id=(
+            source_provenance[1] if source_provenance is not None else None
+        ),
     )
     rejected = EntityReferenceState(
         entity_id="e2",
@@ -1256,7 +1263,10 @@ def test_compact_export_contains_only_accepted_training_artifacts(
         git_commit="abc123",
         created_at="2026-07-30T00:00:00+00:00",
     )
-    _create_exportable_clip(storage)
+    _create_exportable_clip(
+        storage,
+        source_provenance=("donor-clip", "e2"),
+    )
     storage.create_clip(
         clip_uid="rejected-clip",
         source=_clip_source(storage, "rejected-clip").model_copy(
@@ -1289,6 +1299,13 @@ def test_compact_export_contains_only_accepted_training_artifacts(
         (config.resolved_export_root / "samples.jsonl").read_text(encoding="utf-8")
     )
     assert sample["sample_id"] == "clip-1"
+    entity_reference = next(
+        reference
+        for reference in sample["references"]
+        if reference["type"] == "entity"
+    )
+    assert entity_reference["source_clip_uid"] == "donor-clip"
+    assert entity_reference["source_entity_id"] == "e2"
     assert {reference["entity_id"] for reference in sample["references"]} == {
         "e1",
         None,
@@ -1526,3 +1543,44 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
             stages=("annotate",),
             git_commit="abc123",
         )
+
+
+def test_entity_provenance_fields_are_paired_and_legacy_optional() -> None:
+    legacy = EntityReferenceState(
+        entity_id="e1",
+        status="ready",
+        reference_scope="full",
+        visible_region="whole",
+        whole_entity_recognizable=True,
+        identity_features_visible=True,
+        scope_reason="clear full reference",
+        image_path="clips/clip-1/selected/e1.png",
+        source_frame_index=20,
+    )
+    assert legacy.source_clip_uid is None
+    assert legacy.source_entity_id is None
+
+    payload = legacy.model_dump(mode="json")
+    payload["source_clip_uid"] = "donor-clip"
+    with pytest.raises(ValidationError, match="must be set together"):
+        EntityReferenceState.model_validate(payload)
+
+    dataset_reference = DatasetReference(
+        token="<ref_subject_1>",
+        type="entity",
+        entity_id="e1",
+        scope="full",
+        visible_region="whole",
+        image_path="references/clip-1/subject_1.png",
+        source_frame_index=20,
+        source_clip_uid="donor-clip",
+        source_entity_id="e2",
+        synthetic=False,
+    )
+    assert dataset_reference.source_clip_uid == "donor-clip"
+    assert dataset_reference.source_entity_id == "e2"
+
+    dataset_payload = dataset_reference.model_dump(mode="json")
+    dataset_payload["source_entity_id"] = None
+    with pytest.raises(ValidationError, match="must be set together"):
+        DatasetReference.model_validate(dataset_payload)

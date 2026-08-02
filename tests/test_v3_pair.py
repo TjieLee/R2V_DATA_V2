@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from r2v_data_v2.v3.config import (
     SourceConfig,
     V3Config,
 )
+from r2v_data_v2.v3.cross_pair_judge import CrossPairDecisionAttempt
+from r2v_data_v2.v3.instruction import build_instruction_bindings
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.pair import (
     build_candidate_context_image,
@@ -36,11 +39,13 @@ from r2v_data_v2.v3.reference_judge import (
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
+    BackgroundAnnotation,
     BackgroundReferenceState,
     ClipSource,
     CoverageState,
     EntityVisibilitySummary,
     PairingState,
+    RawCrossPairDecision,
     RawEntityReferenceDecision,
     ReferencesState,
     SampledFrame,
@@ -87,6 +92,11 @@ def _config(
             instruction_writer=QwenServiceConfig(model=model),
             candidate_judge=QwenServiceConfig(model=model),
             background_remove_judge=QwenServiceConfig(model=model),
+cross_pair_judge=(
+                QwenServiceConfig(model=model)
+                if pair is not None and pair.same_parent_fallback_enabled
+                else None
+            ),
         ),
         reference_scope=ReferenceScopeConfig(allow_local=allow_local),
         pair=pair or PairConfig(),
@@ -159,6 +169,8 @@ def _add_ready_clip(
     clip_uid: str = "clip-1",
     entity_types: tuple[str, ...] = ("subject", "object"),
     tracking_status: dict[str, str] | None = None,
+    parent_video_id: str = "parent",
+    clip_suffix: str | None = None,
 ) -> None:
     tracking_status = tracking_status or {}
     storage.create_clip(
@@ -167,8 +179,8 @@ def _add_ready_clip(
             video_path=str(
                 config.dataset_json.parent / "videos" / f"{clip_uid}.mp4"
             ),
-            parent_video_id="parent",
-            clip_suffix=clip_uid,
+            parent_video_id=parent_video_id,
+            clip_suffix=clip_suffix or clip_uid,
             source_index=0,
             caption_raw="",
             metadata={},
@@ -460,6 +472,9 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         "entities_rejected": 0,
         "backgrounds_bound": 0,
         "repaired": 1,
+        "cross_pair_attempted": 0,
+        "cross_pair_ready": 0,
+        "cross_pair_repaired": 0,
     }
     assert clip.pairing == PairingState(
         status="ready",
@@ -863,3 +878,603 @@ def test_clip_schema_enforces_exact_ready_pair_contract(
     }
     with pytest.raises(ValidationError, match="deterministic per-type"):
         pair_module.ClipRecord.model_validate(payload)
+
+
+def _cross_decision(*, accept: bool) -> RawCrossPairDecision:
+    return RawCrossPairDecision(
+        verdict="accept" if accept else "reject",
+        same_physical_entity=accept,
+        identity_features_match=accept,
+        reference_is_usable=accept,
+        reason=(
+            "The visible identity matches."
+            if accept
+            else "The visible identity does not match."
+        ),
+    )
+
+
+class _ClipJudge:
+    def __init__(
+        self,
+        scopes: dict[tuple[str, str], str] | None = None,
+    ) -> None:
+        self.scopes = scopes or {}
+        self.calls: list[tuple[str, str]] = []
+
+    def decide(self, *, entity, candidates, source_images):
+        clip_uid = Path(candidates[0].image_path).parts[1]
+        self.calls.append((clip_uid, entity.entity_id))
+        assert set(source_images) == {item.image_path for item in candidates}
+        return EntityReferenceDecisionAttempt(
+            decision=_decision(
+                self.scopes.get((clip_uid, entity.entity_id), "full")
+            ),
+            raw_responses=("{}",),
+            repair_attempts=0,
+        )
+
+
+class _CrossJudge:
+    def __init__(
+        self,
+        decisions: list[bool] | None = None,
+        *,
+        repair_attempts: int = 0,
+    ) -> None:
+        self.decisions = iter(decisions or [True])
+        self.repair_attempts = repair_attempts
+        self.calls: list[dict[str, object]] = []
+
+    def decide(
+        self,
+        *,
+        target_clip_uid,
+        target_entity,
+        target_context_image,
+        target_entity_crop,
+        donor_clip_uid,
+        donor_entity,
+        donor_reference_image,
+    ):
+        self.calls.append(
+            {
+                "target_clip_uid": target_clip_uid,
+                "target_entity_id": target_entity.entity_id,
+                "target_reference_type": target_entity.reference_type,
+                "target_phrase": target_entity.phrase,
+                "donor_clip_uid": donor_clip_uid,
+                "donor_entity_id": donor_entity.entity_id,
+                "donor_reference_type": donor_entity.reference_type,
+                "context_mode": target_context_image.mode,
+                "crop_mode": target_entity_crop.mode,
+                "donor_mode": donor_reference_image.mode,
+            }
+        )
+        return CrossPairDecisionAttempt(
+            decision=_cross_decision(accept=next(self.decisions)),
+            raw_responses=("{}",),
+            repair_attempts=self.repair_attempts,
+        )
+
+
+def _same_parent_storage(
+    config: V3Config,
+    *,
+    donor_suffix: str = "2",
+    target_parent: str = "parent",
+    target_tracking_status: str = "ready",
+    donor_type: str = "subject",
+    target_type: str = "subject",
+) -> RunStorage:
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-pair-test")
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix=donor_suffix,
+        entity_types=(donor_type,),
+    )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="20",
+        parent_video_id=target_parent,
+        entity_types=(target_type,),
+        tracking_status={"e1": target_tracking_status},
+    )
+    return storage
+
+
+def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(config)
+    target = storage.read_clip("target")
+    assert target.annotation is not None
+    updated_annotation = target.annotation.model_copy(
+        update={
+            "background": BackgroundAnnotation(
+                phrase="a city street",
+                grounding_prompt="the visible city street",
+            )
+        }
+    )
+    write_json_atomic(
+        storage.clip_path("target"),
+        target.model_copy(update={"annotation": updated_annotation}).model_dump(
+            mode="json"
+        ),
+    )
+    background = BackgroundReferenceState(
+        status="clean_raw",
+        source_image_path="clips/target/frames/00.jpg",
+        output_image_path="clips/target/frames/00.jpg",
+        source_frame_slot=0,
+        source_frame_index=0,
+        source_foreground_area_pixels=0,
+        source_foreground_area_ratio=0.0,
+    )
+    storage.write_references(
+        "target",
+        ReferencesState(background=background),
+    )
+    phase_a = _ClipJudge({("target", "e1"): "reject"})
+    cross = _CrossJudge(repair_attempts=1)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=cross,
+    )
+
+    donor = storage.read_clip("donor")
+    target = storage.read_clip("target")
+    donor_path = storage.selected_entity_path("donor", "e1")
+    target_path = storage.selected_entity_path("target", "e1")
+    target_reference = target.references.entities[0]
+    assert target.pairing == PairingState(
+        status="ready",
+        retained_entity_ids=["e1"],
+        tokens={"e1": "<ref_subject_1>"},
+        background_token="<ref_bg_1>",
+    )
+    assert target_reference.source_clip_uid == "donor"
+    assert target_reference.source_entity_id == "e1"
+    assert target_reference.source_frame_index == (
+        donor.references.entities[0].source_frame_index
+    )
+    assert donor.references.entities[0].source_clip_uid == "donor"
+    assert donor.references.entities[0].source_entity_id == "e1"
+    assert target_path.read_bytes() == donor_path.read_bytes()
+    with Image.open(target_path) as image:
+        assert image.format == "PNG"
+        assert image.mode == "RGBA"
+    bindings = build_instruction_bindings(target)
+    assert bindings[0].entity_id == "e1"
+    assert bindings[0].phrase == target.annotation.entities[0].phrase
+    assert bindings[1].reference_type == "background"
+    assert target.references.background == background
+    assert stats.cross_pair_attempted == 1
+    assert stats.cross_pair_ready == 1
+    assert stats.cross_pair_repaired == 1
+    assert cross.calls[0] == {
+        "target_clip_uid": "target",
+        "target_entity_id": "e1",
+        "target_reference_type": "subject",
+        "target_phrase": "entity 1",
+        "donor_clip_uid": "donor",
+        "donor_entity_id": "e1",
+        "donor_reference_type": "subject",
+        "context_mode": "RGB",
+        "crop_mode": "RGBA",
+        "donor_mode": "RGBA",
+    }
+
+
+@pytest.mark.parametrize(
+    "target_parent,target_tracking_status,donor_type,target_type,donor_scope",
+    [
+        ("other-parent", "ready", "subject", "subject", "full"),
+        ("parent", "failed", "subject", "subject", "full"),
+        ("parent", "ready", "object", "subject", "full"),
+        ("parent", "ready", "subject", "subject", "local"),
+    ],
+)
+def test_fallback_rejects_ineligible_donors_or_text_only_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_parent: str,
+    target_tracking_status: str,
+    donor_type: str,
+    target_type: str,
+    donor_scope: str,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(
+        config,
+        target_parent=target_parent,
+        target_tracking_status=target_tracking_status,
+        donor_type=donor_type,
+        target_type=target_type,
+    )
+    phase_a = _ClipJudge(
+        {
+            ("donor", "e1"): donor_scope,
+            ("target", "e1"): "reject",
+        }
+    )
+    cross = _CrossJudge()
+
+    pair_clips(config, storage, judge=phase_a, cross_pair_judge=cross)
+
+    assert cross.calls == []
+    assert storage.read_clip("target").references.entities[0].status == "rejected"
+    assert not storage.selected_entity_path("target", "e1").exists()
+
+
+def test_fallback_uses_natural_donor_order_and_stops_at_first_accept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(
+            same_parent_fallback_enabled=True,
+            same_parent_max_donor_references=2,
+        ),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-order-test")
+    for uid, suffix in (("donor-10", "10"), ("donor-2", "2")):
+        _add_ready_clip(
+            config,
+            storage,
+            clip_uid=uid,
+            clip_suffix=suffix,
+            entity_types=("subject",),
+        )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+    phase_a = _ClipJudge({("target", "e1"): "reject"})
+    cross = _CrossJudge([False, True])
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=cross,
+    )
+
+    assert [call["donor_clip_uid"] for call in cross.calls] == [
+        "donor-2",
+        "donor-10",
+    ]
+    assert stats.cross_pair_attempted == 2
+    assert stats.cross_pair_ready == 1
+    assert storage.read_clip("target").references.entities[0].source_clip_uid == (
+        "donor-10"
+    )
+
+
+@pytest.mark.parametrize("target_scope", ["full", "local"])
+def test_fallback_never_replaces_an_existing_ready_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_scope: str,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(config)
+    phase_a = _ClipJudge({("target", "e1"): "local"})
+    cross = _CrossJudge()
+
+    pair_clips(config, storage, judge=phase_a, cross_pair_judge=cross)
+
+    target_reference = storage.read_clip("target").references.entities[0]
+    assert target_reference.status == "ready"
+    assert target_reference.reference_scope == "local"
+    assert target_reference.source_clip_uid == "target"
+    assert cross.calls == []
+
+
+def test_cross_pair_publication_rolls_back_when_clip_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(config)
+    phase_a = _ClipJudge({("target", "e1"): "reject"})
+    cross = _CrossJudge()
+    original_write = storage.write_references_and_pairing
+    write_calls = 0
+
+    def fail_cross_write(clip_uid, references, pairing):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 3:
+            raise OSError("simulated cross-pair clip write failure")
+        return original_write(clip_uid, references, pairing)
+
+    monkeypatch.setattr(storage, "write_references_and_pairing", fail_cross_write)
+    donor_path = storage.selected_entity_path("donor", "e1")
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=cross,
+    )
+
+    target = storage.read_clip("target")
+    assert target.references.entities[0].status == "rejected"
+    assert not storage.selected_entity_path("target", "e1").exists()
+    assert donor_path.exists()
+    assert stats.cross_pair_attempted == 1
+    assert stats.cross_pair_ready == 0
+    assert stats.failed == 1
+
+
+def test_existing_cross_pair_validates_and_overwrite_is_deterministic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(config)
+    phase_a = _ClipJudge({("target", "e1"): "reject"})
+    first_cross = _CrossJudge()
+    pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=first_cross,
+    )
+    donor_bytes = storage.selected_entity_path("donor", "e1").read_bytes()
+
+    unused_cross = _CrossJudge()
+    skipped = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=unused_cross,
+    )
+    assert skipped.skipped_existing == 2
+    assert unused_cross.calls == []
+
+    storage.selected_entity_path("target", "e1").write_bytes(b"corrupt")
+    corrupt_cross = _CrossJudge()
+    corrupt = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=corrupt_cross,
+    )
+    assert corrupt.failed == 1
+    assert corrupt.skipped_existing == 1
+    assert corrupt_cross.calls == []
+
+    overwritten = pair_clips(
+        config,
+        storage,
+        overwrite=True,
+        judge=phase_a,
+        cross_pair_judge=_CrossJudge(),
+    )
+    target_reference = storage.read_clip("target").references.entities[0]
+    assert target_reference.source_clip_uid == "donor"
+    assert storage.selected_entity_path("target", "e1").read_bytes() == donor_bytes
+    assert overwritten.cross_pair_ready == 1
+
+
+def test_legacy_in_pair_reference_without_provenance_still_validates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    payload = storage.read_clip("clip-1").model_dump(mode="json")
+    reference = payload["references"]["entities"][0]
+    reference.pop("source_clip_uid")
+    reference.pop("source_entity_id")
+    storage.clip_path("clip-1").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    stats = pair_clips(config, storage, judge=_Judge())
+
+    assert stats.skipped_existing == 1
+    loaded = storage.read_clip("clip-1").references.entities[0]
+    assert loaded.source_clip_uid is None
+    assert loaded.source_entity_id is None
+
+def test_donor_limit_caps_judge_calls_and_all_reject_preserves_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(
+            same_parent_fallback_enabled=True,
+            same_parent_max_donor_references=2,
+        ),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-limit-test")
+    for uid, suffix in (
+        ("donor-10", "10"),
+        ("donor-2", "2"),
+        ("donor-1", "1"),
+    ):
+        _add_ready_clip(
+            config,
+            storage,
+            clip_uid=uid,
+            clip_suffix=suffix,
+            entity_types=("subject",),
+        )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="20",
+        entity_types=("subject",),
+    )
+    cross = _CrossJudge([False, False])
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert [call["donor_clip_uid"] for call in cross.calls] == [
+        "donor-1",
+        "donor-2",
+    ]
+    assert stats.cross_pair_attempted == 2
+    assert stats.cross_pair_ready == 0
+    target = storage.read_clip("target")
+    assert target.pairing is not None
+    assert target.pairing.status == "rejected"
+    assert target.references.entities[0].status == "rejected"
+    assert not storage.selected_entity_path("target", "e1").exists()
+
+def test_pipeline_pair_integration_passes_injected_cross_pair_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    _same_parent_storage(config)
+    config_path = tmp_path / "cross-pair.yaml"
+    assert config.qwen.candidate_judge is not None
+    assert config.qwen.background_remove_judge is not None
+    assert config.qwen.cross_pair_judge is not None
+    config_path.write_text(
+        "\n".join(
+            [
+                f"dataset_json: {config.dataset_json}",
+                f"run_root: {config.run_root}",
+                f"export_root: {config.export_root}",
+                "source:",
+                "  limit: 10",
+                "qwen:",
+                "  annotation:",
+                f"    model: {config.qwen.annotation.model}",
+                "  instruction_writer:",
+                f"    model: {config.qwen.instruction_writer.model}",
+                "  candidate_judge:",
+                f"    model: {config.qwen.candidate_judge.model}",
+                "  background_remove_judge:",
+                f"    model: {config.qwen.background_remove_judge.model}",
+                "  cross_pair_judge:",
+                f"    model: {config.qwen.cross_pair_judge.model}",
+                "pair:",
+                "  same_parent_fallback_enabled: true",
+                "  same_parent_max_donor_references: 8",
+                "remove:",
+                f"  base_model_path: {config.remove.base_model_path}",
+                f"  adapter_path: {config.remove.adapter_path}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cross = _CrossJudge()
+
+    result = run_pipeline_v3(
+        config_path=config_path,
+        stages=("pair",),
+        git_commit="cross-pair-test",
+        entity_reference_judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert result["pair"]["cross_pair_ready"] == 1
+    assert cross.calls[0]["target_clip_uid"] == "target"
+
+def test_cross_pair_debug_is_json_only_and_disabled_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enabled_config = _config(
+        tmp_path / "enabled",
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+        debug=True,
+    )
+    enabled_storage = _same_parent_storage(enabled_config)
+    pair_clips(
+        enabled_config,
+        enabled_storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=_CrossJudge(),
+    )
+    debug_root = (
+        enabled_storage.clip_dir("target")
+        / "debug"
+        / "pair"
+        / "e1"
+        / "cross_pair"
+    )
+    artifact = debug_root / "donor-e1" / "decision.json"
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert set(payload) == {
+        "target",
+        "donor",
+        "raw_responses",
+        "issues",
+        "repair_attempts",
+        "decision",
+    }
+    assert not list(debug_root.rglob("*.png"))
+
+    disabled_config = _config(
+        tmp_path / "disabled",
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    disabled_storage = _same_parent_storage(disabled_config)
+    pair_clips(
+        disabled_config,
+        disabled_storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=_CrossJudge(),
+    )
+    assert not (disabled_storage.clip_dir("target") / "debug").exists()
