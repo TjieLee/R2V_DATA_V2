@@ -17,6 +17,7 @@ from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.config import (
     BackgroundConfig,
     DebugConfig,
+    QwenServiceConfig,
     QwenServicesConfig,
     RemoveConfig,
     SourceConfig,
@@ -166,7 +167,14 @@ def _config(
         run_root=writable / "runs" / run_name,
         export_root=writable / "datasets" / f"{run_name}-dataset",
         source=SourceConfig(limit=10),
-        qwen=QwenServicesConfig(background_remove_judge=None),
+        qwen=QwenServicesConfig(
+            candidate_judge=QwenServiceConfig(
+                model=str(pretrained / "Qwen" / "judge")
+            ),
+            background_remove_judge=QwenServiceConfig(
+                model=str(pretrained / "Qwen" / "judge")
+            ),
+        ),
         background=BackgroundConfig(max_pending_remove_area_ratio=0.5),
         remove=RemoveConfig(
             enabled=enabled,
@@ -557,6 +565,11 @@ def test_remove_yaml_parser_loads_new_fields(
                 f"export_root: {config.export_root}",
                 "source:",
                 "  limit: 10",
+                "qwen:",
+                "  candidate_judge:",
+                f"    model: {config.qwen.candidate_judge.model}",
+                "  background_remove_judge:",
+                f"    model: {config.qwen.background_remove_judge.model}",
                 "remove:",
                 f"  base_model_path: {config.remove.base_model_path}",
                 f"  adapter_path: {config.remove.adapter_path}",
@@ -770,18 +783,24 @@ def test_injected_backend_does_not_require_real_adapter_files(
     assert stats.ready_removed == 1
 
 
-def test_no_judge_configuration_is_explicit_clip_failure(
+def test_missing_background_remove_judge_fails_config_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
-    storage = _pending_storage(config)
-    stats = remove_backgrounds(config, storage, backend=_Backend())
-    assert stats.failed == 1
-    assert _background(storage).status == "pending_remove"
-    assert "background remove judge is not configured" in (
-        storage.failures_path.read_text()
+    invalid = replace(
+        config,
+        qwen=replace(config.qwen, background_remove_judge=None),
     )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "qwen.background_remove_judge is required when "
+            "remove.enabled is true"
+        ),
+    ):
+        invalid.validate()
 
 
 def test_judge_failure_is_current_candidate_failure_and_continues(
@@ -1079,6 +1098,11 @@ def test_pipeline_executes_remove_and_pair_without_models(
                 f"export_root: {config.export_root}",
                 "source:",
                 "  limit: 10",
+                "qwen:",
+                "  candidate_judge:",
+                f"    model: {config.qwen.candidate_judge.model}",
+                "  background_remove_judge:",
+                f"    model: {config.qwen.background_remove_judge.model}",
                 "remove:",
                 f"  base_model_path: {config.remove.base_model_path}",
                 f"  adapter_path: {config.remove.adapter_path}",

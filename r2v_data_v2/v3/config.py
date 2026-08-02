@@ -301,6 +301,10 @@ class V3Config:
             raise ValueError("V3 does not allow synthetic entity completion")
         if not isinstance(self.pair.enabled, bool):
             raise TypeError("pair.enabled must be a boolean")
+        if self.pair.enabled and self.qwen.candidate_judge is None:
+            raise ValueError(
+                "qwen.candidate_judge is required when pair.enabled is true"
+            )
         if (
             not isinstance(self.pair.max_candidates_per_entity, int)
             or isinstance(self.pair.max_candidates_per_entity, bool)
@@ -334,6 +338,13 @@ class V3Config:
             raise ValueError(
                 "background.max_pending_remove_area_ratio must be a finite "
                 "float greater than 0 and at most 1"
+            )
+        if not isinstance(self.remove.enabled, bool):
+            raise TypeError("remove.enabled must be a boolean")
+        if self.remove.enabled and self.qwen.background_remove_judge is None:
+            raise ValueError(
+                "qwen.background_remove_judge is required when "
+                "remove.enabled is true"
             )
         if self.remove.backend != REMOVE_BACKEND:
             raise ValueError(f"unsupported V3 remove backend: {self.remove.backend}")

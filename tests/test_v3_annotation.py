@@ -87,6 +87,8 @@ def _config(
                 repair_retries=repair_retries,
             ),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
+            candidate_judge=QwenServiceConfig(model=str(annotation_model)),
+            background_remove_judge=QwenServiceConfig(model=str(annotation_model)),
         ),
         sam3=Sam3Config(
             model_path=user_models / "sam3" / "checkpoint.pt"
@@ -123,6 +125,10 @@ def _config_path(config: V3Config, tmp_path: Path) -> Path:
         "  annotation:\n"
         f"    model: {config.qwen.annotation.model}\n"
         f"    repair_retries: {config.qwen.annotation.repair_retries}\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n"
         "debug:\n"
         f"  save_diagnostics: {str(config.debug.save_diagnostics).lower()}\n",
         encoding="utf-8",

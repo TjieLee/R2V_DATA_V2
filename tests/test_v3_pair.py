@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -61,7 +60,6 @@ def _config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    candidate_service: bool = False,
     allow_local: bool = True,
     pair: PairConfig | None = None,
     debug: bool = False,
@@ -87,9 +85,8 @@ def _config(
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=model),
             instruction_writer=QwenServiceConfig(model=model),
-            candidate_judge=(
-                QwenServiceConfig(model=model) if candidate_service else None
-            ),
+            candidate_judge=QwenServiceConfig(model=model),
+            background_remove_judge=QwenServiceConfig(model=model),
         ),
         reference_scope=ReferenceScopeConfig(allow_local=allow_local),
         pair=pair or PairConfig(),
@@ -534,20 +531,21 @@ def test_nonqualifying_ready_reference_is_kept_but_cannot_rescue_pairing(
     assert storage.selected_entity_path("clip-1", "e2").is_file()
 
 
-def test_missing_judge_is_transient_clip_failure(
+def test_missing_candidate_judge_fails_config_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
-    storage = _storage(config)
+    invalid = replace(
+        config,
+        qwen=replace(config.qwen, candidate_judge=None),
+    )
 
-    stats = pair_clips(config, storage)
-
-    assert stats.failed == 1
-    assert storage.read_clip("clip-1").pairing is None
-    failure = json.loads(storage.failures_path.read_text(encoding="utf-8"))
-    assert failure["stage"] == "pair"
-    assert failure["reason"] == "candidate judge is not configured"
+    with pytest.raises(
+        ValueError,
+        match="qwen.candidate_judge is required when pair.enabled is true",
+    ):
+        invalid.validate()
 
 
 @pytest.mark.parametrize("status", ["pending_remove", "rejected"])
@@ -756,7 +754,7 @@ def test_owned_judge_is_lazy_and_closed_but_injected_judge_is_not(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, monkeypatch, candidate_service=True)
+    config = _config(tmp_path, monkeypatch)
     storage = _storage(config)
     owned = _Judge()
     constructions: list[object] = []
@@ -786,7 +784,7 @@ def test_no_eligible_clip_does_not_construct_owned_judge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, monkeypatch, candidate_service=True)
+    config = _config(tmp_path, monkeypatch)
     storage = RunStorage(config)
     storage.initialize(git_commit="pair-test")
 
@@ -817,6 +815,10 @@ def test_pipeline_pair_integration_uses_injected_judge(
                 f"    model: {config.qwen.annotation.model}",
                 "  instruction_writer:",
                 f"    model: {config.qwen.instruction_writer.model}",
+                "  candidate_judge:",
+                f"    model: {config.qwen.candidate_judge.model}",
+                "  background_remove_judge:",
+                f"    model: {config.qwen.background_remove_judge.model}",
                 "remove:",
                 f"  base_model_path: {config.remove.base_model_path}",
                 f"  adapter_path: {config.remove.adapter_path}",

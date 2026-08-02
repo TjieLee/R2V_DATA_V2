@@ -46,7 +46,11 @@ from r2v_data_v2.v3.schemas import (
     TrackedMasksArtifact,
     render_instruction_text,
 )
-from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
+from r2v_data_v2.v3.storage import (
+    DatasetExporter,
+    RunStorage,
+    evaluate_export_state,
+)
 from run_pipeline_v3 import run_pipeline_v3
 
 
@@ -79,6 +83,8 @@ def _config(
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=str(annotation_model)),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
+            candidate_judge=QwenServiceConfig(model=str(annotation_model)),
+            background_remove_judge=QwenServiceConfig(model=str(annotation_model)),
         ),
         sam3=v3_config_module.Sam3Config(
             model_path=user_models / "sam3" / "checkpoint.pt"
@@ -219,6 +225,7 @@ def _create_exportable_clip(
     *,
     clip_uid: str = "clip-1",
     include_background: bool = True,
+    preaccepted: bool = False,
 ) -> None:
     storage.create_clip(
         clip_uid=clip_uid,
@@ -304,10 +311,11 @@ def _create_exportable_clip(
         clip_uid,
         _instruction_state(include_background=include_background),
     )
-    storage.write_export(
-        clip_uid,
-        ExportState(accepted=True, reason=None),
-    )
+    if preaccepted:
+        storage.write_export(
+            clip_uid,
+            ExportState(accepted=True, reason=None),
+        )
 
 
 def _initialize_storage_with_complete_clip(
@@ -325,7 +333,9 @@ def _initialize_storage_with_complete_clip(
             source=_clip_source(storage, "clip-1"),
         )
         storage.write_masks("clip-1", _tracked_masks("clip-1"))
-    _create_exportable_clip(storage, include_background=False)
+    _create_exportable_clip(
+        storage, include_background=False, preaccepted=True
+    )
     return storage
 
 
@@ -341,6 +351,11 @@ def test_v3_config_loads_32b_defaults_without_model_access(
         f"export_root: {config.export_root}\n"
         "source:\n"
         "  limit: 100\n"
+        "qwen:\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n"
         "sam3:\n"
         f"  model_path: {config.sam3.model_path}\n",
         encoding="utf-8",
@@ -753,6 +768,228 @@ def test_accepted_export_requires_all_cross_section_state() -> None:
         )
 
 
+@pytest.mark.parametrize("background_status", [None, "none", "rejected"])
+def test_evaluate_export_state_accepts_entity_only_background_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background_status: str | None,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    _create_exportable_clip(storage, include_background=False)
+    clip = storage.read_clip("clip-1")
+    if background_status is not None:
+        background = BackgroundReferenceState(
+            status=background_status,
+            reason=(
+                "background is not reusable"
+                if background_status == "rejected"
+                else None
+            ),
+        )
+        clip = clip.model_copy(
+            update={
+                "references": clip.references.model_copy(
+                    update={"background": background}
+                )
+            }
+        )
+
+    state = evaluate_export_state(clip)
+
+    assert state == ExportState(accepted=True, reason=None)
+    assert clip.export == ExportState()
+
+
+def test_evaluate_export_state_accepts_clean_raw_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    _create_exportable_clip(storage, include_background=True)
+
+    assert evaluate_export_state(
+        storage.read_clip("clip-1")
+    ) == ExportState(accepted=True, reason=None)
+
+
+def test_evaluate_export_state_accepts_ready_removed_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    ready_removed = BackgroundReferenceState(
+        status="ready_removed",
+        source_image_path="clips/clip-1/frames/03.jpg",
+        output_image_path="clips/clip-1/selected/bg_removed.png",
+        source_frame_slot=3,
+        source_frame_index=30,
+        source_mask_path="clips/clip-1/background/source_mask.png",
+        generation_mask_path="clips/clip-1/background/generation_mask.png",
+        source_foreground_area_pixels=2,
+        source_foreground_area_ratio=0.02,
+        removal_backend="qwen_image_edit_2511_object_remover",
+        removal_seed=0,
+        generation_mask_dilation_pixels=0,
+        generation_mask_area_pixels=2,
+        generation_mask_area_ratio=0.02,
+        output_sha256="a" * 64,
+        removal_attempts=[
+            BackgroundRemovalAttempt(
+                seed=0,
+                status="accepted",
+                runtime_seconds=1.0,
+                candidate_sha256="a" * 64,
+                review=BackgroundRemovalReview(
+                    verdict="accept",
+                    foreground_absent=True,
+                    foreground_not_reconstructed=True,
+                    no_new_salient_entity=True,
+                    background_only_in_repaired_region=True,
+                    background_continuity_ok=True,
+                    no_visible_artifacts=True,
+                    reason="accepted for production gate test",
+                ),
+            )
+        ],
+    )
+    clip = clip.model_copy(
+        update={
+            "references": clip.references.model_copy(
+                update={"background": ready_removed}
+            )
+        }
+    )
+
+    assert evaluate_export_state(clip) == ExportState(
+        accepted=True,
+        reason=None,
+    )
+
+
+def test_evaluate_export_state_rejects_pending_background_remove(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    pending = BackgroundReferenceState(
+        status="pending_remove",
+        source_image_path="clips/clip-1/frames/03.jpg",
+        source_frame_slot=3,
+        source_frame_index=30,
+        source_mask_path="clips/clip-1/background/source_mask.png",
+        source_foreground_area_pixels=2,
+        source_foreground_area_ratio=0.02,
+    )
+    clip = clip.model_copy(
+        update={
+            "references": clip.references.model_copy(
+                update={"background": pending}
+            )
+        }
+    )
+
+    assert evaluate_export_state(clip) == ExportState(
+        accepted=False,
+        reason="background_remove_pending",
+    )
+
+
+@pytest.mark.parametrize(
+    ("gate", "reason"),
+    [
+        ("annotation", "annotation_not_ready"),
+        ("coverage", "coverage_not_passed"),
+        ("pairing", "pairing_not_ready"),
+        ("instruction", "instruction_not_ready"),
+        ("qualifying_entity", "no_bound_qualifying_entity"),
+    ],
+)
+def test_evaluate_export_state_uses_stable_rejection_reasons(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gate: str,
+    reason: str,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    assert clip.annotation is not None
+    assert clip.coverage is not None
+    assert clip.pairing is not None
+    assert clip.instruction is not None
+    if gate == "annotation":
+        clip = clip.model_copy(
+            update={
+                "annotation": clip.annotation.model_copy(
+                    update={"status": "failed"}
+                )
+            }
+        )
+    elif gate == "coverage":
+        clip = clip.model_copy(
+            update={
+                "coverage": clip.coverage.model_copy(
+                    update={"passed": False}
+                )
+            }
+        )
+    elif gate == "pairing":
+        clip = clip.model_copy(
+            update={
+                "pairing": PairingState(
+                    status="rejected",
+                    reason="no usable pairing",
+                )
+            }
+        )
+    elif gate == "instruction":
+        clip = clip.model_copy(
+            update={
+                "instruction": clip.instruction.model_copy(
+                    update={"status": "failed"}
+                )
+            }
+        )
+    else:
+        clip = clip.model_copy(
+            update={
+                "coverage": clip.coverage.model_copy(
+                    update={"qualifying_entity_ids": []}
+                )
+            }
+        )
+
+    assert evaluate_export_state(clip) == ExportState(
+        accepted=False,
+        reason=reason,
+    )
+
+
+def test_legacy_clip_without_export_state_can_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    storage.create_clip(
+        clip_uid="legacy-clip",
+        source=_clip_source(storage, "legacy-clip"),
+    )
+    payload = storage.read_clip("legacy-clip").model_dump(mode="json")
+    payload.pop("export")
+    storage.clip_path("legacy-clip").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    assert storage.read_clip("legacy-clip").export == ExportState()
+
 def test_clip_cross_section_validator_rejects_inconsistent_bindings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -940,11 +1177,14 @@ def test_exporter_reads_only_background_output_image_path(
         "clip-1",
         _instruction_state(include_background=True),
     )
-    storage.write_export("clip-1", ExportState(accepted=True, reason=None))
 
     dataset = DatasetExporter(storage.config, storage).export()
 
     assert dataset.reference_count == 2
+    assert storage.read_clip("clip-1").export == ExportState(
+        accepted=True,
+        reason=None,
+    )
     exported_background = (
         storage.config.resolved_export_root
         / "references"
@@ -1024,12 +1264,22 @@ def test_compact_export_contains_only_accepted_training_artifacts(
         ),
     )
 
+    assert storage.read_clip("clip-1").export == ExportState()
+    assert storage.read_clip("rejected-clip").export == ExportState()
     dataset = DatasetExporter(config, storage).export(
         created_at="2026-07-30T01:00:00+00:00"
     )
 
     assert dataset.sample_count == 1
     assert dataset.reference_count == 2
+    assert storage.read_clip("clip-1").export == ExportState(
+        accepted=True,
+        reason=None,
+    )
+    assert storage.read_clip("rejected-clip").export == ExportState(
+        accepted=False,
+        reason="annotation_not_ready",
+    )
     assert {path.name for path in config.resolved_export_root.iterdir()} == {
         "dataset.json",
         "samples.jsonl",
@@ -1074,6 +1324,93 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     assert "127.0.0.1" not in dataset_text
     assert str(config.resolved_run_root) not in dataset_text
 
+
+def test_exporter_accepts_entity_only_clip_without_manual_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    _create_exportable_clip(storage, include_background=False)
+    assert storage.read_clip("clip-1").export == ExportState()
+
+    dataset = DatasetExporter(config, storage).export(
+        created_at="2026-07-30T01:00:00+00:00"
+    )
+
+    assert dataset.sample_count == 1
+    assert storage.read_clip("clip-1").export == ExportState(
+        accepted=True,
+        reason=None,
+    )
+
+
+def test_exporter_rejects_and_writes_pending_background_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    _create_exportable_clip(storage, include_background=False)
+    clip = storage.read_clip("clip-1")
+    pending = BackgroundReferenceState(
+        status="pending_remove",
+        source_image_path="clips/clip-1/frames/03.jpg",
+        source_frame_slot=3,
+        source_frame_index=30,
+        source_mask_path="clips/clip-1/background/source_mask.png",
+        source_foreground_area_pixels=2,
+        source_foreground_area_ratio=0.02,
+    )
+    storage.write_references(
+        "clip-1",
+        clip.references.model_copy(update={"background": pending}),
+    )
+    storage.write_pairing(
+        "clip-1",
+        PairingState(
+            status="ready",
+            retained_entity_ids=["e1"],
+            tokens={"e1": "<ref_subject_1>"},
+        ),
+    )
+    storage.write_instruction(
+        "clip-1",
+        _instruction_state(include_background=False),
+    )
+
+    dataset = DatasetExporter(config, storage).export()
+
+    assert dataset.sample_count == 0
+    assert storage.read_clip("clip-1").export == ExportState(
+        accepted=False,
+        reason="background_remove_pending",
+    )
+
+
+def test_repeated_export_writes_deterministic_acceptance_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    _create_exportable_clip(storage, include_background=False)
+    exporter = DatasetExporter(config, storage)
+
+    first = exporter.export(created_at="2026-07-30T01:00:00+00:00")
+    first_state = storage.read_clip("clip-1").export
+    first_clip_bytes = storage.clip_path("clip-1").read_bytes()
+    second = exporter.export(
+        overwrite=True,
+        created_at="2026-07-30T01:00:00+00:00",
+    )
+
+    assert second == first
+    assert storage.read_clip("clip-1").export == first_state
+    assert storage.clip_path("clip-1").read_bytes() == first_clip_bytes
 
 def test_entity_la_png_export_preserves_alpha(tmp_path: Path) -> None:
     source = tmp_path / "entity-la.png"
@@ -1162,7 +1499,12 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
         f"run_root: {config.run_root}\n"
         f"export_root: {config.export_root}\n"
         "source:\n"
-        "  limit: 100\n",
+        "  limit: 100\n"
+        "qwen:\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n",
         encoding="utf-8",
     )
 

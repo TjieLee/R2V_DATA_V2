@@ -52,6 +52,30 @@ def utc_now() -> str:
     return datetime.now(_UTC).isoformat()
 
 
+def evaluate_export_state(clip: ClipRecord) -> ExportState:
+    if clip.annotation is None or clip.annotation.status != "ready":
+        return ExportState(accepted=False, reason="annotation_not_ready")
+    if clip.coverage is None or not clip.coverage.passed:
+        return ExportState(accepted=False, reason="coverage_not_passed")
+    if clip.pairing is None or clip.pairing.status != "ready":
+        return ExportState(accepted=False, reason="pairing_not_ready")
+    if clip.instruction is None or clip.instruction.status != "ready":
+        return ExportState(accepted=False, reason="instruction_not_ready")
+    retained = set(clip.pairing.retained_entity_ids)
+    if not retained.intersection(clip.coverage.qualifying_entity_ids):
+        return ExportState(
+            accepted=False,
+            reason="no_bound_qualifying_entity",
+        )
+    background = clip.references.background
+    if background is not None and background.status == "pending_remove":
+        return ExportState(
+            accepted=False,
+            reason="background_remove_pending",
+        )
+    return ExportState(accepted=True, reason=None)
+
+
 def _safe_component(value: str, field_name: str) -> str:
     if _SAFE_COMPONENT.fullmatch(value) is None or value in {".", ".."}:
         raise ValueError(f"{field_name} must be a safe path component")
@@ -675,6 +699,13 @@ class DatasetExporter:
                 f"dataset_root already exists: {self.destination}"
             )
         run = self.storage.read_run()
+        evaluated_clips = [
+            self.storage.write_export(
+                clip.clip_uid,
+                evaluate_export_state(clip),
+            )
+            for clip in self.storage.iter_clips()
+        ]
         temporary = self.destination.with_name(
             f".{self.destination.name}.tmp-{uuid.uuid4().hex}"
         )
@@ -684,7 +715,7 @@ class DatasetExporter:
             references_root.mkdir(parents=True)
             samples: list[DatasetSample] = []
             reference_count = 0
-            for clip in self.storage.iter_clips():
+            for clip in evaluated_clips:
                 if not clip.export.accepted:
                     continue
                 sample = self._export_clip(clip, temporary)

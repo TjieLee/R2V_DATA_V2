@@ -115,6 +115,8 @@ def _config(
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=str(annotation_model)),
             instruction_writer=QwenServiceConfig(model=str(annotation_model)),
+            candidate_judge=QwenServiceConfig(model=str(annotation_model)),
+            background_remove_judge=QwenServiceConfig(model=str(annotation_model)),
         ),
         remove=RemoveConfig(
             base_model_path=pretrained

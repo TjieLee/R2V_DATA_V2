@@ -73,6 +73,8 @@ def _config(
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=str(model)),
             instruction_writer=QwenServiceConfig(model=str(model)),
+            candidate_judge=QwenServiceConfig(model=str(model)),
+            background_remove_judge=QwenServiceConfig(model=str(model)),
         ),
         coverage=CoverageConfig(
             required_visible_frames=required_visible_frames
@@ -437,6 +439,11 @@ def test_coverage_threshold_loads_from_yaml(
         f"export_root: {config.export_root}\n"
         "source:\n"
         "  limit: 10\n"
+        "qwen:\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n"
         "sam3:\n"
         f"  model_path: {config.sam3.model_path}\n"
         "coverage:\n"
