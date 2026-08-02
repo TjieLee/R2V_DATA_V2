@@ -78,13 +78,16 @@ V3 does not synthesize missing entity parts.
 - Convert a semantically useful but incomplete entity into an honest local reference.
 - Reject unusably fragmented references.
 
+`full`, `local`, and `reject` are the only entity-reference quality
+classifications. V3 does not add a second normalization-specific quality tier.
+
 ### 2.4 Caption policy
 
 Every accepted sample has two distinct text fields:
 
 - `t2v_caption`: literal, chronological, complete video description;
-- `r2v_instruction`: generation-oriented Chinese instruction using rendered
-  image labels such as `图1`.
+- `r2v_instruction`: generation-oriented English instruction using rendered
+  image labels such as `<Image 1>`.
 
 The R2V instruction must not be produced by mechanically inserting internal
 pairing tokens into the T2V caption. Pairing tokens remain internal metadata and
@@ -158,6 +161,9 @@ manifest
 -> instruct
 -> export
 ```
+
+There is no `reference_finalize` stage. Pairing publishes the final
+source-faithful entity references consumed directly by instruction and export.
 
 ### 5.1 Stage responsibilities
 
@@ -251,7 +257,9 @@ publication, final retained filtering, optional ready-background binding, and
 deterministic per-type tokens. Every ready entity reference is retained in
 annotation order, and at least one retained entity must pass temporal coverage.
 The stage does not rerun SAM3, resize references, synthesize missing content, or
-perform same-parent/cross-parent pairing.
+perform same-parent/cross-parent pairing. Each retained entity remains a
+variable-size, source-faithful RGBA mask-bbox crop; pairing does not create a
+fixed canvas or a second normalized artifact.
 
 #### `instruct`
 
@@ -678,16 +686,17 @@ The instruction writer returns:
 }
 ```
 
-`instruction_body_template` is Chinese, preserves chronology, action,
-environment, camera, composition, and lighting, and may use the same image
-placeholder multiple times. It must use every final binding at least once.
-Without `source_transcript`, it cannot invent quoted dialogue.
+`instruction_body_template` and every legend description are English. The body
+preserves chronology, action, environment, camera, composition, and lighting,
+and may use the same image placeholder multiple times. It must use every final
+binding at least once. Without `source_transcript`, it cannot invent quoted
+dialogue.
 
 Code performs the only presentation-layer conversion:
 
 ```text
-{{image_1}} -> 图1
-{{image_2}} -> 图2
+{{image_1}} -> <Image 1>
+{{image_2}} -> <Image 2>
 ```
 
 It then appends the legend in binding order:
@@ -695,22 +704,24 @@ It then appends the legend in binding order:
 ```text
 <rendered instruction body>
 
-图1：<description>
-图2：<description>
+<Image 1>: <description>
+<Image 2>: <description>
 ```
 
-Chinese image labels are never schema identifiers, enum values, binding IDs, or
-raw model placeholders. Internal `<ref_...>` pairing tokens remain separate and
-do not appear in the structured instruction output or rendered instruction.
+Rendered image labels are never schema identifiers, enum values, binding IDs,
+or raw model placeholders. Internal `<ref_...>` pairing tokens remain separate
+and do not appear in the structured instruction output or rendered instruction.
 
 ### 11.4 Instruction validation
 
-Validate raw structured output before Chinese rendering:
+Validate raw structured output before deterministic English rendering:
 
 - the body template is non-empty and uses only exact `{{image_N}}` placeholders;
 - every binding appears at least once; repeated placeholders are allowed;
 - no unknown placeholder or `<ref_...>` token appears;
-- raw output contains no direct Chinese image label matching `图` plus a number;
+- raw output contains no rendered `<Image N>`, plain `Image N`, or Chinese `图N`
+  label;
+- the body and every legend description contain no CJK characters;
 - legend count, IDs, and order exactly match bindings;
 - every legend description is non-empty;
 - without a source transcript, quoted dialogue is forbidden;
@@ -784,6 +795,9 @@ Rules:
   fixed `selected/eN.png` path and is an RGBA PNG cropped without resize. Alpha
   is the exact binary tracked-mask crop; opaque RGB equals the sampled source,
   and transparent RGB is white.
+- Entity reference dimensions remain the variable mask-bbox crop dimensions.
+  Do not upscale, resize, place them on a 1024-by-1024 canvas, or create a
+  second normalized entity artifact.
 - Pair publication validates temporary PNGs, backs up only entity PNGs, updates
   references and pairing in one atomic clip write, and restores the old files
   and state on failure. It never deletes `bg_removed.png` or other selected files.
@@ -909,12 +923,14 @@ The final training dataset contains only three elements:
 ```
 
 Only files referenced by an accepted sample may exist under `references/`.
+Each retained entity and background is exported exactly once. Do not create
+separate source and normalized copies such as `*.source.png` plus `*.png`.
 
 Do not export:
 
 - sampled frames;
 - masks;
-- raw source reference images;
+- duplicate source/normalized reference variants;
 - rejected images;
 - candidate images;
 - contact sheets;
@@ -955,7 +971,7 @@ Each line is one compact training record:
   "sample_id": "<clip_uid>",
   "target_video": "/mnt/workspace/public/dataset/.../clip.mp4",
   "t2v_caption": "...",
-  "r2v_instruction": "以图2作为整体背景，图1向前行走。\\n\\n图1：...\\n图2：...",
+  "r2v_instruction": "Use <Image 2> as the background while <Image 1> walks forward.\\n\\n<Image 1>: ...\\n<Image 2>: ...",
   "references": [
     {
       "token": "<ref_subject_1>",
@@ -992,7 +1008,10 @@ requires them.
 ### 13.3 Reference file format
 
 - Export references as lossless PNG.
-- Preserve alpha for entity cutouts when the selected entity artifact is mask-backed.
+- Export each retained entity as the single source-faithful, variable-size RGBA
+  PNG produced by pairing.
+- Preserve the exact crop geometry, source RGB under the binary mask, white RGB
+  where alpha is zero, and binary alpha; do not resize or normalize entities.
 - Export backgrounds as RGB PNG.
 - The exporter must not silently alter crop geometry, colors, or alpha semantics.
 - Reference paths in `samples.jsonl` are relative to `dataset_root`.
@@ -1169,7 +1188,9 @@ python -m ruff check .
 - repeated image placeholders are allowed;
 - no unknown placeholder or internal `<ref_...>` token appears;
 - legend IDs exactly match final binding order;
-- Chinese `图N` labels are introduced only by deterministic rendering;
+- raw body and legend descriptions are English and contain no CJK characters;
+- raw output rejects `<Image N>`, plain `Image N`, and Chinese `图N` labels;
+- deterministic rendering introduces `<Image N>` labels and an English legend;
 - quoted dialogue requires an explicit source transcript.
 
 ### 16.3 Reference-scope tests
@@ -1351,7 +1372,11 @@ V3 is complete only when all statements are true:
 - V3 uses Qwen3-VL-32B-Instruct for production annotation.
 - V3 has separate `t2v_caption` and `r2v_instruction`.
 - The instruction is generated after final references are known.
+- New instructions use English raw text with `{{image_N}}` placeholders and
+  deterministic `<Image N>` rendered labels.
 - Entity references are explicitly full, local, or rejected.
+- Entity references remain variable-size source-faithful RGBA crops and are
+  exported once, without normalization or duplicated source files.
 - No synthetic entity completion exists.
 - Non-empty background masks always require removal.
 - FLUX is not the V3 production backend.
