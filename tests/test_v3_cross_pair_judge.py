@@ -15,6 +15,7 @@ from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.cross_pair_judge import (
     SYSTEM_PROMPT,
     CrossPairJudgeFailure,
+    CrossPairTargetEvidenceMode,
     QwenCrossPairJudge,
     build_cross_pair_request_payload,
 )
@@ -33,6 +34,7 @@ def _entity(entity_id: str, phrase: str) -> AnnotationEntity:
 def _payload(*, accept: bool = True, **updates: object) -> dict[str, object]:
     result: dict[str, object] = {
         "verdict": "accept" if accept else "reject",
+        "target_entity_visible": accept,
         "same_physical_entity": accept,
         "identity_features_match": accept,
         "reference_is_usable": accept,
@@ -48,6 +50,10 @@ def _payload(*, accept: bool = True, **updates: object) -> dict[str, object]:
         ({"reason": ""}, "reason"),
         ({"same_physical_entity": 1}, "valid boolean"),
         ({"extra": "forbidden"}, "Extra inputs"),
+        (
+            {"verdict": "accept", "target_entity_visible": False},
+            "if and only if",
+        ),
         (
             {"verdict": "accept", "same_physical_entity": False},
             "if and only if",
@@ -75,6 +81,7 @@ def test_cross_pair_payload_keeps_target_and_donor_semantics_separate() -> None:
     payload = build_cross_pair_request_payload(
         target_clip_uid="target-clip",
         target_entity=_entity("e1", "target woman"),
+        target_evidence_mode="sampled_frames",
         donor_clip_uid="donor-clip",
         donor_entity=_entity("e2", "donor woman"),
     )
@@ -85,6 +92,7 @@ def test_cross_pair_payload_keeps_target_and_donor_semantics_separate() -> None:
             "reference_type": "subject",
             "phrase": "target woman",
             "grounding_prompt": "the visible target woman",
+            "evidence_mode": "sampled_frames",
         },
         "donor": {
             "clip_uid": "donor-clip",
@@ -145,14 +153,24 @@ def _judge(
     )
 
 
-def _decide(judge: QwenCrossPairJudge):
+def _decide(
+    judge: QwenCrossPairJudge,
+    *,
+    target_evidence_mode: CrossPairTargetEvidenceMode = "masked_candidate",
+):
     donor = Image.new("RGBA", (3, 2), (40, 50, 60, 255))
     donor.putpixel((0, 0), (1, 2, 3, 0))
+    target_crop = (
+        Image.new("RGBA", (3, 2), (70, 80, 90, 255))
+        if target_evidence_mode == "masked_candidate"
+        else None
+    )
     return judge.decide(
         target_clip_uid="target-clip",
         target_entity=_entity("e1", "target woman"),
+        target_evidence_mode=target_evidence_mode,
         target_context_image=Image.new("RGB", (6, 4), (10, 20, 30)),
-        target_entity_crop=Image.new("RGBA", (3, 2), (70, 80, 90, 255)),
+        target_entity_crop=target_crop,
         donor_clip_uid="donor-clip",
         donor_entity=_entity("e2", "donor woman"),
         donor_reference_image=donor,
@@ -185,6 +203,26 @@ def test_messages_send_three_ordered_images_and_white_donor_background() -> None
     with Image.open(BytesIO(donor_bytes)) as donor:
         assert donor.mode == "RGB"
         assert donor.getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_sampled_frames_messages_send_contact_sheet_without_crop() -> None:
+    completions = _Completions([_payload()])
+    attempt = _decide(
+        _judge(completions),
+        target_evidence_mode="sampled_frames",
+    )
+
+    assert attempt.decision.verdict == "accept"
+    content = completions.calls[0]["messages"][1]["content"]
+    labels = [item["text"] for item in content if item["type"] == "text"]
+    assert labels[1:] == [
+        "Target sampled-frame contact sheet",
+        "Donor source-faithful reference",
+    ]
+    assert '"evidence_mode": "sampled_frames"' in labels[0]
+    assert len(
+        [item for item in content if item["type"] == "image_url"]
+    ) == 2
 
 
 def test_structured_repair_reuses_schema_and_fails_closed() -> None:
@@ -222,11 +260,17 @@ def test_json_schema_bad_request_falls_back_only_to_json_object() -> None:
 def test_prompt_requires_visual_identity_and_uncertain_rejection() -> None:
     required = (
         "same physical entity",
+        "target phrase's entity is actually visible",
+        "If you cannot find the target entity, reject it",
         "Matching category does not prove matching identity",
-        "Similar clothing, color",
-        "Reject whenever identity is uncertain",
+        "Similar clothing is insufficient",
+        "Generic trees",
+        "Reject whenever target or donor identity is",
         "Never accept from text alone",
         "donor is not a faithful usable reference",
         "never infer an identity relationship that is not visible",
+        "shared parent video",
+        "context-only evidence must still be judged visually",
+        "all four boolean checks are true",
     )
     assert all(fragment in SYSTEM_PROMPT for fragment in required)

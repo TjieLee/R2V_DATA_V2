@@ -4,7 +4,7 @@ import base64
 import io
 import json
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from openai import BadRequestError, OpenAI
 from PIL import Image
@@ -21,19 +21,28 @@ from r2v_data_v2.v3.schemas import (
     RawCrossPairDecision,
 )
 
+CrossPairTargetEvidenceMode = Literal["masked_candidate", "sampled_frames"]
+
+
 SYSTEM_PROMPT = """You decide whether a donor reference shows the same physical entity as a target entity.
 
 Judge people, objects, and groups only from the supplied visual evidence.
+First confirm that the target phrase's entity is actually visible in the target
+visual evidence. If you cannot find the target entity, reject it.
 Matching category does not prove matching identity; the same class is not identity.
-Similar clothing, color, or general appearance alone is insufficient.
-Reject whenever identity is uncertain.
+Similar clothing is insufficient to prove a person's identity. Generic trees,
+fish, vehicles, furniture, and other category-level appearances are insufficient
+to prove the same physical entity. Reject whenever target or donor identity is
+uncertain.
 Reject when the donor is not a faithful usable reference for the target.
 Never accept from text alone, and never infer an identity relationship that is not visible.
+Do not infer identity from a shared parent video, neighboring clips, or textual
+semantics. Sampled-frame context-only evidence must still be judged visually.
 Do not invent unseen identity features.
 
-Return one strict JSON object only with verdict, same_physical_entity,
-identity_features_match, reference_is_usable, and reason. Accept if and only if
-all three boolean checks are true."""
+Return one strict JSON object only with verdict, target_entity_visible,
+same_physical_entity, identity_features_match, reference_is_usable, and reason.
+Accept if and only if all four boolean checks are true."""
 
 
 @dataclass(frozen=True)
@@ -53,8 +62,9 @@ class CrossPairJudge(Protocol):
         *,
         target_clip_uid: str,
         target_entity: AnnotationEntity,
+        target_evidence_mode: CrossPairTargetEvidenceMode,
         target_context_image: Image.Image,
-        target_entity_crop: Image.Image,
+        target_entity_crop: Image.Image | None,
         donor_clip_uid: str,
         donor_entity: AnnotationEntity,
         donor_reference_image: Image.Image,
@@ -65,6 +75,7 @@ def build_cross_pair_request_payload(
     *,
     target_clip_uid: str,
     target_entity: AnnotationEntity,
+    target_evidence_mode: CrossPairTargetEvidenceMode,
     donor_clip_uid: str,
     donor_entity: AnnotationEntity,
 ) -> dict[str, object]:
@@ -75,6 +86,7 @@ def build_cross_pair_request_payload(
             "reference_type": target_entity.reference_type,
             "phrase": target_entity.phrase,
             "grounding_prompt": target_entity.grounding_prompt,
+            "evidence_mode": target_evidence_mode,
         },
         "donor": {
             "clip_uid": donor_clip_uid,
@@ -122,17 +134,38 @@ class QwenCrossPairJudge:
     def _messages(
         self,
         *,
+        target_evidence_mode: CrossPairTargetEvidenceMode,
         target_context_image: Image.Image,
-        target_entity_crop: Image.Image,
+        target_entity_crop: Image.Image | None,
         donor_reference_image: Image.Image,
         request_text: str,
     ) -> list[dict[str, object]]:
         content: list[dict[str, object]] = [
             {"type": "text", "text": request_text},
         ]
+        if target_evidence_mode == "masked_candidate":
+            if target_entity_crop is None:
+                raise ValueError(
+                    "masked_candidate evidence requires a target entity crop"
+                )
+            target_images = (
+                ("Target context frame", target_context_image),
+                ("Target entity crop", target_entity_crop),
+            )
+        elif target_evidence_mode == "sampled_frames":
+            if target_entity_crop is not None:
+                raise ValueError(
+                    "sampled_frames evidence must not include a target entity crop"
+                )
+            target_images = (
+                ("Target sampled-frame contact sheet", target_context_image),
+            )
+        else:
+            raise ValueError(
+                f"unsupported target evidence mode: {target_evidence_mode}"
+            )
         for label, image in (
-            ("Target context frame", target_context_image),
-            ("Target entity crop", target_entity_crop),
+            *target_images,
             ("Donor source-faithful reference", donor_reference_image),
         ):
             content.append({"type": "text", "text": label})
@@ -185,8 +218,9 @@ class QwenCrossPairJudge:
         *,
         target_clip_uid: str,
         target_entity: AnnotationEntity,
+        target_evidence_mode: CrossPairTargetEvidenceMode,
         target_context_image: Image.Image,
-        target_entity_crop: Image.Image,
+        target_entity_crop: Image.Image | None,
         donor_clip_uid: str,
         donor_entity: AnnotationEntity,
         donor_reference_image: Image.Image,
@@ -194,6 +228,7 @@ class QwenCrossPairJudge:
         payload = build_cross_pair_request_payload(
             target_clip_uid=target_clip_uid,
             target_entity=target_entity,
+            target_evidence_mode=target_evidence_mode,
             donor_clip_uid=donor_clip_uid,
             donor_entity=donor_entity,
         )
@@ -216,6 +251,7 @@ class QwenCrossPairJudge:
             try:
                 raw = self._request(
                     self._messages(
+                        target_evidence_mode=target_evidence_mode,
                         target_context_image=target_context_image,
                         target_entity_crop=target_entity_crop,
                         donor_reference_image=donor_reference_image,

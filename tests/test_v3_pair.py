@@ -28,6 +28,7 @@ from r2v_data_v2.v3.instruction import build_instruction_bindings
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.pair import (
     build_candidate_context_image,
+    build_cross_pair_target_contact_sheet,
     build_entity_reference_candidates,
     build_reference_crop,
     pair_clips,
@@ -366,6 +367,56 @@ def test_pair_config_changes_fingerprint(
         pair=replace(config.pair, max_candidates_per_entity=4),
     )
     assert config.fingerprint() != changed.fingerprint()
+
+
+def test_cross_pair_target_contact_sheet_is_bounded_and_source_safe() -> None:
+    frame_images = [
+        (
+            slot,
+            Image.new(
+                "RGB",
+                (80, 40),
+                ((slot * 23) % 256, 100, 150),
+            ),
+        )
+        for slot in range(10)
+    ]
+    source_pixels = [np.asarray(image).copy() for _, image in frame_images]
+
+    sheet = build_cross_pair_target_contact_sheet(
+        frame_images,
+        panel_max_side=40,
+    )
+
+    assert sheet.mode == "RGB"
+    assert sheet.size == (200, 136)
+    sheet_pixels = np.asarray(sheet)
+    for slot, image in frame_images:
+        column = slot % 5
+        row = slot // 5
+        origin_x = column * 40
+        origin_y = row * 68
+        assert sheet.getpixel((origin_x + 20, origin_y + 48)) == (
+            (slot * 23) % 256,
+            100,
+            150,
+        )
+        assert sheet.getpixel((origin_x + 20, origin_y + 67)) == (
+            255,
+            255,
+            255,
+        )
+        assert np.any(
+            sheet_pixels[
+                origin_y : origin_y + 28,
+                origin_x : origin_x + 40,
+            ]
+            != 255
+        )
+        assert np.array_equal(np.asarray(image), source_pixels[slot])
+
+    with pytest.raises(ValueError, match="ordered slots 0 through 9"):
+        build_cross_pair_target_contact_sheet(frame_images[:-1])
 
 
 def test_context_and_crop_preserve_exact_pixels_without_resize() -> None:
@@ -883,6 +934,7 @@ def test_clip_schema_enforces_exact_ready_pair_contract(
 def _cross_decision(*, accept: bool) -> RawCrossPairDecision:
     return RawCrossPairDecision(
         verdict="accept" if accept else "reject",
+        target_entity_visible=accept,
         same_physical_entity=accept,
         identity_features_match=accept,
         reference_is_usable=accept,
@@ -931,6 +983,7 @@ class _CrossJudge:
         *,
         target_clip_uid,
         target_entity,
+        target_evidence_mode,
         target_context_image,
         target_entity_crop,
         donor_clip_uid,
@@ -943,11 +996,17 @@ class _CrossJudge:
                 "target_entity_id": target_entity.entity_id,
                 "target_reference_type": target_entity.reference_type,
                 "target_phrase": target_entity.phrase,
+                "target_evidence_mode": target_evidence_mode,
                 "donor_clip_uid": donor_clip_uid,
                 "donor_entity_id": donor_entity.entity_id,
                 "donor_reference_type": donor_entity.reference_type,
                 "context_mode": target_context_image.mode,
-                "crop_mode": target_entity_crop.mode,
+                "context_size": target_context_image.size,
+                "crop_mode": (
+                    target_entity_crop.mode
+                    if target_entity_crop is not None
+                    else None
+                ),
                 "donor_mode": donor_reference_image.mode,
             }
         )
@@ -1073,10 +1132,12 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
         "target_entity_id": "e1",
         "target_reference_type": "subject",
         "target_phrase": "entity 1",
+        "target_evidence_mode": "masked_candidate",
         "donor_clip_uid": "donor",
         "donor_entity_id": "e1",
         "donor_reference_type": "subject",
         "context_mode": "RGB",
+        "context_size": (WIDTH, HEIGHT),
         "crop_mode": "RGBA",
         "donor_mode": "RGBA",
     }
@@ -1086,12 +1147,11 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
     "target_parent,target_tracking_status,donor_type,target_type,donor_scope",
     [
         ("other-parent", "ready", "subject", "subject", "full"),
-        ("parent", "failed", "subject", "subject", "full"),
         ("parent", "ready", "object", "subject", "full"),
         ("parent", "ready", "subject", "subject", "local"),
     ],
 )
-def test_fallback_rejects_ineligible_donors_or_text_only_targets(
+def test_fallback_rejects_ineligible_donors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target_parent: str,
@@ -1125,6 +1185,101 @@ def test_fallback_rejects_ineligible_donors_or_text_only_targets(
     assert cross.calls == []
     assert storage.read_clip("target").references.entities[0].status == "rejected"
     assert not storage.selected_entity_path("target", "e1").exists()
+
+
+@pytest.mark.parametrize("tracking_status", ["not_found", "failed"])
+def test_fallback_uses_sampled_frames_without_a_target_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tracking_status: str,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(
+        config,
+        target_tracking_status=tracking_status,
+    )
+    phase_a = _ClipJudge()
+    cross = _CrossJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=cross,
+    )
+
+    assert ("target", "e1") not in phase_a.calls
+    assert stats.cross_pair_attempted == 1
+    assert stats.cross_pair_ready == 1
+    assert cross.calls[0]["target_evidence_mode"] == "sampled_frames"
+    assert cross.calls[0]["context_mode"] == "RGB"
+    assert cross.calls[0]["context_size"] == (1920, 824)
+    assert cross.calls[0]["crop_mode"] is None
+    target = storage.read_clip("target")
+    assert target.references.entities[0].source_clip_uid == "donor"
+    assert storage.selected_entity_path(
+        "target",
+        "e1",
+    ).read_bytes() == storage.selected_entity_path(
+        "donor",
+        "e1",
+    ).read_bytes()
+
+
+def test_ready_tracking_without_a_valid_candidate_uses_sampled_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(config)
+    original_builder = pair_module.build_entity_reference_candidates
+
+    def without_target_candidates(
+        config,
+        storage,
+        *,
+        clip_uid,
+        entity,
+        frames,
+        masks,
+    ):
+        if clip_uid == "target":
+            return []
+        return original_builder(
+            config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            frames=frames,
+            masks=masks,
+        )
+
+    monkeypatch.setattr(
+        pair_module,
+        "build_entity_reference_candidates",
+        without_target_candidates,
+    )
+    cross = _CrossJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge(),
+        cross_pair_judge=cross,
+    )
+
+    assert stats.cross_pair_attempted == 1
+    assert stats.cross_pair_ready == 1
+    assert cross.calls[0]["target_evidence_mode"] == "sampled_frames"
+    assert cross.calls[0]["crop_mode"] is None
 
 
 def test_fallback_uses_natural_donor_order_and_stops_at_first_accept(
@@ -1297,6 +1452,51 @@ def test_existing_cross_pair_validates_and_overwrite_is_deterministic(
     assert overwritten.cross_pair_ready == 1
 
 
+def test_context_only_existing_cross_pair_requires_complete_sampled_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(
+        config,
+        target_tracking_status="not_found",
+    )
+    first_cross = _CrossJudge()
+    pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge(),
+        cross_pair_judge=first_cross,
+    )
+    assert first_cross.calls[0]["target_evidence_mode"] == "sampled_frames"
+
+    unused_cross = _CrossJudge()
+    skipped = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge(),
+        cross_pair_judge=unused_cross,
+    )
+    assert skipped.skipped_existing == 2
+    assert unused_cross.calls == []
+
+    storage.frame_path("target", 9).unlink()
+    incomplete_cross = _CrossJudge()
+    invalid = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge(),
+        cross_pair_judge=incomplete_cross,
+    )
+    assert invalid.failed == 1
+    assert invalid.skipped_existing == 1
+    assert incomplete_cross.calls == []
+
+
 def test_legacy_in_pair_reference_without_provenance_still_validates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1430,7 +1630,7 @@ def test_pipeline_pair_integration_passes_injected_cross_pair_judge(
     assert result["pair"]["cross_pair_ready"] == 1
     assert cross.calls[0]["target_clip_uid"] == "target"
 
-def test_cross_pair_debug_is_json_only_and_disabled_by_default(
+def test_masked_cross_pair_debug_is_json_only_and_disabled_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1457,6 +1657,8 @@ def test_cross_pair_debug_is_json_only_and_disabled_by_default(
     artifact = debug_root / "donor-e1" / "decision.json"
     payload = json.loads(artifact.read_text(encoding="utf-8"))
     assert set(payload) == {
+        "target_evidence_mode",
+        "target_frame_slots",
         "target",
         "donor",
         "raw_responses",
@@ -1464,6 +1666,8 @@ def test_cross_pair_debug_is_json_only_and_disabled_by_default(
         "repair_attempts",
         "decision",
     }
+    assert payload["target_evidence_mode"] == "masked_candidate"
+    assert len(payload["target_frame_slots"]) == 1
     assert not list(debug_root.rglob("*.png"))
 
     disabled_config = _config(
@@ -1476,6 +1680,68 @@ def test_cross_pair_debug_is_json_only_and_disabled_by_default(
         disabled_config,
         disabled_storage,
         judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=_CrossJudge(),
+    )
+    assert not (disabled_storage.clip_dir("target") / "debug").exists()
+
+
+def test_sampled_frame_debug_saves_contact_sheet_only_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enabled_config = _config(
+        tmp_path / "enabled-sampled",
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+        debug=True,
+    )
+    enabled_storage = _same_parent_storage(
+        enabled_config,
+        target_tracking_status="not_found",
+    )
+    pair_clips(
+        enabled_config,
+        enabled_storage,
+        judge=_ClipJudge(),
+        cross_pair_judge=_CrossJudge(),
+    )
+    debug_directory = (
+        enabled_storage.clip_dir("target")
+        / "debug"
+        / "pair"
+        / "e1"
+        / "cross_pair"
+        / "donor-e1"
+    )
+    payload = json.loads(
+        (debug_directory / "decision.json").read_text(encoding="utf-8")
+    )
+    assert payload["target_evidence_mode"] == "sampled_frames"
+    assert payload["target_frame_slots"] == list(range(10))
+    contact_sheet = debug_directory / "target_contact_sheet.png"
+    with Image.open(contact_sheet) as image:
+        assert image.format == "PNG"
+        assert image.mode == "RGB"
+        assert image.size == (1920, 824)
+    assert not list(
+        enabled_storage.selected_entity_path("target", "e1").parent.glob(
+            "*contact*"
+        )
+    )
+
+    disabled_config = _config(
+        tmp_path / "disabled-sampled",
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    disabled_storage = _same_parent_storage(
+        disabled_config,
+        target_tracking_status="not_found",
+    )
+    pair_clips(
+        disabled_config,
+        disabled_storage,
+        judge=_ClipJudge(),
         cross_pair_judge=_CrossJudge(),
     )
     assert not (disabled_storage.clip_dir("target") / "debug").exists()
@@ -1704,3 +1970,54 @@ def test_cross_pair_does_not_double_count_existing_background_binding(
     assert target.references.entities[1].source_clip_uid == "donor"
     assert stats.cross_pair_ready == 1
     assert stats.backgrounds_bound == 1
+
+
+def test_four_context_only_targets_attempt_judge_without_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-context-smoke-test")
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix="1",
+        entity_types=("subject",),
+    )
+    target_uids = [f"target-{index}" for index in range(4)]
+    for index, target_uid in enumerate(target_uids, start=2):
+        _add_ready_clip(
+            config,
+            storage,
+            clip_uid=target_uid,
+            clip_suffix=str(index),
+            entity_types=("subject",),
+            tracking_status={
+                "e1": "not_found" if index % 2 == 0 else "failed"
+            },
+        )
+    cross = _CrossJudge([False, False, False, False])
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge(),
+        cross_pair_judge=cross,
+    )
+
+    assert stats.cross_pair_attempted == 4
+    assert stats.cross_pair_ready == 0
+    assert len(cross.calls) == 4
+    assert {
+        call["target_evidence_mode"] for call in cross.calls
+    } == {"sampled_frames"}
+    for target_uid in target_uids:
+        target = storage.read_clip(target_uid)
+        assert target.references.entities[0].status == "rejected"
+        assert not storage.selected_entity_path(target_uid, "e1").exists()

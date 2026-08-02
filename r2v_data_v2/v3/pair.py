@@ -16,6 +16,7 @@ from r2v_data_v2.v3.cross_pair_judge import (
     CrossPairDecisionAttempt,
     CrossPairJudge,
     CrossPairJudgeFailure,
+    CrossPairTargetEvidenceMode,
     QwenCrossPairJudge,
 )
 from r2v_data_v2.v3.frames import validate_sampled_frames
@@ -45,6 +46,9 @@ _SLOT_PRIORITY_INDEX = {
     slot: index for index, slot in enumerate(_SLOT_PRIORITY)
 }
 _ENTITY_PNG = re.compile(r"e[1-9]\d*\.png")
+_CROSS_PAIR_CONTACT_SHEET_COLUMNS = 5
+_CROSS_PAIR_CONTACT_SHEET_PANEL_MAX_SIDE = 384
+_CROSS_PAIR_CONTACT_SHEET_LABEL_HEIGHT = 28
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,64 @@ def build_candidate_context_image(
     restored = np.asarray(result).copy()
     restored[binary] = source[binary]
     return Image.fromarray(restored, mode="RGB")
+
+
+def build_cross_pair_target_contact_sheet(
+    frame_images: list[tuple[int, Image.Image]],
+    *,
+    panel_max_side: int = _CROSS_PAIR_CONTACT_SHEET_PANEL_MAX_SIDE,
+) -> Image.Image:
+    if (
+        isinstance(panel_max_side, bool)
+        or not isinstance(panel_max_side, int)
+        or panel_max_side <= 0
+    ):
+        raise ValueError(
+            "cross-pair contact-sheet panel_max_side must be a positive integer"
+        )
+    slots = [slot for slot, _ in frame_images]
+    if slots != list(range(10)):
+        raise ValueError(
+            "cross-pair target frames must contain ordered slots 0 through 9"
+        )
+    for _, image in frame_images:
+        if not isinstance(image, Image.Image):
+            raise TypeError("cross-pair target frames must be PIL images")
+
+    label_height = _CROSS_PAIR_CONTACT_SHEET_LABEL_HEIGHT
+    panel_height = panel_max_side + label_height
+    sheet = Image.new(
+        "RGB",
+        (
+            panel_max_side * _CROSS_PAIR_CONTACT_SHEET_COLUMNS,
+            panel_height * 2,
+        ),
+        (255, 255, 255),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, (slot, image) in enumerate(frame_images):
+        thumbnail = image.convert("RGB")
+        thumbnail.thumbnail(
+            (panel_max_side, panel_max_side),
+            Image.Resampling.LANCZOS,
+        )
+        column = index % _CROSS_PAIR_CONTACT_SHEET_COLUMNS
+        row = index // _CROSS_PAIR_CONTACT_SHEET_COLUMNS
+        origin_x = column * panel_max_side
+        origin_y = row * panel_height
+        image_x = origin_x + (panel_max_side - thumbnail.width) // 2
+        image_y = (
+            origin_y
+            + label_height
+            + (panel_max_side - thumbnail.height) // 2
+        )
+        sheet.paste(thumbnail, (image_x, image_y))
+        draw.text(
+            (origin_x + 8, origin_y + 6),
+            f"slot {slot}",
+            fill=(0, 0, 0),
+        )
+    return sheet
 
 
 def build_reference_crop(
@@ -477,7 +539,11 @@ def validate_entity_reference_artifact(
         donor_frames,
         donor_masks,
     )
-    target_candidates = build_entity_reference_candidates(
+    # A cross-paired target can be validated from either a masked candidate
+    # or the complete sampled-frame artifact already validated by the caller.
+    # Building candidates still validates masked evidence when it exists;
+    # an empty shortlist is valid for context-only cross-pairing.
+    build_entity_reference_candidates(
         config,
         storage,
         clip_uid=clip_uid,
@@ -485,8 +551,6 @@ def validate_entity_reference_artifact(
         frames=frames,
         masks=masks,
     )
-    if not target_candidates:
-        raise ValueError("cross-pair target lacks its own visual candidate")
     inherited_fields = (
         "reference_scope",
         "visible_region",
@@ -551,6 +615,21 @@ def _load_source_images(
             image.load()
         images[candidate.image_path] = image
     return images
+
+
+def _load_cross_pair_target_frame_images(
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    frames: SampledFramesArtifact,
+) -> list[tuple[int, Image.Image]]:
+    frame_images: list[tuple[int, Image.Image]] = []
+    for frame in frames.frames:
+        with Image.open(storage.frame_path(clip_uid, frame.slot)) as opened:
+            image = opened.convert("RGB")
+            image.load()
+        frame_images.append((frame.slot, image))
+    return frame_images
 
 
 def _write_debug_attempt(
@@ -787,6 +866,9 @@ def _write_cross_pair_debug(
     *,
     target_clip: ClipRecord,
     target_entity: AnnotationEntity,
+    target_evidence_mode: CrossPairTargetEvidenceMode,
+    target_frame_slots: tuple[int, ...],
+    target_context_image: Image.Image,
     donor: _CrossPairDonor,
     attempt: CrossPairDecisionAttempt | None = None,
     failure: CrossPairJudgeFailure | None = None,
@@ -804,6 +886,11 @@ def _write_cross_pair_debug(
     )
     directory = root / "cross_pair" / safe_donor
     directory.mkdir(parents=True, exist_ok=True)
+    if target_evidence_mode == "sampled_frames":
+        target_context_image.save(
+            directory / "target_contact_sheet.png",
+            format="PNG",
+        )
     raw_responses = (
         list(attempt.raw_responses)
         if attempt is not None
@@ -817,6 +904,8 @@ def _write_cross_pair_debug(
     write_json_atomic(
         directory / "decision.json",
         {
+            "target_evidence_mode": target_evidence_mode,
+            "target_frame_slots": list(target_frame_slots),
             "target": {
                 "clip_uid": target_clip.clip_uid,
                 "entity_id": target_entity.entity_id,
@@ -982,29 +1071,54 @@ def _run_same_parent_cross_pair_fallback(
                         frames=target_frames,
                         masks=target_masks,
                     )
-                    if not target_candidates:
-                        continue
-                    target_candidate = target_candidates[0]
-                    target_sources = _load_source_images(
-                        storage,
-                        [target_candidate],
-                    )
-                    target_source = target_sources[target_candidate.image_path]
-                    target_context = build_candidate_context_image(
-                        target_source,
-                        target_candidate.mask,
-                    )
-                    target_crop, _ = build_reference_crop(
-                        target_source,
-                        target_candidate.mask,
-                        crop_padding_ratio=config.pair.crop_padding_ratio,
-                    )
                     donors = _donors_for_target(
                         config,
                         donor_index,
                         target_clip=target_clip,
                         target_entity=target_entity,
                     )
+                    if not donors:
+                        continue
+                    if target_candidates:
+                        target_evidence_mode: CrossPairTargetEvidenceMode = (
+                            "masked_candidate"
+                        )
+                        target_candidate = target_candidates[0]
+                        target_frame_slots = (target_candidate.frame_slot,)
+                        target_sources = _load_source_images(
+                            storage,
+                            [target_candidate],
+                        )
+                        target_source = target_sources[
+                            target_candidate.image_path
+                        ]
+                        target_context = build_candidate_context_image(
+                            target_source,
+                            target_candidate.mask,
+                        )
+                        target_crop, _ = build_reference_crop(
+                            target_source,
+                            target_candidate.mask,
+                            crop_padding_ratio=config.pair.crop_padding_ratio,
+                        )
+                    else:
+                        target_evidence_mode = "sampled_frames"
+                        target_frame_images = (
+                            _load_cross_pair_target_frame_images(
+                                storage,
+                                clip_uid=target_clip.clip_uid,
+                                frames=target_frames,
+                            )
+                        )
+                        target_frame_slots = tuple(
+                            slot for slot, _ in target_frame_images
+                        )
+                        target_context = (
+                            build_cross_pair_target_contact_sheet(
+                                target_frame_images
+                            )
+                        )
+                        target_crop = None
                     for donor in donors:
                         if active_judge is None:
                             judge_config = config.qwen.cross_pair_judge
@@ -1025,6 +1139,7 @@ def _run_same_parent_cross_pair_fallback(
                             attempt = active_judge.decide(
                                 target_clip_uid=target_clip.clip_uid,
                                 target_entity=target_entity,
+                                target_evidence_mode=target_evidence_mode,
                                 target_context_image=target_context,
                                 target_entity_crop=target_crop,
                                 donor_clip_uid=donor.clip.clip_uid,
@@ -1036,6 +1151,9 @@ def _run_same_parent_cross_pair_fallback(
                                 storage,
                                 target_clip=target_clip,
                                 target_entity=target_entity,
+                                target_evidence_mode=target_evidence_mode,
+                                target_frame_slots=target_frame_slots,
+                                target_context_image=target_context,
                                 donor=donor,
                                 failure=exc,
                             )
@@ -1044,6 +1162,9 @@ def _run_same_parent_cross_pair_fallback(
                             storage,
                             target_clip=target_clip,
                             target_entity=target_entity,
+                            target_evidence_mode=target_evidence_mode,
+                            target_frame_slots=target_frame_slots,
+                            target_context_image=target_context,
                             donor=donor,
                             attempt=attempt,
                         )

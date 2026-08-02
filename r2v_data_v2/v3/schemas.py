@@ -370,6 +370,7 @@ class RawEntityReferenceDecision(SchemaModel):
 
 class RawCrossPairDecision(SchemaModel):
     verdict: Literal["accept", "reject"]
+    target_entity_visible: StrictBool
     same_physical_entity: StrictBool
     identity_features_match: StrictBool
     reference_is_usable: StrictBool
@@ -381,6 +382,7 @@ class RawCrossPairDecision(SchemaModel):
             raise ValueError("cross-pair reason must not be empty")
         all_passed = all(
             (
+                self.target_entity_visible,
                 self.same_physical_entity,
                 self.identity_features_match,
                 self.reference_is_usable,
