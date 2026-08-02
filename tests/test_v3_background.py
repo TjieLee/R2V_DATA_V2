@@ -17,6 +17,8 @@ from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.config import (
     BackgroundConfig,
+    QwenServiceConfig,
+    QwenServicesConfig,
     RemoveConfig,
     SourceConfig,
     V3Config,
@@ -76,6 +78,14 @@ def _config(
         run_root=writable / "runs" / run_name,
         export_root=writable / "datasets" / f"{run_name}-dataset",
         source=SourceConfig(limit=10),
+        qwen=QwenServicesConfig(
+            candidate_judge=QwenServiceConfig(
+                model=str(pretrained / "Qwen" / "judge")
+            ),
+            background_remove_judge=QwenServiceConfig(
+                model=str(pretrained / "Qwen" / "judge")
+            ),
+        ),
         background=BackgroundConfig(
             enabled=enabled,
             max_pending_remove_area_ratio=max_ratio,
@@ -693,6 +703,11 @@ def test_config_loader_reads_background_maximum(
         f"export_root: {config.export_root}\n"
         "source:\n"
         "  limit: 10\n"
+        "qwen:\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n"
         "background:\n"
         "  enabled: true\n"
         "  raw_foreground_area_ratio: 0.0\n"
@@ -939,7 +954,12 @@ def test_pipeline_executes_background_stage_without_models(
         f"run_root: {config.run_root}\n"
         f"export_root: {config.export_root}\n"
         "source:\n"
-        "  limit: 10\n",
+        "  limit: 10\n"
+        "qwen:\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n",
         encoding="utf-8",
     )
 

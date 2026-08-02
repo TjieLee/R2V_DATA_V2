@@ -214,6 +214,8 @@ def _config(
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=str(model)),
             instruction_writer=QwenServiceConfig(model=str(model)),
+            candidate_judge=QwenServiceConfig(model=str(model)),
+            background_remove_judge=QwenServiceConfig(model=str(model)),
         ),
         sam3=Sam3Config(
             model_path=(
@@ -1216,6 +1218,11 @@ def test_pipeline_accepts_fake_segment_backend_and_runs_rank(
         f"export_root: {storage.config.export_root}\n"
         "source:\n"
         "  limit: 10\n"
+        "qwen:\n"
+        "  candidate_judge:\n"
+        f"    model: {storage.config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {storage.config.qwen.background_remove_judge.model}\n"
         "sam3:\n"
         f"  model_path: {storage.config.sam3.model_path}\n",
         encoding="utf-8",

@@ -67,6 +67,8 @@ def _config(
         qwen=QwenServicesConfig(
             annotation=QwenAnnotationConfig(model=str(model)),
             instruction_writer=QwenServiceConfig(model=str(model)),
+            candidate_judge=QwenServiceConfig(model=str(model)),
+            background_remove_judge=QwenServiceConfig(model=str(model)),
         ),
         sam3=Sam3Config(
             model_path=user_models / "sam3" / "checkpoint.pt"
@@ -96,7 +98,11 @@ def _config_path(config: V3Config, tmp_path: Path) -> Path:
         "  annotation:\n"
         f"    model: {config.qwen.annotation.model}\n"
         "  instruction_writer:\n"
-        f"    model: {config.qwen.instruction_writer.model}\n",
+        f"    model: {config.qwen.instruction_writer.model}\n"
+        "  candidate_judge:\n"
+        f"    model: {config.qwen.candidate_judge.model}\n"
+        "  background_remove_judge:\n"
+        f"    model: {config.qwen.background_remove_judge.model}\n",
         encoding="utf-8",
     )
     return path
