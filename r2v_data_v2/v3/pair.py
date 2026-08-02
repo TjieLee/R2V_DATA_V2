@@ -664,22 +664,15 @@ def _natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
     )
 
 
-def _eligible_cross_pair_donors(
+def _build_same_parent_donor_index(
     config: V3Config,
     storage: RunStorage,
-    *,
-    target_clip: ClipRecord,
-    target_entity: AnnotationEntity,
-) -> list[_CrossPairDonor]:
-    donors: list[_CrossPairDonor] = []
+) -> dict[tuple[str, str], tuple[_CrossPairDonor, ...]]:
+    donors_by_key: dict[tuple[str, str], list[_CrossPairDonor]] = {}
     for initial_donor in storage.iter_clips():
-        if initial_donor.clip_uid == target_clip.clip_uid:
-            continue
         donor_clip = storage.read_clip(initial_donor.clip_uid)
         if (
-            donor_clip.source.parent_video_id
-            != target_clip.source.parent_video_id
-            or donor_clip.annotation is None
+            donor_clip.annotation is None
             or donor_clip.annotation.status != "ready"
             or donor_clip.pairing is None
             or donor_clip.pairing.status != "ready"
@@ -688,10 +681,21 @@ def _eligible_cross_pair_donors(
         donor_states = {
             state.entity_id: state for state in donor_clip.references.entities
         }
+        eligible_references: list[
+            tuple[AnnotationEntity, EntityReferenceState]
+        ] = []
         for donor_entity in donor_clip.annotation.entities:
-            if donor_entity.reference_type != target_entity.reference_type:
-                continue
             donor_state = donor_states.get(donor_entity.entity_id)
+            is_legacy = (
+                donor_state is not None
+                and donor_state.source_clip_uid is None
+                and donor_state.source_entity_id is None
+            )
+            is_self = (
+                donor_state is not None
+                and donor_state.source_clip_uid == donor_clip.clip_uid
+                and donor_state.source_entity_id == donor_entity.entity_id
+            )
             if (
                 donor_state is None
                 or donor_state.status != "ready"
@@ -699,19 +703,23 @@ def _eligible_cross_pair_donors(
                 or not donor_state.identity_features_visible
                 or donor_entity.entity_id
                 not in donor_clip.pairing.retained_entity_ids
-                or donor_state.source_clip_uid
-                not in {None, donor_clip.clip_uid}
-                or donor_state.source_entity_id
-                not in {None, donor_entity.entity_id}
+                or not (is_legacy or is_self)
             ):
                 continue
+            eligible_references.append((donor_entity, donor_state))
+        if not eligible_references:
+            continue
+        try:
+            donor_frames = validate_sampled_frames(
+                storage,
+                donor_clip.clip_uid,
+            )
+            donor_masks = storage.read_masks(donor_clip.clip_uid)
+            _validate_pair_inputs(donor_clip, donor_frames, donor_masks)
+        except Exception:  # noqa: BLE001, S112 - skip invalid donor clip
+            continue
+        for donor_entity, donor_state in eligible_references:
             try:
-                donor_frames = validate_sampled_frames(
-                    storage,
-                    donor_clip.clip_uid,
-                )
-                donor_masks = storage.read_masks(donor_clip.clip_uid)
-                _validate_pair_inputs(donor_clip, donor_frames, donor_masks)
                 validate_entity_reference_artifact(
                     config,
                     storage,
@@ -723,7 +731,11 @@ def _eligible_cross_pair_donors(
                 )
             except Exception:  # noqa: BLE001, S112 - skip invalid donors
                 continue
-            donors.append(
+            key = (
+                donor_clip.source.parent_video_id,
+                donor_entity.reference_type,
+            )
+            donors_by_key.setdefault(key, []).append(
                 _CrossPairDonor(
                     clip=donor_clip,
                     entity=donor_entity,
@@ -734,14 +746,40 @@ def _eligible_cross_pair_donors(
                     ),
                 )
             )
-    donors.sort(
-        key=lambda donor: (
-            _natural_sort_key(donor.clip.source.clip_suffix),
-            donor.clip.clip_uid,
-            donor.entity.entity_id,
+    return {
+        key: tuple(
+            sorted(
+                donors,
+                key=lambda donor: (
+                    _natural_sort_key(donor.clip.source.clip_suffix),
+                    donor.clip.clip_uid,
+                    donor.entity.entity_id,
+                ),
+            )
         )
+        for key, donors in donors_by_key.items()
+    }
+
+
+def _donors_for_target(
+    config: V3Config,
+    donor_index: dict[tuple[str, str], tuple[_CrossPairDonor, ...]],
+    *,
+    target_clip: ClipRecord,
+    target_entity: AnnotationEntity,
+) -> tuple[_CrossPairDonor, ...]:
+    key = (
+        target_clip.source.parent_video_id,
+        target_entity.reference_type,
     )
-    return donors[: config.pair.same_parent_max_donor_references]
+    selected: list[_CrossPairDonor] = []
+    for donor in donor_index.get(key, ()):
+        if donor.clip.clip_uid == target_clip.clip_uid:
+            continue
+        selected.append(donor)
+        if len(selected) == config.pair.same_parent_max_donor_references:
+            break
+    return tuple(selected)
 
 
 def _write_cross_pair_debug(
@@ -901,15 +939,17 @@ def _run_same_parent_cross_pair_fallback(
     counters: dict[str, int],
     judge: CrossPairJudge | None,
 ) -> None:
-    if not config.pair.same_parent_fallback_enabled:
+    if (
+        not config.pair.same_parent_fallback_enabled
+        or not target_clip_uids
+    ):
         return
+    donor_index = _build_same_parent_donor_index(config, storage)
     active_judge = judge
     owned_judge: QwenCrossPairJudge | None = None
     try:
-        for initial_target in storage.iter_clips():
-            if initial_target.clip_uid not in target_clip_uids:
-                continue
-            target_clip = storage.read_clip(initial_target.clip_uid)
+        for target_clip_uid in sorted(target_clip_uids):
+            target_clip = storage.read_clip(target_clip_uid)
             temporary_donors: dict[str, Path] = {}
             try:
                 if (
@@ -959,9 +999,9 @@ def _run_same_parent_cross_pair_fallback(
                         target_candidate.mask,
                         crop_padding_ratio=config.pair.crop_padding_ratio,
                     )
-                    donors = _eligible_cross_pair_donors(
+                    donors = _donors_for_target(
                         config,
-                        storage,
+                        donor_index,
                         target_clip=target_clip,
                         target_entity=target_entity,
                     )
@@ -1070,6 +1110,12 @@ def _run_same_parent_cross_pair_fallback(
                 if previous_status != pairing.status:
                     counters[previous_status] -= 1
                     counters[pairing.status] += 1
+                    if (
+                        previous_status == "rejected"
+                        and pairing.status == "ready"
+                        and pairing.background_token is not None
+                    ):
+                        counters["backgrounds_bound"] += 1
             except Exception as exc:  # noqa: BLE001 - isolate target clips
                 storage.cleanup_pair_artifacts(target_clip.clip_uid)
                 storage.append_failure(

@@ -1067,6 +1067,7 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
     assert stats.cross_pair_attempted == 1
     assert stats.cross_pair_ready == 1
     assert stats.cross_pair_repaired == 1
+    assert stats.backgrounds_bound == 1
     assert cross.calls[0] == {
         "target_clip_uid": "target",
         "target_entity_id": "e1",
@@ -1478,3 +1479,228 @@ def test_cross_pair_debug_is_json_only_and_disabled_by_default(
         cross_pair_judge=_CrossJudge(),
     )
     assert not (disabled_storage.clip_dir("target") / "debug").exists()
+
+
+def test_donor_index_scans_once_and_validates_each_artifact_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-index-test")
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix="1",
+        entity_types=("subject", "object"),
+    )
+    for target_uid, suffix in (("target-a", "2"), ("target-b", "3")):
+        _add_ready_clip(
+            config,
+            storage,
+            clip_uid=target_uid,
+            clip_suffix=suffix,
+            entity_types=("subject", "object"),
+        )
+
+    iter_calls = 0
+    original_iter_clips = storage.iter_clips
+
+    def counted_iter_clips():
+        nonlocal iter_calls
+        iter_calls += 1
+        yield from original_iter_clips()
+
+    index_builds = 0
+    original_build_index = pair_module._build_same_parent_donor_index
+
+    def counted_build_index(config, storage):
+        nonlocal index_builds
+        index_builds += 1
+        return original_build_index(config, storage)
+
+    validation_calls: dict[tuple[str, str], int] = {}
+    original_validate = pair_module.validate_entity_reference_artifact
+
+    def counted_validate(
+        config,
+        storage,
+        clip_uid,
+        annotation_entity,
+        reference_state,
+        frames,
+        masks,
+    ):
+        key = (clip_uid, annotation_entity.entity_id)
+        validation_calls[key] = validation_calls.get(key, 0) + 1
+        return original_validate(
+            config,
+            storage,
+            clip_uid,
+            annotation_entity,
+            reference_state,
+            frames,
+            masks,
+        )
+
+    monkeypatch.setattr(storage, "iter_clips", counted_iter_clips)
+    monkeypatch.setattr(
+        pair_module,
+        "_build_same_parent_donor_index",
+        counted_build_index,
+    )
+    monkeypatch.setattr(
+        pair_module,
+        "validate_entity_reference_artifact",
+        counted_validate,
+    )
+    phase_a = _ClipJudge(
+        {
+            (target_uid, entity_id): "reject"
+            for target_uid in ("target-a", "target-b")
+            for entity_id in ("e1", "e2")
+        }
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=phase_a,
+        cross_pair_judge=_CrossJudge([True, True, True, True]),
+    )
+
+    assert iter_calls == 2  # Phase A once, donor index once.
+    assert index_builds == 1
+    assert validation_calls == {("donor", "e1"): 1, ("donor", "e2"): 1}
+    assert stats.cross_pair_ready == 4
+
+
+def test_target_self_is_excluded_before_donor_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(
+            same_parent_fallback_enabled=True,
+            same_parent_max_donor_references=1,
+        ),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-self-limit-test")
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="1",
+        entity_types=("subject", "subject"),
+    )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix="2",
+        entity_types=("subject",),
+    )
+    cross = _CrossJudge()
+
+    pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e2"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert [call["donor_clip_uid"] for call in cross.calls] == ["donor"]
+    target_reference = storage.read_clip("target").references.entities[1]
+    assert target_reference.source_clip_uid == "donor"
+
+
+def test_disabled_fallback_never_builds_donor_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _same_parent_storage(config)
+
+    def unexpected_index_build(config, storage):
+        del config, storage
+        raise AssertionError("disabled fallback must not build a donor index")
+
+    monkeypatch.setattr(
+        pair_module,
+        "_build_same_parent_donor_index",
+        unexpected_index_build,
+    )
+    cross = _CrossJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "reject"}),
+        cross_pair_judge=cross,
+    )
+
+    assert stats.cross_pair_attempted == 0
+    assert cross.calls == []
+
+
+def test_cross_pair_does_not_double_count_existing_background_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="cross-background-count-test")
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="donor",
+        clip_suffix="1",
+        entity_types=("subject",),
+    )
+    _add_ready_clip(
+        config,
+        storage,
+        clip_uid="target",
+        clip_suffix="2",
+        entity_types=("subject", "subject"),
+    )
+    background = BackgroundReferenceState(
+        status="clean_raw",
+        source_image_path="clips/target/frames/00.jpg",
+        output_image_path="clips/target/frames/00.jpg",
+        source_frame_slot=0,
+        source_frame_index=0,
+        source_foreground_area_pixels=0,
+        source_foreground_area_ratio=0.0,
+    )
+    storage.write_references(
+        "target",
+        ReferencesState(background=background),
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e2"): "reject"}),
+        cross_pair_judge=_CrossJudge(),
+    )
+
+    target = storage.read_clip("target")
+    assert target.pairing is not None
+    assert target.pairing.status == "ready"
+    assert target.pairing.background_token == "<ref_bg_1>"
+    assert target.references.entities[1].source_clip_uid == "donor"
+    assert stats.cross_pair_ready == 1
+    assert stats.backgrounds_bound == 1
