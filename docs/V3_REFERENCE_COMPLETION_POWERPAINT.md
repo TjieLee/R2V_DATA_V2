@@ -58,18 +58,21 @@ run. Every optional value is still represented explicitly:
   "entity_phrase": "a person in a red coat",
   "source_rgba_path": "/mnt/workspace/litengjie/data/inputs/entity.png",
   "context_rgb_path": null,
+  "completion_mask_path": null,
   "completion_sides": ["bottom"],
   "completion_start_ratio": 0.45
 }
 ```
 
+`completion_mask_path` must be present and may be `null`. When non-null, it must
+be an absolute PNG path under `/mnt/workspace/litengjie/data/`.
 `completion_sides` is non-empty, unique, and normalized to the stable order
 `top`, `bottom`, `left`, `right`. `completion_start_ratio` is within `[0, 1]`.
 The source must be an RGBA PNG with non-empty binary alpha. An optional context
-must be a same-size RGB PNG or JPEG. Manifest, source, and context paths must
-resolve under `/mnt/workspace/litengjie/data/`.
+must be a same-size RGB PNG or JPEG. Manifest, source, context, and explicit
+mask paths must resolve under `/mnt/workspace/litengjie/data/`.
 
-## Canvas And Directional Mask
+## Canvas And Completion Mask Modes
 
 The source is placed without resizing on a deterministic canvas. Only requested
 sides are extended by `canvas_expand_ratio`; left and top extension determine
@@ -77,13 +80,27 @@ the recorded source offset. The optional context fills transparent pixels in the
 original source rectangle. Without context, those pixels and all new canvas
 areas are white.
 
-For each requested side, the completion zone starts at
+When `completion_mask_path` is `null`, the benchmark uses directional mode. For
+each requested side, the completion zone starts at
 `completion_start_ratio` along the visible alpha bounding box and continues to
 that canvas edge. Its perpendicular span includes deterministic lateral
 padding. Multiple directional zones are unioned. Visible alpha pixels are then
 forced to mask value zero.
 
-The final L-mode mask must be binary, non-empty, smaller than the full canvas,
+When `completion_mask_path` is non-null, the same directional settings still
+determine canvas expansion and source offset, but the supplied mask completely
+replaces the generated directional mask. `completion_start_ratio` remains in
+the manifest and result for compatibility but does not affect explicit-mask
+pixels. Different manifest records may use different explicit masks; there is no
+global CLI mask option.
+
+An explicit mask must be an L-mode PNG whose dimensions exactly match the final
+expanded canvas. It is never resized, thresholded, or antialiased. Its only
+allowed values are 0 and 255. It must be non-empty, smaller than the full
+canvas, disjoint from visible source pixels, adjacent to their one-pixel
+dilation, and different from the complete transparent region.
+
+Every final L-mode mask must be binary, non-empty, smaller than the full canvas,
 adjacent to a one-pixel dilation of the visible entity, and different from the
 set of all transparent pixels. `255` permits generation and `0` preserves the
 baseline. No SAM3 or free-form mask UI is used.
@@ -119,6 +136,9 @@ The source file itself remains byte-identical. A candidate must also be RGB,
 have the expanded canvas dimensions, change pixels inside the completion mask,
 contain non-constant completion content, contain valid pixels, and preserve mask
 connectivity and bounds. Any hard-gate failure skips the Qwen judge.
+For explicit mode, the published `completion_mask.png` is also checked for
+pixel equality with the input, and the input mask SHA-256 must remain unchanged
+through the run.
 
 ## Structured Review And Selection
 
@@ -153,6 +173,9 @@ The benchmark root must be a new directory strictly below
 `/mnt/workspace/litengjie/data/reference_completion_benchmarks/`. Existing roots
 fail closed. Each sample is assembled in a temporary sibling directory and
 published with one rename; exceptions remove the temporary directory.
+All source, context, and explicit mask files are validated before the benchmark
+root is created. One invalid explicit mask therefore aborts the whole manifest
+without running PowerPaint or Qwen and without leaving output directories.
 
 ```text
 <benchmark_root>/<sample_id>/
@@ -176,3 +199,6 @@ published with one rename; exceptions remove the temporary directory.
 The expanded RGB candidate is an experiment artifact, not a replacement for the
 source RGBA reference. No output is written to `r2v_v3_runs`,
 `r2v_v3_datasets`, `selected/`, or the public dataset tree.
+`result.json` records `completion_mask_mode` as `directional` or `explicit`.
+Explicit mode also records the resolved mask source path and SHA-256;
+directional mode records `null` for both fields.

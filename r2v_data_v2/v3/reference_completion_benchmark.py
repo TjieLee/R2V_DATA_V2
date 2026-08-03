@@ -89,6 +89,7 @@ class CompletionManifestRecord(BaseModel):
     entity_phrase: str = Field(min_length=1)
     source_rgba_path: Path
     context_rgb_path: Optional[Path]
+    completion_mask_path: Optional[Path]
     completion_sides: tuple[CompletionSide, ...]
     completion_start_ratio: float
 
@@ -288,6 +289,24 @@ class CompletionCanvas:
 
 
 @dataclass(frozen=True)
+class _CompletionCanvasBase:
+    baseline_rgb: Image.Image
+    visible_mask: Image.Image
+    visible_bbox: tuple[int, int, int, int]
+    source_offset_xy: tuple[int, int]
+    source_size: tuple[int, int]
+    canvas_size: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _CompletionPreflight:
+    source_path: Path
+    context_path: Path | None
+    completion_mask_path: Path | None
+    completion_mask_source_sha256: str | None
+
+
+@dataclass(frozen=True)
 class ModelSpaceTransform:
     canvas_size: tuple[int, int]
     model_size: tuple[int, int]
@@ -455,14 +474,13 @@ def _dilate_one_pixel(mask: np.ndarray) -> np.ndarray:
     return result
 
 
-def build_completion_canvas(
+def _build_completion_canvas_base(
     *,
     source_rgba: Image.Image,
     context_rgb: Image.Image | None,
     completion_sides: tuple[CompletionSide, ...],
-    completion_start_ratio: float,
     config: PowerPaintV21CompletionConfig,
-) -> CompletionCanvas:
+) -> _CompletionCanvasBase:
     if source_rgba.mode != "RGBA":
         raise ValueError("completion source must be RGBA")
     if not completion_sides:
@@ -498,12 +516,60 @@ def build_completion_canvas(
     visible = np.zeros((canvas_height, canvas_width), dtype=bool)
     visible[source_rectangle] = source_visible
     x1, y1, x2, y2 = _visible_bbox(source_visible)
-    bbox_width = x2 - x1
-    bbox_height = y2 - y1
     x1 += offset_x
     x2 += offset_x
     y1 += offset_y
     y2 += offset_y
+
+    return _CompletionCanvasBase(
+        baseline_rgb=Image.fromarray(baseline),
+        visible_mask=Image.fromarray(visible.astype(np.uint8) * 255),
+        visible_bbox=(x1, y1, x2, y2),
+        source_offset_xy=(offset_x, offset_y),
+        source_size=source_rgba.size,
+        canvas_size=(canvas_width, canvas_height),
+    )
+
+
+def _validate_completion_mask(
+    mask_image: Image.Image,
+    *,
+    canvas_base: _CompletionCanvasBase,
+) -> np.ndarray:
+    if mask_image.mode != "L":
+        raise ValueError("completion mask must use PIL mode L")
+    if mask_image.size != canvas_base.canvas_size:
+        raise ValueError("completion mask dimensions must match completion canvas")
+    mask_values = np.asarray(mask_image, dtype=np.uint8)
+    if not {int(value) for value in np.unique(mask_values)}.issubset({0, 255}):
+        raise ValueError("completion mask must contain only 0 and 255")
+    mask = mask_values == 255
+    visible = np.asarray(canvas_base.visible_mask, dtype=np.uint8) == 255
+    if not mask.any():
+        raise ValueError("completion mask is empty")
+    if mask.all():
+        raise ValueError("completion mask covers the full canvas")
+    if np.logical_and(mask, visible).any():
+        raise ValueError("completion mask overlaps visible entity pixels")
+    if not np.logical_and(mask, _dilate_one_pixel(visible) & ~visible).any():
+        raise ValueError("completion mask is disconnected from visible entity")
+    if np.array_equal(mask, ~visible):
+        raise ValueError("completion mask cannot cover all transparent pixels")
+    return mask
+
+
+def _build_directional_completion_mask(
+    *,
+    canvas_base: _CompletionCanvasBase,
+    completion_sides: tuple[CompletionSide, ...],
+    completion_start_ratio: float,
+    config: PowerPaintV21CompletionConfig,
+) -> Image.Image:
+    visible = np.asarray(canvas_base.visible_mask, dtype=np.uint8) == 255
+    x1, y1, x2, y2 = canvas_base.visible_bbox
+    bbox_width = x2 - x1
+    bbox_height = y2 - y1
+    canvas_width, canvas_height = canvas_base.canvas_size
     lateral_x = round(bbox_width * config.lateral_padding_ratio)
     lateral_y = round(bbox_height * config.lateral_padding_ratio)
     overlap = config.mask_overlap_pixels
@@ -535,24 +601,77 @@ def build_completion_canvas(
         ] = True
 
     mask[visible] = False
-    if not mask.any():
-        raise ValueError("completion mask is empty")
-    if mask.all():
-        raise ValueError("completion mask covers the full canvas")
-    if not np.logical_and(mask, _dilate_one_pixel(visible) & ~visible).any():
-        raise ValueError("completion mask is disconnected from visible entity")
-    all_transparent = ~visible
-    if np.array_equal(mask, all_transparent):
-        raise ValueError("completion mask cannot cover all transparent pixels")
+    mask_image = Image.fromarray(mask.astype(np.uint8) * 255)
+    _validate_completion_mask(mask_image, canvas_base=canvas_base)
+    return mask_image
+
+
+def _load_explicit_completion_mask(
+    path: Path,
+    *,
+    canvas_base: _CompletionCanvasBase,
+) -> tuple[Image.Image, str]:
+    if path.suffix.casefold() != ".png":
+        raise ValueError("explicit completion mask must use a .png path")
+    mask_bytes = path.read_bytes()
+    with Image.open(io.BytesIO(mask_bytes)) as opened:
+        opened.load()
+        if opened.format != "PNG":
+            raise ValueError("explicit completion mask must be a PNG")
+        if opened.mode != "L":
+            raise ValueError("explicit completion mask must use PIL mode L")
+        mask_image = opened.copy()
+    _validate_completion_mask(mask_image, canvas_base=canvas_base)
+    return mask_image, _sha256_bytes(mask_bytes)
+
+
+def _finish_completion_canvas(
+    *,
+    canvas_base: _CompletionCanvasBase,
+    completion_mask: Image.Image,
+) -> CompletionCanvas:
+    mask = _validate_completion_mask(
+        completion_mask,
+        canvas_base=canvas_base,
+    )
 
     return CompletionCanvas(
-        baseline_rgb=Image.fromarray(baseline),
-        visible_mask=Image.fromarray(visible.astype(np.uint8) * 255),
-        completion_mask=Image.fromarray(mask.astype(np.uint8) * 255),
-        source_offset_xy=(offset_x, offset_y),
-        source_size=source_rgba.size,
-        canvas_size=(canvas_width, canvas_height),
+        baseline_rgb=canvas_base.baseline_rgb,
+        visible_mask=canvas_base.visible_mask,
+        completion_mask=completion_mask.copy(),
+        source_offset_xy=canvas_base.source_offset_xy,
+        source_size=canvas_base.source_size,
+        canvas_size=canvas_base.canvas_size,
         completion_mask_area_ratio=float(mask.mean()),
+    )
+
+
+def build_completion_canvas(
+    *,
+    source_rgba: Image.Image,
+    context_rgb: Image.Image | None,
+    completion_sides: tuple[CompletionSide, ...],
+    completion_start_ratio: float,
+    config: PowerPaintV21CompletionConfig,
+    explicit_completion_mask: Image.Image | None = None,
+) -> CompletionCanvas:
+    canvas_base = _build_completion_canvas_base(
+        source_rgba=source_rgba,
+        context_rgb=context_rgb,
+        completion_sides=completion_sides,
+        config=config,
+    )
+    completion_mask = explicit_completion_mask
+    if completion_mask is None:
+        completion_mask = _build_directional_completion_mask(
+            canvas_base=canvas_base,
+            completion_sides=completion_sides,
+            completion_start_ratio=completion_start_ratio,
+            config=config,
+        )
+    return _finish_completion_canvas(
+        canvas_base=canvas_base,
+        completion_mask=completion_mask,
     )
 
 
@@ -883,8 +1002,7 @@ class PowerPaintV21ReferenceCompletionBackend:
             keys = getattr(incompatible_keys, field_name)
             if not isinstance(keys, (list, tuple)):
                 raise TypeError(
-                    "PowerPaint text encoder incompatible keys must be lists "
-                    "or tuples"
+                    "PowerPaint text encoder incompatible keys must be lists or tuples"
                 )
         pipeline.scheduler = UniPCMultistepScheduler.from_config(
             pipeline.scheduler.config
@@ -1372,34 +1490,97 @@ def load_completion_manifest(path: Path) -> list[CompletionManifestRecord]:
     return records
 
 
+def _build_record_canvas(
+    record: CompletionManifestRecord,
+    *,
+    source_rgba: Image.Image,
+    context_rgb: Image.Image | None,
+    completion_mask_path: Path | None,
+    config: PowerPaintV21CompletionConfig,
+) -> tuple[CompletionCanvas, str | None]:
+    canvas_base = _build_completion_canvas_base(
+        source_rgba=source_rgba,
+        context_rgb=context_rgb,
+        completion_sides=record.completion_sides,
+        config=config,
+    )
+    completion_mask_sha256: str | None = None
+    if completion_mask_path is None:
+        completion_mask = _build_directional_completion_mask(
+            canvas_base=canvas_base,
+            completion_sides=record.completion_sides,
+            completion_start_ratio=record.completion_start_ratio,
+            config=config,
+        )
+    else:
+        completion_mask, completion_mask_sha256 = _load_explicit_completion_mask(
+            completion_mask_path,
+            canvas_base=canvas_base,
+        )
+    return (
+        _finish_completion_canvas(
+            canvas_base=canvas_base,
+            completion_mask=completion_mask,
+        ),
+        completion_mask_sha256,
+    )
+
+
 def _preflight_record(
     record: CompletionManifestRecord,
-) -> tuple[Path, Path | None]:
+    *,
+    config: PowerPaintV21CompletionConfig,
+) -> _CompletionPreflight:
     source_path = _resolve_input_path(
         record.source_rgba_path,
         field_name="source_rgba_path",
     )
     source, _, _ = _load_source_rgba(source_path)
     context_path: Path | None = None
+    context_rgb: Image.Image | None = None
     if record.context_rgb_path is not None:
         context_path = _resolve_input_path(
             record.context_rgb_path,
             field_name="context_rgb_path",
         )
-        _load_context_rgb(context_path, expected_size=source.size)
-    return source_path, context_path
+        context_rgb, _, _ = _load_context_rgb(
+            context_path,
+            expected_size=source.size,
+        )
+    completion_mask_path: Path | None = None
+    if record.completion_mask_path is not None:
+        completion_mask_path = _resolve_input_path(
+            record.completion_mask_path,
+            field_name="completion_mask_path",
+        )
+    _, completion_mask_sha256 = _build_record_canvas(
+        record,
+        source_rgba=source,
+        context_rgb=context_rgb,
+        completion_mask_path=completion_mask_path,
+        config=config,
+    )
+    return _CompletionPreflight(
+        source_path=source_path,
+        context_path=context_path,
+        completion_mask_path=completion_mask_path,
+        completion_mask_source_sha256=completion_mask_sha256,
+    )
 
 
 def _process_record(
     record: CompletionManifestRecord,
     *,
+    preflight: _CompletionPreflight,
     benchmark_root: Path,
     config: PowerPaintV21CompletionConfig,
     backend: ReferenceCompletionBackend,
     judge: ReferenceCompletionJudge,
     candidate_order: tuple[tuple[CompletionStrategy, int], ...],
 ) -> dict[str, object]:
-    source_path, context_path = _preflight_record(record)
+    source_path = preflight.source_path
+    context_path = preflight.context_path
+    completion_mask_path = preflight.completion_mask_path
     source_rgba, source_bytes, source_sha256 = _load_source_rgba(source_path)
     context_rgb: Image.Image | None = None
     context_sha256: str | None = None
@@ -1408,13 +1589,15 @@ def _process_record(
             context_path,
             expected_size=source_rgba.size,
         )
-    canvas = build_completion_canvas(
+    canvas, completion_mask_sha256 = _build_record_canvas(
+        record,
         source_rgba=source_rgba,
         context_rgb=context_rgb,
-        completion_sides=record.completion_sides,
-        completion_start_ratio=record.completion_start_ratio,
+        completion_mask_path=completion_mask_path,
         config=config,
     )
+    if completion_mask_sha256 != preflight.completion_mask_source_sha256:
+        raise RuntimeError("explicit completion mask changed after preflight")
     transform = build_model_space_transform(
         canvas.canvas_size,
         model_min_side=config.model_min_side,
@@ -1433,6 +1616,16 @@ def _process_record(
         _save_png(temporary / "baseline_canvas.png", canvas.baseline_rgb)
         _save_png(temporary / "visible_mask.png", canvas.visible_mask)
         _save_png(temporary / "completion_mask.png", canvas.completion_mask)
+        if completion_mask_path is not None:
+            with Image.open(temporary / "completion_mask.png") as published_mask:
+                published_mask.load()
+                if not np.array_equal(
+                    np.asarray(published_mask, dtype=np.uint8),
+                    np.asarray(canvas.completion_mask, dtype=np.uint8),
+                ):
+                    raise RuntimeError(
+                        "published completion mask differs from explicit source"
+                    )
         prompt = build_completion_prompt(
             entity_phrase=record.entity_phrase,
             reference_type=record.reference_type,
@@ -1538,6 +1731,13 @@ def _process_record(
             context_sha256 is None or _sha256_path(context_path) != context_sha256
         ):
             raise RuntimeError("context image changed during completion benchmark")
+        if completion_mask_path is not None and (
+            completion_mask_sha256 is None
+            or _sha256_path(completion_mask_path) != completion_mask_sha256
+        ):
+            raise RuntimeError(
+                "explicit completion mask changed during completion benchmark"
+            )
         status = "accepted" if accepted is not None else "rejected"
         result: dict[str, object] = {
             "sample_id": record.sample_id,
@@ -1554,6 +1754,13 @@ def _process_record(
             "source_offset_xy": list(canvas.source_offset_xy),
             "completion_sides": list(record.completion_sides),
             "completion_start_ratio": record.completion_start_ratio,
+            "completion_mask_mode": (
+                "explicit" if completion_mask_path is not None else "directional"
+            ),
+            "completion_mask_source_path": (
+                str(completion_mask_path) if completion_mask_path is not None else None
+            ),
+            "completion_mask_source_sha256": completion_mask_sha256,
             "completion_mask_area_ratio": canvas.completion_mask_area_ratio,
             "model_space_transform": transform.to_dict(),
             "status": status,
@@ -1588,13 +1795,13 @@ def run_reference_completion_benchmark(
     resolved_root = _resolve_benchmark_root(benchmark_root)
     records = load_completion_manifest(manifest_path)
     candidate_order = _validated_candidate_order(strategies, seeds)
-    for record in records:
-        _preflight_record(record)
+    preflights = [_preflight_record(record, config=config) for record in records]
     resolved_root.mkdir(parents=True, exist_ok=False)
     accepted = rejected = 0
-    for record in records:
+    for record, preflight in zip(records, preflights):
         result = _process_record(
             record,
+            preflight=preflight,
             benchmark_root=resolved_root,
             config=config,
             backend=backend,

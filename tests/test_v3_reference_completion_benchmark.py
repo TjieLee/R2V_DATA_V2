@@ -72,11 +72,32 @@ def _write_source(
     image.save(path, format="PNG")
 
 
+def _valid_explicit_mask() -> np.ndarray:
+    mask = np.zeros((15, 12), dtype=np.uint8)
+    mask[7:15, 4:8] = 255
+    return mask
+
+
+def _write_completion_mask(
+    path: Path,
+    *,
+    pixels: np.ndarray | None = None,
+    mode: str = "L",
+    image_format: str = "PNG",
+) -> None:
+    mask = _valid_explicit_mask() if pixels is None else pixels
+    image = Image.fromarray(mask)
+    if mode != "L":
+        image = image.convert(mode)
+    image.save(path, format=image_format)
+
+
 def _write_manifest(
     path: Path,
     source: Path,
     *,
     context: Path | None = None,
+    completion_mask: Path | None = None,
     completion_sides: list[str] | None = None,
     completion_start_ratio: float = 0.5,
     sample_id: str = "sample-1",
@@ -89,6 +110,9 @@ def _write_manifest(
         "entity_phrase": "a person in a red coat",
         "source_rgba_path": str(source),
         "context_rgb_path": str(context) if context is not None else None,
+        "completion_mask_path": (
+            str(completion_mask) if completion_mask is not None else None
+        ),
         "completion_sides": completion_sides or ["bottom"],
         "completion_start_ratio": completion_start_ratio,
     }
@@ -249,6 +273,17 @@ def test_manifest_requires_explicit_completion_sides(environment: _Environment) 
         load_completion_manifest(environment.manifest)
 
 
+def test_manifest_requires_explicit_completion_mask_path_field(
+    environment: _Environment,
+) -> None:
+    payload = json.loads(environment.manifest.read_text())
+    del payload["completion_mask_path"]
+    environment.manifest.write_text(json.dumps(payload) + "\n")
+
+    with pytest.raises(ValueError, match="completion_mask_path"):
+        load_completion_manifest(environment.manifest)
+
+
 @pytest.mark.parametrize("sides", [[], ["bottom", "bottom"]])
 def test_manifest_rejects_empty_or_duplicate_sides(
     environment: _Environment,
@@ -274,6 +309,7 @@ def test_manifest_sides_have_stable_canonical_order() -> None:
             "entity_phrase": "a device",
             "source_rgba_path": "/tmp/source.png",
             "context_rgb_path": None,
+            "completion_mask_path": None,
             "completion_sides": ["right", "top", "left"],
             "completion_start_ratio": 0.5,
         }
@@ -294,6 +330,7 @@ def test_manifest_rejects_invalid_start_ratio(value: float) -> None:
                 "entity_phrase": "a device",
                 "source_rgba_path": "/tmp/source.png",
                 "context_rgb_path": None,
+                "completion_mask_path": None,
                 "completion_sides": ["bottom"],
                 "completion_start_ratio": value,
             }
@@ -446,6 +483,52 @@ def test_completion_mask_is_binary_bounded_adjacent_and_excludes_visible(
     ).any()
 
 
+def test_directional_mask_pixels_remain_unchanged(tmp_path: Path) -> None:
+    canvas = build_completion_canvas(
+        source_rgba=_source_image(),
+        context_rgb=None,
+        completion_sides=("bottom",),
+        completion_start_ratio=0.5,
+        config=_config(tmp_path),
+    )
+    expected = np.zeros((15, 12), dtype=np.uint8)
+    expected[4:15, 2:10] = 255
+    expected[4:7, 3:9] = 0
+
+    assert np.array_equal(np.asarray(canvas.completion_mask), expected)
+
+
+def test_explicit_mask_ignores_start_ratio_without_resize(tmp_path: Path) -> None:
+    explicit = Image.fromarray(_valid_explicit_mask())
+    low_ratio = build_completion_canvas(
+        source_rgba=_source_image(),
+        context_rgb=None,
+        completion_sides=("bottom",),
+        completion_start_ratio=0.0,
+        config=_config(tmp_path),
+        explicit_completion_mask=explicit,
+    )
+    high_ratio = build_completion_canvas(
+        source_rgba=_source_image(),
+        context_rgb=None,
+        completion_sides=("bottom",),
+        completion_start_ratio=1.0,
+        config=_config(tmp_path),
+        explicit_completion_mask=explicit,
+    )
+
+    assert low_ratio.canvas_size == (12, 15)
+    assert low_ratio.completion_mask.size == explicit.size
+    assert np.array_equal(
+        np.asarray(low_ratio.completion_mask),
+        np.asarray(high_ratio.completion_mask),
+    )
+    assert np.array_equal(
+        np.asarray(low_ratio.completion_mask),
+        np.asarray(explicit),
+    )
+
+
 def test_completion_mask_cannot_equal_all_transparent_pixels(tmp_path: Path) -> None:
     source = Image.new("RGBA", (4, 4), (20, 30, 40, 255))
     with pytest.raises(ValueError, match="all transparent"):
@@ -460,6 +543,218 @@ def test_completion_mask_cannot_equal_all_transparent_pixels(tmp_path: Path) -> 
                 lateral_padding_ratio=1.0,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("rgb", "mode L"),
+        ("nonbinary", "only 0 and 255"),
+        ("wrong_size", "dimensions"),
+        ("empty", "empty"),
+        ("full", "full canvas"),
+        ("visible_overlap", "overlaps visible"),
+        ("disconnected", "disconnected"),
+        ("all_transparent", "all transparent"),
+        ("jpeg_path", r"\.png path"),
+    ],
+)
+def test_invalid_explicit_mask_fails_preflight_without_model_calls(
+    environment: _Environment,
+    case: str,
+    error: str,
+) -> None:
+    mask_path = environment.source.parent / "completion-mask.png"
+    pixels = _valid_explicit_mask()
+    mode = "L"
+    image_format = "PNG"
+    if case == "rgb":
+        mode = "RGB"
+    elif case == "nonbinary":
+        pixels[pixels == 255] = 128
+    elif case == "wrong_size":
+        pixels = np.zeros((14, 12), dtype=np.uint8)
+        pixels[7:14, 4:8] = 255
+    elif case == "empty":
+        pixels = np.zeros((15, 12), dtype=np.uint8)
+    elif case == "full":
+        pixels = np.full((15, 12), 255, dtype=np.uint8)
+    elif case == "visible_overlap":
+        pixels = np.zeros((15, 12), dtype=np.uint8)
+        pixels[6:9, 4:8] = 255
+    elif case == "disconnected":
+        pixels = np.zeros((15, 12), dtype=np.uint8)
+        pixels[14, 0] = 255
+    elif case == "all_transparent":
+        pixels = np.full((15, 12), 255, dtype=np.uint8)
+        pixels[2:7, 3:9] = 0
+    elif case == "jpeg_path":
+        mask_path = mask_path.with_suffix(".jpg")
+        image_format = "JPEG"
+    _write_completion_mask(
+        mask_path,
+        pixels=pixels,
+        mode=mode,
+        image_format=image_format,
+    )
+    _write_manifest(
+        environment.manifest,
+        environment.source,
+        completion_mask=mask_path,
+    )
+    backend = _Backend()
+    judge = _Judge([_accept()])
+
+    with pytest.raises(ValueError, match=error):
+        _run(
+            environment,
+            backend=backend,
+            judge=judge,
+            strategies=("text_guided",),
+            seeds=(0,),
+        )
+
+    assert not environment.output_root.exists()
+    assert backend.calls == []
+    assert judge.calls == []
+
+
+def test_explicit_mask_path_escape_fails_before_output_creation(
+    environment: _Environment,
+    tmp_path: Path,
+) -> None:
+    escaped_mask = tmp_path / "escaped-mask.png"
+    _write_completion_mask(escaped_mask)
+    _write_manifest(
+        environment.manifest,
+        environment.source,
+        completion_mask=escaped_mask,
+    )
+    backend = _Backend()
+    judge = _Judge([_accept()])
+
+    with pytest.raises(ValueError, match="must remain under"):
+        _run(
+            environment,
+            backend=backend,
+            judge=judge,
+            strategies=("text_guided",),
+            seeds=(0,),
+        )
+
+    assert not environment.output_root.exists()
+    assert backend.calls == []
+    assert judge.calls == []
+
+
+def test_explicit_mask_is_published_exactly_and_recorded(
+    environment: _Environment,
+) -> None:
+    mask_path = environment.source.parent / "completion-mask.png"
+    _write_completion_mask(mask_path)
+    mask_bytes = mask_path.read_bytes()
+    mask_sha256 = hashlib.sha256(mask_bytes).hexdigest()
+    _write_manifest(
+        environment.manifest,
+        environment.source,
+        completion_mask=mask_path,
+    )
+
+    backend, judge = _run(
+        environment,
+        judge=_Judge([_accept()]),
+        strategies=("text_guided",),
+        seeds=(0,),
+    )
+
+    sample = environment.output_root / "sample-1"
+    with Image.open(mask_path) as source_mask:
+        source_pixels = np.asarray(source_mask).copy()
+    with Image.open(sample / "completion_mask.png") as published_mask:
+        published_pixels = np.asarray(published_mask).copy()
+        assert published_mask.size == (12, 15)
+    with Image.open(sample / "candidate_text_guided_seed_0.png") as opened:
+        candidate = np.asarray(opened.convert("RGB"))
+    with Image.open(sample / "baseline_canvas.png") as opened:
+        baseline = np.asarray(opened.convert("RGB"))
+    with Image.open(sample / "visible_mask.png") as opened:
+        visible = np.asarray(opened.convert("L")) == 255
+    result = json.loads((sample / "result.json").read_text())
+
+    assert np.array_equal(published_pixels, source_pixels)
+    assert mask_path.read_bytes() == mask_bytes
+    assert result["completion_mask_mode"] == "explicit"
+    assert result["completion_mask_source_path"] == str(mask_path.resolve())
+    assert result["completion_mask_source_sha256"] == mask_sha256
+    assert result["completion_start_ratio"] == 0.5
+    completion = source_pixels == 255
+    assert np.array_equal(candidate[visible], baseline[visible])
+    assert np.array_equal(candidate[~completion], baseline[~completion])
+    assert len(backend.calls) == 1
+    assert len(judge.calls) == 1
+
+
+def test_directional_result_records_null_explicit_mask_metadata(
+    environment: _Environment,
+) -> None:
+    _run(
+        environment,
+        judge=_Judge([_accept()]),
+        strategies=("text_guided",),
+        seeds=(0,),
+    )
+
+    result = json.loads(
+        (environment.output_root / "sample-1" / "result.json").read_text()
+    )
+    assert result["completion_mask_mode"] == "directional"
+    assert result["completion_mask_source_path"] is None
+    assert result["completion_mask_source_sha256"] is None
+
+
+def test_explicit_mask_mutation_during_run_rolls_back_sample(
+    environment: _Environment,
+) -> None:
+    mask_path = environment.source.parent / "completion-mask.png"
+    _write_completion_mask(mask_path)
+    _write_manifest(
+        environment.manifest,
+        environment.source,
+        completion_mask=mask_path,
+    )
+
+    class _MutatingBackend:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def complete(self, **kwargs: object) -> Image.Image:
+            self.calls.append(dict(kwargs))
+            changed = np.zeros((15, 12), dtype=np.uint8)
+            changed[7:15, 5:9] = 255
+            _write_completion_mask(mask_path, pixels=changed)
+            input_rgb = kwargs["input_rgb"]
+            assert isinstance(input_rgb, Image.Image)
+            return _gradient(input_rgb.size)
+
+    backend = _MutatingBackend()
+
+    with pytest.raises(
+        RuntimeError,
+        match="explicit completion mask changed during",
+    ):
+        run_reference_completion_benchmark(
+            manifest_path=environment.manifest,
+            benchmark_root=environment.output_root,
+            config=_config(environment.data_root),
+            backend=backend,
+            judge=_Judge([_accept()]),
+            strategies=("text_guided",),
+            seeds=(0,),
+        )
+
+    assert len(backend.calls) == 1
+    assert not (environment.output_root / "sample-1").exists()
+    assert list(environment.output_root.glob(".sample-1.tmp-*")) == []
 
 
 @pytest.mark.parametrize("canvas_size", [(17, 29), (41, 19), (31, 31)])
@@ -895,9 +1190,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
     }
     assert records["clip_tokenizer_calls"] == 0
     assert records["offload"] is enable_model_cpu_offload
-    assert records["to_device"] == (
-        None if enable_model_cpu_offload else config.device
-    )
+    assert records["to_device"] == (None if enable_model_cpu_offload else config.device)
     assert records["progress_disabled"] is True
     assert all(
         kwargs["local_files_only"] is True for _, _, kwargs in records["pretrained"]
@@ -911,8 +1204,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
     assert pipeline_kwargs["unet"] is records["component_UNet2DConditionModel"]
     assert pipeline_kwargs["brushnet"] is records["brushnet"]
     assert (
-        pipeline_kwargs["text_encoder_brushnet"]
-        is records["component_CLIPTextModel"]
+        pipeline_kwargs["text_encoder_brushnet"] is records["component_CLIPTextModel"]
     )
     pipeline = records["pipeline_instance"]
     assert pipeline.tokenizer is records["tokenizer"]
