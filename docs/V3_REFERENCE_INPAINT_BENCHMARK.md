@@ -108,3 +108,12 @@ sample is never exposed.
 verdicts, the earliest accepted selection, runtime, and rejection reasons. No
 benchmark artifact is written into `r2v_v3_runs`, `r2v_v3_datasets`, `selected/`,
 an existing clip directory, or the public dataset tree.
+
+## Related Entity-Completion Experiment
+
+The separate [PowerPaint v2-1 reference-completion benchmark](V3_REFERENCE_COMPLETION_POWERPAINT.md)
+tests extending a truncated or occluded entity inside an explicit directional
+completion zone on a larger RGB canvas. That experiment may generate missing
+entity pixels. This background-contextualization benchmark does not: its source
+entity is already complete, remains at the original dimensions, and only
+transparent background pixels may change.
