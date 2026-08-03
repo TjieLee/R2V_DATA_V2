@@ -819,12 +819,28 @@ class PowerPaintV21ReferenceCompletionBackend:
             torch_dtype=dtype,
             **common,
         )
+        brushnet = BrushNetModel.from_unet(unet)
+        pipeline = Pipeline.from_pretrained(
+            base_model,
+            unet=unet,
+            brushnet=brushnet,
+            text_encoder_brushnet=text_encoder_brushnet,
+            torch_dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=False,
+            safety_checker=None,
+            feature_extractor=None,
+            requires_safety_checker=False,
+        )
         tokenizer = TokenizerWrapper(
             from_pretrained=base_model,
             subfolder="tokenizer",
             revision=None,
             local_files_only=True,
         )
+        wrapped_tokenizer = object.__getattribute__(tokenizer, "wrapped")
+        tokenizer._module_cls = type(wrapped_tokenizer)
+        tokenizer._module_name = type(wrapped_tokenizer).__name__
         add_tokens(
             tokenizer=tokenizer,
             text_encoder=text_encoder_brushnet,
@@ -832,7 +848,18 @@ class PowerPaintV21ReferenceCompletionBackend:
             initialize_tokens=["a", "a", "a"],
             num_vectors_per_token=10,
         )
-        brushnet = BrushNetModel.from_unet(unet)
+        pipeline.tokenizer = tokenizer
+        for component_name, expected_component in (
+            ("unet", unet),
+            ("brushnet", brushnet),
+            ("text_encoder_brushnet", text_encoder_brushnet),
+            ("tokenizer", tokenizer),
+        ):
+            if getattr(pipeline, component_name, None) is not expected_component:
+                raise RuntimeError(
+                    "PowerPaint pipeline did not preserve the expected "
+                    f"{component_name} component"
+                )
         load_model(brushnet, str(paths["brushnet_weights"]))
         torch_load_parameters: dict[str, object] = {"map_location": "cpu"}
         if _supports_parameter(torch.load, "weights_only"):
@@ -859,19 +886,6 @@ class PowerPaintV21ReferenceCompletionBackend:
                     "PowerPaint text encoder incompatible keys must be lists "
                     "or tuples"
                 )
-        pipeline = Pipeline.from_pretrained(
-            base_model,
-            unet=unet,
-            brushnet=brushnet,
-            text_encoder_brushnet=text_encoder_brushnet,
-            tokenizer=tokenizer,
-            torch_dtype=dtype,
-            local_files_only=True,
-            low_cpu_mem_usage=False,
-            safety_checker=None,
-            feature_extractor=None,
-            requires_safety_checker=False,
-        )
         pipeline.scheduler = UniPCMultistepScheduler.from_config(
             pipeline.scheduler.config
         )

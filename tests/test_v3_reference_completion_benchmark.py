@@ -701,6 +701,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
         "offload": False,
         "to_device": None,
         "clip_tokenizer_calls": 0,
+        "events": [],
     }
 
     class _LoadedComponent:
@@ -726,6 +727,9 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
             records["brushnet"] = instance
             return instance
 
+    class _WrappedTokenizer:
+        pass
+
     class _TokenizerWrapper:
         def __init__(
             self,
@@ -734,6 +738,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
             *args: object,
             **kwargs: object,
         ) -> None:
+            self.wrapped = _WrappedTokenizer()
             records["tokenizer_init"] = {
                 "from_pretrained": from_pretrained,
                 "from_config": from_config,
@@ -741,6 +746,10 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
                 "kwargs": dict(kwargs),
             }
             records["tokenizer"] = self
+            records["events"].append("tokenizer_created")
+
+        def __repr__(self) -> str:
+            return f"{self._module_name}:{self._module_cls.__name__}"
 
     class _ForbiddenClipTokenizer:
         @classmethod
@@ -756,6 +765,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
         initialize_tokens: list[str],
         num_vectors_per_token: int,
     ) -> None:
+        records["events"].append("tokens_added")
         records["tokens"] = {
             "tokenizer": tokenizer,
             "text_encoder": text_encoder,
@@ -768,15 +778,25 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
         def __init__(self) -> None:
             self.scheduler = SimpleNamespace(config={"name": "scheduler"})
 
+        def __setattr__(self, name: str, value: object) -> None:
+            object.__setattr__(self, name, value)
+            if name == "tokenizer" and records.get("tokenizer") is value:
+                records["events"].append("tokenizer_assigned")
+
         @classmethod
         def from_pretrained(
             cls,
             path: str,
             **kwargs: object,
         ) -> _LoadedPipeline:
+            assert "tokenizer" not in kwargs
             records["pipeline"] = (path, dict(kwargs))
             instance = cls()
+            instance.unet = kwargs["unet"]
+            instance.brushnet = kwargs["brushnet"]
+            instance.text_encoder_brushnet = kwargs["text_encoder_brushnet"]
             records["pipeline_instance"] = instance
+            records["events"].append("pipeline_constructed")
             return instance
 
         def set_progress_bar_config(self, *, disable: bool) -> None:
@@ -887,13 +907,25 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
     assert pipeline_kwargs["low_cpu_mem_usage"] is False
     assert pipeline_kwargs["safety_checker"] is None
     assert pipeline_kwargs["feature_extractor"] is None
+    assert "tokenizer" not in pipeline_kwargs
     assert pipeline_kwargs["unet"] is records["component_UNet2DConditionModel"]
     assert pipeline_kwargs["brushnet"] is records["brushnet"]
     assert (
         pipeline_kwargs["text_encoder_brushnet"]
         is records["component_CLIPTextModel"]
     )
-    assert pipeline_kwargs["tokenizer"] is records["tokenizer"]
+    pipeline = records["pipeline_instance"]
+    assert pipeline.tokenizer is records["tokenizer"]
+    tokenizer = records["tokenizer"]
+    assert tokenizer._module_cls is _WrappedTokenizer
+    assert tokenizer._module_name == "_WrappedTokenizer"
+    assert repr(tokenizer) == "_WrappedTokenizer:_WrappedTokenizer"
+    assert records["events"] == [
+        "pipeline_constructed",
+        "tokenizer_created",
+        "tokens_added",
+        "tokenizer_assigned",
+    ]
     token_kwargs = records["tokens"]
     assert token_kwargs == {
         "tokenizer": records["tokenizer"],
@@ -904,7 +936,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
     }
     assert records["text_state"] == ({"embedding": "local"}, False)
     assert records["torch_load"][1:] == ("cpu", True)
-    assert backend._pipeline is records["pipeline_instance"]
+    assert backend._pipeline is pipeline
 
 
 def test_candidate_order_is_deterministic(environment: _Environment) -> None:
