@@ -75,6 +75,10 @@ DEFAULT_QWEN_LOCALIZED_GROUP_PROMPT = (
     "the locally incomplete region so the existing group looks naturally "
     "continuous. Keep the background plain and unchanged."
 )
+QWEN_LOCALIZED_PROMPT_EN_SHORT = (
+    "Complete the missing parts in this image. "
+    "Do not generate a new instance."
+)
 QWEN_LOCALIZED_PROMPT_ZH_SHORT = (
     "\u628a\u8fd9\u5f20\u56fe\u4e2d\u6b8b\u7f3a\u7684\u90e8\u5206\u8865\u5145\u5b8c\u6574\uff0c\u4e0d\u8981\u751f\u6210\u65b0\u7684\u5b9e\u4f8b"
 )
@@ -511,9 +515,13 @@ def _localized_prompt(
     prompt = override.strip()
     if not prompt:
         raise ValueError("Qwen completion prompt must be non-empty")
-    language: Literal["en", "zh", "custom"] = (
-        "zh" if prompt == QWEN_LOCALIZED_PROMPT_ZH_SHORT else "custom"
-    )
+    language: Literal["en", "zh", "custom"]
+    if prompt == QWEN_LOCALIZED_PROMPT_EN_SHORT:
+        language = "en"
+    elif prompt == QWEN_LOCALIZED_PROMPT_ZH_SHORT:
+        language = "zh"
+    else:
+        language = "custom"
     return prompt, language
 
 

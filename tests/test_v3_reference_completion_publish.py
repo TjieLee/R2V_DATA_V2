@@ -539,6 +539,18 @@ def test_background_gate_allows_white_shadow_and_rejects_complex() -> None:
     assert passed is True
     assert reasons == []
     assert metrics["outside_near_white_ratio"] >= 0.8
+    assert metrics["outside_color_diversity_waived_by_near_white"] is False
+    assert {
+        "outside_pixel_count",
+        "outside_mean",
+        "outside_std",
+        "outside_near_white_ratio",
+        "outside_color_bins",
+        "border_outside_pixel_count",
+        "border_mean",
+        "border_std",
+        "checks",
+    }.issubset(metrics)
 
     rng = np.random.default_rng(7)
     complex_pixels = rng.integers(0, 256, (100, 100, 3), dtype=np.uint8)
@@ -550,6 +562,116 @@ def test_background_gate_allows_white_shadow_and_rejects_complex() -> None:
     )
     assert passed is False
     assert reasons
+
+
+def _near_white_diverse_background(mask: Image.Image) -> np.ndarray:
+    foreground = np.asarray(mask, dtype=np.uint8) == 255
+    height, width = foreground.shape
+    pixels = np.full((height, width, 3), 255, dtype=np.uint8)
+    interior_outside = np.argwhere(~foreground)
+    interior_outside = interior_outside[
+        (interior_outside[:, 0] > 0)
+        & (interior_outside[:, 0] < height - 1)
+        & (interior_outside[:, 1] > 0)
+        & (interior_outside[:, 1] < width - 1)
+    ]
+    palette = [
+        (red * 16, green * 16, blue * 16)
+        for red in range(15)
+        for green in range(15)
+        for blue in range(15)
+    ][:93]
+    for (row, column), color in zip(
+        interior_outside[:93],
+        palette,
+        strict=True,
+    ):
+        pixels[row, column] = color
+    return pixels
+
+
+def test_background_gate_waives_color_bins_for_99_percent_white_background() -> None:
+    mask_pixels = np.zeros((200, 200), dtype=np.uint8)
+    mask_pixels[50:150, 60:140] = 255
+    mask = Image.fromarray(mask_pixels, mode="L")
+    pixels = _near_white_diverse_background(mask)
+    metrics, passed, reasons = evaluate_background_gate(
+        Image.fromarray(pixels, mode="RGB"),
+        mask,
+        config=PublicationConfig(),
+    )
+    assert metrics["outside_near_white_ratio"] >= 0.99
+    assert metrics["outside_color_bins"] == 94
+    assert metrics["outside_color_diversity_waived_by_near_white"] is True
+    assert metrics["checks"]["outside_color_diversity"] is True
+    assert passed is True
+    assert reasons == []
+
+
+def test_background_gate_does_not_waive_color_bins_below_near_white_ratio() -> None:
+    mask = _good_mask()
+    pixels = _near_white_diverse_background(mask)
+    foreground = np.asarray(mask, dtype=np.uint8) == 255
+    outside = np.argwhere(~foreground)
+    outside = outside[
+        (outside[:, 0] > 0)
+        & (outside[:, 0] < 99)
+        & (outside[:, 1] > 0)
+        & (outside[:, 1] < 99)
+    ]
+    for row, column in outside[93:593]:
+        pixels[row, column] = (160, 176, 192)
+    metrics, passed, reasons = evaluate_background_gate(
+        Image.fromarray(pixels, mode="RGB"),
+        mask,
+        config=PublicationConfig(),
+    )
+    assert 0.8 <= metrics["outside_near_white_ratio"] < 0.98
+    assert metrics["outside_color_bins"] > 64
+    assert metrics["outside_color_diversity_waived_by_near_white"] is False
+    assert passed is False
+    assert "background_outside_color_diversity_failed" in reasons
+
+
+@pytest.mark.parametrize("failed_border_check", ["border_mean", "border_std"])
+def test_background_gate_never_waives_failed_border_check(
+    failed_border_check: str,
+) -> None:
+    mask = _good_mask()
+    pixels = _near_white_diverse_background(mask)
+    border = np.zeros((100, 100), dtype=bool)
+    border[0, :] = True
+    border[-1, :] = True
+    border[:, 0] = True
+    border[:, -1] = True
+    border_outside = np.argwhere(border & (np.asarray(mask) == 0))
+    if failed_border_check == "border_mean":
+        pixels[border] = 230
+    else:
+        for row, column in border_outside[:20]:
+            pixels[row, column] = 0
+    metrics, passed, reasons = evaluate_background_gate(
+        Image.fromarray(pixels, mode="RGB"),
+        mask,
+        config=PublicationConfig(),
+    )
+    assert metrics["checks"][failed_border_check] is False
+    assert metrics["outside_color_diversity_waived_by_near_white"] is False
+    assert passed is False
+    assert f"background_{failed_border_check}_failed" in reasons
+
+
+def test_background_gate_passes_color_bins_within_limit_without_waiver() -> None:
+    mask = _good_mask()
+    metrics, passed, reasons = evaluate_background_gate(
+        _candidate(mask),
+        mask,
+        config=PublicationConfig(),
+    )
+    assert metrics["outside_color_bins"] <= 64
+    assert metrics["outside_color_diversity_waived_by_near_white"] is False
+    assert passed is True
+    assert reasons == []
 
 
 @pytest.mark.parametrize("kind", ["identity", "locality", "usability"])

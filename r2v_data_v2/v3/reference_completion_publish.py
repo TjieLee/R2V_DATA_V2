@@ -1016,14 +1016,25 @@ def evaluate_background_gate(
         outside_std = 0.0
     border_mean = float(border.mean()) if border.size else 0.0
     border_std = float(border.std()) if border.size else math.inf
+    border_mean_passed = border_mean >= config.min_border_mean
+    border_std_passed = border_std <= config.max_border_std
+    outside_color_diversity_waived_by_near_white = (
+        color_bins > config.max_outside_color_bins
+        and near_white_ratio >= 0.98
+        and border_mean_passed
+        and border_std_passed
+    )
     checks = {
         "outside_pixels_present": bool(outside.size),
         "outside_near_white_ratio": (
             near_white_ratio >= config.min_outside_near_white_ratio
         ),
-        "border_mean": border_mean >= config.min_border_mean,
-        "border_std": border_std <= config.max_border_std,
-        "outside_color_diversity": color_bins <= config.max_outside_color_bins,
+        "border_mean": border_mean_passed,
+        "border_std": border_std_passed,
+        "outside_color_diversity": (
+            color_bins <= config.max_outside_color_bins
+            or outside_color_diversity_waived_by_near_white
+        ),
     }
     reasons = [
         f"background_{name}_failed" for name, passed in checks.items() if not passed
@@ -1034,6 +1045,9 @@ def evaluate_background_gate(
         "outside_std": outside_std,
         "outside_near_white_ratio": near_white_ratio,
         "outside_color_bins": color_bins,
+        "outside_color_diversity_waived_by_near_white": (
+            outside_color_diversity_waived_by_near_white
+        ),
         "border_outside_pixel_count": int(border.shape[0]),
         "border_mean": border_mean,
         "border_std": border_std,

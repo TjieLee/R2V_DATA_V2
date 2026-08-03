@@ -38,6 +38,9 @@ from r2v_data_v2.v3.pair import (
 from r2v_data_v2.v3.reference_completion_benchmark import (
     ReferenceCompletionReview,
 )
+from r2v_data_v2.v3.reference_completion_qwen import (
+    QWEN_LOCALIZED_PROMPT_EN_SHORT,
+)
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
 )
@@ -2281,6 +2284,11 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert state.source_entity_id == "e1"
     assert state.generation_metadata_path is not None
     assert completion.calls[0]["entity_phrase"] == "entity 1"
+    assert completion.calls[0]["prompt"] == QWEN_LOCALIZED_PROMPT_EN_SHORT
+    assert completion.calls[0]["prompt"] == (
+        "Complete the missing parts in this image. "
+        "Do not generate a new instance."
+    )
     assert segmenter.calls[0]["grounding_prompt"] == "entity 1"
     assert segmenter.calls[0]["session_entries"] == ["00.jpg"]
     assert segmenter.calls[0]["working_png_names"] == [
@@ -2301,6 +2309,8 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["status"] == "accepted"
     assert metadata["completion"]["mode"] == "localized_raw"
+    assert metadata["completion"]["prompt_language"] == "en"
+    assert metadata["completion"]["prompt"] == QWEN_LOCALIZED_PROMPT_EN_SHORT
     assert metadata["segmentation"]["backend"] == "sam3"
     assert not _completion_rejection_path(storage).exists()
     assert not (metadata_path.parent / ".sam3_single_frame").exists()

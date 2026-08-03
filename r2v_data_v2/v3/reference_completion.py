@@ -34,6 +34,7 @@ from r2v_data_v2.v3.reference_completion_publish import (
 from r2v_data_v2.v3.reference_completion_qwen import (
     DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT,
     DEFAULT_QWEN_SEEDS,
+    QWEN_LOCALIZED_PROMPT_EN_SHORT,
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
     QwenLocalizedCompletionJudge,
@@ -229,7 +230,10 @@ def _attempt(
         input_rgb = _white_source(source_rgba)
         input_path = working / "input_rgb.png"
         _save_png(input_path, input_rgb)
-        prompt, prompt_language = _localized_prompt(entity.reference_type, None)
+        prompt, prompt_language = _localized_prompt(
+            entity.reference_type,
+            QWEN_LOCALIZED_PROMPT_EN_SHORT,
+        )
         seed = DEFAULT_QWEN_SEEDS[0]
         diagnostics.set_stage("generation")
         generated = completion_backend.complete(
