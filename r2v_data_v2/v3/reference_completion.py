@@ -6,7 +6,7 @@ import hashlib
 import math
 import shutil
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +58,20 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 _SCHEMA_VERSION = "r2v.v3.reference_completion.1"
+_REJECTION_SCHEMA_VERSION = "r2v.v3.reference_completion.rejection.1"
+_REJECTION_STAGES = frozenset(
+    {
+        "generation",
+        "localized_hard_check",
+        "segmentation",
+        "mask_gate",
+        "improvement_gate",
+        "background_gate",
+        "localized_judge",
+        "reference_ranking",
+        "publication",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +82,22 @@ class ReferenceCompletionFallbackStats:
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
+
+
+@dataclass
+class _RejectionDiagnostics:
+    stage: str = "generation"
+    source_image_sha256: str | None = None
+    details: dict[str, object] = field(default_factory=dict)
+
+    def set_stage(self, stage: str) -> None:
+        if stage not in _REJECTION_STAGES:
+            raise ValueError(f"unsupported completion diagnostic stage: {stage}")
+        self.stage = stage
+
+
+class _ExpectedRejection(ValueError):
+    """A deterministic reject, rather than an unexpected execution error."""
 
 
 @dataclass(frozen=True)
@@ -180,11 +210,13 @@ def _attempt(
     segmenter: SegmentationBackend,
     reference_judge: EntityReferenceJudge,
     gates: PublicationConfig,
+    diagnostics: _RejectionDiagnostics,
 ) -> _AcceptedFallback:
     if source_state.image_path is None or source_state.source_frame_index is None:
         raise ValueError("local reference provenance is incomplete")
     source_path = _artifact(storage, source_state.image_path)
     source_rgba, source_bytes, source_sha256 = _load_source_rgba(source_path)
+    diagnostics.source_image_sha256 = source_sha256
     final_directory = _completion_directory(storage, clip_uid, entity.entity_id)
     final_directory.parent.mkdir(parents=True, exist_ok=True)
     working = final_directory.parent / f".tmp-{entity.entity_id}-{uuid.uuid4().hex}"
@@ -199,6 +231,7 @@ def _attempt(
         _save_png(input_path, input_rgb)
         prompt, prompt_language = _localized_prompt(entity.reference_type, None)
         seed = DEFAULT_QWEN_SEEDS[0]
+        diagnostics.set_stage("generation")
         generated = completion_backend.complete(
             input_rgb=input_rgb.copy(),
             entity_phrase=entity.phrase,
@@ -207,6 +240,7 @@ def _attempt(
             negative_prompt=DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT,
         )
         candidate_path = working / "candidate_rgb.png"
+        diagnostics.set_stage("localized_hard_check")
         candidate_rgb, candidate_sha256, hard_check = _localized_hard_check(
             generated=generated,
             input_rgb=input_rgb,
@@ -215,11 +249,13 @@ def _attempt(
             source_path=source_path,
             source_sha256=source_sha256,
         )
+        diagnostics.details["localized_hard_check"] = hard_check.to_dict()
         if candidate_rgb is None or not hard_check.passed:
-            raise ValueError(
+            raise _ExpectedRejection(
                 "localized completion hard check failed: "
                 + ",".join(hard_check.reasons)
             )
+        diagnostics.set_stage("segmentation")
         sam3_frames_directory = working / ".sam3_single_frame"
         sam3_frames_directory.mkdir()
         isolated_frame_path = sam3_frames_directory / "00.jpg"
@@ -233,32 +269,70 @@ def _attempt(
             )
         finally:
             shutil.rmtree(sam3_frames_directory, ignore_errors=True)
-        mask, mask_ranking = _mask_from_track_result(
-            track,
-            expected_size=candidate_rgb.size,
-        )
+        segmentation_details: dict[str, object] = {
+            "track_status": getattr(track, "status", None),
+            "track_reason": getattr(track, "reason", None),
+        }
+        diagnostics.details["segmentation"] = segmentation_details
+        try:
+            mask, mask_ranking = _mask_from_track_result(
+                track,
+                expected_size=candidate_rgb.size,
+            )
+        except ValueError as exc:
+            raise _ExpectedRejection(str(exc)) from exc
+        segmentation_details["ranking"] = mask_ranking
         mask_sha256 = _save_png(working / "candidate_mask.png", mask)
         source_metrics = compute_foreground_metrics(source_rgba.getchannel("A"))
         candidate_metrics = compute_foreground_metrics(mask)
+        diagnostics.set_stage("mask_gate")
         mask_metrics, mask_ok, mask_reasons = evaluate_mask_gate(
             mask,
             reference_type=entity.reference_type,
             config=gates,
         )
+        diagnostics.details["mask_gate"] = {
+            "passed": mask_ok,
+            "reasons": list(mask_reasons),
+            "metrics": mask_metrics,
+        }
+        diagnostics.set_stage("improvement_gate")
         improvement, improvement_ok, improvement_reasons = evaluate_improvement_gate(
             source_metrics,
             candidate_metrics,
             reference_type=entity.reference_type,
             config=gates,
         )
+        diagnostics.details["improvement_gate"] = {
+            "passed": improvement_ok,
+            "reasons": list(improvement_reasons),
+            "metrics": improvement,
+            "source_metrics": source_metrics,
+            "candidate_metrics": candidate_metrics,
+        }
+        diagnostics.set_stage("background_gate")
         background, background_ok, background_reasons = evaluate_background_gate(
             candidate_rgb,
             mask,
             config=gates,
         )
+        diagnostics.details["background_gate"] = {
+            "passed": background_ok,
+            "reasons": list(background_reasons),
+            "metrics": background,
+        }
         reasons = [*mask_reasons, *improvement_reasons, *background_reasons]
         if not all((mask_ok, improvement_ok, background_ok)):
-            raise ValueError(f"completion production gate failed: {reasons[0]}")
+            if not mask_ok:
+                diagnostics.set_stage("mask_gate")
+            elif not improvement_ok:
+                diagnostics.set_stage("improvement_gate")
+            else:
+                diagnostics.set_stage("background_gate")
+            raise _ExpectedRejection(
+                f"completion production gate failed: {reasons[0]}"
+            )
+        diagnostics.set_stage("localized_judge")
         review = completion_judge.review(
             source_rgba=source_rgba.copy(),
             candidate_rgb=candidate_rgb.copy(),
@@ -267,8 +341,15 @@ def _attempt(
         )
         if not isinstance(review, ReferenceCompletionReview):
             raise TypeError("localized completion judge returned an invalid result")
+        diagnostics.details["localized_judge"] = {
+            "verdict": review.verdict,
+            "reason": review.reason,
+        }
         if review.verdict != "accept":
-            raise ValueError("localized completion judge rejected the candidate")
+            raise _ExpectedRejection(
+                "localized completion judge rejected the candidate"
+            )
+        diagnostics.set_stage("reference_ranking")
         ranked = _candidate(
             entity,
             candidate_rgb,
@@ -285,8 +366,16 @@ def _attempt(
             rank_attempt.decision,
             candidate_ids={"candidate_1"},
         )
+        diagnostics.details["reference_ranking"] = {
+            "decision": rank_attempt.decision.model_dump(mode="json"),
+            "issues": [issue.to_dict() for issue in issues],
+            "repair_attempts": rank_attempt.repair_attempts,
+        }
         if issues or rank_attempt.decision.reference_scope != "full":
-            raise ValueError("generated fallback did not rank as a full reference")
+            raise _ExpectedRejection(
+                "generated fallback did not rank as a full reference"
+            )
+        diagnostics.set_stage("publication")
         output_sha256 = _save_png(
             working / "generated_reference.png",
             build_candidate_reference(candidate_rgb, mask),
@@ -371,6 +460,141 @@ def _attempt(
     except Exception:
         shutil.rmtree(working, ignore_errors=True)
         raise
+
+
+def _rejection_payload(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+    error: Exception,
+) -> dict[str, object]:
+    source_sha256 = diagnostics.source_image_sha256
+    if source_sha256 is None and source_state.image_path is not None:
+        try:
+            source_sha256 = _sha256(
+                _artifact(storage, source_state.image_path)
+            )
+        except Exception:  # noqa: BLE001 - diagnostics are best effort
+            source_sha256 = None
+    payload: dict[str, object] = {
+        "schema_version": _REJECTION_SCHEMA_VERSION,
+        "status": "rejected",
+        "clip_uid": clip_uid,
+        "entity_id": entity.entity_id,
+        "reference_type": entity.reference_type,
+        "stage": diagnostics.stage,
+        "reason": str(error).strip() or type(error).__name__,
+        "exception_type": (
+            None
+            if isinstance(error, _ExpectedRejection)
+            else type(error).__name__
+        ),
+        "source_reference": source_state.model_dump(mode="json"),
+        "source_image_sha256": source_sha256,
+        "config_hash": config.fingerprint(),
+        "git_commit": storage.read_run().git_commit,
+    }
+    payload.update(diagnostics.details)
+    return payload
+
+
+def _publish_rejection(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+    error: Exception,
+) -> None:
+    final_directory = _completion_directory(
+        storage,
+        clip_uid,
+        entity.entity_id,
+    )
+    final_directory.parent.mkdir(parents=True, exist_ok=True)
+    working = final_directory.parent / (
+        f".tmp-rejection-{entity.entity_id}-{uuid.uuid4().hex}"
+    )
+    backup = final_directory.parent / (
+        f".backup-rejection-{entity.entity_id}-{uuid.uuid4().hex}"
+    )
+    working.mkdir(parents=False, exist_ok=False)
+    backup_created = False
+    published = False
+    try:
+        write_json_atomic(
+            working / "rejection.json",
+            _rejection_payload(
+                config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                source_state=source_state,
+                diagnostics=diagnostics,
+                error=error,
+            ),
+        )
+        if final_directory.exists():
+            final_directory.replace(backup)
+            backup_created = True
+        working.replace(final_directory)
+        published = True
+    except Exception:
+        if published and final_directory.exists():
+            shutil.rmtree(final_directory)
+        if backup_created and backup.exists():
+            backup.replace(final_directory)
+        raise
+    else:
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if working.exists():
+            shutil.rmtree(working)
+
+
+def _record_rejection_safely(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+    error: Exception,
+) -> None:
+    try:
+        _publish_rejection(
+            config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            source_state=source_state,
+            diagnostics=diagnostics,
+            error=error,
+        )
+    except Exception as diagnostic_error:  # noqa: BLE001 - fallback stays open
+        try:
+            storage.append_failure(
+                stage="pair",
+                clip_uid=clip_uid,
+                reason="completion rejection diagnostic write failed",
+                details={
+                    "entity_id": entity.entity_id,
+                    "completion_stage": diagnostics.stage,
+                    "rejection_reason": str(error),
+                    "diagnostic_error_type": type(diagnostic_error).__name__,
+                    "diagnostic_error": str(diagnostic_error),
+                },
+            )
+        except Exception:  # noqa: BLE001,S110 - diagnostics stay fail-open
+            pass
 
 
 def _publish(
@@ -477,7 +701,12 @@ def run_reference_completion_fallbacks(
                     continue
                 assert source_state is not None
                 counts["attempted"] += 1
+                diagnostics = _RejectionDiagnostics()
                 try:
+                    if source_state.image_path is not None:
+                        diagnostics.source_image_sha256 = _sha256(
+                            _artifact(storage, source_state.image_path)
+                        )
                     if backend is None:
                         owned_backend = _owned_backend(config)
                         backend = owned_backend
@@ -505,18 +734,29 @@ def run_reference_completion_fallbacks(
                         segmenter=segmenter,
                         reference_judge=reference_judge,
                         gates=gates,
+                        diagnostics=diagnostics,
                     )
                     states[entity.entity_id] = accepted.state
                     ordered = [states[item.entity_id] for item in clip.annotation.entities]
+                    diagnostics.set_stage("publication")
                     _publish(
                         storage,
                         clip_uid=clip_uid,
                         states=ordered,
                         accepted=accepted,
                     )
-                except Exception:  # noqa: BLE001 - optional fallback fails open
+                except Exception as exc:  # noqa: BLE001 - fallback fails open
                     states[entity.entity_id] = source_state
                     counts["rejected"] += 1
+                    _record_rejection_safely(
+                        config,
+                        storage,
+                        clip_uid=clip_uid,
+                        entity=entity,
+                        source_state=source_state,
+                        diagnostics=diagnostics,
+                        error=exc,
+                    )
                 else:
                     counts["ready"] += 1
     finally:

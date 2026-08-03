@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as config_module
 import r2v_data_v2.v3.pair as pair_module
+import r2v_data_v2.v3.reference_completion as completion_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import (
     PairConfig,
@@ -2033,8 +2034,14 @@ def test_four_context_only_targets_attempt_judge_without_publication(
 
 
 class _LocalizedCompletionBackend:
-    def __init__(self, *, fail: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail: Exception | None = None,
+        return_input_unchanged: bool = False,
+    ) -> None:
         self.fail = fail
+        self.return_input_unchanged = return_input_unchanged
         self.calls: list[dict[str, object]] = []
 
     def complete(
@@ -2057,6 +2064,8 @@ class _LocalizedCompletionBackend:
         )
         if self.fail is not None:
             raise self.fail
+        if self.return_input_unchanged:
+            return input_rgb.copy()
         pixels = np.asarray(input_rgb, dtype=np.uint8).copy()
         visible = np.any(pixels < 250, axis=2)
         rows, columns = np.nonzero(visible)
@@ -2074,8 +2083,15 @@ class _LocalizedCompletionBackend:
 
 
 class _LocalizedCompletionJudge:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        verdict: str = "accept",
+        reason: str = "The local missing region is repaired cleanly.",
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.verdict = verdict
+        self.reason = reason
 
     def review(
         self,
@@ -2088,19 +2104,20 @@ class _LocalizedCompletionJudge:
         assert source_rgba.mode == "RGBA"
         assert candidate_rgb.mode == "RGB"
         self.calls.append((entity_phrase, reference_type))
+        accepted = self.verdict == "accept"
         return ReferenceCompletionReview(
-            verdict="accept",
-            visible_source_preserved=True,
-            same_entity_continued=True,
-            identity_preserved=True,
-            exactly_one_entity=True,
-            completion_plausible=True,
-            completion_useful=True,
-            no_occluder_reconstructed=True,
-            no_new_salient_entity=True,
-            boundary_clean=True,
-            reference_usable=True,
-            reason="The local missing region is repaired cleanly.",
+            verdict=self.verdict,
+            visible_source_preserved=accepted,
+            same_entity_continued=accepted,
+            identity_preserved=accepted,
+            exactly_one_entity=accepted,
+            completion_plausible=accepted,
+            completion_useful=accepted,
+            no_occluder_reconstructed=accepted,
+            no_new_salient_entity=accepted,
+            boundary_clean=accepted,
+            reference_usable=accepted,
+            reason=self.reason,
         )
 
 
@@ -2171,7 +2188,11 @@ class _SingleFrameSegmentationBackend:
                     ),
                 ),
             )
-        mask = np.any(isolated_pixels < 240, axis=2)
+        mask = (
+            np.ones(isolated_pixels.shape[:2], dtype=bool)
+            if self.status == "mask_gate"
+            else np.any(isolated_pixels < 240, axis=2)
+        )
         return EntityTrackResult(
             status="ready",
             observations=(
@@ -2186,8 +2207,9 @@ class _SingleFrameSegmentationBackend:
 
 
 class _LocalThenGeneratedFullJudge:
-    def __init__(self) -> None:
+    def __init__(self, *, generated_scope: str = "full") -> None:
         self.calls: list[str] = []
+        self.generated_scope = generated_scope
 
     def decide(self, *, entity, candidates, source_images):
         del entity
@@ -2195,10 +2217,32 @@ class _LocalThenGeneratedFullJudge:
         generated = "reference_completion" in candidates[0].image_path
         self.calls.append("generated" if generated else "source")
         return EntityReferenceDecisionAttempt(
-            decision=_decision("full" if generated else "local"),
+            decision=_decision(
+                self.generated_scope if generated else "local"
+            ),
             raw_responses=("{}",),
             repair_attempts=0,
         )
+
+
+def _completion_rejection_path(
+    storage: RunStorage,
+    *,
+    clip_uid: str = "clip-1",
+    entity_id: str = "e1",
+) -> Path:
+    return (
+        storage.clip_dir(clip_uid)
+        / "reference_completion"
+        / entity_id
+        / "rejection.json"
+    )
+
+
+def _read_completion_rejection(storage: RunStorage) -> dict[str, object]:
+    return json.loads(
+        _completion_rejection_path(storage).read_text(encoding="utf-8")
+    )
 
 
 def test_generated_fallback_uses_existing_components_and_is_idempotent(
@@ -2258,6 +2302,7 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert metadata["status"] == "accepted"
     assert metadata["completion"]["mode"] == "localized_raw"
     assert metadata["segmentation"]["backend"] == "sam3"
+    assert not _completion_rejection_path(storage).exists()
     assert not (metadata_path.parent / ".sam3_single_frame").exists()
     candidate_path = metadata_path.parent / "candidate_rgb.png"
     assert candidate_path.read_bytes() == segmenter.calls[0]["candidate_bytes"]
@@ -2384,10 +2429,57 @@ def test_completion_generation_failure_keeps_original_local_reference(
     assert state.reference_scope == "local"
     assert state.synthetic is False
     assert segmenter.calls == []
+    rejection_path = _completion_rejection_path(storage)
+    rejection = _read_completion_rejection(storage)
+    assert rejection["schema_version"] == (
+        "r2v.v3.reference_completion.rejection.1"
+    )
+    assert rejection["status"] == "rejected"
+    assert rejection["clip_uid"] == "clip-1"
+    assert rejection["entity_id"] == "e1"
+    assert rejection["reference_type"] == "subject"
+    assert rejection["stage"] == "generation"
+    assert rejection["reason"] == "completion failed"
+    assert rejection["exception_type"] == "RuntimeError"
+    assert rejection["source_reference"] == state.model_dump(mode="json")
+    assert rejection["source_image_sha256"] == _sha256(
+        storage.selected_entity_path("clip-1", "e1")
+    )
+    assert rejection["config_hash"] == config.fingerprint()
+    assert rejection["git_commit"] == "pair-test"
+    assert [path.name for path in rejection_path.parent.iterdir()] == [
+        "rejection.json"
+    ]
     completion_root = storage.clip_dir("clip-1") / "reference_completion"
     assert not list(completion_root.glob(".tmp-*"))
+    assert not list(completion_root.glob(".backup-*"))
     with Image.open(storage.selected_entity_path("clip-1", "e1")) as opened:
         assert opened.mode == "RGBA"
+
+    body = "Keep {{image_1}} visually consistent throughout the clip."
+    legend = [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description="The original local subject reference.",
+        )
+    ]
+    storage.write_instruction(
+        "clip-1",
+        InstructionState(
+            status="ready",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=render_instruction_text(body, legend),
+        ),
+    )
+    dataset = DatasetExporter(config, storage).export()
+    assert dataset.sample_count == 1
+    sample = json.loads(
+        (config.resolved_export_root / "samples.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sample["references"][0]["synthetic"] is False
 
 
 @pytest.mark.parametrize(
@@ -2429,8 +2521,352 @@ def test_generated_fallback_failure_keeps_original_local_reference(
     assert state.source_clip_uid == "clip-1"
     assert reference_judge.calls == ["source"]
     assert not segmenter.calls[0]["session_directory"].exists()
+    rejection = _read_completion_rejection(storage)
+    assert rejection["stage"] == "segmentation"
+    assert rejection["exception_type"] == (
+        "RuntimeError" if segmentation_status == "exception" else None
+    )
+    if segmentation_status == "not_found":
+        assert rejection["reason"] == (
+            "SAM3 track status is not_found: not found"
+        )
+        assert rejection["segmentation"] == {
+            "track_status": "not_found",
+            "track_reason": "not found",
+        }
+    rejection_directory = _completion_rejection_path(storage).parent
+    assert [path.name for path in rejection_directory.iterdir()] == [
+        "rejection.json"
+    ]
     with Image.open(storage.selected_entity_path("clip-1", "e1")) as opened:
         assert opened.mode == "RGBA"
+
+
+def test_completion_hard_check_rejection_records_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    segmenter = _SingleFrameSegmentationBackend("exception")
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(
+            return_input_unchanged=True
+        ),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=segmenter,
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    rejection = _read_completion_rejection(storage)
+    assert stats.completion_rejected == 1
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert segmenter.calls == []
+    assert rejection["stage"] == "localized_hard_check"
+    assert rejection["exception_type"] is None
+    assert rejection["localized_hard_check"]["status"] == "failed"
+    assert "candidate_unchanged_from_input" in (
+        rejection["localized_hard_check"]["reasons"]
+    )
+
+
+def test_completion_mask_gate_rejection_records_reasons_and_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(
+            "mask_gate"
+        ),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    rejection = _read_completion_rejection(storage)
+    assert stats.completion_rejected == 1
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert rejection["stage"] == "mask_gate"
+    assert rejection["exception_type"] is None
+    assert rejection["mask_gate"]["passed"] is False
+    assert "mask_full" in rejection["mask_gate"]["reasons"]
+    mask_metrics = rejection["mask_gate"]["metrics"]
+    assert mask_metrics["foreground_pixels"] == (
+        mask_metrics["canvas_size"][0] * mask_metrics["canvas_size"][1]
+    )
+
+
+def test_completion_localized_judge_rejection_records_verdict_and_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    review_reason = "The completion changes the subject identity."
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(
+            verdict="reject",
+            reason=review_reason,
+        ),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    rejection = _read_completion_rejection(storage)
+    assert stats.completion_rejected == 1
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert rejection["stage"] == "localized_judge"
+    assert rejection["exception_type"] is None
+    assert rejection["localized_judge"] == {
+        "verdict": "reject",
+        "reason": review_reason,
+    }
+
+
+def test_completion_non_full_ranking_records_decision_and_issues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(generated_scope="local"),
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    rejection = _read_completion_rejection(storage)
+    assert stats.completion_rejected == 1
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert rejection["stage"] == "reference_ranking"
+    assert rejection["exception_type"] is None
+    assert rejection["reference_ranking"]["decision"]["reference_scope"] == (
+        "local"
+    )
+    assert rejection["reference_ranking"]["issues"] == []
+
+
+def test_completion_publication_failure_records_stage_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    original_write = storage.write_references_and_pairing
+    write_calls = 0
+
+    def fail_fallback_publication(clip_uid, references, pairing):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 2:
+            raise RuntimeError("completion publication failed")
+        return original_write(clip_uid, references, pairing)
+
+    monkeypatch.setattr(
+        storage,
+        "write_references_and_pairing",
+        fail_fallback_publication,
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    rejection = _read_completion_rejection(storage)
+    assert write_calls == 2
+    assert stats.failed == 0
+    assert stats.completion_rejected == 1
+    assert stats.completion_ready == 0
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert rejection["stage"] == "publication"
+    assert rejection["reason"] == "completion publication failed"
+    assert rejection["exception_type"] == "RuntimeError"
+    completion_directory = _completion_rejection_path(storage).parent
+    assert [path.name for path in completion_directory.iterdir()] == [
+        "rejection.json"
+    ]
+    completion_root = completion_directory.parent
+    assert not list(completion_root.glob(".tmp-*"))
+    assert not list(completion_root.glob(".backup-*"))
+    validate_entity_reference_artifact(
+        config,
+        storage,
+        "clip-1",
+        storage.read_clip("clip-1").annotation.entities[0],
+        state,
+        storage.read_frames("clip-1"),
+        storage.read_masks("clip-1"),
+    )
+
+
+def test_completion_rejection_and_success_replace_each_other_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+
+    first = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(
+            fail=RuntimeError("first generation failure")
+        ),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+    first_rejection = _read_completion_rejection(storage)
+    assert first.completion_rejected == 1
+    assert first_rejection["stage"] == "generation"
+
+    second = pair_clips(
+        config,
+        storage,
+        overwrite=True,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+    completion_directory = _completion_rejection_path(storage).parent
+    assert second.completion_ready == 1
+    assert not _completion_rejection_path(storage).exists()
+    assert (completion_directory / "metadata.json").is_file()
+    assert (completion_directory / "generated_reference.png").is_file()
+
+    third = pair_clips(
+        config,
+        storage,
+        overwrite=True,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(
+            "not_found"
+        ),
+    )
+    third_rejection = _read_completion_rejection(storage)
+    assert third.completion_rejected == 1
+    assert third_rejection["stage"] == "segmentation"
+    assert third_rejection["reason"] != first_rejection["reason"]
+    assert [path.name for path in completion_directory.iterdir()] == [
+        "rejection.json"
+    ]
+    completion_root = completion_directory.parent
+    assert not list(completion_root.glob(".tmp-*"))
+    assert not list(completion_root.glob(".backup-*"))
+    final_state = storage.read_clip("clip-1").references.entities[0]
+    assert final_state.reference_scope == "local"
+    assert final_state.synthetic is False
+
+
+def test_completion_rejection_diagnostic_write_failure_is_fail_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    original_write_json = completion_module.write_json_atomic
+
+    def fail_rejection_write(path, value):
+        if path.name == "rejection.json":
+            raise OSError("diagnostic disk failure")
+        return original_write_json(path, value)
+
+    monkeypatch.setattr(
+        completion_module,
+        "write_json_atomic",
+        fail_rejection_write,
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(
+            fail=RuntimeError("completion failed")
+        ),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert stats.completion_rejected == 1
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert not _completion_rejection_path(storage).exists()
+    failures = [
+        json.loads(line)
+        for line in storage.failures_path.read_text(encoding="utf-8").splitlines()
+    ]
+    failure = failures[-1]
+    assert failure["stage"] == "pair"
+    assert failure["reason"] == "completion rejection diagnostic write failed"
+    assert failure["details"]["completion_stage"] == "generation"
+    assert failure["details"]["diagnostic_error_type"] == "OSError"
+    completion_root = storage.clip_dir("clip-1") / "reference_completion"
+    assert not list(completion_root.glob(".tmp-*"))
+    assert not list(completion_root.glob(".backup-*"))
 
 
 def test_real_donor_precedes_generated_fallback(
