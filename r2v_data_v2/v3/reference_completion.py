@@ -15,6 +15,7 @@ from PIL import Image
 
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.frames import _save_jpeg
 from r2v_data_v2.v3.reference_completion_benchmark import (
     ReferenceCompletionReview,
     _white_source,
@@ -219,12 +220,19 @@ def _attempt(
                 "localized completion hard check failed: "
                 + ",".join(hard_check.reasons)
             )
-        track = segmenter.track(
-            frame_paths=[candidate_path],
-            entity_id=entity.entity_id,
-            reference_type=entity.reference_type,
-            grounding_prompt=entity.phrase,
-        )
+        sam3_frames_directory = working / ".sam3_single_frame"
+        sam3_frames_directory.mkdir()
+        isolated_frame_path = sam3_frames_directory / "00.jpg"
+        try:
+            _save_jpeg(candidate_rgb, isolated_frame_path)
+            track = segmenter.track(
+                frame_paths=[isolated_frame_path],
+                entity_id=entity.entity_id,
+                reference_type=entity.reference_type,
+                grounding_prompt=entity.phrase,
+            )
+        finally:
+            shutil.rmtree(sam3_frames_directory, ignore_errors=True)
         mask, mask_ranking = _mask_from_track_result(
             track,
             expected_size=candidate_rgb.size,

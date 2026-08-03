@@ -2118,17 +2118,43 @@ class _SingleFrameSegmentationBackend:
         grounding_prompt,
     ):
         assert len(frame_paths) == 1
-        candidate_path = frame_paths[0]
-        assert candidate_path.name == "candidate_rgb.png"
+        isolated_frame_path = frame_paths[0]
+        assert isolated_frame_path.name == "00.jpg"
+        assert isolated_frame_path.is_file()
+        session_entries = sorted(
+            path.name for path in isolated_frame_path.parent.iterdir()
+        )
+        assert session_entries == ["00.jpg"]
+        with Image.open(isolated_frame_path) as opened:
+            opened.load()
+            assert opened.format == "JPEG"
+            assert opened.mode == "RGB"
+            isolated_pixels = np.asarray(opened, dtype=np.uint8)
+        working_directory = isolated_frame_path.parent.parent
+        working_png_names = sorted(
+            path.name for path in working_directory.glob("*.png")
+        )
+        assert working_png_names == [
+            "candidate_rgb.png",
+            "input_rgb.png",
+            "source_rgba.png",
+        ]
+        candidate_path = working_directory / "candidate_rgb.png"
         assert candidate_path.is_file()
         self.calls.append(
             {
                 "frame_paths": list(frame_paths),
+                "session_directory": isolated_frame_path.parent,
+                "session_entries": session_entries,
+                "working_png_names": working_png_names,
+                "candidate_bytes": candidate_path.read_bytes(),
                 "entity_id": entity_id,
                 "reference_type": reference_type,
                 "grounding_prompt": grounding_prompt,
             }
         )
+        if self.status == "exception":
+            raise RuntimeError("segmentation crashed")
         if self.status == "not_found":
             return EntityTrackResult(status="not_found", reason="not found")
         if self.status == "failed":
@@ -2145,9 +2171,7 @@ class _SingleFrameSegmentationBackend:
                     ),
                 ),
             )
-        with Image.open(candidate_path) as opened:
-            pixels = np.asarray(opened.convert("RGB"), dtype=np.uint8)
-        mask = np.any(pixels < 250, axis=2)
+        mask = np.any(isolated_pixels < 240, axis=2)
         return EntityTrackResult(
             status="ready",
             observations=(
@@ -2214,6 +2238,13 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert state.generation_metadata_path is not None
     assert completion.calls[0]["entity_phrase"] == "entity 1"
     assert segmenter.calls[0]["grounding_prompt"] == "entity 1"
+    assert segmenter.calls[0]["session_entries"] == ["00.jpg"]
+    assert segmenter.calls[0]["working_png_names"] == [
+        "candidate_rgb.png",
+        "input_rgb.png",
+        "source_rgba.png",
+    ]
+    assert not segmenter.calls[0]["session_directory"].exists()
     assert reference_judge.calls == ["source", "generated"]
     final_path = storage.selected_entity_path("clip-1", "e1")
     with Image.open(final_path) as opened:
@@ -2227,6 +2258,10 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert metadata["status"] == "accepted"
     assert metadata["completion"]["mode"] == "localized_raw"
     assert metadata["segmentation"]["backend"] == "sam3"
+    assert not (metadata_path.parent / ".sam3_single_frame").exists()
+    candidate_path = metadata_path.parent / "candidate_rgb.png"
+    assert candidate_path.read_bytes() == segmenter.calls[0]["candidate_bytes"]
+    assert _sha256(candidate_path) == metadata["candidate_rgb_sha256"]
     assert metadata["production_gates"] == {
         **metadata["production_gates"],
         "mask_passed": True,
@@ -2315,9 +2350,49 @@ def test_generated_fallback_is_disabled_by_default(
     assert completion.calls == []
 
 
+def test_completion_generation_failure_keeps_original_local_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    segmenter = _SingleFrameSegmentationBackend(
+        "exception",
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=_LocalizedCompletionBackend(
+            fail=RuntimeError("completion failed"),
+        ),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=segmenter,
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert stats.failed == 0
+    assert stats.completion_attempted == 1
+    assert stats.completion_ready == 0
+    assert stats.completion_rejected == 1
+    assert state.status == "ready"
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert segmenter.calls == []
+    completion_root = storage.clip_dir("clip-1") / "reference_completion"
+    assert not list(completion_root.glob(".tmp-*"))
+    with Image.open(storage.selected_entity_path("clip-1", "e1")) as opened:
+        assert opened.mode == "RGBA"
+
+
 @pytest.mark.parametrize(
     "segmentation_status",
-    ["not_found", "failed", "missing_slot"],
+    ["not_found", "failed", "missing_slot", "exception"],
 )
 def test_generated_fallback_failure_keeps_original_local_reference(
     tmp_path: Path,
@@ -2331,6 +2406,7 @@ def test_generated_fallback_failure_keeps_original_local_reference(
     )
     storage = _storage(config, entity_types=("subject",))
     reference_judge = _LocalThenGeneratedFullJudge()
+    segmenter = _SingleFrameSegmentationBackend(segmentation_status)
 
     stats = pair_clips(
         config,
@@ -2338,9 +2414,7 @@ def test_generated_fallback_failure_keeps_original_local_reference(
         judge=reference_judge,
         completion_backend=_LocalizedCompletionBackend(),
         completion_judge=_LocalizedCompletionJudge(),
-        completion_segmentation_backend=(
-            _SingleFrameSegmentationBackend(segmentation_status)
-        ),
+        completion_segmentation_backend=segmenter,
     )
 
     clip = storage.read_clip("clip-1")
@@ -2354,6 +2428,7 @@ def test_generated_fallback_failure_keeps_original_local_reference(
     assert state.synthetic is False
     assert state.source_clip_uid == "clip-1"
     assert reference_judge.calls == ["source"]
+    assert not segmenter.calls[0]["session_directory"].exists()
     with Image.open(storage.selected_entity_path("clip-1", "e1")) as opened:
         assert opened.mode == "RGBA"
 
