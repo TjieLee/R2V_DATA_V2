@@ -686,38 +686,83 @@ def test_powerpaint_v21_layout_missing_artifact_fails_closed(
         validate_powerpaint_v21_layout(config)
 
 
+@pytest.mark.parametrize("enable_model_cpu_offload", [True, False])
 def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    enable_model_cpu_offload: bool,
 ) -> None:
-    config = _create_powerpaint_layout(tmp_path)
-    records: dict[str, object] = {"pretrained": [], "offload": False}
+    config = replace(
+        _create_powerpaint_layout(tmp_path),
+        enable_model_cpu_offload=enable_model_cpu_offload,
+    )
+    records: dict[str, object] = {
+        "pretrained": [],
+        "offload": False,
+        "to_device": None,
+        "clip_tokenizer_calls": 0,
+    }
 
     class _LoadedComponent:
         @classmethod
         def from_pretrained(cls, path: str, **kwargs: object) -> _LoadedComponent:
+            instance = cls()
             records["pretrained"].append((cls.__name__, path, dict(kwargs)))
-            return cls()
+            records[f"component_{cls.__name__}"] = instance
+            return instance
 
-        def load_state_dict(self, state: object) -> None:
-            records["text_state"] = state
+        def load_state_dict(self, state: object, *, strict: bool) -> object:
+            records["text_state"] = (state, strict)
+            return SimpleNamespace(
+                missing_keys=["position_ids"],
+                unexpected_keys=["legacy_embedding"],
+            )
 
     class _BrushNet:
         @classmethod
         def from_unet(cls, unet: object) -> _BrushNet:
             records["brushnet_unet"] = unet
-            return cls()
+            instance = cls()
+            records["brushnet"] = instance
+            return instance
 
     class _TokenizerWrapper:
-        def __init__(self, tokenizer: object) -> None:
-            self.tokenizer = tokenizer
+        def __init__(
+            self,
+            from_pretrained: str | None = None,
+            from_config: object | None = None,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            records["tokenizer_init"] = {
+                "from_pretrained": from_pretrained,
+                "from_config": from_config,
+                "args": args,
+                "kwargs": dict(kwargs),
+            }
+            records["tokenizer"] = self
+
+    class _ForbiddenClipTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args: object, **_kwargs: object) -> object:
+            records["clip_tokenizer_calls"] += 1
+            raise AssertionError("CLIPTokenizer must not be loaded directly")
 
     def _add_tokens(
+        *,
         tokenizer: object,
         text_encoder: object,
-        **kwargs: object,
+        placeholder_tokens: list[str],
+        initialize_tokens: list[str],
+        num_vectors_per_token: int,
     ) -> None:
-        records["tokens"] = (tokenizer, text_encoder, kwargs)
+        records["tokens"] = {
+            "tokenizer": tokenizer,
+            "text_encoder": text_encoder,
+            "placeholder_tokens": placeholder_tokens,
+            "initialize_tokens": initialize_tokens,
+            "num_vectors_per_token": num_vectors_per_token,
+        }
 
     class _LoadedPipeline:
         def __init__(self) -> None:
@@ -730,13 +775,19 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
             **kwargs: object,
         ) -> _LoadedPipeline:
             records["pipeline"] = (path, dict(kwargs))
-            return cls()
+            instance = cls()
+            records["pipeline_instance"] = instance
+            return instance
 
         def set_progress_bar_config(self, *, disable: bool) -> None:
             records["progress_disabled"] = disable
 
         def enable_model_cpu_offload(self) -> None:
             records["offload"] = True
+
+        def to(self, device: str) -> _LoadedPipeline:
+            records["to_device"] = device
+            return self
 
     class _Scheduler:
         @classmethod
@@ -768,11 +819,7 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
         (_LoadedComponent,),
         {},
     )
-    transformers_module.CLIPTokenizer = type(
-        "CLIPTokenizer",
-        (_LoadedComponent,),
-        {},
-    )
+    transformers_module.CLIPTokenizer = _ForbiddenClipTokenizer
     safetensors_module = types.ModuleType("safetensors")
     safetensors_torch_module = types.ModuleType("safetensors.torch")
 
@@ -814,19 +861,50 @@ def test_powerpaint_loader_uses_custom_local_only_v21_pipeline(
     backend = PowerPaintV21ReferenceCompletionBackend(config)
     backend._ensure_loaded()
 
-    assert records["offload"] is True
+    base_model = str(config.checkpoint_dir / "realisticVisionV60B1_v51VAE")
+    tokenizer_init = records["tokenizer_init"]
+    assert tokenizer_init == {
+        "from_pretrained": base_model,
+        "from_config": None,
+        "args": (),
+        "kwargs": {
+            "subfolder": "tokenizer",
+            "revision": None,
+            "local_files_only": True,
+        },
+    }
+    assert records["clip_tokenizer_calls"] == 0
+    assert records["offload"] is enable_model_cpu_offload
+    assert records["to_device"] == (
+        None if enable_model_cpu_offload else config.device
+    )
     assert records["progress_disabled"] is True
     assert all(
         kwargs["local_files_only"] is True for _, _, kwargs in records["pretrained"]
     )
     pipeline_kwargs = records["pipeline"][1]
     assert pipeline_kwargs["local_files_only"] is True
+    assert pipeline_kwargs["low_cpu_mem_usage"] is False
     assert pipeline_kwargs["safety_checker"] is None
     assert pipeline_kwargs["feature_extractor"] is None
-    token_kwargs = records["tokens"][2]
-    assert token_kwargs["placeholder_tokens"] == ["P_ctxt", "P_shape", "P_obj"]
-    assert token_kwargs["num_vectors_per_token"] == 10
+    assert pipeline_kwargs["unet"] is records["component_UNet2DConditionModel"]
+    assert pipeline_kwargs["brushnet"] is records["brushnet"]
+    assert (
+        pipeline_kwargs["text_encoder_brushnet"]
+        is records["component_CLIPTextModel"]
+    )
+    assert pipeline_kwargs["tokenizer"] is records["tokenizer"]
+    token_kwargs = records["tokens"]
+    assert token_kwargs == {
+        "tokenizer": records["tokenizer"],
+        "text_encoder": records["component_CLIPTextModel"],
+        "placeholder_tokens": ["P_ctxt", "P_shape", "P_obj"],
+        "initialize_tokens": ["a", "a", "a"],
+        "num_vectors_per_token": 10,
+    }
+    assert records["text_state"] == ({"embedding": "local"}, False)
     assert records["torch_load"][1:] == ("cpu", True)
+    assert backend._pipeline is records["pipeline_instance"]
 
 
 def test_candidate_order_is_deterministic(environment: _Environment) -> None:

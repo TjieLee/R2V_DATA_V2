@@ -793,7 +793,7 @@ class PowerPaintV21ReferenceCompletionBackend:
         import torch
         from diffusers import UniPCMultistepScheduler
         from safetensors.torch import load_model
-        from transformers import CLIPTextModel, CLIPTokenizer
+        from transformers import CLIPTextModel
 
         dtype = getattr(torch, self.config.dtype, None)
         if dtype is None:
@@ -819,21 +819,19 @@ class PowerPaintV21ReferenceCompletionBackend:
             torch_dtype=dtype,
             **common,
         )
-        tokenizer_base = CLIPTokenizer.from_pretrained(
-            base_model,
+        tokenizer = TokenizerWrapper(
+            from_pretrained=base_model,
             subfolder="tokenizer",
-            **common,
+            revision=None,
+            local_files_only=True,
         )
-        tokenizer = TokenizerWrapper(tokenizer_base)
-        token_result = add_tokens(
-            tokenizer,
-            text_encoder_brushnet,
+        add_tokens(
+            tokenizer=tokenizer,
+            text_encoder=text_encoder_brushnet,
             placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
             initialize_tokens=["a", "a", "a"],
             num_vectors_per_token=10,
         )
-        if isinstance(token_result, tuple) and len(token_result) == 2:
-            tokenizer, text_encoder_brushnet = token_result
         brushnet = BrushNetModel.from_unet(unet)
         load_model(brushnet, str(paths["brushnet_weights"]))
         torch_load_parameters: dict[str, object] = {"map_location": "cpu"}
@@ -845,7 +843,22 @@ class PowerPaintV21ReferenceCompletionBackend:
         )
         if isinstance(text_state, dict) and set(text_state) == {"state_dict"}:
             text_state = text_state["state_dict"]
-        text_encoder_brushnet.load_state_dict(text_state)
+        incompatible_keys = text_encoder_brushnet.load_state_dict(
+            text_state,
+            strict=False,
+        )
+        for field_name in ("missing_keys", "unexpected_keys"):
+            if not hasattr(incompatible_keys, field_name):
+                raise TypeError(
+                    "PowerPaint text encoder load_state_dict must return "
+                    "torch-compatible incompatible keys"
+                )
+            keys = getattr(incompatible_keys, field_name)
+            if not isinstance(keys, (list, tuple)):
+                raise TypeError(
+                    "PowerPaint text encoder incompatible keys must be lists "
+                    "or tuples"
+                )
         pipeline = Pipeline.from_pretrained(
             base_model,
             unet=unet,
@@ -854,6 +867,7 @@ class PowerPaintV21ReferenceCompletionBackend:
             tokenizer=tokenizer,
             torch_dtype=dtype,
             local_files_only=True,
+            low_cpu_mem_usage=False,
             safety_checker=None,
             feature_extractor=None,
             requires_safety_checker=False,
