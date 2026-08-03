@@ -14,15 +14,20 @@ from PIL import Image
 
 import r2v_data_v2.v3.reference_completion_benchmark as completion_module
 import r2v_data_v2.v3.reference_completion_qwen as qwen_module
+from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.reference_completion_benchmark import (
+    QwenReferenceCompletionJudge,
     ReferenceCompletionReview,
 )
 from r2v_data_v2.v3.reference_completion_qwen import (
+    DEFAULT_QWEN_COMPOSITING_MODE,
     DEFAULT_QWEN_MODEL_PATH,
     DEFAULT_QWEN_SEEDS,
     DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
     DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT,
     QWEN_COMPLETION_BACKEND,
+    QWEN_WHOLE_CANVAS_JUDGE_ADDENDUM,
+    QwenCompletionCompositingMode,
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
     run_qwen_reference_completion_benchmark,
@@ -79,6 +84,7 @@ def _write_manifest(
     reference_type: str = "subject",
     completion_mask_path: Path | None | object = ...,
     entity_phrase: str = "a person in a red coat",
+    completion_start_ratio: float = 0.5,
 ) -> None:
     mask_path = (
         environment.completion_mask
@@ -95,7 +101,7 @@ def _write_manifest(
         "context_rgb_path": None,
         "completion_mask_path": str(mask_path) if mask_path is not None else None,
         "completion_sides": ["bottom"],
-        "completion_start_ratio": 0.5,
+        "completion_start_ratio": completion_start_ratio,
     }
     environment.manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
@@ -217,13 +223,16 @@ def _run(
     prompt: str = DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT,
     negative_prompt: str = DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
     seeds: tuple[int, ...] = DEFAULT_QWEN_SEEDS,
+    compositing_mode: QwenCompletionCompositingMode = (
+        DEFAULT_QWEN_COMPOSITING_MODE
+    ),
 ) -> tuple[_Backend, _Judge]:
     selected_backend = backend or _Backend()
     selected_judge = judge or _Judge([_accept() for _ in seeds])
     run_qwen_reference_completion_benchmark(
         manifest_path=environment.manifest,
         benchmark_root=environment.output_root,
-        config=_config(environment),
+        config=_config(environment, compositing_mode=compositing_mode),
         backend=selected_backend,
         judge=selected_judge,
         prompt=prompt,
@@ -246,6 +255,8 @@ def test_default_configuration_and_prompts_are_local_and_english() -> None:
     assert config.local_files_only is True
     assert config.model_min_side == 1024
     assert config.model_multiple == 16
+    assert config.compositing_mode == "whole_canvas"
+    assert DEFAULT_QWEN_COMPOSITING_MODE == "whole_canvas"
     assert DEFAULT_QWEN_SEEDS == (0, 17)
     assert "Complete the missing parts of the same single person" in (
         DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT
@@ -279,6 +290,7 @@ def test_config_requires_existing_local_model_directory(
         ({"mask_overlap_pixels": -1}, "non-negative integer"),
         ({"model_min_side": 0}, "positive integer"),
         ({"model_multiple": 0}, "positive integer"),
+        ({"compositing_mode": "unknown"}, "compositing_mode"),
     ],
 )
 def test_config_rejects_invalid_values(
@@ -558,7 +570,13 @@ def test_missing_explicit_mask_fails_before_root_creation(
     judge = _Judge([_accept()])
 
     with pytest.raises(ValueError, match="requires completion_mask_path"):
-        _run(environment, backend=backend, judge=judge, seeds=(0,))
+        _run(
+            environment,
+            backend=backend,
+            judge=judge,
+            seeds=(0,),
+            compositing_mode="explicit_mask",
+        )
 
     assert not environment.output_root.exists()
     assert backend.calls == [] and judge.calls == []
@@ -572,7 +590,13 @@ def test_invalid_explicit_mask_keeps_shared_fail_closed_validation(
     judge = _Judge([_accept()])
 
     with pytest.raises(ValueError, match="empty"):
-        _run(environment, backend=backend, judge=judge, seeds=(0,))
+        _run(
+            environment,
+            backend=backend,
+            judge=judge,
+            seeds=(0,),
+            compositing_mode="explicit_mask",
+        )
 
     assert not environment.output_root.exists()
     assert backend.calls == [] and judge.calls == []
@@ -628,14 +652,18 @@ def test_prompt_override_is_preserved_and_blank_prompts_are_rejected(
         assert not output_root.exists()
 
 
-def test_result_uses_qwen_candidate_fields_and_keeps_both_seeds(
+def test_whole_canvas_result_uses_qwen_fields_and_keeps_both_seeds(
     environment: _Environment,
 ) -> None:
     _run(environment)
     result = _result(environment)
 
     assert result["backend"] == QWEN_COMPLETION_BACKEND
-    assert result["completion_mask_mode"] == "explicit"
+    assert result["compositing_mode"] == "whole_canvas"
+    assert result["completion_mask_mode"] is None
+    assert result["completion_mask_source_path"] is None
+    assert result["completion_mask_source_sha256"] is None
+    assert result["editable_region_path"] == "editable_region.png"
     assert [attempt["candidate_id"] for attempt in result["attempts"]] == [
         "qwen_seed_0",
         "qwen_seed_17",
@@ -650,9 +678,201 @@ def test_result_uses_qwen_candidate_fields_and_keeps_both_seeds(
     ]
     assert result["accepted_candidate"]["candidate_id"] == "qwen_seed_0"
     assert all("fitting_degree" not in attempt for attempt in result["attempts"])
+    assert all(
+        attempt["compositing_mode"] == "whole_canvas"
+        for attempt in result["attempts"]
+    )
     assert "fitting_degree" not in result["accepted_candidate"]
     assert all(attempt["prompt"] for attempt in result["attempts"])
     assert all(attempt["negative_prompt"] for attempt in result["attempts"])
+
+
+def test_whole_canvas_allows_null_mask_and_publishes_editable_region(
+    environment: _Environment,
+) -> None:
+    _write_manifest(environment, completion_mask_path=None)
+    _, judge = _run(environment, seeds=(0,))
+    sample_root = environment.output_root / "sample-1"
+
+    with Image.open(sample_root / "editable_region.png") as opened:
+        opened.load()
+        editable = np.asarray(opened)
+        assert opened.mode == "L"
+        assert opened.size == (12, 15)
+    with Image.open(sample_root / "visible_mask.png") as opened:
+        visible = np.asarray(opened) == 255
+
+    assert set(np.unique(editable)) == {0, 255}
+    assert np.all(editable[visible] == 0)
+    assert np.all(editable[~visible] == 255)
+    assert not (sample_root / "completion_mask.png").exists()
+    assert np.array_equal(
+        np.asarray(judge.calls[0]["completion_mask"]),
+        editable,
+    )
+    assert judge.calls[0]["completion_region_label"] == (
+        "editable region; this is not a model input mask"
+    )
+    assert judge.calls[0]["system_prompt_addendum"] == (
+        QWEN_WHOLE_CANVAS_JUDGE_ADDENDUM
+    )
+
+
+def test_qwen_judge_renders_whole_canvas_region_label_and_instructions() -> None:
+    judge = QwenReferenceCompletionJudge(
+        QwenServiceConfig(model="fake-local-judge"),
+        client=SimpleNamespace(),
+    )
+    canvas = Image.new("RGB", (12, 15), "white")
+    editable = Image.new("L", canvas.size, 255)
+    messages = judge._messages(
+        source_rgba=_source_image(),
+        completion_canvas=canvas,
+        completion_mask=editable,
+        candidate_rgb=_gradient(canvas.size),
+        request_text="Review.",
+        completion_region_label=(
+            "editable region; this is not a model input mask"
+        ),
+        system_prompt_addendum=QWEN_WHOLE_CANVAS_JUDGE_ADDENDUM,
+    )
+
+    assert QWEN_WHOLE_CANVAS_JUDGE_ADDENDUM in messages[0]["content"]
+    assert any(
+        item
+        == {
+            "type": "text",
+            "text": (
+                "Image 3: editable region; this is not a model input mask"
+            ),
+        }
+        for item in messages[1]["content"]
+    )
+
+
+def test_whole_canvas_keeps_qwen_pixels_outside_visible_entity(
+    environment: _Environment,
+) -> None:
+    _write_manifest(environment, completion_mask_path=None)
+    _run(environment, seeds=(0,))
+    sample_root = environment.output_root / "sample-1"
+    with Image.open(sample_root / "candidate_qwen_seed_0.png") as opened:
+        candidate = np.asarray(opened.convert("RGB"))
+    with Image.open(sample_root / "baseline_canvas.png") as opened:
+        baseline = np.asarray(opened.convert("RGB"))
+    with Image.open(sample_root / "visible_mask.png") as opened:
+        visible = np.asarray(opened) == 255
+    expected_generated = np.asarray(
+        _gradient((64, 80)).resize((12, 15), Image.Resampling.LANCZOS)
+    )
+
+    assert np.array_equal(candidate[visible], baseline[visible])
+    assert np.array_equal(candidate[~visible], expected_generated[~visible])
+    assert np.any(candidate[~visible] != baseline[~visible])
+
+
+def test_whole_canvas_ignores_completion_start_ratio(
+    environment: _Environment,
+) -> None:
+    first = replace(
+        environment,
+        output_root=environment.benchmark_base / "ratio-zero",
+    )
+    _write_manifest(
+        first,
+        completion_mask_path=None,
+        completion_start_ratio=0.0,
+    )
+    _run(first, seeds=(0,))
+    first_region = (first.output_root / "sample-1" / "editable_region.png").read_bytes()
+
+    second = replace(
+        environment,
+        output_root=environment.benchmark_base / "ratio-one",
+    )
+    _write_manifest(
+        second,
+        completion_mask_path=None,
+        completion_start_ratio=1.0,
+    )
+    _run(second, seeds=(0,))
+    second_region = (
+        second.output_root / "sample-1" / "editable_region.png"
+    ).read_bytes()
+
+    assert first_region == second_region
+    assert _result(second)["completion_start_ratio"] == 1.0
+
+
+def test_explicit_mask_result_and_artifacts_remain_available(
+    environment: _Environment,
+) -> None:
+    _run(environment, seeds=(0,), compositing_mode="explicit_mask")
+    result = _result(environment)
+    attempt = result["attempts"][0]
+    sample_root = environment.output_root / "sample-1"
+
+    assert result["compositing_mode"] == "explicit_mask"
+    assert result["completion_mask_mode"] == "explicit"
+    assert result["completion_mask_source_path"] == str(
+        environment.completion_mask
+    )
+    assert result["completion_mask_source_sha256"] == _sha256(
+        environment.completion_mask
+    )
+    assert result["editable_region_path"] is None
+    assert attempt["compositing_mode"] == "explicit_mask"
+    assert "outside_completion_mask_exact" in attempt["hard_check"]["checks"]
+    assert (sample_root / "completion_mask.png").exists()
+    assert not (sample_root / "editable_region.png").exists()
+
+
+@pytest.mark.parametrize(
+    ("backend_mode", "reason"),
+    [
+        ("unchanged", "candidate_unchanged_outside_visible_region"),
+        ("constant", "generated_region_is_constant"),
+    ],
+)
+def test_whole_canvas_hard_rejections_skip_judge(
+    environment: _Environment,
+    backend_mode: str,
+    reason: str,
+) -> None:
+    class HardFailureBackend(_Backend):
+        def complete(self, **kwargs: object) -> Image.Image:
+            self.calls.append(dict(kwargs))
+            input_rgb = kwargs["input_rgb"]
+            assert isinstance(input_rgb, Image.Image)
+            if backend_mode == "unchanged":
+                return input_rgb.copy()
+            return Image.new("RGB", input_rgb.size, (77, 77, 77))
+
+    judge = _Judge([_accept()])
+    _run(
+        environment,
+        backend=HardFailureBackend(),
+        judge=judge,
+        seeds=(0,),
+    )
+    attempt = _result(environment)["attempts"][0]
+
+    assert attempt["judge_status"] == "not_run"
+    assert reason in attempt["hard_check"]["reasons"]
+    assert "outside_completion_mask_exact" not in attempt["hard_check"]["checks"]
+    assert judge.calls == []
+
+
+def test_whole_canvas_hard_checks_use_editable_region_fields(
+    environment: _Environment,
+) -> None:
+    _run(environment, seeds=(0,))
+    checks = _result(environment)["attempts"][0]["hard_check"]["checks"]
+
+    assert checks["candidate_changed_outside_visible_region"] is True
+    assert checks["generated_region_not_constant"] is True
+    assert "outside_completion_mask_exact" not in checks
+    assert "candidate_changed_inside_completion_mask" not in checks
 
 
 def test_hard_compositing_restores_visible_and_outside_mask_pixels(
@@ -660,7 +880,7 @@ def test_hard_compositing_restores_visible_and_outside_mask_pixels(
 ) -> None:
     source_hash = _sha256(environment.source)
     mask_hash = _sha256(environment.completion_mask)
-    _run(environment, seeds=(0,))
+    _run(environment, seeds=(0,), compositing_mode="explicit_mask")
     sample_root = environment.output_root / "sample-1"
     with Image.open(sample_root / "candidate_qwen_seed_0.png") as candidate_image:
         candidate = np.asarray(candidate_image.convert("RGB"))
@@ -696,7 +916,13 @@ def test_hard_reject_skips_judge(
 
     backend = HardFailureBackend()
     judge = _Judge([_accept()])
-    _run(environment, backend=backend, judge=judge, seeds=(0,))
+    _run(
+        environment,
+        backend=backend,
+        judge=judge,
+        seeds=(0,),
+        compositing_mode="explicit_mask",
+    )
     attempt = _result(environment)["attempts"][0]
 
     assert attempt["judge_status"] == "not_run"
@@ -765,14 +991,24 @@ def test_summary_counts_hard_and_judge_rejections_deterministically(
         "accepted": 0,
         "rejected": 1,
         "hard_check_rejection_counts": {
-            "candidate_unchanged_inside_completion_mask": 1,
+            "candidate_unchanged_outside_visible_region": 1,
         },
         "judge_rejection_flag_counts": {
             "boundary_clean": 1,
             "completion_useful": 1,
             "identity_preserved": 1,
         },
+        "compositing_mode_counts": {"whole_canvas": 1},
     }
+
+
+def test_summary_counts_explicit_mask_mode(environment: _Environment) -> None:
+    _run(environment, seeds=(0,), compositing_mode="explicit_mask")
+    summary = json.loads(
+        (environment.output_root / "benchmark_summary.json").read_text()
+    )
+
+    assert summary["compositing_mode_counts"] == {"explicit_mask": 1}
 
 
 def test_existing_root_is_rejected_without_calls(environment: _Environment) -> None:
@@ -784,6 +1020,28 @@ def test_existing_root_is_rejected_without_calls(environment: _Environment) -> N
         _run(environment, backend=backend, judge=judge, seeds=(0,))
 
     assert backend.calls == [] and judge.calls == []
+
+
+def test_whole_canvas_preserves_source_and_context_files(
+    environment: _Environment,
+) -> None:
+    context = environment.source.parent / "context.png"
+    Image.new("RGB", (12, 10), (231, 233, 235)).save(context, format="PNG")
+    payload = json.loads(environment.manifest.read_text(encoding="utf-8"))
+    payload["context_rgb_path"] = str(context)
+    payload["completion_mask_path"] = None
+    environment.manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    source_sha256 = _sha256(environment.source)
+    context_sha256 = _sha256(context)
+
+    _run(environment, seeds=(0,))
+    result = _result(environment)
+
+    assert _sha256(environment.source) == source_sha256
+    assert _sha256(context) == context_sha256
+    assert result["source_sha256"] == source_sha256
+    assert result["context_sha256"] == context_sha256
+    assert (environment.output_root / "sample-1" / "context_rgb.png").exists()
 
 
 def test_sample_publication_is_transactional_on_metadata_failure(
@@ -841,10 +1099,25 @@ def test_cli_has_qwen_defaults_and_no_powerpaint_arguments() -> None:
     assert arguments.model_min_side == 1024
     assert arguments.prompt == DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT
     assert arguments.negative_prompt == DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT
+    assert arguments.compositing_mode == "whole_canvas"
     assert arguments.seeds is None
     assert {"--powerpaint-repo", "--checkpoint-dir", "--strategy", "--fitting-degree"}.isdisjoint(
         option_strings
     )
+
+    explicit_arguments = parser.parse_args(
+        [
+            "--manifest",
+            "/tmp/manifest.jsonl",
+            "--benchmark-root",
+            "/tmp/benchmark",
+            "--judge-model",
+            "local-qwen-judge",
+            "--compositing-mode",
+            "explicit_mask",
+        ]
+    )
+    assert explicit_arguments.compositing_mode == "explicit_mask"
 
 
 def test_duplicate_or_invalid_seeds_fail_before_root(environment: _Environment) -> None:

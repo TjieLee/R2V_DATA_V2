@@ -1475,6 +1475,10 @@ def test_qwen_judge_requests_strict_schema_with_four_images() -> None:
     assert response_format["json_schema"]["strict"] is True
     content = completions.calls[0]["messages"][1]["content"]
     assert len([item for item in content if item["type"] == "image_url"]) == 4
+    assert any(
+        item == {"type": "text", "text": "Image 3: completion mask"}
+        for item in content
+    )
 
 
 def test_qwen_judge_falls_back_to_json_object() -> None:

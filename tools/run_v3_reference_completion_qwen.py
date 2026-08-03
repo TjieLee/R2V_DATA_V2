@@ -9,6 +9,7 @@ from r2v_data_v2.v3.reference_completion_benchmark import (
     QwenReferenceCompletionJudge,
 )
 from r2v_data_v2.v3.reference_completion_qwen import (
+    DEFAULT_QWEN_COMPOSITING_MODE,
     DEFAULT_QWEN_MODEL_PATH,
     DEFAULT_QWEN_SEEDS,
     DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
@@ -58,6 +59,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-min-side", type=int, default=1024)
     parser.add_argument("--model-multiple", type=int, default=16)
     parser.add_argument(
+        "--compositing-mode",
+        choices=("whole_canvas", "explicit_mask"),
+        default=DEFAULT_QWEN_COMPOSITING_MODE,
+    )
+    parser.add_argument(
         "--seed",
         action="append",
         type=int,
@@ -81,6 +87,7 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         mask_overlap_pixels=arguments.mask_overlap_pixels,
         model_min_side=arguments.model_min_side,
         model_multiple=arguments.model_multiple,
+        compositing_mode=arguments.compositing_mode,
     )
     backend = QwenImageEdit2511ReferenceCompletionBackend(completion_config)
     judge = QwenReferenceCompletionJudge(

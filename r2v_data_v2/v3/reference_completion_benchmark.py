@@ -41,6 +41,7 @@ from r2v_data_v2.v3.config import QwenServiceConfig
 ReferenceType = Literal["subject", "object", "group"]
 CompletionStrategy = Literal["text_guided", "shape_guided"]
 CompletionSide = Literal["top", "bottom", "left", "right"]
+CompletionCandidateRegionKind = Literal["completion_mask", "editable_region"]
 
 DEFAULT_STRATEGIES: tuple[CompletionStrategy, ...] = (
     "text_guided",
@@ -199,6 +200,8 @@ class ReferenceCompletionJudge(Protocol):
         candidate_rgb: Image.Image,
         entity_phrase: str,
         reference_type: ReferenceType,
+        completion_region_label: str = "completion mask",
+        system_prompt_addendum: str = "",
     ) -> ReferenceCompletionReview: ...
 
 
@@ -281,11 +284,22 @@ class PowerPaintV21CompletionConfig:
 class CompletionCanvas:
     baseline_rgb: Image.Image
     visible_mask: Image.Image
-    completion_mask: Image.Image
+    candidate_region: Image.Image
+    candidate_region_kind: CompletionCandidateRegionKind
     source_offset_xy: tuple[int, int]
     source_size: tuple[int, int]
     canvas_size: tuple[int, int]
-    completion_mask_area_ratio: float
+    candidate_region_area_ratio: float
+
+    @property
+    def completion_mask(self) -> Image.Image:
+        """Compatibility alias for PowerPaint completion-mask callers."""
+        return self.candidate_region
+
+    @property
+    def completion_mask_area_ratio(self) -> float:
+        """Compatibility alias for existing PowerPaint result metadata."""
+        return self.candidate_region_area_ratio
 
 
 @dataclass(frozen=True)
@@ -370,7 +384,7 @@ class CompletionCandidateGenerator(Protocol):
         record: CompletionManifestRecord,
         candidate: CompletionCandidateSpec,
         input_rgb: Image.Image,
-        completion_mask: Image.Image,
+        candidate_region: Image.Image,
     ) -> Image.Image: ...
 
 
@@ -382,6 +396,29 @@ class CompletionCanvasRuntimeConfig(Protocol):
     model_multiple: int
 
     def validate(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class CompletionRunPolicy:
+    candidate_region_kind: CompletionCandidateRegionKind = "completion_mask"
+    preserve_outside_candidate_region: bool = True
+    region_artifact_name: str = "completion_mask.png"
+    judge_region_label: str = "completion mask"
+    judge_system_prompt_addendum: str = ""
+
+    def validate(self) -> None:
+        if self.candidate_region_kind == "completion_mask":
+            if self.region_artifact_name != "completion_mask.png":
+                raise ValueError("completion-mask policy must publish completion_mask.png")
+        elif self.candidate_region_kind == "editable_region":
+            if self.preserve_outside_candidate_region:
+                raise ValueError("editable-region policy cannot preserve its outside")
+            if self.region_artifact_name != "editable_region.png":
+                raise ValueError("editable-region policy must publish editable_region.png")
+        else:
+            raise ValueError("unsupported candidate region kind")
+        if not self.judge_region_label.strip():
+            raise ValueError("judge_region_label must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -684,11 +721,12 @@ def _finish_completion_canvas(
     return CompletionCanvas(
         baseline_rgb=canvas_base.baseline_rgb,
         visible_mask=canvas_base.visible_mask,
-        completion_mask=completion_mask.copy(),
+        candidate_region=completion_mask.copy(),
+        candidate_region_kind="completion_mask",
         source_offset_xy=canvas_base.source_offset_xy,
         source_size=canvas_base.source_size,
         canvas_size=canvas_base.canvas_size,
-        completion_mask_area_ratio=float(mask.mean()),
+        candidate_region_area_ratio=float(mask.mean()),
     )
 
 
@@ -718,6 +756,34 @@ def build_completion_canvas(
     return _finish_completion_canvas(
         canvas_base=canvas_base,
         completion_mask=completion_mask,
+    )
+
+
+def build_editable_completion_canvas(
+    *,
+    source_rgba: Image.Image,
+    context_rgb: Image.Image | None,
+    completion_sides: tuple[CompletionSide, ...],
+    config: CompletionCanvasRuntimeConfig,
+) -> CompletionCanvas:
+    canvas_base = _build_completion_canvas_base(
+        source_rgba=source_rgba,
+        context_rgb=context_rgb,
+        completion_sides=completion_sides,
+        config=config,
+    )
+    visible = np.asarray(canvas_base.visible_mask, dtype=np.uint8) == 255
+    editable = ~visible
+    editable_region = Image.fromarray(editable.astype(np.uint8) * 255)
+    return CompletionCanvas(
+        baseline_rgb=canvas_base.baseline_rgb,
+        visible_mask=canvas_base.visible_mask,
+        candidate_region=editable_region,
+        candidate_region_kind="editable_region",
+        source_offset_xy=canvas_base.source_offset_xy,
+        source_size=canvas_base.source_size,
+        canvas_size=canvas_base.canvas_size,
+        candidate_region_area_ratio=float(editable.mean()),
     )
 
 
@@ -765,14 +831,14 @@ def resize_completion_inputs(
         transform.model_size,
         resample=Image.Resampling.LANCZOS,
     )
-    model_mask = canvas.completion_mask.resize(
+    model_region = canvas.candidate_region.resize(
         transform.model_size,
         resample=Image.Resampling.NEAREST,
     )
-    mask_values = np.asarray(model_mask, dtype=np.uint8)
-    if not {int(value) for value in np.unique(mask_values)}.issubset({0, 255}):
-        raise RuntimeError("model-space completion mask is not binary")
-    return model_rgb, model_mask
+    region_values = np.asarray(model_region, dtype=np.uint8)
+    if not {int(value) for value in np.unique(region_values)}.issubset({0, 255}):
+        raise RuntimeError("model-space candidate region is not binary")
+    return model_rgb, model_region
 
 
 def build_completion_prompt(
@@ -1218,12 +1284,14 @@ class QwenReferenceCompletionJudge:
         completion_mask: Image.Image,
         candidate_rgb: Image.Image,
         request_text: str,
+        completion_region_label: str,
+        system_prompt_addendum: str,
     ) -> list[dict[str, object]]:
         content: list[dict[str, object]] = [{"type": "text", "text": request_text}]
         for label, image in (
             ("Image 1: source entity on white", _white_source(source_rgba)),
             ("Image 2: completion canvas input", completion_canvas),
-            ("Image 3: completion mask", completion_mask.convert("L")),
+            (f"Image 3: {completion_region_label}", completion_mask.convert("L")),
             ("Image 4: completed candidate", candidate_rgb),
         ):
             content.append({"type": "text", "text": label})
@@ -1233,8 +1301,11 @@ class QwenReferenceCompletionJudge:
                     "image_url": {"url": _png_data_url(image)},
                 }
             )
+        system_prompt = JUDGE_SYSTEM_PROMPT
+        if system_prompt_addendum.strip():
+            system_prompt += "\n\n" + system_prompt_addendum.strip()
         return [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ]
 
@@ -1278,17 +1349,21 @@ class QwenReferenceCompletionJudge:
         candidate_rgb: Image.Image,
         entity_phrase: str,
         reference_type: ReferenceType,
+        completion_region_label: str = "completion mask",
+        system_prompt_addendum: str = "",
     ) -> ReferenceCompletionReview:
         if source_rgba.mode != "RGBA":
             raise ValueError("completion judge source must be RGBA")
         if completion_canvas.mode != "RGB" or candidate_rgb.mode != "RGB":
             raise ValueError("completion judge canvas and candidate must be RGB")
         if completion_mask.mode != "L":
-            raise ValueError("completion judge mask must be L mode")
+            raise ValueError("completion judge region must be L mode")
         if completion_canvas.size != candidate_rgb.size or (
             completion_mask.size != completion_canvas.size
         ):
             raise ValueError("completion judge canvas images must have matching sizes")
+        if not completion_region_label.strip():
+            raise ValueError("completion_region_label must be non-empty")
         original_request = (
             "Judge this immutable completion candidate. "
             f"reference_type={reference_type}; entity_phrase={entity_phrase}. "
@@ -1313,6 +1388,8 @@ class QwenReferenceCompletionJudge:
                         completion_mask=completion_mask,
                         candidate_rgb=candidate_rgb,
                         request_text=request_text,
+                        completion_region_label=completion_region_label,
+                        system_prompt_addendum=system_prompt_addendum,
                     )
                 )
             except Exception as exc:
@@ -1353,21 +1430,34 @@ def _hard_check_candidate(
     source_sha256: str,
     canvas: CompletionCanvas,
     transform: ModelSpaceTransform,
+    preserve_outside_candidate_region: bool = True,
 ) -> tuple[Image.Image | None, HardCheckReport]:
     checks = {
         "output_rgb": isinstance(generated_model_rgb, Image.Image)
         and generated_model_rgb.mode == "RGB",
         "dimensions_match_completion_canvas": False,
         "source_visible_pixels_exact": False,
-        "outside_completion_mask_exact": False,
-        "completion_mask_nonempty": False,
-        "completion_mask_not_full_canvas": False,
-        "completion_mask_connected_to_visible_entity": False,
-        "candidate_changed_inside_completion_mask": False,
-        "background_not_constant": False,
         "no_invalid_pixels": False,
         "source_file_unchanged": False,
     }
+    if preserve_outside_candidate_region:
+        checks.update(
+            {
+                "outside_completion_mask_exact": False,
+                "completion_mask_nonempty": False,
+                "completion_mask_not_full_canvas": False,
+                "completion_mask_connected_to_visible_entity": False,
+                "candidate_changed_inside_completion_mask": False,
+                "background_not_constant": False,
+            }
+        )
+    else:
+        checks.update(
+            {
+                "candidate_changed_outside_visible_region": False,
+                "generated_region_not_constant": False,
+            }
+        )
     reasons: list[str] = []
     if not checks["output_rgb"]:
         reasons.append("generated_output_must_be_rgb_pil")
@@ -1383,10 +1473,13 @@ def _hard_check_candidate(
     )
     restored_pixels = np.asarray(restored, dtype=np.uint8)
     baseline = np.asarray(canvas.baseline_rgb, dtype=np.uint8)
-    completion_mask = np.asarray(canvas.completion_mask, dtype=np.uint8) == 255
+    candidate_region = (
+        np.asarray(canvas.candidate_region, dtype=np.uint8) == 255
+    )
     visible_mask = np.asarray(canvas.visible_mask, dtype=np.uint8) == 255
     final = restored_pixels.copy()
-    final[~completion_mask] = baseline[~completion_mask]
+    if preserve_outside_candidate_region:
+        final[~candidate_region] = baseline[~candidate_region]
 
     source = np.asarray(source_rgba, dtype=np.uint8)
     source_visible = source[:, :, 3] == 255
@@ -1407,48 +1500,83 @@ def _hard_check_candidate(
             baseline[visible_mask],
         )
     )
-    checks["outside_completion_mask_exact"] = bool(
-        np.array_equal(
-            np.asarray(candidate)[~completion_mask],
-            baseline[~completion_mask],
+    if preserve_outside_candidate_region:
+        checks["outside_completion_mask_exact"] = bool(
+            np.array_equal(
+                np.asarray(candidate)[~candidate_region],
+                baseline[~candidate_region],
+            )
         )
-    )
-    checks["completion_mask_nonempty"] = bool(completion_mask.any())
-    checks["completion_mask_not_full_canvas"] = not bool(completion_mask.all())
-    checks["completion_mask_connected_to_visible_entity"] = bool(
-        np.logical_and(
-            completion_mask,
-            _dilate_one_pixel(visible_mask) & ~visible_mask,
-        ).any()
-    )
-    model_baseline = np.asarray(
-        canvas.baseline_rgb.resize(
-            transform.model_size,
-            resample=Image.Resampling.LANCZOS,
-        ),
-        dtype=np.uint8,
-    )
-    model_mask = (
-        np.asarray(
-            canvas.completion_mask.resize(
+        checks["completion_mask_nonempty"] = bool(candidate_region.any())
+        checks["completion_mask_not_full_canvas"] = not bool(
+            candidate_region.all()
+        )
+        checks["completion_mask_connected_to_visible_entity"] = bool(
+            np.logical_and(
+                candidate_region,
+                _dilate_one_pixel(visible_mask) & ~visible_mask,
+            ).any()
+        )
+        model_baseline = np.asarray(
+            canvas.baseline_rgb.resize(
                 transform.model_size,
-                resample=Image.Resampling.NEAREST,
+                resample=Image.Resampling.LANCZOS,
             ),
             dtype=np.uint8,
         )
-        == 255
-    )
-    checks["candidate_changed_inside_completion_mask"] = bool(
-        np.any(
-            np.asarray(generated_model_rgb, dtype=np.uint8)[model_mask]
-            != model_baseline[model_mask]
+        model_region = (
+            np.asarray(
+                canvas.candidate_region.resize(
+                    transform.model_size,
+                    resample=Image.Resampling.NEAREST,
+                ),
+                dtype=np.uint8,
+            )
+            == 255
         )
-        and np.any(final[completion_mask] != baseline[completion_mask])
-    )
-    mask_pixels = final[completion_mask]
-    checks["background_not_constant"] = bool(
-        mask_pixels.size and np.unique(mask_pixels.reshape(-1, 3), axis=0).shape[0] > 1
-    )
+        checks["candidate_changed_inside_completion_mask"] = bool(
+            np.any(
+                np.asarray(generated_model_rgb, dtype=np.uint8)[model_region]
+                != model_baseline[model_region]
+            )
+            and np.any(final[candidate_region] != baseline[candidate_region])
+        )
+        region_pixels = final[candidate_region]
+        checks["background_not_constant"] = bool(
+            region_pixels.size
+            and np.unique(region_pixels.reshape(-1, 3), axis=0).shape[0] > 1
+        )
+    else:
+        model_baseline = np.asarray(
+            canvas.baseline_rgb.resize(
+                transform.model_size,
+                resample=Image.Resampling.LANCZOS,
+            ),
+            dtype=np.uint8,
+        )
+        model_region = (
+            np.asarray(
+                canvas.candidate_region.resize(
+                    transform.model_size,
+                    resample=Image.Resampling.NEAREST,
+                ),
+                dtype=np.uint8,
+            )
+            == 255
+        )
+        checks["candidate_changed_outside_visible_region"] = bool(
+            candidate_region.any()
+            and np.any(
+                np.asarray(generated_model_rgb, dtype=np.uint8)[model_region]
+                != model_baseline[model_region]
+            )
+            and np.any(final[candidate_region] != baseline[candidate_region])
+        )
+        generated_pixels = final[candidate_region]
+        checks["generated_region_not_constant"] = bool(
+            generated_pixels.size
+            and np.unique(generated_pixels.reshape(-1, 3), axis=0).shape[0] > 1
+        )
     checks["no_invalid_pixels"] = final.dtype == np.uint8 and bool(
         np.isfinite(final).all()
     )
@@ -1466,10 +1594,18 @@ def _hard_check_candidate(
             "candidate_unchanged_inside_completion_mask"
         ),
         "background_not_constant": "candidate_completion_is_constant",
+        "candidate_changed_outside_visible_region": (
+            "candidate_unchanged_outside_visible_region"
+        ),
+        "generated_region_not_constant": "generated_region_is_constant",
         "no_invalid_pixels": "candidate_has_invalid_pixels",
         "source_file_unchanged": "source_file_changed",
     }
-    reasons.extend(code for name, code in reason_codes.items() if not checks[name])
+    reasons.extend(
+        reason_codes[name]
+        for name, passed in checks.items()
+        if not passed and name in reason_codes
+    )
     return candidate, HardCheckReport(
         passed=all(checks.values()),
         checks=checks,
@@ -1543,7 +1679,18 @@ def _build_record_canvas(
     context_rgb: Image.Image | None,
     completion_mask_path: Path | None,
     config: CompletionCanvasRuntimeConfig,
+    policy: CompletionRunPolicy,
 ) -> tuple[CompletionCanvas, str | None]:
+    if policy.candidate_region_kind == "editable_region":
+        return (
+            build_editable_completion_canvas(
+                source_rgba=source_rgba,
+                context_rgb=context_rgb,
+                completion_sides=record.completion_sides,
+                config=config,
+            ),
+            None,
+        )
     canvas_base = _build_completion_canvas_base(
         source_rgba=source_rgba,
         context_rgb=context_rgb,
@@ -1576,6 +1723,7 @@ def _preflight_record(
     record: CompletionManifestRecord,
     *,
     config: CompletionCanvasRuntimeConfig,
+    policy: CompletionRunPolicy,
 ) -> _CompletionPreflight:
     source_path = _resolve_input_path(
         record.source_rgba_path,
@@ -1594,7 +1742,10 @@ def _preflight_record(
             expected_size=source.size,
         )
     completion_mask_path: Path | None = None
-    if record.completion_mask_path is not None:
+    if (
+        policy.candidate_region_kind == "completion_mask"
+        and record.completion_mask_path is not None
+    ):
         completion_mask_path = _resolve_input_path(
             record.completion_mask_path,
             field_name="completion_mask_path",
@@ -1605,6 +1756,7 @@ def _preflight_record(
         context_rgb=context_rgb,
         completion_mask_path=completion_mask_path,
         config=config,
+        policy=policy,
     )
     return _CompletionPreflight(
         source_path=source_path,
@@ -1627,6 +1779,7 @@ def _process_record(
     ],
     generate_candidate: CompletionCandidateGenerator,
     result_metadata: dict[str, object],
+    policy: CompletionRunPolicy,
 ) -> dict[str, object]:
     source_path = preflight.source_path
     context_path = preflight.context_path
@@ -1645,6 +1798,7 @@ def _process_record(
         context_rgb=context_rgb,
         completion_mask_path=completion_mask_path,
         config=config,
+        policy=policy,
     )
     if completion_mask_sha256 != preflight.completion_mask_source_sha256:
         raise RuntimeError("explicit completion mask changed after preflight")
@@ -1653,7 +1807,7 @@ def _process_record(
         model_min_side=config.model_min_side,
         model_multiple=config.model_multiple,
     )
-    model_rgb, model_mask = resize_completion_inputs(canvas, transform)
+    model_rgb, model_region = resize_completion_inputs(canvas, transform)
     final_directory = benchmark_root / record.sample_id
     temporary = benchmark_root / f".{record.sample_id}.tmp-{uuid.uuid4().hex}"
     temporary.mkdir(parents=False, exist_ok=False)
@@ -1665,13 +1819,13 @@ def _process_record(
             _save_png(temporary / "context_rgb.png", context_rgb)
         _save_png(temporary / "baseline_canvas.png", canvas.baseline_rgb)
         _save_png(temporary / "visible_mask.png", canvas.visible_mask)
-        _save_png(temporary / "completion_mask.png", canvas.completion_mask)
+        _save_png(temporary / policy.region_artifact_name, canvas.candidate_region)
         if completion_mask_path is not None:
             with Image.open(temporary / "completion_mask.png") as published_mask:
                 published_mask.load()
                 if not np.array_equal(
                     np.asarray(published_mask, dtype=np.uint8),
-                    np.asarray(canvas.completion_mask, dtype=np.uint8),
+                    np.asarray(canvas.candidate_region, dtype=np.uint8),
                 ):
                     raise RuntimeError(
                         "published completion mask differs from explicit source"
@@ -1694,7 +1848,7 @@ def _process_record(
                     record=record,
                     candidate=candidate_spec,
                     input_rgb=model_rgb.copy(),
-                    completion_mask=model_mask.copy(),
+                    candidate_region=model_region.copy(),
                 )
                 candidate, hard_check = _hard_check_candidate(
                     generated_model_rgb=generated,
@@ -1703,6 +1857,9 @@ def _process_record(
                     source_sha256=source_sha256,
                     canvas=canvas,
                     transform=transform,
+                    preserve_outside_candidate_region=(
+                        policy.preserve_outside_candidate_region
+                    ),
                 )
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 candidate = None
@@ -1725,10 +1882,12 @@ def _process_record(
                     review = judge.review(
                         source_rgba=source_rgba.copy(),
                         completion_canvas=canvas.baseline_rgb.copy(),
-                        completion_mask=canvas.completion_mask.copy(),
+                        completion_mask=canvas.candidate_region.copy(),
                         candidate_rgb=candidate.copy(),
                         entity_phrase=record.entity_phrase,
                         reference_type=record.reference_type,
+                        completion_region_label=policy.judge_region_label,
+                        system_prompt_addendum=policy.judge_system_prompt_addendum,
                     )
                     if not isinstance(review, ReferenceCompletionReview):
                         raise TypeError("judge must return ReferenceCompletionReview")
@@ -1800,7 +1959,7 @@ def _process_record(
                 str(completion_mask_path) if completion_mask_path is not None else None
             ),
             "completion_mask_source_sha256": completion_mask_sha256,
-            "completion_mask_area_ratio": canvas.completion_mask_area_ratio,
+            "completion_mask_area_ratio": canvas.candidate_region_area_ratio,
             "model_space_transform": transform.to_dict(),
             **result_metadata,
             "status": status,
@@ -1835,8 +1994,11 @@ def run_completion_benchmark(
     generate_candidate: CompletionCandidateGenerator,
     record_validator: Callable[[CompletionManifestRecord], None] | None = None,
     result_metadata: dict[str, object] | None = None,
+    policy: CompletionRunPolicy | None = None,
 ) -> CompletionBenchmarkRun:
     config.validate()
+    selected_policy = policy or CompletionRunPolicy()
+    selected_policy.validate()
     resolved_root = _resolve_benchmark_root(
         benchmark_root,
         allowed_benchmark_root=allowed_benchmark_root,
@@ -1845,7 +2007,10 @@ def run_completion_benchmark(
     if record_validator is not None:
         for record in records:
             record_validator(record)
-    preflights = [_preflight_record(record, config=config) for record in records]
+    preflights = [
+        _preflight_record(record, config=config, policy=selected_policy)
+        for record in records
+    ]
     resolved_root.mkdir(parents=True, exist_ok=False)
     accepted = rejected = 0
     results: list[dict[str, object]] = []
@@ -1859,6 +2024,7 @@ def run_completion_benchmark(
             candidate_factory=candidate_factory,
             generate_candidate=generate_candidate,
             result_metadata=dict(result_metadata or {}),
+            policy=selected_policy,
         )
         results.append(result)
         accepted += int(result["status"] == "accepted")
@@ -1918,14 +2084,14 @@ def run_reference_completion_benchmark(
         record: CompletionManifestRecord,
         candidate: CompletionCandidateSpec,
         input_rgb: Image.Image,
-        completion_mask: Image.Image,
+        candidate_region: Image.Image,
     ) -> Image.Image:
         strategy = candidate.attempt_metadata["strategy"]
         if strategy not in DEFAULT_STRATEGIES:
             raise ValueError("invalid PowerPaint completion strategy")
         return backend.complete(
             input_rgb=input_rgb,
-            completion_mask=completion_mask,
+            completion_mask=candidate_region,
             entity_phrase=record.entity_phrase,
             reference_type=record.reference_type,
             strategy=strategy,
@@ -1943,5 +2109,11 @@ def run_reference_completion_benchmark(
         judge=judge,
         candidate_factory=candidate_factory,
         generate_candidate=generate_candidate,
+        policy=CompletionRunPolicy(
+            candidate_region_kind="completion_mask",
+            preserve_outside_candidate_region=True,
+            region_artifact_name="completion_mask.png",
+            judge_region_label="completion mask",
+        ),
     )
     return run.stats
