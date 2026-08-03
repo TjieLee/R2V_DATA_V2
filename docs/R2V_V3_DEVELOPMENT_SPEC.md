@@ -16,7 +16,7 @@ Build a cleaner, quality-first R2V data construction pipeline with four delibera
 1. use a stronger video annotation model for production captions and entity analysis;
 2. separate the ordinary T2V caption from a reference-aware generation instruction;
 3. replace FLUX background inpainting with an object-removal backend based on Qwen Image Edit;
-4. classify entity references as full, local, or rejected instead of attempting synthetic entity completion.
+4. classify entity references as full, local, or rejected, with an optional generated fallback only after real-reference selection fails.
 
 The exported training dataset must be compact. It must not repeat the V2 pattern of many stage manifests, per-sample JSON files, duplicated canonical files, raw/repaired aliases, and diagnostics mixed into the final dataset.
 
@@ -70,10 +70,15 @@ a similarly named adapter, or downloads either component.
 
 ### 2.3 Entity completion policy
 
-V3 does not synthesize missing entity parts.
+V3 does not synthesize missing entity parts by default. When the explicit
+`allow_synthetic_completion` fallback is enabled, it may repair only an already
+selected, identity-visible local reference after real self and same-parent donor
+options are exhausted.
 
 - Do not densely resample videos to search for more reference frames.
-- Do not generate legs, clothing, object parts, or other unseen structure to create a supposedly complete reference.
+- Outside the explicit gated fallback, do not generate legs, clothing, object
+  parts, or other unseen structure to create a supposedly complete reference;
+  generated content is never treated as a real source reference.
 - Preserve a sufficiently recognizable whole object as a full reference even if a peripheral part is clipped or occluded.
 - Convert a semantically useful but incomplete entity into an honest local reference.
 - Reject unusably fragmented references.
@@ -113,7 +118,7 @@ never appear in the final instruction.
 - changing the source dataset;
 - changing the fixed ten-frame SAM/ranking policy;
 - dense temporal resampling;
-- synthetic entity completion;
+- standalone synthetic-completion publication or manual-approval workflows;
 - generated viewpoints or entity augmentation;
 - cross-parent reference pairing;
 - training-code changes in `R2V-Next`;
@@ -256,13 +261,15 @@ semantic full/local/reject decision. Code owns mask integrity, geometry, crop
 publication, final retained filtering, optional ready-background binding, and
 deterministic per-type tokens. Every ready entity reference is retained in
 annotation order, and at least one retained entity must pass temporal coverage.
-The stage does not rerun SAM3, resize references, synthesize missing content, or
-perform cross-parent pairing. When the optional same-parent fallback is enabled,
-a second phase may bind only a missing target reference from an exact
-`parent_video_id` match after a dedicated visual judge accepts the same physical
-entity. It never replaces a ready full/local target reference. Each retained
-entity remains a variable-size, source-faithful RGBA mask-bbox crop; pairing does
-not create a fixed canvas or a second normalized artifact.
+The stage does not resize references or perform cross-parent pairing. When the
+optional same-parent fallback is enabled, its second phase may replace a rejected
+or local target reference from an exact `parent_video_id` match after a dedicated
+visual judge accepts the same physical entity. The optional final phase may call
+the existing localized Qwen completion and existing SAM3 backend only for a
+remaining local self reference. Real references remain variable-size,
+source-faithful RGBA mask-bbox crops; generated fallback RGBA preserves binary
+alpha and exact white transparent RGB. Pairing creates no fixed canvas or second
+normalized artifact.
 
 #### `instruct`
 
@@ -478,15 +485,14 @@ Qwen provides semantic scope judgment. Code validates geometry and existing hard
 
 Connected-component count is diagnostic only. It must not independently decide full/local/reject because many valid objects naturally have separated or thin parts.
 
-### 8.5 No synthetic entity repair
+### 8.5 Optional generated fallback
 
-V3 must not add an entity-repair backend. Fields in old V2 inpainting schemas may remain for compatibility, but V3 export must set:
-
-```json
-"synthetic": false
-```
-
-for all entity references.
+V3 must not add a second entity-repair implementation. The optional fallback
+reuses the existing localized Qwen completion backend and SAM3 backend, and it
+runs only after real self and same-parent donor selection. Real references
+export with `synthetic=false`; accepted generated fallbacks export with
+`synthetic=true`. No manual approval state or standalone publication workflow is
+part of production.
 
 ---
 
@@ -630,11 +636,31 @@ V3 preserves the corrected clip-level coverage semantics:
 - an entity without a final reference remains in natural language but has no token;
 - token assignment and final reference filtering happen together.
 
-Pairing has two deterministic phases. Phase A is the existing in-pair candidate
-selection and full/local/reject decision. Phase B is disabled by default. When
-`pair.same_parent_fallback_enabled` is true, it considers only target entities
-that still lack a ready reference and that have their own valid target-frame
-visual candidate. It never replaces a ready full or local reference.
+Pairing has three deterministic priority phases and runs after `remove`. Phase A
+is the existing in-pair candidate selection and full/local/reject decision.
+Phase B is disabled by default. When `pair.same_parent_fallback_enabled` is true,
+it considers rejected targets and lower-priority local self references. A ready
+full real self reference is immutable; an accepted same-parent full real donor
+may replace a local self reference.
+
+Phase C is the thin optional localized-completion fallback controlled by
+`reference_scope.allow_synthetic_completion` (default `false`). It considers
+only remaining ready local, identity-visible real self references. It sends the
+published source-faithful RGBA through the existing localized Qwen completion,
+tracks the single `candidate_rgb.png` frame with `Sam3SegmentationBackend`, and
+reuses the existing deterministic mask/improvement/background gates, localized
+completion review, binary-alpha RGBA constructor, and reference ranking. Only a
+candidate that ranks as `full` is published. Any model, segmentation, gate,
+judge, or transactional write failure keeps the original local reference and
+does not fail the clip. No independent publication stage, three-judge
+publication system, or manual-approval state participates in production.
+
+The resulting priority is: full real self, then same-parent full real donor,
+then Qwen generated fallback, then the original local/no reference outcome.
+Generated fallbacks cannot enter the donor index. Their accepted sidecar records
+source, input, candidate, mask, gate, review, ranking, model-setting, and output
+hash provenance; `selected/eN.png` remains the only reference consumed by
+instruction generation and export.
 
 A donor must use the exact same `source.parent_video_id`, have a different
 `clip_uid`, ready annotation and pairing, and a retained full, identity-visible
@@ -1043,8 +1069,9 @@ requires them.
 ### 13.3 Reference file format
 
 - Export references as lossless PNG.
-- Export each retained entity as the single source-faithful, variable-size RGBA
-  PNG produced by pairing.
+- Export each retained entity as the single final variable-size RGBA PNG produced
+  by pairing. Real references are source-faithful; an accepted generated fallback
+  carries `synthetic=true` and complete run-side provenance.
 - Preserve the exact crop geometry, source RGB under the binary mask, white RGB
   where alpha is zero, and binary alpha; do not resize or normalize entities.
 - Export backgrounds as RGB PNG.
@@ -1140,7 +1167,8 @@ Validation must reject:
 - writable output roots outside `/mnt/workspace/litengjie/data/**`;
 - model downloads into public paths;
 - `coverage.required_visible_frames` outside 1 through `frames.count`;
-- `allow_synthetic_completion: true` in the initial V3 implementation;
+- non-boolean `reference_scope` switches, or synthetic completion enabled while
+  `pair.enabled` is false;
 - non-boolean `pair.enabled`, candidate limits outside 1 through 10,
   non-finite/non-float crop padding outside 0 through 0.5, or negative/non-integer
   pair repair retries;
@@ -1265,8 +1293,14 @@ Include fixtures for:
   all-reject behavior are deterministic;
 - accepted donor PNG bytes are unchanged, publication rolls back on clip-write
   failure, and corrupt existing cross-pair artifacts fail validation;
-- full/local target references are never replaced and cross-parent donors are
-  never considered;
+- full real self references are never replaced; a full real donor may replace a
+  lower-priority local self reference, while cross-parent donors are never
+  considered;
+- generated fallback is disabled by default, never becomes a donor, runs only
+  after real donor fallback, and preserves the local source on every failure;
+- accepted generated fallback uses existing Qwen/SAM3/gates/ranking components,
+  publishes binary-alpha RGBA transactionally, and validates its provenance on
+  idempotent reruns;
 - legacy references without provenance remain readable, while new provenance is
   exported with the dataset reference;
 - every accepted sample binds at least one qualifying target entity;
@@ -1424,7 +1458,8 @@ V3 is complete only when all statements are true:
 - Entity references are explicitly full, local, or rejected.
 - Entity references remain variable-size source-faithful RGBA crops and are
   exported once, without normalization or duplicated source files.
-- No synthetic entity completion exists.
+- Synthetic entity completion is disabled by default; when explicitly enabled,
+  only the thin post-donor localized fallback is allowed.
 - Non-empty background masks always require removal.
 - FLUX is not the V3 production backend.
 - Rejected removal outputs never fall back to raw.

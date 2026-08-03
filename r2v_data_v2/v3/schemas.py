@@ -408,12 +408,23 @@ class EntityReferenceState(SchemaModel):
     source_frame_index: Optional[int] = Field(default=None, ge=0)
     source_clip_uid: Optional[str] = None
     source_entity_id: Optional[str] = None
-    synthetic: Literal[False] = False
+    synthetic: bool = False
+    generation_metadata_path: Optional[str] = None
+    generation_source_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    generation_output_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @model_validator(mode="after")
     def validate_reference_state(self) -> EntityReferenceState:
         if not self.scope_reason.strip():
             raise ValueError("entity reference scope_reason must not be empty")
+        if not isinstance(self.synthetic, bool):
+            raise TypeError("entity reference synthetic must be a boolean")
         if (self.source_clip_uid is None) != (self.source_entity_id is None):
             raise ValueError(
                 "entity reference source_clip_uid and source_entity_id "
@@ -450,6 +461,28 @@ class EntityReferenceState(SchemaModel):
                 raise ValueError(
                     "ready entity reference requires image_path and source_frame_index"
                 )
+            generation_fields = (
+                self.generation_metadata_path,
+                self.generation_source_sha256,
+                self.generation_output_sha256,
+            )
+            if self.synthetic:
+                if self.reference_scope != "full":
+                    raise ValueError(
+                        "generated fallback reference must use full scope"
+                    )
+                if self.source_entity_id != self.entity_id:
+                    raise ValueError(
+                        "generated fallback must preserve self entity provenance"
+                    )
+                if any(value is None for value in generation_fields):
+                    raise ValueError(
+                        "generated fallback requires complete generation provenance"
+                    )
+            elif any(value is not None for value in generation_fields):
+                raise ValueError(
+                    "real entity reference cannot publish generation provenance"
+                )
         else:
             if self.reference_scope != "reject":
                 raise ValueError("rejected entity reference requires reject scope")
@@ -458,9 +491,13 @@ class EntityReferenceState(SchemaModel):
                 or self.source_frame_index is not None
                 or self.source_clip_uid is not None
                 or self.source_entity_id is not None
+                or self.synthetic
+                or self.generation_metadata_path is not None
+                or self.generation_source_sha256 is not None
+                or self.generation_output_sha256 is not None
             ):
                 raise ValueError(
-                    "rejected entity reference cannot publish image provenance"
+                    "rejected entity reference cannot publish image or generation provenance"
                 )
         return self
 
@@ -1122,6 +1159,14 @@ class ClipRecord(SchemaModel):
             raise ValueError(
                 "entity references must follow annotation entity order"
             )
+        for reference in self.references.entities:
+            if (
+                reference.synthetic
+                and reference.source_clip_uid != self.clip_uid
+            ):
+                raise ValueError(
+                    "generated fallback must preserve self clip provenance"
+                )
         if self.pairing is not None and self.pairing.status == "ready":
             retained = self.pairing.retained_entity_ids
             retained_ids = set(retained)
@@ -1422,8 +1467,6 @@ class DatasetReference(SchemaModel):
                 raise ValueError("entity reference cannot use a background token")
             if self.scope not in {"full", "local"}:
                 raise ValueError("entity reference scope must be full or local")
-            if self.synthetic:
-                raise ValueError("V3 entity references must not be synthetic")
         else:
             if self.source_clip_uid is not None:
                 raise ValueError(

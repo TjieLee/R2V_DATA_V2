@@ -806,7 +806,7 @@ class DatasetExporter:
                     source_frame_index=reference.source_frame_index,
                     source_clip_uid=reference.source_clip_uid,
                     source_entity_id=reference.source_entity_id,
-                    synthetic=False,
+                    synthetic=reference.synthetic,
                 )
             )
         if clip.pairing.background_token is not None:

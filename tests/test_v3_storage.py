@@ -16,7 +16,6 @@ from r2v_data_v2.v3.config import (
     QwenAnnotationConfig,
     QwenServiceConfig,
     QwenServicesConfig,
-    ReferenceScopeConfig,
     RemoveConfig,
     SourceConfig,
     V3Config,
@@ -386,11 +385,7 @@ def test_v3_config_loads_32b_defaults_without_model_access(
             FramesConfig(count=8),
             "exactly 10",
         ),
-        (
-            "reference_scope",
-            ReferenceScopeConfig(allow_synthetic_completion=True),
-            "synthetic entity completion",
-        ),
+
         (
             "background",
             BackgroundConfig(raw_foreground_area_ratio=0.01),

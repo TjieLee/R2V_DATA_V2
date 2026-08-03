@@ -19,6 +19,7 @@ def _write_config(
     cross_pair_judge: bool = False,
     same_parent_fallback_enabled: bool = False,
     same_parent_max_donor_references: object = 8,
+    synthetic_completion_enabled: object = False,
 ) -> Path:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -73,6 +74,11 @@ def _write_config(
                 "source:",
                 "  limit: 1",
                 *qwen_lines,
+                "reference_scope:",
+                (
+                    "  allow_synthetic_completion: "
+                    f"{str(synthetic_completion_enabled).lower()}"
+                ),
                 "pair:",
                 f"  enabled: {str(pair_enabled).lower()}",
                 (
@@ -338,3 +344,55 @@ def test_same_parent_fallback_flag_is_strict_boolean(
 
     with pytest.raises(TypeError, match="same_parent_fallback_enabled"):
         load_config(path)
+
+def test_synthetic_completion_fallback_is_explicit_and_optional(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disabled = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+        )
+    )
+    enabled = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+            synthetic_completion_enabled=True,
+        )
+    )
+
+    assert disabled.reference_scope.allow_synthetic_completion is False
+    assert enabled.reference_scope.allow_synthetic_completion is True
+    assert disabled.fingerprint() != enabled.fingerprint()
+
+
+def test_synthetic_completion_requires_pair_and_strict_boolean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disabled_pair = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=False,
+        background_remove_judge=True,
+        pair_enabled=False,
+        synthetic_completion_enabled=True,
+    )
+    with pytest.raises(ValueError, match="requires pair.enabled"):
+        load_config(disabled_pair)
+
+    non_boolean = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        synthetic_completion_enabled=1,
+    )
+    with pytest.raises(TypeError, match="allow_synthetic_completion"):
+        load_config(non_boolean)

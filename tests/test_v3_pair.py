@@ -34,8 +34,15 @@ from r2v_data_v2.v3.pair import (
     pair_clips,
     validate_entity_reference_artifact,
 )
+from r2v_data_v2.v3.reference_completion_benchmark import (
+    ReferenceCompletionReview,
+)
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
+)
+from r2v_data_v2.v3.sam3_backend import (
+    BackendMaskObservation,
+    EntityTrackResult,
 )
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -45,6 +52,8 @@ from r2v_data_v2.v3.schemas import (
     ClipSource,
     CoverageState,
     EntityVisibilitySummary,
+    InstructionLegendEntry,
+    InstructionState,
     PairingState,
     RawCrossPairDecision,
     RawEntityReferenceDecision,
@@ -54,8 +63,9 @@ from r2v_data_v2.v3.schemas import (
     TrackedEntityMasks,
     TrackedMaskFrame,
     TrackedMasksArtifact,
+    render_instruction_text,
 )
-from r2v_data_v2.v3.storage import RunStorage
+from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
 from run_pipeline_v3 import run_pipeline_v3
 
 WIDTH = 12
@@ -67,6 +77,7 @@ def _config(
     monkeypatch: pytest.MonkeyPatch,
     *,
     allow_local: bool = True,
+    allow_synthetic_completion: bool = False,
     pair: PairConfig | None = None,
     debug: bool = False,
 ) -> V3Config:
@@ -93,13 +104,16 @@ def _config(
             instruction_writer=QwenServiceConfig(model=model),
             candidate_judge=QwenServiceConfig(model=model),
             background_remove_judge=QwenServiceConfig(model=model),
-cross_pair_judge=(
+            cross_pair_judge=(
                 QwenServiceConfig(model=model)
                 if pair is not None and pair.same_parent_fallback_enabled
                 else None
             ),
         ),
-        reference_scope=ReferenceScopeConfig(allow_local=allow_local),
+        reference_scope=ReferenceScopeConfig(
+            allow_local=allow_local,
+            allow_synthetic_completion=allow_synthetic_completion,
+        ),
         pair=pair or PairConfig(),
         remove=RemoveConfig(
             base_model_path=pretrained / "Qwen" / "edit",
@@ -177,9 +191,7 @@ def _add_ready_clip(
     storage.create_clip(
         clip_uid=clip_uid,
         source=ClipSource(
-            video_path=str(
-                config.dataset_json.parent / "videos" / f"{clip_uid}.mp4"
-            ),
+            video_path=str(config.dataset_json.parent / "videos" / f"{clip_uid}.mp4"),
             parent_video_id=parent_video_id,
             clip_suffix=clip_suffix or clip_uid,
             source_index=0,
@@ -435,9 +447,7 @@ def test_context_and_crop_preserve_exact_pixels_without_resize() -> None:
     rgba = np.asarray(crop)
 
     assert np.array_equal(context[mask], pixels[mask])
-    assert np.array_equal(
-        context[6, 7], pixels[6, 7].astype(np.uint16) * 35 // 100
-    )
+    assert np.array_equal(context[6, 7], pixels[6, 7].astype(np.uint16) * 35 // 100)
     assert crop_box == (1, 0, 7, 6)
     assert crop.size == (6, 6)
     expected_mask = mask[0:6, 1:7]
@@ -526,6 +536,9 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         "cross_pair_attempted": 0,
         "cross_pair_ready": 0,
         "cross_pair_repaired": 0,
+        "completion_attempted": 0,
+        "completion_ready": 0,
+        "completion_rejected": 0,
     }
     assert clip.pairing == PairingState(
         status="ready",
@@ -551,7 +564,9 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
             storage.read_frames("clip-1"),
             storage.read_masks("clip-1"),
         )
-        with Image.open(storage.selected_entity_path("clip-1", entity.entity_id)) as image:
+        with Image.open(
+            storage.selected_entity_path("clip-1", entity.entity_id)
+        ) as image:
             assert image.mode == "RGBA"
     assert not (storage.clip_dir("clip-1") / "debug" / "pair").exists()
 
@@ -748,9 +763,7 @@ def test_publication_failure_rolls_back_old_artifacts_and_clip_state(
         for entity_id in ("e1", "e2")
     } == old_artifacts
     assert not list(
-        storage.selected_entity_path("clip-1", "e1").parent.glob(
-            ".*-pair-*.png"
-        )
+        storage.selected_entity_path("clip-1", "e1").parent.glob(".*-pair-*.png")
     )
 
 
@@ -959,9 +972,7 @@ class _ClipJudge:
         self.calls.append((clip_uid, entity.entity_id))
         assert set(source_images) == {item.image_path for item in candidates}
         return EntityReferenceDecisionAttempt(
-            decision=_decision(
-                self.scopes.get((clip_uid, entity.entity_id), "full")
-            ),
+            decision=_decision(self.scopes.get((clip_uid, entity.entity_id), "full")),
             raw_responses=("{}",),
             repair_attempts=0,
         )
@@ -1003,9 +1014,7 @@ class _CrossJudge:
                 "context_mode": target_context_image.mode,
                 "context_size": target_context_image.size,
                 "crop_mode": (
-                    target_entity_crop.mode
-                    if target_entity_crop is not None
-                    else None
+                    target_entity_crop.mode if target_entity_crop is not None else None
                 ),
                 "donor_mode": donor_reference_image.mode,
             }
@@ -1221,13 +1230,16 @@ def test_fallback_uses_sampled_frames_without_a_target_candidate(
     assert cross.calls[0]["crop_mode"] is None
     target = storage.read_clip("target")
     assert target.references.entities[0].source_clip_uid == "donor"
-    assert storage.selected_entity_path(
-        "target",
-        "e1",
-    ).read_bytes() == storage.selected_entity_path(
-        "donor",
-        "e1",
-    ).read_bytes()
+    assert (
+        storage.selected_entity_path(
+            "target",
+            "e1",
+        ).read_bytes()
+        == storage.selected_entity_path(
+            "donor",
+            "e1",
+        ).read_bytes()
+    )
 
 
 def test_ready_tracking_without_a_valid_candidate_uses_sampled_frames(
@@ -1333,7 +1345,7 @@ def test_fallback_uses_natural_donor_order_and_stops_at_first_accept(
 
 
 @pytest.mark.parametrize("target_scope", ["full", "local"])
-def test_fallback_never_replaces_an_existing_ready_reference(
+def test_real_donor_replaces_only_lower_priority_local_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     target_scope: str,
@@ -1344,16 +1356,20 @@ def test_fallback_never_replaces_an_existing_ready_reference(
         pair=PairConfig(same_parent_fallback_enabled=True),
     )
     storage = _same_parent_storage(config)
-    phase_a = _ClipJudge({("target", "e1"): "local"})
+    phase_a = _ClipJudge({("target", "e1"): target_scope})
     cross = _CrossJudge()
 
     pair_clips(config, storage, judge=phase_a, cross_pair_judge=cross)
 
     target_reference = storage.read_clip("target").references.entities[0]
     assert target_reference.status == "ready"
-    assert target_reference.reference_scope == "local"
-    assert target_reference.source_clip_uid == "target"
-    assert cross.calls == []
+    assert target_reference.reference_scope == "full"
+    if target_scope == "full":
+        assert target_reference.source_clip_uid == "target"
+        assert cross.calls == []
+    else:
+        assert target_reference.source_clip_uid == "donor"
+        assert len(cross.calls) == 1
 
 
 def test_cross_pair_publication_rolls_back_when_clip_write_fails(
@@ -1520,6 +1536,7 @@ def test_legacy_in_pair_reference_without_provenance_still_validates(
     assert loaded.source_clip_uid is None
     assert loaded.source_entity_id is None
 
+
 def test_donor_limit_caps_judge_calls_and_all_reject_preserves_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1573,6 +1590,7 @@ def test_donor_limit_caps_judge_calls_and_all_reject_preserves_target(
     assert target.pairing.status == "rejected"
     assert target.references.entities[0].status == "rejected"
     assert not storage.selected_entity_path("target", "e1").exists()
+
 
 def test_pipeline_pair_integration_passes_injected_cross_pair_judge(
     tmp_path: Path,
@@ -1630,6 +1648,7 @@ def test_pipeline_pair_integration_passes_injected_cross_pair_judge(
     assert result["pair"]["cross_pair_ready"] == 1
     assert cross.calls[0]["target_clip_uid"] == "target"
 
+
 def test_masked_cross_pair_debug_is_json_only_and_disabled_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1648,11 +1667,7 @@ def test_masked_cross_pair_debug_is_json_only_and_disabled_by_default(
         cross_pair_judge=_CrossJudge(),
     )
     debug_root = (
-        enabled_storage.clip_dir("target")
-        / "debug"
-        / "pair"
-        / "e1"
-        / "cross_pair"
+        enabled_storage.clip_dir("target") / "debug" / "pair" / "e1" / "cross_pair"
     )
     artifact = debug_root / "donor-e1" / "decision.json"
     payload = json.loads(artifact.read_text(encoding="utf-8"))
@@ -1724,9 +1739,7 @@ def test_sampled_frame_debug_saves_contact_sheet_only_when_enabled(
         assert image.mode == "RGB"
         assert image.size == (1920, 824)
     assert not list(
-        enabled_storage.selected_entity_path("target", "e1").parent.glob(
-            "*contact*"
-        )
+        enabled_storage.selected_entity_path("target", "e1").parent.glob("*contact*")
     )
 
     disabled_config = _config(
@@ -1998,9 +2011,7 @@ def test_four_context_only_targets_attempt_judge_without_publication(
             clip_uid=target_uid,
             clip_suffix=str(index),
             entity_types=("subject",),
-            tracking_status={
-                "e1": "not_found" if index % 2 == 0 else "failed"
-            },
+            tracking_status={"e1": "not_found" if index % 2 == 0 else "failed"},
         )
     cross = _CrossJudge([False, False, False, False])
 
@@ -2014,10 +2025,397 @@ def test_four_context_only_targets_attempt_judge_without_publication(
     assert stats.cross_pair_attempted == 4
     assert stats.cross_pair_ready == 0
     assert len(cross.calls) == 4
-    assert {
-        call["target_evidence_mode"] for call in cross.calls
-    } == {"sampled_frames"}
+    assert {call["target_evidence_mode"] for call in cross.calls} == {"sampled_frames"}
     for target_uid in target_uids:
         target = storage.read_clip(target_uid)
         assert target.references.entities[0].status == "rejected"
         assert not storage.selected_entity_path(target_uid, "e1").exists()
+
+
+class _LocalizedCompletionBackend:
+    def __init__(self, *, fail: Exception | None = None) -> None:
+        self.fail = fail
+        self.calls: list[dict[str, object]] = []
+
+    def complete(
+        self,
+        *,
+        input_rgb,
+        entity_phrase,
+        seed,
+        prompt,
+        negative_prompt,
+    ):
+        self.calls.append(
+            {
+                "input_size": input_rgb.size,
+                "entity_phrase": entity_phrase,
+                "seed": seed,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+            }
+        )
+        if self.fail is not None:
+            raise self.fail
+        pixels = np.asarray(input_rgb, dtype=np.uint8).copy()
+        visible = np.any(pixels < 250, axis=2)
+        rows, columns = np.nonzero(visible)
+        assert rows.size
+        top = int(rows.min())
+        left = int(columns.min())
+        right = int(columns.max()) + 1
+        if top > 0:
+            pixels[top - 1, left:right] = pixels[top, left:right]
+        else:
+            bottom = int(rows.max()) + 1
+            assert bottom < pixels.shape[0]
+            pixels[bottom, left:right] = pixels[bottom - 1, left:right]
+        return Image.fromarray(pixels, mode="RGB")
+
+
+class _LocalizedCompletionJudge:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def review(
+        self,
+        *,
+        source_rgba,
+        candidate_rgb,
+        entity_phrase,
+        reference_type,
+    ):
+        assert source_rgba.mode == "RGBA"
+        assert candidate_rgb.mode == "RGB"
+        self.calls.append((entity_phrase, reference_type))
+        return ReferenceCompletionReview(
+            verdict="accept",
+            visible_source_preserved=True,
+            same_entity_continued=True,
+            identity_preserved=True,
+            exactly_one_entity=True,
+            completion_plausible=True,
+            completion_useful=True,
+            no_occluder_reconstructed=True,
+            no_new_salient_entity=True,
+            boundary_clean=True,
+            reference_usable=True,
+            reason="The local missing region is repaired cleanly.",
+        )
+
+
+class _SingleFrameSegmentationBackend:
+    def __init__(self, status: str = "ready") -> None:
+        self.status = status
+        self.calls: list[dict[str, object]] = []
+
+    def track(
+        self,
+        *,
+        frame_paths,
+        entity_id,
+        reference_type,
+        grounding_prompt,
+    ):
+        assert len(frame_paths) == 1
+        candidate_path = frame_paths[0]
+        assert candidate_path.name == "candidate_rgb.png"
+        assert candidate_path.is_file()
+        self.calls.append(
+            {
+                "frame_paths": list(frame_paths),
+                "entity_id": entity_id,
+                "reference_type": reference_type,
+                "grounding_prompt": grounding_prompt,
+            }
+        )
+        if self.status == "not_found":
+            return EntityTrackResult(status="not_found", reason="not found")
+        if self.status == "failed":
+            return EntityTrackResult(status="failed", reason="segmentation failed")
+        if self.status == "missing_slot":
+            return EntityTrackResult(
+                status="ready",
+                observations=(
+                    BackendMaskObservation(
+                        slot=1,
+                        mask=np.ones((HEIGHT, WIDTH), dtype=bool),
+                        confidence=0.97,
+                        object_id="wrong-slot",
+                    ),
+                ),
+            )
+        with Image.open(candidate_path) as opened:
+            pixels = np.asarray(opened.convert("RGB"), dtype=np.uint8)
+        mask = np.any(pixels < 250, axis=2)
+        return EntityTrackResult(
+            status="ready",
+            observations=(
+                BackendMaskObservation(
+                    slot=0,
+                    mask=mask,
+                    confidence=0.97,
+                    object_id="generated-entity",
+                ),
+            ),
+        )
+
+
+class _LocalThenGeneratedFullJudge:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def decide(self, *, entity, candidates, source_images):
+        del entity
+        assert set(source_images) == {item.image_path for item in candidates}
+        generated = "reference_completion" in candidates[0].image_path
+        self.calls.append("generated" if generated else "source")
+        return EntityReferenceDecisionAttempt(
+            decision=_decision("full" if generated else "local"),
+            raw_responses=("{}",),
+            repair_attempts=0,
+        )
+
+
+def test_generated_fallback_uses_existing_components_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    completion = _LocalizedCompletionBackend()
+    completion_judge = _LocalizedCompletionJudge()
+    segmenter = _SingleFrameSegmentationBackend()
+    reference_judge = _LocalThenGeneratedFullJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=reference_judge,
+        completion_backend=completion,
+        completion_judge=completion_judge,
+        completion_segmentation_backend=segmenter,
+    )
+
+    clip = storage.read_clip("clip-1")
+    state = clip.references.entities[0]
+    assert stats.completion_attempted == 1
+    assert stats.completion_ready == 1
+    assert stats.completion_rejected == 0
+    assert state.status == "ready"
+    assert state.reference_scope == "full"
+    assert state.synthetic is True
+    assert state.source_clip_uid == "clip-1"
+    assert state.source_entity_id == "e1"
+    assert state.generation_metadata_path is not None
+    assert completion.calls[0]["entity_phrase"] == "entity 1"
+    assert segmenter.calls[0]["grounding_prompt"] == "entity 1"
+    assert reference_judge.calls == ["source", "generated"]
+    final_path = storage.selected_entity_path("clip-1", "e1")
+    with Image.open(final_path) as opened:
+        assert opened.format == "PNG"
+        assert opened.mode == "RGBA"
+        pixels = np.asarray(opened, dtype=np.uint8)
+    assert set(np.unique(pixels[..., 3])).issubset({0, 255})
+    assert np.all(pixels[..., :3][pixels[..., 3] == 0] == 255)
+    metadata_path = storage.root / state.generation_metadata_path
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "accepted"
+    assert metadata["completion"]["mode"] == "localized_raw"
+    assert metadata["segmentation"]["backend"] == "sam3"
+    assert metadata["production_gates"] == {
+        **metadata["production_gates"],
+        "mask_passed": True,
+        "improvement_passed": True,
+        "background_passed": True,
+    }
+    validate_entity_reference_artifact(
+        config,
+        storage,
+        "clip-1",
+        clip.annotation.entities[0],
+        state,
+        storage.read_frames("clip-1"),
+        storage.read_masks("clip-1"),
+    )
+
+    unused_completion = _LocalizedCompletionBackend(
+        fail=AssertionError("existing generated fallback must be skipped")
+    )
+    skipped = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=unused_completion,
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+    assert skipped.skipped_existing == 1
+    assert skipped.completion_attempted == 0
+    assert unused_completion.calls == []
+
+    body = "Keep {{image_1}} visually consistent throughout the clip."
+    legend = [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description="The completed subject reference.",
+        )
+    ]
+    storage.write_instruction(
+        "clip-1",
+        InstructionState(
+            status="ready",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=render_instruction_text(body, legend),
+        ),
+    )
+    dataset = DatasetExporter(config, storage).export()
+    assert dataset.sample_count == 1
+    sample = json.loads(
+        (config.resolved_export_root / "samples.jsonl").read_text(encoding="utf-8")
+    )
+    exported_reference = sample["references"][0]
+    assert exported_reference["synthetic"] is True
+    assert _sha256(config.resolved_export_root / exported_reference["image_path"]) == (
+        state.generation_output_sha256
+    )
+
+
+def test_generated_fallback_is_disabled_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    completion = _LocalizedCompletionBackend(
+        fail=AssertionError("disabled completion must not call Qwen")
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=completion,
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert state.status == "ready"
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert stats.completion_attempted == 0
+    assert stats.completion_ready == 0
+    assert stats.completion_rejected == 0
+    assert completion.calls == []
+
+
+@pytest.mark.parametrize(
+    "segmentation_status",
+    ["not_found", "failed", "missing_slot"],
+)
+def test_generated_fallback_failure_keeps_original_local_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    segmentation_status: str,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    reference_judge = _LocalThenGeneratedFullJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=reference_judge,
+        completion_backend=_LocalizedCompletionBackend(),
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=(
+            _SingleFrameSegmentationBackend(segmentation_status)
+        ),
+    )
+
+    clip = storage.read_clip("clip-1")
+    state = clip.references.entities[0]
+    assert stats.failed == 0
+    assert stats.completion_attempted == 1
+    assert stats.completion_ready == 0
+    assert stats.completion_rejected == 1
+    assert state.status == "ready"
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert state.source_clip_uid == "clip-1"
+    assert reference_judge.calls == ["source"]
+    with Image.open(storage.selected_entity_path("clip-1", "e1")) as opened:
+        assert opened.mode == "RGBA"
+
+
+def test_real_donor_precedes_generated_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+        pair=PairConfig(same_parent_fallback_enabled=True),
+    )
+    storage = _same_parent_storage(config)
+    completion = _LocalizedCompletionBackend(
+        fail=AssertionError("real donor must precede Qwen fallback")
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_ClipJudge({("target", "e1"): "local"}),
+        cross_pair_judge=_CrossJudge(),
+        completion_backend=completion,
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    target = storage.read_clip("target").references.entities[0]
+    assert target.source_clip_uid == "donor"
+    assert target.synthetic is False
+    assert stats.cross_pair_ready == 1
+    assert stats.completion_attempted == 0
+    assert completion.calls == []
+
+
+def test_full_real_self_precedes_all_fallbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    completion = _LocalizedCompletionBackend(
+        fail=AssertionError("full real self reference must not call Qwen")
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        completion_backend=completion,
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert state.reference_scope == "full"
+    assert state.synthetic is False
+    assert stats.completion_attempted == 0
+    assert completion.calls == []

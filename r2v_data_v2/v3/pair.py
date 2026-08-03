@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 import shutil
@@ -21,6 +23,13 @@ from r2v_data_v2.v3.cross_pair_judge import (
 )
 from r2v_data_v2.v3.frames import validate_sampled_frames
 from r2v_data_v2.v3.mask_codec import decode_binary_mask
+from r2v_data_v2.v3.reference_completion import (
+    run_reference_completion_fallbacks,
+)
+from r2v_data_v2.v3.reference_completion_qwen import (
+    QwenLocalizedCompletionJudge,
+    QwenReferenceCompletionBackend,
+)
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     EntityReferenceJudge,
@@ -28,6 +37,7 @@ from r2v_data_v2.v3.reference_judge import (
     QwenEntityReferenceJudge,
     validate_entity_reference_decision,
 )
+from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     ClipRecord,
@@ -82,6 +92,9 @@ class PairStats:
     cross_pair_attempted: int = 0
     cross_pair_ready: int = 0
     cross_pair_repaired: int = 0
+    completion_attempted: int = 0
+    completion_ready: int = 0
+    completion_rejected: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -383,7 +396,7 @@ def _resolve_run_artifact(storage: RunStorage, relative_path: str) -> Path:
 def _validate_reference_png(
     path: Path,
     *,
-    expected: Image.Image,
+    expected: Image.Image | None,
 ) -> None:
     if not path.is_file():
         raise ValueError("ready entity reference artifact is missing")
@@ -394,12 +407,18 @@ def _validate_reference_png(
         if opened.mode != "RGBA":
             raise ValueError("ready entity reference must be RGBA")
         actual = np.asarray(opened)
-    expected_pixels = np.asarray(expected)
-    if actual.shape != expected_pixels.shape:
-        raise ValueError("ready entity reference dimensions are invalid")
     alpha = actual[..., 3]
     if not np.isin(alpha, (0, 255)).all():
         raise ValueError("ready entity reference alpha must be binary")
+    if not np.any(alpha == 255):
+        raise ValueError("ready entity reference alpha must not be empty")
+    if np.any(actual[..., :3][alpha == 0] != 255):
+        raise ValueError("ready entity reference transparent RGB must be white")
+    if expected is None:
+        return
+    expected_pixels = np.asarray(expected)
+    if actual.shape != expected_pixels.shape:
+        raise ValueError("ready entity reference dimensions are invalid")
     if not np.array_equal(actual, expected_pixels):
         expected_alpha = expected_pixels[..., 3]
         if not np.array_equal(alpha, expected_alpha):
@@ -456,8 +475,6 @@ def validate_entity_reference_artifact(
         if final_path.exists():
             raise ValueError("rejected entity reference has a final artifact")
         return
-    if reference_state.synthetic:
-        raise ValueError("synthetic entity references are not allowed")
     if reference_state.image_path is None:
         raise ValueError("ready entity reference is missing image_path")
     state_path = _resolve_run_artifact(storage, reference_state.image_path)
@@ -471,6 +488,36 @@ def validate_entity_reference_artifact(
         source_clip_uid == clip_uid
         and source_entity_id == annotation_entity.entity_id
     )
+    if reference_state.synthetic:
+        if not is_self:
+            raise ValueError("generated fallback must use self provenance")
+        _validate_reference_png(state_path, expected=None)
+        output_sha256 = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        if output_sha256 != reference_state.generation_output_sha256:
+            raise ValueError("generated fallback output hash changed")
+        metadata_value = reference_state.generation_metadata_path
+        if metadata_value is None:
+            raise ValueError("generated fallback metadata path is missing")
+        metadata_path = _resolve_run_artifact(storage, metadata_value)
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (
+            metadata.get("status") != "accepted"
+            or metadata.get("clip_uid") != clip_uid
+            or metadata.get("entity_id") != annotation_entity.entity_id
+            or metadata.get("generated_reference_sha256") != output_sha256
+        ):
+            raise ValueError("generated fallback metadata does not match state")
+        source_path_value = metadata.get("source_image_path")
+        if not isinstance(source_path_value, str):
+            raise ValueError("generated fallback source path is missing")
+        source_path = _resolve_run_artifact(storage, source_path_value)
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if (
+            source_sha256 != reference_state.generation_source_sha256
+            or metadata.get("source_image_sha256") != source_sha256
+        ):
+            raise ValueError("generated fallback source hash changed")
+        return
     if is_legacy or is_self:
         candidate = _selected_candidate_for_state(
             config,
@@ -520,6 +567,7 @@ def validate_entity_reference_artifact(
         or donor_state.status != "ready"
         or donor_state.reference_scope != "full"
         or not donor_state.identity_features_visible
+        or donor_state.synthetic
         or source_entity_id not in donor_clip.pairing.retained_entity_ids
     ):
         raise ValueError("cross-pair donor reference is no longer eligible")
@@ -780,6 +828,7 @@ def _build_same_parent_donor_index(
                 or donor_state.status != "ready"
                 or donor_state.reference_scope != "full"
                 or not donor_state.identity_features_visible
+                or donor_state.synthetic
                 or donor_entity.entity_id
                 not in donor_clip.pairing.retained_entity_ids
                 or not (is_legacy or is_self)
@@ -1059,9 +1108,17 @@ def _run_same_parent_cross_pair_fallback(
                     state.entity_id: state
                     for state in target_clip.references.entities
                 }
+                original_statuses = {
+                    entity_id: state.status
+                    for entity_id, state in states_by_id.items()
+                }
                 for target_entity in target_clip.annotation.entities:
                     current_state = states_by_id.get(target_entity.entity_id)
-                    if current_state is not None and current_state.status == "ready":
+                    if (
+                        current_state is not None
+                        and current_state.status == "ready"
+                        and current_state.reference_scope == "full"
+                    ):
                         continue
                     target_candidates = build_entity_reference_candidates(
                         config,
@@ -1225,9 +1282,13 @@ def _run_same_parent_cross_pair_fallback(
                     donor_paths=temporary_donors,
                 )
                 added = len(temporary_donors)
+                newly_ready = sum(
+                    original_statuses[entity_id] != "ready"
+                    for entity_id in temporary_donors
+                )
                 counters["cross_pair_ready"] += added
-                counters["entities_ready"] += added
-                counters["entities_rejected"] -= added
+                counters["entities_ready"] += newly_ready
+                counters["entities_rejected"] -= newly_ready
                 if previous_status != pairing.status:
                     counters[previous_status] -= 1
                     counters[pairing.status] += 1
@@ -1314,6 +1375,9 @@ def pair_clips(
     overwrite: bool = False,
     judge: EntityReferenceJudge | None = None,
     cross_pair_judge: CrossPairJudge | None = None,
+    completion_backend: QwenReferenceCompletionBackend | None = None,
+    completion_judge: QwenLocalizedCompletionJudge | None = None,
+    completion_segmentation_backend: SegmentationBackend | None = None,
 ) -> PairStats:
     config.validate()
     if storage.root != config.resolved_run_root:
@@ -1573,6 +1637,18 @@ def pair_clips(
             counters=counters,
             judge=cross_pair_judge,
         )
+        completion_stats = run_reference_completion_fallbacks(
+            config,
+            storage,
+            target_clip_uids=cross_pair_targets,
+            reference_judge=active_judge,
+            completion_backend=completion_backend,
+            completion_judge=completion_judge,
+            segmentation_backend=completion_segmentation_backend,
+        )
+        counters["completion_attempted"] += completion_stats.attempted
+        counters["completion_ready"] += completion_stats.ready
+        counters["completion_rejected"] += completion_stats.rejected
     finally:
         if owned_judge is not None:
             owned_judge.close()

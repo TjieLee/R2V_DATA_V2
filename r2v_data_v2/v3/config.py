@@ -299,8 +299,24 @@ class V3Config:
             raise ValueError(
                 "instruction.repair_retries must be a non-negative integer"
             )
-        if self.reference_scope.allow_synthetic_completion:
-            raise ValueError("V3 does not allow synthetic entity completion")
+        for name, value in (
+            ("enabled", self.reference_scope.enabled),
+            ("allow_local", self.reference_scope.allow_local),
+            (
+                "allow_synthetic_completion",
+                self.reference_scope.allow_synthetic_completion,
+            ),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"reference_scope.{name} must be a boolean")
+        if (
+            self.reference_scope.allow_synthetic_completion
+            and not self.pair.enabled
+        ):
+            raise ValueError(
+                "reference_scope.allow_synthetic_completion requires "
+                "pair.enabled"
+            )
         if not isinstance(self.pair.enabled, bool):
             raise TypeError("pair.enabled must be a boolean")
         if self.pair.enabled and self.qwen.candidate_judge is None:

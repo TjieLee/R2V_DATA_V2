@@ -15,6 +15,10 @@ from r2v_data_v2.v3.manifest import build_manifest
 from r2v_data_v2.v3.pair import pair_clips
 from r2v_data_v2.v3.qwen_image_edit_backend import BackgroundRemovalBackend
 from r2v_data_v2.v3.rank import rank_temporal_coverage
+from r2v_data_v2.v3.reference_completion_qwen import (
+    QwenLocalizedCompletionJudge,
+    QwenReferenceCompletionBackend,
+)
 from r2v_data_v2.v3.reference_judge import EntityReferenceJudge
 from r2v_data_v2.v3.removal_judge import BackgroundRemovalJudge
 from r2v_data_v2.v3.remove import remove_backgrounds
@@ -79,6 +83,8 @@ def run_pipeline_v3(
     background_removal_judge: BackgroundRemovalJudge | None = None,
     entity_reference_judge: EntityReferenceJudge | None = None,
     cross_pair_judge: CrossPairJudge | None = None,
+    reference_completion_backend: QwenReferenceCompletionBackend | None = None,
+    reference_completion_judge: QwenLocalizedCompletionJudge | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -155,6 +161,9 @@ def run_pipeline_v3(
                 overwrite=overwrite,
                 judge=entity_reference_judge,
                 cross_pair_judge=cross_pair_judge,
+                completion_backend=reference_completion_backend,
+                completion_judge=reference_completion_judge,
+                completion_segmentation_backend=segmentation_backend,
             ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
