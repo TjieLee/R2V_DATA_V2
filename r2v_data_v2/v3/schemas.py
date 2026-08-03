@@ -368,6 +368,34 @@ class RawEntityReferenceDecision(SchemaModel):
         return self
 
 
+class RawCrossPairDecision(SchemaModel):
+    verdict: Literal["accept", "reject"]
+    target_entity_visible: StrictBool
+    same_physical_entity: StrictBool
+    identity_features_match: StrictBool
+    reference_is_usable: StrictBool
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> RawCrossPairDecision:
+        if not self.reason.strip():
+            raise ValueError("cross-pair reason must not be empty")
+        all_passed = all(
+            (
+                self.target_entity_visible,
+                self.same_physical_entity,
+                self.identity_features_match,
+                self.reference_is_usable,
+            )
+        )
+        expected = "accept" if all_passed else "reject"
+        if self.verdict != expected:
+            raise ValueError(
+                "cross-pair verdict must accept if and only if all checks pass"
+            )
+        return self
+
+
 class EntityReferenceState(SchemaModel):
     entity_id: str
     status: Literal["ready", "rejected"]
@@ -378,12 +406,19 @@ class EntityReferenceState(SchemaModel):
     scope_reason: str
     image_path: Optional[str] = None
     source_frame_index: Optional[int] = Field(default=None, ge=0)
+    source_clip_uid: Optional[str] = None
+    source_entity_id: Optional[str] = None
     synthetic: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_reference_state(self) -> EntityReferenceState:
         if not self.scope_reason.strip():
             raise ValueError("entity reference scope_reason must not be empty")
+        if (self.source_clip_uid is None) != (self.source_entity_id is None):
+            raise ValueError(
+                "entity reference source_clip_uid and source_entity_id "
+                "must be set together"
+            )
         if self.status == "ready":
             if self.reference_scope == "full":
                 if (
@@ -418,7 +453,12 @@ class EntityReferenceState(SchemaModel):
         else:
             if self.reference_scope != "reject":
                 raise ValueError("rejected entity reference requires reject scope")
-            if self.image_path is not None or self.source_frame_index is not None:
+            if (
+                self.image_path is not None
+                or self.source_frame_index is not None
+                or self.source_clip_uid is not None
+                or self.source_entity_id is not None
+            ):
                 raise ValueError(
                     "rejected entity reference cannot publish image provenance"
                 )
@@ -1348,6 +1388,8 @@ class DatasetReference(SchemaModel):
     visible_region: VisibleRegion
     image_path: str
     source_frame_index: int = Field(ge=0)
+    source_clip_uid: Optional[str] = None
+    source_entity_id: Optional[str] = None
     synthetic: bool
 
     @field_validator("token")
@@ -1368,6 +1410,11 @@ class DatasetReference(SchemaModel):
 
     @model_validator(mode="after")
     def validate_type_fields(self) -> DatasetReference:
+        if (self.source_clip_uid is None) != (self.source_entity_id is None):
+            raise ValueError(
+                "dataset reference source_clip_uid and source_entity_id "
+                "must be set together"
+            )
         if self.type == "entity":
             if self.entity_id is None:
                 raise ValueError("entity reference requires entity_id")
@@ -1378,6 +1425,10 @@ class DatasetReference(SchemaModel):
             if self.synthetic:
                 raise ValueError("V3 entity references must not be synthetic")
         else:
+            if self.source_clip_uid is not None:
+                raise ValueError(
+                    "background reference cannot publish entity provenance"
+                )
             if self.entity_id is not None or self.scope != "scene":
                 raise ValueError("background reference must use scene scope and no entity_id")
             if not self.token.startswith("<ref_bg_"):

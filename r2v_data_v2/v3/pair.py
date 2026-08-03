@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import shutil
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -11,6 +12,13 @@ from PIL import Image, ImageDraw
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.background import validate_background_reference
 from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.cross_pair_judge import (
+    CrossPairDecisionAttempt,
+    CrossPairJudge,
+    CrossPairJudgeFailure,
+    CrossPairTargetEvidenceMode,
+    QwenCrossPairJudge,
+)
 from r2v_data_v2.v3.frames import validate_sampled_frames
 from r2v_data_v2.v3.mask_codec import decode_binary_mask
 from r2v_data_v2.v3.reference_judge import (
@@ -38,6 +46,9 @@ _SLOT_PRIORITY_INDEX = {
     slot: index for index, slot in enumerate(_SLOT_PRIORITY)
 }
 _ENTITY_PNG = re.compile(r"e[1-9]\d*\.png")
+_CROSS_PAIR_CONTACT_SHEET_COLUMNS = 5
+_CROSS_PAIR_CONTACT_SHEET_PANEL_MAX_SIDE = 384
+_CROSS_PAIR_CONTACT_SHEET_LABEL_HEIGHT = 28
 
 
 @dataclass(frozen=True)
@@ -68,6 +79,9 @@ class PairStats:
     entities_rejected: int = 0
     backgrounds_bound: int = 0
     repaired: int = 0
+    cross_pair_attempted: int = 0
+    cross_pair_ready: int = 0
+    cross_pair_repaired: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -126,6 +140,64 @@ def build_candidate_context_image(
     restored = np.asarray(result).copy()
     restored[binary] = source[binary]
     return Image.fromarray(restored, mode="RGB")
+
+
+def build_cross_pair_target_contact_sheet(
+    frame_images: list[tuple[int, Image.Image]],
+    *,
+    panel_max_side: int = _CROSS_PAIR_CONTACT_SHEET_PANEL_MAX_SIDE,
+) -> Image.Image:
+    if (
+        isinstance(panel_max_side, bool)
+        or not isinstance(panel_max_side, int)
+        or panel_max_side <= 0
+    ):
+        raise ValueError(
+            "cross-pair contact-sheet panel_max_side must be a positive integer"
+        )
+    slots = [slot for slot, _ in frame_images]
+    if slots != list(range(10)):
+        raise ValueError(
+            "cross-pair target frames must contain ordered slots 0 through 9"
+        )
+    for _, image in frame_images:
+        if not isinstance(image, Image.Image):
+            raise TypeError("cross-pair target frames must be PIL images")
+
+    label_height = _CROSS_PAIR_CONTACT_SHEET_LABEL_HEIGHT
+    panel_height = panel_max_side + label_height
+    sheet = Image.new(
+        "RGB",
+        (
+            panel_max_side * _CROSS_PAIR_CONTACT_SHEET_COLUMNS,
+            panel_height * 2,
+        ),
+        (255, 255, 255),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, (slot, image) in enumerate(frame_images):
+        thumbnail = image.convert("RGB")
+        thumbnail.thumbnail(
+            (panel_max_side, panel_max_side),
+            Image.Resampling.LANCZOS,
+        )
+        column = index % _CROSS_PAIR_CONTACT_SHEET_COLUMNS
+        row = index // _CROSS_PAIR_CONTACT_SHEET_COLUMNS
+        origin_x = column * panel_max_side
+        origin_y = row * panel_height
+        image_x = origin_x + (panel_max_side - thumbnail.width) // 2
+        image_y = (
+            origin_y
+            + label_height
+            + (panel_max_side - thumbnail.height) // 2
+        )
+        sheet.paste(thumbnail, (image_x, image_y))
+        draw.text(
+            (origin_x + 8, origin_y + 6),
+            f"slot {slot}",
+            fill=(0, 0, 0),
+        )
+    return sheet
 
 
 def build_reference_crop(
@@ -391,25 +463,113 @@ def validate_entity_reference_artifact(
     state_path = _resolve_run_artifact(storage, reference_state.image_path)
     if state_path != final_path:
         raise ValueError("ready entity reference path must be selected/eN.png")
-    candidate = _selected_candidate_for_state(
+
+    source_clip_uid = reference_state.source_clip_uid
+    source_entity_id = reference_state.source_entity_id
+    is_legacy = source_clip_uid is None and source_entity_id is None
+    is_self = (
+        source_clip_uid == clip_uid
+        and source_entity_id == annotation_entity.entity_id
+    )
+    if is_legacy or is_self:
+        candidate = _selected_candidate_for_state(
+            config,
+            storage,
+            clip_uid=clip_uid,
+            entity=annotation_entity,
+            state=reference_state,
+            frames=frames,
+            masks=masks,
+        )
+        source_path = _resolve_run_artifact(storage, candidate.image_path)
+        with Image.open(source_path) as opened:
+            source = opened.convert("RGB")
+            source.load()
+        expected, _ = build_reference_crop(
+            source,
+            candidate.mask,
+            crop_padding_ratio=config.pair.crop_padding_ratio,
+        )
+        _validate_reference_png(state_path, expected=expected)
+        return
+
+    target_clip = storage.read_clip(clip_uid)
+    if source_clip_uid == clip_uid:
+        raise ValueError("cross-pair provenance must use a different clip_uid")
+    donor_clip = storage.read_clip(source_clip_uid)
+    if donor_clip.source.parent_video_id != target_clip.source.parent_video_id:
+        raise ValueError("cross-pair donor must have the exact same parent_video_id")
+    if donor_clip.annotation is None or donor_clip.annotation.status != "ready":
+        raise ValueError("cross-pair donor annotation is not ready")
+    if donor_clip.pairing is None or donor_clip.pairing.status != "ready":
+        raise ValueError("cross-pair donor pairing is not ready")
+    donor_entities = {
+        entity.entity_id: entity for entity in donor_clip.annotation.entities
+    }
+    donor_entity = donor_entities.get(source_entity_id)
+    if donor_entity is None:
+        raise ValueError("cross-pair donor entity is missing")
+    if donor_entity.reference_type != annotation_entity.reference_type:
+        raise ValueError("cross-pair donor reference type does not match target")
+    donor_states = {
+        state.entity_id: state for state in donor_clip.references.entities
+    }
+    donor_state = donor_states.get(source_entity_id)
+    if (
+        donor_state is None
+        or donor_state.status != "ready"
+        or donor_state.reference_scope != "full"
+        or not donor_state.identity_features_visible
+        or source_entity_id not in donor_clip.pairing.retained_entity_ids
+    ):
+        raise ValueError("cross-pair donor reference is no longer eligible")
+    if donor_state.source_clip_uid not in {None, source_clip_uid} or (
+        donor_state.source_entity_id not in {None, source_entity_id}
+    ):
+        raise ValueError("cross-pair donor references cannot be chained")
+    donor_frames = validate_sampled_frames(storage, source_clip_uid)
+    donor_masks = storage.read_masks(source_clip_uid)
+    _validate_pair_inputs(donor_clip, donor_frames, donor_masks)
+    validate_entity_reference_artifact(
+        config,
+        storage,
+        source_clip_uid,
+        donor_entity,
+        donor_state,
+        donor_frames,
+        donor_masks,
+    )
+    # A cross-paired target can be validated from either a masked candidate
+    # or the complete sampled-frame artifact already validated by the caller.
+    # Building candidates still validates masked evidence when it exists;
+    # an empty shortlist is valid for context-only cross-pairing.
+    build_entity_reference_candidates(
         config,
         storage,
         clip_uid=clip_uid,
         entity=annotation_entity,
-        state=reference_state,
         frames=frames,
         masks=masks,
     )
-    source_path = _resolve_run_artifact(storage, candidate.image_path)
-    with Image.open(source_path) as opened:
-        source = opened.convert("RGB")
-        source.load()
-    expected, _ = build_reference_crop(
-        source,
-        candidate.mask,
-        crop_padding_ratio=config.pair.crop_padding_ratio,
+    inherited_fields = (
+        "reference_scope",
+        "visible_region",
+        "whole_entity_recognizable",
+        "identity_features_visible",
+        "scope_reason",
+        "source_frame_index",
     )
-    _validate_reference_png(state_path, expected=expected)
+    if any(
+        getattr(reference_state, field) != getattr(donor_state, field)
+        for field in inherited_fields
+    ):
+        raise ValueError("cross-pair reference did not inherit donor quality fields")
+    donor_path = storage.selected_entity_path(
+        source_clip_uid,
+        source_entity_id,
+    )
+    if state_path.read_bytes() != donor_path.read_bytes():
+        raise ValueError("cross-pair target artifact bytes do not match donor PNG")
 
 
 def _rejected_reference(entity_id: str, reason: str) -> EntityReferenceState:
@@ -455,6 +615,21 @@ def _load_source_images(
             image.load()
         images[candidate.image_path] = image
     return images
+
+
+def _load_cross_pair_target_frame_images(
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    frames: SampledFramesArtifact,
+) -> list[tuple[int, Image.Image]]:
+    frame_images: list[tuple[int, Image.Image]] = []
+    for frame in frames.frames:
+        with Image.open(storage.frame_path(clip_uid, frame.slot)) as opened:
+            image = opened.convert("RGB")
+            image.load()
+        frame_images.append((frame.slot, image))
+    return frame_images
 
 
 def _write_debug_attempt(
@@ -552,6 +727,531 @@ def _validate_existing_pairing(
         raise ValueError("ready background was not bound")
 
 
+@dataclass(frozen=True)
+class _CrossPairDonor:
+    clip: ClipRecord
+    entity: AnnotationEntity
+    reference: EntityReferenceState
+    image_path: Path
+
+
+def _natural_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", value)
+        if part
+    )
+
+
+def _build_same_parent_donor_index(
+    config: V3Config,
+    storage: RunStorage,
+) -> dict[tuple[str, str], tuple[_CrossPairDonor, ...]]:
+    donors_by_key: dict[tuple[str, str], list[_CrossPairDonor]] = {}
+    for initial_donor in storage.iter_clips():
+        donor_clip = storage.read_clip(initial_donor.clip_uid)
+        if (
+            donor_clip.annotation is None
+            or donor_clip.annotation.status != "ready"
+            or donor_clip.pairing is None
+            or donor_clip.pairing.status != "ready"
+        ):
+            continue
+        donor_states = {
+            state.entity_id: state for state in donor_clip.references.entities
+        }
+        eligible_references: list[
+            tuple[AnnotationEntity, EntityReferenceState]
+        ] = []
+        for donor_entity in donor_clip.annotation.entities:
+            donor_state = donor_states.get(donor_entity.entity_id)
+            is_legacy = (
+                donor_state is not None
+                and donor_state.source_clip_uid is None
+                and donor_state.source_entity_id is None
+            )
+            is_self = (
+                donor_state is not None
+                and donor_state.source_clip_uid == donor_clip.clip_uid
+                and donor_state.source_entity_id == donor_entity.entity_id
+            )
+            if (
+                donor_state is None
+                or donor_state.status != "ready"
+                or donor_state.reference_scope != "full"
+                or not donor_state.identity_features_visible
+                or donor_entity.entity_id
+                not in donor_clip.pairing.retained_entity_ids
+                or not (is_legacy or is_self)
+            ):
+                continue
+            eligible_references.append((donor_entity, donor_state))
+        if not eligible_references:
+            continue
+        try:
+            donor_frames = validate_sampled_frames(
+                storage,
+                donor_clip.clip_uid,
+            )
+            donor_masks = storage.read_masks(donor_clip.clip_uid)
+            _validate_pair_inputs(donor_clip, donor_frames, donor_masks)
+        except Exception:  # noqa: BLE001, S112 - skip invalid donor clip
+            continue
+        for donor_entity, donor_state in eligible_references:
+            try:
+                validate_entity_reference_artifact(
+                    config,
+                    storage,
+                    donor_clip.clip_uid,
+                    donor_entity,
+                    donor_state,
+                    donor_frames,
+                    donor_masks,
+                )
+            except Exception:  # noqa: BLE001, S112 - skip invalid donors
+                continue
+            key = (
+                donor_clip.source.parent_video_id,
+                donor_entity.reference_type,
+            )
+            donors_by_key.setdefault(key, []).append(
+                _CrossPairDonor(
+                    clip=donor_clip,
+                    entity=donor_entity,
+                    reference=donor_state,
+                    image_path=storage.selected_entity_path(
+                        donor_clip.clip_uid,
+                        donor_entity.entity_id,
+                    ),
+                )
+            )
+    return {
+        key: tuple(
+            sorted(
+                donors,
+                key=lambda donor: (
+                    _natural_sort_key(donor.clip.source.clip_suffix),
+                    donor.clip.clip_uid,
+                    donor.entity.entity_id,
+                ),
+            )
+        )
+        for key, donors in donors_by_key.items()
+    }
+
+
+def _donors_for_target(
+    config: V3Config,
+    donor_index: dict[tuple[str, str], tuple[_CrossPairDonor, ...]],
+    *,
+    target_clip: ClipRecord,
+    target_entity: AnnotationEntity,
+) -> tuple[_CrossPairDonor, ...]:
+    key = (
+        target_clip.source.parent_video_id,
+        target_entity.reference_type,
+    )
+    selected: list[_CrossPairDonor] = []
+    for donor in donor_index.get(key, ()):
+        if donor.clip.clip_uid == target_clip.clip_uid:
+            continue
+        selected.append(donor)
+        if len(selected) == config.pair.same_parent_max_donor_references:
+            break
+    return tuple(selected)
+
+
+def _write_cross_pair_debug(
+    storage: RunStorage,
+    *,
+    target_clip: ClipRecord,
+    target_entity: AnnotationEntity,
+    target_evidence_mode: CrossPairTargetEvidenceMode,
+    target_frame_slots: tuple[int, ...],
+    target_context_image: Image.Image,
+    donor: _CrossPairDonor,
+    attempt: CrossPairDecisionAttempt | None = None,
+    failure: CrossPairJudgeFailure | None = None,
+) -> None:
+    if not storage.config.debug.save_diagnostics:
+        return
+    root = storage.pair_debug_dir(
+        target_clip.clip_uid,
+        target_entity.entity_id,
+    )
+    safe_donor = re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        f"{donor.clip.clip_uid}-{donor.entity.entity_id}",
+    )
+    directory = root / "cross_pair" / safe_donor
+    directory.mkdir(parents=True, exist_ok=True)
+    if target_evidence_mode == "sampled_frames":
+        target_context_image.save(
+            directory / "target_contact_sheet.png",
+            format="PNG",
+        )
+    raw_responses = (
+        list(attempt.raw_responses)
+        if attempt is not None
+        else list(failure.raw_responses if failure is not None else [])
+    )
+    issues = (
+        []
+        if failure is None
+        else [issue.to_dict() for issue in failure.issues]
+    )
+    write_json_atomic(
+        directory / "decision.json",
+        {
+            "target_evidence_mode": target_evidence_mode,
+            "target_frame_slots": list(target_frame_slots),
+            "target": {
+                "clip_uid": target_clip.clip_uid,
+                "entity_id": target_entity.entity_id,
+                "reference_type": target_entity.reference_type,
+                "phrase": target_entity.phrase,
+                "grounding_prompt": target_entity.grounding_prompt,
+            },
+            "donor": {
+                "clip_uid": donor.clip.clip_uid,
+                "entity_id": donor.entity.entity_id,
+                "reference_type": donor.entity.reference_type,
+                "phrase": donor.entity.phrase,
+                "grounding_prompt": donor.entity.grounding_prompt,
+                "image_path": storage.relative_artifact_path(
+                    donor.image_path
+                ),
+            },
+            "raw_responses": raw_responses,
+            "issues": issues,
+            "repair_attempts": (
+                attempt.repair_attempts if attempt is not None else None
+            ),
+            "decision": (
+                attempt.decision.model_dump(mode="json")
+                if attempt is not None
+                else None
+            ),
+        },
+    )
+
+
+def _pairing_from_references(
+    clip: ClipRecord,
+    entity_states: list[EntityReferenceState],
+) -> PairingState:
+    if clip.annotation is None or clip.coverage is None:
+        raise ValueError("cross-pair target inputs are incomplete")
+    retained = [
+        state.entity_id for state in entity_states if state.status == "ready"
+    ]
+    if not set(retained).intersection(clip.coverage.qualifying_entity_ids):
+        return PairingState(
+            status="rejected",
+            reason="no_qualifying_ready_reference",
+        )
+    entity_by_id = {
+        entity.entity_id: entity for entity in clip.annotation.entities
+    }
+    background = clip.references.background
+    background_token = (
+        "<ref_bg_1>"
+        if background is not None
+        and background.status in {"clean_raw", "ready_removed"}
+        else None
+    )
+    return PairingState(
+        status="ready",
+        retained_entity_ids=retained,
+        tokens=_tokens_for_retained(retained, entity_by_id),
+        background_token=background_token,
+    )
+
+
+def _publish_cross_pair_result(
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    references: ReferencesState,
+    pairing: PairingState,
+    donor_paths: dict[str, Path],
+) -> None:
+    temporary_paths: dict[str, Path] = {}
+    expected_bytes: dict[str, bytes] = {}
+    backups: dict[Path, Path] = {}
+    published: list[Path] = []
+    try:
+        for entity_id, donor_path in donor_paths.items():
+            donor_bytes = donor_path.read_bytes()
+            temporary = storage.pair_output_temporary_path(
+                clip_uid,
+                entity_id,
+            )
+            shutil.copyfile(donor_path, temporary)
+            if temporary.read_bytes() != donor_bytes:
+                raise ValueError("cross-pair temporary PNG bytes changed during copy")
+            temporary_paths[entity_id] = temporary
+            expected_bytes[entity_id] = donor_bytes
+        for entity_id, temporary in temporary_paths.items():
+            final = storage.selected_entity_path(clip_uid, entity_id)
+            if final.exists():
+                backup = storage.pair_output_backup_path(clip_uid, entity_id)
+                final.replace(backup)
+                backups[final] = backup
+            temporary.replace(final)
+            published.append(final)
+            if final.read_bytes() != expected_bytes[entity_id]:
+                raise ValueError("cross-pair target PNG bytes changed during publish")
+        storage.write_references_and_pairing(clip_uid, references, pairing)
+    except Exception:
+        for final in published:
+            final.unlink(missing_ok=True)
+        for final, backup in backups.items():
+            if backup.exists():
+                backup.replace(final)
+        raise
+    else:
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+    finally:
+        for temporary in temporary_paths.values():
+            temporary.unlink(missing_ok=True)
+        storage.cleanup_pair_artifacts(clip_uid)
+
+
+def _run_same_parent_cross_pair_fallback(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    target_clip_uids: set[str],
+    counters: dict[str, int],
+    judge: CrossPairJudge | None,
+) -> None:
+    if (
+        not config.pair.same_parent_fallback_enabled
+        or not target_clip_uids
+    ):
+        return
+    donor_index = _build_same_parent_donor_index(config, storage)
+    active_judge = judge
+    owned_judge: QwenCrossPairJudge | None = None
+    try:
+        for target_clip_uid in sorted(target_clip_uids):
+            target_clip = storage.read_clip(target_clip_uid)
+            temporary_donors: dict[str, Path] = {}
+            try:
+                if (
+                    target_clip.annotation is None
+                    or target_clip.annotation.status != "ready"
+                    or target_clip.coverage is None
+                    or not target_clip.coverage.passed
+                    or target_clip.pairing is None
+                ):
+                    continue
+                target_frames = validate_sampled_frames(
+                    storage,
+                    target_clip.clip_uid,
+                )
+                target_masks = storage.read_masks(target_clip.clip_uid)
+                _validate_pair_inputs(target_clip, target_frames, target_masks)
+                states_by_id = {
+                    state.entity_id: state
+                    for state in target_clip.references.entities
+                }
+                for target_entity in target_clip.annotation.entities:
+                    current_state = states_by_id.get(target_entity.entity_id)
+                    if current_state is not None and current_state.status == "ready":
+                        continue
+                    target_candidates = build_entity_reference_candidates(
+                        config,
+                        storage,
+                        clip_uid=target_clip.clip_uid,
+                        entity=target_entity,
+                        frames=target_frames,
+                        masks=target_masks,
+                    )
+                    donors = _donors_for_target(
+                        config,
+                        donor_index,
+                        target_clip=target_clip,
+                        target_entity=target_entity,
+                    )
+                    if not donors:
+                        continue
+                    if target_candidates:
+                        target_evidence_mode: CrossPairTargetEvidenceMode = (
+                            "masked_candidate"
+                        )
+                        target_candidate = target_candidates[0]
+                        target_frame_slots = (target_candidate.frame_slot,)
+                        target_sources = _load_source_images(
+                            storage,
+                            [target_candidate],
+                        )
+                        target_source = target_sources[
+                            target_candidate.image_path
+                        ]
+                        target_context = build_candidate_context_image(
+                            target_source,
+                            target_candidate.mask,
+                        )
+                        target_crop, _ = build_reference_crop(
+                            target_source,
+                            target_candidate.mask,
+                            crop_padding_ratio=config.pair.crop_padding_ratio,
+                        )
+                    else:
+                        target_evidence_mode = "sampled_frames"
+                        target_frame_images = (
+                            _load_cross_pair_target_frame_images(
+                                storage,
+                                clip_uid=target_clip.clip_uid,
+                                frames=target_frames,
+                            )
+                        )
+                        target_frame_slots = tuple(
+                            slot for slot, _ in target_frame_images
+                        )
+                        target_context = (
+                            build_cross_pair_target_contact_sheet(
+                                target_frame_images
+                            )
+                        )
+                        target_crop = None
+                    for donor in donors:
+                        if active_judge is None:
+                            judge_config = config.qwen.cross_pair_judge
+                            if judge_config is None:
+                                raise RuntimeError(
+                                    "cross-pair judge is not configured"
+                                )
+                            owned_judge = QwenCrossPairJudge(
+                                judge_config,
+                                repair_retries=config.pair.repair_retries,
+                            )
+                            active_judge = owned_judge
+                        with Image.open(donor.image_path) as opened:
+                            donor_image = opened.convert("RGBA")
+                            donor_image.load()
+                        counters["cross_pair_attempted"] += 1
+                        try:
+                            attempt = active_judge.decide(
+                                target_clip_uid=target_clip.clip_uid,
+                                target_entity=target_entity,
+                                target_evidence_mode=target_evidence_mode,
+                                target_context_image=target_context,
+                                target_entity_crop=target_crop,
+                                donor_clip_uid=donor.clip.clip_uid,
+                                donor_entity=donor.entity,
+                                donor_reference_image=donor_image,
+                            )
+                        except CrossPairJudgeFailure as exc:
+                            _write_cross_pair_debug(
+                                storage,
+                                target_clip=target_clip,
+                                target_entity=target_entity,
+                                target_evidence_mode=target_evidence_mode,
+                                target_frame_slots=target_frame_slots,
+                                target_context_image=target_context,
+                                donor=donor,
+                                failure=exc,
+                            )
+                            raise
+                        _write_cross_pair_debug(
+                            storage,
+                            target_clip=target_clip,
+                            target_entity=target_entity,
+                            target_evidence_mode=target_evidence_mode,
+                            target_frame_slots=target_frame_slots,
+                            target_context_image=target_context,
+                            donor=donor,
+                            attempt=attempt,
+                        )
+                        counters["cross_pair_repaired"] += int(
+                            attempt.repair_attempts > 0
+                        )
+                        if attempt.decision.verdict != "accept":
+                            continue
+                        donor_state = donor.reference
+                        states_by_id[target_entity.entity_id] = (
+                            EntityReferenceState(
+                                entity_id=target_entity.entity_id,
+                                status="ready",
+                                reference_scope=donor_state.reference_scope,
+                                visible_region=donor_state.visible_region,
+                                whole_entity_recognizable=(
+                                    donor_state.whole_entity_recognizable
+                                ),
+                                identity_features_visible=(
+                                    donor_state.identity_features_visible
+                                ),
+                                scope_reason=donor_state.scope_reason,
+                                image_path=storage.relative_artifact_path(
+                                    storage.selected_entity_path(
+                                        target_clip.clip_uid,
+                                        target_entity.entity_id,
+                                    )
+                                ),
+                                source_frame_index=(
+                                    donor_state.source_frame_index
+                                ),
+                                synthetic=False,
+                                source_clip_uid=donor.clip.clip_uid,
+                                source_entity_id=donor.entity.entity_id,
+                            )
+                        )
+                        temporary_donors[target_entity.entity_id] = (
+                            donor.image_path
+                        )
+                        break
+                if not temporary_donors:
+                    continue
+                entity_states = [
+                    states_by_id[entity.entity_id]
+                    for entity in target_clip.annotation.entities
+                ]
+                pairing = _pairing_from_references(target_clip, entity_states)
+                references = ReferencesState(
+                    entities=entity_states,
+                    background=target_clip.references.background,
+                )
+                previous_status = target_clip.pairing.status
+                _publish_cross_pair_result(
+                    storage,
+                    clip_uid=target_clip.clip_uid,
+                    references=references,
+                    pairing=pairing,
+                    donor_paths=temporary_donors,
+                )
+                added = len(temporary_donors)
+                counters["cross_pair_ready"] += added
+                counters["entities_ready"] += added
+                counters["entities_rejected"] -= added
+                if previous_status != pairing.status:
+                    counters[previous_status] -= 1
+                    counters[pairing.status] += 1
+                    if (
+                        previous_status == "rejected"
+                        and pairing.status == "ready"
+                        and pairing.background_token is not None
+                    ):
+                        counters["backgrounds_bound"] += 1
+            except Exception as exc:  # noqa: BLE001 - isolate target clips
+                storage.cleanup_pair_artifacts(target_clip.clip_uid)
+                storage.append_failure(
+                    stage="pair",
+                    clip_uid=target_clip.clip_uid,
+                    reason=str(exc),
+                    details=_failure_details(exc),
+                )
+                counters["failed"] += 1
+
+    finally:
+        if owned_judge is not None:
+            owned_judge.close()
+
+
 def _publish_pair_result(
     config: V3Config,
     storage: RunStorage,
@@ -599,7 +1299,10 @@ def _publish_pair_result(
 
 
 def _failure_details(exc: Exception) -> dict[str, object]:
-    if isinstance(exc, EntityReferenceJudgeFailure):
+    if isinstance(
+        exc,
+        (EntityReferenceJudgeFailure, CrossPairJudgeFailure),
+    ):
         return exc.to_dict()
     return {"exception_type": type(exc).__name__}
 
@@ -610,6 +1313,7 @@ def pair_clips(
     *,
     overwrite: bool = False,
     judge: EntityReferenceJudge | None = None,
+    cross_pair_judge: CrossPairJudge | None = None,
 ) -> PairStats:
     config.validate()
     if storage.root != config.resolved_run_root:
@@ -617,6 +1321,7 @@ def pair_clips(
     if not config.pair.enabled:
         raise ValueError("V3 pair stage is disabled")
     counters = {field: 0 for field in PairStats.__dataclass_fields__}
+    cross_pair_targets: set[str] = set()
     active_judge = judge
     owned_judge: QwenEntityReferenceJudge | None = None
     try:
@@ -786,6 +1491,8 @@ def pair_clips(
                             ),
                             source_frame_index=selected.source_frame_index,
                             synthetic=False,
+                            source_clip_uid=clip.clip_uid,
+                            source_entity_id=entity.entity_id,
                         )
                     )
                 retained = [
@@ -847,6 +1554,7 @@ def pair_clips(
                 counters["backgrounds_bound"] += int(
                     pairing.background_token is not None
                 )
+                cross_pair_targets.add(clip.clip_uid)
             except Exception as exc:  # noqa: BLE001 - continue with later clips
                 for temporary, _ in temporary_images.values():
                     temporary.unlink(missing_ok=True)
@@ -858,6 +1566,13 @@ def pair_clips(
                     details=_failure_details(exc),
                 )
                 counters["failed"] += 1
+        _run_same_parent_cross_pair_fallback(
+            config,
+            storage,
+            target_clip_uids=cross_pair_targets,
+            counters=counters,
+            judge=cross_pair_judge,
+        )
     finally:
         if owned_judge is not None:
             owned_judge.close()

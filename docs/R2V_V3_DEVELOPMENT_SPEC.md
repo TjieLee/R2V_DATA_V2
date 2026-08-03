@@ -257,9 +257,12 @@ publication, final retained filtering, optional ready-background binding, and
 deterministic per-type tokens. Every ready entity reference is retained in
 annotation order, and at least one retained entity must pass temporal coverage.
 The stage does not rerun SAM3, resize references, synthesize missing content, or
-perform same-parent/cross-parent pairing. Each retained entity remains a
-variable-size, source-faithful RGBA mask-bbox crop; pairing does not create a
-fixed canvas or a second normalized artifact.
+perform cross-parent pairing. When the optional same-parent fallback is enabled,
+a second phase may bind only a missing target reference from an exact
+`parent_video_id` match after a dedicated visual judge accepts the same physical
+entity. It never replaces a ready full/local target reference. Each retained
+entity remains a variable-size, source-faithful RGBA mask-bbox crop; pairing does
+not create a fixed canvas or a second normalized artifact.
 
 #### `instruct`
 
@@ -304,8 +307,12 @@ qwen:
     # independently configurable
 
   cross_pair_judge:
-    # independently configurable
+    # required explicitly only when same-parent fallback is enabled
 ```
+
+`qwen.cross_pair_judge` never falls back to `candidate_judge` or
+`instruction_writer`. Multiple explicitly configured services may point to the
+same vLLM endpoint.
 
 `full_video` means that the pipeline submits the complete local video file.
 vLLM's media I/O layer decodes and samples the video at the configured 2 FPS
@@ -623,9 +630,29 @@ V3 preserves the corrected clip-level coverage semantics:
 - an entity without a final reference remains in natural language but has no token;
 - token assignment and final reference filtering happen together.
 
-The current implementation is in-pair only. It does not invoke
-`qwen.cross_pair_judge`, search same-parent clips, search cross-parent clips, or
-fall back from any cross-pair attempt.
+Pairing has two deterministic phases. Phase A is the existing in-pair candidate
+selection and full/local/reject decision. Phase B is disabled by default. When
+`pair.same_parent_fallback_enabled` is true, it considers only target entities
+that still lack a ready reference and that have their own valid target-frame
+visual candidate. It never replaces a ready full or local reference.
+
+A donor must use the exact same `source.parent_video_id`, have a different
+`clip_uid`, ready annotation and pairing, and a retained full, identity-visible
+reference of the same type. Local/background references and invalid or missing
+PNGs are ineligible. Donors are ordered naturally by `clip_suffix`, then by
+`clip_uid` and donor `entity_id`, and capped by
+`pair.same_parent_max_donor_references`. Cross-parent and fuzzy parent matching
+are forbidden.
+
+The dedicated visual judge receives one target context frame, one target crop,
+and the donor source-faithful RGBA reference shown on white. It accepts only the
+same physical entity with matching identity features and a usable donor. A
+rejection advances to the next donor; uncertainty fails closed. On acceptance,
+the donor PNG is copied byte-for-byte to the target's canonical `selected/eN.png`
+without resize or re-encoding. Target tokens and instruction semantics remain
+target-owned. `source_clip_uid` and `source_entity_id` record the donor, while
+legacy references may omit both fields. Publication is transactional and rolls
+back target files when the authoritative clip write fails.
 
 ---
 
@@ -801,6 +828,12 @@ Rules:
 - Pair publication validates temporary PNGs, backs up only entity PNGs, updates
   references and pairing in one atomic clip write, and restores the old files
   and state on failure. It never deletes `bg_removed.png` or other selected files.
+- Same-parent publication copies accepted donor bytes to the target canonical
+  path with a temporary file plus atomic rename, verifies byte equality before
+  and after publication, and never modifies the donor artifact.
+- New in-pair references record self/self source provenance. Same-parent
+  references record donor clip/entity provenance. Legacy artifacts with neither
+  provenance field remain readable; exactly one field is invalid.
 - `background/source_mask_<sha256>.png` is the exact, single-channel 0/255
   union mask used by `pending_remove` and oversized audit states.
 - Background source masks are content-addressed and atomically published; stale
@@ -981,6 +1014,8 @@ Each line is one compact training record:
       "visible_region": "upper_body",
       "image_path": "references/<sample_id>/subject_1.png",
       "source_frame_index": 128,
+      "source_clip_uid": "<donor_or_self_clip_uid>",
+      "source_entity_id": "<donor_or_self_entity_id>",
       "synthetic": false
     },
     {
@@ -1060,6 +1095,8 @@ pair:
   max_candidates_per_entity: 3
   crop_padding_ratio: 0.08
   repair_retries: 1
+  same_parent_fallback_enabled: false
+  same_parent_max_donor_references: 8
 
 background:
   enabled: true
@@ -1132,6 +1169,7 @@ r2v_data_v2/v3/
 ├── annotation.py
 ├── pair.py
 ├── reference_judge.py
+|-- cross_pair_judge.py
 ├── background.py
 ├── remove.py
 ├── qwen_image_edit_backend.py
@@ -1222,7 +1260,16 @@ Include fixtures for:
 - clip-level coverage defaults to 7/10, is configurable, and uses ANY
   semantics;
 - shorter-lived ready references remain after another entity qualifies the clip;
-- every accepted sample binds at least one qualifying entity;
+- same-parent fallback is off by default and requires an explicit dedicated judge;
+- donor eligibility, natural ordering, configured cap, reject-continue, and
+  all-reject behavior are deterministic;
+- accepted donor PNG bytes are unchanged, publication rolls back on clip-write
+  failure, and corrupt existing cross-pair artifacts fail validation;
+- full/local target references are never replaced and cross-parent donors are
+  never considered;
+- legacy references without provenance remain readable, while new provenance is
+  exported with the dataset reference;
+- every accepted sample binds at least one qualifying target entity;
 - final reference order and instruction image bindings match exactly;
 - only accepted references are copied to the final dataset;
 - final reference count matches files on disk.

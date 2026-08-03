@@ -804,6 +804,8 @@ class DatasetExporter:
                     visible_region=reference.visible_region,
                     image_path=relative_path.as_posix(),
                     source_frame_index=reference.source_frame_index,
+                    source_clip_uid=reference.source_clip_uid,
+                    source_entity_id=reference.source_entity_id,
                     synthetic=False,
                 )
             )

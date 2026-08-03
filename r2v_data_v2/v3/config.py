@@ -112,6 +112,8 @@ class PairConfig:
     max_candidates_per_entity: int = 3
     crop_padding_ratio: float = 0.08
     repair_retries: int = 1
+    same_parent_fallback_enabled: bool = False
+    same_parent_max_donor_references: int = 8
 
 
 @dataclass(frozen=True)
@@ -327,6 +329,30 @@ class V3Config:
             or self.pair.repair_retries < 0
         ):
             raise ValueError("pair.repair_retries must be a non-negative integer")
+        if not isinstance(self.pair.same_parent_fallback_enabled, bool):
+            raise TypeError(
+                "pair.same_parent_fallback_enabled must be a boolean"
+            )
+        if (
+            not isinstance(self.pair.same_parent_max_donor_references, int)
+            or isinstance(
+                self.pair.same_parent_max_donor_references,
+                bool,
+            )
+            or not 1 <= self.pair.same_parent_max_donor_references <= 64
+        ):
+            raise ValueError(
+                "pair.same_parent_max_donor_references must be an integer "
+                "between 1 and 64"
+            )
+        if (
+            self.pair.same_parent_fallback_enabled
+            and self.qwen.cross_pair_judge is None
+        ):
+            raise ValueError(
+                "qwen.cross_pair_judge is required when "
+                "pair.same_parent_fallback_enabled is true"
+            )
         if self.background.raw_foreground_area_ratio != 0.0:
             raise ValueError("V3 background.raw_foreground_area_ratio must be 0.0")
         max_pending_ratio = self.background.max_pending_remove_area_ratio

@@ -16,6 +16,9 @@ def _write_config(
     background_remove_judge: bool,
     pair_enabled: bool = True,
     remove_enabled: bool = True,
+    cross_pair_judge: bool = False,
+    same_parent_fallback_enabled: bool = False,
+    same_parent_max_donor_references: object = 8,
 ) -> Path:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -52,6 +55,13 @@ def _write_config(
                 f"    model: {model}",
             ]
         )
+    if cross_pair_judge:
+        qwen_lines.extend(
+            [
+                "  cross_pair_judge:",
+                f"    model: {model}",
+            ]
+        )
 
     path = tmp_path / "v3.yaml"
     path.write_text(
@@ -65,6 +75,14 @@ def _write_config(
                 *qwen_lines,
                 "pair:",
                 f"  enabled: {str(pair_enabled).lower()}",
+                (
+                    "  same_parent_fallback_enabled: "
+                    f"{str(same_parent_fallback_enabled).lower()}"
+                ),
+                (
+                    "  same_parent_max_donor_references: "
+                    f"{str(same_parent_max_donor_references).lower()}"
+                ),
                 "remove:",
                 f"  enabled: {str(remove_enabled).lower()}",
                 f"  base_model_path: {pretrained / 'Qwen' / 'edit'}",
@@ -184,12 +202,14 @@ def test_explicit_judges_may_share_one_endpoint(
         monkeypatch,
         candidate_judge=True,
         background_remove_judge=True,
+        cross_pair_judge=True,
     )
 
     config = load_config(path)
 
     assert config.qwen.candidate_judge is not None
     assert config.qwen.background_remove_judge is not None
+    assert config.qwen.cross_pair_judge is not None
     assert (
         config.qwen.candidate_judge.base_url
         == config.qwen.background_remove_judge.base_url
@@ -197,4 +217,124 @@ def test_explicit_judges_may_share_one_endpoint(
     assert (
         config.qwen.candidate_judge.model
         == config.qwen.background_remove_judge.model
+        == config.qwen.cross_pair_judge.model
     )
+    assert (
+        config.qwen.candidate_judge.base_url
+        == config.qwen.background_remove_judge.base_url
+        == config.qwen.cross_pair_judge.base_url
+    )
+
+
+def test_same_parent_fallback_requires_explicit_cross_pair_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        same_parent_fallback_enabled=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "qwen.cross_pair_judge is required when "
+            "pair.same_parent_fallback_enabled is true"
+        ),
+    ):
+        load_config(path)
+
+
+def test_explicit_cross_pair_judge_enables_same_parent_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        cross_pair_judge=True,
+        same_parent_fallback_enabled=True,
+    )
+
+    config = load_config(path)
+
+    assert config.pair.same_parent_fallback_enabled is True
+    assert config.pair.same_parent_max_donor_references == 8
+    assert config.qwen.cross_pair_judge is not None
+
+
+@pytest.mark.parametrize("value", [True, 0, 65])
+def test_same_parent_donor_limit_is_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        cross_pair_judge=True,
+        same_parent_fallback_enabled=True,
+        same_parent_max_donor_references=value,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="same_parent_max_donor_references",
+    ):
+        load_config(path)
+
+
+def test_same_parent_settings_participate_in_config_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        cross_pair_judge=True,
+        same_parent_fallback_enabled=True,
+        same_parent_max_donor_references=4,
+    )
+    first = load_config(first_path)
+    second_path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        cross_pair_judge=True,
+        same_parent_fallback_enabled=True,
+        same_parent_max_donor_references=5,
+    )
+    second = load_config(second_path)
+
+    assert first.fingerprint() != second.fingerprint()
+
+
+def test_same_parent_fallback_flag_is_strict_boolean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        cross_pair_judge=True,
+    )
+    contents = path.read_text(encoding="utf-8").replace(
+        "same_parent_fallback_enabled: false",
+        "same_parent_fallback_enabled: 1",
+    )
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(TypeError, match="same_parent_fallback_enabled"):
+        load_config(path)

@@ -8,6 +8,7 @@ from pathlib import Path
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.config import load_config
+from r2v_data_v2.v3.cross_pair_judge import CrossPairJudge
 from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
 from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
 from r2v_data_v2.v3.manifest import build_manifest
@@ -77,6 +78,7 @@ def run_pipeline_v3(
     background_removal_backend: BackgroundRemovalBackend | None = None,
     background_removal_judge: BackgroundRemovalJudge | None = None,
     entity_reference_judge: EntityReferenceJudge | None = None,
+    cross_pair_judge: CrossPairJudge | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -152,6 +154,7 @@ def run_pipeline_v3(
                 storage,
                 overwrite=overwrite,
                 judge=entity_reference_judge,
+                cross_pair_judge=cross_pair_judge,
             ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
