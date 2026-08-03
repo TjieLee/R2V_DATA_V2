@@ -10,16 +10,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import inspect
 import io
 import json
 import math
 import shutil
-import sys
 import uuid
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast
@@ -44,6 +41,10 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.sam3_backend import (
+    EntityTrackResult,
+    SegmentationBackend,
+)
 
 ReferenceType = Literal["subject", "object", "group"]
 PublicationStatus = Literal["auto_published", "rejected"]
@@ -55,7 +56,6 @@ ALLOWED_DATA_ROOT = Path("/mnt/workspace/litengjie/data").resolve()
 DEFAULT_PUBLICATION_ROOT = (
     ALLOWED_DATA_ROOT / "reference_completion_publication_benchmarks"
 ).resolve()
-DEFAULT_SAM3_CODE_ROOT = ALLOWED_DATA_ROOT / "vendor" / "sam3"
 DEFAULT_SAM3_CHECKPOINT = Path(
     "/mnt/workspace/public/pretrained/facebook/sam3/sam3.pt"
 )
@@ -251,15 +251,6 @@ class SegmentationMaskCandidate:
     confidence: float
     object_id: str = ""
 
-
-class CompletionSegmenter(Protocol):
-    def segment(
-        self,
-        *,
-        candidate_rgb: Image.Image,
-        entity_phrase: str,
-        reference_type: ReferenceType,
-    ) -> Sequence[SegmentationMaskCandidate]: ...
 
 
 class CompletionPublicationJudge(Protocol):
@@ -1262,149 +1253,38 @@ class QwenCompletionPublicationJudge:
             close()
 
 
-@contextmanager
-def _temporary_import_path(path: Path) -> Iterator[None]:
-    value = str(path)
-    sys.path.insert(0, value)
-    try:
-        yield
-    finally:
-        if value in sys.path:
-            sys.path.remove(value)
-
-
-def _tensor_to_numpy(value: object) -> np.ndarray:
-    converted = value
-    for method_name in ("detach", "cpu"):
-        method = getattr(converted, method_name, None)
-        if callable(method):
-            converted = method()
-    numpy_method = getattr(converted, "numpy", None)
-    if callable(numpy_method):
-        converted = numpy_method()
-    return np.asarray(converted)
-
-
-class Sam3LocalizedCompletionSegmenter:
-    """Lazy local-only adapter for SAM3 image text-prompt segmentation."""
-
-    def __init__(
-        self,
-        *,
-        code_root: Path = DEFAULT_SAM3_CODE_ROOT,
-        checkpoint_path: Path = DEFAULT_SAM3_CHECKPOINT,
-        device: str = "cuda",
-        builder: Callable[..., object] | None = None,
-        processor_factory: Callable[[object], object] | None = None,
-    ) -> None:
-        self.code_root = code_root
-        self.checkpoint_path = checkpoint_path
-        self.device = device
-        self._builder = builder
-        self._processor_factory = processor_factory
-        self._model: object | None = None
-        self._processor: object | None = None
-
-    def _load(self) -> object:
-        if self._processor is not None:
-            return self._processor
-        code_root = self.code_root.expanduser().resolve()
-        checkpoint = self.checkpoint_path.expanduser().resolve()
-        if not code_root.is_dir():
-            raise FileNotFoundError(f"SAM3 code root does not exist: {code_root}")
-        if not checkpoint.is_file():
-            raise FileNotFoundError(
-                f"SAM3 checkpoint does not exist: {checkpoint}"
-            )
-        builder = self._builder
-        processor_factory = self._processor_factory
-        if builder is None or processor_factory is None:
-            with _temporary_import_path(code_root):
-                if builder is None:
-                    from sam3.model_builder import build_sam3_image_model
-
-                    builder = build_sam3_image_model
-                if processor_factory is None:
-                    from sam3.model.sam3_image_processor import Sam3Processor
-
-                    processor_factory = Sam3Processor
-        parameters = inspect.signature(builder).parameters
-        arguments: dict[str, object] = {}
-        if "checkpoint_path" in parameters:
-            arguments["checkpoint_path"] = str(checkpoint)
-        elif "checkpoint" in parameters:
-            arguments["checkpoint"] = str(checkpoint)
-        else:
-            raise ValueError(
-                "installed SAM3 image builder does not expose a local checkpoint "
-                "parameter"
-            )
-        if "device" in parameters:
-            arguments["device"] = self.device
-        elif self.device != "cuda":
-            raise ValueError(
-                "installed SAM3 builder does not expose device; only cuda default "
-                "can be requested"
-            )
-        if "load_from_HF" in parameters:
-            arguments["load_from_HF"] = False
-        self._model = builder(**arguments)
-        self._processor = processor_factory(self._model)
-        return self._processor
-
-    def segment(
-        self,
-        *,
-        candidate_rgb: Image.Image,
-        entity_phrase: str,
-        reference_type: ReferenceType,
-    ) -> Sequence[SegmentationMaskCandidate]:
-        del reference_type
-        if candidate_rgb.mode != "RGB":
-            raise ValueError("SAM3 publication candidate must be RGB")
-        prompt = entity_phrase.strip()
-        if not prompt:
-            raise ValueError("SAM3 entity_phrase must be non-empty")
-        processor = self._load()
-        set_image = getattr(processor, "set_image", None)
-        set_text_prompt = getattr(processor, "set_text_prompt", None)
-        if not callable(set_image) or not callable(set_text_prompt):
-            raise TypeError("installed SAM3 processor lacks verified image APIs")
-        state = set_image(candidate_rgb.copy())
-        parameters = inspect.signature(set_text_prompt).parameters
-        if "state" not in parameters or "prompt" not in parameters:
-            raise ValueError(
-                "installed SAM3 set_text_prompt must accept state and prompt"
-            )
-        output = set_text_prompt(state=state, prompt=prompt)
-        if not isinstance(output, dict):
-            raise TypeError("SAM3 image processor output must be a dictionary")
-        if "masks" not in output or "scores" not in output:
-            raise ValueError("SAM3 image output must contain masks and scores")
-        masks = _tensor_to_numpy(output["masks"])
-        scores = _tensor_to_numpy(output["scores"]).reshape(-1)
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks = masks[:, 0]
-        if masks.ndim == 2:
-            masks = masks[None, ...]
-        if masks.ndim != 3 or len(masks) != len(scores):
-            raise ValueError("SAM3 masks and scores must have matching N-H-W shape")
-        object_ids = output.get("object_ids", [str(index) for index in range(len(masks))])
-        object_id_values = list(_tensor_to_numpy(object_ids).reshape(-1))
-        if len(object_id_values) != len(masks):
-            raise ValueError("SAM3 object ID count must match mask count")
-        return tuple(
-            SegmentationMaskCandidate(
-                mask=np.asarray(mask),
-                confidence=float(score),
-                object_id=str(object_id),
-            )
-            for mask, score, object_id in zip(masks, scores, object_id_values)
+def _mask_from_track_result(
+    result: EntityTrackResult,
+    *,
+    expected_size: tuple[int, int],
+) -> tuple[Image.Image, dict[str, object]]:
+    if not isinstance(result, EntityTrackResult):
+        raise TypeError("SAM3 backend must return EntityTrackResult")
+    if result.status != "ready":
+        detail = f": {result.reason}" if result.reason else ""
+        raise ValueError(f"SAM3 track status is {result.status}{detail}")
+    slot_zero = [
+        observation
+        for observation in result.observations
+        if observation.slot == 0
+    ]
+    if len(slot_zero) != 1:
+        raise ValueError(
+            "SAM3 ready track must contain exactly one slot 0 observation"
         )
-
-    def close(self) -> None:
-        self._processor = None
-        self._model = None
+    observation = slot_zero[0]
+    if not observation.valid:
+        raise ValueError("SAM3 slot 0 observation is invalid")
+    return select_segmented_mask(
+        (
+            SegmentationMaskCandidate(
+                mask=observation.mask,
+                confidence=observation.confidence,
+                object_id=observation.object_id,
+            ),
+        ),
+        expected_size=expected_size,
+    )
 
 
 def _synthetic_review(kind: JudgeKind, reason: str) -> ReviewModel:
@@ -1519,7 +1399,7 @@ def _process_preflight(
     *,
     benchmark_root: Path,
     config: PublicationConfig,
-    segmenter: CompletionSegmenter,
+    segmenter: SegmentationBackend,
     identity_judge: CompletionPublicationJudge,
     locality_judge: CompletionPublicationJudge,
     usability_judge: CompletionPublicationJudge,
@@ -1550,13 +1430,14 @@ def _process_preflight(
 
         segmentation_error: str | None = None
         try:
-            candidates = segmenter.segment(
-                candidate_rgb=candidate_rgb.copy(),
-                entity_phrase=record.entity_phrase,
+            track_result = segmenter.track(
+                frame_paths=[candidate_output],
+                entity_id=record.entity_id,
                 reference_type=record.reference_type,
+                grounding_prompt=record.entity_phrase,
             )
-            candidate_mask, ranking = select_segmented_mask(
-                candidates,
+            candidate_mask, ranking = _mask_from_track_result(
+                track_result,
                 expected_size=candidate_rgb.size,
             )
         except Exception as exc:  # noqa: BLE001 - segmentation fails closed
@@ -1849,7 +1730,7 @@ def run_reference_completion_publication(
     manifest_path: Path,
     benchmark_root: Path,
     config: PublicationConfig,
-    segmenter: CompletionSegmenter,
+    segmenter: SegmentationBackend,
     identity_judge: CompletionPublicationJudge,
     locality_judge: CompletionPublicationJudge,
     usability_judge: CompletionPublicationJudge,

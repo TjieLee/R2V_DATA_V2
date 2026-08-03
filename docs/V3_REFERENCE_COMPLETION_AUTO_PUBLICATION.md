@@ -81,28 +81,30 @@ There is no `manual_review_pending` state.
 
 ## Local SAM3 segmentation
 
-The CLI uses only the local SAM3 source and checkpoint:
+The CLI reuses `r2v_data_v2.v3.sam3_backend.Sam3SegmentationBackend` with the
+local checkpoint:
 
 ```text
-/mnt/workspace/litengjie/data/vendor/sam3
 /mnt/workspace/public/pretrained/facebook/sam3/sam3.pt
 ```
 
-SAM3 segments the immutable localized RGB candidate with `entity_phrase`. The
-adapter is injectable, so tests use a fake segmenter and never load a model.
-The adapter disables Hugging Face loading when the installed builder exposes
-that option. Missing local paths or an incompatible image API fail explicitly.
+The already-published per-sample `candidate_rgb.png` is passed to the existing
+backend as a one-frame track with `entity_phrase` as its grounding prompt. The
+publication module does not import vendor SAM3, build a model, or call an image
+processor directly. Tests inject a fake `SegmentationBackend` and never load a
+model.
 
 Every candidate mask must be an L-mode binary mask at the original candidate
-size. Empty and full-canvas masks are rejected. If SAM3 returns multiple masks,
-exactly one is selected with this deterministic ordering:
+size. Publication accepts only a `ready` track with exactly one valid slot-zero
+observation. `not_found`, `failed`, missing slot zero, or multiple slot-zero
+observations fail closed. The selected observation still passes through the
+existing deterministic normalization and ranking policy:
 
 1. confidence descending;
 2. foreground area descending;
 3. original result index ascending.
 
 The full ranking provenance is stored in `mask_metrics`.
-
 ## Deterministic gates
 
 For `subject` and `object`, the default component gates are:

@@ -15,7 +15,6 @@ from r2v_data_v2.v3.reference_completion_publish import (
     IdentityReview,
     LocalityReview,
     PublicationConfig,
-    Sam3LocalizedCompletionSegmenter,
     SegmentationMaskCandidate,
     UsabilityReview,
     build_candidate_reference,
@@ -25,6 +24,10 @@ from r2v_data_v2.v3.reference_completion_publish import (
     evaluate_mask_gate,
     run_reference_completion_publication,
     select_segmented_mask,
+)
+from r2v_data_v2.v3.sam3_backend import (
+    BackendMaskObservation,
+    EntityTrackResult,
 )
 
 
@@ -115,23 +118,52 @@ def _reject(review: Any) -> Any:
     payload["reason"] = "rejected by test"
     return type(review).model_validate(payload)
 
+def _ready_track(
+    mask: Image.Image | None = None,
+    *,
+    slot: int = 0,
+    object_id: str = "1",
+) -> EntityTrackResult:
+    selected = _good_mask() if mask is None else mask
+    return EntityTrackResult(
+        status="ready",
+        observations=(
+            BackendMaskObservation(
+                slot=slot,
+                mask=np.asarray(selected),
+                confidence=0.9,
+                object_id=object_id,
+            ),
+        ),
+    )
+
+
 
 class _Segmenter:
     def __init__(self, response: object | None = None) -> None:
         self.response = response
         self.calls: list[dict[str, object]] = []
+        self.frame_existed_during_call = False
 
-    def segment(self, **kwargs: object) -> list[SegmentationMaskCandidate]:
+    def track(self, **kwargs: object) -> EntityTrackResult:
         self.calls.append(kwargs)
+        frame_paths = kwargs["frame_paths"]
+        assert isinstance(frame_paths, list)
+        self.frame_existed_during_call = all(
+            isinstance(path, Path) and path.is_file() for path in frame_paths
+        )
         response = self.response
         if callable(response):
             response = response(kwargs)
         if isinstance(response, Exception):
             raise response
-        mask = _good_mask() if response is None else response
-        if isinstance(mask, list):
-            return mask
-        return [SegmentationMaskCandidate(mask=mask, confidence=0.9, object_id="1")]
+        if response is None:
+            return _ready_track()
+        if isinstance(response, Image.Image):
+            return _ready_track(response)
+        if not isinstance(response, EntityTrackResult):
+            raise TypeError("fake backend response must be EntityTrackResult")
+        return response
 
 
 class _Judge:
@@ -628,9 +660,9 @@ def test_failure_continues_transactionally_for_remaining_samples(
     _write_manifest(environment, records)
 
     def response(kwargs: dict[str, object]) -> object:
-        if kwargs["entity_phrase"] == "fail segmentation":
+        if kwargs["grounding_prompt"] == "fail segmentation":
             return RuntimeError("fake SAM3 failure")
-        return _good_mask()
+        return _ready_track()
 
     root, stats, _ = _run(environment, segmenter=_Segmenter(response))
     assert stats.to_dict() == {"processed": 2, "auto_published": 1, "rejected": 1}
@@ -650,48 +682,101 @@ def test_review_schemas_are_strict_and_uncertainty_cannot_accept() -> None:
         IdentityReview.model_validate(payload)
 
 
-def test_fake_sam3_adapter_uses_local_checkpoint_and_phrase(tmp_path: Path) -> None:
-    code_root = tmp_path / "sam3"
-    code_root.mkdir()
-    checkpoint = tmp_path / "sam3.pt"
-    checkpoint.write_bytes(b"fake")
-    calls: dict[str, object] = {}
+def test_ready_track_uses_published_candidate_as_single_frame(
+    environment: _Environment,
+) -> None:
+    segmenter = _Segmenter()
+    root, stats, _ = _run(environment, segmenter=segmenter)
 
-    def builder(*, checkpoint_path: str, device: str) -> object:
-        calls["builder"] = (checkpoint_path, device)
-        return object()
+    assert stats.auto_published == 1
+    assert segmenter.frame_existed_during_call is True
+    assert len(segmenter.calls) == 1
+    call = segmenter.calls[0]
+    assert call["entity_id"] == "e1"
+    assert call["reference_type"] == "subject"
+    assert call["grounding_prompt"] == "the blue subject"
+    frame_paths = call["frame_paths"]
+    assert isinstance(frame_paths, list)
+    assert len(frame_paths) == 1
+    assert isinstance(frame_paths[0], Path)
+    assert frame_paths[0].name == "candidate_rgb.png"
+    result = _result(root)
+    assert result["status"] == "auto_published"
+    assert result["mask_metrics"]["ranking"]["candidate_count"] == 1
 
-    class Processor:
-        def set_image(self, image: Image.Image) -> str:
-            calls["image"] = image.copy()
-            return "state"
 
-        def set_text_prompt(self, *, state: str, prompt: str) -> dict[str, object]:
-            calls["prompt"] = (state, prompt)
-            return {
-                "masks": np.ones((1, 10, 12), dtype=bool),
-                "scores": np.asarray([0.75]),
-                "object_ids": np.asarray([7]),
-            }
-
-    segmenter = Sam3LocalizedCompletionSegmenter(
-        code_root=code_root,
-        checkpoint_path=checkpoint,
-        device="cpu",
-        builder=builder,
-        processor_factory=lambda model: Processor(),
+@pytest.mark.parametrize(
+    ("track_result", "error_fragment"),
+    [
+        (
+            EntityTrackResult(
+                status="not_found",
+                reason="SAM3 did not find the prompted entity",
+            ),
+            "status is not_found",
+        ),
+        (
+            EntityTrackResult(
+                status="failed",
+                reason="ambiguous instance",
+            ),
+            "status is failed",
+        ),
+    ],
+)
+def test_non_ready_track_results_fail_closed(
+    environment: _Environment,
+    track_result: EntityTrackResult,
+    error_fragment: str,
+) -> None:
+    root, stats, judges = _run(
+        environment,
+        segmenter=_Segmenter(track_result),
     )
-    results = segmenter.segment(
-        candidate_rgb=Image.new("RGB", (12, 10), "white"),
-        entity_phrase="the target object",
-        reference_type="object",
+    result = _result(root)
+    assert stats.rejected == 1
+    assert result["status"] == "rejected"
+    assert result["reason"] == "segmentation_failed"
+    assert error_fragment in result["mask_metrics"]["ranking"]["error"]
+    assert result["candidate_reference_path"] is None
+    assert all(not judge.calls for judge in judges)
+
+
+@pytest.mark.parametrize("case", ["missing_slot_zero", "multiple_slot_zero"])
+def test_ready_track_requires_exactly_one_slot_zero_observation(
+    environment: _Environment,
+    case: str,
+) -> None:
+    first = BackendMaskObservation(
+        slot=1 if case == "missing_slot_zero" else 0,
+        mask=np.asarray(_good_mask()),
+        confidence=0.9,
+        object_id="1",
     )
-    assert calls["builder"] == (str(checkpoint.resolve()), "cpu")
-    assert calls["prompt"] == ("state", "the target object")
-    assert len(results) == 1
-    assert results[0].object_id == "7"
-
-
+    observations = (first,)
+    if case == "multiple_slot_zero":
+        observations = (
+            first,
+            BackendMaskObservation(
+                slot=0,
+                mask=np.asarray(_good_mask()),
+                confidence=0.8,
+                object_id="2",
+            ),
+        )
+    track_result = EntityTrackResult(
+        status="ready",
+        observations=observations,
+    )
+    root, _, judges = _run(
+        environment,
+        segmenter=_Segmenter(track_result),
+    )
+    result = _result(root)
+    assert result["status"] == "rejected"
+    assert result["reason"] == "segmentation_failed"
+    assert "exactly one slot 0" in result["mask_metrics"]["ranking"]["error"]
+    assert all(not judge.calls for judge in judges)
 def test_output_must_stay_in_dedicated_publication_root(
     environment: _Environment,
 ) -> None:

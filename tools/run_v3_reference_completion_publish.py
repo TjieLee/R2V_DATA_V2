@@ -4,16 +4,15 @@ import argparse
 import json
 from pathlib import Path
 
-from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.config import QwenServiceConfig, Sam3Config
 from r2v_data_v2.v3.reference_completion_publish import (
     DEFAULT_PUBLICATION_ROOT,
     DEFAULT_SAM3_CHECKPOINT,
-    DEFAULT_SAM3_CODE_ROOT,
     PublicationConfig,
     QwenCompletionPublicationJudge,
-    Sam3LocalizedCompletionSegmenter,
     run_reference_completion_publication,
 )
+from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -25,7 +24,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--sam3-code-root", type=Path, default=DEFAULT_SAM3_CODE_ROOT)
     parser.add_argument(
         "--sam3-checkpoint",
         type=Path,
@@ -133,10 +131,11 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         max_tokens=arguments.judge_max_tokens,
         timeout_seconds=arguments.judge_timeout_seconds,
     )
-    segmenter = Sam3LocalizedCompletionSegmenter(
-        code_root=arguments.sam3_code_root,
-        checkpoint_path=arguments.sam3_checkpoint,
-        device=arguments.sam3_device,
+    segmenter = Sam3SegmentationBackend(
+        Sam3Config(
+            model_path=arguments.sam3_checkpoint,
+            device=arguments.sam3_device,
+        )
     )
     judges = {
         kind: QwenCompletionPublicationJudge(
