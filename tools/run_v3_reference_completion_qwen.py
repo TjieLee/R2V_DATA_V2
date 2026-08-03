@@ -9,13 +9,13 @@ from r2v_data_v2.v3.reference_completion_benchmark import (
     QwenReferenceCompletionJudge,
 )
 from r2v_data_v2.v3.reference_completion_qwen import (
-    DEFAULT_QWEN_COMPOSITING_MODE,
+    DEFAULT_QWEN_COMPLETION_MODE,
     DEFAULT_QWEN_MODEL_PATH,
     DEFAULT_QWEN_SEEDS,
-    DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
-    DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT,
+    LEGACY_QWEN_SEEDS,
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
+    QwenLocalizedReferenceCompletionJudge,
     run_qwen_reference_completion_benchmark,
 )
 
@@ -23,7 +23,7 @@ from r2v_data_v2.v3.reference_completion_qwen import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the offline V3 Qwen-Image-Edit-2511 subject-reference "
+            "Run the offline V3 Qwen-Image-Edit-2511 entity-reference "
             "completion benchmark"
         )
     )
@@ -48,27 +48,42 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-inference-steps", type=int, default=40)
     parser.add_argument("--true-cfg-scale", type=float, default=4.0)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
-    parser.add_argument("--prompt", default=DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT)
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Override the reference-type-specific localized prompt.",
+    )
     parser.add_argument(
         "--negative-prompt",
-        default=DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
+        default=None,
+        help="Override the mode default; localized_raw defaults to one space.",
     )
-    parser.add_argument("--canvas-expand-ratio", type=float, default=0.75)
-    parser.add_argument("--lateral-padding-ratio", type=float, default=0.20)
-    parser.add_argument("--mask-overlap-pixels", type=int, default=0)
-    parser.add_argument("--model-min-side", type=int, default=1024)
-    parser.add_argument("--model-multiple", type=int, default=16)
+    legacy_help = "Used only by legacy whole_canvas / explicit_mask modes."
     parser.add_argument(
-        "--compositing-mode",
-        choices=("whole_canvas", "explicit_mask"),
-        default=DEFAULT_QWEN_COMPOSITING_MODE,
+        "--canvas-expand-ratio", type=float, default=0.75, help=legacy_help
+    )
+    parser.add_argument(
+        "--lateral-padding-ratio", type=float, default=0.20, help=legacy_help
+    )
+    parser.add_argument(
+        "--mask-overlap-pixels", type=int, default=0, help=legacy_help
+    )
+    parser.add_argument("--model-min-side", type=int, default=1024, help=legacy_help)
+    parser.add_argument("--model-multiple", type=int, default=16, help=legacy_help)
+    parser.add_argument(
+        "--mode",
+        choices=("localized_raw", "whole_canvas", "explicit_mask"),
+        default=DEFAULT_QWEN_COMPLETION_MODE,
     )
     parser.add_argument(
         "--seed",
         action="append",
         type=int,
         dest="seeds",
-        help="Repeat to choose and order seeds; defaults to 0 and 17.",
+        help=(
+            "Choose and order seeds. localized_raw defaults to 0; legacy modes "
+            "retain their 0,17 default."
+        ),
     )
     return parser
 
@@ -87,10 +102,15 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         mask_overlap_pixels=arguments.mask_overlap_pixels,
         model_min_side=arguments.model_min_side,
         model_multiple=arguments.model_multiple,
-        compositing_mode=arguments.compositing_mode,
+        mode=arguments.mode,
     )
     backend = QwenImageEdit2511ReferenceCompletionBackend(completion_config)
-    judge = QwenReferenceCompletionJudge(
+    judge_class = (
+        QwenLocalizedReferenceCompletionJudge
+        if arguments.mode == "localized_raw"
+        else QwenReferenceCompletionJudge
+    )
+    judge = judge_class(
         QwenServiceConfig(
             base_url=arguments.judge_base_url,
             api_key=arguments.judge_api_key,
@@ -102,6 +122,11 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
         repair_retries=arguments.repair_retries,
     )
     try:
+        default_seeds = (
+            DEFAULT_QWEN_SEEDS
+            if arguments.mode == "localized_raw"
+            else LEGACY_QWEN_SEEDS
+        )
         stats = run_qwen_reference_completion_benchmark(
             manifest_path=arguments.manifest,
             benchmark_root=arguments.benchmark_root,
@@ -110,7 +135,7 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
             judge=judge,
             prompt=arguments.prompt,
             negative_prompt=arguments.negative_prompt,
-            seeds=tuple(arguments.seeds or DEFAULT_QWEN_SEEDS),
+            seeds=tuple(arguments.seeds or default_seeds),
         )
     finally:
         backend.close()

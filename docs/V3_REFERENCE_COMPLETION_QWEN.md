@@ -1,134 +1,183 @@
-# V3 Qwen Reference Completion Benchmark
+# V3 Qwen Localized Entity Completion Benchmark
 
-## Status And Goal
+## Status And Scope
 
-This is an independent offline benchmark for completing the same incomplete,
-occluded, or truncated person with a local Qwen-Image-Edit-2511 model. It is
-not a V3 production stage and is not registered in `run_pipeline_v3.py`. It
-does not update `clip.json`, pairing, instructions, exports, selected
-references, or any production dataset.
+This is an independent offline benchmark for localized completion with the
+local Qwen-Image-Edit-2511 model. It supports `subject`, `object`, and `group`
+references. It repairs only a missing or incomplete local part inside the
+reference's current canvas. It does not require a complete body, a complete new
+object, or a larger group scene.
 
-The production reference remains the source-faithful RGBA artifact. A Qwen
-candidate must pass the shared hard checks, the structured Qwen completion
-judge, and subsequent human review. A failed benchmark leaves the original
-RGBA reference unchanged.
+The benchmark is not a V3 production stage and is not registered in
+`run_pipeline_v3.py`. It does not update `clip.json`, selected references,
+pairing, instructions, exports, or any production dataset. The canonical
+production reference remains the source-faithful RGBA image.
 
-PowerPaint v2-1 remains frozen as a historical negative experiment. Qwen is a
-separate benchmark, not a fallback or an automatic competitor. One successful
-manual Qwen example shows only that the direction may be viable; it does not
-establish production eligibility. A diverse multi-sample benchmark is still
-required, and any production integration must be a separate future task.
+PowerPaint v2-1 remains frozen as a historical negative experiment and is not a
+fallback. Its final evaluation and production rejection are unchanged.
 
 ## Local Model
 
-The backend uses the local model directory:
+The backend loads only:
 
 ```text
 /mnt/workspace/public/pretrained/Qwen/Qwen-Image-Edit-2511
 ```
 
-It loads `diffusers.QwenImageEditPlusPipeline` with
-`local_files_only=True`, disables its progress bar, and moves the pipeline to
-the configured device. It does not download a model, use a network model ID,
-load Object-Remover LoRA, call a closed image API, or enable CPU offload.
-`close()` releases the pipeline and clears the CUDA cache when CUDA is
-available.
+It uses `diffusers.QwenImageEditPlusPipeline` with `local_files_only=True`,
+disables the progress bar, and moves the pipeline to the configured device. It
+does not load Object-Remover LoRA, use a network model ID, call an external image
+API, or use PowerPaint. Dtype compatibility supports either the current `dtype`
+or legacy `torch_dtype` loader parameter.
 
-The default model-space short side is 1024 and both dimensions are rounded to
-a multiple of 16 while preserving aspect ratio. Seeds run in deterministic
-order: `0`, then `17`.
+## Modes
 
-## Supported Input
+`localized_raw` is the default and the only active development mode. It supports
+all three entity reference types:
 
-The input is the existing completion JSONL manifest and `reference_type` must
-remain `subject`; `object` and `group` fail during preflight. In the default
-`whole_canvas` mode, `completion_mask_path` may be `null`. `completion_sides`
-still determine canvas expansion, while `completion_start_ratio` is retained
-for provenance but is not used. Source RGBA, optional context, canvas, and
-filesystem checks remain active.
+- `subject`: repair a local missing part of the same person, animal, or subject
+  without changing identity, appearance, clothing, pose, or outline.
+- `object`: repair a local missing part of the same object while preserving
+  geometry, material, texture, color, scale, and viewpoint.
+- `group`: repair a local missing part of the same group while preserving its
+  members, arrangement, relationships, appearance, scale, and viewpoint.
 
-The historical `explicit_mask` comparison mode requires a non-null valid
-binary `completion_mask_path` and preserves the original explicit-mask
-validation. PowerPaint continues to support its directional and explicit mask
-modes without any behavior change.
+`whole_canvas` and `explicit_mask` remain available only as historical
+experimental modes. Their artifact and compositing behavior is retained for
+reproduction, but they are not defaults and are not being extended.
 
-## Prompt Contract
+## Localized Input
 
-The public default prompt is English:
+`localized_raw` validates the source as an RGBA PNG with binary alpha and a
+non-empty foreground. Code composites the visible source pixels over white at
+the source's original width and height and publishes that input as
+`input_source_white.png`.
 
-> Complete the missing parts of the same single person shown in this image.
-> Preserve the person's identity, face, hairstyle, clothing, accessories,
-> pose, body proportions, lighting, perspective, and all visible appearance
-> details. Extend only the incomplete body and clothing naturally into the
-> empty region. Do not create another person, another face, duplicate body
-> parts, new clothing, or new foreground objects. Do not alter the already
-> visible person. Keep the background plain white.
+The mode deliberately does not:
 
-The deterministic entity phrase is appended as `Entity description: ...` and
-does not replace the core constraints. The default negative prompt rejects a
-second or different person, duplicate faces or bodies, extra or disconnected
-limbs, anatomy and identity changes, different clothing, new foreground
-objects, text, watermarks, and logos. `--prompt` and `--negative-prompt` may
-override these defaults, but blank values fail closed. There is no per-sample
-LLM prompt rewrite.
+- expand or pad the canvas;
+- use `completion_sides` or `completion_start_ratio`;
+- read or apply `completion_mask_path`;
+- build a completion mask or editable region;
+- resize to `model_min_side` or force a multiple;
+- pass `height`, `width`, a mask, or an editable region to Qwen;
+- restore visible pixels after generation;
+- perform mask compositing or alpha extraction.
 
-## Compositing Modes
+The manifest continues to use `CompletionManifestRecord`; legacy geometry
+fields are accepted only for compatibility and are ignored by `localized_raw`.
 
-Qwen-Image-Edit-2511 is not native mask-conditioned inpainting. The backend
-receives exactly one expanded RGB completion canvas and may regenerate the
-whole image. No completion mask or editable region is passed to the Qwen
-pipeline.
+## Generation Prompts
 
-`whole_canvas` is the default. After restoring model output to canvas size,
-code restores only the original visible entity pixels exactly from the source
-RGBA. Every other canvas pixel remains Qwen output. This permits continuous
-clothing, anatomy, a near-white background, and slight natural shadows. The
-binary `editable_region` is exactly the inverse of the visible entity mask. It
-is used only for hard-check statistics, judge visualization, and provenance;
-it is not a model input mask and does not crop the candidate.
+The default English prompt is selected by `reference_type`. Subject completion
+preserves identity, appearance, pose, proportions, clothing, texture, and other
+visible characteristics. Object completion preserves geometry, material,
+texture, color, scale, and viewpoint. Group completion preserves members,
+arrangement, relationships, appearance, scale, and viewpoint.
 
-The whole-canvas hard checks require RGB canvas-sized output, exact visible
-source pixels, unchanged source bytes, real change outside the visible region,
-non-constant generated-region content, and valid pixel values. Background
-complexity, a second person, identity or clothing changes, new objects or
-scenes, watermarks, and structural continuity are left to the structured judge
-and human review rather than an uncalibrated hard classifier.
+All three prompts request only the missing local part, prohibit a new instance
+or expanded composition, and keep the background plain and unchanged. The
+entity phrase is recorded as metadata but is never appended to the generation
+prompt.
 
-`explicit_mask` remains only as a historical comparison and debugging mode. It
-retains the previous two-layer compositing order:
+The short Chinese reproduction prompt is:
 
-1. restore every pixel outside the explicit mask from the baseline canvas;
-2. restore every visible source pixel exactly from the source RGBA RGB.
+```text
+把这张图中残缺的部分补充完整，不要生成新的实例
+```
 
-This geometric postprocessing can create artificial vertical or diagonal cuts
-and break clothing or anatomy when a whole-image editor generated a coherent
-result outside the narrow polygon. It is therefore no longer the Qwen default.
-Explicit mode still requires exact pixels outside the mask, a changed and
-non-constant masked region, and unchanged source and mask hashes. Any hard-check
-failure skips the judge in either mode.
+It is an explicit CLI override and historical comparison baseline, not the
+formal default. Any other `--prompt` value is a custom override applied to all
+records. The official-like default negative prompt is exactly one space.
+
+## Official-Like Call
+
+The default localized call uses seed `0`, 40 inference steps,
+`true_cfg_scale=4.0`, and `guidance_scale=1.0`:
+
+```python
+result = pipeline(
+    image=[input_rgb],
+    prompt=final_prompt,
+    negative_prompt=" ",
+    generator=torch.Generator(device=config.device).manual_seed(seed),
+    true_cfg_scale=4.0,
+    guidance_scale=1.0,
+    num_inference_steps=40,
+    num_images_per_prompt=1,
+)
+```
+
+No `height`, `width`, mask, completion mask, or editable region is sent.
+
+## Raw Candidate And Hard Checks
+
+The first returned PIL image is converted to RGB and saved at its native output
+size as:
+
+```text
+candidate_qwen_localized_seed_0.png
+```
+
+It is not resized, cropped, composited, or combined with restored source pixels.
+`result.json` records both `input_size` and `output_size`; they are allowed to
+differ.
+
+Hard checks are deliberately entity-agnostic. They require a PIL image that can
+be converted to RGB, positive dimensions, uint8 finite pixels, non-constant
+content, a result different from the white input, unchanged source bytes,
+reopenable published PNGs, and a recorded candidate SHA-256. They do not inspect
+masks, visible-pixel equality, entity completeness, anatomy, object geometry, or
+group semantics.
 
 ## Structured Review
 
-The benchmark reuses `QwenReferenceCompletionJudge` and
-`ReferenceCompletionReview`; it does not introduce another review schema. The
-judge receives the source entity on white, the baseline expanded canvas, the
-mode-specific region image, and the final candidate. Image 3 is labeled
-`completion mask` in explicit mode and
-`editable region; this is not a model input mask` in whole-canvas mode.
+`QwenLocalizedReferenceCompletionJudge` reuses
+`ReferenceCompletionReview`, strict JSON schema output, `json_object` fallback,
+structured repair, and fail-closed behavior. The judge receives only:
 
-For whole-canvas review, the judge is told that Qwen may edit the full canvas
-and that code has already restored the visible person exactly. It must reject a
-second person or face, identity or clothing changes, a new scene or salient
-object, text or logos, unnatural body and clothing continuation, isolated
-fragments, incomplete anatomy, and obvious vertical or diagonal crop
-boundaries. White or near-white background and slight natural shadow are
-allowed. Acceptance still requires every existing review boolean to be true;
-attractive appearance alone is insufficient.
+1. source entity on white;
+2. localized raw candidate.
 
-Both seed candidates and their reviews are retained. The earliest candidate
-that passes hard checks and structured review is recorded for compatibility;
-later candidates are still evaluated and preserved. There is no PowerPaint
-fallback and no cross-backend quality selection.
+It does not receive a baseline duplicate, mask, or editable region. The system
+prompt states that this is local repair rather than full-instance
+reconstruction, so a candidate cannot be rejected merely for completing only a
+small genuinely missing area.
+
+The type-specific review guidance checks subject identity and body consistency,
+object instance geometry/material continuity, or group membership and
+arrangement. For `object` and `group`, `identity_preserved` means that the result
+is still the same object or group rather than a new or redesigned instance.
+Every review boolean must be true for an `accept` verdict.
+
+The judge can reject automatically but cannot approve production use. A passing
+hard check plus judge `accept` produces `manual_review_pending`; every other
+outcome is `rejected`. `localized_raw` never emits `accepted`, and
+`accepted_candidate` is always `null`.
+
+## Artifacts And Metadata
+
+Each localized sample contains only:
+
+```text
+<sample_id>/
+  source_rgba.png
+  input_source_white.png
+  candidate_qwen_localized_seed_0.png
+  review_qwen_localized_seed_0.json
+  result.json
+```
+
+The result records backend, mode, source identity and hash, input and output
+sizes, prompt and language, inference parameters, candidate path and hash, hard
+checks, judge status and verdict, manual-review state, and runtime. It also
+records that localized completion is enabled while full reconstruction, canvas
+expansion, completion masks, visible-pixel restoration, forced dimensions, and
+entity-phrase prompt appending are disabled.
+
+The deterministic root summary records `reference_type_counts`,
+`manual_review_pending`, rejected and accepted counts, hard-check rejection
+reasons, and false judge flags. `accepted` is always zero for `localized_raw`.
 
 ## Execution
 
@@ -136,7 +185,9 @@ fallback and no cross-backend quality selection.
 python -m tools.run_v3_reference_completion_qwen \
   --manifest /mnt/workspace/litengjie/data/reference_completion_qwen.jsonl \
   --benchmark-root /mnt/workspace/litengjie/data/reference_completion_qwen_benchmarks/run-001 \
-  --judge-model /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+  --judge-model /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
+  --mode localized_raw \
+  --seed 0
 ```
 
 The benchmark root must be a new directory strictly below:
@@ -145,68 +196,18 @@ The benchmark root must be a new directory strictly below:
 /mnt/workspace/litengjie/data/reference_completion_qwen_benchmarks/
 ```
 
-All records are preflighted before this root is created. Each sample is built
-in a temporary sibling directory and atomically renamed into place. Exceptions
+All records are preflighted before the root is created. Each sample is built in
+a temporary sibling directory and atomically renamed into place. Exceptions
 remove the temporary sample. The benchmark never writes to production run or
 dataset roots, the public dataset, or `selected/`.
 
-Use `--compositing-mode explicit_mask` only to reproduce the historical
-comparison. The CLI default is `whole_canvas` and does not require a manifest
-mask.
-
-## Artifacts
-
-Each default whole-canvas sample contains:
-
-```text
-<sample_id>/
-  source_rgba.png
-  source_white.png
-  context_rgb.png                 # only when supplied
-  baseline_canvas.png
-  visible_mask.png
-  editable_region.png
-  candidate_qwen_seed_0.png
-  candidate_qwen_seed_17.png
-  review_qwen_seed_0.json
-  review_qwen_seed_17.json
-  result.json
-```
-
-Explicit mode publishes `completion_mask.png` instead of
-`editable_region.png`.
-
-Each Qwen attempt in `result.json` records `backend`, `candidate_id`, `seed`,
-`compositing_mode`, the final full prompt and negative prompt, candidate path
-and hash, hard-check report, judge status and verdict, review path, runtime, and
-reason. The top-level result records `compositing_mode`. Whole-canvas results
-set completion-mask mode/path/hash to `null` and record
-`editable_region_path`; explicit results preserve completion-mask provenance
-and set `editable_region_path` to `null`. Qwen results do not record PowerPaint
-`strategy` or `fitting_degree` fields.
-
-The root `benchmark_summary.json` records the Qwen backend identifier,
-processed/accepted/rejected counts, sorted hard-check rejection counts, and
-sorted false judge-flag counts. It also records deterministic
-`compositing_mode_counts`. It contains no image bytes or duplicated full review
-payloads.
-
-## Prompt Language Comparison
-
-The current English/Chinese prompt A/B examples were affected by narrow
-explicit-polygon compositing, so they do not support a conclusion about prompt
-language quality. A fair next comparison must use whole-canvas mode with the
-same input, seed, and inference parameters, changing only the prompt. The
-official default remains the English prompt above; a Chinese prompt is still
-available only through an explicit CLI override. The successful manual Qwen
-example is closer to whole-canvas behavior, but it does not establish
-production readiness.
+Legacy canvas, padding, mask-overlap, and model-size CLI options apply only when
+`--mode whole_canvas` or `--mode explicit_mask` is selected.
 
 ## Production Decision Boundary
 
-This benchmark has no authority to publish or replace a production reference.
-The original source-faithful RGBA remains canonical on every failure and after
-every experimental run. Human review is mandatory even after the structured
-judge accepts a candidate. Production integration, alpha extraction, SAM3
-re-segmentation, automatic eligibility detection, and generated-reference
-publication are intentionally out of scope and require a separate task.
+This benchmark has no authority to publish, replace, or automatically qualify a
+production reference. Human review remains mandatory even after a structured
+judge accepts a localized candidate. Production integration, SAM3,
+re-segmentation, alpha extraction, automatic eligibility, and generated
+reference publication remain out of scope.

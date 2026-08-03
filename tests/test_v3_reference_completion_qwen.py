@@ -20,16 +20,24 @@ from r2v_data_v2.v3.reference_completion_benchmark import (
     ReferenceCompletionReview,
 )
 from r2v_data_v2.v3.reference_completion_qwen import (
+    DEFAULT_QWEN_COMPLETION_MODE,
     DEFAULT_QWEN_COMPOSITING_MODE,
+    DEFAULT_QWEN_LOCALIZED_GROUP_PROMPT,
+    DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT,
+    DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+    DEFAULT_QWEN_LOCALIZED_SUBJECT_PROMPT,
     DEFAULT_QWEN_MODEL_PATH,
     DEFAULT_QWEN_SEEDS,
     DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
     DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT,
     QWEN_COMPLETION_BACKEND,
+    QWEN_LOCALIZED_JUDGE_SYSTEM_PROMPT,
+    QWEN_LOCALIZED_PROMPT_ZH_SHORT,
     QWEN_WHOLE_CANVAS_JUDGE_ADDENDUM,
     QwenCompletionCompositingMode,
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
+    QwenLocalizedReferenceCompletionJudge,
     run_qwen_reference_completion_benchmark,
 )
 from tools.run_v3_reference_completion_qwen import _parser
@@ -85,6 +93,7 @@ def _write_manifest(
     completion_mask_path: Path | None | object = ...,
     entity_phrase: str = "a person in a red coat",
     completion_start_ratio: float = 0.5,
+    completion_sides: list[str] | None = None,
 ) -> None:
     mask_path = (
         environment.completion_mask
@@ -100,7 +109,7 @@ def _write_manifest(
         "source_rgba_path": str(environment.source),
         "context_rgb_path": None,
         "completion_mask_path": str(mask_path) if mask_path is not None else None,
-        "completion_sides": ["bottom"],
+        "completion_sides": completion_sides or ["bottom"],
         "completion_start_ratio": completion_start_ratio,
     }
     environment.manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
@@ -145,6 +154,7 @@ def _config(
         "lateral_padding_ratio": 0.2,
         "model_min_side": 64,
         "model_multiple": 8,
+        "mode": "whole_canvas",
     }
     values.update(updates)
     return QwenImageEdit2511CompletionConfig(**values)
@@ -222,7 +232,7 @@ def _run(
     judge: _Judge | None = None,
     prompt: str = DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT,
     negative_prompt: str = DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
-    seeds: tuple[int, ...] = DEFAULT_QWEN_SEEDS,
+    seeds: tuple[int, ...] = (0, 17),
     compositing_mode: QwenCompletionCompositingMode = (
         DEFAULT_QWEN_COMPOSITING_MODE
     ),
@@ -232,12 +242,36 @@ def _run(
     run_qwen_reference_completion_benchmark(
         manifest_path=environment.manifest,
         benchmark_root=environment.output_root,
-        config=_config(environment, compositing_mode=compositing_mode),
+        config=_config(environment, mode=compositing_mode),
         backend=selected_backend,
         judge=selected_judge,
         prompt=prompt,
         negative_prompt=negative_prompt,
         seeds=seeds,
+    )
+    return selected_backend, selected_judge
+
+
+def _run_localized(
+    environment: _Environment,
+    *,
+    backend: _Backend | None = None,
+    judge: _Judge | None = None,
+    prompt: str | None = None,
+    negative_prompt: str | None = None,
+    seed: int = 0,
+) -> tuple[_Backend, _Judge]:
+    selected_backend = backend or _Backend()
+    selected_judge = judge or _Judge([_accept()])
+    run_qwen_reference_completion_benchmark(
+        manifest_path=environment.manifest,
+        benchmark_root=environment.output_root,
+        config=_config(environment, mode="localized_raw"),
+        backend=selected_backend,
+        judge=selected_judge,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        seeds=(seed,),
     )
     return selected_backend, selected_judge
 
@@ -255,9 +289,12 @@ def test_default_configuration_and_prompts_are_local_and_english() -> None:
     assert config.local_files_only is True
     assert config.model_min_side == 1024
     assert config.model_multiple == 16
-    assert config.compositing_mode == "whole_canvas"
+    assert config.mode == "localized_raw"
+    assert config.compositing_mode is None
+    assert DEFAULT_QWEN_COMPLETION_MODE == "localized_raw"
     assert DEFAULT_QWEN_COMPOSITING_MODE == "whole_canvas"
-    assert DEFAULT_QWEN_SEEDS == (0, 17)
+    assert DEFAULT_QWEN_SEEDS == (0,)
+    assert DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT == " "
     assert "Complete the missing parts of the same single person" in (
         DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT
     )
@@ -290,7 +327,7 @@ def test_config_requires_existing_local_model_directory(
         ({"mask_overlap_pixels": -1}, "non-negative integer"),
         ({"model_min_side": 0}, "positive integer"),
         ({"model_multiple": 0}, "positive integer"),
-        ({"compositing_mode": "unknown"}, "compositing_mode"),
+        ({"mode": "unknown"}, "mode"),
     ],
 )
 def test_config_rejects_invalid_values(
@@ -300,6 +337,21 @@ def test_config_rejects_invalid_values(
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=error):
         replace(_config(environment), **updates).validate()
+
+
+def test_localized_config_ignores_legacy_geometry_settings(
+    environment: _Environment,
+) -> None:
+    config = replace(
+        _config(environment, mode="localized_raw"),
+        canvas_expand_ratio=0.0,
+        lateral_padding_ratio=float("nan"),
+        mask_overlap_pixels=-1,
+        model_min_side=0,
+        model_multiple=0,
+    )
+
+    config.validate()
 
 
 @dataclass
@@ -358,6 +410,31 @@ class _FakePipeline:
         if self.output is not None:
             return self.output
         return SimpleNamespace(images=[_gradient((width, height))])
+
+
+class _LocalizedFakePipeline:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.output: object | None = None
+
+    def __call__(
+        self,
+        *,
+        image: list[Image.Image],
+        prompt: str,
+        negative_prompt: str,
+        generator: _FakeGenerator,
+        true_cfg_scale: float,
+        guidance_scale: float,
+        num_inference_steps: int,
+        num_images_per_prompt: int,
+    ) -> object:
+        parameters = dict(locals())
+        parameters.pop("self")
+        self.calls.append(parameters)
+        if self.output is not None:
+            return self.output
+        return SimpleNamespace(images=[_gradient(image[0].size)])
 
 
 def _fake_torch() -> SimpleNamespace:
@@ -497,6 +574,48 @@ def test_backend_sends_one_rgb_image_no_mask_and_all_inference_parameters(
     assert request["generator"].seed == 17
 
 
+def test_localized_backend_uses_official_like_call_and_preserves_raw_size(
+    environment: _Environment,
+) -> None:
+    pipeline = _LocalizedFakePipeline()
+    pipeline.output = SimpleNamespace(images=[Image.new("RGBA", (19, 23), "red")])
+    config = replace(
+        _config(environment, mode="localized_raw"),
+        num_inference_steps=23,
+        true_cfg_scale=3.5,
+        guidance_scale=1.25,
+    )
+    backend = QwenImageEdit2511ReferenceCompletionBackend(
+        config,
+        pipeline=pipeline,
+        torch_module=_fake_torch(),
+    )
+    input_rgb = Image.new("RGB", (32, 48), "white")
+
+    output = backend.complete(
+        input_rgb=input_rgb,
+        entity_phrase="a ceramic vessel",
+        seed=0,
+        prompt=DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+        negative_prompt=" ",
+    )
+
+    assert output.mode == "RGB"
+    assert output.size == (19, 23)
+    assert len(pipeline.calls) == 1
+    request = pipeline.calls[0]
+    assert request["image"] == [input_rgb]
+    assert request["prompt"] == DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT
+    assert request["negative_prompt"] == " "
+    assert request["true_cfg_scale"] == 3.5
+    assert request["guidance_scale"] == 1.25
+    assert request["num_inference_steps"] == 23
+    assert request["num_images_per_prompt"] == 1
+    assert request["generator"].device == "cuda"
+    assert request["generator"].seed == 0
+    assert {"height", "width", "mask", "completion_mask"}.isdisjoint(request)
+
+
 @pytest.mark.parametrize(
     ("output", "error"),
     [
@@ -544,6 +663,334 @@ def test_backend_close_releases_pipeline_and_cuda_cache(
     assert backend._pipeline is None
     assert backend._torch is None
     assert torch.cuda.empty_cache_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("reference_type", "expected_prompt"),
+    [
+        ("subject", DEFAULT_QWEN_LOCALIZED_SUBJECT_PROMPT),
+        ("object", DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT),
+        ("group", DEFAULT_QWEN_LOCALIZED_GROUP_PROMPT),
+    ],
+)
+def test_localized_raw_supports_each_reference_type_and_default_prompt(
+    environment: _Environment,
+    reference_type: str,
+    expected_prompt: str,
+) -> None:
+    _write_manifest(
+        environment,
+        reference_type=reference_type,
+        entity_phrase="distinct evidence phrase",
+    )
+    source_sha256 = _sha256(environment.source)
+
+    backend, judge = _run_localized(environment)
+    result = _result(environment)
+    sample_root = environment.output_root / "sample-1"
+
+    assert len(backend.calls) == 1
+    assert backend.calls[0]["input_rgb"].size == _source_image().size
+    assert backend.calls[0]["prompt"] == expected_prompt
+    assert backend.calls[0]["negative_prompt"] == " "
+    assert "distinct evidence phrase" not in backend.calls[0]["prompt"]
+    assert judge.calls[0]["reference_type"] == reference_type
+    assert set(judge.calls[0]) == {
+        "source_rgba",
+        "candidate_rgb",
+        "entity_phrase",
+        "reference_type",
+    }
+    assert result["mode"] == "localized_raw"
+    assert result["reference_type"] == reference_type
+    assert result["prompt"] == expected_prompt
+    assert result["prompt_language"] == "en"
+    assert result["negative_prompt"] == " "
+    assert result["seed"] == 0
+    assert result["input_path"] == "input_source_white.png"
+    assert result["input_size"] == [12, 10]
+    assert result["candidate_path"] == "candidate_qwen_localized_seed_0.png"
+    assert result["output_size"] == [12, 10]
+    assert result["status"] == "manual_review_pending"
+    assert result["manual_review_required"] is True
+    assert result["accepted_candidate"] is None
+    assert result["localized_completion"] is True
+    assert result["full_instance_reconstruction_requested"] is False
+    assert result["canvas_expansion_used"] is False
+    assert result["completion_mask_used"] is False
+    assert result["visible_pixel_restore_used"] is False
+    assert result["height_width_forced"] is False
+    assert result["entity_phrase_appended_to_prompt"] is False
+    assert result["source_sha256"] == source_sha256
+    assert _sha256(environment.source) == source_sha256
+    assert result["candidate_sha256"] == _sha256(
+        sample_root / "candidate_qwen_localized_seed_0.png"
+    )
+    assert {
+        "completion_mask_area_ratio",
+        "editable_region_path",
+        "source_offset_xy",
+        "canvas_size",
+        "compositing_mode",
+    }.isdisjoint(result)
+    assert {path.name for path in sample_root.iterdir()} == {
+        "source_rgba.png",
+        "input_source_white.png",
+        "candidate_qwen_localized_seed_0.png",
+        "review_qwen_localized_seed_0.json",
+        "result.json",
+    }
+
+
+@pytest.mark.parametrize("reference_type", ["subject", "object", "group"])
+def test_localized_prompt_override_applies_without_entity_phrase(
+    environment: _Environment,
+    reference_type: str,
+) -> None:
+    _write_manifest(
+        environment,
+        reference_type=reference_type,
+        entity_phrase="never append this phrase",
+    )
+
+    backend, _ = _run_localized(
+        environment,
+        prompt=QWEN_LOCALIZED_PROMPT_ZH_SHORT,
+    )
+    result = _result(environment)
+
+    assert backend.calls[0]["prompt"] == QWEN_LOCALIZED_PROMPT_ZH_SHORT
+    assert "never append this phrase" not in backend.calls[0]["prompt"]
+    assert result["prompt_language"] == "zh"
+
+
+def test_localized_raw_ignores_legacy_completion_geometry(
+    environment: _Environment,
+) -> None:
+    ignored_mask = environment.data_root.parent / "outside-mask-that-must-not-be-read.png"
+    _write_manifest(
+        environment,
+        completion_mask_path=ignored_mask,
+        completion_sides=["top", "left", "right"],
+        completion_start_ratio=1.0,
+    )
+
+    backend, _ = _run_localized(environment)
+    result = _result(environment)
+
+    assert backend.calls[0]["input_rgb"].size == (12, 10)
+    assert result["input_size"] == [12, 10]
+    assert result["completion_mask_used"] is False
+    assert not (environment.output_root / "sample-1" / "completion_mask.png").exists()
+    assert not (environment.output_root / "sample-1" / "editable_region.png").exists()
+
+
+def test_localized_raw_preserves_pipeline_output_size_without_restoration(
+    environment: _Environment,
+) -> None:
+    class DifferentSizeBackend(_Backend):
+        def complete(self, **kwargs: object) -> Image.Image:
+            self.calls.append(dict(kwargs))
+            return _gradient((7, 9), offset=91)
+
+    _run_localized(environment, backend=DifferentSizeBackend())
+    result = _result(environment)
+    sample_root = environment.output_root / "sample-1"
+    with Image.open(sample_root / "candidate_qwen_localized_seed_0.png") as opened:
+        opened.load()
+        assert opened.mode == "RGB"
+        assert opened.size == (7, 9)
+        assert np.array_equal(np.asarray(opened), np.asarray(_gradient((7, 9), offset=91)))
+
+    assert result["input_size"] == [12, 10]
+    assert result["output_size"] == [7, 9]
+    assert result["visible_pixel_restore_used"] is False
+    assert not list(sample_root.glob("visible_restored_candidate_*.png"))
+
+
+@pytest.mark.parametrize(
+    ("backend_mode", "reason"),
+    [
+        ("unchanged", "candidate_unchanged_from_input"),
+        ("constant", "candidate_is_constant"),
+    ],
+)
+def test_localized_raw_hard_rejects_unchanged_or_constant_output(
+    environment: _Environment,
+    backend_mode: str,
+    reason: str,
+) -> None:
+    class HardFailureBackend(_Backend):
+        def complete(self, **kwargs: object) -> Image.Image:
+            self.calls.append(dict(kwargs))
+            input_rgb = kwargs["input_rgb"]
+            assert isinstance(input_rgb, Image.Image)
+            if backend_mode == "unchanged":
+                return input_rgb.copy()
+            return Image.new("RGB", input_rgb.size, (77, 77, 77))
+
+    judge = _Judge([_accept()])
+    _run_localized(
+        environment,
+        backend=HardFailureBackend(),
+        judge=judge,
+    )
+    result = _result(environment)
+    checks = result["hard_check"]["checks"]
+
+    assert result["status"] == "rejected"
+    assert result["accepted_candidate"] is None
+    assert result["judge_status"] == "not_run"
+    assert reason in result["hard_check"]["reasons"]
+    assert {
+        "source_visible_pixels_exact",
+        "outside_completion_mask_exact",
+        "completion_mask_connected_to_visible_entity",
+        "candidate_changed_inside_completion_mask",
+    }.isdisjoint(checks)
+    assert judge.calls == []
+    summary = json.loads(
+        (environment.output_root / "benchmark_summary.json").read_text()
+    )
+    assert summary["hard_check_rejection_counts"][reason] == 1
+
+
+@pytest.mark.parametrize("reference_type", ["subject", "object", "group"])
+def test_localized_judge_rejection_fails_closed_for_every_reference_type(
+    environment: _Environment,
+    reference_type: str,
+) -> None:
+    _write_manifest(environment, reference_type=reference_type)
+    _run_localized(
+        environment,
+        judge=_Judge([_reject(exactly_one_entity=False)]),
+    )
+    result = _result(environment)
+
+    assert result["status"] == "rejected"
+    assert result["judge_status"] == "reviewed"
+    assert result["judge_verdict"] == "reject"
+    assert result["accepted_candidate"] is None
+
+
+def test_localized_judge_sends_only_source_and_candidate_with_type_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = QwenLocalizedReferenceCompletionJudge(
+        QwenServiceConfig(model="fake-local-judge"),
+        client=SimpleNamespace(),
+    )
+    captured: list[list[dict[str, object]]] = []
+
+    def fake_request(messages: list[dict[str, object]]) -> str:
+        captured.append(messages)
+        return json.dumps(_review_payload())
+
+    monkeypatch.setattr(judge, "_request", fake_request)
+    review = judge.review(
+        source_rgba=_source_image(),
+        candidate_rgb=_gradient((17, 19)),
+        entity_phrase="a ceramic vessel",
+        reference_type="object",
+    )
+
+    assert review.verdict == "accept"
+    assert len(captured) == 1
+    messages = captured[0]
+    assert QWEN_LOCALIZED_JUDGE_SYSTEM_PROMPT in messages[0]["content"]
+    assert "For an object" in messages[0]["content"]
+    user_content = messages[1]["content"]
+    labels = [item["text"] for item in user_content if item["type"] == "text"]
+    assert labels[1:] == [
+        "Image 1: source entity on white",
+        "Image 2: localized raw candidate",
+    ]
+    assert len([item for item in user_content if item["type"] == "image_url"]) == 2
+    assert not any("mask" in label.casefold() for label in labels)
+
+
+def test_localized_summary_counts_reference_types_and_manual_review(
+    environment: _Environment,
+) -> None:
+    base = json.loads(environment.manifest.read_text(encoding="utf-8"))
+    records = []
+    for index, reference_type in enumerate(("subject", "object", "group"), start=1):
+        record = dict(base)
+        record.update(
+            sample_id=f"sample-{index}",
+            entity_id=f"e{index}",
+            reference_type=reference_type,
+        )
+        records.append(record)
+    environment.manifest.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    backend = _Backend()
+    judge = _Judge([_accept(), _accept(), _accept()])
+    stats = run_qwen_reference_completion_benchmark(
+        manifest_path=environment.manifest,
+        benchmark_root=environment.output_root,
+        config=_config(environment, mode="localized_raw"),
+        backend=backend,
+        judge=judge,
+    )
+    summary = json.loads(
+        (environment.output_root / "benchmark_summary.json").read_text()
+    )
+
+    assert stats.to_dict() == {"processed": 3, "accepted": 0, "rejected": 0}
+    assert summary == {
+        "backend": QWEN_COMPLETION_BACKEND,
+        "mode": "localized_raw",
+        "processed": 3,
+        "reference_type_counts": {"group": 1, "object": 1, "subject": 1},
+        "manual_review_pending": 3,
+        "rejected": 0,
+        "accepted": 0,
+        "hard_check_rejection_counts": {},
+        "judge_rejection_flag_counts": {},
+    }
+
+
+def test_localized_unknown_reference_type_fails_before_root_creation(
+    environment: _Environment,
+) -> None:
+    payload = json.loads(environment.manifest.read_text(encoding="utf-8"))
+    payload["reference_type"] = "unknown"
+    environment.manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid completion manifest"):
+        _run_localized(environment)
+
+    assert not environment.output_root.exists()
+
+
+@pytest.mark.parametrize(
+    ("source_mode", "error"),
+    [
+        ("rgb", "RGBA PNG"),
+        ("partial_alpha", "only 0 and 255"),
+        ("empty_alpha", "foreground is empty"),
+    ],
+)
+def test_localized_source_rgba_validation_fails_before_root_creation(
+    environment: _Environment,
+    source_mode: str,
+    error: str,
+) -> None:
+    if source_mode == "rgb":
+        Image.new("RGB", (12, 10), "white").save(environment.source, format="PNG")
+    else:
+        pixels = np.asarray(_source_image()).copy()
+        pixels[:, :, 3] = 128 if source_mode == "partial_alpha" else 0
+        Image.fromarray(pixels).save(environment.source, format="PNG")
+
+    with pytest.raises(ValueError, match=error):
+        _run_localized(environment)
+
+    assert not environment.output_root.exists()
 
 
 @pytest.mark.parametrize("reference_type", ["object", "group"])
@@ -1022,6 +1469,19 @@ def test_existing_root_is_rejected_without_calls(environment: _Environment) -> N
     assert backend.calls == [] and judge.calls == []
 
 
+def test_localized_existing_root_is_rejected_without_calls(
+    environment: _Environment,
+) -> None:
+    environment.output_root.mkdir()
+    backend = _Backend()
+    judge = _Judge([_accept()])
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        _run_localized(environment, backend=backend, judge=judge)
+
+    assert backend.calls == [] and judge.calls == []
+
+
 def test_whole_canvas_preserves_source_and_context_files(
     environment: _Environment,
 ) -> None:
@@ -1064,6 +1524,26 @@ def test_sample_publication_is_transactional_on_metadata_failure(
     assert not list(environment.output_root.glob(".sample-1.tmp-*"))
 
 
+def test_localized_publication_is_transactional_on_review_failure(
+    environment: _Environment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write_json = qwen_module.write_json_atomic
+
+    def fail_review(path: Path, payload: object) -> None:
+        if path.name.startswith("review_"):
+            raise OSError("simulated localized metadata failure")
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(qwen_module, "write_json_atomic", fail_review)
+
+    with pytest.raises(OSError, match="simulated localized metadata failure"):
+        _run_localized(environment)
+
+    assert not (environment.output_root / "sample-1").exists()
+    assert not list(environment.output_root.glob(".sample-1.tmp-*"))
+
+
 def test_benchmark_does_not_touch_production_roots(environment: _Environment) -> None:
     sentinels = []
     for name in ("r2v_v3_runs", "r2v_v3_datasets", "selected"):
@@ -1097,9 +1577,9 @@ def test_cli_has_qwen_defaults_and_no_powerpaint_arguments() -> None:
 
     assert arguments.model_path == DEFAULT_QWEN_MODEL_PATH
     assert arguments.model_min_side == 1024
-    assert arguments.prompt == DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT
-    assert arguments.negative_prompt == DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT
-    assert arguments.compositing_mode == "whole_canvas"
+    assert arguments.prompt is None
+    assert arguments.negative_prompt is None
+    assert arguments.mode == "localized_raw"
     assert arguments.seeds is None
     assert {"--powerpaint-repo", "--checkpoint-dir", "--strategy", "--fitting-degree"}.isdisjoint(
         option_strings
@@ -1113,11 +1593,12 @@ def test_cli_has_qwen_defaults_and_no_powerpaint_arguments() -> None:
             "/tmp/benchmark",
             "--judge-model",
             "local-qwen-judge",
-            "--compositing-mode",
+            "--mode",
             "explicit_mask",
         ]
     )
-    assert explicit_arguments.compositing_mode == "explicit_mask"
+    assert explicit_arguments.mode == "explicit_mask"
+    assert "--compositing-mode" not in option_strings
 
 
 def test_duplicate_or_invalid_seeds_fail_before_root(environment: _Environment) -> None:

@@ -3,11 +3,15 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import shutil
+import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
+import numpy as np
 from PIL import Image
 
 from r2v_data_v2.reconciliation import write_json_atomic
@@ -17,7 +21,19 @@ from r2v_data_v2.v3.reference_completion_benchmark import (
     CompletionCandidateSpec,
     CompletionManifestRecord,
     CompletionRunPolicy,
+    HardCheckReport,
+    QwenReferenceCompletionJudge,
     ReferenceCompletionJudge,
+    ReferenceCompletionReview,
+    ReferenceType,
+    _load_source_rgba,
+    _resolve_benchmark_root,
+    _resolve_input_path,
+    _save_png,
+    _sha256_path,
+    _synthetic_reject_review,
+    _white_source,
+    load_completion_manifest,
     run_completion_benchmark,
 )
 
@@ -28,9 +44,41 @@ DEFAULT_QWEN_MODEL_PATH = Path(
 ALLOWED_QWEN_BENCHMARK_ROOT = (
     ALLOWED_INPUT_ROOT / "reference_completion_qwen_benchmarks"
 ).resolve()
-DEFAULT_QWEN_SEEDS = (0, 17)
+DEFAULT_QWEN_SEEDS = (0,)
+LEGACY_QWEN_SEEDS = (0, 17)
 QwenCompletionCompositingMode = Literal["whole_canvas", "explicit_mask"]
 DEFAULT_QWEN_COMPOSITING_MODE: QwenCompletionCompositingMode = "whole_canvas"
+QwenCompletionMode = Literal["localized_raw", "whole_canvas", "explicit_mask"]
+DEFAULT_QWEN_COMPLETION_MODE: QwenCompletionMode = "localized_raw"
+
+DEFAULT_QWEN_LOCALIZED_SUBJECT_PROMPT = (
+    "Complete only the missing local part of the same existing subject. "
+    "Preserve its identity, appearance, pose, proportions, clothing, texture, "
+    "and all visible characteristics. Do not generate a new instance, do not "
+    "redraw the entire subject, and do not expand the composition. Only repair "
+    "the locally incomplete region so the existing subject looks naturally "
+    "continuous. Keep the background plain and unchanged."
+)
+DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT = (
+    "Complete only the missing local part of the same existing object. Preserve "
+    "its geometry, material, texture, color, scale, viewpoint, and all visible "
+    "characteristics. Do not generate a second object, do not redesign the "
+    "entire object, and do not expand the composition. Only repair the locally "
+    "incomplete region so the existing object looks naturally continuous. Keep "
+    "the background plain and unchanged."
+)
+DEFAULT_QWEN_LOCALIZED_GROUP_PROMPT = (
+    "Complete only the missing local part of the same existing group. Preserve "
+    "the visible members, arrangement, relationships, appearance, scale, "
+    "viewpoint, and all visible characteristics. Do not add unrelated members, "
+    "do not create a new group, and do not expand the composition. Only repair "
+    "the locally incomplete region so the existing group looks naturally "
+    "continuous. Keep the background plain and unchanged."
+)
+QWEN_LOCALIZED_PROMPT_ZH_SHORT = (
+    "\u628a\u8fd9\u5f20\u56fe\u4e2d\u6b8b\u7f3a\u7684\u90e8\u5206\u8865\u5145\u5b8c\u6574\uff0c\u4e0d\u8981\u751f\u6210\u65b0\u7684\u5b9e\u4f8b"
+)
+DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT = " "
 
 DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT = (
     "Complete the missing parts of the same single person shown in this image. "
@@ -59,6 +107,46 @@ diagonal cut boundaries. Newly generated anatomy, pose, and clothing must
 continue naturally from the restored person. Reject isolated clothing
 fragments or an incomplete body."""
 
+QWEN_LOCALIZED_JUDGE_SYSTEM_PROMPT = """You judge a localized entity-reference
+completion benchmark. This task repairs only a genuinely missing local part of
+the same existing entity; it is not full-instance reconstruction. Do not reject
+a candidate merely because it does not produce a complete body, complete object,
+or expanded group. A small completion is sufficient when the missing local part
+is repaired naturally.
+
+Require the same entity instance, a plain unchanged background, stable overall
+composition, and no major redraw of already visible content. Reject an extra
+instance, composition expansion, a complex background or new scene, an obvious
+seam, ghosting, repeated structure, or unrelated new content. Return one strict
+JSON object containing only verdict, visible_source_preserved,
+same_entity_continued, identity_preserved, exactly_one_entity,
+completion_plausible, completion_useful, no_occluder_reconstructed,
+no_new_salient_entity, boundary_clean, reference_usable, and reason. verdict is
+accept if and only if every boolean is true. Return JSON only."""
+
+_LOCALIZED_JUDGE_TYPE_GUIDANCE: dict[ReferenceType, str] = {
+    "subject": (
+        "For a subject, preserve the same identity and appearance. Reject a "
+        "second subject, extra body, face, or limb, or inconsistent clothing, "
+        "pose, or silhouette."
+    ),
+    "object": (
+        "For an object, preserve the same instance, geometry, material, texture, "
+        "and color. Reject a second object or a redesigned object."
+    ),
+    "group": (
+        "For a group, preserve the existing members, arrangement, and "
+        "relationships. Reject unrelated new members or a replacement group or "
+        "scene."
+    ),
+}
+
+_DEFAULT_LOCALIZED_PROMPTS: dict[ReferenceType, str] = {
+    "subject": DEFAULT_QWEN_LOCALIZED_SUBJECT_PROMPT,
+    "object": DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+    "group": DEFAULT_QWEN_LOCALIZED_GROUP_PROMPT,
+}
+
 _REVIEW_BOOLEAN_FIELDS = (
     "visible_source_preserved",
     "same_entity_continued",
@@ -85,6 +173,17 @@ class QwenReferenceCompletionBackend(Protocol):
     ) -> Image.Image: ...
 
 
+class QwenLocalizedCompletionJudge(Protocol):
+    def review(
+        self,
+        *,
+        source_rgba: Image.Image,
+        candidate_rgb: Image.Image,
+        entity_phrase: str,
+        reference_type: ReferenceType,
+    ) -> ReferenceCompletionReview: ...
+
+
 @dataclass(frozen=True)
 class QwenImageEdit2511CompletionConfig:
     model_path: Path = DEFAULT_QWEN_MODEL_PATH
@@ -99,9 +198,13 @@ class QwenImageEdit2511CompletionConfig:
     mask_overlap_pixels: int = 0
     model_min_side: int = 1024
     model_multiple: int = 16
-    compositing_mode: QwenCompletionCompositingMode = (
-        DEFAULT_QWEN_COMPOSITING_MODE
-    )
+    mode: QwenCompletionMode = DEFAULT_QWEN_COMPLETION_MODE
+
+    @property
+    def compositing_mode(self) -> QwenCompletionCompositingMode | None:
+        if self.mode == "localized_raw":
+            return None
+        return self.mode
 
     def validate(self) -> None:
         if not isinstance(self.model_path, Path):
@@ -116,8 +219,8 @@ class QwenImageEdit2511CompletionConfig:
             raise ValueError("dtype must be float16, bfloat16, or float32")
         if self.local_files_only is not True:
             raise ValueError("Qwen completion requires local_files_only=true")
-        if self.compositing_mode not in {"whole_canvas", "explicit_mask"}:
-            raise ValueError("unsupported Qwen completion compositing_mode")
+        if self.mode not in {"localized_raw", "whole_canvas", "explicit_mask"}:
+            raise ValueError("unsupported Qwen completion mode")
         if (
             not isinstance(self.num_inference_steps, int)
             or isinstance(self.num_inference_steps, bool)
@@ -127,27 +230,40 @@ class QwenImageEdit2511CompletionConfig:
         for name, value in (
             ("true_cfg_scale", self.true_cfg_scale),
             ("guidance_scale", self.guidance_scale),
-            ("canvas_expand_ratio", self.canvas_expand_ratio),
-            ("lateral_padding_ratio", self.lateral_padding_ratio),
         ):
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise TypeError(f"{name} must be numeric")
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        if self.canvas_expand_ratio <= 0:
-            raise ValueError("canvas_expand_ratio must be positive")
-        if (
-            not isinstance(self.mask_overlap_pixels, int)
-            or isinstance(self.mask_overlap_pixels, bool)
-            or self.mask_overlap_pixels < 0
-        ):
-            raise ValueError("mask_overlap_pixels must be a non-negative integer")
-        for name, value in (
-            ("model_min_side", self.model_min_side),
-            ("model_multiple", self.model_multiple),
-        ):
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
+        if self.mode != "localized_raw":
+            for name, value in (
+                ("canvas_expand_ratio", self.canvas_expand_ratio),
+                ("lateral_padding_ratio", self.lateral_padding_ratio),
+            ):
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise TypeError(f"{name} must be numeric")
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{name} must be finite and non-negative")
+            if self.canvas_expand_ratio <= 0:
+                raise ValueError("canvas_expand_ratio must be positive")
+            if (
+                not isinstance(self.mask_overlap_pixels, int)
+                or isinstance(self.mask_overlap_pixels, bool)
+                or self.mask_overlap_pixels < 0
+            ):
+                raise ValueError(
+                    "mask_overlap_pixels must be a non-negative integer"
+                )
+            for name, value in (
+                ("model_min_side", self.model_min_side),
+                ("model_multiple", self.model_multiple),
+            ):
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
+                ):
+                    raise ValueError(f"{name} must be a positive integer")
 
 
 def _supports_explicit_parameter(callable_object: Any, name: str) -> bool:
@@ -174,7 +290,7 @@ def _require_parameters(
 
 
 class QwenImageEdit2511ReferenceCompletionBackend:
-    """Local whole-image editing backend constrained by hard compositing."""
+    """Local Qwen image-edit backend for raw and historical completion modes."""
 
     def __init__(
         self,
@@ -258,8 +374,10 @@ class QwenImageEdit2511ReferenceCompletionBackend:
             raise ValueError("entity_phrase must be non-empty")
         if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
             raise ValueError("seed must be a non-negative integer")
-        if not prompt.strip() or not negative_prompt.strip():
-            raise ValueError("Qwen completion prompts must be non-empty")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Qwen completion prompt must be non-empty")
+        if not isinstance(negative_prompt, str) or not negative_prompt:
+            raise ValueError("Qwen completion negative prompt must be non-empty")
         self._ensure_loaded()
         if self._pipeline is None or self._torch is None:
             raise RuntimeError("Qwen completion backend is unavailable")
@@ -269,14 +387,15 @@ class QwenImageEdit2511ReferenceCompletionBackend:
             "image": [input_rgb],
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "height": input_rgb.height,
-            "width": input_rgb.width,
             "generator": generator,
             "true_cfg_scale": self.config.true_cfg_scale,
             "guidance_scale": self.config.guidance_scale,
             "num_inference_steps": self.config.num_inference_steps,
             "num_images_per_prompt": 1,
         }
+        if self.config.mode != "localized_raw":
+            parameters["height"] = input_rgb.height
+            parameters["width"] = input_rgb.width
         _require_parameters(
             self._pipeline.__call__,
             tuple(parameters),
@@ -291,13 +410,13 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         ):
             raise TypeError("Qwen completion backend did not return a PIL image")
         output = images[0]
-        if output.mode != "RGB":
+        if self.config.mode != "localized_raw" and output.mode != "RGB":
             raise TypeError("Qwen completion output must use RGB mode")
-        if output.size != input_rgb.size:
+        if self.config.mode != "localized_raw" and output.size != input_rgb.size:
             raise RuntimeError(
                 "Qwen completion output dimensions do not match model input"
             )
-        return output.copy()
+        return output.convert("RGB").copy()
 
     def close(self) -> None:
         pipeline = self._pipeline
@@ -314,6 +433,182 @@ class QwenImageEdit2511ReferenceCompletionBackend:
             torch.cuda.empty_cache()
 
 
+class QwenLocalizedReferenceCompletionJudge(QwenReferenceCompletionJudge):
+    """Two-image structured judge for mode-agnostic localized completion."""
+
+    def _messages(
+        self,
+        *,
+        source_rgba: Image.Image,
+        completion_canvas: Image.Image,
+        completion_mask: Image.Image,
+        candidate_rgb: Image.Image,
+        request_text: str,
+        completion_region_label: str,
+        system_prompt_addendum: str,
+    ) -> list[dict[str, object]]:
+        del completion_canvas, completion_mask, completion_region_label
+        content: list[dict[str, object]] = [{"type": "text", "text": request_text}]
+        for label, image in (
+            ("Image 1: source entity on white", _white_source(source_rgba)),
+            ("Image 2: localized raw candidate", candidate_rgb),
+        ):
+            content.append({"type": "text", "text": label})
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _png_data_url_local(image)},
+                }
+            )
+        system_prompt = QWEN_LOCALIZED_JUDGE_SYSTEM_PROMPT
+        if system_prompt_addendum.strip():
+            system_prompt += "\n\n" + system_prompt_addendum.strip()
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+    def review(
+        self,
+        *,
+        source_rgba: Image.Image,
+        candidate_rgb: Image.Image,
+        entity_phrase: str,
+        reference_type: ReferenceType,
+    ) -> ReferenceCompletionReview:
+        if reference_type not in _LOCALIZED_JUDGE_TYPE_GUIDANCE:
+            raise ValueError("unsupported localized completion reference_type")
+        if candidate_rgb.mode != "RGB":
+            raise ValueError("localized completion judge candidate must be RGB")
+        return super().review(
+            source_rgba=source_rgba,
+            completion_canvas=candidate_rgb.copy(),
+            completion_mask=Image.new("L", candidate_rgb.size, 255),
+            candidate_rgb=candidate_rgb,
+            entity_phrase=entity_phrase,
+            reference_type=reference_type,
+            completion_region_label="localized raw candidate",
+            system_prompt_addendum=_LOCALIZED_JUDGE_TYPE_GUIDANCE[reference_type],
+        )
+
+
+def _png_data_url_local(image: Image.Image) -> str:
+    import base64
+    import io
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _localized_prompt(
+    reference_type: ReferenceType,
+    override: str | None,
+) -> tuple[str, Literal["en", "zh", "custom"]]:
+    if override is None:
+        return _DEFAULT_LOCALIZED_PROMPTS[reference_type], "en"
+    prompt = override.strip()
+    if not prompt:
+        raise ValueError("Qwen completion prompt must be non-empty")
+    language: Literal["en", "zh", "custom"] = (
+        "zh" if prompt == QWEN_LOCALIZED_PROMPT_ZH_SHORT else "custom"
+    )
+    return prompt, language
+
+
+def _localized_hard_check(
+    *,
+    generated: object,
+    input_rgb: Image.Image,
+    input_path: Path,
+    candidate_path: Path,
+    source_path: Path,
+    source_sha256: str,
+) -> tuple[Image.Image | None, str | None, HardCheckReport]:
+    checks = {
+        "pipeline_returned_pil_image": isinstance(generated, Image.Image),
+        "output_convertible_to_rgb": False,
+        "output_dimensions_positive": False,
+        "output_pixels_uint8": False,
+        "output_has_no_invalid_values": False,
+        "output_not_constant": False,
+        "output_differs_from_input": False,
+        "source_file_unchanged": _sha256_path(source_path) == source_sha256,
+        "published_input_reopenable": False,
+        "published_candidate_reopenable": False,
+        "candidate_sha256_recorded": False,
+    }
+    candidate: Image.Image | None = None
+    converted_candidate: Image.Image | None = None
+    candidate_sha256: str | None = None
+    try:
+        with Image.open(input_path) as opened_input:
+            opened_input.load()
+            checks["published_input_reopenable"] = (
+                opened_input.format == "PNG"
+                and opened_input.mode == "RGB"
+                and opened_input.size == input_rgb.size
+            )
+    except (OSError, ValueError):
+        pass
+
+    if isinstance(generated, Image.Image):
+        try:
+            converted_candidate = generated.convert("RGB")
+            checks["output_convertible_to_rgb"] = True
+        except (OSError, ValueError):
+            converted_candidate = None
+    if converted_candidate is not None:
+        checks["output_dimensions_positive"] = (
+            converted_candidate.width > 0 and converted_candidate.height > 0
+        )
+        pixels = np.asarray(converted_candidate)
+        checks["output_pixels_uint8"] = pixels.dtype == np.uint8
+        checks["output_has_no_invalid_values"] = bool(np.isfinite(pixels).all())
+        checks["output_not_constant"] = bool(
+            pixels.size
+            and np.unique(pixels.reshape(-1, 3), axis=0).shape[0] > 1
+        )
+        checks["output_differs_from_input"] = (
+            converted_candidate.size != input_rgb.size
+            or not np.array_equal(pixels, np.asarray(input_rgb, dtype=np.uint8))
+        )
+        if checks["output_dimensions_positive"]:
+            _save_png(candidate_path, converted_candidate)
+            with Image.open(candidate_path) as opened_candidate:
+                opened_candidate.load()
+                checks["published_candidate_reopenable"] = (
+                    opened_candidate.format == "PNG"
+                    and opened_candidate.mode == "RGB"
+                    and opened_candidate.size == converted_candidate.size
+                )
+            candidate_sha256 = _sha256_path(candidate_path)
+            checks["candidate_sha256_recorded"] = (
+                len(candidate_sha256) == 64
+                and candidate_sha256 == _sha256_path(candidate_path)
+            )
+            candidate = converted_candidate
+
+    reason_codes = {
+        "pipeline_returned_pil_image": "pipeline_did_not_return_pil_image",
+        "output_convertible_to_rgb": "candidate_not_convertible_to_rgb",
+        "output_dimensions_positive": "candidate_dimensions_not_positive",
+        "output_pixels_uint8": "candidate_pixels_not_uint8",
+        "output_has_no_invalid_values": "candidate_has_invalid_pixels",
+        "output_not_constant": "candidate_is_constant",
+        "output_differs_from_input": "candidate_unchanged_from_input",
+        "source_file_unchanged": "source_file_changed",
+        "published_input_reopenable": "published_input_not_reopenable",
+        "published_candidate_reopenable": "published_candidate_not_reopenable",
+        "candidate_sha256_recorded": "candidate_sha256_not_recorded",
+    }
+    reasons = tuple(
+        reason_codes[name] for name, passed in checks.items() if not passed
+    )
+    return candidate, candidate_sha256, HardCheckReport(not reasons, checks, reasons)
+
+
 def _validate_seeds(seeds: tuple[int, ...]) -> tuple[int, ...]:
     if not seeds or len(set(seeds)) != len(seeds):
         raise ValueError("Qwen completion seeds must be non-empty and unique")
@@ -328,16 +623,251 @@ def _validate_seeds(seeds: tuple[int, ...]) -> tuple[int, ...]:
 def _validate_qwen_record(
     record: CompletionManifestRecord,
     *,
-    compositing_mode: QwenCompletionCompositingMode,
+    mode: QwenCompletionMode,
 ) -> None:
-    if record.reference_type != "subject":
+    if mode != "localized_raw" and record.reference_type != "subject":
         raise ValueError("Qwen completion supports only reference_type=subject")
-    if compositing_mode == "explicit_mask" and record.completion_mask_path is None:
+    if mode == "explicit_mask" and record.completion_mask_path is None:
         raise ValueError("Qwen completion requires completion_mask_path")
 
 
 def _full_prompt(prompt: str, entity_phrase: str) -> str:
     return f"{prompt.strip()} Entity description: {entity_phrase.strip()}."
+
+
+def _localized_summary(
+    benchmark_root: Path,
+    results: tuple[dict[str, object], ...],
+    stats: CompletionBenchmarkStats,
+) -> dict[str, object]:
+    reference_types: Counter[str] = Counter()
+    hard_rejections: Counter[str] = Counter()
+    judge_rejections: Counter[str] = Counter()
+    manual_review_pending = 0
+    for result in results:
+        reference_types[str(result["reference_type"])] += 1
+        manual_review_pending += int(result["status"] == "manual_review_pending")
+        hard_check = result.get("hard_check")
+        if not isinstance(hard_check, dict):
+            raise TypeError("localized completion hard_check must be an object")
+        if hard_check.get("status") == "failed":
+            reasons = hard_check.get("reasons")
+            if not isinstance(reasons, list):
+                raise TypeError("localized hard-check reasons must be a list")
+            hard_rejections.update(str(reason) for reason in reasons)
+            continue
+        if result.get("judge_status") != "reviewed" or (
+            result.get("judge_verdict") != "reject"
+        ):
+            continue
+        review_path = result.get("review_path")
+        if not isinstance(review_path, str):
+            raise TypeError("localized completion review_path must be a string")
+        review = json.loads(
+            (benchmark_root / str(result["sample_id"]) / review_path).read_text(
+                encoding="utf-8"
+            )
+        )
+        for field_name in _REVIEW_BOOLEAN_FIELDS:
+            if review.get(field_name) is False:
+                judge_rejections[field_name] += 1
+    return {
+        "backend": QWEN_COMPLETION_BACKEND,
+        "mode": "localized_raw",
+        "processed": stats.processed,
+        "reference_type_counts": dict(sorted(reference_types.items())),
+        "manual_review_pending": manual_review_pending,
+        "rejected": stats.rejected,
+        "accepted": 0,
+        "hard_check_rejection_counts": dict(sorted(hard_rejections.items())),
+        "judge_rejection_flag_counts": dict(sorted(judge_rejections.items())),
+    }
+
+
+def _process_localized_record(
+    record: CompletionManifestRecord,
+    *,
+    source_path: Path,
+    benchmark_root: Path,
+    config: QwenImageEdit2511CompletionConfig,
+    backend: QwenReferenceCompletionBackend,
+    judge: QwenLocalizedCompletionJudge,
+    prompt_override: str | None,
+    negative_prompt: str,
+    seed: int,
+) -> dict[str, object]:
+    source_rgba, source_bytes, source_sha256 = _load_source_rgba(source_path)
+    input_rgb = _white_source(source_rgba)
+    prompt, prompt_language = _localized_prompt(
+        record.reference_type,
+        prompt_override,
+    )
+    final_directory = benchmark_root / record.sample_id
+    temporary = benchmark_root / f".{record.sample_id}.tmp-{uuid.uuid4().hex}"
+    temporary.mkdir(parents=False, exist_ok=False)
+    started = time.perf_counter()
+    candidate_name = f"candidate_qwen_localized_seed_{seed}.png"
+    review_name = f"review_qwen_localized_seed_{seed}.json"
+    try:
+        (temporary / "source_rgba.png").write_bytes(source_bytes)
+        input_path = temporary / "input_source_white.png"
+        _save_png(input_path, input_rgb)
+        generation_error: str | None = None
+        try:
+            generated: object = backend.complete(
+                input_rgb=input_rgb.copy(),
+                entity_phrase=record.entity_phrase,
+                seed=seed,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            generated = None
+            generation_error = f"backend_failed: {exc}"
+        candidate, candidate_sha256, hard_check = _localized_hard_check(
+            generated=generated,
+            input_rgb=input_rgb,
+            input_path=input_path,
+            candidate_path=temporary / candidate_name,
+            source_path=source_path,
+            source_sha256=source_sha256,
+        )
+        if generation_error is not None:
+            hard_check = HardCheckReport(
+                passed=False,
+                checks=hard_check.checks,
+                reasons=(generation_error, *hard_check.reasons),
+            )
+
+        judge_status = "not_run"
+        if not hard_check.passed or candidate is None:
+            reason = "hard_check_failed: " + "; ".join(hard_check.reasons)
+            review = _synthetic_reject_review(reason)
+        else:
+            try:
+                review = judge.review(
+                    source_rgba=source_rgba.copy(),
+                    candidate_rgb=candidate.copy(),
+                    entity_phrase=record.entity_phrase,
+                    reference_type=record.reference_type,
+                )
+                if not isinstance(review, ReferenceCompletionReview):
+                    raise TypeError("judge must return ReferenceCompletionReview")
+                judge_status = "reviewed"
+                reason = review.reason
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                judge_status = "failed_closed"
+                reason = f"judge_failed: {exc}"
+                review = _synthetic_reject_review(reason)
+        write_json_atomic(temporary / review_name, review.model_dump(mode="json"))
+        status = (
+            "manual_review_pending"
+            if hard_check.passed and review.verdict == "accept"
+            else "rejected"
+        )
+        if _sha256_path(source_path) != source_sha256:
+            raise RuntimeError(
+                "source reference changed during localized completion benchmark"
+            )
+        result: dict[str, object] = {
+            "backend": QWEN_COMPLETION_BACKEND,
+            "mode": "localized_raw",
+            "sample_id": record.sample_id,
+            "clip_uid": record.clip_uid,
+            "entity_id": record.entity_id,
+            "reference_type": record.reference_type,
+            "entity_phrase": record.entity_phrase,
+            "source_path": str(source_path),
+            "source_sha256": source_sha256,
+            "input_path": "input_source_white.png",
+            "input_size": list(input_rgb.size),
+            "prompt": prompt,
+            "prompt_language": prompt_language,
+            "negative_prompt": negative_prompt,
+            "seed": seed,
+            "num_inference_steps": config.num_inference_steps,
+            "true_cfg_scale": config.true_cfg_scale,
+            "guidance_scale": config.guidance_scale,
+            "candidate_path": candidate_name if candidate is not None else None,
+            "candidate_sha256": candidate_sha256,
+            "output_size": list(candidate.size) if candidate is not None else None,
+            "hard_check": hard_check.to_dict(),
+            "judge_status": judge_status,
+            "judge_verdict": review.verdict,
+            "review_path": review_name,
+            "status": status,
+            "manual_review_required": True,
+            "accepted_candidate": None,
+            "localized_completion": True,
+            "full_instance_reconstruction_requested": False,
+            "canvas_expansion_used": False,
+            "completion_mask_used": False,
+            "visible_pixel_restore_used": False,
+            "height_width_forced": False,
+            "entity_phrase_appended_to_prompt": False,
+            "runtime_seconds": time.perf_counter() - started,
+            "reason": reason,
+        }
+        write_json_atomic(temporary / "result.json", result)
+        temporary.replace(final_directory)
+        return result
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def _run_localized_completion_benchmark(
+    *,
+    manifest_path: Path,
+    benchmark_root: Path,
+    config: QwenImageEdit2511CompletionConfig,
+    backend: QwenReferenceCompletionBackend,
+    judge: QwenLocalizedCompletionJudge,
+    prompt: str | None,
+    negative_prompt: str,
+    seeds: tuple[int, ...],
+) -> CompletionBenchmarkStats:
+    if len(seeds) != 1:
+        raise ValueError("localized_raw requires exactly one seed")
+    resolved_root = _resolve_benchmark_root(
+        benchmark_root,
+        allowed_benchmark_root=ALLOWED_QWEN_BENCHMARK_ROOT,
+    )
+    records = load_completion_manifest(manifest_path)
+    preflights: list[Path] = []
+    for record in records:
+        _validate_qwen_record(record, mode="localized_raw")
+        source_path = _resolve_input_path(
+            record.source_rgba_path,
+            field_name="source_rgba_path",
+        )
+        _load_source_rgba(source_path)
+        preflights.append(source_path)
+    resolved_root.mkdir(parents=True, exist_ok=False)
+    results = tuple(
+        _process_localized_record(
+            record,
+            source_path=source_path,
+            benchmark_root=resolved_root,
+            config=config,
+            backend=backend,
+            judge=judge,
+            prompt_override=prompt,
+            negative_prompt=negative_prompt,
+            seed=seeds[0],
+        )
+        for record, source_path in zip(records, preflights)
+    )
+    stats = CompletionBenchmarkStats(
+        processed=len(results),
+        accepted=0,
+        rejected=sum(result["status"] == "rejected" for result in results),
+    )
+    write_json_atomic(
+        resolved_root / "benchmark_summary.json",
+        _localized_summary(resolved_root, results, stats),
+    )
+    return stats
 
 
 def _summary_from_results(
@@ -398,19 +928,51 @@ def run_qwen_reference_completion_benchmark(
     benchmark_root: Path,
     config: QwenImageEdit2511CompletionConfig,
     backend: QwenReferenceCompletionBackend,
-    judge: ReferenceCompletionJudge,
-    prompt: str = DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT,
-    negative_prompt: str = DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT,
-    seeds: tuple[int, ...] = DEFAULT_QWEN_SEEDS,
+    judge: ReferenceCompletionJudge | QwenLocalizedCompletionJudge,
+    prompt: str | None = None,
+    negative_prompt: str | None = None,
+    seeds: tuple[int, ...] | None = None,
 ) -> CompletionBenchmarkStats:
-    prompt = prompt.strip()
-    negative_prompt = negative_prompt.strip()
-    if not prompt:
+    config.validate()
+    selected_seeds = _validate_seeds(
+        seeds
+        if seeds is not None
+        else (DEFAULT_QWEN_SEEDS if config.mode == "localized_raw" else LEGACY_QWEN_SEEDS)
+    )
+    if config.mode == "localized_raw":
+        if prompt is not None and not prompt.strip():
+            raise ValueError("Qwen completion prompt must be non-empty")
+        selected_negative_prompt = (
+            DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT
+            if negative_prompt is None
+            else negative_prompt
+        )
+        if not isinstance(selected_negative_prompt, str) or not selected_negative_prompt:
+            raise ValueError("Qwen completion negative prompt must be non-empty")
+        return _run_localized_completion_benchmark(
+            manifest_path=manifest_path,
+            benchmark_root=benchmark_root,
+            config=config,
+            backend=backend,
+            judge=cast(QwenLocalizedCompletionJudge, judge),
+            prompt=prompt,
+            negative_prompt=selected_negative_prompt,
+            seeds=selected_seeds,
+        )
+
+    selected_prompt = (
+        DEFAULT_QWEN_SUBJECT_COMPLETION_PROMPT if prompt is None else prompt.strip()
+    )
+    selected_negative_prompt = (
+        DEFAULT_QWEN_SUBJECT_COMPLETION_NEGATIVE_PROMPT
+        if negative_prompt is None
+        else negative_prompt.strip()
+    )
+    if not selected_prompt:
         raise ValueError("Qwen completion prompt must be non-empty")
-    if not negative_prompt:
+    if not selected_negative_prompt:
         raise ValueError("Qwen completion negative prompt must be non-empty")
-    seeds = _validate_seeds(seeds)
-    compositing_mode = config.compositing_mode
+    compositing_mode = cast(QwenCompletionCompositingMode, config.mode)
     if compositing_mode == "whole_canvas":
         policy = CompletionRunPolicy(
             candidate_region_kind="editable_region",
@@ -423,6 +985,7 @@ def run_qwen_reference_completion_benchmark(
         )
         result_metadata: dict[str, object] = {
             "backend": QWEN_COMPLETION_BACKEND,
+            "mode": compositing_mode,
             "compositing_mode": compositing_mode,
             "completion_mask_mode": None,
             "completion_mask_source_path": None,
@@ -434,6 +997,7 @@ def run_qwen_reference_completion_benchmark(
         policy = CompletionRunPolicy()
         result_metadata = {
             "backend": QWEN_COMPLETION_BACKEND,
+            "mode": compositing_mode,
             "compositing_mode": compositing_mode,
             "editable_region_path": None,
         }
@@ -441,19 +1005,19 @@ def run_qwen_reference_completion_benchmark(
     def candidate_factory(
         record: CompletionManifestRecord,
     ) -> tuple[CompletionCandidateSpec, ...]:
-        final_prompt = _full_prompt(prompt, record.entity_phrase)
+        final_prompt = _full_prompt(selected_prompt, record.entity_phrase)
         return tuple(
             CompletionCandidateSpec(
                 file_stem=f"qwen_seed_{seed}",
                 seed=seed,
                 prompt=final_prompt,
-                negative_prompt=negative_prompt,
+                negative_prompt=selected_negative_prompt,
                 attempt_metadata={
                     "backend": QWEN_COMPLETION_BACKEND,
                     "candidate_id": f"qwen_seed_{seed}",
                     "seed": seed,
                     "prompt": final_prompt,
-                    "negative_prompt": negative_prompt,
+                    "negative_prompt": selected_negative_prompt,
                     "compositing_mode": compositing_mode,
                 },
                 selection_metadata={
@@ -462,7 +1026,7 @@ def run_qwen_reference_completion_benchmark(
                     "seed": seed,
                 },
             )
-            for seed in seeds
+            for seed in selected_seeds
         )
 
     def generate_candidate(
@@ -492,7 +1056,7 @@ def run_qwen_reference_completion_benchmark(
         generate_candidate=generate_candidate,
         record_validator=lambda record: _validate_qwen_record(
             record,
-            compositing_mode=compositing_mode,
+            mode=compositing_mode,
         ),
         result_metadata=result_metadata,
         policy=policy,
