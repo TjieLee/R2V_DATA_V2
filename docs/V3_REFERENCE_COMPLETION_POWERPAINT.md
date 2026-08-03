@@ -202,3 +202,45 @@ source RGBA reference. No output is written to `r2v_v3_runs`,
 `result.json` records `completion_mask_mode` as `directional` or `explicit`.
 Explicit mode also records the resolved mask source path and SHA-256;
 directional mode records `null` for both fields.
+
+## Final Evaluation
+
+The completed pilot produced a negative result for identity-preserving entity
+completion with PowerPaint v2-1.
+
+### Directional Text-Guided Evaluation
+
+The first evaluation used `strategy=text_guided`, seed `0`,
+`fitting_degree=0.55`, and the broad directional bottom mask. The candidate was
+rejected because it generated multiple new salient people instead of continuing
+the original visible entity.
+
+### Explicit Shape-Guided Evaluation
+
+The second evaluation used `strategy=shape_guided`, seeds `0` and `17`,
+`fitting_degree=0.80`, and a narrow explicit bottom mask. Both candidates were
+rejected. Each generated a separate complete person rather than a connected
+continuation of the source entity; identity, clothing, proportions, and
+structure were not continuous with the preserved source pixels.
+
+### Frozen Benchmark Evidence
+
+The two existing server-side output directories under
+`/mnt/workspace/litengjie/data/reference_completion_benchmarks/` whose
+`result.json` files match the two configurations above are frozen benchmark
+evidence. They must not be renamed, overwritten, regenerated in place, or used
+as production references. Their images, logs, model files, and benchmark
+artifacts remain outside this repository and are not committed.
+
+### Decision
+
+PowerPaint v2-1 is not suitable for identity-preserving entity completion in
+this pipeline. The narrow explicit mask did not solve the entity-insertion
+failure, and the failures cannot be attributed only to one seed or to the broad
+directional mask. Prompt, seed, mask, and fitting-degree searches are therefore
+closed for this backend, and it will not be integrated into production.
+
+Production references continue to use source-faithful RGBA artifacts. Reference
+coverage should preferentially come from real-frame donors and same-parent
+cross-pairing. When no qualifying donor exists, no generated completion may be
+published.
