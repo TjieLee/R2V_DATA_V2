@@ -11,7 +11,7 @@ import shutil
 import sys
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -348,6 +348,43 @@ class CompletionBenchmarkStats:
 
 
 @dataclass(frozen=True)
+class CompletionCandidateSpec:
+    file_stem: str
+    seed: int
+    prompt: str
+    negative_prompt: str
+    attempt_metadata: dict[str, object]
+    selection_metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class CompletionBenchmarkRun:
+    stats: CompletionBenchmarkStats
+    results: tuple[dict[str, object], ...]
+
+
+class CompletionCandidateGenerator(Protocol):
+    def __call__(
+        self,
+        *,
+        record: CompletionManifestRecord,
+        candidate: CompletionCandidateSpec,
+        input_rgb: Image.Image,
+        completion_mask: Image.Image,
+    ) -> Image.Image: ...
+
+
+class CompletionCanvasRuntimeConfig(Protocol):
+    canvas_expand_ratio: float
+    lateral_padding_ratio: float
+    mask_overlap_pixels: int
+    model_min_side: int
+    model_multiple: int
+
+    def validate(self) -> None: ...
+
+
+@dataclass(frozen=True)
 class PowerPaintTaskPrompts:
     promptA: str
     promptB: str
@@ -370,21 +407,30 @@ def _resolve_input_path(path: Path, *, field_name: str) -> Path:
     return resolved
 
 
-def _resolve_benchmark_root(path: Path) -> Path:
+def _resolve_benchmark_root(
+    path: Path,
+    *,
+    allowed_benchmark_root: Path | None = None,
+) -> Path:
+    allowed_root = (
+        ALLOWED_BENCHMARK_ROOT
+        if allowed_benchmark_root is None
+        else allowed_benchmark_root.resolve()
+    )
     if not path.is_absolute():
         raise ValueError("benchmark_root must be an absolute path")
     resolved = path.expanduser().resolve(strict=False)
-    if resolved == ALLOWED_BENCHMARK_ROOT or not _is_at_or_below(
+    if resolved == allowed_root or not _is_at_or_below(
         resolved,
-        ALLOWED_BENCHMARK_ROOT,
+        allowed_root,
     ):
         raise ValueError(
             "benchmark_root must be a run directory strictly below "
-            f"{ALLOWED_BENCHMARK_ROOT}"
+            f"{allowed_root}"
         )
     forbidden = {"selected", "r2v_v3_runs", "r2v_v3_datasets"}
     relative_parts = {
-        part.casefold() for part in resolved.relative_to(ALLOWED_BENCHMARK_ROOT).parts
+        part.casefold() for part in resolved.relative_to(allowed_root).parts
     }
     if relative_parts & forbidden:
         raise ValueError("benchmark_root targets a forbidden production directory")
@@ -479,7 +525,7 @@ def _build_completion_canvas_base(
     source_rgba: Image.Image,
     context_rgb: Image.Image | None,
     completion_sides: tuple[CompletionSide, ...],
-    config: PowerPaintV21CompletionConfig,
+    config: CompletionCanvasRuntimeConfig,
 ) -> _CompletionCanvasBase:
     if source_rgba.mode != "RGBA":
         raise ValueError("completion source must be RGBA")
@@ -563,7 +609,7 @@ def _build_directional_completion_mask(
     canvas_base: _CompletionCanvasBase,
     completion_sides: tuple[CompletionSide, ...],
     completion_start_ratio: float,
-    config: PowerPaintV21CompletionConfig,
+    config: CompletionCanvasRuntimeConfig,
 ) -> Image.Image:
     visible = np.asarray(canvas_base.visible_mask, dtype=np.uint8) == 255
     x1, y1, x2, y2 = canvas_base.visible_bbox
@@ -652,7 +698,7 @@ def build_completion_canvas(
     context_rgb: Image.Image | None,
     completion_sides: tuple[CompletionSide, ...],
     completion_start_ratio: float,
-    config: PowerPaintV21CompletionConfig,
+    config: CompletionCanvasRuntimeConfig,
     explicit_completion_mask: Image.Image | None = None,
 ) -> CompletionCanvas:
     canvas_base = _build_completion_canvas_base(
@@ -1496,7 +1542,7 @@ def _build_record_canvas(
     source_rgba: Image.Image,
     context_rgb: Image.Image | None,
     completion_mask_path: Path | None,
-    config: PowerPaintV21CompletionConfig,
+    config: CompletionCanvasRuntimeConfig,
 ) -> tuple[CompletionCanvas, str | None]:
     canvas_base = _build_completion_canvas_base(
         source_rgba=source_rgba,
@@ -1529,7 +1575,7 @@ def _build_record_canvas(
 def _preflight_record(
     record: CompletionManifestRecord,
     *,
-    config: PowerPaintV21CompletionConfig,
+    config: CompletionCanvasRuntimeConfig,
 ) -> _CompletionPreflight:
     source_path = _resolve_input_path(
         record.source_rgba_path,
@@ -1573,10 +1619,14 @@ def _process_record(
     *,
     preflight: _CompletionPreflight,
     benchmark_root: Path,
-    config: PowerPaintV21CompletionConfig,
-    backend: ReferenceCompletionBackend,
+    config: CompletionCanvasRuntimeConfig,
     judge: ReferenceCompletionJudge,
-    candidate_order: tuple[tuple[CompletionStrategy, int], ...],
+    candidate_factory: Callable[
+        [CompletionManifestRecord],
+        tuple[CompletionCandidateSpec, ...],
+    ],
+    generate_candidate: CompletionCandidateGenerator,
+    result_metadata: dict[str, object],
 ) -> dict[str, object]:
     source_path = preflight.source_path
     context_path = preflight.context_path
@@ -1626,32 +1676,25 @@ def _process_record(
                     raise RuntimeError(
                         "published completion mask differs from explicit source"
                     )
-        prompt = build_completion_prompt(
-            entity_phrase=record.entity_phrase,
-            reference_type=record.reference_type,
-        )
-        negative_prompt = build_completion_negative_prompt(record.reference_type)
+        candidate_specs = candidate_factory(record)
+        if not candidate_specs:
+            raise ValueError("completion candidate plan must be non-empty")
         attempts: list[dict[str, object]] = []
         accepted: dict[str, object] | None = None
-        for strategy, seed in candidate_order:
+        for candidate_spec in candidate_specs:
             attempt_started = time.perf_counter()
-            stem = f"{strategy}_seed_{seed}"
+            stem = candidate_spec.file_stem
             candidate_name = f"candidate_{stem}.png"
             review_name = f"review_{stem}.json"
             candidate_sha256: str | None = None
             judge_status = "not_run"
             reason = ""
             try:
-                generated = backend.complete(
+                generated = generate_candidate(
+                    record=record,
+                    candidate=candidate_spec,
                     input_rgb=model_rgb.copy(),
                     completion_mask=model_mask.copy(),
-                    entity_phrase=record.entity_phrase,
-                    reference_type=record.reference_type,
-                    strategy=strategy,
-                    seed=seed,
-                    fitting_degree=config.fitting_degree,
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
                 )
                 candidate, hard_check = _hard_check_candidate(
                     generated_model_rgb=generated,
@@ -1701,9 +1744,7 @@ def _process_record(
             )
             attempts.append(
                 {
-                    "strategy": strategy,
-                    "seed": seed,
-                    "fitting_degree": config.fitting_degree,
+                    **candidate_spec.attempt_metadata,
                     "candidate_path": (
                         candidate_name if candidate is not None else None
                     ),
@@ -1718,9 +1759,7 @@ def _process_record(
             )
             if accepted is None and hard_check.passed and review.verdict == "accept":
                 accepted = {
-                    "strategy": strategy,
-                    "seed": seed,
-                    "fitting_degree": config.fitting_degree,
+                    **candidate_spec.selection_metadata,
                     "candidate_path": candidate_name,
                     "candidate_sha256": candidate_sha256,
                 }
@@ -1763,6 +1802,7 @@ def _process_record(
             "completion_mask_source_sha256": completion_mask_sha256,
             "completion_mask_area_ratio": canvas.completion_mask_area_ratio,
             "model_space_transform": transform.to_dict(),
+            **result_metadata,
             "status": status,
             "accepted_candidate": accepted,
             "attempts": attempts,
@@ -1781,6 +1821,58 @@ def _process_record(
         raise
 
 
+def run_completion_benchmark(
+    *,
+    manifest_path: Path,
+    benchmark_root: Path,
+    allowed_benchmark_root: Path | None,
+    config: CompletionCanvasRuntimeConfig,
+    judge: ReferenceCompletionJudge,
+    candidate_factory: Callable[
+        [CompletionManifestRecord],
+        tuple[CompletionCandidateSpec, ...],
+    ],
+    generate_candidate: CompletionCandidateGenerator,
+    record_validator: Callable[[CompletionManifestRecord], None] | None = None,
+    result_metadata: dict[str, object] | None = None,
+) -> CompletionBenchmarkRun:
+    config.validate()
+    resolved_root = _resolve_benchmark_root(
+        benchmark_root,
+        allowed_benchmark_root=allowed_benchmark_root,
+    )
+    records = load_completion_manifest(manifest_path)
+    if record_validator is not None:
+        for record in records:
+            record_validator(record)
+    preflights = [_preflight_record(record, config=config) for record in records]
+    resolved_root.mkdir(parents=True, exist_ok=False)
+    accepted = rejected = 0
+    results: list[dict[str, object]] = []
+    for record, preflight in zip(records, preflights):
+        result = _process_record(
+            record,
+            preflight=preflight,
+            benchmark_root=resolved_root,
+            config=config,
+            judge=judge,
+            candidate_factory=candidate_factory,
+            generate_candidate=generate_candidate,
+            result_metadata=dict(result_metadata or {}),
+        )
+        results.append(result)
+        accepted += int(result["status"] == "accepted")
+        rejected += int(result["status"] == "rejected")
+    return CompletionBenchmarkRun(
+        stats=CompletionBenchmarkStats(
+            processed=len(records),
+            accepted=accepted,
+            rejected=rejected,
+        ),
+        results=tuple(results),
+    )
+
+
 def run_reference_completion_benchmark(
     *,
     manifest_path: Path,
@@ -1791,27 +1883,65 @@ def run_reference_completion_benchmark(
     strategies: tuple[CompletionStrategy, ...] = DEFAULT_STRATEGIES,
     seeds: tuple[int, ...] = DEFAULT_SEEDS,
 ) -> CompletionBenchmarkStats:
-    config.validate()
-    resolved_root = _resolve_benchmark_root(benchmark_root)
-    records = load_completion_manifest(manifest_path)
     candidate_order = _validated_candidate_order(strategies, seeds)
-    preflights = [_preflight_record(record, config=config) for record in records]
-    resolved_root.mkdir(parents=True, exist_ok=False)
-    accepted = rejected = 0
-    for record, preflight in zip(records, preflights):
-        result = _process_record(
-            record,
-            preflight=preflight,
-            benchmark_root=resolved_root,
-            config=config,
-            backend=backend,
-            judge=judge,
-            candidate_order=candidate_order,
+
+    def candidate_factory(
+        record: CompletionManifestRecord,
+    ) -> tuple[CompletionCandidateSpec, ...]:
+        prompt = build_completion_prompt(
+            entity_phrase=record.entity_phrase,
+            reference_type=record.reference_type,
         )
-        accepted += int(result["status"] == "accepted")
-        rejected += int(result["status"] == "rejected")
-    return CompletionBenchmarkStats(
-        processed=len(records),
-        accepted=accepted,
-        rejected=rejected,
+        negative_prompt = build_completion_negative_prompt(record.reference_type)
+        return tuple(
+            CompletionCandidateSpec(
+                file_stem=f"{strategy}_seed_{seed}",
+                seed=seed,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                attempt_metadata={
+                    "strategy": strategy,
+                    "seed": seed,
+                    "fitting_degree": config.fitting_degree,
+                },
+                selection_metadata={
+                    "strategy": strategy,
+                    "seed": seed,
+                    "fitting_degree": config.fitting_degree,
+                },
+            )
+            for strategy, seed in candidate_order
+        )
+
+    def generate_candidate(
+        *,
+        record: CompletionManifestRecord,
+        candidate: CompletionCandidateSpec,
+        input_rgb: Image.Image,
+        completion_mask: Image.Image,
+    ) -> Image.Image:
+        strategy = candidate.attempt_metadata["strategy"]
+        if strategy not in DEFAULT_STRATEGIES:
+            raise ValueError("invalid PowerPaint completion strategy")
+        return backend.complete(
+            input_rgb=input_rgb,
+            completion_mask=completion_mask,
+            entity_phrase=record.entity_phrase,
+            reference_type=record.reference_type,
+            strategy=strategy,
+            seed=candidate.seed,
+            fitting_degree=config.fitting_degree,
+            prompt=candidate.prompt,
+            negative_prompt=candidate.negative_prompt,
+        )
+
+    run = run_completion_benchmark(
+        manifest_path=manifest_path,
+        benchmark_root=benchmark_root,
+        allowed_benchmark_root=None,
+        config=config,
+        judge=judge,
+        candidate_factory=candidate_factory,
+        generate_candidate=generate_candidate,
     )
+    return run.stats
