@@ -616,6 +616,37 @@ def test_localized_backend_uses_official_like_call_and_preserves_raw_size(
     assert {"height", "width", "mask", "completion_mask"}.isdisjoint(request)
 
 
+def test_localized_backend_can_force_exact_production_input_size(
+    environment: _Environment,
+) -> None:
+    pipeline = _FakePipeline()
+    config = replace(
+        _config(environment, mode="localized_raw"),
+        force_input_size=True,
+    )
+    backend = QwenImageEdit2511ReferenceCompletionBackend(
+        config,
+        pipeline=pipeline,
+        torch_module=_fake_torch(),
+    )
+    input_rgb = Image.new("RGB", (37, 53), "white")
+
+    output = backend.complete(
+        input_rgb=input_rgb,
+        entity_phrase="a ceramic vessel",
+        seed=0,
+        prompt=DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+        negative_prompt=" ",
+    )
+
+    assert output.mode == "RGB"
+    assert output.size == input_rgb.size
+    request = pipeline.calls[0]
+    assert request["height"] == 53
+    assert request["width"] == 37
+    assert request["image"] == [input_rgb]
+
+
 @pytest.mark.parametrize(
     ("output", "error"),
     [

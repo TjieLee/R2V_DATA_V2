@@ -30,10 +30,12 @@ Candidate IDs and candidate order are immutable. Judge only visible evidence and
 never infer a body, structure, accessory, or identity feature outside the
 images. A full reference may still have minor edge contact or small peripheral
 parts outside the frame; do not downgrade only because of border contact,
-natural holes, or multiple natural connected components. Local means one
-coherent, reusable, identity-bearing but incomplete visual region. Reject when
-identity is not visible, fragmentation or occlusion is severe, or segmentation
-is wrong. The context image shows scene placement; the isolated crop shows the
+natural holes, or multiple natural connected components. Local means a
+coherent, reusable, identity-bearing but incomplete visual region; it may still
+be recognizable as the whole known entity when enough identity and structure
+remain visible. Reject when identity is not visible, fragmentation or occlusion
+is severe, or segmentation is wrong. The context image shows scene placement;
+the isolated crop shows the
 exact proposed reference content.
 
 Do not output tokens or crop coordinates. Return one strict JSON object only
@@ -139,14 +141,6 @@ def validate_entity_reference_decision(
                     code="local_must_be_non_whole",
                     field="visible_region",
                     message="local reference cannot use visible_region=whole",
-                )
-            )
-        if decision.whole_entity_recognizable:
-            issues.append(
-                ValidationIssue(
-                    code="local_must_be_incomplete",
-                    field="whole_entity_recognizable",
-                    message="local reference cannot claim whole-entity recognition",
                 )
             )
         if not decision.identity_features_visible:

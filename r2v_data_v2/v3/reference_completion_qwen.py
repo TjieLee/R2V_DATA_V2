@@ -203,6 +203,7 @@ class QwenImageEdit2511CompletionConfig:
     model_min_side: int = 1024
     model_multiple: int = 16
     mode: QwenCompletionMode = DEFAULT_QWEN_COMPLETION_MODE
+    force_input_size: bool = False
 
     @property
     def compositing_mode(self) -> QwenCompletionCompositingMode | None:
@@ -225,6 +226,8 @@ class QwenImageEdit2511CompletionConfig:
             raise ValueError("Qwen completion requires local_files_only=true")
         if self.mode not in {"localized_raw", "whole_canvas", "explicit_mask"}:
             raise ValueError("unsupported Qwen completion mode")
+        if not isinstance(self.force_input_size, bool):
+            raise TypeError("force_input_size must be a boolean")
         if (
             not isinstance(self.num_inference_steps, int)
             or isinstance(self.num_inference_steps, bool)
@@ -397,7 +400,8 @@ class QwenImageEdit2511ReferenceCompletionBackend:
             "num_inference_steps": self.config.num_inference_steps,
             "num_images_per_prompt": 1,
         }
-        if self.config.mode != "localized_raw":
+        size_is_forced = self.config.mode != "localized_raw" or self.config.force_input_size
+        if size_is_forced:
             parameters["height"] = input_rgb.height
             parameters["width"] = input_rgb.width
         _require_parameters(
@@ -414,9 +418,9 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         ):
             raise TypeError("Qwen completion backend did not return a PIL image")
         output = images[0]
-        if self.config.mode != "localized_raw" and output.mode != "RGB":
+        if size_is_forced and output.mode != "RGB":
             raise TypeError("Qwen completion output must use RGB mode")
-        if self.config.mode != "localized_raw" and output.size != input_rgb.size:
+        if size_is_forced and output.size != input_rgb.size:
             raise RuntimeError(
                 "Qwen completion output dimensions do not match model input"
             )

@@ -444,7 +444,6 @@ class EntityReferenceState(SchemaModel):
             elif self.reference_scope == "local":
                 if (
                     self.visible_region == "whole"
-                    or self.whole_entity_recognizable
                     or not self.identity_features_visible
                 ):
                     raise ValueError(

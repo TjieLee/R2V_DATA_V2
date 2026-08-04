@@ -136,14 +136,6 @@ def test_reject_decision_contract_is_valid() -> None:
             {
                 "reference_scope": "local",
                 "visible_region": "central",
-                "whole_entity_recognizable": True,
-            },
-            "local_must_be_incomplete",
-        ),
-        (
-            {
-                "reference_scope": "local",
-                "visible_region": "central",
                 "whole_entity_recognizable": False,
                 "identity_features_visible": False,
             },
@@ -161,6 +153,20 @@ def test_request_level_semantic_validation(
         candidate_ids={"candidate_1"},
     )
     assert code in {issue.code for issue in issues}
+
+
+def test_recognizable_local_reference_is_valid() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            reference_scope="local",
+            visible_region="central",
+            whole_entity_recognizable=True,
+        )
+    )
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+    ) == []
 
 
 def test_request_payload_contains_only_required_evidence() -> None:

@@ -259,8 +259,9 @@ def _add_ready_clip(
         for slot in range(10):
             mask = np.zeros((HEIGHT, WIDTH), dtype=bool)
             if status == "ready":
+                top = 0 if config.reference_scope.allow_synthetic_completion else 2
                 left = min(index + (slot % 2), WIDTH - 5)
-                mask[2:7, left : left + 4] = True
+                mask[top : top + 5, left : left + 4] = True
             frame_masks.append(_tracked_frame(slot, mask))
         tracked_entities[entity.entity_id] = TrackedEntityMasks(
             status=status,
@@ -323,7 +324,9 @@ def _decision(scope: str = "full") -> RawEntityReferenceDecision:
         selected_candidate_id="candidate_1",
         reference_scope=scope,
         visible_region="whole" if scope == "full" else "central",
-        whole_entity_recognizable=scope == "full",
+        whole_entity_recognizable=(
+            scope in {"full", "local"}
+        ),
         identity_features_visible=True,
         scope_reason="clear visual identity",
     )
@@ -2210,19 +2213,30 @@ class _SingleFrameSegmentationBackend:
 
 
 class _LocalThenGeneratedFullJudge:
-    def __init__(self, *, generated_scope: str = "full") -> None:
+    def __init__(
+        self,
+        *,
+        generated_scope: str = "full",
+        source_recognizable: bool = True,
+    ) -> None:
         self.calls: list[str] = []
         self.generated_scope = generated_scope
+        self.source_recognizable = source_recognizable
 
     def decide(self, *, entity, candidates, source_images):
         del entity
         assert set(source_images) == {item.image_path for item in candidates}
         generated = "reference_completion" in candidates[0].image_path
         self.calls.append("generated" if generated else "source")
+        decision = _decision(
+            self.generated_scope if generated else "local"
+        )
+        if not generated and not self.source_recognizable:
+            decision = decision.model_copy(
+                update={"whole_entity_recognizable": False}
+            )
         return EntityReferenceDecisionAttempt(
-            decision=_decision(
-                self.generated_scope if generated else "local"
-            ),
+            decision=decision,
             raw_responses=("{}",),
             repair_attempts=0,
         )
@@ -2246,6 +2260,27 @@ def _read_completion_rejection(storage: RunStorage) -> dict[str, object]:
     return json.loads(
         _completion_rejection_path(storage).read_text(encoding="utf-8")
     )
+
+
+def _assert_completion_rejection_artifacts(
+    directory: Path,
+    *,
+    expected_filename: str = "rejection.json",
+) -> None:
+    assert {path.name for path in directory.iterdir()} == {
+        "diagnostics",
+        expected_filename,
+    }
+    diagnostic_names = {
+        path.name for path in (directory / "diagnostics").iterdir()
+    }
+    assert {
+        "cleaned_source.png",
+        "protected_component_mask.png",
+        "recovery_corridor_mask.png",
+    }.issubset(diagnostic_names)
+    assert not list(directory.parent.glob(".tmp-*"))
+    assert not list(directory.parent.glob(".backup-*"))
 
 
 def test_generated_fallback_uses_existing_components_and_is_idempotent(
@@ -2312,6 +2347,19 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert metadata["completion"]["prompt_language"] == "en"
     assert metadata["completion"]["prompt"] == QWEN_LOCALIZED_PROMPT_EN_SHORT
     assert metadata["segmentation"]["backend"] == "sam3"
+    assert metadata["fallback_used"] is False
+    assert metadata["recovery_direction"] == ["top"]
+    assert metadata["protected_component_ids"] == ["component_1"]
+    assert metadata["candidate_new_region_stats"][
+        "matching_recovery_directions"
+    ] == ["top"]
+    diagnostic_directory = metadata_path.parent / "diagnostics"
+    assert {path.name for path in diagnostic_directory.iterdir()} == {
+        "cleaned_source.png",
+        "protected_component_mask.png",
+        "recovery_corridor_mask.png",
+        "sam3_candidate_mask.png",
+    }
     assert not _completion_rejection_path(storage).exists()
     assert not (metadata_path.parent / ".sam3_single_frame").exists()
     candidate_path = metadata_path.parent / "candidate_rgb.png"
@@ -2405,6 +2453,56 @@ def test_generated_fallback_is_disabled_by_default(
     assert completion.calls == []
 
 
+def test_ineligible_local_reference_skips_completion_and_keeps_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    completion = _LocalizedCompletionBackend(
+        fail=AssertionError("ineligible source must not call Qwen")
+    )
+    completion_judge = _LocalizedCompletionJudge()
+    segmenter = _SingleFrameSegmentationBackend("exception")
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(source_recognizable=False),
+        completion_backend=completion,
+        completion_judge=completion_judge,
+        completion_segmentation_backend=segmenter,
+    )
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert state.status == "ready"
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
+    assert state.whole_entity_recognizable is False
+    assert stats.completion_attempted == 0
+    assert stats.completion_ready == 0
+    assert stats.completion_rejected == 0
+    assert completion.calls == []
+    assert completion_judge.calls == []
+    assert segmenter.calls == []
+    metadata_path = _completion_rejection_path(storage).with_name("metadata.json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "skipped"
+    assert metadata["completion_skipped_reason"] == (
+        "completion_source_not_whole_recognizable"
+    )
+    assert metadata["fallback_used"] is True
+    assert not _completion_rejection_path(storage).exists()
+    _assert_completion_rejection_artifacts(
+        metadata_path.parent,
+        expected_filename="metadata.json",
+    )
+
+
 def test_completion_generation_failure_keeps_original_local_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2457,9 +2555,9 @@ def test_completion_generation_failure_keeps_original_local_reference(
     )
     assert rejection["config_hash"] == config.fingerprint()
     assert rejection["git_commit"] == "pair-test"
-    assert [path.name for path in rejection_path.parent.iterdir()] == [
-        "rejection.json"
-    ]
+    assert rejection["fallback_used"] is True
+    assert rejection["protected_component_ids"] == ["component_1"]
+    _assert_completion_rejection_artifacts(rejection_path.parent)
     completion_root = storage.clip_dir("clip-1") / "reference_completion"
     assert not list(completion_root.glob(".tmp-*"))
     assert not list(completion_root.glob(".backup-*"))
@@ -2545,9 +2643,7 @@ def test_generated_fallback_failure_keeps_original_local_reference(
             "track_reason": "not found",
         }
     rejection_directory = _completion_rejection_path(storage).parent
-    assert [path.name for path in rejection_directory.iterdir()] == [
-        "rejection.json"
-    ]
+    _assert_completion_rejection_artifacts(rejection_directory)
     with Image.open(storage.selected_entity_path("clip-1", "e1")) as opened:
         assert opened.mode == "RGBA"
 
@@ -2616,14 +2712,15 @@ def test_completion_mask_gate_rejection_records_reasons_and_metrics(
     assert stats.completion_rejected == 1
     assert state.reference_scope == "local"
     assert state.synthetic is False
-    assert rejection["stage"] == "mask_gate"
+    assert rejection["stage"] == "improvement_gate"
     assert rejection["exception_type"] is None
-    assert rejection["mask_gate"]["passed"] is False
-    assert "mask_full" in rejection["mask_gate"]["reasons"]
-    mask_metrics = rejection["mask_gate"]["metrics"]
-    assert mask_metrics["foreground_pixels"] == (
-        mask_metrics["canvas_size"][0] * mask_metrics["canvas_size"][1]
-    )
+    assert rejection["reason"] == "completion_growth_outside_recovery_corridor"
+    candidate_stats = rejection["candidate_new_region_stats"]
+    assert "completion_growth_outside_recovery_corridor" in candidate_stats[
+        "reasons"
+    ]
+    assert candidate_stats["outside_recovery_corridor_pixels"] > 0
+    assert rejection["fallback_used"] is True
 
 
 def test_completion_localized_judge_rejection_records_verdict_and_reason(
@@ -2743,9 +2840,7 @@ def test_completion_publication_failure_records_stage_and_rolls_back(
     assert rejection["reason"] == "completion publication failed"
     assert rejection["exception_type"] == "RuntimeError"
     completion_directory = _completion_rejection_path(storage).parent
-    assert [path.name for path in completion_directory.iterdir()] == [
-        "rejection.json"
-    ]
+    _assert_completion_rejection_artifacts(completion_directory)
     completion_root = completion_directory.parent
     assert not list(completion_root.glob(".tmp-*"))
     assert not list(completion_root.glob(".backup-*"))
@@ -2815,9 +2910,7 @@ def test_completion_rejection_and_success_replace_each_other_idempotently(
     assert third.completion_rejected == 1
     assert third_rejection["stage"] == "segmentation"
     assert third_rejection["reason"] != first_rejection["reason"]
-    assert [path.name for path in completion_directory.iterdir()] == [
-        "rejection.json"
-    ]
+    _assert_completion_rejection_artifacts(completion_directory)
     completion_root = completion_directory.parent
     assert not list(completion_root.glob(".tmp-*"))
     assert not list(completion_root.glob(".backup-*"))

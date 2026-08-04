@@ -18,7 +18,12 @@ from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.frames import _save_jpeg
 from r2v_data_v2.v3.reference_completion_benchmark import (
     ReferenceCompletionReview,
-    _white_source,
+)
+from r2v_data_v2.v3.reference_completion_policy import (
+    ConservativeCompletionPolicy,
+    build_conservative_completion_policy,
+    restore_protected_source_pixels,
+    validate_conservative_completion_candidate,
 )
 from r2v_data_v2.v3.reference_completion_publish import (
     PublicationConfig,
@@ -28,7 +33,6 @@ from r2v_data_v2.v3.reference_completion_publish import (
     build_candidate_reference,
     compute_foreground_metrics,
     evaluate_background_gate,
-    evaluate_improvement_gate,
     evaluate_mask_gate,
 )
 from r2v_data_v2.v3.reference_completion_qwen import (
@@ -90,6 +94,7 @@ class _RejectionDiagnostics:
     stage: str = "generation"
     source_image_sha256: str | None = None
     details: dict[str, object] = field(default_factory=dict)
+    artifacts: dict[str, Image.Image] = field(default_factory=dict)
 
     def set_stage(self, stage: str) -> None:
         if stage not in _REJECTION_STAGES:
@@ -130,6 +135,28 @@ def _completion_directory(
 ) -> Path:
     storage.selected_entity_path(clip_uid, entity_id)
     return storage.clip_dir(clip_uid) / "reference_completion" / entity_id
+
+
+def _write_diagnostic_artifacts(
+    directory: Path,
+    diagnostics: _RejectionDiagnostics,
+) -> None:
+    if not diagnostics.artifacts:
+        return
+    diagnostic_directory = directory / "diagnostics"
+    diagnostic_directory.mkdir(parents=True, exist_ok=False)
+    for name, image in sorted(diagnostics.artifacts.items()):
+        if Path(name).name != name or not name.endswith(".png"):
+            raise ValueError("completion diagnostic artifact name is invalid")
+        _save_png(diagnostic_directory / name, image)
+
+
+def _policy_artifact_paths() -> dict[str, str]:
+    return {
+        "cleaned_source_image": "diagnostics/cleaned_source.png",
+        "protected_component_mask": "diagnostics/protected_component_mask.png",
+        "recovery_corridor_mask": "diagnostics/recovery_corridor_mask.png",
+    }
 
 
 def _eligible(
@@ -212,6 +239,7 @@ def _attempt(
     reference_judge: EntityReferenceJudge,
     gates: PublicationConfig,
     diagnostics: _RejectionDiagnostics,
+    policy: ConservativeCompletionPolicy,
 ) -> _AcceptedFallback:
     if source_state.image_path is None or source_state.source_frame_index is None:
         raise ValueError("local reference provenance is incomplete")
@@ -227,7 +255,8 @@ def _attempt(
     )
     try:
         (working / "source_rgba.png").write_bytes(source_bytes)
-        input_rgb = _white_source(source_rgba)
+        _write_diagnostic_artifacts(working, diagnostics)
+        input_rgb = policy.completion_input_rgb.copy()
         input_path = working / "input_rgb.png"
         _save_png(input_path, input_rgb)
         prompt, prompt_language = _localized_prompt(
@@ -245,7 +274,11 @@ def _attempt(
         )
         candidate_path = working / "candidate_rgb.png"
         diagnostics.set_stage("localized_hard_check")
-        candidate_rgb, candidate_sha256, hard_check = _localized_hard_check(
+        (
+            candidate_rgb,
+            generated_candidate_sha256,
+            hard_check,
+        ) = _localized_hard_check(
             generated=generated,
             input_rgb=input_rgb,
             input_path=input_path,
@@ -286,27 +319,55 @@ def _attempt(
         except ValueError as exc:
             raise _ExpectedRejection(str(exc)) from exc
         segmentation_details["ranking"] = mask_ranking
+        diagnostics.artifacts["sam3_candidate_mask.png"] = mask.copy()
+        _save_png(
+            working / "diagnostics" / "sam3_candidate_mask.png",
+            mask,
+        )
+        diagnostics.set_stage("improvement_gate")
+        conservative = validate_conservative_completion_candidate(policy, mask)
+        diagnostics.details["candidate_new_region_stats"] = conservative.report
+        if not conservative.passed:
+            raise _ExpectedRejection(conservative.reasons[0])
+        mask = conservative.mask
+        candidate_rgb = restore_protected_source_pixels(policy, candidate_rgb)
+        candidate_sha256 = _save_png(candidate_path, candidate_rgb)
         mask_sha256 = _save_png(working / "candidate_mask.png", mask)
-        source_metrics = compute_foreground_metrics(source_rgba.getchannel("A"))
+        source_metrics = policy.source_metrics
         candidate_metrics = compute_foreground_metrics(mask)
         diagnostics.set_stage("mask_gate")
-        mask_metrics, mask_ok, mask_reasons = evaluate_mask_gate(
+        mask_metrics, _, raw_mask_reasons = evaluate_mask_gate(
             mask,
             reference_type=entity.reference_type,
             config=gates,
         )
+        component_reasons = {
+            "largest_component_ratio_below_min",
+            "secondary_component_ratio_above_max",
+            "group_largest_component_ratio_below_min",
+            "group_secondary_component_ratio_above_max",
+            "group_significant_component_isolated",
+        }
+        mask_reasons = [
+            reason
+            for reason in raw_mask_reasons
+            if reason not in component_reasons
+        ]
+        mask_ok = not mask_reasons
         diagnostics.details["mask_gate"] = {
             "passed": mask_ok,
             "reasons": list(mask_reasons),
+            "suppressed_protected_component_reasons": [
+                reason
+                for reason in raw_mask_reasons
+                if reason in component_reasons
+            ],
             "metrics": mask_metrics,
         }
         diagnostics.set_stage("improvement_gate")
-        improvement, improvement_ok, improvement_reasons = evaluate_improvement_gate(
-            source_metrics,
-            candidate_metrics,
-            reference_type=entity.reference_type,
-            config=gates,
-        )
+        improvement = conservative.report
+        improvement_ok = conservative.passed
+        improvement_reasons = list(conservative.reasons)
         diagnostics.details["improvement_gate"] = {
             "passed": improvement_ok,
             "reasons": list(improvement_reasons),
@@ -411,6 +472,7 @@ def _attempt(
                 "prompt": prompt,
                 "prompt_language": prompt_language,
                 "negative_prompt": DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT,
+                "height_width_forced": True,
                 "num_inference_steps": config.remove.num_inference_steps,
                 "true_cfg_scale": config.remove.true_cfg_scale,
                 "guidance_scale": config.remove.guidance_scale,
@@ -431,6 +493,7 @@ def _attempt(
                 "background_metrics": background,
                 "thresholds": gates.thresholds_for(entity.reference_type),
             },
+            "generated_candidate_sha256": generated_candidate_sha256,
             "localized_completion_review": review.model_dump(mode="json"),
             "reference_ranking": {
                 "decision": decision.model_dump(mode="json"),
@@ -439,6 +502,10 @@ def _attempt(
             },
             "generated_reference_path": source_state.image_path,
             "generated_reference_sha256": output_sha256,
+            **policy.diagnostics(),
+            "diagnostic_artifacts": _policy_artifact_paths(),
+            "candidate_new_region_stats": conservative.report,
+            "fallback_used": False,
         }
         write_json_atomic(working / "metadata.json", metadata)
         return _AcceptedFallback(
@@ -501,49 +568,35 @@ def _rejection_payload(
         "source_image_sha256": source_sha256,
         "config_hash": config.fingerprint(),
         "git_commit": storage.read_run().git_commit,
+        "diagnostic_artifacts": _policy_artifact_paths(),
+        "fallback_used": True,
     }
     payload.update(diagnostics.details)
     return payload
 
 
-def _publish_rejection(
-    config: V3Config,
-    storage: RunStorage,
+def _publish_diagnostic_result(
     *,
-    clip_uid: str,
-    entity: AnnotationEntity,
-    source_state: EntityReferenceState,
+    final_directory: Path,
+    entity_id: str,
+    kind: str,
+    filename: str,
+    payload: dict[str, object],
     diagnostics: _RejectionDiagnostics,
-    error: Exception,
 ) -> None:
-    final_directory = _completion_directory(
-        storage,
-        clip_uid,
-        entity.entity_id,
-    )
     final_directory.parent.mkdir(parents=True, exist_ok=True)
     working = final_directory.parent / (
-        f".tmp-rejection-{entity.entity_id}-{uuid.uuid4().hex}"
+        f".tmp-{kind}-{entity_id}-{uuid.uuid4().hex}"
     )
     backup = final_directory.parent / (
-        f".backup-rejection-{entity.entity_id}-{uuid.uuid4().hex}"
+        f".backup-{kind}-{entity_id}-{uuid.uuid4().hex}"
     )
     working.mkdir(parents=False, exist_ok=False)
     backup_created = False
     published = False
     try:
-        write_json_atomic(
-            working / "rejection.json",
-            _rejection_payload(
-                config,
-                storage,
-                clip_uid=clip_uid,
-                entity=entity,
-                source_state=source_state,
-                diagnostics=diagnostics,
-                error=error,
-            ),
-        )
+        write_json_atomic(working / filename, payload)
+        _write_diagnostic_artifacts(working, diagnostics)
         if final_directory.exists():
             final_directory.replace(backup)
             backup_created = True
@@ -561,6 +614,113 @@ def _publish_rejection(
     finally:
         if working.exists():
             shutil.rmtree(working)
+
+
+def _publish_rejection(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+    error: Exception,
+) -> None:
+    _publish_diagnostic_result(
+        final_directory=_completion_directory(
+            storage,
+            clip_uid,
+            entity.entity_id,
+        ),
+        entity_id=entity.entity_id,
+        kind="rejection",
+        filename="rejection.json",
+        payload=_rejection_payload(
+            config,
+            storage,
+            clip_uid=clip_uid,
+            entity=entity,
+            source_state=source_state,
+            diagnostics=diagnostics,
+            error=error,
+        ),
+        diagnostics=diagnostics,
+    )
+
+
+def _skip_payload(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "status": "skipped",
+        "clip_uid": clip_uid,
+        "entity_id": entity.entity_id,
+        "reference_type": entity.reference_type,
+        "completion_skipped_reason": reason,
+        "source_reference": source_state.model_dump(mode="json"),
+        "source_image_sha256": diagnostics.source_image_sha256,
+        "config_hash": config.fingerprint(),
+        "git_commit": storage.read_run().git_commit,
+        "diagnostic_artifacts": _policy_artifact_paths(),
+        "fallback_used": True,
+        **diagnostics.details,
+    }
+
+
+def _record_skip_safely(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+    reason: str,
+) -> None:
+    try:
+        _publish_diagnostic_result(
+            final_directory=_completion_directory(
+                storage,
+                clip_uid,
+                entity.entity_id,
+            ),
+            entity_id=entity.entity_id,
+            kind="skip",
+            filename="metadata.json",
+            payload=_skip_payload(
+                config,
+                storage,
+                clip_uid=clip_uid,
+                entity=entity,
+                source_state=source_state,
+                diagnostics=diagnostics,
+                reason=reason,
+            ),
+            diagnostics=diagnostics,
+        )
+    except Exception as diagnostic_error:  # noqa: BLE001 - fallback stays open
+        try:
+            storage.append_failure(
+                stage="pair",
+                clip_uid=clip_uid,
+                reason="completion skip diagnostic write failed",
+                details={
+                    "entity_id": entity.entity_id,
+                    "completion_skipped_reason": reason,
+                    "diagnostic_error_type": type(diagnostic_error).__name__,
+                    "diagnostic_error": str(diagnostic_error),
+                },
+            )
+        except Exception:  # noqa: BLE001,S110 - diagnostics stay fail-open
+            pass
 
 
 def _record_rejection_safely(
@@ -656,6 +816,38 @@ def _publish(
         storage.cleanup_pair_artifacts(clip_uid)
 
 
+def _prepare_policy(
+    storage: RunStorage,
+    *,
+    source_state: EntityReferenceState,
+    diagnostics: _RejectionDiagnostics,
+) -> ConservativeCompletionPolicy:
+    if source_state.image_path is None:
+        raise ValueError("local reference image path is missing")
+    source_path = _artifact(storage, source_state.image_path)
+    source_rgba, _, source_sha256 = _load_source_rgba(source_path)
+    diagnostics.source_image_sha256 = source_sha256
+    policy = build_conservative_completion_policy(
+        source_rgba,
+        whole_entity_recognizable=source_state.whole_entity_recognizable,
+    )
+    diagnostics.details.update(policy.diagnostics())
+    diagnostics.details.update(
+        {
+            "diagnostic_artifacts": _policy_artifact_paths(),
+            "fallback_used": True,
+        }
+    )
+    diagnostics.artifacts.update(
+        {
+            "cleaned_source.png": policy.cleaned_source_rgba,
+            "protected_component_mask.png": policy.protected_component_mask,
+            "recovery_corridor_mask.png": policy.recovery_corridor_mask,
+        }
+    )
+    return policy
+
+
 def _owned_backend(config: V3Config) -> QwenImageEdit2511ReferenceCompletionBackend:
     return QwenImageEdit2511ReferenceCompletionBackend(
         QwenImageEdit2511CompletionConfig(
@@ -666,6 +858,7 @@ def _owned_backend(config: V3Config) -> QwenImageEdit2511ReferenceCompletionBack
             true_cfg_scale=config.remove.true_cfg_scale,
             guidance_scale=config.remove.guidance_scale,
             mode="localized_raw",
+            force_input_size=True,
         )
     )
 
@@ -704,13 +897,42 @@ def run_reference_completion_fallbacks(
                 if not _eligible(clip_uid, entity, source_state):
                     continue
                 assert source_state is not None
-                counts["attempted"] += 1
                 diagnostics = _RejectionDiagnostics()
                 try:
-                    if source_state.image_path is not None:
-                        diagnostics.source_image_sha256 = _sha256(
-                            _artifact(storage, source_state.image_path)
-                        )
+                    policy = _prepare_policy(
+                        storage,
+                        source_state=source_state,
+                        diagnostics=diagnostics,
+                    )
+                except Exception as exc:  # noqa: BLE001 - fallback fails open
+                    counts["attempted"] += 1
+                    counts["rejected"] += 1
+                    _record_rejection_safely(
+                        config,
+                        storage,
+                        clip_uid=clip_uid,
+                        entity=entity,
+                        source_state=source_state,
+                        diagnostics=diagnostics,
+                        error=exc,
+                    )
+                    continue
+                if not policy.eligible:
+                    reason = policy.completion_skipped_reason
+                    if reason is None:
+                        raise RuntimeError("ineligible completion policy has no reason")
+                    _record_skip_safely(
+                        config,
+                        storage,
+                        clip_uid=clip_uid,
+                        entity=entity,
+                        source_state=source_state,
+                        diagnostics=diagnostics,
+                        reason=reason,
+                    )
+                    continue
+                counts["attempted"] += 1
+                try:
                     if backend is None:
                         owned_backend = _owned_backend(config)
                         backend = owned_backend
@@ -739,6 +961,7 @@ def run_reference_completion_fallbacks(
                         reference_judge=reference_judge,
                         gates=gates,
                         diagnostics=diagnostics,
+                        policy=policy,
                     )
                     states[entity.entity_id] = accepted.state
                     ordered = [states[item.entity_id] for item in clip.annotation.entities]
