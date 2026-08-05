@@ -38,6 +38,7 @@ from r2v_data_v2.v3.reference_completion_qwen import (
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
     QwenLocalizedReferenceCompletionJudge,
+    _pad_rgb_to_model_multiple,
     run_qwen_reference_completion_benchmark,
 )
 from tools.run_v3_reference_completion_qwen import _parser
@@ -378,6 +379,7 @@ class _FakeCuda:
 
 class _FakePipeline:
     def __init__(self) -> None:
+        self.vae_scale_factor = 8
         self.calls: list[dict[str, object]] = []
         self.progress_values: list[bool] = []
         self.devices: list[str] = []
@@ -629,7 +631,7 @@ def test_localized_backend_can_force_exact_production_input_size(
         pipeline=pipeline,
         torch_module=_fake_torch(),
     )
-    input_rgb = Image.new("RGB", (37, 53), "white")
+    input_rgb = _gradient((19, 23))
 
     output = backend.complete(
         input_rgb=input_rgb,
@@ -642,9 +644,145 @@ def test_localized_backend_can_force_exact_production_input_size(
     assert output.mode == "RGB"
     assert output.size == input_rgb.size
     request = pipeline.calls[0]
-    assert request["height"] == 53
-    assert request["width"] == 37
-    assert request["image"] == [input_rgb]
+    assert request["height"] == 32
+    assert request["width"] == 32
+    padded = request["image"][0]
+    assert isinstance(padded, Image.Image)
+    assert padded.size == (32, 32)
+    padded_pixels = np.asarray(padded, dtype=np.uint8)
+    original_pixels = np.asarray(input_rgb, dtype=np.uint8)
+    assert np.array_equal(padded_pixels[:23, :19], original_pixels)
+    assert np.all(padded_pixels[:, 19:] == 255)
+    assert np.all(padded_pixels[23:, :] == 255)
+    assert backend.last_size_diagnostics == {
+        "original_model_input_size": [19, 23],
+        "padded_model_input_size": [32, 32],
+        "model_multiple": 16,
+        "padding_right": 13,
+        "padding_bottom": 9,
+        "returned_model_output_size": [32, 32],
+    }
+
+
+def test_force_input_size_does_not_pad_aligned_input(
+    environment: _Environment,
+) -> None:
+    pipeline = _FakePipeline()
+    backend = QwenImageEdit2511ReferenceCompletionBackend(
+        replace(
+            _config(environment, mode="localized_raw"),
+            force_input_size=True,
+        ),
+        pipeline=pipeline,
+        torch_module=_fake_torch(),
+    )
+    input_rgb = _gradient((32, 48))
+
+    output = backend.complete(
+        input_rgb=input_rgb,
+        entity_phrase="a ceramic vessel",
+        seed=0,
+        prompt=DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+        negative_prompt=" ",
+    )
+
+    request = pipeline.calls[0]
+    model_input = request["image"][0]
+    assert isinstance(model_input, Image.Image)
+    assert model_input.size == input_rgb.size
+    assert np.array_equal(np.asarray(model_input), np.asarray(input_rgb))
+    assert request["height"] == 48
+    assert request["width"] == 32
+    assert output.size == input_rgb.size
+    assert backend.last_size_diagnostics == {
+        "original_model_input_size": [32, 48],
+        "padded_model_input_size": [32, 48],
+        "model_multiple": 16,
+        "padding_right": 0,
+        "padding_bottom": 0,
+        "returned_model_output_size": [32, 48],
+    }
+
+
+def test_pad_rgb_to_model_multiple_preserves_pixels_and_uses_white(
+) -> None:
+    input_rgb = _gradient((19, 23))
+
+    padded, padding_right, padding_bottom = _pad_rgb_to_model_multiple(
+        input_rgb,
+        16,
+    )
+
+    pixels = np.asarray(padded, dtype=np.uint8)
+    assert padded.size == (32, 32)
+    assert (padding_right, padding_bottom) == (13, 9)
+    assert np.array_equal(pixels[:23, :19], np.asarray(input_rgb))
+    assert np.all(pixels[:, 19:] == 255)
+    assert np.all(pixels[23:, :] == 255)
+
+
+def test_force_input_size_wrong_return_size_reports_all_dimensions(
+    environment: _Environment,
+) -> None:
+    pipeline = _FakePipeline()
+    pipeline.output = SimpleNamespace(images=[Image.new("RGB", (16, 32))])
+    backend = QwenImageEdit2511ReferenceCompletionBackend(
+        replace(
+            _config(environment, mode="localized_raw"),
+            force_input_size=True,
+        ),
+        pipeline=pipeline,
+        torch_module=_fake_torch(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        backend.complete(
+            input_rgb=Image.new("RGB", (19, 23), "white"),
+            entity_phrase="a ceramic vessel",
+            seed=0,
+            prompt=DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+            negative_prompt=" ",
+        )
+
+    message = str(raised.value)
+    assert "original_size=(19, 23)" in message
+    assert "padded_size=(32, 32)" in message
+    assert "returned_size=(16, 32)" in message
+    assert "model_multiple=16" in message
+    assert backend.last_size_diagnostics == {
+        "original_model_input_size": [19, 23],
+        "padded_model_input_size": [32, 32],
+        "model_multiple": 16,
+        "padding_right": 13,
+        "padding_bottom": 9,
+        "returned_model_output_size": [16, 32],
+    }
+
+
+def test_force_input_size_rejects_invalid_pipeline_model_multiple(
+    environment: _Environment,
+) -> None:
+    pipeline = _FakePipeline()
+    pipeline.vae_scale_factor = 0
+    backend = QwenImageEdit2511ReferenceCompletionBackend(
+        replace(
+            _config(environment, mode="localized_raw"),
+            force_input_size=True,
+        ),
+        pipeline=pipeline,
+        torch_module=_fake_torch(),
+    )
+
+    with pytest.raises(ValueError, match="model_multiple"):
+        backend.complete(
+            input_rgb=Image.new("RGB", (19, 23), "white"),
+            entity_phrase="a ceramic vessel",
+            seed=0,
+            prompt=DEFAULT_QWEN_LOCALIZED_OBJECT_PROMPT,
+            negative_prompt=" ",
+        )
+
+    assert pipeline.calls == []
 
 
 @pytest.mark.parametrize(

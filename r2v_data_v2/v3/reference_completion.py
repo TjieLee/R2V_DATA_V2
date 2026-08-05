@@ -120,6 +120,17 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _completion_size_diagnostics(
+    backend: QwenReferenceCompletionBackend,
+) -> dict[str, object]:
+    value = getattr(backend, "last_size_diagnostics", None)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("completion backend size diagnostics must be an object")
+    return dict(value)
+
+
 def _artifact(storage: RunStorage, value: str) -> Path:
     root = storage.root.resolve(strict=False)
     path = (root / value).resolve(strict=False)
@@ -265,13 +276,20 @@ def _attempt(
         )
         seed = DEFAULT_QWEN_SEEDS[0]
         diagnostics.set_stage("generation")
-        generated = completion_backend.complete(
-            input_rgb=input_rgb.copy(),
-            entity_phrase=entity.phrase,
-            seed=seed,
-            prompt=prompt,
-            negative_prompt=DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT,
-        )
+        completion_size_metadata: dict[str, object] = {}
+        try:
+            generated = completion_backend.complete(
+                input_rgb=input_rgb.copy(),
+                entity_phrase=entity.phrase,
+                seed=seed,
+                prompt=prompt,
+                negative_prompt=DEFAULT_QWEN_LOCALIZED_NEGATIVE_PROMPT,
+            )
+        finally:
+            completion_size_metadata = _completion_size_diagnostics(
+                completion_backend
+            )
+            diagnostics.details.update(completion_size_metadata)
         candidate_path = working / "candidate_rgb.png"
         diagnostics.set_stage("localized_hard_check")
         (
@@ -476,6 +494,7 @@ def _attempt(
                 "num_inference_steps": config.remove.num_inference_steps,
                 "true_cfg_scale": config.remove.true_cfg_scale,
                 "guidance_scale": config.remove.guidance_scale,
+                **completion_size_metadata,
             },
             "segmentation": {
                 "backend": "sam3",

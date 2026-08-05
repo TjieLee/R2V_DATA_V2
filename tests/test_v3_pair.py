@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -40,6 +41,8 @@ from r2v_data_v2.v3.reference_completion_benchmark import (
 )
 from r2v_data_v2.v3.reference_completion_qwen import (
     QWEN_LOCALIZED_PROMPT_EN_SHORT,
+    QwenImageEdit2511CompletionConfig,
+    QwenImageEdit2511ReferenceCompletionBackend,
 )
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
@@ -2088,6 +2091,96 @@ class _LocalizedCompletionBackend:
         return Image.fromarray(pixels, mode="RGB")
 
 
+class _CompletionGenerator:
+    def __init__(self, device: str) -> None:
+        self.device = device
+        self.seed: int | None = None
+
+    def manual_seed(self, seed: int) -> _CompletionGenerator:
+        self.seed = seed
+        return self
+
+
+class _PaddedLocalizedCompletionPipeline:
+    vae_scale_factor = 8
+
+    def __init__(self, *, returned_size: tuple[int, int] | None = None) -> None:
+        self.returned_size = returned_size
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        *,
+        image,
+        prompt,
+        negative_prompt,
+        height,
+        width,
+        generator,
+        true_cfg_scale,
+        guidance_scale,
+        num_inference_steps,
+        num_images_per_prompt,
+    ):
+        self.calls.append(
+            {
+                "image": image,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "height": height,
+                "width": width,
+                "generator": generator,
+                "true_cfg_scale": true_cfg_scale,
+                "guidance_scale": guidance_scale,
+                "num_inference_steps": num_inference_steps,
+                "num_images_per_prompt": num_images_per_prompt,
+            }
+        )
+        if self.returned_size is not None:
+            return SimpleNamespace(
+                images=[Image.new("RGB", self.returned_size, "white")]
+            )
+        model_input = image[0]
+        assert isinstance(model_input, Image.Image)
+        assert model_input.mode == "RGB"
+        assert model_input.size == (width, height)
+        pixels = np.asarray(model_input, dtype=np.uint8).copy()
+        visible = np.any(pixels < 250, axis=2)
+        rows, columns = np.nonzero(visible)
+        assert rows.size
+        top = int(rows.min())
+        left = int(columns.min())
+        right = int(columns.max()) + 1
+        if top > 0:
+            pixels[top - 1, left:right] = pixels[top, left:right]
+        else:
+            bottom = int(rows.max()) + 1
+            assert bottom < pixels.shape[0]
+            pixels[bottom, left:right] = pixels[bottom - 1, left:right]
+        return SimpleNamespace(images=[Image.fromarray(pixels, mode="RGB")])
+
+
+def _production_completion_backend(
+    config: V3Config,
+    pipeline: _PaddedLocalizedCompletionPipeline,
+) -> QwenImageEdit2511ReferenceCompletionBackend:
+    config.remove.base_model_path.mkdir(parents=True, exist_ok=True)
+    return QwenImageEdit2511ReferenceCompletionBackend(
+        QwenImageEdit2511CompletionConfig(
+            model_path=config.remove.base_model_path,
+            device=config.remove.device,
+            dtype=config.remove.dtype,
+            num_inference_steps=config.remove.num_inference_steps,
+            true_cfg_scale=config.remove.true_cfg_scale,
+            guidance_scale=config.remove.guidance_scale,
+            mode="localized_raw",
+            force_input_size=True,
+        ),
+        pipeline=pipeline,
+        torch_module=SimpleNamespace(Generator=_CompletionGenerator),
+    )
+
+
 class _LocalizedCompletionJudge:
     def __init__(
         self,
@@ -2422,6 +2515,106 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert _sha256(config.resolved_export_root / exported_reference["image_path"]) == (
         state.generation_output_sha256
     )
+
+
+def test_production_qwen_backend_accepts_arbitrary_policy_canvas_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pipeline = _PaddedLocalizedCompletionPipeline()
+    backend = _production_completion_backend(config, pipeline)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=backend,
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    assert stats.completion_attempted == 1
+    assert stats.completion_ready == 1
+    assert stats.completion_rejected == 0
+    size_diagnostics = backend.last_size_diagnostics
+    assert size_diagnostics is not None
+    original_size = size_diagnostics["original_model_input_size"]
+    padded_size = size_diagnostics["padded_model_input_size"]
+    assert isinstance(original_size, list)
+    assert isinstance(padded_size, list)
+    assert any(value % 16 for value in original_size)
+    assert all(value % 16 == 0 for value in padded_size)
+    assert size_diagnostics["model_multiple"] == 16
+    assert size_diagnostics["returned_model_output_size"] == padded_size
+    request = pipeline.calls[0]
+    assert [request["width"], request["height"]] == padded_size
+    model_input = request["image"][0]
+    assert isinstance(model_input, Image.Image)
+    assert list(model_input.size) == padded_size
+
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert state.generation_metadata_path is not None
+    metadata = json.loads(
+        (storage.root / state.generation_metadata_path).read_text(
+            encoding="utf-8"
+        )
+    )
+    completion_metadata = metadata["completion"]
+    for field_name, expected in size_diagnostics.items():
+        assert completion_metadata[field_name] == expected
+    assert completion_metadata["original_model_input_size"] == metadata[
+        "completion_input_size"
+    ]
+
+
+def test_production_qwen_size_failure_records_rejection_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        allow_synthetic_completion=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pipeline = _PaddedLocalizedCompletionPipeline(returned_size=(1, 1))
+    backend = _production_completion_backend(config, pipeline)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_LocalThenGeneratedFullJudge(),
+        completion_backend=backend,
+        completion_judge=_LocalizedCompletionJudge(),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend(),
+    )
+
+    assert stats.completion_attempted == 1
+    assert stats.completion_ready == 0
+    assert stats.completion_rejected == 1
+    rejection = _read_completion_rejection(storage)
+    assert rejection["stage"] == "generation"
+    assert rejection["exception_type"] == "RuntimeError"
+    assert rejection["original_model_input_size"]
+    assert rejection["padded_model_input_size"]
+    assert rejection["model_multiple"] == 16
+    assert rejection["returned_model_output_size"] == [1, 1]
+    assert rejection["padding_right"] >= 0
+    assert rejection["padding_bottom"] >= 0
+    assert "original_size=" in rejection["reason"]
+    assert "padded_size=" in rejection["reason"]
+    assert "returned_size=(1, 1)" in rejection["reason"]
+    assert "model_multiple=16" in rejection["reason"]
+    state = storage.read_clip("clip-1").references.entities[0]
+    assert state.status == "ready"
+    assert state.reference_scope == "local"
+    assert state.synthetic is False
 
 
 def test_generated_fallback_is_disabled_by_default(

@@ -296,6 +296,48 @@ def _require_parameters(
         raise RuntimeError(f"installed API lacks {operation} parameters {missing}")
 
 
+def _pad_rgb_to_model_multiple(
+    image: Image.Image,
+    model_multiple: int,
+) -> tuple[Image.Image, int, int]:
+    if not isinstance(image, Image.Image) or image.mode != "RGB":
+        raise ValueError("Qwen model padding requires an RGB image")
+    if (
+        not isinstance(model_multiple, int)
+        or isinstance(model_multiple, bool)
+        or model_multiple <= 0
+    ):
+        raise ValueError("model_multiple must be a positive integer")
+    padded_width = (
+        (image.width + model_multiple - 1) // model_multiple
+    ) * model_multiple
+    padded_height = (
+        (image.height + model_multiple - 1) // model_multiple
+    ) * model_multiple
+    padding_right = padded_width - image.width
+    padding_bottom = padded_height - image.height
+    if padding_right == 0 and padding_bottom == 0:
+        return image.copy(), 0, 0
+    padded = Image.new("RGB", (padded_width, padded_height), (255, 255, 255))
+    padded.paste(image, (0, 0))
+    return padded, padding_right, padding_bottom
+
+
+def _pipeline_model_multiple(pipeline: Any) -> int:
+    value = getattr(pipeline, "vae_scale_factor", None)
+    if isinstance(value, bool):
+        raise TypeError("pipeline vae_scale_factor must define a positive integer")
+    try:
+        model_multiple = int(value) * 2
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "pipeline vae_scale_factor must define a positive integer"
+        ) from exc
+    if model_multiple <= 0:
+        raise ValueError("model_multiple must be a positive integer")
+    return model_multiple
+
+
 class QwenImageEdit2511ReferenceCompletionBackend:
     """Local Qwen image-edit backend for raw and historical completion modes."""
 
@@ -313,6 +355,13 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         self._pipeline = pipeline
         self._torch = torch_module
         self._load_error: BaseException | None = None
+        self._last_size_diagnostics: dict[str, object] | None = None
+
+    @property
+    def last_size_diagnostics(self) -> dict[str, object] | None:
+        if self._last_size_diagnostics is None:
+            return None
+        return dict(self._last_size_diagnostics)
 
     def _load(self) -> None:
         import torch
@@ -375,6 +424,7 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         prompt: str,
         negative_prompt: str,
     ) -> Image.Image:
+        self._last_size_diagnostics = None
         if not isinstance(input_rgb, Image.Image) or input_rgb.mode != "RGB":
             raise ValueError("Qwen completion input must be an RGB image")
         if not entity_phrase.strip():
@@ -389,9 +439,26 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         if self._pipeline is None or self._torch is None:
             raise RuntimeError("Qwen completion backend is unavailable")
 
+        original_size = input_rgb.size
+        model_input = input_rgb
+        model_multiple: int | None = None
+        if self.config.force_input_size:
+            model_multiple = _pipeline_model_multiple(self._pipeline)
+            model_input, padding_right, padding_bottom = (
+                _pad_rgb_to_model_multiple(input_rgb, model_multiple)
+            )
+            self._last_size_diagnostics = {
+                "original_model_input_size": list(original_size),
+                "padded_model_input_size": list(model_input.size),
+                "model_multiple": model_multiple,
+                "padding_right": padding_right,
+                "padding_bottom": padding_bottom,
+                "returned_model_output_size": None,
+            }
+
         generator = self._torch.Generator(device=self.config.device).manual_seed(seed)
         parameters = {
-            "image": [input_rgb],
+            "image": [model_input],
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "generator": generator,
@@ -402,8 +469,8 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         }
         size_is_forced = self.config.mode != "localized_raw" or self.config.force_input_size
         if size_is_forced:
-            parameters["height"] = input_rgb.height
-            parameters["width"] = input_rgb.width
+            parameters["height"] = model_input.height
+            parameters["width"] = model_input.width
         _require_parameters(
             self._pipeline.__call__,
             tuple(parameters),
@@ -418,6 +485,24 @@ class QwenImageEdit2511ReferenceCompletionBackend:
         ):
             raise TypeError("Qwen completion backend did not return a PIL image")
         output = images[0]
+        if self.config.force_input_size:
+            assert self._last_size_diagnostics is not None
+            self._last_size_diagnostics["returned_model_output_size"] = list(
+                output.size
+            )
+            if output.mode != "RGB":
+                raise TypeError("Qwen completion output must use RGB mode")
+            if output.size != model_input.size:
+                raise RuntimeError(
+                    "Qwen completion output dimensions do not match padded model "
+                    f"input: original_size={original_size}, "
+                    f"padded_size={model_input.size}, returned_size={output.size}, "
+                    f"model_multiple={model_multiple}"
+                )
+            cropped = output.crop((0, 0, original_size[0], original_size[1]))
+            if cropped.size != original_size:
+                raise RuntimeError("Qwen completion crop did not restore original size")
+            return cropped.copy()
         if size_is_forced and output.mode != "RGB":
             raise TypeError("Qwen completion output must use RGB mode")
         if size_is_forced and output.size != input_rgb.size:
