@@ -553,6 +553,13 @@ def instruct_clips(
             or clip.annotation.status != "ready"
             or clip.pairing is None
             or clip.pairing.status != "ready"
+            or (
+                config.reference_edit.enabled
+                and (
+                    clip.reference_edit is None
+                    or clip.reference_edit.status != "ready"
+                )
+            )
         ):
             skipped_not_ready += 1
             continue

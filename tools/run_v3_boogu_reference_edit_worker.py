@@ -1,13 +1,9 @@
-"""Linux CUDA worker for one Boogu reference-edit request.
-
-This entrypoint intentionally imports torch and Boogu only after validating the
-request. The parent process invokes this file with the dedicated Boogu Python;
-no shell or environment activation is used.
-"""
+"""Persistent Linux CUDA JSONL worker for V3 Boogu reference editing."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -19,25 +15,31 @@ from PIL import Image
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request", type=Path, required=True)
+    parser.add_argument("--serve", action="store_true", required=True)
+    parser.add_argument("--code-root", type=Path, required=True)
+    parser.add_argument("--model-path", type=Path, required=True)
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--model-revision", required=True)
+    parser.add_argument("--device", required=True)
+    parser.add_argument("--seed", type=int, required=True)
     return parser
 
 
-def _load_request(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.expanduser().resolve().read_text(encoding="utf-8"))
+def _nonempty(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _validate_edit_request(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TypeError("worker request must be a JSON object")
     required = {
         "schema_version",
-        "code_root",
-        "model_path",
-        "model_name",
-        "model_revision",
-        "device",
-        "seed",
+        "type",
+        "request_id",
         "input_image_path",
         "output_image_path",
-        "result_path",
         "instruction",
         "thinking_enabled",
         "width",
@@ -49,16 +51,14 @@ def _load_request(path: Path) -> dict[str, Any]:
         raise ValueError(
             f"invalid worker request keys: missing={missing}, unknown={unknown}"
         )
-    if payload["schema_version"] != 1:
-        raise ValueError("unsupported worker request schema_version")
-    for name in ("code_root", "model_path", "input_image_path", "output_image_path", "result_path"):
+    if payload["schema_version"] != 1 or payload["type"] != "edit":
+        raise ValueError("unsupported worker request")
+    _nonempty(payload["request_id"], "request_id")
+    for name in ("input_image_path", "output_image_path"):
         value = payload[name]
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise ValueError(f"{name} must be an absolute path")
-    for name in ("model_name", "model_revision", "device", "instruction"):
-        value = payload[name]
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{name} must be a non-empty string")
+    _nonempty(payload["instruction"], "instruction")
     if not isinstance(payload["thinking_enabled"], bool):
         raise TypeError("thinking_enabled must be a boolean")
     for name in ("width", "height"):
@@ -67,9 +67,6 @@ def _load_request(path: Path) -> dict[str, Any]:
             raise ValueError(f"{name} must be a positive integer")
         if value % 16:
             raise ValueError(f"{name} must be aligned to 16 pixels")
-    seed = payload["seed"]
-    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
-        raise ValueError("seed must be a non-negative integer")
     return payload
 
 
@@ -81,9 +78,14 @@ def _first_instruction(value: object) -> str | None:
     return None
 
 
-def _load_rewrite_result(path: Path, original_instruction: str) -> tuple[str | None, str]:
+def _load_rewrite_result(
+    path: Path,
+    original_instruction: str,
+) -> tuple[str | None, str]:
     if not path.is_file():
-        raise RuntimeError("Boogu thinking was enabled but no rewrite metadata was saved")
+        raise RuntimeError(
+            "Boogu thinking was enabled but no rewrite metadata was saved"
+        )
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise TypeError("Boogu rewrite metadata must be a JSON object")
@@ -96,65 +98,81 @@ def _load_rewrite_result(path: Path, original_instruction: str) -> tuple[str | N
     return rewritten, rewritten
 
 
-def run_request(payload: dict[str, Any]) -> dict[str, Any]:
-    code_root = Path(payload["code_root"]).resolve(strict=True)
-    model_path = Path(payload["model_path"]).resolve(strict=True)
-    input_path = Path(payload["input_image_path"]).resolve(strict=True)
-    output_path = Path(payload["output_image_path"]).resolve(strict=False)
-    result_path = Path(payload["result_path"]).resolve(strict=False)
-    device = str(payload["device"])
-    width = int(payload["width"])
-    height = int(payload["height"])
-    instruction = str(payload["instruction"]).strip()
-    thinking_enabled = bool(payload["thinking_enabled"])
-
-    sys.path.insert(0, str(code_root))
+def _load_pipeline(
+    *, code_root: Path, model_path: Path, device: str
+) -> tuple[Any, Any]:
+    resolved_code_root = code_root.expanduser().resolve(strict=True)
+    resolved_model_path = model_path.expanduser().resolve(strict=True)
+    sys.path.insert(0, str(resolved_code_root))
     os.environ["device"] = device
+    with contextlib.redirect_stdout(sys.stderr):
+        import torch
+        from boogu.pipelines.boogu.pipeline_boogu_turbo import (
+            BooguImageTurboPipeline,
+        )
 
-    import torch
-    from boogu.pipelines.boogu.pipeline_boogu_turbo import (
-        BooguImageTurboPipeline,
-    )
+        pipeline = BooguImageTurboPipeline.from_pretrained(
+            str(resolved_model_path),
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        pipeline.to(device)
+    return pipeline, torch
 
-    pipeline = BooguImageTurboPipeline.from_pretrained(
-        str(model_path),
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    pipeline.to(device)
+
+def _run_loaded_request(
+    payload: dict[str, Any],
+    *,
+    pipeline: Any,
+    torch_module: Any,
+    device: str,
+    seed: int,
+    model_name: str,
+    model_revision: str,
+) -> dict[str, Any]:
+    request = _validate_edit_request(payload)
+    input_path = Path(request["input_image_path"]).resolve(strict=True)
+    output_path = Path(request["output_image_path"]).resolve(strict=False)
+    width = int(request["width"])
+    height = int(request["height"])
+    instruction = str(request["instruction"]).strip()
+    thinking_enabled = bool(request["thinking_enabled"])
     with Image.open(input_path) as loaded:
         loaded.load()
         if loaded.mode != "RGB":
             raise ValueError(f"Boogu worker input must be RGB, got {loaded.mode}")
         source_rgb = loaded.copy()
 
-    rewrite_path = output_path.parent / "rewritten_instruction.json"
-    result = pipeline(
-        instruction=[instruction],
-        input_images=[[source_rgb]],
-        input_image_paths=None,
-        negative_instruction="",
-        width=width,
-        height=height,
-        align_res=True,
-        max_input_image_pixels=2048 * 2048,
-        max_input_image_side_length=2048 * 2,
-        num_inference_steps=4,
-        text_guidance_scale=1.0,
-        image_guidance_scale=1.0,
-        empty_instruction_guidance_scale=0.0,
-        use_dmd_student_inference=True,
-        dmd_conditioning_sigma=0.0,
-        generator=torch.Generator(device).manual_seed(int(payload["seed"])),
-        use_rewrite_text_instruction=thinking_enabled,
-        merge_original_and_rewritten_instructions=True,
-        save_rewritten_instruction=thinking_enabled,
-        save_rewritten_instruction_path=(
-            str(rewrite_path) if thinking_enabled else None
-        ),
-        output_type="pil",
+    rewrite_path = output_path.parent / (
+        f"rewritten_instruction_{request['request_id']}.json"
     )
+    with contextlib.redirect_stdout(sys.stderr):
+        result = pipeline(
+            instruction=[instruction],
+            input_images=[[source_rgb]],
+            input_image_paths=None,
+            negative_instruction="",
+            width=width,
+            height=height,
+            align_res=True,
+            max_input_image_pixels=2048 * 2048,
+            max_input_image_side_length=2048 * 2,
+            num_inference_steps=4,
+            text_guidance_scale=1.0,
+            image_guidance_scale=1.0,
+            empty_instruction_guidance_scale=0.0,
+            use_dmd_student_inference=True,
+            dmd_conditioning_sigma=0.0,
+            generator=torch_module.Generator(device).manual_seed(seed),
+            use_rewrite_text_instruction=thinking_enabled,
+            merge_original_and_rewritten_instructions=True,
+            save_rewritten_instruction=thinking_enabled,
+            save_rewritten_instruction_path=(
+                str(rewrite_path) if thinking_enabled else None
+            ),
+            output_type="pil",
+        )
     images = getattr(result, "images", None)
     if not isinstance(images, list) or len(images) != 1:
         raise RuntimeError("Boogu worker expected exactly one generated image")
@@ -175,32 +193,139 @@ def run_request(payload: dict[str, Any]) -> dict[str, Any]:
         rewritten, effective = _load_rewrite_result(rewrite_path, instruction)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     candidate.save(output_path, format="PNG")
-    response = {
+    rewrite_path.unlink(missing_ok=True)
+    return {
         "schema_version": 1,
-        "model_name": payload["model_name"],
-        "model_revision": payload["model_revision"],
+        "type": "response",
+        "request_id": request["request_id"],
+        "status": "ok",
+        "model_name": model_name,
+        "model_revision": model_revision,
         "original_instruction": instruction,
         "rewritten_instruction": rewritten,
         "effective_instruction": effective,
         "thinking_enabled": thinking_enabled,
         "requested_size": [width, height],
         "returned_size": [candidate.width, candidate.height],
-        "seed": payload["seed"],
+        "seed": seed,
         "num_inference_steps": 4,
     }
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-    result_path.write_text(
-        json.dumps(response, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+
+
+def run_request(payload: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility helper for unit tests; the CLI uses the persistent server."""
+
+    required = {
+        "code_root",
+        "model_path",
+        "model_name",
+        "model_revision",
+        "device",
+        "seed",
+        "input_image_path",
+        "output_image_path",
+        "instruction",
+        "thinking_enabled",
+        "width",
+        "height",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(f"legacy worker request missing keys: {missing}")
+    pipeline, torch_module = _load_pipeline(
+        code_root=Path(payload["code_root"]),
+        model_path=Path(payload["model_path"]),
+        device=str(payload["device"]),
     )
+    request = {
+        "schema_version": 1,
+        "type": "edit",
+        "request_id": "legacy_request",
+        "input_image_path": payload["input_image_path"],
+        "output_image_path": payload["output_image_path"],
+        "instruction": payload["instruction"],
+        "thinking_enabled": payload["thinking_enabled"],
+        "width": payload["width"],
+        "height": payload["height"],
+    }
+    response = _run_loaded_request(
+        request,
+        pipeline=pipeline,
+        torch_module=torch_module,
+        device=str(payload["device"]),
+        seed=int(payload["seed"]),
+        model_name=str(payload["model_name"]),
+        model_revision=str(payload["model_revision"]),
+    )
+    response.pop("type")
+    response.pop("request_id")
+    response.pop("status")
+    result_path = payload.get("result_path")
+    if isinstance(result_path, str):
+        Path(result_path).write_text(
+            json.dumps(response, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     return response
+
+
+def _write_response(payload: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+def serve(args: argparse.Namespace) -> int:
+    if args.seed < 0:
+        raise ValueError("seed must be non-negative")
+    pipeline, torch_module = _load_pipeline(
+        code_root=args.code_root,
+        model_path=args.model_path,
+        device=args.device,
+    )
+    _write_response({"schema_version": 1, "type": "ready", "status": "ok"})
+    for line in sys.stdin:
+        request_id: str | None = None
+        try:
+            payload = json.loads(line)
+            if isinstance(payload, dict):
+                raw_request_id = payload.get("request_id")
+                if isinstance(raw_request_id, str):
+                    request_id = raw_request_id
+                if payload.get("type") == "shutdown":
+                    _write_response(
+                        {
+                            "schema_version": 1,
+                            "type": "shutdown",
+                            "request_id": _nonempty(request_id, "request_id"),
+                            "status": "ok",
+                        }
+                    )
+                    return 0
+            response = _run_loaded_request(
+                payload,
+                pipeline=pipeline,
+                torch_module=torch_module,
+                device=args.device,
+                seed=args.seed,
+                model_name=args.model_name,
+                model_revision=args.model_revision,
+            )
+        except Exception as exc:  # noqa: BLE001 - process boundary response
+            response = {
+                "schema_version": 1,
+                "type": "response",
+                "request_id": request_id,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "reason": str(exc),
+            }
+        _write_response(response)
+    return 0
 
 
 def main() -> int:
     args = _parser().parse_args()
-    request = _load_request(args.request)
-    run_request(request)
-    return 0
+    return serve(args)
 
 
 if __name__ == "__main__":

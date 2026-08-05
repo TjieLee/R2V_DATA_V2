@@ -38,9 +38,19 @@ is severe, or segmentation is wrong. The context image shows scene placement;
 the isolated crop shows the
 exact proposed reference content.
 
+Classify image_quality as high, acceptable, or poor. Classify completeness as
+one routing outcome: complete, repairable, local_usable, severely_incomplete,
+or fragmented. complete is a ready full reference. repairable is an
+identity-bearing local reference whose missing structure can plausibly be
+completed by the later reference-edit stage. local_usable is useful only as an
+honest local reference and must not be sent for generative completion.
+severely_incomplete and fragmented must be rejected. Poor image quality must
+also be rejected.
+
 Do not output tokens or crop coordinates. Return one strict JSON object only
-with selected_candidate_id, reference_scope, visible_region,
-whole_entity_recognizable, identity_features_visible, and scope_reason."""
+with selected_candidate_id, image_quality, completeness, reference_scope,
+visible_region, whole_entity_recognizable, identity_features_visible, and
+scope_reason."""
 
 
 @dataclass(frozen=True)
@@ -88,6 +98,7 @@ def build_entity_reference_request_payload(
                 "area_ratio": candidate.area_ratio,
                 "bbox_fill_ratio": candidate.bbox_fill_ratio,
                 "border_contact_count": candidate.border_contact_count,
+                "sharpness_score": candidate.sharpness_score,
             }
             for candidate in candidates
         ],
@@ -107,6 +118,29 @@ def validate_entity_reference_decision(
                 code="unknown_candidate_id",
                 field="selected_candidate_id",
                 message=f"unknown candidate ID: {selected}",
+            )
+        )
+    expected_scope = {
+        "complete": "full",
+        "repairable": "local",
+        "local_usable": "local",
+        "severely_incomplete": "reject",
+        "fragmented": "reject",
+    }[decision.completeness]
+    if decision.reference_scope != expected_scope:
+        issues.append(
+            ValidationIssue(
+                code="completeness_scope_mismatch",
+                field="reference_scope",
+                message="reference scope must match completeness routing",
+            )
+        )
+    if decision.image_quality == "poor" and decision.reference_scope != "reject":
+        issues.append(
+            ValidationIssue(
+                code="poor_quality_not_rejected",
+                field="image_quality",
+                message="poor image quality must reject the reference",
             )
         )
     if decision.reference_scope == "full":

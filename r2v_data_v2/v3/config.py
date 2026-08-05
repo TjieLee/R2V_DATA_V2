@@ -18,6 +18,8 @@ ANNOTATION_MODEL_RELATIVE_PATH = Path("Qwen/Qwen3-VL-32B-Instruct")
 REMOVE_MODEL_RELATIVE_PATH = Path("Qwen/Qwen-Image-Edit-2511")
 REMOVE_ADAPTER_NAME = "Qwen-Image-Edit-2511-Object-Remover"
 REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
+REFERENCE_EDIT_BACKEND = "boogu_image_0_1_edit_turbo"
+REFERENCE_EDIT_MODEL_REVISION = "hotfix-1k-20260708"
 
 _T = TypeVar("_T")
 
@@ -73,6 +75,7 @@ class QwenServicesConfig:
     candidate_judge: QwenServiceConfig | None = None
     background_remove_judge: QwenServiceConfig | None = None
     cross_pair_judge: QwenServiceConfig | None = None
+    reference_edit_judge: QwenServiceConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,7 @@ class ReferenceScopeConfig:
     enabled: bool = True
     allow_local: bool = True
     allow_synthetic_completion: bool = False
+
 
 @dataclass(frozen=True)
 class PairConfig:
@@ -145,6 +149,29 @@ class RemoveConfig:
 
 
 @dataclass(frozen=True)
+class ReferenceEditConfig:
+    enabled: bool = False
+    backend: str = REFERENCE_EDIT_BACKEND
+    python_executable: Path = Path(
+        "/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python"
+    )
+    code_root: Path = Path("/mnt/workspace/litengjie/data/vendor/Boogu-Image")
+    model_path: Path = Path(
+        "/mnt/workspace/litengjie/data/models/"
+        "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
+    )
+    model_revision: str = REFERENCE_EDIT_MODEL_REVISION
+    cuda_visible_devices: str = "0"
+    target_area: int = 1024 * 1024
+    alignment: int = 16
+    timeout_seconds: int = 3600
+    add_background_to_complete: bool = True
+    fallback_policy: str = "keep_source"
+    sam_max_area_growth_ratio: float = 3.0
+    sam_max_significant_components: int = 4
+
+
+@dataclass(frozen=True)
 class InstructionConfig:
     enabled: bool = True
     repair_retries: int = 1
@@ -165,12 +192,11 @@ class V3Config:
     frames: FramesConfig = field(default_factory=FramesConfig)
     sam3: Sam3Config = field(default_factory=Sam3Config)
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
-    reference_scope: ReferenceScopeConfig = field(
-        default_factory=ReferenceScopeConfig
-    )
+    reference_scope: ReferenceScopeConfig = field(default_factory=ReferenceScopeConfig)
     pair: PairConfig = field(default_factory=PairConfig)
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     remove: RemoveConfig = field(default_factory=RemoveConfig)
+    reference_edit: ReferenceEditConfig = field(default_factory=ReferenceEditConfig)
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
@@ -268,28 +294,19 @@ class V3Config:
         if not isinstance(self.sam3.save_debug_overlays, bool):
             raise TypeError("sam3.save_debug_overlays must be a boolean")
         if self.sam3.model_path is not None:
-            sam3_model = self.sam3.model_path.expanduser().resolve(
-                strict=False
-            )
+            sam3_model = self.sam3.model_path.expanduser().resolve(strict=False)
             if not (
                 _is_at_or_below(sam3_model, ALLOWED_PRETRAINED_ROOT)
                 or _is_at_or_below(sam3_model, ALLOWED_USER_MODEL_ROOT)
             ):
-                raise ValueError(
-                    "sam3.model_path must be inside an allowed model root"
-                )
+                raise ValueError("sam3.model_path must be inside an allowed model root")
         if (
             not isinstance(self.coverage.required_visible_frames, int)
             or isinstance(self.coverage.required_visible_frames, bool)
-            or not (
-                1
-                <= self.coverage.required_visible_frames
-                <= self.frames.count
-            )
+            or not (1 <= self.coverage.required_visible_frames <= self.frames.count)
         ):
             raise ValueError(
-                "coverage.required_visible_frames must be between 1 and "
-                "frames.count"
+                "coverage.required_visible_frames must be between 1 and frames.count"
             )
         if (
             not isinstance(self.instruction.repair_retries, int)
@@ -309,13 +326,9 @@ class V3Config:
         ):
             if not isinstance(value, bool):
                 raise TypeError(f"reference_scope.{name} must be a boolean")
-        if (
-            self.reference_scope.allow_synthetic_completion
-            and not self.pair.enabled
-        ):
+        if self.reference_scope.allow_synthetic_completion and not self.pair.enabled:
             raise ValueError(
-                "reference_scope.allow_synthetic_completion requires "
-                "pair.enabled"
+                "reference_scope.allow_synthetic_completion requires pair.enabled"
             )
         if not isinstance(self.pair.enabled, bool):
             raise TypeError("pair.enabled must be a boolean")
@@ -346,9 +359,7 @@ class V3Config:
         ):
             raise ValueError("pair.repair_retries must be a non-negative integer")
         if not isinstance(self.pair.same_parent_fallback_enabled, bool):
-            raise TypeError(
-                "pair.same_parent_fallback_enabled must be a boolean"
-            )
+            raise TypeError("pair.same_parent_fallback_enabled must be a boolean")
         if (
             not isinstance(self.pair.same_parent_max_donor_references, int)
             or isinstance(
@@ -385,8 +396,7 @@ class V3Config:
             raise TypeError("remove.enabled must be a boolean")
         if self.remove.enabled and self.qwen.background_remove_judge is None:
             raise ValueError(
-                "qwen.background_remove_judge is required when "
-                "remove.enabled is true"
+                "qwen.background_remove_judge is required when remove.enabled is true"
             )
         if self.remove.backend != REMOVE_BACKEND:
             raise ValueError(f"unsupported V3 remove backend: {self.remove.backend}")
@@ -408,9 +418,7 @@ class V3Config:
         if not isinstance(self.remove.device, str) or not self.remove.device.strip():
             raise ValueError("remove.device must be a non-empty string")
         if self.remove.dtype not in {"bfloat16", "float16", "float32"}:
-            raise ValueError(
-                "remove.dtype must be bfloat16, float16, or float32"
-            )
+            raise ValueError("remove.dtype must be bfloat16, float16, or float32")
         if (
             not isinstance(self.remove.num_inference_steps, int)
             or isinstance(self.remove.num_inference_steps, bool)
@@ -429,11 +437,7 @@ class V3Config:
             ):
                 raise ValueError(f"remove.{name} must be finite and non-negative")
         dilation = self.remove.generation_mask_dilation_pixels
-        if (
-            not isinstance(dilation, int)
-            or isinstance(dilation, bool)
-            or dilation < 0
-        ):
+        if not isinstance(dilation, int) or isinstance(dilation, bool) or dilation < 0:
             raise ValueError(
                 "remove.generation_mask_dilation_pixels must be a non-negative integer"
             )
@@ -460,8 +464,7 @@ class V3Config:
         remove_model = self.remove.base_model_path.expanduser().resolve(strict=False)
         if not _is_at_or_below(remove_model, ALLOWED_PRETRAINED_ROOT):
             raise ValueError(
-                "remove.base_model_path must be inside "
-                "/mnt/workspace/public/pretrained"
+                "remove.base_model_path must be inside /mnt/workspace/public/pretrained"
             )
         if self.remove.adapter_path is not None:
             adapter = self.remove.adapter_path.expanduser().resolve(strict=False)
@@ -470,6 +473,89 @@ class V3Config:
                     "remove.adapter_path must be inside "
                     "/mnt/workspace/litengjie/data/models"
                 )
+        if not isinstance(self.reference_edit.enabled, bool):
+            raise TypeError("reference_edit.enabled must be a boolean")
+        if self.reference_edit.backend != REFERENCE_EDIT_BACKEND:
+            raise ValueError(
+                f"unsupported V3 reference_edit backend: {self.reference_edit.backend}"
+            )
+        if self.reference_edit.enabled and self.qwen.reference_edit_judge is None:
+            raise ValueError(
+                "qwen.reference_edit_judge is required when "
+                "reference_edit.enabled is true"
+            )
+        if self.reference_edit.enabled:
+            for name, path in (
+                ("python_executable", self.reference_edit.python_executable),
+                ("code_root", self.reference_edit.code_root),
+                ("model_path", self.reference_edit.model_path),
+            ):
+                if not isinstance(path, Path):
+                    raise TypeError(f"reference_edit.{name} must be a pathlib.Path")
+                resolved = path.expanduser().resolve(strict=False)
+                if not _is_at_or_below(resolved, ALLOWED_WRITABLE_ROOT):
+                    raise ValueError(
+                        f"reference_edit.{name} must be inside "
+                        "/mnt/workspace/litengjie/data"
+                    )
+        if self.reference_edit.model_revision != REFERENCE_EDIT_MODEL_REVISION:
+            raise ValueError("reference_edit.model_revision must be hotfix-1k-20260708")
+        if (
+            not isinstance(self.reference_edit.cuda_visible_devices, str)
+            or not self.reference_edit.cuda_visible_devices.strip()
+        ):
+            raise ValueError("reference_edit.cuda_visible_devices must be non-empty")
+        if (
+            not isinstance(self.reference_edit.target_area, int)
+            or isinstance(self.reference_edit.target_area, bool)
+            or self.reference_edit.target_area < 1
+        ):
+            raise ValueError("reference_edit.target_area must be a positive integer")
+        if self.reference_edit.alignment != 16:
+            raise ValueError("reference_edit.alignment must be 16")
+        if (
+            not isinstance(self.reference_edit.timeout_seconds, int)
+            or isinstance(self.reference_edit.timeout_seconds, bool)
+            or self.reference_edit.timeout_seconds < 1
+        ):
+            raise ValueError(
+                "reference_edit.timeout_seconds must be a positive integer"
+            )
+        if not isinstance(self.reference_edit.add_background_to_complete, bool):
+            raise TypeError(
+                "reference_edit.add_background_to_complete must be a boolean"
+            )
+        if self.reference_edit.fallback_policy not in {
+            "keep_source",
+            "reject_entity",
+        }:
+            raise ValueError(
+                "reference_edit.fallback_policy must be keep_source or reject_entity"
+            )
+        if (
+            not isinstance(self.reference_edit.sam_max_area_growth_ratio, float)
+            or not math.isfinite(self.reference_edit.sam_max_area_growth_ratio)
+            or self.reference_edit.sam_max_area_growth_ratio < 1
+        ):
+            raise ValueError(
+                "reference_edit.sam_max_area_growth_ratio must be a finite "
+                "float at least 1"
+            )
+        if (
+            not isinstance(
+                self.reference_edit.sam_max_significant_components,
+                int,
+            )
+            or isinstance(
+                self.reference_edit.sam_max_significant_components,
+                bool,
+            )
+            or self.reference_edit.sam_max_significant_components < 1
+        ):
+            raise ValueError(
+                "reference_edit.sam_max_significant_components must be a "
+                "positive integer"
+            )
 
     def qwen_services(self) -> list[tuple[str, QwenServiceConfig]]:
         services: list[tuple[str, QwenServiceConfig]] = [
@@ -480,6 +566,7 @@ class V3Config:
             "candidate_judge",
             "background_remove_judge",
             "cross_pair_judge",
+            "reference_edit_judge",
         ):
             service = getattr(self.qwen, name)
             if service is not None:
@@ -488,10 +575,7 @@ class V3Config:
 
     def model_identifiers(self) -> dict[str, str | None]:
         return {
-            **{
-                f"qwen.{name}": service.model
-                for name, service in self.qwen_services()
-            },
+            **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
             "remove.backend": self.remove.backend,
             "remove.base_model": str(self.remove.base_model_path),
             "remove.adapter": (
@@ -515,11 +599,12 @@ class V3Config:
             "remove.save_rejected_candidates": str(
                 self.remove.save_rejected_candidates
             ).lower(),
+            "reference_edit.backend": self.reference_edit.backend,
+            "reference_edit.model": str(self.reference_edit.model_path),
+            "reference_edit.model_revision": self.reference_edit.model_revision,
             "sam3.backend": self.sam3.backend,
             "sam3.model": (
-                str(self.sam3.model_path)
-                if self.sam3.model_path is not None
-                else None
+                str(self.sam3.model_path) if self.sam3.model_path is not None else None
             ),
             "sam3.device": self.sam3.device,
         }
@@ -616,6 +701,7 @@ def load_config(path: str | Path) -> V3Config:
         "pair",
         "background",
         "remove",
+        "reference_edit",
         "instruction",
         "debug",
     }
@@ -623,9 +709,7 @@ def load_config(path: str | Path) -> V3Config:
     if unknown:
         raise ValueError(f"unknown V3 configuration keys: {unknown}")
     missing = [
-        name
-        for name in ("dataset_json", "run_root", "export_root")
-        if name not in raw
+        name for name in ("dataset_json", "run_root", "export_root") if name not in raw
     ]
     if missing:
         raise ValueError(f"missing required V3 configuration keys: {missing}")
@@ -639,6 +723,7 @@ def load_config(path: str | Path) -> V3Config:
             "candidate_judge",
             "background_remove_judge",
             "cross_pair_judge",
+            "reference_edit_judge",
         }
     )
     if qwen_unknown:
@@ -665,15 +750,21 @@ def load_config(path: str | Path) -> V3Config:
             qwen_values.get("cross_pair_judge"),
             field_name="qwen.cross_pair_judge",
         ),
+        reference_edit_judge=_parse_optional_service(
+            qwen_values.get("reference_edit_judge"),
+            field_name="qwen.reference_edit_judge",
+        ),
     )
     remove_values = _mapping(raw.get("remove"), "remove")
+    reference_edit_values = _mapping(
+        raw.get("reference_edit"),
+        "reference_edit",
+    )
     sam3_values = _mapping(raw.get("sam3"), "sam3")
     if "model_path" in sam3_values:
         model_path = sam3_values["model_path"]
         sam3_values["model_path"] = (
-            None
-            if model_path in (None, "")
-            else Path(str(model_path)).expanduser()
+            None if model_path in (None, "") else Path(str(model_path)).expanduser()
         )
     if "base_model_path" in remove_values:
         remove_values["base_model_path"] = Path(
@@ -689,6 +780,11 @@ def load_config(path: str | Path) -> V3Config:
         if not isinstance(seeds, list):
             raise TypeError("remove.candidate_seeds must be a list")
         remove_values["candidate_seeds"] = tuple(seeds)
+    for name in ("python_executable", "code_root", "model_path"):
+        if name in reference_edit_values:
+            reference_edit_values[name] = Path(
+                str(reference_edit_values[name])
+            ).expanduser()
 
     config = V3Config(
         dataset_json=Path(str(raw["dataset_json"])).expanduser(),
@@ -731,6 +827,11 @@ def load_config(path: str | Path) -> V3Config:
             "background",
         ),
         remove=_build(RemoveConfig, remove_values, "remove"),
+        reference_edit=_build(
+            ReferenceEditConfig,
+            reference_edit_values,
+            "reference_edit",
+        ),
         instruction=_build(
             InstructionConfig,
             _mapping(raw.get("instruction"), "instruction"),

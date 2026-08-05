@@ -58,6 +58,8 @@ def _candidate(candidate_id: str = "candidate_1") -> EntityReferenceCandidate:
 def _payload(**updates: object) -> dict[str, object]:
     result: dict[str, object] = {
         "selected_candidate_id": "candidate_1",
+        "image_quality": "high",
+        "completeness": "complete",
         "reference_scope": "full",
         "visible_region": "whole",
         "whole_entity_recognizable": True,
@@ -70,9 +72,7 @@ def _payload(**updates: object) -> dict[str, object]:
 
 def _source_images() -> dict[str, Image.Image]:
     pixels = np.arange(5 * 6 * 3, dtype=np.uint8).reshape(5, 6, 3)
-    return {
-        "clips/clip-1/frames/05.jpg": Image.fromarray(pixels, mode="RGB")
-    }
+    return {"clips/clip-1/frames/05.jpg": Image.fromarray(pixels, mode="RGB")}
 
 
 @pytest.mark.parametrize(
@@ -104,6 +104,8 @@ def test_reject_decision_contract_is_valid() -> None:
     decision = RawEntityReferenceDecision.model_validate(
         _payload(
             selected_candidate_id=None,
+            image_quality="acceptable",
+            completeness="fragmented",
             reference_scope="reject",
             visible_region="custom",
             whole_entity_recognizable=False,
@@ -111,10 +113,54 @@ def test_reject_decision_contract_is_valid() -> None:
             scope_reason="Identity is occluded.",
         )
     )
-    assert validate_entity_reference_decision(
-        decision,
-        candidate_ids={"candidate_1"},
-    ) == []
+    assert (
+        validate_entity_reference_decision(
+            decision,
+            candidate_ids={"candidate_1"},
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("completeness", "scope", "selected"),
+    [
+        ("complete", "full", "candidate_1"),
+        ("repairable", "local", "candidate_1"),
+        ("local_usable", "local", "candidate_1"),
+        ("severely_incomplete", "reject", None),
+        ("fragmented", "reject", None),
+    ],
+)
+def test_completeness_routes_to_deterministic_reference_scope(
+    completeness: str,
+    scope: str,
+    selected: str | None,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness=completeness,
+            reference_scope=scope,
+            selected_candidate_id=selected,
+            visible_region=(
+                "whole"
+                if scope == "full"
+                else "central"
+                if scope == "local"
+                else "custom"
+            ),
+            whole_entity_recognizable=scope == "full",
+            identity_features_visible=scope != "reject",
+        )
+    )
+
+    assert decision.completeness == completeness
+    assert decision.reference_scope == scope
+
+
+def test_poor_image_quality_fails_closed() -> None:
+    with pytest.raises(ValidationError, match="poor image quality"):
+        RawEntityReferenceDecision.model_validate(_payload(image_quality="poor"))
 
 
 @pytest.mark.parametrize(
@@ -126,6 +172,7 @@ def test_reject_decision_contract_is_valid() -> None:
         ({"identity_features_visible": False}, "full_requires_identity"),
         (
             {
+                "completeness": "repairable",
                 "reference_scope": "local",
                 "visible_region": "whole",
                 "whole_entity_recognizable": False,
@@ -134,6 +181,7 @@ def test_reject_decision_contract_is_valid() -> None:
         ),
         (
             {
+                "completeness": "repairable",
                 "reference_scope": "local",
                 "visible_region": "central",
                 "whole_entity_recognizable": False,
@@ -158,15 +206,19 @@ def test_request_level_semantic_validation(
 def test_recognizable_local_reference_is_valid() -> None:
     decision = RawEntityReferenceDecision.model_validate(
         _payload(
+            completeness="repairable",
             reference_scope="local",
             visible_region="central",
             whole_entity_recognizable=True,
         )
     )
-    assert validate_entity_reference_decision(
-        decision,
-        candidate_ids={"candidate_1"},
-    ) == []
+    assert (
+        validate_entity_reference_decision(
+            decision,
+            candidate_ids={"candidate_1"},
+        )
+        == []
+    )
 
 
 def test_request_payload_contains_only_required_evidence() -> None:
@@ -187,6 +239,7 @@ def test_request_payload_contains_only_required_evidence() -> None:
                 "area_ratio": 0.3,
                 "bbox_fill_ratio": 1.0,
                 "border_contact_count": 0,
+                "sharpness_score": 0.0,
             }
         ],
     }
@@ -236,9 +289,7 @@ def _judge(
             max_tokens=500,
         ),
         repair_retries=repair_retries,
-        client=SimpleNamespace(
-            chat=SimpleNamespace(completions=completions)
-        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
 
@@ -261,7 +312,9 @@ def test_messages_use_ordered_in_memory_context_and_crop_data_urls() -> None:
         "Candidate candidate_1 context",
         "Candidate candidate_1 isolated crop",
     ]
-    images = [item["image_url"]["url"] for item in content if item["type"] == "image_url"]
+    images = [
+        item["image_url"]["url"] for item in content if item["type"] == "image_url"
+    ]
     assert len(images) == 2
     for data_url in images:
         assert data_url.startswith("data:image/png;base64,")
@@ -329,9 +382,10 @@ def test_bad_request_falls_back_to_json_object_without_network() -> None:
     )
 
     assert result.decision.reference_scope == "full"
-    assert [
-        call["response_format"]["type"] for call in completions.calls
-    ] == ["json_schema", "json_object"]
+    assert [call["response_format"]["type"] for call in completions.calls] == [
+        "json_schema",
+        "json_object",
+    ]
 
 
 @pytest.mark.parametrize(

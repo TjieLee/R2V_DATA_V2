@@ -28,6 +28,7 @@ from r2v_data_v2.v3.schemas import (
     FailureRecord,
     InstructionState,
     PairingState,
+    ReferenceEditState,
     ReferencesState,
     RunRecord,
     SampledFramesArtifact,
@@ -38,12 +39,40 @@ _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _EXPORT_TOKEN = re.compile(r"<ref_(subject|object|group|bg)_(\d+)>")
 _UTC = getattr(datetime_module, "UTC", timezone.utc)  # noqa: UP017 - Python 3.9 CI
 _SECTION_INVALIDATIONS = {
-    "annotation": ("coverage", "references", "pairing", "instruction", "export"),
-    "frames": ("coverage", "references", "pairing", "instruction", "export"),
-    "masks": ("coverage", "references", "pairing", "instruction", "export"),
-    "coverage": ("references", "pairing", "instruction", "export"),
-    "references": ("pairing", "instruction", "export"),
-    "pairing": ("instruction", "export"),
+    "annotation": (
+        "coverage",
+        "references",
+        "pairing",
+        "reference_edit",
+        "instruction",
+        "export",
+    ),
+    "frames": (
+        "coverage",
+        "references",
+        "pairing",
+        "reference_edit",
+        "instruction",
+        "export",
+    ),
+    "masks": (
+        "coverage",
+        "references",
+        "pairing",
+        "reference_edit",
+        "instruction",
+        "export",
+    ),
+    "coverage": (
+        "references",
+        "pairing",
+        "reference_edit",
+        "instruction",
+        "export",
+    ),
+    "references": ("pairing", "reference_edit", "instruction", "export"),
+    "pairing": ("reference_edit", "instruction", "export"),
+    "reference_edit": ("instruction", "export"),
     "instruction": ("export",),
 }
 
@@ -52,13 +81,21 @@ def utc_now() -> str:
     return datetime.now(_UTC).isoformat()
 
 
-def evaluate_export_state(clip: ClipRecord) -> ExportState:
+def evaluate_export_state(
+    clip: ClipRecord,
+    *,
+    require_reference_edit: bool = False,
+) -> ExportState:
     if clip.annotation is None or clip.annotation.status != "ready":
         return ExportState(accepted=False, reason="annotation_not_ready")
     if clip.coverage is None or not clip.coverage.passed:
         return ExportState(accepted=False, reason="coverage_not_passed")
     if clip.pairing is None or clip.pairing.status != "ready":
         return ExportState(accepted=False, reason="pairing_not_ready")
+    if require_reference_edit and (
+        clip.reference_edit is None or clip.reference_edit.status != "ready"
+    ):
+        return ExportState(accepted=False, reason="reference_edit_not_ready")
     if clip.instruction is None or clip.instruction.status != "ready":
         return ExportState(accepted=False, reason="instruction_not_ready")
     retained = set(clip.pairing.retained_entity_ids)
@@ -182,16 +219,16 @@ class RunStorage:
                 )
             return existing
         if self.root.exists() and any(self.root.iterdir()):
-            raise ValueError(
-                "run_root is non-empty but has no matching run.json"
-            )
+            raise ValueError("run_root is non-empty but has no matching run.json")
         self.root.mkdir(parents=True, exist_ok=True)
         write_json_atomic(self.run_path, _model_dict(expected))
         return expected
 
     def _require_initialized(self) -> None:
         if not self.run_path.is_file():
-            raise FileNotFoundError("initialize V3 run storage before writing artifacts")
+            raise FileNotFoundError(
+                "initialize V3 run storage before writing artifacts"
+            )
 
     def _require_clip(self, clip_uid: str) -> None:
         if not self.clip_path(clip_uid).is_file():
@@ -216,12 +253,7 @@ class RunStorage:
         _safe_component(stage, "stage")
         current = self.read_run()
         merged = dict(current.counts)
-        merged.update(
-            {
-                f"{stage}.{name}": value
-                for name, value in counts.items()
-            }
-        )
+        merged.update({f"{stage}.{name}": value for name, value in counts.items()})
         return self.update_run_counts(merged)
 
     def clip_dir(self, clip_uid: str) -> Path:
@@ -239,8 +271,7 @@ class RunStorage:
         dataset_root = v3_config_module.ALLOWED_DATASET_ROOT.resolve(strict=False)
         if dataset_root not in resolved_source_path.parents:
             raise ValueError(
-                "source.video_path must be inside "
-                "/mnt/workspace/public/dataset"
+                "source.video_path must be inside /mnt/workspace/public/dataset"
             )
         normalized_source = source.model_copy(
             update={"video_path": str(resolved_source_path)}
@@ -252,9 +283,7 @@ class RunStorage:
             if existing.clip_uid != clip_uid:
                 raise ValueError(f"clip.json identity mismatch for {clip_uid}")
             if existing.source != normalized_source:
-                raise ValueError(
-                    f"existing clip source does not match for {clip_uid}"
-                )
+                raise ValueError(f"existing clip source does not match for {clip_uid}")
             return existing
         write_json_atomic(path, _model_dict(record))
         return record
@@ -301,6 +330,8 @@ class RunStorage:
                 shutil.rmtree(frames_dir)
         if section in {"annotation", "frames"}:
             self.masks_path(clip_uid).unlink(missing_ok=True)
+        if "reference_edit" in _SECTION_INVALIDATIONS.get(section, ()):
+            self.cleanup_reference_edit_artifacts(clip_uid)
 
     def write_annotation(
         self,
@@ -319,10 +350,9 @@ class RunStorage:
             **_section_updates_after_change("coverage"),
         }
         updated = current.model_copy(update=updates)
-        validated = ClipRecord.model_validate(
-            updated.model_dump(mode="json")
-        )
+        validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
         if validated != current:
+            self._invalidate_artifacts_after_change(clip_uid, "coverage")
             write_json_atomic(
                 self.clip_path(clip_uid),
                 _model_dict(validated),
@@ -349,26 +379,75 @@ class RunStorage:
         validated_references = ReferencesState.model_validate(
             references.model_dump(mode="json")
         )
-        validated_pairing = PairingState.model_validate(
-            pairing.model_dump(mode="json")
-        )
+        validated_pairing = PairingState.model_validate(pairing.model_dump(mode="json"))
+        if (
+            current.references == validated_references
+            and current.pairing == validated_pairing
+        ):
+            return current
         updated = current.model_copy(
             update={
                 "references": validated_references,
                 "pairing": validated_pairing,
+                "reference_edit": None,
                 "instruction": None,
                 "export": ExportState(),
             }
         )
-        validated = ClipRecord.model_validate(
-            updated.model_dump(mode="json")
-        )
+        validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
         if validated != current:
+            self.cleanup_reference_edit_artifacts(clip_uid)
             write_json_atomic(
                 self.clip_path(clip_uid),
                 _model_dict(validated),
             )
         return validated
+
+    def write_reference_edit_result(
+        self,
+        clip_uid: str,
+        references: ReferencesState,
+        pairing: PairingState,
+        reference_edit: ReferenceEditState,
+    ) -> ClipRecord:
+        current = self.read_clip(clip_uid)
+        validated_references = ReferencesState.model_validate(
+            references.model_dump(mode="json")
+        )
+        validated_pairing = PairingState.model_validate(pairing.model_dump(mode="json"))
+        validated_reference_edit = ReferenceEditState.model_validate(
+            reference_edit.model_dump(mode="json")
+        )
+        if (
+            current.references == validated_references
+            and current.pairing == validated_pairing
+            and current.reference_edit == validated_reference_edit
+        ):
+            return current
+        updated = current.model_copy(
+            update={
+                "references": validated_references,
+                "pairing": validated_pairing,
+                "reference_edit": validated_reference_edit,
+                "instruction": None,
+                "export": ExportState(),
+            }
+        )
+        validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
+        if validated != current:
+            write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
+        return validated
+
+    def write_reference_edit_failure(
+        self,
+        clip_uid: str,
+        reason: str,
+    ) -> ClipRecord:
+        return self._replace_section(
+            clip_uid,
+            "reference_edit",
+            ReferenceEditState(status="failed", reason=reason),
+        )
 
     def write_instruction(
         self,
@@ -396,11 +475,10 @@ class RunStorage:
             if existing == value:
                 return destination
         current = self.read_clip(clip_uid)
-        invalidated = current.model_copy(
-            update=_section_updates_after_change("masks")
-        )
+        invalidated = current.model_copy(update=_section_updates_after_change("masks"))
         validated = ClipRecord.model_validate(invalidated.model_dump(mode="json"))
         if validated != current:
+            self._invalidate_artifacts_after_change(clip_uid, "masks")
             write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
         write_json_atomic(destination, _model_dict(value))
         return destination
@@ -429,12 +507,8 @@ class RunStorage:
     def prepare_frames_publication(self, clip_uid: str) -> None:
         self._require_clip(clip_uid)
         current = self.read_clip(clip_uid)
-        invalidated = current.model_copy(
-            update=_section_updates_after_change("frames")
-        )
-        validated = ClipRecord.model_validate(
-            invalidated.model_dump(mode="json")
-        )
+        invalidated = current.model_copy(update=_section_updates_after_change("frames"))
+        validated = ClipRecord.model_validate(invalidated.model_dump(mode="json"))
         self._invalidate_artifacts_after_change(clip_uid, "frames")
         self.frames_manifest_path(clip_uid).unlink(missing_ok=True)
         if validated != current:
@@ -446,12 +520,9 @@ class RunStorage:
     def prepare_masks_publication(self, clip_uid: str) -> None:
         self._require_clip(clip_uid)
         current = self.read_clip(clip_uid)
-        invalidated = current.model_copy(
-            update=_section_updates_after_change("masks")
-        )
-        validated = ClipRecord.model_validate(
-            invalidated.model_dump(mode="json")
-        )
+        invalidated = current.model_copy(update=_section_updates_after_change("masks"))
+        validated = ClipRecord.model_validate(invalidated.model_dump(mode="json"))
+        self._invalidate_artifacts_after_change(clip_uid, "masks")
         self.masks_path(clip_uid).unlink(missing_ok=True)
         if validated != current:
             write_json_atomic(
@@ -485,9 +556,7 @@ class RunStorage:
         entity_id: str,
     ) -> Path:
         directory = self.selected_entity_path(clip_uid, entity_id).parent
-        return directory / (
-            f".tmp-pair-{entity_id}-{uuid.uuid4().hex}.png"
-        )
+        return directory / (f".tmp-pair-{entity_id}-{uuid.uuid4().hex}.png")
 
     def pair_output_backup_path(
         self,
@@ -495,17 +564,13 @@ class RunStorage:
         entity_id: str,
     ) -> Path:
         directory = self.selected_entity_path(clip_uid, entity_id).parent
-        return directory / (
-            f".backup-pair-{entity_id}-{uuid.uuid4().hex}.png"
-        )
+        return directory / (f".backup-pair-{entity_id}-{uuid.uuid4().hex}.png")
 
     def pair_debug_dir(self, clip_uid: str, entity_id: str) -> Path:
         if not self.config.debug.save_diagnostics:
             raise RuntimeError("pair debug artifact saving is disabled")
         self.selected_entity_path(clip_uid, entity_id)
-        destination = (
-            self.clip_dir(clip_uid) / "debug" / "pair" / entity_id
-        )
+        destination = self.clip_dir(clip_uid) / "debug" / "pair" / entity_id
         destination.mkdir(parents=True, exist_ok=True)
         return destination
 
@@ -526,8 +591,7 @@ class RunStorage:
         if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
             raise ValueError("background source mask sha256 must be lowercase hex")
         return (
-            self.prepare_background_publication(clip_uid)
-            / f"source_mask_{sha256}.png"
+            self.prepare_background_publication(clip_uid) / f"source_mask_{sha256}.png"
         )
 
     def background_generation_mask_path(
@@ -580,9 +644,7 @@ class RunStorage:
             resolved_keep.parent != background.resolve(strict=False)
             or not resolved_keep.name.startswith("generation_mask_")
         ):
-            raise ValueError(
-                "kept generation mask must be inside background_dir"
-            )
+            raise ValueError("kept generation mask must be inside background_dir")
         if background.is_dir():
             for path in background.glob("generation_mask_*.png"):
                 if path.resolve(strict=False) != resolved_keep:
@@ -609,6 +671,27 @@ class RunStorage:
             for path in selected.glob(pattern):
                 path.unlink(missing_ok=True)
 
+    def reference_edit_dir(self, clip_uid: str) -> Path:
+        self._require_clip(clip_uid)
+        return self.clip_dir(clip_uid) / "reference_edit"
+
+    def reference_edit_worker_log_path(self) -> Path:
+        self._require_initialized()
+        destination = self.root / "logs" / "reference_edit_worker.stderr.log"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def reference_edit_temporary_dir(self) -> Path:
+        self._require_initialized()
+        destination = self.root / ".tmp" / "reference_edit"
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def cleanup_reference_edit_artifacts(self, clip_uid: str) -> None:
+        directory = self.clip_dir(clip_uid) / "reference_edit"
+        if directory.exists():
+            shutil.rmtree(directory)
+
     def cleanup_background_artifacts(
         self,
         clip_uid: str,
@@ -620,9 +703,7 @@ class RunStorage:
             return
         resolved_keep = None if keep is None else keep.resolve(strict=False)
         if resolved_keep is not None and resolved_keep.parent != directory.resolve():
-            raise ValueError(
-                "kept background artifact must be inside background_dir"
-            )
+            raise ValueError("kept background artifact must be inside background_dir")
         for path in directory.glob("source_mask_*.png"):
             if path.resolve(strict=False) != resolved_keep:
                 path.unlink(missing_ok=True)
@@ -643,8 +724,7 @@ class RunStorage:
     def segment_debug_dir(self, clip_uid: str) -> Path:
         self._require_clip(clip_uid)
         if not (
-            self.config.debug.save_diagnostics
-            or self.config.sam3.save_debug_overlays
+            self.config.debug.save_diagnostics or self.config.sam3.save_debug_overlays
         ):
             raise RuntimeError("segment debug artifact saving is disabled")
         destination = self.clip_dir(clip_uid) / "debug" / "segment"
@@ -695,14 +775,15 @@ class DatasetExporter:
         created_at: str | None = None,
     ) -> DatasetRecord:
         if self.destination.exists() and not overwrite:
-            raise FileExistsError(
-                f"dataset_root already exists: {self.destination}"
-            )
+            raise FileExistsError(f"dataset_root already exists: {self.destination}")
         run = self.storage.read_run()
         evaluated_clips = [
             self.storage.write_export(
                 clip.clip_uid,
-                evaluate_export_state(clip),
+                evaluate_export_state(
+                    clip,
+                    require_reference_edit=self.config.reference_edit.enabled,
+                ),
             )
             for clip in self.storage.iter_clips()
         ]
@@ -773,22 +854,22 @@ class DatasetExporter:
             for reference in clip.references.entities
             if reference.status == "ready"
         }
-        destination_dir = temporary / "references" / _safe_component(
-            clip.clip_uid,
-            "sample_id",
+        destination_dir = (
+            temporary
+            / "references"
+            / _safe_component(
+                clip.clip_uid,
+                "sample_id",
+            )
         )
         dataset_references: list[DatasetReference] = []
         for entity_id in clip.pairing.retained_entity_ids:
             reference = references_by_id.get(entity_id)
             if reference is None:
-                raise ValueError(
-                    f"retained entity has no ready reference: {entity_id}"
-                )
+                raise ValueError(f"retained entity has no ready reference: {entity_id}")
             token = clip.pairing.tokens[entity_id]
             relative_path = (
-                Path("references")
-                / clip.clip_uid
-                / self._filename_for_token(token)
+                Path("references") / clip.clip_uid / self._filename_for_token(token)
             )
             self._copy_png(
                 self._resolve_run_artifact(reference.image_path),
@@ -815,9 +896,7 @@ class DatasetExporter:
                 "clean_raw",
                 "ready_removed",
             }:
-                raise ValueError(
-                    f"paired background is not ready: {clip.clip_uid}"
-                )
+                raise ValueError(f"paired background is not ready: {clip.clip_uid}")
             dataset_references.append(
                 self._export_background(
                     clip_uid=clip.clip_uid,
@@ -848,9 +927,7 @@ class DatasetExporter:
         background: BackgroundReferenceState,
         temporary: Path,
     ) -> DatasetReference:
-        relative_path = (
-            Path("references") / clip_uid / self._filename_for_token(token)
-        )
+        relative_path = Path("references") / clip_uid / self._filename_for_token(token)
         self._copy_png(
             self._resolve_background_artifact(
                 clip_uid,
@@ -956,16 +1033,16 @@ class DatasetExporter:
             try:
                 resolved.relative_to(root.resolve())
             except ValueError as exc:
-                raise ValueError("exported reference path escapes dataset root") from exc
+                raise ValueError(
+                    "exported reference path escapes dataset root"
+                ) from exc
 
     def _publish(self, temporary: Path, *, overwrite: bool) -> None:
         if not self.destination.exists():
             temporary.replace(self.destination)
             return
         if not overwrite:
-            raise FileExistsError(
-                f"dataset_root already exists: {self.destination}"
-            )
+            raise FileExistsError(f"dataset_root already exists: {self.destination}")
         backup = self.destination.with_name(
             f".{self.destination.name}.backup-{uuid.uuid4().hex}"
         )

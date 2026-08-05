@@ -19,6 +19,12 @@ from r2v_data_v2.v3.reference_completion_qwen import (
     QwenLocalizedCompletionJudge,
     QwenReferenceCompletionBackend,
 )
+from r2v_data_v2.v3.reference_edit import reference_edit_clips
+from r2v_data_v2.v3.reference_edit_boogu import (
+    BooguReferenceEditBackend,
+    BooguReferenceEditJudge,
+    BooguSamReviewer,
+)
 from r2v_data_v2.v3.reference_judge import EntityReferenceJudge
 from r2v_data_v2.v3.removal_judge import BackgroundRemovalJudge
 from r2v_data_v2.v3.remove import remove_backgrounds
@@ -35,6 +41,7 @@ STAGE_ORDER = (
     "background",
     "remove",
     "pair",
+    "reference_edit",
     "instruct",
     "export",
 )
@@ -47,6 +54,7 @@ _IMPLEMENTED_STAGES = frozenset(
         "rank",
         "background",
         "pair",
+        "reference_edit",
         "instruct",
         "remove",
         "export",
@@ -85,6 +93,9 @@ def run_pipeline_v3(
     cross_pair_judge: CrossPairJudge | None = None,
     reference_completion_backend: QwenReferenceCompletionBackend | None = None,
     reference_completion_judge: QwenLocalizedCompletionJudge | None = None,
+    reference_edit_backend: BooguReferenceEditBackend | None = None,
+    reference_edit_judge: BooguReferenceEditJudge | None = None,
+    reference_edit_sam_reviewer: BooguSamReviewer | None = None,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -93,13 +104,12 @@ def run_pipeline_v3(
     if unavailable:
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
-            "frames, segment, rank, background, remove, pair, instruct, and export only; "
+            "frames, segment, rank, background, remove, pair, reference_edit, "
+            "instruct, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)
-    ordered_stages = tuple(
-        stage for stage in STAGE_ORDER if stage in requested
-    )
+    ordered_stages = tuple(stage for stage in STAGE_ORDER if stage in requested)
     config = load_config(config_path)
     storage = RunStorage(config)
     run = storage.initialize(git_commit=git_commit or _git_commit())
@@ -165,6 +175,15 @@ def run_pipeline_v3(
                 completion_judge=reference_completion_judge,
                 completion_segmentation_backend=segmentation_backend,
             ).to_dict()
+        elif stage == "reference_edit":
+            results[stage] = reference_edit_clips(
+                config,
+                storage,
+                overwrite=overwrite,
+                backend=reference_edit_backend,
+                judge=reference_edit_judge,
+                sam_reviewer=reference_edit_sam_reviewer,
+            ).to_dict()
         elif stage == "instruct":
             results[stage] = instruct_clips(
                 config,
@@ -173,9 +192,7 @@ def run_pipeline_v3(
                 client=instruction_client,
             ).to_dict()
         else:
-            dataset = DatasetExporter(config, storage).export(
-                overwrite=overwrite
-            )
+            dataset = DatasetExporter(config, storage).export(overwrite=overwrite)
             results[stage] = dataset.model_dump(mode="json")
     results["completed_stages"] = list(ordered_stages)
     return results
@@ -191,7 +208,8 @@ def main() -> None:
         default="",
         help=(
             "comma-separated V3 stages; manifest, annotate, frames, segment, "
-            "rank, background, remove, pair, instruct, and export are currently implemented"
+            "rank, background, remove, pair, reference_edit, instruct, and "
+            "export are currently implemented"
         ),
     )
     parser.add_argument(

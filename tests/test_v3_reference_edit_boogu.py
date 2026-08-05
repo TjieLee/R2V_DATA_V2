@@ -8,10 +8,12 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from PIL import Image
 
 import r2v_data_v2.v3.reference_edit_boogu as boogu_module
+from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguBackgroundReview,
     BooguCompletionReview,
@@ -19,8 +21,14 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguSamReview,
     BooguSubprocessBackend,
     BooguWorkerConfig,
+    QwenBooguReferenceEditJudge,
+    Sam3BooguReferenceReviewer,
     resolve_boogu_1k_size,
     run_boogu_reference_edit,
+)
+from r2v_data_v2.v3.sam3_backend import (
+    BackendMaskObservation,
+    EntityTrackResult,
 )
 
 
@@ -387,65 +395,155 @@ def test_subprocess_backend_invokes_configured_python_directly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    python = tmp_path / "venvs" / "boogu" / "bin" / "python"
+    python = Path(sys.executable).resolve()
     code_root = tmp_path / "vendor" / "Boogu-Image"
     model = tmp_path / "models" / "boogu"
     worker = tmp_path / "repo" / "worker.py"
-    for path in (python, worker):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
     code_root.mkdir(parents=True)
     model.mkdir(parents=True)
-    calls: list[dict[str, object]] = []
+    worker.parent.mkdir(parents=True)
+    events_path = tmp_path / "events.jsonl"
+    worker.write_text(
+        """import json
+import os
+import sys
+from pathlib import Path
+from PIL import Image
 
-    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
-        calls.append({"command": command, **kwargs})
-        request_path = Path(command[-1])
-        request = json.loads(request_path.read_text(encoding="utf-8"))
-        Path(request["output_image_path"]).write_bytes(
-            _png_bytes((request["width"], request["height"]))
-        )
-        Path(request["result_path"]).write_text(
-            json.dumps(
-                {
-                    "original_instruction": request["instruction"],
-                    "rewritten_instruction": None,
-                    "effective_instruction": request["instruction"],
-                    "returned_size": [request["width"], request["height"]],
-                }
-            ),
-            encoding="utf-8",
-        )
-        assert request["thinking_enabled"] is False
-        assert request["width"] == 1360
-        assert request["height"] == 768
-        return SimpleNamespace(returncode=0)
+events = Path(os.environ["FAKE_BOOGU_EVENTS"])
+def emit(value):
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value) + "\\n")
 
-    monkeypatch.setattr(boogu_module.subprocess, "run", fake_run)
+emit({"type": "startup", "argv": sys.argv, "cuda": os.environ.get("CUDA_VISIBLE_DEVICES")})
+print(json.dumps({"schema_version": 1, "type": "ready", "status": "ok"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    emit(request)
+    if request["type"] == "shutdown":
+        print(json.dumps({"schema_version": 1, "type": "shutdown", "request_id": request["request_id"], "status": "ok"}), flush=True)
+        break
+    Image.new("RGB", (request["width"], request["height"]), (1, 2, 3)).save(request["output_image_path"], format="PNG")
+    print(json.dumps({
+        "schema_version": 1,
+        "type": "response",
+        "request_id": request["request_id"],
+        "status": "ok",
+        "original_instruction": request["instruction"],
+        "rewritten_instruction": None,
+        "effective_instruction": request["instruction"],
+        "returned_size": [request["width"], request["height"]],
+    }), flush=True)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FAKE_BOOGU_EVENTS", str(events_path))
     backend = BooguSubprocessBackend(
         BooguWorkerConfig(
-            python_executable=python.resolve(),
+            python_executable=python,
             code_root=code_root.resolve(),
             model_path=model.resolve(),
-            allowed_server_root=tmp_path.resolve(),
+            cuda_visible_devices="3",
+            allowed_server_root=Path("/"),
+            temporary_root=(tmp_path / "temporary").resolve(),
             worker_script=worker.resolve(),
         )
     )
 
-    output = backend.edit(
+    backend.start(stderr_log_path=tmp_path / "worker.stderr.log")
+    first = backend.edit(
         source_rgb=Image.new("RGB", (160, 90)),
         instruction="Add a background.",
         width=1360,
         height=768,
         thinking_enabled=False,
     )
+    second = backend.edit(
+        source_rgb=Image.new("RGB", (160, 90)),
+        instruction="Complete the entity.",
+        width=1360,
+        height=768,
+        thinking_enabled=True,
+    )
+    backend.close()
 
-    assert output.effective_instruction == "Add a background."
-    assert calls[0]["command"][:2] == [str(python.resolve()), str(worker.resolve())]
-    assert calls[0]["cwd"] == code_root.resolve()
-    assert calls[0]["check"] is True
-    assert "shell" not in calls[0]
-    assert all("conda" not in part for part in calls[0]["command"])
+    assert first.effective_instruction == "Add a background."
+    assert second.effective_instruction == "Complete the entity."
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert [event["type"] for event in events] == [
+        "startup",
+        "edit",
+        "edit",
+        "shutdown",
+    ]
+    assert events[0]["argv"][:2] == [str(worker.resolve()), "--serve"]
+    assert events[0]["cuda"] == "3"
+    assert events[1]["request_id"] != events[2]["request_id"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "match"),
+    [
+        ("invalid_json", "invalid JSON"),
+        ("exit", "exited without a response"),
+        ("timeout", "timed out"),
+    ],
+)
+def test_jsonl_worker_protocol_failures_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    match: str,
+) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        """import json
+import os
+import sys
+import time
+
+print(json.dumps({"schema_version": 1, "type": "ready", "status": "ok"}), flush=True)
+for line in sys.stdin:
+    json.loads(line)
+    mode = os.environ["FAKE_PROTOCOL_MODE"]
+    if mode == "invalid_json":
+        print("not-json", flush=True)
+        time.sleep(10)
+    elif mode == "exit":
+        raise SystemExit(3)
+    else:
+        time.sleep(10)
+""",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    model_path = tmp_path / "model"
+    code_root.mkdir()
+    model_path.mkdir()
+    monkeypatch.setenv("FAKE_PROTOCOL_MODE", mode)
+    backend = BooguSubprocessBackend(
+        BooguWorkerConfig(
+            python_executable=Path(sys.executable).resolve(),
+            code_root=code_root.resolve(),
+            model_path=model_path.resolve(),
+            worker_script=worker.resolve(),
+            allowed_server_root=Path("/"),
+            temporary_root=(tmp_path / "temporary").resolve(),
+            timeout_seconds=1,
+        )
+    )
+    backend.start(stderr_log_path=tmp_path / "stderr.log")
+
+    with pytest.raises((RuntimeError, TimeoutError), match=match):
+        backend.edit(
+            source_rgb=Image.new("RGB", (8, 8)),
+            instruction="Edit the entity.",
+            width=32,
+            height=32,
+            thinking_enabled=False,
+        )
+
+    assert backend.started is False
 
 
 def test_worker_module_import_does_not_import_torch_or_boogu(
@@ -553,3 +651,208 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
     with Image.open(output_path) as output:
         assert output.size == (1360, 768)
         assert output.mode == "RGB"
+
+
+def test_jsonl_worker_loads_pipeline_once_for_multiple_entities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_module = importlib.import_module("tools.run_v3_boogu_reference_edit_worker")
+    input_path = tmp_path / "input.png"
+    Image.new("RGB", (19, 23), (1, 2, 3)).save(input_path)
+    load_calls = 0
+    inference_calls: list[dict[str, object]] = []
+
+    class FakeGenerator:
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def manual_seed(self, seed: int) -> FakeGenerator:
+            self.seed = seed
+            return self
+
+    class FakePipeline:
+        def __call__(self, **kwargs: object) -> SimpleNamespace:
+            inference_calls.append(kwargs)
+            return SimpleNamespace(
+                images=[
+                    Image.new(
+                        "RGB",
+                        (int(kwargs["width"]), int(kwargs["height"])),
+                    )
+                ]
+            )
+
+    def fake_load_pipeline(**kwargs: object) -> tuple[FakePipeline, object]:
+        nonlocal load_calls
+        del kwargs
+        load_calls += 1
+        return FakePipeline(), SimpleNamespace(Generator=FakeGenerator)
+
+    requests = [
+        {
+            "schema_version": 1,
+            "type": "edit",
+            "request_id": request_id,
+            "input_image_path": str(input_path.resolve()),
+            "output_image_path": str((tmp_path / f"{request_id}.png").resolve()),
+            "instruction": f"Edit {request_id}.",
+            "thinking_enabled": False,
+            "width": 32,
+            "height": 32,
+        }
+        for request_id in ("entity_1", "entity_2")
+    ]
+    requests.append(
+        {
+            "schema_version": 1,
+            "type": "shutdown",
+            "request_id": "shutdown_1",
+        }
+    )
+    stdin = io.StringIO("".join(json.dumps(item) + "\n" for item in requests))
+    stdout = io.StringIO()
+    monkeypatch.setattr(worker_module, "_load_pipeline", fake_load_pipeline)
+    monkeypatch.setattr(worker_module.sys, "stdin", stdin)
+    monkeypatch.setattr(worker_module.sys, "stdout", stdout)
+    args = SimpleNamespace(
+        code_root=tmp_path,
+        model_path=tmp_path,
+        model_name="Boogu-Image-0.1-Edit-Turbo",
+        model_revision="hotfix-1k-20260708",
+        device="cuda:0",
+        seed=0,
+    )
+
+    assert worker_module.serve(args) == 0
+
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert load_calls == 1
+    assert len(inference_calls) == 2
+    assert [item["request_id"] for item in responses[1:3]] == [
+        "entity_1",
+        "entity_2",
+    ]
+    assert responses[-1]["type"] == "shutdown"
+
+
+class _ReviewCompletions:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(self.payload))
+                )
+            ]
+        )
+
+
+def test_production_qwen_boogu_reviewer_uses_structured_two_image_review() -> None:
+    payload = _completion_review().model_dump(mode="json")
+    completions = _ReviewCompletions(payload)
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=completions),
+        close=lambda: None,
+    )
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=client,
+    )
+
+    review = judge.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (12, 10), (1, 2, 3, 255)),
+        source_input_rgb=Image.new("RGB", (12, 10), (1, 2, 3)),
+        candidate_rgb=Image.new("RGB", (32, 32), (4, 5, 6)),
+        entity_phrase="a person in a blue coat",
+        reference_type="subject",
+    )
+
+    assert review.verdict == "accept"
+    call = completions.calls[0]
+    assert call["response_format"]["type"] == "json_schema"
+    user_content = call["messages"][1]["content"]
+    assert sum(item["type"] == "image_url" for item in user_content) == 2
+    assert not any("mask" in str(item).lower() for item in user_content)
+
+
+class _SamTrackBackend:
+    def __init__(self, mask: np.ndarray) -> None:
+        self.mask = mask
+        self.calls: list[dict[str, object]] = []
+
+    def track(self, **kwargs: object) -> EntityTrackResult:
+        self.calls.append(kwargs)
+        return EntityTrackResult(
+            status="ready",
+            observations=(
+                BackendMaskObservation(
+                    slot=5,
+                    mask=self.mask,
+                    confidence=0.9,
+                    object_id="target",
+                ),
+            ),
+        )
+
+
+def test_production_sam3_boogu_reviewer_is_review_only_and_tracks_ten_frames(
+    tmp_path: Path,
+) -> None:
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[2:6, 2:6] = True
+    backend = _SamTrackBackend(mask)
+    reviewer = Sam3BooguReferenceReviewer(
+        backend,
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+    source = Image.new("RGBA", (10, 10), (1, 2, 3, 0))
+    source_alpha = np.zeros((10, 10), dtype=np.uint8)
+    source_alpha[2:6, 2:6] = 255
+    source.putalpha(Image.fromarray(source_alpha, mode="L"))
+
+    review = reviewer.review(
+        operation="complete_entity",
+        source_rgba=source,
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the blue object",
+        reference_type="object",
+    )
+
+    assert review.passed is True
+    assert review.diagnostics["mask_usage"] == "review_only"
+    assert len(backend.calls[0]["frame_paths"]) == 10
+    assert backend.calls[0]["grounding_prompt"] == "the blue object"
+
+
+def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
+    tmp_path: Path,
+) -> None:
+    mask = np.ones((10, 10), dtype=bool)
+    backend = _SamTrackBackend(mask)
+    reviewer = Sam3BooguReferenceReviewer(
+        backend,
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+    source = Image.new("RGBA", (10, 10), (1, 2, 3, 0))
+    source.putpixel((5, 5), (1, 2, 3, 255))
+
+    review = reviewer.review(
+        operation="add_entity_background",
+        source_rgba=source,
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.area_growth_acceptable is False

@@ -135,9 +135,7 @@ class AnnotationState(SchemaModel):
         ):
             raise ValueError("failed annotation must not publish semantic content")
         entity_ids = [entity.entity_id for entity in self.entities]
-        expected_entity_ids = [
-            f"e{index}" for index in range(1, len(entity_ids) + 1)
-        ]
+        expected_entity_ids = [f"e{index}" for index in range(1, len(entity_ids) + 1)]
         if entity_ids != expected_entity_ids:
             raise ValueError(
                 "annotation entity_id values must be contiguous and ordered"
@@ -160,9 +158,7 @@ class SampledFrame(SchemaModel):
             raise ValueError("frame timestamp_seconds must be finite")
         expected_path = f"frames/{self.slot:02d}.jpg"
         if self.image_path != expected_path:
-            raise ValueError(
-                f"frame image_path must match its slot: {expected_path}"
-            )
+            raise ValueError(f"frame image_path must match its slot: {expected_path}")
         return self
 
 
@@ -181,9 +177,7 @@ class SampledFramesArtifact(SchemaModel):
         slots = [frame.slot for frame in self.frames]
         if slots != list(range(self.sampled_frame_count)):
             raise ValueError("frame slots must be ordered from 0 through 9")
-        source_indices = [
-            frame.source_frame_index for frame in self.frames
-        ]
+        source_indices = [frame.source_frame_index for frame in self.frames]
         if any(
             source_indices[index] >= source_indices[index + 1]
             for index in range(len(source_indices) - 1)
@@ -196,9 +190,7 @@ class SampledFramesArtifact(SchemaModel):
             timestamps[index] >= timestamps[index + 1]
             for index in range(len(timestamps) - 1)
         ):
-            raise ValueError(
-                "frame timestamps must be unique and strictly increasing"
-            )
+            raise ValueError("frame timestamps must be unique and strictly increasing")
         return self
 
 
@@ -213,72 +205,45 @@ class EntityVisibilitySummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_visibility(self) -> EntityVisibilitySummary:
-        if (
-            len(self.per_frame_area_ratio) != 10
-            or len(self.per_frame_confidence) != 10
-        ):
+        if len(self.per_frame_area_ratio) != 10 or len(self.per_frame_confidence) != 10:
             raise ValueError(
                 "entity visibility diagnostics must contain ten frame slots"
             )
-        if self.visible_frame_slots != sorted(
-            set(self.visible_frame_slots)
-        ) or any(
+        if self.visible_frame_slots != sorted(set(self.visible_frame_slots)) or any(
             not 0 <= slot < 10 for slot in self.visible_frame_slots
         ):
             raise ValueError(
                 "visible frame slots must be unique, ordered, and in range"
             )
         if self.visible_frame_count != len(self.visible_frame_slots):
-            raise ValueError(
-                "visible_frame_count must match visible_frame_slots"
-            )
+            raise ValueError("visible_frame_count must match visible_frame_slots")
         if not math.isclose(
             self.coverage_ratio,
             self.visible_frame_count / 10,
             rel_tol=0,
             abs_tol=1e-12,
         ):
-            raise ValueError(
-                "coverage_ratio must match visible_frame_count"
-            )
+            raise ValueError("coverage_ratio must match visible_frame_count")
         diagnostics = [
             *self.per_frame_area_ratio,
-            *(
-                value
-                for value in self.per_frame_confidence
-                if value is not None
-            ),
+            *(value for value in self.per_frame_confidence if value is not None),
         ]
         if any(not math.isfinite(value) for value in diagnostics):
             raise ValueError("entity visibility diagnostics must be finite")
         visible_slots = set(self.visible_frame_slots)
-        if any(
-            self.per_frame_confidence[slot] is None
-            for slot in visible_slots
-        ):
-            raise ValueError(
-                "visible frame slots require confidence diagnostics"
-            )
-        if any(
-            self.per_frame_area_ratio[slot] <= 0
-            for slot in visible_slots
-        ):
-            raise ValueError(
-                "visible frame slots require positive area diagnostics"
-            )
+        if any(self.per_frame_confidence[slot] is None for slot in visible_slots):
+            raise ValueError("visible frame slots require confidence diagnostics")
+        if any(self.per_frame_area_ratio[slot] <= 0 for slot in visible_slots):
+            raise ValueError("visible frame slots require positive area diagnostics")
         hidden_slots = set(range(10)) - visible_slots
         if any(
             self.per_frame_confidence[slot] is not None
             or self.per_frame_area_ratio[slot] != 0
             for slot in hidden_slots
         ):
-            raise ValueError(
-                "non-visible frame slots must have empty diagnostics"
-            )
+            raise ValueError("non-visible frame slots must have empty diagnostics")
         if self.status != "ready" and self.visible_frame_count:
-            raise ValueError(
-                "non-ready tracked entities cannot have visible frames"
-            )
+            raise ValueError("non-ready tracked entities cannot have visible frames")
         return self
 
 
@@ -299,16 +264,13 @@ class CoverageState(SchemaModel):
         if len(self.qualifying_entity_ids) != len(set(self.qualifying_entity_ids)):
             raise ValueError("qualifying_entity_ids must be unique")
         if self.qualifying_entity_ids and not self.entity_visibility_summary:
-            raise ValueError(
-                "qualifying entities require visible-frame summaries"
-            )
+            raise ValueError("qualifying entities require visible-frame summaries")
         if self.entity_visibility_summary:
             expected_qualifying: list[str] = []
             for entity_id, summary in self.entity_visibility_summary.items():
                 expected = (
                     summary.status == "ready"
-                    and summary.visible_frame_count
-                    >= self.required_visible_frames
+                    and summary.visible_frame_count >= self.required_visible_frames
                 )
                 if summary.qualifies != expected:
                     raise ValueError(
@@ -324,6 +286,14 @@ class CoverageState(SchemaModel):
 
 
 ReferenceScope = Literal["full", "local", "reject"]
+ReferenceImageQuality = Literal["high", "acceptable", "poor"]
+ReferenceCompleteness = Literal[
+    "complete",
+    "repairable",
+    "local_usable",
+    "severely_incomplete",
+    "fragmented",
+]
 VisibleRegion = Literal[
     "whole",
     "head_shoulders",
@@ -339,6 +309,8 @@ VisibleRegion = Literal[
 
 class RawEntityReferenceDecision(SchemaModel):
     selected_candidate_id: Optional[str]
+    image_quality: ReferenceImageQuality
+    completeness: ReferenceCompleteness
     reference_scope: ReferenceScope
     visible_region: VisibleRegion
     whole_entity_recognizable: StrictBool
@@ -353,17 +325,24 @@ class RawEntityReferenceDecision(SchemaModel):
             self.selected_candidate_id is not None
             and _CANDIDATE_ID.fullmatch(self.selected_candidate_id) is None
         ):
-            raise ValueError(
-                "selected_candidate_id must use candidate_N"
-            )
+            raise ValueError("selected_candidate_id must use candidate_N")
         if self.reference_scope == "reject":
             if self.selected_candidate_id is not None:
-                raise ValueError(
-                    "reject decision must not select a candidate"
-                )
+                raise ValueError("reject decision must not select a candidate")
         elif self.selected_candidate_id is None:
+            raise ValueError("full or local decision requires selected_candidate_id")
+        if self.image_quality == "poor" and self.reference_scope != "reject":
+            raise ValueError("poor image quality must reject the reference")
+        expected_scope: ReferenceScope
+        if self.completeness == "complete":
+            expected_scope = "full"
+        elif self.completeness in {"repairable", "local_usable"}:
+            expected_scope = "local"
+        else:
+            expected_scope = "reject"
+        if self.reference_scope != expected_scope:
             raise ValueError(
-                "full or local decision requires selected_candidate_id"
+                "reference_scope must match the completeness routing decision"
             )
         return self
 
@@ -408,6 +387,8 @@ class EntityReferenceState(SchemaModel):
     source_frame_index: Optional[int] = Field(default=None, ge=0)
     source_clip_uid: Optional[str] = None
     source_entity_id: Optional[str] = None
+    image_quality: Optional[ReferenceImageQuality] = None
+    completeness: Optional[ReferenceCompleteness] = None
     synthetic: bool = False
     generation_metadata_path: Optional[str] = None
     generation_source_sha256: Optional[str] = Field(
@@ -430,6 +411,10 @@ class EntityReferenceState(SchemaModel):
                 "entity reference source_clip_uid and source_entity_id "
                 "must be set together"
             )
+        if (self.image_quality is None) != (self.completeness is None):
+            raise ValueError(
+                "entity reference quality and completeness must be set together"
+            )
         if self.status == "ready":
             if self.reference_scope == "full":
                 if (
@@ -442,10 +427,7 @@ class EntityReferenceState(SchemaModel):
                         "recognizable identity"
                     )
             elif self.reference_scope == "local":
-                if (
-                    self.visible_region == "whole"
-                    or not self.identity_features_visible
-                ):
+                if self.visible_region == "whole" or not self.identity_features_visible:
                     raise ValueError(
                         "ready local reference requires a non-whole "
                         "identity-visible region"
@@ -467,9 +449,7 @@ class EntityReferenceState(SchemaModel):
             )
             if self.synthetic:
                 if self.reference_scope != "full":
-                    raise ValueError(
-                        "generated fallback reference must use full scope"
-                    )
+                    raise ValueError("generated fallback reference must use full scope")
                 if self.source_entity_id != self.entity_id:
                     raise ValueError(
                         "generated fallback must preserve self entity provenance"
@@ -657,16 +637,12 @@ class BackgroundReferenceState(SchemaModel):
                     "clean_raw output_image_path must equal source_image_path"
                 )
             if diagnostics != (0, 0.0):
-                raise ValueError(
-                    "clean_raw background requires zero foreground area"
-                )
+                raise ValueError("clean_raw background requires zero foreground area")
             if (
                 self.source_mask_path is not None
                 or self.generation_mask_path is not None
             ):
-                raise ValueError(
-                    "clean_raw background cannot reference mask artifacts"
-                )
+                raise ValueError("clean_raw background cannot reference mask artifacts")
         if self.status == "pending_remove":
             if self.source_mask_path is None:
                 raise ValueError("pending_remove background requires source_mask_path")
@@ -709,9 +685,7 @@ class BackgroundReferenceState(SchemaModel):
             if not self.reason:
                 raise ValueError("rejected background requires a reason")
             if self.output_image_path is not None:
-                raise ValueError(
-                    "rejected background cannot publish output_image_path"
-                )
+                raise ValueError("rejected background cannot publish output_image_path")
             if self.generation_mask_path is not None:
                 raise ValueError(
                     "rejected background cannot publish generation_mask_path"
@@ -745,9 +719,8 @@ class BackgroundReferenceState(SchemaModel):
             raise ValueError(
                 "background generation-mask diagnostics must be set together"
             )
-        if (
-            self.generation_mask_area_ratio is not None
-            and not math.isfinite(self.generation_mask_area_ratio)
+        if self.generation_mask_area_ratio is not None and not math.isfinite(
+            self.generation_mask_area_ratio
         ):
             raise ValueError("background generation-mask ratio must be finite")
         if self.removal_backend is not None and not self.removal_backend.strip():
@@ -806,9 +779,7 @@ class BackgroundReferenceState(SchemaModel):
                 raise ValueError("rejected background cannot publish removal_seed")
             if self.removal_attempts:
                 if self.removal_backend is None:
-                    raise ValueError(
-                        "remove-stage rejection requires removal_backend"
-                    )
+                    raise ValueError("remove-stage rejection requires removal_backend")
                 if (
                     self.source_image_path is None
                     or self.source_frame_slot is None
@@ -823,8 +794,7 @@ class BackgroundReferenceState(SchemaModel):
                         "remove-stage rejection requires source provenance"
                     )
                 if any(
-                    attempt.status == "accepted"
-                    for attempt in self.removal_attempts
+                    attempt.status == "accepted" for attempt in self.removal_attempts
                 ):
                     raise ValueError(
                         "rejected background cannot contain an accepted attempt"
@@ -834,7 +804,6 @@ class BackgroundReferenceState(SchemaModel):
                     "background-stage rejection cannot publish removal_backend"
                 )
         return self
-
 
 
 class ReferencesState(SchemaModel):
@@ -866,9 +835,7 @@ class PairingState(SchemaModel):
                 or self.tokens
                 or self.background_token is not None
             ):
-                raise ValueError(
-                    "rejected pairing must clear retained IDs and tokens"
-                )
+                raise ValueError("rejected pairing must clear retained IDs and tokens")
             return self
         if self.reason is not None:
             raise ValueError("ready pairing reason must be null")
@@ -886,9 +853,104 @@ class PairingState(SchemaModel):
         if any(token.startswith("<ref_bg_") for token in entity_tokens):
             raise ValueError("entity tokens cannot use background reference tokens")
         if self.background_token not in {None, "<ref_bg_1>"}:
+            raise ValueError('background_token must be null or "<ref_bg_1>"')
+        return self
+
+
+ReferenceEditOperation = Literal[
+    "complete_entity",
+    "add_entity_background",
+]
+ReferenceEditFallbackPolicy = Literal[
+    "not_used",
+    "keep_source",
+    "reject_entity",
+]
+
+
+class ReferenceEditEntityState(SchemaModel):
+    entity_id: str
+    route: ReferenceCompleteness
+    status: Literal["accepted", "fallback", "rejected", "not_required"]
+    source_reference: EntityReferenceState
+    source_image_path: str
+    output_image_path: Optional[str] = None
+    operation: Optional[ReferenceEditOperation] = None
+    metadata_path: Optional[str] = None
+    fallback_policy: ReferenceEditFallbackPolicy = "not_used"
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> ReferenceEditEntityState:
+        if not self.source_image_path.strip():
+            raise ValueError("reference edit source_image_path must not be empty")
+        if (
+            self.source_reference.entity_id != self.entity_id
+            or self.source_reference.status != "ready"
+            or self.source_reference.image_path != self.source_image_path
+            or self.source_reference.synthetic
+        ):
             raise ValueError(
-                'background_token must be null or "<ref_bg_1>"'
+                "reference edit source evidence must be a ready real reference"
             )
+        if self.status == "accepted":
+            if (
+                self.operation is None
+                or self.output_image_path is None
+                or not self.output_image_path.strip()
+                or self.metadata_path is None
+                or not self.metadata_path.strip()
+            ):
+                raise ValueError(
+                    "accepted reference edit requires operation, output, and metadata"
+                )
+            if self.fallback_policy != "not_used" or self.reason is not None:
+                raise ValueError("accepted reference edit cannot use fallback")
+        elif self.status == "fallback":
+            if self.fallback_policy != "keep_source":
+                raise ValueError("reference edit fallback must keep source")
+            if self.output_image_path != self.source_image_path:
+                raise ValueError("keep-source fallback must publish the source image")
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("reference edit fallback requires a reason")
+        elif self.status == "not_required":
+            if (
+                self.operation is not None
+                or self.metadata_path is not None
+                or self.fallback_policy != "not_used"
+            ):
+                raise ValueError("not-required reference edit cannot run generation")
+            if self.output_image_path != self.source_image_path:
+                raise ValueError("not-required reference edit must preserve its source")
+            if self.reason is not None:
+                raise ValueError("not-required reference edit cannot have a reason")
+        else:
+            if self.output_image_path is not None:
+                raise ValueError("rejected reference edit cannot publish an output")
+            if self.fallback_policy != "reject_entity":
+                raise ValueError("rejected reference edit must reject the entity")
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("rejected reference edit requires a reason")
+        return self
+
+
+class ReferenceEditState(SchemaModel):
+    status: Literal["ready", "failed"]
+    entities: list[ReferenceEditEntityState] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> ReferenceEditState:
+        entity_ids = [item.entity_id for item in self.entities]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("reference edit entity IDs must be unique")
+        if self.status == "failed":
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("failed reference edit requires a reason")
+            if self.entities:
+                raise ValueError("failed reference edit must clear entity results")
+        elif self.reason is not None:
+            raise ValueError("ready reference edit cannot have a failure reason")
         return self
 
 
@@ -1037,25 +1099,18 @@ class InstructionState(SchemaModel):
         )
         if _ANY_REF_TOKEN.search(raw_text):
             raise ValueError("ready instruction must not contain reference tokens")
-        if (
-            _DIRECT_CHINESE_IMAGE_LABEL.search(raw_text)
-            or _DIRECT_ENGLISH_IMAGE_LABEL.search(raw_text)
-        ):
+        if _DIRECT_CHINESE_IMAGE_LABEL.search(
+            raw_text
+        ) or _DIRECT_ENGLISH_IMAGE_LABEL.search(raw_text):
             raise ValueError(
                 "raw instruction fields must use image_N placeholders instead "
                 "of rendered image labels"
             )
         legend_ids = [entry.image_id for entry in self.reference_legend]
-        expected_ids = [
-            f"image_{index}" for index in range(1, len(legend_ids) + 1)
-        ]
+        expected_ids = [f"image_{index}" for index in range(1, len(legend_ids) + 1)]
         if legend_ids != expected_ids:
-            raise ValueError(
-                "reference legend IDs must be contiguous and ordered"
-            )
-        exact_placeholders = _IMAGE_PLACEHOLDER.findall(
-            self.instruction_body_template
-        )
+            raise ValueError("reference legend IDs must be contiguous and ordered")
+        exact_placeholders = _IMAGE_PLACEHOLDER.findall(self.instruction_body_template)
         all_placeholders = _ANY_TEMPLATE_PLACEHOLDER.findall(
             self.instruction_body_template
         )
@@ -1114,6 +1169,7 @@ class ClipRecord(SchemaModel):
     coverage: Optional[CoverageState] = None
     references: ReferencesState = Field(default_factory=ReferencesState)
     pairing: Optional[PairingState] = None
+    reference_edit: Optional[ReferenceEditState] = None
     instruction: Optional[InstructionState] = None
     export: ExportState = Field(default_factory=ExportState)
 
@@ -1122,12 +1178,8 @@ class ClipRecord(SchemaModel):
         annotation_entities = (
             self.annotation.entities if self.annotation is not None else []
         )
-        annotation_order = [
-            entity.entity_id for entity in annotation_entities
-        ]
-        annotation_by_id = {
-            entity.entity_id: entity for entity in annotation_entities
-        }
+        annotation_order = [entity.entity_id for entity in annotation_entities]
+        annotation_by_id = {entity.entity_id: entity for entity in annotation_entities}
         annotation_ids = set(annotation_order)
         if self.coverage is not None:
             unknown_qualifying = (
@@ -1146,23 +1198,14 @@ class ClipRecord(SchemaModel):
         ]
         reference_ids = set(reference_order)
         if reference_ids - annotation_ids:
-            raise ValueError(
-                "entity references must correspond to annotation entities"
-            )
+            raise ValueError("entity references must correspond to annotation entities")
         expected_reference_order = [
-            entity_id
-            for entity_id in annotation_order
-            if entity_id in reference_ids
+            entity_id for entity_id in annotation_order if entity_id in reference_ids
         ]
         if reference_order != expected_reference_order:
-            raise ValueError(
-                "entity references must follow annotation entity order"
-            )
+            raise ValueError("entity references must follow annotation entity order")
         for reference in self.references.entities:
-            if (
-                reference.synthetic
-                and reference.source_clip_uid != self.clip_uid
-            ):
+            if reference.synthetic and reference.source_clip_uid != self.clip_uid:
                 raise ValueError(
                     "generated fallback must preserve self clip provenance"
                 )
@@ -1170,9 +1213,7 @@ class ClipRecord(SchemaModel):
             retained = self.pairing.retained_entity_ids
             retained_ids = set(retained)
             expected_retained_order = [
-                entity_id
-                for entity_id in annotation_order
-                if entity_id in retained_ids
+                entity_id for entity_id in annotation_order if entity_id in retained_ids
             ]
             if retained != expected_retained_order:
                 raise ValueError(
@@ -1217,9 +1258,59 @@ class ClipRecord(SchemaModel):
                     raise ValueError(
                         "ready pairing background token requires a ready background"
                     )
+        if self.reference_edit is not None and self.reference_edit.status == "ready":
+            edit_order = [item.entity_id for item in self.reference_edit.entities]
+            expected_edit_order = [
+                entity_id for entity_id in annotation_order if entity_id in edit_order
+            ]
+            if edit_order != expected_edit_order:
+                raise ValueError(
+                    "reference edit entities must follow annotation entity order"
+                )
+            if set(edit_order) - annotation_ids:
+                raise ValueError(
+                    "reference edit entities must correspond to annotation entities"
+                )
+            references_by_id = {
+                reference.entity_id: reference for reference in self.references.entities
+            }
+            edits_by_id = {
+                item.entity_id: item for item in self.reference_edit.entities
+            }
+            if self.pairing is not None and self.pairing.status == "ready":
+                missing_edits = set(self.pairing.retained_entity_ids) - set(edits_by_id)
+                if missing_edits:
+                    raise ValueError(
+                        "ready pairing references require reference edit results"
+                    )
+            for entity_id, item in edits_by_id.items():
+                reference = references_by_id.get(entity_id)
+                if item.status == "rejected":
+                    if reference is not None and reference.status != "rejected":
+                        raise ValueError(
+                            "rejected reference edit must reject its entity reference"
+                        )
+                    continue
+                if reference is None or reference.status != "ready":
+                    raise ValueError(
+                        "published reference edit requires a ready entity reference"
+                    )
+                if item.output_image_path != reference.image_path:
+                    raise ValueError(
+                        "reference edit output must match the published reference path"
+                    )
+                if item.status == "accepted" and not reference.synthetic:
+                    raise ValueError(
+                        "accepted reference edit must publish a synthetic reference"
+                    )
         if self.instruction is not None and self.instruction.status == "ready":
             if self.pairing is None or self.pairing.status != "ready":
                 raise ValueError("ready instruction requires ready pairing")
+            if (
+                self.reference_edit is not None
+                and self.reference_edit.status != "ready"
+            ):
+                raise ValueError("ready instruction requires ready reference edit")
             binding_count = len(self.pairing.retained_entity_ids)
             if self.pairing.background_token is not None:
                 binding_count += 1
@@ -1227,8 +1318,7 @@ class ClipRecord(SchemaModel):
                 f"image_{index}" for index in range(1, binding_count + 1)
             ]
             legend_image_ids = [
-                entry.image_id
-                for entry in self.instruction.reference_legend
+                entry.image_id for entry in self.instruction.reference_legend
             ]
             if legend_image_ids != expected_image_ids:
                 raise ValueError(
@@ -1243,6 +1333,11 @@ class ClipRecord(SchemaModel):
                 raise ValueError("accepted export requires ready pairing")
             if self.instruction is None or self.instruction.status != "ready":
                 raise ValueError("accepted export requires ready instruction")
+            if (
+                self.reference_edit is not None
+                and self.reference_edit.status != "ready"
+            ):
+                raise ValueError("accepted export requires ready reference edit")
         return self
 
 
@@ -1257,9 +1352,7 @@ class MaskRle(SchemaModel):
             raise ValueError("mask RLE dimensions must be positive")
         if not self.counts:
             raise ValueError("mask RLE counts must not be empty")
-        if self.counts[0] < 0 or any(
-            count < 1 for count in self.counts[1:]
-        ):
+        if self.counts[0] < 0 or any(count < 1 for count in self.counts[1:]):
             raise ValueError("mask RLE counts must contain valid run lengths")
         if sum(self.counts) != height * width:
             raise ValueError("mask RLE counts do not match its dimensions")
@@ -1290,9 +1383,7 @@ class TrackedMaskFrame(SchemaModel):
             raise ValueError(
                 "backend object IDs and confidences must have equal lengths"
             )
-        if len(self.backend_object_ids) != len(
-            set(self.backend_object_ids)
-        ):
+        if len(self.backend_object_ids) != len(set(self.backend_object_ids)):
             raise ValueError("backend object IDs must be unique per frame")
         encoded_area = sum(self.rle.counts[1::2])
         if self.area_pixels != encoded_area:
@@ -1348,23 +1439,17 @@ class TrackedEntityMasks(SchemaModel):
     def validate_entity(self) -> TrackedEntityMasks:
         if not self.grounding_prompt.strip():
             raise ValueError("tracked entity grounding_prompt must not be empty")
-        if len(self.backend_object_ids) != len(
-            set(self.backend_object_ids)
-        ):
+        if len(self.backend_object_ids) != len(set(self.backend_object_ids)):
             raise ValueError("tracked entity backend object IDs must be unique")
-        if len(self.frames) != 10 or [
-            frame.slot for frame in self.frames
-        ] != list(range(10)):
-            raise ValueError(
-                "tracked entity must contain ten ordered frame slots"
-            )
+        if len(self.frames) != 10 or [frame.slot for frame in self.frames] != list(
+            range(10)
+        ):
+            raise ValueError("tracked entity must contain ten ordered frame slots")
         present_frames = [frame for frame in self.frames if frame.present]
         if self.status == "ready" and not present_frames:
             raise ValueError("ready tracked entity requires a present mask")
         if self.status != "ready" and present_frames:
-            raise ValueError(
-                "not-found or failed tracked entity cannot publish masks"
-            )
+            raise ValueError("not-found or failed tracked entity cannot publish masks")
         if self.status == "failed" and not self.reason:
             raise ValueError("failed tracked entity requires a reason")
         published_ids = {
@@ -1393,13 +1478,8 @@ class TrackedMasksArtifact(SchemaModel):
         for entity_id, entity in self.entities.items():
             if not entity_id.strip():
                 raise ValueError("tracked mask entity IDs must not be empty")
-            if any(
-                frame.rle.size != expected_size
-                for frame in entity.frames
-            ):
-                raise ValueError(
-                    "tracked masks must match artifact dimensions"
-                )
+            if any(frame.rle.size != expected_size for frame in entity.frames):
+                raise ValueError("tracked masks must match artifact dimensions")
         return self
 
 
@@ -1424,6 +1504,8 @@ class FailureRecord(SchemaModel):
 
 DatasetReferenceType = Literal["entity", "background"]
 DatasetReferenceScope = Literal["full", "local", "scene"]
+
+
 class DatasetReference(SchemaModel):
     token: str
     type: DatasetReferenceType
@@ -1449,7 +1531,9 @@ class DatasetReference(SchemaModel):
         if value.startswith("/") or not value.startswith("references/"):
             raise ValueError("dataset reference image_path must be relative")
         if ".." in value.split("/"):
-            raise ValueError("dataset reference image_path must not escape dataset root")
+            raise ValueError(
+                "dataset reference image_path must not escape dataset root"
+            )
         return value
 
     @model_validator(mode="after")
@@ -1472,7 +1556,9 @@ class DatasetReference(SchemaModel):
                     "background reference cannot publish entity provenance"
                 )
             if self.entity_id is not None or self.scope != "scene":
-                raise ValueError("background reference must use scene scope and no entity_id")
+                raise ValueError(
+                    "background reference must use scene scope and no entity_id"
+                )
             if not self.token.startswith("<ref_bg_"):
                 raise ValueError("background reference must use a background token")
         return self
@@ -1496,9 +1582,7 @@ class DatasetSample(SchemaModel):
     def validate_bindings(self) -> DatasetSample:
         if _ANY_REF_TOKEN.search(self.t2v_caption):
             raise ValueError("t2v_caption must not contain reference tokens")
-        if " ".join(self.r2v_instruction.split()) == " ".join(
-            self.t2v_caption.split()
-        ):
+        if " ".join(self.r2v_instruction.split()) == " ".join(self.t2v_caption.split()):
             raise ValueError("r2v_instruction must differ from t2v_caption")
         if not self.references:
             raise ValueError("dataset sample requires at least one reference")
@@ -1512,21 +1596,15 @@ class DatasetSample(SchemaModel):
                 "r2v_instruction must not expose internal reference tokens"
             )
         if _ANY_TEMPLATE_PLACEHOLDER.search(self.r2v_instruction):
-            raise ValueError(
-                "r2v_instruction must not expose raw image placeholders"
-            )
-        expected_indexes = {
-            str(index) for index in range(1, len(self.references) + 1)
-        }
+            raise ValueError("r2v_instruction must not expose raw image placeholders")
+        expected_indexes = {str(index) for index in range(1, len(self.references) + 1)}
         angle_english_indexes = set(
             _ANGLE_ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
         )
         plain_english_indexes = set(
             _PLAIN_ENGLISH_IMAGE_INDEX.findall(self.r2v_instruction)
         )
-        legacy_indexes = set(
-            _CHINESE_IMAGE_INDEX.findall(self.r2v_instruction)
-        )
+        legacy_indexes = set(_CHINESE_IMAGE_INDEX.findall(self.r2v_instruction))
         if not (
             (
                 angle_english_indexes == expected_indexes

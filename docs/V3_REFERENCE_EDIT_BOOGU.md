@@ -1,8 +1,10 @@
 # V3 Boogu Reference Edit
 
-This path is isolated from the existing V3 Qwen completion and pairing stages.
-It treats Boogu output as a newly generated reference image, not as a repair
-layer for the canonical reference.
+This is the production V3 post-pair `reference_edit` stage. It treats Boogu
+output as a newly generated reference image, not as a repair layer for the
+canonical reference. Legacy Qwen completion source and artifacts remain
+readable, but production pairing does not invoke that fallback when this stage
+is enabled.
 
 ## Fixed server layout
 
@@ -58,19 +60,44 @@ canonical reference and never publishes a composited rescue image. The caller
 may keep the canonical reference, try another source candidate, or reject the
 entity.
 
-## Server invocation boundary
+## Persistent worker boundary
 
-The parent backend writes one JSON request and invokes:
+The stage starts one worker process before its first eligible entity:
 
 ```bash
 /mnt/workspace/litengjie/data/venvs/boogu-image/bin/python \
   tools/run_v3_boogu_reference_edit_worker.py \
-  --request /absolute/path/to/request.json
+  --serve \
+  --code-root /mnt/workspace/litengjie/data/vendor/Boogu-Image \
+  --model-path /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708 \
+  --model-name Boogu-Image-0.1-Edit-Turbo \
+  --model-revision hotfix-1k-20260708 \
+  --device cuda:0 \
+  --seed 0
 ```
 
+The worker loads the pipeline once, emits a JSONL readiness record, then reads
+one request per stdin line and writes one response per stdout line. Every edit
+and shutdown message carries a `request_id`. All eligible entities in the stage
+reuse this process. The parent sends shutdown after the stage, writes worker
+stderr to a separate run log, and fails closed on timeout, process exit,
+request-ID mismatch, or invalid JSON. When there are no eligible entities, no
+worker is started. `CUDA_VISIBLE_DEVICES` comes from `reference_edit` config.
+
 The worker is the only repository file that imports torch or Boogu, and those
-imports occur inside request execution. macOS development and unit tests use
+imports occur once during worker startup. macOS development and unit tests use
 fake backends and do not load Boogu, CUDA, weights, or real data.
+
+## Production routing
+
+The candidate judge records `image_quality` and one completeness route:
+`complete`, `repairable`, `local_usable`, `severely_incomplete`, or
+`fragmented`. `repairable` enters entity completion, `complete` may receive a
+background, `local_usable` keeps the source-faithful local reference, and the
+two severe outcomes are rejected. Qwen and SAM3 review generated candidates;
+SAM3 masks are review-only. An accepted candidate becomes the entity's
+`final_reference_1k.png`. Rejections follow the configured `keep_source` or
+`reject_entity` policy.
 
 ## Validation
 

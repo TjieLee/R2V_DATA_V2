@@ -52,9 +52,7 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 _SLOT_PRIORITY = (5, 4, 6, 3, 7, 2, 8, 1, 9, 0)
-_SLOT_PRIORITY_INDEX = {
-    slot: index for index, slot in enumerate(_SLOT_PRIORITY)
-}
+_SLOT_PRIORITY_INDEX = {slot: index for index, slot in enumerate(_SLOT_PRIORITY)}
 _ENTITY_PNG = re.compile(r"e[1-9]\d*\.png")
 _CROSS_PAIR_CONTACT_SHEET_COLUMNS = 5
 _CROSS_PAIR_CONTACT_SHEET_PANEL_MAX_SIDE = 384
@@ -75,6 +73,7 @@ class EntityReferenceCandidate:
     bbox_fill_ratio: float
     border_contact_count: int
     normalized_center_distance: float
+    sharpness_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -136,9 +135,7 @@ def build_candidate_context_image(
 ) -> Image.Image:
     source, binary = _validate_source_and_mask(source_image, mask)
     context = source.copy()
-    context[~binary] = (context[~binary].astype(np.uint16) * 35 // 100).astype(
-        np.uint8
-    )
+    context[~binary] = (context[~binary].astype(np.uint16) * 35 // 100).astype(np.uint8)
     bbox = _bbox_from_mask(binary)
     result = Image.fromarray(context, mode="RGB")
     draw = ImageDraw.Draw(result)
@@ -199,11 +196,7 @@ def build_cross_pair_target_contact_sheet(
         origin_x = column * panel_max_side
         origin_y = row * panel_height
         image_x = origin_x + (panel_max_side - thumbnail.width) // 2
-        image_y = (
-            origin_y
-            + label_height
-            + (panel_max_side - thumbnail.height) // 2
-        )
+        image_y = origin_y + label_height + (panel_max_side - thumbnail.height) // 2
         sheet.paste(thumbnail, (image_x, image_y))
         draw.text(
             (origin_x + 8, origin_y + 6),
@@ -224,9 +217,7 @@ def build_reference_crop(
         or not math.isfinite(crop_padding_ratio)
         or not 0 <= crop_padding_ratio <= 0.5
     ):
-        raise ValueError(
-            "crop_padding_ratio must be a finite float between 0 and 0.5"
-        )
+        raise ValueError("crop_padding_ratio must be a finite float between 0 and 0.5")
     source, binary = _validate_source_and_mask(source_image, mask)
     x1, y1, x2, y2 = _bbox_from_mask(binary)
     padding = math.ceil(max(x2 - x1, y2 - y1) * crop_padding_ratio)
@@ -293,6 +284,7 @@ def _candidate_from_frame(
     with Image.open(image_path) as opened:
         if opened.size != (frames.width, frames.height):
             raise ValueError("sampled frame image dimensions are invalid")
+        source = np.asarray(opened.convert("RGB"), dtype=np.float32)
     area = int(np.count_nonzero(binary))
     x1, y1, x2, y2 = bbox
     bbox_area = (x2 - x1) * (y2 - y1)
@@ -310,6 +302,7 @@ def _candidate_from_frame(
             bool(np.any(binary[:, -1])),
         )
     )
+    sharpness_score = _masked_sharpness_score(source, binary)
     return EntityReferenceCandidate(
         candidate_id="candidate_0",
         entity_id=entity.entity_id,
@@ -323,7 +316,31 @@ def _candidate_from_frame(
         bbox_fill_ratio=area / bbox_area,
         border_contact_count=border_contact,
         normalized_center_distance=center_distance,
+        sharpness_score=sharpness_score,
     )
+
+
+def _masked_sharpness_score(source: np.ndarray, mask: np.ndarray) -> float:
+    if source.ndim != 3 or source.shape[2] != 3:
+        raise ValueError("sharpness source must be an H-W-RGB array")
+    binary = np.asarray(mask, dtype=bool)
+    if binary.shape != source.shape[:2] or not binary.any():
+        raise ValueError("sharpness mask must match source and be non-empty")
+    gray = 0.299 * source[..., 0] + 0.587 * source[..., 1] + 0.114 * source[..., 2]
+    horizontal_valid = binary[:, 1:] & binary[:, :-1]
+    vertical_valid = binary[1:, :] & binary[:-1, :]
+    gradients: list[np.ndarray] = []
+    if horizontal_valid.any():
+        gradients.append(np.diff(gray, axis=1)[horizontal_valid])
+    if vertical_valid.any():
+        gradients.append(np.diff(gray, axis=0)[vertical_valid])
+    if not gradients:
+        return 0.0
+    values = np.concatenate(gradients).astype(np.float64, copy=False)
+    score = float(np.mean(values * values))
+    if not math.isfinite(score) or score < 0:
+        raise ValueError("sharpness score must be finite and non-negative")
+    return score
 
 
 def build_entity_reference_candidates(
@@ -372,6 +389,7 @@ def build_entity_reference_candidates(
     candidates.sort(
         key=lambda candidate: (
             candidate.border_contact_count,
+            -candidate.sharpness_score,
             -candidate.area_pixels,
             -candidate.bbox_fill_ratio,
             candidate.normalized_center_distance,
@@ -431,6 +449,19 @@ def _validate_reference_png(
         raise ValueError("ready entity reference transparent RGB must be white")
 
 
+def _validate_boogu_reference_png(path: Path) -> None:
+    if not path.is_file():
+        raise ValueError("ready Boogu reference artifact is missing")
+    with Image.open(path) as opened:
+        opened.load()
+        if opened.format != "PNG":
+            raise ValueError("ready Boogu reference must be a PNG")
+        if opened.mode != "RGB":
+            raise ValueError("ready Boogu reference must be native RGB")
+        if opened.width <= 0 or opened.height <= 0:
+            raise ValueError("ready Boogu reference dimensions are invalid")
+
+
 def _selected_candidate_for_state(
     config: V3Config,
     storage: RunStorage,
@@ -472,34 +503,57 @@ def validate_entity_reference_artifact(
         annotation_entity.entity_id,
     ).resolve(strict=False)
     if reference_state.status == "rejected":
-        if final_path.exists():
+        clip = storage.read_clip(clip_uid)
+        preserved_after_rejection = (
+            clip.reference_edit is not None
+            and clip.reference_edit.status == "ready"
+            and any(
+                item.entity_id == annotation_entity.entity_id
+                and item.status == "rejected"
+                for item in clip.reference_edit.entities
+            )
+        )
+        if final_path.exists() and not preserved_after_rejection:
             raise ValueError("rejected entity reference has a final artifact")
         return
     if reference_state.image_path is None:
         raise ValueError("ready entity reference is missing image_path")
     state_path = _resolve_run_artifact(storage, reference_state.image_path)
-    if state_path != final_path:
-        raise ValueError("ready entity reference path must be selected/eN.png")
 
     source_clip_uid = reference_state.source_clip_uid
     source_entity_id = reference_state.source_entity_id
     is_legacy = source_clip_uid is None and source_entity_id is None
     is_self = (
-        source_clip_uid == clip_uid
-        and source_entity_id == annotation_entity.entity_id
+        source_clip_uid == clip_uid and source_entity_id == annotation_entity.entity_id
     )
     if reference_state.synthetic:
         if not is_self:
             raise ValueError("generated fallback must use self provenance")
-        _validate_reference_png(state_path, expected=None)
-        output_sha256 = hashlib.sha256(state_path.read_bytes()).hexdigest()
-        if output_sha256 != reference_state.generation_output_sha256:
-            raise ValueError("generated fallback output hash changed")
         metadata_value = reference_state.generation_metadata_path
         if metadata_value is None:
             raise ValueError("generated fallback metadata path is missing")
         metadata_path = _resolve_run_artifact(storage, metadata_value)
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("backend") == "boogu_image_0_1_edit_turbo":
+            expected_path = (
+                storage.reference_edit_dir(clip_uid)
+                / annotation_entity.entity_id
+                / "final_reference_1k.png"
+            ).resolve(strict=False)
+            if state_path != expected_path:
+                raise ValueError(
+                    "ready Boogu reference path must use final_reference_1k.png"
+                )
+            _validate_boogu_reference_png(state_path)
+        else:
+            if state_path != final_path:
+                raise ValueError(
+                    "legacy generated reference path must be selected/eN.png"
+                )
+            _validate_reference_png(state_path, expected=None)
+        output_sha256 = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        if output_sha256 != reference_state.generation_output_sha256:
+            raise ValueError("generated fallback output hash changed")
         if (
             metadata.get("status") != "accepted"
             or metadata.get("clip_uid") != clip_uid
@@ -518,6 +572,8 @@ def validate_entity_reference_artifact(
         ):
             raise ValueError("generated fallback source hash changed")
         return
+    if state_path != final_path:
+        raise ValueError("ready real reference path must be selected/eN.png")
     if is_legacy or is_self:
         candidate = _selected_candidate_for_state(
             config,
@@ -558,9 +614,7 @@ def validate_entity_reference_artifact(
         raise ValueError("cross-pair donor entity is missing")
     if donor_entity.reference_type != annotation_entity.reference_type:
         raise ValueError("cross-pair donor reference type does not match target")
-    donor_states = {
-        state.entity_id: state for state in donor_clip.references.entities
-    }
+    donor_states = {state.entity_id: state for state in donor_clip.references.entities}
     donor_state = donor_states.get(source_entity_id)
     if (
         donor_state is None
@@ -642,9 +696,7 @@ def _tokens_for_retained(
     for entity_id in retained:
         reference_type = entities[entity_id].reference_type
         counters[reference_type] += 1
-        tokens[entity_id] = (
-            f"<ref_{reference_type}_{counters[reference_type]}>"
-        )
+        tokens[entity_id] = f"<ref_{reference_type}_{counters[reference_type]}>"
     return tokens
 
 
@@ -656,9 +708,7 @@ def _load_source_images(
     for candidate in candidates:
         if candidate.image_path in images:
             continue
-        with Image.open(
-            _resolve_run_artifact(storage, candidate.image_path)
-        ) as opened:
+        with Image.open(_resolve_run_artifact(storage, candidate.image_path)) as opened:
             image = opened.convert("RGB")
             image.load()
         images[candidate.image_path] = image
@@ -741,9 +791,7 @@ def _validate_existing_pairing(
     actual_ids = [state.entity_id for state in clip.references.entities]
     if actual_ids != expected_ids:
         raise ValueError("existing references do not match annotation order")
-    entity_by_id = {
-        entity.entity_id: entity for entity in clip.annotation.entities
-    }
+    entity_by_id = {entity.entity_id: entity for entity in clip.annotation.entities}
     for state in clip.references.entities:
         validate_entity_reference_artifact(
             config,
@@ -808,9 +856,7 @@ def _build_same_parent_donor_index(
         donor_states = {
             state.entity_id: state for state in donor_clip.references.entities
         }
-        eligible_references: list[
-            tuple[AnnotationEntity, EntityReferenceState]
-        ] = []
+        eligible_references: list[tuple[AnnotationEntity, EntityReferenceState]] = []
         for donor_entity in donor_clip.annotation.entities:
             donor_state = donor_states.get(donor_entity.entity_id)
             is_legacy = (
@@ -829,8 +875,7 @@ def _build_same_parent_donor_index(
                 or donor_state.reference_scope != "full"
                 or not donor_state.identity_features_visible
                 or donor_state.synthetic
-                or donor_entity.entity_id
-                not in donor_clip.pairing.retained_entity_ids
+                or donor_entity.entity_id not in donor_clip.pairing.retained_entity_ids
                 or not (is_legacy or is_self)
             ):
                 continue
@@ -945,11 +990,7 @@ def _write_cross_pair_debug(
         if attempt is not None
         else list(failure.raw_responses if failure is not None else [])
     )
-    issues = (
-        []
-        if failure is None
-        else [issue.to_dict() for issue in failure.issues]
-    )
+    issues = [] if failure is None else [issue.to_dict() for issue in failure.issues]
     write_json_atomic(
         directory / "decision.json",
         {
@@ -968,9 +1009,7 @@ def _write_cross_pair_debug(
                 "reference_type": donor.entity.reference_type,
                 "phrase": donor.entity.phrase,
                 "grounding_prompt": donor.entity.grounding_prompt,
-                "image_path": storage.relative_artifact_path(
-                    donor.image_path
-                ),
+                "image_path": storage.relative_artifact_path(donor.image_path),
             },
             "raw_responses": raw_responses,
             "issues": issues,
@@ -992,17 +1031,13 @@ def _pairing_from_references(
 ) -> PairingState:
     if clip.annotation is None or clip.coverage is None:
         raise ValueError("cross-pair target inputs are incomplete")
-    retained = [
-        state.entity_id for state in entity_states if state.status == "ready"
-    ]
+    retained = [state.entity_id for state in entity_states if state.status == "ready"]
     if not set(retained).intersection(clip.coverage.qualifying_entity_ids):
         return PairingState(
             status="rejected",
             reason="no_qualifying_ready_reference",
         )
-    entity_by_id = {
-        entity.entity_id: entity for entity in clip.annotation.entities
-    }
+    entity_by_id = {entity.entity_id: entity for entity in clip.annotation.entities}
     background = clip.references.background
     background_token = (
         "<ref_bg_1>"
@@ -1077,10 +1112,7 @@ def _run_same_parent_cross_pair_fallback(
     counters: dict[str, int],
     judge: CrossPairJudge | None,
 ) -> None:
-    if (
-        not config.pair.same_parent_fallback_enabled
-        or not target_clip_uids
-    ):
+    if not config.pair.same_parent_fallback_enabled or not target_clip_uids:
         return
     donor_index = _build_same_parent_donor_index(config, storage)
     active_judge = judge
@@ -1105,12 +1137,10 @@ def _run_same_parent_cross_pair_fallback(
                 target_masks = storage.read_masks(target_clip.clip_uid)
                 _validate_pair_inputs(target_clip, target_frames, target_masks)
                 states_by_id = {
-                    state.entity_id: state
-                    for state in target_clip.references.entities
+                    state.entity_id: state for state in target_clip.references.entities
                 }
                 original_statuses = {
-                    entity_id: state.status
-                    for entity_id, state in states_by_id.items()
+                    entity_id: state.status for entity_id, state in states_by_id.items()
                 }
                 for target_entity in target_clip.annotation.entities:
                     current_state = states_by_id.get(target_entity.entity_id)
@@ -1146,9 +1176,7 @@ def _run_same_parent_cross_pair_fallback(
                             storage,
                             [target_candidate],
                         )
-                        target_source = target_sources[
-                            target_candidate.image_path
-                        ]
+                        target_source = target_sources[target_candidate.image_path]
                         target_context = build_candidate_context_image(
                             target_source,
                             target_candidate.mask,
@@ -1160,29 +1188,23 @@ def _run_same_parent_cross_pair_fallback(
                         )
                     else:
                         target_evidence_mode = "sampled_frames"
-                        target_frame_images = (
-                            _load_cross_pair_target_frame_images(
-                                storage,
-                                clip_uid=target_clip.clip_uid,
-                                frames=target_frames,
-                            )
+                        target_frame_images = _load_cross_pair_target_frame_images(
+                            storage,
+                            clip_uid=target_clip.clip_uid,
+                            frames=target_frames,
                         )
                         target_frame_slots = tuple(
                             slot for slot, _ in target_frame_images
                         )
-                        target_context = (
-                            build_cross_pair_target_contact_sheet(
-                                target_frame_images
-                            )
+                        target_context = build_cross_pair_target_contact_sheet(
+                            target_frame_images
                         )
                         target_crop = None
                     for donor in donors:
                         if active_judge is None:
                             judge_config = config.qwen.cross_pair_judge
                             if judge_config is None:
-                                raise RuntimeError(
-                                    "cross-pair judge is not configured"
-                                )
+                                raise RuntimeError("cross-pair judge is not configured")
                             owned_judge = QwenCrossPairJudge(
                                 judge_config,
                                 repair_retries=config.pair.repair_retries,
@@ -1231,36 +1253,32 @@ def _run_same_parent_cross_pair_fallback(
                         if attempt.decision.verdict != "accept":
                             continue
                         donor_state = donor.reference
-                        states_by_id[target_entity.entity_id] = (
-                            EntityReferenceState(
-                                entity_id=target_entity.entity_id,
-                                status="ready",
-                                reference_scope=donor_state.reference_scope,
-                                visible_region=donor_state.visible_region,
-                                whole_entity_recognizable=(
-                                    donor_state.whole_entity_recognizable
-                                ),
-                                identity_features_visible=(
-                                    donor_state.identity_features_visible
-                                ),
-                                scope_reason=donor_state.scope_reason,
-                                image_path=storage.relative_artifact_path(
-                                    storage.selected_entity_path(
-                                        target_clip.clip_uid,
-                                        target_entity.entity_id,
-                                    )
-                                ),
-                                source_frame_index=(
-                                    donor_state.source_frame_index
-                                ),
-                                synthetic=False,
-                                source_clip_uid=donor.clip.clip_uid,
-                                source_entity_id=donor.entity.entity_id,
-                            )
+                        states_by_id[target_entity.entity_id] = EntityReferenceState(
+                            entity_id=target_entity.entity_id,
+                            status="ready",
+                            reference_scope=donor_state.reference_scope,
+                            visible_region=donor_state.visible_region,
+                            whole_entity_recognizable=(
+                                donor_state.whole_entity_recognizable
+                            ),
+                            identity_features_visible=(
+                                donor_state.identity_features_visible
+                            ),
+                            scope_reason=donor_state.scope_reason,
+                            image_path=storage.relative_artifact_path(
+                                storage.selected_entity_path(
+                                    target_clip.clip_uid,
+                                    target_entity.entity_id,
+                                )
+                            ),
+                            source_frame_index=(donor_state.source_frame_index),
+                            synthetic=False,
+                            source_clip_uid=donor.clip.clip_uid,
+                            source_entity_id=donor.entity.entity_id,
+                            image_quality=(donor_state.image_quality or "high"),
+                            completeness="complete",
                         )
-                        temporary_donors[target_entity.entity_id] = (
-                            donor.image_path
-                        )
+                        temporary_donors[target_entity.entity_id] = donor.image_path
                         break
                 if not temporary_donors:
                     continue
@@ -1490,15 +1508,21 @@ def pair_clips(
                         candidate_ids={item.candidate_id for item in candidates},
                     )
                     if decision_issues:
-                        messages = "; ".join(
-                            issue.message for issue in decision_issues
-                        )
+                        messages = "; ".join(issue.message for issue in decision_issues)
                         raise ValueError(f"invalid judge decision: {messages}")
                     if decision.reference_scope == "reject":
                         entity_states.append(
-                            _rejected_reference(
-                                entity.entity_id,
-                                decision.scope_reason,
+                            EntityReferenceState(
+                                entity_id=entity.entity_id,
+                                status="rejected",
+                                reference_scope="reject",
+                                visible_region="custom",
+                                whole_entity_recognizable=False,
+                                identity_features_visible=False,
+                                scope_reason=decision.scope_reason,
+                                image_quality=decision.image_quality,
+                                completeness=decision.completeness,
+                                synthetic=False,
                             )
                         )
                         continue
@@ -1516,8 +1540,7 @@ def pair_clips(
                     selected = next(
                         candidate
                         for candidate in candidates
-                        if candidate.candidate_id
-                        == decision.selected_candidate_id
+                        if candidate.candidate_id == decision.selected_candidate_id
                     )
                     source = source_images[selected.image_path]
                     reference_image, _ = build_reference_crop(
@@ -1557,6 +1580,8 @@ def pair_clips(
                             synthetic=False,
                             source_clip_uid=clip.clip_uid,
                             source_entity_id=entity.entity_id,
+                            image_quality=decision.image_quality,
+                            completeness=decision.completeness,
                         )
                     )
                 retained = [
@@ -1566,10 +1591,10 @@ def pair_clips(
                 ]
                 background = clip.references.background
                 background_token: str | None = None
-                if (
-                    background is not None
-                    and background.status in {"clean_raw", "ready_removed"}
-                ):
+                if background is not None and background.status in {
+                    "clean_raw",
+                    "ready_removed",
+                }:
                     validate_background_reference(
                         storage,
                         clip.clip_uid,
@@ -1577,17 +1602,14 @@ def pair_clips(
                         frames=frames,
                     )
                     background_token = "<ref_bg_1>"
-                if not set(retained).intersection(
-                    clip.coverage.qualifying_entity_ids
-                ):
+                if not set(retained).intersection(clip.coverage.qualifying_entity_ids):
                     pairing = PairingState(
                         status="rejected",
                         reason="no_qualifying_ready_reference",
                     )
                 else:
                     entity_by_id = {
-                        entity.entity_id: entity
-                        for entity in clip.annotation.entities
+                        entity.entity_id: entity for entity in clip.annotation.entities
                     }
                     pairing = PairingState(
                         status="ready",
@@ -1607,13 +1629,9 @@ def pair_clips(
                     pairing=pairing,
                     temporary_images=temporary_images,
                 )
-                ready_count = sum(
-                    state.status == "ready" for state in entity_states
-                )
+                ready_count = sum(state.status == "ready" for state in entity_states)
                 counters["entities_ready"] += ready_count
-                counters["entities_rejected"] += (
-                    len(entity_states) - ready_count
-                )
+                counters["entities_rejected"] += len(entity_states) - ready_count
                 counters[pairing.status] += 1
                 counters["backgrounds_bound"] += int(
                     pairing.background_token is not None
@@ -1637,18 +1655,19 @@ def pair_clips(
             counters=counters,
             judge=cross_pair_judge,
         )
-        completion_stats = run_reference_completion_fallbacks(
-            config,
-            storage,
-            target_clip_uids=cross_pair_targets,
-            reference_judge=active_judge,
-            completion_backend=completion_backend,
-            completion_judge=completion_judge,
-            segmentation_backend=completion_segmentation_backend,
-        )
-        counters["completion_attempted"] += completion_stats.attempted
-        counters["completion_ready"] += completion_stats.ready
-        counters["completion_rejected"] += completion_stats.rejected
+        if not config.reference_edit.enabled:
+            completion_stats = run_reference_completion_fallbacks(
+                config,
+                storage,
+                target_clip_uids=cross_pair_targets,
+                reference_judge=active_judge,
+                completion_backend=completion_backend,
+                completion_judge=completion_judge,
+                segmentation_backend=completion_segmentation_backend,
+            )
+            counters["completion_attempted"] += completion_stats.attempted
+            counters["completion_ready"] += completion_stats.ready
+            counters["completion_rejected"] += completion_stats.rejected
     finally:
         if owned_judge is not None:
             owned_judge.close()

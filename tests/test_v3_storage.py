@@ -39,6 +39,8 @@ from r2v_data_v2.v3.schemas import (
     InstructionLegendEntry,
     InstructionState,
     PairingState,
+    ReferenceEditEntityState,
+    ReferenceEditState,
     ReferencesState,
     TrackedEntityMasks,
     TrackedMaskFrame,
@@ -119,12 +121,10 @@ def _visibility_summary(
         coverage_ratio=visible_frame_count / 10,
         qualifies=qualifies,
         per_frame_area_ratio=[
-            0.1 if slot < visible_frame_count else 0.0
-            for slot in range(10)
+            0.1 if slot < visible_frame_count else 0.0 for slot in range(10)
         ],
         per_frame_confidence=[
-            0.9 if slot < visible_frame_count else None
-            for slot in range(10)
+            0.9 if slot < visible_frame_count else None for slot in range(10)
         ],
     )
 
@@ -161,9 +161,7 @@ def _instruction_state(*, include_background: bool = False) -> InstructionState:
 
 
 def _source_video_path(storage: RunStorage, clip_uid: str) -> str:
-    return str(
-        storage.config.dataset_json.parent / "videos" / f"{clip_uid}.mp4"
-    )
+    return str(storage.config.dataset_json.parent / "videos" / f"{clip_uid}.mp4")
 
 
 def _clip_source(storage: RunStorage, clip_uid: str) -> ClipSource:
@@ -201,14 +199,10 @@ def _tracked_masks(
                         slot=slot,
                         present=slot == 0,
                         confidence=confidence if slot == 0 else None,
-                        backend_confidences=(
-                            [confidence] if slot == 0 else []
-                        ),
+                        backend_confidences=([confidence] if slot == 0 else []),
                         backend_object_ids=["7"] if slot == 0 else [],
                         area_pixels=int(mask.sum()) if slot == 0 else 0,
-                        area_ratio=(
-                            float(mask.mean()) if slot == 0 else 0.0
-                        ),
+                        area_ratio=(float(mask.mean()) if slot == 0 else 0.0),
                         bbox_xyxy=(2, 1, 4, 3) if slot == 0 else None,
                         rle=encode_binary_mask(mask) if slot == 0 else empty,
                     )
@@ -339,9 +333,7 @@ def _initialize_storage_with_complete_clip(
             source=_clip_source(storage, "clip-1"),
         )
         storage.write_masks("clip-1", _tracked_masks("clip-1"))
-    _create_exportable_clip(
-        storage, include_background=False, preaccepted=True
-    )
+    _create_exportable_clip(storage, include_background=False, preaccepted=True)
     return storage
 
 
@@ -385,7 +377,6 @@ def test_v3_config_loads_32b_defaults_without_model_access(
             FramesConfig(count=8),
             "exactly 10",
         ),
-
         (
             "background",
             BackgroundConfig(raw_foreground_area_ratio=0.01),
@@ -449,11 +440,8 @@ def test_v3_config_rejects_sam3_model_path_outside_allowed_roots(
     ):
         replace(
             config,
-            sam3=v3_config_module.Sam3Config(
-                model_path=tmp_path / "outside-model.pt"
-            ),
+            sam3=v3_config_module.Sam3Config(model_path=tmp_path / "outside-model.pt"),
         ).validate()
-
 
 
 @pytest.mark.parametrize("required", [0, 11])
@@ -474,9 +462,7 @@ def test_coverage_default_is_seven_and_eight_is_also_valid() -> None:
             passed=True,
             qualifying_entity_ids=["e1"],
             required_visible_frames=8,
-            entity_visibility_summary={
-                "e1": _visibility_summary(8, qualifies=True)
-            },
+            entity_visibility_summary={"e1": _visibility_summary(8, qualifies=True)},
         ).required_visible_frames
         == 8
     )
@@ -527,9 +513,7 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
         CoverageState(
             passed=True,
             qualifying_entity_ids=["e1"],
-            entity_visibility_summary={
-                "e1": _visibility_summary(7, qualifies=True)
-            },
+            entity_visibility_summary={"e1": _visibility_summary(7, qualifies=True)},
         ),
     )
     masks_path = storage.write_masks(
@@ -541,9 +525,7 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     assert storage.read_clip("clip-1").annotation is not None
     assert masks_path.name == "masks.rle.json"
     clip_files = {
-        path.name
-        for path in storage.clip_dir("clip-1").iterdir()
-        if path.is_file()
+        path.name for path in storage.clip_dir("clip-1").iterdir() if path.is_file()
     }
     assert clip_files == {"clip.json", "masks.rle.json"}
     assert len(list(config.resolved_run_root.rglob("clip.json"))) == 1
@@ -562,18 +544,32 @@ def test_single_clip_json_lifecycle_and_single_mask_artifact(
     [
         (
             "annotation",
-            {"coverage", "references", "pairing", "instruction", "export"},
+            {
+                "coverage",
+                "references",
+                "pairing",
+                "reference_edit",
+                "instruction",
+                "export",
+            },
         ),
         (
             "masks",
-            {"coverage", "references", "pairing", "instruction", "export"},
+            {
+                "coverage",
+                "references",
+                "pairing",
+                "reference_edit",
+                "instruction",
+                "export",
+            },
         ),
         (
             "coverage",
-            {"references", "pairing", "instruction", "export"},
+            {"references", "pairing", "reference_edit", "instruction", "export"},
         ),
-        ("references", {"pairing", "instruction", "export"}),
-        ("pairing", {"instruction", "export"}),
+        ("references", {"pairing", "reference_edit", "instruction", "export"}),
+        ("pairing", {"reference_edit", "instruction", "export"}),
         ("instruction", {"export"}),
     ],
 )
@@ -670,9 +666,7 @@ def test_changed_upstream_content_invalidates_only_downstream_sections(
             assert getattr(after, section) is None
     if upstream == "masks":
         masks = TrackedMasksArtifact.model_validate_json(
-            (storage.clip_dir("clip-1") / "masks.rle.json").read_text(
-                encoding="utf-8"
-            )
+            (storage.clip_dir("clip-1") / "masks.rle.json").read_text(encoding="utf-8")
         )
         assert masks == _tracked_masks("clip-1", counts="changed")
     else:
@@ -705,6 +699,97 @@ def test_repeated_identical_writes_preserve_all_downstream_state(
     storage.write_export("clip-1", before.export)
 
     assert storage.read_clip("clip-1") == before
+    assert storage.clip_path("clip-1").read_bytes() == clip_bytes
+
+
+def _not_required_reference_edit(clip: ClipRecord) -> ReferenceEditState:
+    ready = next(
+        reference
+        for reference in clip.references.entities
+        if reference.status == "ready"
+    )
+    assert ready.image_path is not None
+    return ReferenceEditState(
+        status="ready",
+        entities=[
+            ReferenceEditEntityState(
+                entity_id=ready.entity_id,
+                route="local_usable",
+                status="not_required",
+                source_reference=ready,
+                source_image_path=ready.image_path,
+                output_image_path=ready.image_path,
+            )
+        ],
+    )
+
+
+def test_pairing_change_invalidates_reference_edit_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    storage.write_reference_edit_result(
+        "clip-1",
+        clip.references,
+        clip.pairing,
+        _not_required_reference_edit(clip),
+    )
+    edit_dir = storage.reference_edit_dir("clip-1")
+    edit_dir.mkdir(parents=True)
+    (edit_dir / "marker.txt").write_text("stale", encoding="utf-8")
+
+    storage.write_pairing(
+        "clip-1",
+        PairingState(status="rejected", reason="pairing changed"),
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert updated.reference_edit is None
+    assert updated.instruction is None
+    assert updated.export == ExportState()
+    assert not edit_dir.exists()
+
+
+def test_repeated_reference_edit_result_preserves_instruction_and_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing is not None
+    reference_edit = _not_required_reference_edit(clip)
+    storage.write_reference_edit_result(
+        "clip-1",
+        clip.references,
+        clip.pairing,
+        reference_edit,
+    )
+    storage.write_instruction("clip-1", _instruction_state())
+    storage.write_export("clip-1", ExportState(accepted=True, reason=None))
+    before = storage.read_clip("clip-1")
+    clip_bytes = storage.clip_path("clip-1").read_bytes()
+
+    repeated = storage.write_reference_edit_result(
+        "clip-1",
+        before.references,
+        before.pairing,
+        reference_edit,
+    )
+
+    assert repeated == before
+    assert repeated.instruction is not None
+    assert repeated.export.accepted is True
+    assert storage.clip_path("clip-1").read_bytes() == clip_bytes
+    repeated_pair = storage.write_references_and_pairing(
+        "clip-1",
+        before.references,
+        before.pairing,
+    )
+    assert repeated_pair == before
+    assert repeated_pair.reference_edit == reference_edit
     assert storage.clip_path("clip-1").read_bytes() == clip_bytes
 
 
@@ -813,9 +898,9 @@ def test_evaluate_export_state_accepts_clean_raw_background(
     storage.initialize(git_commit="abc123")
     _create_exportable_clip(storage, include_background=True)
 
-    assert evaluate_export_state(
-        storage.read_clip("clip-1")
-    ) == ExportState(accepted=True, reason=None)
+    assert evaluate_export_state(storage.read_clip("clip-1")) == ExportState(
+        accepted=True, reason=None
+    )
 
 
 def test_evaluate_export_state_accepts_ready_removed_background(
@@ -890,9 +975,7 @@ def test_evaluate_export_state_rejects_pending_background_remove(
     )
     clip = clip.model_copy(
         update={
-            "references": clip.references.model_copy(
-                update={"background": pending}
-            )
+            "references": clip.references.model_copy(update={"background": pending})
         }
     )
 
@@ -927,18 +1010,12 @@ def test_evaluate_export_state_uses_stable_rejection_reasons(
     if gate == "annotation":
         clip = clip.model_copy(
             update={
-                "annotation": clip.annotation.model_copy(
-                    update={"status": "failed"}
-                )
+                "annotation": clip.annotation.model_copy(update={"status": "failed"})
             }
         )
     elif gate == "coverage":
         clip = clip.model_copy(
-            update={
-                "coverage": clip.coverage.model_copy(
-                    update={"passed": False}
-                )
-            }
+            update={"coverage": clip.coverage.model_copy(update={"passed": False})}
         )
     elif gate == "pairing":
         clip = clip.model_copy(
@@ -952,9 +1029,7 @@ def test_evaluate_export_state_uses_stable_rejection_reasons(
     elif gate == "instruction":
         clip = clip.model_copy(
             update={
-                "instruction": clip.instruction.model_copy(
-                    update={"status": "failed"}
-                )
+                "instruction": clip.instruction.model_copy(update={"status": "failed"})
             }
         )
     else:
@@ -992,6 +1067,7 @@ def test_legacy_clip_without_export_state_can_be_read(
 
     assert storage.read_clip("legacy-clip").export == ExportState()
 
+
 def test_clip_cross_section_validator_rejects_inconsistent_bindings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1025,9 +1101,9 @@ def test_clip_cross_section_validator_rejects_unknown_qualifying_entity(
     storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
     payload = storage.read_clip("clip-1").model_dump(mode="json")
     payload["coverage"]["qualifying_entity_ids"] = ["missing"]
-    payload["coverage"]["entity_visibility_summary"]["missing"] = (
-        payload["coverage"]["entity_visibility_summary"].pop("e1")
-    )
+    payload["coverage"]["entity_visibility_summary"]["missing"] = payload["coverage"][
+        "entity_visibility_summary"
+    ].pop("e1")
 
     with pytest.raises(ValidationError, match="must exist in annotation"):
         ClipRecord.model_validate(payload)
@@ -1243,9 +1319,7 @@ def test_failures_use_one_structured_jsonl(
         for line in storage.failures_path.read_text(encoding="utf-8").splitlines()
     ]
     assert [record["clip_uid"] for record in records] == ["clip-1", "clip-2"]
-    assert list(config.resolved_run_root.glob("*.jsonl")) == [
-        storage.failures_path
-    ]
+    assert list(config.resolved_run_root.glob("*.jsonl")) == [storage.failures_path]
 
 
 def test_compact_export_contains_only_accepted_training_artifacts(
@@ -1295,9 +1369,7 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     )
     assert sample["sample_id"] == "clip-1"
     entity_reference = next(
-        reference
-        for reference in sample["references"]
-        if reference["type"] == "entity"
+        reference for reference in sample["references"] if reference["type"] == "entity"
     )
     assert entity_reference["source_clip_uid"] == "donor-clip"
     assert entity_reference["source_entity_id"] == "e2"
@@ -1423,6 +1495,7 @@ def test_repeated_export_writes_deterministic_acceptance_state(
     assert second == first
     assert storage.read_clip("clip-1").export == first_state
     assert storage.clip_path("clip-1").read_bytes() == first_clip_bytes
+
 
 def test_entity_la_png_export_preserves_alpha(tmp_path: Path) -> None:
     source = tmp_path / "entity-la.png"

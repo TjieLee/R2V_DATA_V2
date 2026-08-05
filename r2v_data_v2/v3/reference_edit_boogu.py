@@ -7,19 +7,23 @@ is an optional quality signal only.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
 import math
 import os
 import re
+import selectors
 import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TextIO
 
+import numpy as np
+from openai import BadRequestError, OpenAI
 from PIL import Image
 from pydantic import (
     BaseModel,
@@ -31,6 +35,8 @@ from pydantic import (
 )
 
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 
 BooguEditOperation = Literal["complete_entity", "add_entity_background"]
 ReferenceType = Literal["subject", "object", "group"]
@@ -43,8 +49,7 @@ DEFAULT_BOOGU_PYTHON = Path(
     "/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python"
 )
 DEFAULT_BOOGU_MODEL_PATH = Path(
-    "/mnt/workspace/litengjie/data/models/"
-    "Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
+    "/mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708"
 )
 DEFAULT_ALLOWED_SERVER_ROOT = Path("/mnt/workspace/litengjie/data")
 DEFAULT_TARGET_AREA = 1024 * 1024
@@ -88,9 +93,9 @@ def resolve_boogu_1k_size(
                 continue
             output_ratio = candidate_width / candidate_height
             ratio_error = abs(output_ratio - aspect_ratio) / aspect_ratio
-            area_error = abs(
-                candidate_width * candidate_height - target_area
-            ) / target_area
+            area_error = (
+                abs(candidate_width * candidate_height - target_area) / target_area
+            )
             score = (
                 ratio_error + area_error,
                 ratio_error,
@@ -270,6 +275,292 @@ class BooguSamReviewer(Protocol):
     ) -> BooguSamReview: ...
 
 
+_COMPLETION_REVIEW_PROMPT = """You review a generated entity reference.
+Image 1 is the source reference and Image 2 is the generated completion.
+Accept only if Image 2 preserves the same physical entity and every visible
+identity attribute, contains exactly one coherent target, plausibly completes
+missing structure, adds no duplicate or unrelated entity, has no severe
+structural artifact, and is a usable high-resolution reference. Judge visible
+facts only and return one strict JSON object matching the supplied schema."""
+
+_BACKGROUND_REVIEW_PROMPT = """You review a generated entity reference.
+Image 1 is the source reference and Image 2 adds a clean supporting background.
+Accept only if Image 2 contains exactly the same single target entity, preserves
+its identity and appearance, introduces no duplicate or salient entity, does
+not extend or complete the target unexpectedly, and has a coherent background
+without halos, seams, or severe redraw. Judge visible facts only and return one
+strict JSON object matching the supplied schema."""
+
+
+def _png_data_url(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+class QwenBooguReferenceEditJudge:
+    """Production structured Qwen reviewer for native Boogu candidates."""
+
+    def __init__(
+        self,
+        config: QwenServiceConfig,
+        *,
+        client: Any | None = None,
+        repair_retries: int = 1,
+    ) -> None:
+        if repair_retries < 0:
+            raise ValueError("repair_retries must be non-negative")
+        self.config = config
+        self.client = client or OpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout_seconds,
+        )
+        self.repair_retries = repair_retries
+
+    def review(
+        self,
+        *,
+        operation: BooguEditOperation,
+        source_rgba: Image.Image,
+        source_input_rgb: Image.Image,
+        candidate_rgb: Image.Image,
+        entity_phrase: str,
+        reference_type: ReferenceType,
+    ) -> BooguQwenReview:
+        model = (
+            BooguCompletionReview
+            if operation == "complete_entity"
+            else BooguBackgroundReview
+        )
+        system_prompt = (
+            _COMPLETION_REVIEW_PROMPT
+            if operation == "complete_entity"
+            else _BACKGROUND_REVIEW_PROMPT
+        )
+        source = (
+            source_input_rgb
+            if operation == "complete_entity"
+            else source_rgba.convert("RGB")
+        )
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Reference type: {reference_type}\n"
+                    f"Entity phrase: {entity_phrase.strip()}"
+                ),
+            }
+        ]
+        for label, image in (
+            ("Image 1: source reference", source),
+            ("Image 2: generated candidate", candidate_rgb),
+        ):
+            content.extend(
+                [
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _png_data_url(image.convert("RGB"))},
+                    },
+                ]
+            )
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+        raw = self._request(messages, model)
+        for attempt in range(self.repair_retries + 1):
+            try:
+                return model.model_validate_json(raw)
+            except (TypeError, ValueError) as exc:
+                if attempt >= self.repair_retries:
+                    raise ValueError(f"invalid Qwen Boogu review: {exc}") from exc
+                repair_messages = [
+                    *messages,
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair the JSON to match the schema exactly. "
+                            f"Validation error: {exc}"
+                        ),
+                    },
+                ]
+                raw = self._request(repair_messages, model)
+        raise AssertionError("unreachable")
+
+    def _request(
+        self,
+        messages: list[dict[str, object]],
+        model: type[BooguCompletionReview | BooguBackgroundReview],
+    ) -> str:
+        parameters: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "max_tokens": self.config.max_tokens,
+        }
+        try:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "v3_boogu_reference_edit_review",
+                        "strict": True,
+                        "schema": model.model_json_schema(),
+                    },
+                },
+            )
+        except BadRequestError:
+            response = self.client.chat.completions.create(
+                **parameters,
+                response_format={"type": "json_object"},
+            )
+        raw = response.choices[0].message.content
+        if not raw:
+            raise RuntimeError("Qwen returned an empty Boogu reference review")
+        return str(raw)
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
+
+class Sam3BooguReferenceReviewer:
+    """Use SAM3 only as a post-generation identity/geometry quality guard."""
+
+    def __init__(
+        self,
+        backend: SegmentationBackend,
+        *,
+        temporary_root: Path,
+        max_area_growth_ratio: float,
+        max_significant_components: int,
+    ) -> None:
+        if not math.isfinite(max_area_growth_ratio) or max_area_growth_ratio < 1:
+            raise ValueError("max_area_growth_ratio must be finite and at least 1")
+        if max_significant_components < 1:
+            raise ValueError("max_significant_components must be positive")
+        self.backend = backend
+        self.temporary_root = temporary_root.expanduser().resolve(strict=False)
+        self.max_area_growth_ratio = max_area_growth_ratio
+        self.max_significant_components = max_significant_components
+
+    def review(
+        self,
+        *,
+        operation: BooguEditOperation,
+        source_rgba: Image.Image,
+        candidate_rgb: Image.Image,
+        entity_phrase: str,
+        reference_type: ReferenceType,
+    ) -> BooguSamReview:
+        del operation
+        self.temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="sam3-review-",
+            dir=self.temporary_root,
+        ) as temporary_name:
+            directory = Path(temporary_name)
+            frame_paths: list[Path] = []
+            for slot in range(10):
+                path = directory / f"{slot:02d}.jpg"
+                candidate_rgb.save(path, format="JPEG", quality=95, subsampling=0)
+                frame_paths.append(path)
+            result = self.backend.track(
+                frame_paths=frame_paths,
+                entity_id="e1",
+                reference_type=reference_type,
+                grounding_prompt=entity_phrase,
+            )
+        if result.status != "ready" or not result.observations:
+            return BooguSamReview(
+                passed=False,
+                target_entity_present=False,
+                exactly_one_target_instance=False,
+                area_growth_acceptable=False,
+                fragmentation_acceptable=False,
+                reason=f"sam3_target_not_ready:{result.reason or result.status}",
+                diagnostics={"track_status": result.status},
+            )
+        observation = min(
+            result.observations,
+            key=lambda item: (abs(item.slot - 5), item.slot),
+        )
+        mask = np.asarray(observation.mask, dtype=bool)
+        source_alpha = np.asarray(source_rgba.getchannel("A"), dtype=np.uint8) > 0
+        source_ratio = float(source_alpha.mean())
+        candidate_ratio = float(mask.mean())
+        area_growth = math.inf if source_ratio <= 0 else candidate_ratio / source_ratio
+        component_count = _significant_component_count(mask)
+        target_present = bool(mask.any())
+        exactly_one = (
+            target_present
+            and len({item.object_id for item in result.observations}) == 1
+        )
+        area_ok = area_growth <= self.max_area_growth_ratio
+        fragmentation_ok = component_count <= self.max_significant_components
+        passed = all((target_present, exactly_one, area_ok, fragmentation_ok))
+        return BooguSamReview(
+            passed=passed,
+            target_entity_present=target_present,
+            exactly_one_target_instance=exactly_one,
+            area_growth_acceptable=area_ok,
+            fragmentation_acceptable=fragmentation_ok,
+            reason="sam3_review_passed" if passed else "sam3_review_failed",
+            diagnostics={
+                "source_area_ratio": source_ratio,
+                "candidate_area_ratio": candidate_ratio,
+                "area_growth_ratio": area_growth,
+                "significant_component_count": component_count,
+                "review_slot": observation.slot,
+                "mask_usage": "review_only",
+            },
+        )
+
+
+def _significant_component_count(mask: np.ndarray) -> int:
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 2:
+        raise ValueError("SAM review mask must be two-dimensional")
+    visited = np.zeros(binary.shape, dtype=bool)
+    minimum_area = max(16, int(binary.sum() * 0.02))
+    count = 0
+    height, width = binary.shape
+    rows, columns = np.nonzero(binary)
+    for row, column in zip(rows, columns):
+        if visited[row, column]:
+            continue
+        stack = [(int(row), int(column))]
+        visited[row, column] = True
+        area = 0
+        while stack:
+            current_row, current_column = stack.pop()
+            area += 1
+            for next_row, next_column in (
+                (current_row - 1, current_column),
+                (current_row + 1, current_column),
+                (current_row, current_column - 1),
+                (current_row, current_column + 1),
+            ):
+                if (
+                    0 <= next_row < height
+                    and 0 <= next_column < width
+                    and binary[next_row, next_column]
+                    and not visited[next_row, next_column]
+                ):
+                    visited[next_row, next_column] = True
+                    stack.append((next_row, next_column))
+        count += int(area >= minimum_area)
+    return count
+
+
 @dataclass(frozen=True)
 class BooguWorkerConfig:
     python_executable: Path = DEFAULT_BOOGU_PYTHON
@@ -279,11 +570,15 @@ class BooguWorkerConfig:
     device: str = "cuda:0"
     seed: int = 0
     timeout_seconds: int = 3600
+    cuda_visible_devices: str = "0"
     allowed_server_root: Path = DEFAULT_ALLOWED_SERVER_ROOT
+    temporary_root: Path | None = None
     worker_script: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parents[2]
-        / "tools"
-        / "run_v3_boogu_reference_edit_worker.py"
+        default_factory=lambda: (
+            Path(__file__).resolve().parents[2]
+            / "tools"
+            / "run_v3_boogu_reference_edit_worker.py"
+        )
     )
 
     def validate(self) -> None:
@@ -298,13 +593,31 @@ class BooguWorkerConfig:
             resolved = path.expanduser().resolve(strict=False)
             if resolved != allowed_root and allowed_root not in resolved.parents:
                 raise ValueError(f"{name} must remain inside allowed_server_root")
-        if not isinstance(self.worker_script, Path) or not self.worker_script.is_absolute():
+        if (
+            not isinstance(self.worker_script, Path)
+            or not self.worker_script.is_absolute()
+        ):
             raise ValueError("worker_script must be an absolute pathlib.Path")
         if not self.model_revision.strip():
             raise ValueError("model_revision must be non-empty")
         if not self.device.strip():
             raise ValueError("device must be non-empty")
-        if not isinstance(self.seed, int) or isinstance(self.seed, bool) or self.seed < 0:
+        if not self.cuda_visible_devices.strip():
+            raise ValueError("cuda_visible_devices must be non-empty")
+        if self.temporary_root is not None:
+            temporary_root = self.temporary_root.expanduser().resolve(strict=False)
+            if (
+                temporary_root != allowed_root
+                and allowed_root not in temporary_root.parents
+            ):
+                raise ValueError(
+                    "temporary_root must remain inside allowed_server_root"
+                )
+        if (
+            not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
+            or self.seed < 0
+        ):
             raise ValueError("seed must be a non-negative integer")
         if (
             not isinstance(self.timeout_seconds, int)
@@ -315,11 +628,74 @@ class BooguWorkerConfig:
 
 
 class BooguSubprocessBackend:
-    """Run Boogu through its configured Linux Python without shell activation."""
+    """Reuse one fail-closed JSONL worker for every edit in a stage."""
 
     def __init__(self, config: BooguWorkerConfig) -> None:
         config.validate()
         self.config = config
+        self._process: subprocess.Popen[str] | None = None
+        self._stderr_handle: TextIO | None = None
+        self._stderr_path: Path | None = None
+
+    @property
+    def started(self) -> bool:
+        return self._process is not None
+
+    def start(self, *, stderr_log_path: Path) -> None:
+        if self._process is not None:
+            raise RuntimeError("Boogu worker is already started")
+        stderr_path = stderr_log_path.expanduser().resolve(strict=False)
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_handle = stderr_path.open("a", encoding="utf-8")
+        config = self.config
+        environment = os.environ.copy()
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["CUDA_VISIBLE_DEVICES"] = config.cuda_visible_devices
+        command = [
+            str(config.python_executable),
+            str(config.worker_script),
+            "--serve",
+            "--code-root",
+            str(config.code_root),
+            "--model-path",
+            str(config.model_path),
+            "--model-name",
+            BOOGU_MODEL_NAME,
+            "--model-revision",
+            config.model_revision,
+            "--device",
+            config.device,
+            "--seed",
+            str(config.seed),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=config.code_root,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_handle,
+                text=True,
+                bufsize=1,
+            )
+        except Exception:
+            stderr_handle.close()
+            raise
+        self._process = process
+        self._stderr_handle = stderr_handle
+        self._stderr_path = stderr_path
+        try:
+            response = self._read_response()
+            if response != {
+                "schema_version": 1,
+                "type": "ready",
+                "status": "ok",
+            }:
+                raise RuntimeError(f"invalid Boogu worker startup response: {response}")
+        except Exception:
+            self._terminate()
+            raise
 
     def edit(
         self,
@@ -334,55 +710,51 @@ class BooguSubprocessBackend:
             raise ValueError("Boogu source image must be RGB")
         instruction = _nonempty(instruction, "instruction")
         _validate_output_dimensions(width, height)
+        if self._process is None:
+            raise RuntimeError("Boogu worker must be started before editing")
         config = self.config
-        with tempfile.TemporaryDirectory(prefix="r2v-boogu-") as temporary_name:
+        temporary_root = (
+            None
+            if config.temporary_root is None
+            else config.temporary_root.expanduser().resolve(strict=False)
+        )
+        if temporary_root is not None:
+            temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="r2v-boogu-",
+            dir=temporary_root,
+        ) as temporary_name:
             temporary = Path(temporary_name)
             input_path = temporary / "source_input_rgb.png"
             output_path = temporary / "candidate.png"
-            result_path = temporary / "result.json"
-            request_path = temporary / "request.json"
             source_rgb.save(input_path, format="PNG")
+            request_id = uuid.uuid4().hex
             request = {
                 "schema_version": 1,
-                "code_root": str(config.code_root),
-                "model_path": str(config.model_path),
-                "model_name": BOOGU_MODEL_NAME,
-                "model_revision": config.model_revision,
-                "device": config.device,
-                "seed": config.seed,
+                "type": "edit",
+                "request_id": request_id,
                 "input_image_path": str(input_path),
                 "output_image_path": str(output_path),
-                "result_path": str(result_path),
                 "instruction": instruction,
                 "thinking_enabled": thinking_enabled,
                 "width": width,
                 "height": height,
             }
-            request_path.write_text(
-                json.dumps(request, ensure_ascii=True, sort_keys=True),
-                encoding="utf-8",
-            )
-            environment = os.environ.copy()
-            environment["PYTHONNOUSERSITE"] = "1"
-            subprocess.run(
-                [
-                    str(config.python_executable),
-                    str(config.worker_script),
-                    "--request",
-                    str(request_path),
-                ],
-                cwd=config.code_root,
-                env=environment,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=config.timeout_seconds,
-            )
-            if not result_path.is_file() or not output_path.is_file():
-                raise RuntimeError("Boogu worker did not publish its result artifacts")
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            if not isinstance(result, dict):
-                raise TypeError("Boogu worker result must be a JSON object")
+            try:
+                self._write_request(request)
+                result = self._read_response()
+                if result.get("request_id") != request_id:
+                    raise RuntimeError("Boogu worker response request_id mismatch")
+                if result.get("type") != "response" or result.get("status") != "ok":
+                    raise RuntimeError(
+                        "Boogu worker rejected request: "
+                        f"{result.get('reason', 'invalid response')}"
+                    )
+            except Exception:
+                self._terminate()
+                raise
+            if not output_path.is_file():
+                raise RuntimeError("Boogu worker did not publish its output image")
             output_bytes = output_path.read_bytes()
             _validated_native_png(output_bytes, expected_size=(width, height))
             if result.get("original_instruction") != instruction:
@@ -418,6 +790,107 @@ class BooguSubprocessBackend:
                 },
             )
 
+    def _write_request(self, request: dict[str, object]) -> None:
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeError("Boogu worker stdin is unavailable")
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Boogu worker exited before request with code {process.returncode}"
+            )
+        try:
+            process.stdin.write(
+                json.dumps(request, ensure_ascii=True, sort_keys=True) + "\n"
+            )
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError("Boogu worker request pipe failed") from exc
+
+    def _read_response(self) -> dict[str, Any]:
+        process = self._process
+        if process is None or process.stdout is None:
+            raise RuntimeError("Boogu worker stdout is unavailable")
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            if not selector.select(self.config.timeout_seconds):
+                raise TimeoutError(
+                    f"Boogu worker timed out after {self.config.timeout_seconds}s"
+                )
+            line = process.stdout.readline()
+        finally:
+            selector.close()
+        if not line:
+            returncode = process.poll()
+            raise RuntimeError(
+                "Boogu worker exited without a response: "
+                f"returncode={returncode}, stderr_log={self._stderr_path}"
+            )
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Boogu worker returned invalid JSON") from exc
+        if not isinstance(response, dict):
+            raise TypeError("Boogu worker response must be a JSON object")
+        return response
+
+    def close(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        request_id = uuid.uuid4().hex
+        try:
+            self._write_request(
+                {
+                    "schema_version": 1,
+                    "type": "shutdown",
+                    "request_id": request_id,
+                }
+            )
+            response = self._read_response()
+            if response != {
+                "schema_version": 1,
+                "type": "shutdown",
+                "request_id": request_id,
+                "status": "ok",
+            }:
+                raise RuntimeError(
+                    f"invalid Boogu worker shutdown response: {response}"
+                )
+            process.wait(timeout=self.config.timeout_seconds)
+            if process.returncode != 0:
+                raise RuntimeError(
+                    f"Boogu worker exited with code {process.returncode}"
+                )
+        except Exception:
+            self._terminate()
+            raise
+        finally:
+            self._close_pipes()
+
+    def _terminate(self) -> None:
+        process = self._process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        self._close_pipes()
+
+    def _close_pipes(self) -> None:
+        process = self._process
+        if process is not None:
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
+        if self._stderr_handle is not None:
+            self._stderr_handle.close()
+        self._process = None
+        self._stderr_handle = None
+
 
 @dataclass(frozen=True)
 class BooguReferenceEditResult:
@@ -438,6 +911,7 @@ def run_boogu_reference_edit(
     operation: BooguEditOperation,
     instruction: str,
     entity_phrase: str,
+    grounding_prompt: str | None = None,
     reference_type: ReferenceType,
     backend: BooguReferenceEditBackend,
     judge: BooguReferenceEditJudge,
@@ -454,6 +928,11 @@ def run_boogu_reference_edit(
         raise ValueError(f"unsupported Boogu edit operation: {operation}")
     instruction = _nonempty(instruction, "instruction")
     entity_phrase = _nonempty(entity_phrase, "entity_phrase")
+    grounding_prompt = (
+        entity_phrase
+        if grounding_prompt is None
+        else _nonempty(grounding_prompt, "grounding_prompt")
+    )
     clip_uid = _safe_component(clip_uid, "clip_uid")
     entity_id = _safe_component(entity_id, "entity_id")
     root = run_root.expanduser().resolve(strict=False)
@@ -499,7 +978,8 @@ def run_boogu_reference_edit(
         target_area=target_area,
         alignment=alignment,
     )
-    _write_bytes_atomic(edit_dir / "source_rgba.png", canonical_bytes)
+    source_rgba_path = edit_dir / "source_rgba.png"
+    _write_bytes_atomic(source_rgba_path, canonical_bytes)
     _save_rgb_png_atomic(edit_dir / "source_input_rgb.png", source_input_rgb)
     thinking_enabled = operation == "complete_entity"
 
@@ -538,7 +1018,7 @@ def run_boogu_reference_edit(
                 operation=operation,
                 source_rgba=source_rgba.copy(),
                 candidate_rgb=candidate_rgb.copy(),
-                entity_phrase=entity_phrase,
+                entity_phrase=grounding_prompt,
                 reference_type=reference_type,
             )
             if not isinstance(sam_review, BooguSamReview):
@@ -554,7 +1034,13 @@ def run_boogu_reference_edit(
                 if sam_review is not None
                 else "candidate_rejected"
             )
-    except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
         accepted = False
         rejection_reason = f"boogu_reference_edit_failed: {exc}"
 
@@ -562,8 +1048,13 @@ def run_boogu_reference_edit(
     output_ratio = width / height
     metadata: dict[str, Any] = {
         "schema_version": 1,
+        "backend": "boogu_image_0_1_edit_turbo",
+        "clip_uid": clip_uid,
+        "entity_id": entity_id,
         "status": "accepted" if accepted else "rejected",
         "operation": operation,
+        "entity_phrase": entity_phrase,
+        "grounding_prompt": grounding_prompt,
         "source_dimensions": {
             "width": source_rgba.width,
             "height": source_rgba.height,
@@ -587,6 +1078,9 @@ def run_boogu_reference_edit(
         "thinking_enabled": thinking_enabled,
         "output_sha256": output_sha256,
         "canonical_source_sha256": canonical_sha256,
+        "source_image_path": source_rgba_path.relative_to(root).as_posix(),
+        "source_image_sha256": canonical_sha256,
+        "generated_reference_sha256": output_sha256,
         "qwen_review": (
             qwen_review.model_dump(mode="json") if qwen_review is not None else None
         ),

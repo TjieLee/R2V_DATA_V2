@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,7 @@ from r2v_data_v2.v3.config import (
     QwenAnnotationConfig,
     QwenServiceConfig,
     QwenServicesConfig,
+    ReferenceEditConfig,
     ReferenceScopeConfig,
     RemoveConfig,
     SourceConfig,
@@ -43,6 +45,13 @@ from r2v_data_v2.v3.reference_completion_qwen import (
     QWEN_LOCALIZED_PROMPT_EN_SHORT,
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
+)
+from r2v_data_v2.v3.reference_edit import reference_edit_clips
+from r2v_data_v2.v3.reference_edit_boogu import (
+    BooguBackgroundReview,
+    BooguCompletionReview,
+    BooguEditOutput,
+    BooguSamReview,
 )
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
@@ -73,7 +82,7 @@ from r2v_data_v2.v3.schemas import (
     render_instruction_text,
 )
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
-from run_pipeline_v3 import run_pipeline_v3
+from run_pipeline_v3 import STAGE_ORDER, run_pipeline_v3
 
 WIDTH = 12
 HEIGHT = 9
@@ -87,6 +96,7 @@ def _config(
     allow_synthetic_completion: bool = False,
     pair: PairConfig | None = None,
     debug: bool = False,
+    reference_edit_enabled: bool = False,
 ) -> V3Config:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -116,6 +126,9 @@ def _config(
                 if pair is not None and pair.same_parent_fallback_enabled
                 else None
             ),
+            reference_edit_judge=(
+                QwenServiceConfig(model=model) if reference_edit_enabled else None
+            ),
         ),
         reference_scope=ReferenceScopeConfig(
             allow_local=allow_local,
@@ -125,6 +138,16 @@ def _config(
         remove=RemoveConfig(
             base_model_path=pretrained / "Qwen" / "edit",
             adapter_path=user_models / "object-remover",
+        ),
+        reference_edit=(
+            ReferenceEditConfig(
+                enabled=True,
+                python_executable=writable / "venvs" / "boogu" / "python",
+                code_root=writable / "vendor" / "Boogu-Image",
+                model_path=writable / "models" / "Boogu-Image-0.1-Edit-Turbo",
+            )
+            if reference_edit_enabled
+            else ReferenceEditConfig()
         ),
         debug=config_module.DebugConfig(save_diagnostics=debug),
     )
@@ -317,6 +340,8 @@ def _decision(scope: str = "full") -> RawEntityReferenceDecision:
     if scope == "reject":
         return RawEntityReferenceDecision(
             selected_candidate_id=None,
+            image_quality="acceptable",
+            completeness="fragmented",
             reference_scope="reject",
             visible_region="custom",
             whole_entity_recognizable=False,
@@ -325,11 +350,11 @@ def _decision(scope: str = "full") -> RawEntityReferenceDecision:
         )
     return RawEntityReferenceDecision(
         selected_candidate_id="candidate_1",
+        image_quality="high",
+        completeness="complete" if scope == "full" else "local_usable",
         reference_scope=scope,
         visible_region="whole" if scope == "full" else "central",
-        whole_entity_recognizable=(
-            scope in {"full", "local"}
-        ),
+        whole_entity_recognizable=(scope in {"full", "local"}),
         identity_features_visible=True,
         scope_reason="clear visual identity",
     )
@@ -2321,13 +2346,9 @@ class _LocalThenGeneratedFullJudge:
         assert set(source_images) == {item.image_path for item in candidates}
         generated = "reference_completion" in candidates[0].image_path
         self.calls.append("generated" if generated else "source")
-        decision = _decision(
-            self.generated_scope if generated else "local"
-        )
+        decision = _decision(self.generated_scope if generated else "local")
         if not generated and not self.source_recognizable:
-            decision = decision.model_copy(
-                update={"whole_entity_recognizable": False}
-            )
+            decision = decision.model_copy(update={"whole_entity_recognizable": False})
         return EntityReferenceDecisionAttempt(
             decision=decision,
             raw_responses=("{}",),
@@ -2350,9 +2371,7 @@ def _completion_rejection_path(
 
 
 def _read_completion_rejection(storage: RunStorage) -> dict[str, object]:
-    return json.loads(
-        _completion_rejection_path(storage).read_text(encoding="utf-8")
-    )
+    return json.loads(_completion_rejection_path(storage).read_text(encoding="utf-8"))
 
 
 def _assert_completion_rejection_artifacts(
@@ -2364,9 +2383,7 @@ def _assert_completion_rejection_artifacts(
         "diagnostics",
         expected_filename,
     }
-    diagnostic_names = {
-        path.name for path in (directory / "diagnostics").iterdir()
-    }
+    diagnostic_names = {path.name for path in (directory / "diagnostics").iterdir()}
     assert {
         "cleaned_source.png",
         "protected_component_mask.png",
@@ -2414,8 +2431,7 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert completion.calls[0]["entity_phrase"] == "entity 1"
     assert completion.calls[0]["prompt"] == QWEN_LOCALIZED_PROMPT_EN_SHORT
     assert completion.calls[0]["prompt"] == (
-        "Complete the missing parts in this image. "
-        "Do not generate a new instance."
+        "Complete the missing parts in this image. Do not generate a new instance."
     )
     assert segmenter.calls[0]["grounding_prompt"] == "entity 1"
     assert segmenter.calls[0]["session_entries"] == ["00.jpg"]
@@ -2443,9 +2459,9 @@ def test_generated_fallback_uses_existing_components_and_is_idempotent(
     assert metadata["fallback_used"] is False
     assert metadata["recovery_direction"] == ["top"]
     assert metadata["protected_component_ids"] == ["component_1"]
-    assert metadata["candidate_new_region_stats"][
-        "matching_recovery_directions"
-    ] == ["top"]
+    assert metadata["candidate_new_region_stats"]["matching_recovery_directions"] == [
+        "top"
+    ]
     diagnostic_directory = metadata_path.parent / "diagnostics"
     assert {path.name for path in diagnostic_directory.iterdir()} == {
         "cleaned_source.png",
@@ -2561,16 +2577,15 @@ def test_production_qwen_backend_accepts_arbitrary_policy_canvas_size(
     state = storage.read_clip("clip-1").references.entities[0]
     assert state.generation_metadata_path is not None
     metadata = json.loads(
-        (storage.root / state.generation_metadata_path).read_text(
-            encoding="utf-8"
-        )
+        (storage.root / state.generation_metadata_path).read_text(encoding="utf-8")
     )
     completion_metadata = metadata["completion"]
     for field_name, expected in size_diagnostics.items():
         assert completion_metadata[field_name] == expected
-    assert completion_metadata["original_model_input_size"] == metadata[
-        "completion_input_size"
-    ]
+    assert (
+        completion_metadata["original_model_input_size"]
+        == metadata["completion_input_size"]
+    )
 
 
 def test_production_qwen_size_failure_records_rejection_diagnostics(
@@ -2732,9 +2747,7 @@ def test_completion_generation_failure_keeps_original_local_reference(
     assert segmenter.calls == []
     rejection_path = _completion_rejection_path(storage)
     rejection = _read_completion_rejection(storage)
-    assert rejection["schema_version"] == (
-        "r2v.v3.reference_completion.rejection.1"
-    )
+    assert rejection["schema_version"] == ("r2v.v3.reference_completion.rejection.1")
     assert rejection["status"] == "rejected"
     assert rejection["clip_uid"] == "clip-1"
     assert rejection["entity_id"] == "e1"
@@ -2776,9 +2789,7 @@ def test_completion_generation_failure_keeps_original_local_reference(
     dataset = DatasetExporter(config, storage).export()
     assert dataset.sample_count == 1
     sample = json.loads(
-        (config.resolved_export_root / "samples.jsonl").read_text(
-            encoding="utf-8"
-        )
+        (config.resolved_export_root / "samples.jsonl").read_text(encoding="utf-8")
     )
     assert sample["references"][0]["synthetic"] is False
 
@@ -2828,9 +2839,7 @@ def test_generated_fallback_failure_keeps_original_local_reference(
         "RuntimeError" if segmentation_status == "exception" else None
     )
     if segmentation_status == "not_found":
-        assert rejection["reason"] == (
-            "SAM3 track status is not_found: not found"
-        )
+        assert rejection["reason"] == ("SAM3 track status is not_found: not found")
         assert rejection["segmentation"] == {
             "track_status": "not_found",
             "track_reason": "not found",
@@ -2857,9 +2866,7 @@ def test_completion_hard_check_rejection_records_report(
         config,
         storage,
         judge=_LocalThenGeneratedFullJudge(),
-        completion_backend=_LocalizedCompletionBackend(
-            return_input_unchanged=True
-        ),
+        completion_backend=_LocalizedCompletionBackend(return_input_unchanged=True),
         completion_judge=_LocalizedCompletionJudge(),
         completion_segmentation_backend=segmenter,
     )
@@ -2873,8 +2880,9 @@ def test_completion_hard_check_rejection_records_report(
     assert rejection["stage"] == "localized_hard_check"
     assert rejection["exception_type"] is None
     assert rejection["localized_hard_check"]["status"] == "failed"
-    assert "candidate_unchanged_from_input" in (
-        rejection["localized_hard_check"]["reasons"]
+    assert (
+        "candidate_unchanged_from_input"
+        in (rejection["localized_hard_check"]["reasons"])
     )
 
 
@@ -2895,9 +2903,7 @@ def test_completion_mask_gate_rejection_records_reasons_and_metrics(
         judge=_LocalThenGeneratedFullJudge(),
         completion_backend=_LocalizedCompletionBackend(),
         completion_judge=_LocalizedCompletionJudge(),
-        completion_segmentation_backend=_SingleFrameSegmentationBackend(
-            "mask_gate"
-        ),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend("mask_gate"),
     )
 
     state = storage.read_clip("clip-1").references.entities[0]
@@ -2909,9 +2915,7 @@ def test_completion_mask_gate_rejection_records_reasons_and_metrics(
     assert rejection["exception_type"] is None
     assert rejection["reason"] == "completion_growth_outside_recovery_corridor"
     candidate_stats = rejection["candidate_new_region_stats"]
-    assert "completion_growth_outside_recovery_corridor" in candidate_stats[
-        "reasons"
-    ]
+    assert "completion_growth_outside_recovery_corridor" in candidate_stats["reasons"]
     assert candidate_stats["outside_recovery_corridor_pixels"] > 0
     assert rejection["fallback_used"] is True
 
@@ -2980,9 +2984,7 @@ def test_completion_non_full_ranking_records_decision_and_issues(
     assert state.synthetic is False
     assert rejection["stage"] == "reference_ranking"
     assert rejection["exception_type"] is None
-    assert rejection["reference_ranking"]["decision"]["reference_scope"] == (
-        "local"
-    )
+    assert rejection["reference_ranking"]["decision"]["reference_scope"] == ("local")
     assert rejection["reference_ranking"]["issues"] == []
 
 
@@ -3095,9 +3097,7 @@ def test_completion_rejection_and_success_replace_each_other_idempotently(
         judge=_LocalThenGeneratedFullJudge(),
         completion_backend=_LocalizedCompletionBackend(),
         completion_judge=_LocalizedCompletionJudge(),
-        completion_segmentation_backend=_SingleFrameSegmentationBackend(
-            "not_found"
-        ),
+        completion_segmentation_backend=_SingleFrameSegmentationBackend("not_found"),
     )
     third_rejection = _read_completion_rejection(storage)
     assert third.completion_rejected == 1
@@ -3226,3 +3226,475 @@ def test_full_real_self_precedes_all_fallbacks(
     assert state.synthetic is False
     assert stats.completion_attempted == 0
     assert completion.calls == []
+
+
+class _ReferenceEditBackend:
+    def __init__(self) -> None:
+        self.start_calls = 0
+        self.close_calls = 0
+        self.calls: list[dict[str, object]] = []
+
+    def start(self, *, stderr_log_path: Path) -> None:
+        self.start_calls += 1
+        self.stderr_log_path = stderr_log_path
+
+    def edit(self, **kwargs: object) -> BooguEditOutput:
+        self.calls.append(kwargs)
+        buffer = io.BytesIO()
+        Image.new(
+            "RGB",
+            (int(kwargs["width"]), int(kwargs["height"])),
+            (73, 91, 127),
+        ).save(buffer, format="PNG")
+        instruction = str(kwargs["instruction"])
+        return BooguEditOutput(
+            png_bytes=buffer.getvalue(),
+            original_instruction=instruction,
+            rewritten_instruction=(
+                instruction if bool(kwargs["thinking_enabled"]) else None
+            ),
+            effective_instruction=instruction,
+        )
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FailingReferenceEditBackend(_ReferenceEditBackend):
+    def edit(self, **kwargs: object) -> BooguEditOutput:
+        del kwargs
+        raise RuntimeError("worker protocol failed")
+
+
+class _ReferenceEditJudge:
+    def __init__(self, *, accept: bool = True) -> None:
+        self.accept = accept
+        self.calls: list[str] = []
+
+    def review(self, **kwargs: object) -> object:
+        operation = str(kwargs["operation"])
+        self.calls.append(operation)
+        values = {
+            field: self.accept
+            for field in (
+                "same_physical_entity",
+                "identity_preserved",
+                "original_visible_attributes_preserved",
+                "exactly_one_entity",
+                "missing_parts_plausibly_completed",
+                "no_duplicate_entity",
+                "no_unrelated_entity",
+                "no_severe_structure_artifact",
+                "style_coherent",
+                "resolution_usable",
+                "reference_usable",
+                "certain",
+            )
+        }
+        if operation == "complete_entity":
+            return BooguCompletionReview(
+                verdict="accept" if self.accept else "reject",
+                reason="usable" if self.accept else "rejected",
+                **values,
+            )
+        background_values = {
+            field: self.accept
+            for field in (
+                "exactly_one_target_entity",
+                "identity_preserved",
+                "entity_appearance_consistent",
+                "no_duplicate_entity",
+                "no_added_salient_entity",
+                "no_unintended_completion_or_extension",
+                "background_coherent",
+                "background_style_consistent",
+                "no_halo_or_seam",
+                "subject_not_severely_redrawn",
+                "reference_usable",
+                "certain",
+            )
+        }
+        return BooguBackgroundReview(
+            verdict="accept" if self.accept else "reject",
+            reason="usable" if self.accept else "rejected",
+            **background_values,
+        )
+
+
+class _ReferenceEditSamReviewer:
+    def review(self, **kwargs: object) -> BooguSamReview:
+        del kwargs
+        return BooguSamReview(
+            passed=True,
+            target_entity_present=True,
+            exactly_one_target_instance=True,
+            area_growth_acceptable=True,
+            fragmentation_acceptable=True,
+            reason="valid",
+        )
+
+
+def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config)
+    pair_clips(config, storage, judge=_Judge())
+    canonical_hashes = {
+        entity_id: _sha256(storage.selected_entity_path("clip-1", entity_id))
+        for entity_id in ("e1", "e2")
+    }
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_eligible == 2
+    assert stats.entities_accepted == 2
+    assert stats.worker_starts == 1
+    assert backend.start_calls == 1
+    assert backend.close_calls == 1
+    assert len(backend.calls) == 2
+    assert clip.reference_edit is not None
+    assert clip.reference_edit.status == "ready"
+    for reference in clip.references.entities:
+        assert reference.status == "ready"
+        assert reference.synthetic is True
+        assert reference.image_path is not None
+        assert reference.image_path.endswith("/final_reference_1k.png")
+        assert (
+            _sha256(storage.selected_entity_path("clip-1", reference.entity_id))
+            == (canonical_hashes[reference.entity_id])
+        )
+        validate_entity_reference_artifact(
+            config,
+            storage,
+            "clip-1",
+            next(
+                entity
+                for entity in clip.annotation.entities
+                if entity.entity_id == reference.entity_id
+            ),
+            reference,
+            storage.read_frames("clip-1"),
+            storage.read_masks("clip-1"),
+        )
+
+    body = "Keep {{image_1}} and {{image_2}} visually consistent."
+    legend = [
+        InstructionLegendEntry(image_id="image_1", description="First entity."),
+        InstructionLegendEntry(image_id="image_2", description="Second entity."),
+    ]
+    storage.write_instruction(
+        "clip-1",
+        InstructionState(
+            status="ready",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=render_instruction_text(body, legend),
+        ),
+    )
+    dataset = DatasetExporter(config, storage).export()
+    assert dataset.sample_count == 1
+    sample = json.loads(
+        (config.resolved_export_root / "samples.jsonl").read_text(encoding="utf-8")
+    )
+    for exported, reference in zip(sample["references"], clip.references.entities):
+        assert (config.resolved_export_root / exported["image_path"]).read_bytes() == (
+            (storage.root / reference.image_path).read_bytes()
+        )
+    unused_backend = _ReferenceEditBackend()
+    skipped = reference_edit_clips(
+        config,
+        storage,
+        backend=unused_backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+    assert skipped.skipped_existing == 1
+    assert skipped.worker_starts == 0
+    assert unused_backend.start_calls == 0
+
+
+def test_reference_edit_stage_is_between_pair_and_instruct() -> None:
+    pair_index = STAGE_ORDER.index("pair")
+    assert STAGE_ORDER[pair_index : pair_index + 3] == (
+        "pair",
+        "reference_edit",
+        "instruct",
+    )
+
+
+def test_pipeline_runs_formal_reference_edit_stage_with_injected_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    config_path = tmp_path / "reference-edit.yaml"
+    assert config.qwen.candidate_judge is not None
+    assert config.qwen.background_remove_judge is not None
+    assert config.qwen.reference_edit_judge is not None
+    config_path.write_text(
+        "\n".join(
+            [
+                f"dataset_json: {config.dataset_json}",
+                f"run_root: {config.run_root}",
+                f"export_root: {config.export_root}",
+                "source:",
+                "  limit: 10",
+                "qwen:",
+                "  annotation:",
+                f"    model: {config.qwen.annotation.model}",
+                "  instruction_writer:",
+                f"    model: {config.qwen.instruction_writer.model}",
+                "  candidate_judge:",
+                f"    model: {config.qwen.candidate_judge.model}",
+                "  background_remove_judge:",
+                f"    model: {config.qwen.background_remove_judge.model}",
+                "  reference_edit_judge:",
+                f"    model: {config.qwen.reference_edit_judge.model}",
+                "remove:",
+                f"  base_model_path: {config.remove.base_model_path}",
+                f"  adapter_path: {config.remove.adapter_path}",
+                "reference_edit:",
+                "  enabled: true",
+                (
+                    "  python_executable: "
+                    f"{config.reference_edit.python_executable}"
+                ),
+                f"  code_root: {config.reference_edit.code_root}",
+                f"  model_path: {config.reference_edit.model_path}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_pipeline_v3(
+        config_path=config_path,
+        stages=("reference_edit",),
+        git_commit="pair-test",
+        reference_edit_backend=_ReferenceEditBackend(),
+        reference_edit_judge=_ReferenceEditJudge(),
+        reference_edit_sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert result["reference_edit"]["entities_accepted"] == 1
+    assert result["completed_stages"] == ["reference_edit"]
+
+
+def test_reference_edit_does_not_start_worker_without_eligible_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local"}))
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_eligible == 0
+    assert stats.worker_starts == 0
+    assert backend.start_calls == 0
+    assert backend.close_calls == 0
+    assert clip.reference_edit is not None
+    assert clip.reference_edit.entities[0].status == "not_required"
+
+
+def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    source_path = storage.selected_entity_path("clip-1", "e1")
+    source_bytes = source_path.read_bytes()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(accept=False),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    assert stats.entities_fallback == 1
+    assert clip.pairing.status == "ready"
+    assert clip.reference_edit.entities[0].status == "fallback"
+    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert reference.synthetic is False
+    assert reference.image_path == storage.relative_artifact_path(source_path)
+    assert source_path.read_bytes() == source_bytes
+
+
+def test_reference_edit_overwrite_restores_immutable_source_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    source_path = storage.selected_entity_path("clip-1", "e1")
+    source_bytes = source_path.read_bytes()
+    reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        overwrite=True,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(accept=False),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    assert stats.entities_fallback == 1
+    assert reference.synthetic is False
+    assert reference.image_path == storage.relative_artifact_path(source_path)
+    assert clip.reference_edit.entities[0].source_reference == reference
+    assert source_path.read_bytes() == source_bytes
+    assert not (
+        storage.reference_edit_dir("clip-1") / "e1" / "final_reference_1k.png"
+    ).exists()
+
+
+def test_reference_edit_worker_failure_is_logged_and_falls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_FailingReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_failed == 1
+    assert stats.entities_fallback == 1
+    assert clip.references.entities[0].synthetic is False
+    failures = [
+        json.loads(line)
+        for line in storage.failures_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert failures[-1]["stage"] == "reference_edit"
+    assert failures[-1]["details"]["entity_id"] == "e1"
+    assert failures[-1]["reason"].startswith("boogu_reference_edit_failed:")
+
+
+def test_production_pair_bypasses_legacy_completion_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+
+    def fail_legacy(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("legacy completion must not run")
+
+    monkeypatch.setattr(pair_module, "run_reference_completion_fallbacks", fail_legacy)
+    stats = pair_clips(config, storage, judge=_Judge({"e1": "local"}))
+
+    assert stats.completion_attempted == 0
+    assert storage.read_clip("clip-1").references.entities[0].completeness == (
+        "local_usable"
+    )
+
+
+def test_sharpness_score_controls_reference_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(max_candidates_per_entity=1),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    Image.new("RGB", (WIDTH, HEIGHT), (80, 80, 80)).save(
+        storage.frame_path("clip-1", 5),
+        format="JPEG",
+        quality=100,
+        subsampling=0,
+    )
+    checker = np.indices((HEIGHT, WIDTH)).sum(axis=0) % 2
+    pixels = np.repeat((checker * 255).astype(np.uint8)[..., None], 3, axis=2)
+    Image.fromarray(pixels, mode="RGB").save(
+        storage.frame_path("clip-1", 4),
+        format="JPEG",
+        quality=100,
+        subsampling=0,
+    )
+    clip = storage.read_clip("clip-1")
+    candidates = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid="clip-1",
+        entity=clip.annotation.entities[0],
+        frames=storage.read_frames("clip-1"),
+        masks=storage.read_masks("clip-1"),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].frame_slot == 4
+    assert candidates[0].sharpness_score > 0

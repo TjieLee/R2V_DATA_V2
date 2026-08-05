@@ -163,12 +163,15 @@ manifest
 -> background
 -> remove
 -> pair
+-> reference_edit
 -> instruct
 -> export
 ```
 
-There is no `reference_finalize` stage. Pairing publishes the final
-source-faithful entity references consumed directly by instruction and export.
+There is no generic `reference_finalize` stage. Pairing publishes canonical
+source-faithful references and routing decisions. The explicit
+`reference_edit` stage may replace an accepted entity's published path with a
+validated native Boogu `final_reference_1k.png` before instruction and export.
 
 ### 5.1 Stage responsibilities
 
@@ -264,12 +267,23 @@ annotation order, and at least one retained entity must pass temporal coverage.
 The stage does not resize references or perform cross-parent pairing. When the
 optional same-parent fallback is enabled, its second phase may replace a rejected
 or local target reference from an exact `parent_video_id` match after a dedicated
-visual judge accepts the same physical entity. The optional final phase may call
-the existing localized Qwen completion and existing SAM3 backend only for a
-remaining local self reference. Real references remain variable-size,
-source-faithful RGBA mask-bbox crops; generated fallback RGBA preserves binary
-alpha and exact white transparent RGB. Pairing creates no fixed canvas or second
-normalized artifact.
+visual judge accepts the same physical entity. When `reference_edit.enabled` is
+true, pair does not invoke the legacy localized Qwen completion fallback.
+Legacy source and artifacts remain compatible for old runs. Pairing records
+`image_quality` and the completeness route consumed by the later stage. Real
+references remain variable-size, source-faithful RGBA mask-bbox crops.
+
+#### `reference_edit`
+
+Run after pairing and before instruction generation. `repairable` references
+use Boogu entity completion; `complete` references may receive a coherent
+background; `local_usable` references remain source-faithful; severe or
+fragmented references are not published. One persistent JSONL worker loads
+Boogu once for all eligible entities. Accepted native RGB output is published
+as `reference_edit/<entity_id>/final_reference_1k.png`; rejected candidates use
+the explicit fallback policy. Qwen and SAM3 are independent production guards.
+SAM3 masks are review-only, and no mask paste-back or foreground pixel
+restoration is permitted.
 
 #### `instruct`
 
@@ -315,6 +329,9 @@ qwen:
 
   cross_pair_judge:
     # required explicitly only when same-parent fallback is enabled
+
+  reference_edit_judge:
+    # required explicitly only when reference_edit is enabled
 ```
 
 `qwen.cross_pair_judge` never falls back to `candidate_judge` or
@@ -643,24 +660,18 @@ it considers rejected targets and lower-priority local self references. A ready
 full real self reference is immutable; an accepted same-parent full real donor
 may replace a local self reference.
 
-Phase C is the thin optional localized-completion fallback controlled by
-`reference_scope.allow_synthetic_completion` (default `false`). It considers
-only remaining ready local, identity-visible real self references. It sends the
-published source-faithful RGBA through the existing localized Qwen completion,
-tracks the single `candidate_rgb.png` frame with `Sam3SegmentationBackend`, and
-reuses the existing deterministic mask/improvement/background gates, localized
-completion review, binary-alpha RGBA constructor, and reference ranking. Only a
-candidate that ranks as `full` is published. Any model, segmentation, gate,
-judge, or transactional write failure keeps the original local reference and
-does not fail the clip. No independent publication stage, three-judge
-publication system, or manual-approval state participates in production.
+The legacy Phase C localized-completion fallback remains available only to runs
+that do not enable `reference_edit`. Production runs with `reference_edit`
+enabled stop after real self and same-parent donor selection, then defer any
+generative work to the explicit stage.
 
 The resulting priority is: full real self, then same-parent full real donor,
-then Qwen generated fallback, then the original local/no reference outcome.
-Generated fallbacks cannot enter the donor index. Their accepted sidecar records
-source, input, candidate, mask, gate, review, ranking, model-setting, and output
-hash provenance; `selected/eN.png` remains the only reference consumed by
-instruction generation and export.
+then the configured post-pair reference edit, then the original local/no
+reference outcome. Generated references cannot enter the donor index. An
+accepted Boogu sidecar records source, candidate, model, review, and hash
+provenance. Instruction and export consume the final path in `clip.json`, which
+is either the source-faithful selected reference or accepted
+`final_reference_1k.png`.
 
 A donor must use the exact same `source.parent_video_id`, have a different
 `clip_uid`, ready annotation and pairing, and a retained full, identity-visible
@@ -919,6 +930,10 @@ Rules:
     "retained_entity_ids": ["e1"],
     "tokens": {"e1": "<ref_subject_1>"}
   },
+  "reference_edit": {
+    "status": "ready|failed",
+    "entities": []
+  },
   "instruction": {
     "status": "ready|failed",
     "instruction_body_template": "... {{image_1}} ...",
@@ -1149,6 +1164,22 @@ remove:
   adapter_weight_name: null
   save_rejected_candidates: false
 
+reference_edit:
+  enabled: false
+  backend: boogu_image_0_1_edit_turbo
+  python_executable: /mnt/workspace/litengjie/data/venvs/boogu-image/bin/python
+  code_root: /mnt/workspace/litengjie/data/vendor/Boogu-Image
+  model_path: /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708
+  model_revision: hotfix-1k-20260708
+  cuda_visible_devices: "0"
+  target_area: 1048576
+  alignment: 16
+  timeout_seconds: 3600
+  add_background_to_complete: true
+  fallback_policy: keep_source
+  sam_max_area_growth_ratio: 3.0
+  sam_max_significant_components: 4
+
 instruction:
   enabled: true
   repair_retries: 1
@@ -1177,6 +1208,9 @@ Validation must reject:
 - unsupported remove dtypes, non-finite guidance values, or invalid mask limits;
 - an empty `remove.adapter_weight_name`; adapter existence is checked lazily by
   the real backend, where a missing required adapter fails closed.
+- enabled `reference_edit` without a dedicated Qwen judge, local worker paths,
+  revision `hotfix-1k-20260708`, 16-pixel alignment, positive timeout and target
+  area, or an explicit `keep_source|reject_entity` fallback policy;
 - nonzero `background.raw_foreground_area_ratio` for V3;
 - an empty `source.limit` unless `source.allow_full_run` is `true`;
 - a non-positive or non-integer `source.limit`;
@@ -1198,6 +1232,8 @@ r2v_data_v2/v3/
 ├── pair.py
 ├── reference_judge.py
 |-- cross_pair_judge.py
+├── reference_edit.py
+├── reference_edit_boogu.py
 ├── background.py
 ├── remove.py
 ├── qwen_image_edit_backend.py
@@ -1456,10 +1492,12 @@ V3 is complete only when all statements are true:
 - New instructions use English raw text with `{{image_N}}` placeholders and
   deterministic `<Image N>` rendered labels.
 - Entity references are explicitly full, local, or rejected.
-- Entity references remain variable-size source-faithful RGBA crops and are
-  exported once, without normalization or duplicated source files.
-- Synthetic entity completion is disabled by default; when explicitly enabled,
-  only the thin post-donor localized fallback is allowed.
+- Unedited entity references remain variable-size source-faithful RGBA crops.
+  Accepted Boogu references remain native approximately-one-megapixel RGB PNGs;
+  both are exported once without a second normalized copy.
+- The legacy synthetic completion fallback remains disabled by default.
+  Production Boogu generation occurs only in the explicit `reference_edit`
+  stage when it is enabled and passes both Qwen and SAM3 review.
 - Non-empty background masks always require removal.
 - FLUX is not the V3 production backend.
 - Rejected removal outputs never fall back to raw.
