@@ -448,8 +448,13 @@ class EntityReferenceState(SchemaModel):
                 self.generation_output_sha256,
             )
             if self.synthetic:
-                if self.reference_scope != "full":
-                    raise ValueError("generated fallback reference must use full scope")
+                if (
+                    self.reference_scope == "local"
+                    and self.completeness != "local_usable"
+                ):
+                    raise ValueError(
+                        "generated local reference must preserve local completeness"
+                    )
                 if self.source_entity_id != self.entity_id:
                     raise ValueError(
                         "generated fallback must preserve self entity provenance"
@@ -864,6 +869,7 @@ ReferenceEditOperation = Literal[
 ReferenceEditFallbackPolicy = Literal[
     "not_used",
     "keep_source",
+    "completion_candidate",
     "reject_entity",
 ]
 
@@ -877,6 +883,10 @@ class ReferenceEditEntityState(SchemaModel):
     output_image_path: Optional[str] = None
     operation: Optional[ReferenceEditOperation] = None
     metadata_path: Optional[str] = None
+    operations: list[ReferenceEditOperation] = Field(default_factory=list)
+    completion_metadata_path: Optional[str] = None
+    background_metadata_path: Optional[str] = None
+    background_fallback: Literal["none", "completion_candidate"] = "none"
     fallback_policy: ReferenceEditFallbackPolicy = "not_used"
     reason: Optional[str] = None
 
@@ -893,6 +903,35 @@ class ReferenceEditEntityState(SchemaModel):
             raise ValueError(
                 "reference edit source evidence must be a ready real reference"
             )
+        allowed_sequences = {
+            (),
+            ("complete_entity",),
+            ("add_entity_background",),
+            ("complete_entity", "add_entity_background"),
+        }
+        sequence = tuple(self.operations)
+        if sequence not in allowed_sequences:
+            raise ValueError("reference edit operations are not in production order")
+        if self.operation is not None and sequence and self.operation != sequence[-1]:
+            raise ValueError("reference edit operation must match the last operation")
+        if self.completion_metadata_path is not None and not (
+            self.completion_metadata_path.strip()
+            and (
+                "complete_entity" in sequence
+                or not sequence
+                and self.operation == "complete_entity"
+            )
+        ):
+            raise ValueError("completion metadata requires a completion operation")
+        if self.background_metadata_path is not None and not (
+            self.background_metadata_path.strip()
+            and (
+                "add_entity_background" in sequence
+                or not sequence
+                and self.operation == "add_entity_background"
+            )
+        ):
+            raise ValueError("background metadata requires a background operation")
         if self.status == "accepted":
             if (
                 self.operation is None
@@ -906,17 +945,43 @@ class ReferenceEditEntityState(SchemaModel):
                 )
             if self.fallback_policy != "not_used" or self.reason is not None:
                 raise ValueError("accepted reference edit cannot use fallback")
+            if self.background_fallback != "none":
+                raise ValueError("accepted reference edit cannot mark background fallback")
         elif self.status == "fallback":
-            if self.fallback_policy != "keep_source":
-                raise ValueError("reference edit fallback must keep source")
-            if self.output_image_path != self.source_image_path:
-                raise ValueError("keep-source fallback must publish the source image")
             if self.reason is None or not self.reason.strip():
                 raise ValueError("reference edit fallback requires a reason")
+            if self.fallback_policy == "keep_source":
+                if self.output_image_path != self.source_image_path:
+                    raise ValueError("keep-source fallback must publish the source image")
+                if self.background_fallback != "none":
+                    raise ValueError("keep-source fallback cannot mark background fallback")
+            elif self.fallback_policy == "completion_candidate":
+                if (
+                    self.route != "repairable"
+                    or sequence != ("complete_entity", "add_entity_background")
+                    or self.operation != "add_entity_background"
+                    or self.output_image_path is None
+                    or self.output_image_path == self.source_image_path
+                    or self.metadata_path is None
+                    or self.completion_metadata_path is None
+                    or self.background_metadata_path is None
+                    or self.background_fallback != "completion_candidate"
+                ):
+                    raise ValueError(
+                        "completion fallback requires both operations and final output"
+                    )
+            else:
+                raise ValueError(
+                    "reference edit fallback must keep source or completion candidate"
+                )
         elif self.status == "not_required":
             if (
                 self.operation is not None
                 or self.metadata_path is not None
+                or self.operations
+                or self.completion_metadata_path is not None
+                or self.background_metadata_path is not None
+                or self.background_fallback != "none"
                 or self.fallback_policy != "not_used"
             ):
                 raise ValueError("not-required reference edit cannot run generation")
@@ -929,6 +994,8 @@ class ReferenceEditEntityState(SchemaModel):
                 raise ValueError("rejected reference edit cannot publish an output")
             if self.fallback_policy != "reject_entity":
                 raise ValueError("rejected reference edit must reject the entity")
+            if self.background_fallback != "none":
+                raise ValueError("rejected reference edit cannot mark background fallback")
             if self.reason is None or not self.reason.strip():
                 raise ValueError("rejected reference edit requires a reason")
         return self

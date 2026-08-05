@@ -272,18 +272,27 @@ true, pair does not invoke the legacy localized Qwen completion fallback.
 Legacy source and artifacts remain compatible for old runs. Pairing records
 `image_quality` and the completeness route consumed by the later stage. Real
 references remain variable-size, source-faithful RGBA mask-bbox crops.
+Candidate sharpness is the variance of a discrete Laplacian on the original RGB
+frame inside a two-pixel-eroded entity mask, with the original mask used when
+erosion leaves too few pixels. The deterministic shortlist order is border
+contact, descending area ratio, descending sharpness, center distance, then the
+fixed slot priority. Bbox fill remains diagnostic metadata only.
 
 #### `reference_edit`
 
-Run after pairing and before instruction generation. `repairable` references
-use Boogu entity completion; `complete` references may receive a coherent
-background; `local_usable` references remain source-faithful; severe or
-fragmented references are not published. One persistent JSONL worker loads
-Boogu once for all eligible entities. Accepted native RGB output is published
-as `reference_edit/<entity_id>/final_reference_1k.png`; rejected candidates use
-the explicit fallback policy. Qwen and SAM3 are independent production guards.
-SAM3 masks are review-only, and no mask paste-back or foreground pixel
-restoration is permitted.
+Run after pairing and before instruction generation. `complete` references run
+background generation only. `repairable` references run completion, Qwen/SAM
+completion review, then background generation from the accepted completion
+candidate. `local_usable` references run background generation but remain local
+references; their visible-region and whole-entity fields are not promoted.
+Severely incomplete or fragmented references do not enter the stage. One
+persistent JSONL worker loads Boogu once for all eligible entities and both
+repairable operations reuse it. Accepted native RGB output is published as
+`reference_edit/<entity_id>/final_reference_1k.png`. If repairable completion
+passes but background generation fails, the completion candidate is the
+explicit fallback. Qwen and SAM3 are independent production guards. SAM3 masks
+are review-only, and no mask paste-back or foreground pixel restoration is
+permitted.
 
 #### `instruct`
 

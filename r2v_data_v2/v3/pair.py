@@ -57,6 +57,7 @@ _ENTITY_PNG = re.compile(r"e[1-9]\d*\.png")
 _CROSS_PAIR_CONTACT_SHEET_COLUMNS = 5
 _CROSS_PAIR_CONTACT_SHEET_PANEL_MAX_SIDE = 384
 _CROSS_PAIR_CONTACT_SHEET_LABEL_HEIGHT = 28
+_MIN_ERODED_SHARPNESS_PIXELS = 9
 
 
 @dataclass(frozen=True)
@@ -326,21 +327,38 @@ def _masked_sharpness_score(source: np.ndarray, mask: np.ndarray) -> float:
     binary = np.asarray(mask, dtype=bool)
     if binary.shape != source.shape[:2] or not binary.any():
         raise ValueError("sharpness mask must match source and be non-empty")
+    evaluation_mask = _eroded_sharpness_mask(binary)
     gray = 0.299 * source[..., 0] + 0.587 * source[..., 1] + 0.114 * source[..., 2]
-    horizontal_valid = binary[:, 1:] & binary[:, :-1]
-    vertical_valid = binary[1:, :] & binary[:-1, :]
-    gradients: list[np.ndarray] = []
-    if horizontal_valid.any():
-        gradients.append(np.diff(gray, axis=1)[horizontal_valid])
-    if vertical_valid.any():
-        gradients.append(np.diff(gray, axis=0)[vertical_valid])
-    if not gradients:
-        return 0.0
-    values = np.concatenate(gradients).astype(np.float64, copy=False)
-    score = float(np.mean(values * values))
+    padded = np.pad(gray.astype(np.float64, copy=False), 1, mode="edge")
+    laplacian = (
+        padded[:-2, 1:-1]
+        + padded[2:, 1:-1]
+        + padded[1:-1, :-2]
+        + padded[1:-1, 2:]
+        - 4.0 * padded[1:-1, 1:-1]
+    )
+    values = laplacian[evaluation_mask]
+    score = float(np.var(values)) if values.size > 1 else 0.0
     if not math.isfinite(score) or score < 0:
         raise ValueError("sharpness score must be finite and non-negative")
     return score
+
+
+def _eroded_sharpness_mask(mask: np.ndarray) -> np.ndarray:
+    binary = np.asarray(mask, dtype=bool)
+    padded = np.pad(binary, 2, mode="constant", constant_values=False)
+    eroded = np.ones_like(binary, dtype=bool)
+    for row_offset in range(5):
+        for column_offset in range(5):
+            eroded &= padded[
+                row_offset : row_offset + binary.shape[0],
+                column_offset : column_offset + binary.shape[1],
+            ]
+    return (
+        eroded
+        if np.count_nonzero(eroded) >= _MIN_ERODED_SHARPNESS_PIXELS
+        else binary
+    )
 
 
 def build_entity_reference_candidates(
@@ -389,9 +407,8 @@ def build_entity_reference_candidates(
     candidates.sort(
         key=lambda candidate: (
             candidate.border_contact_count,
+            -candidate.area_ratio,
             -candidate.sharpness_score,
-            -candidate.area_pixels,
-            -candidate.bbox_fill_ratio,
             candidate.normalized_center_distance,
             _SLOT_PRIORITY_INDEX[candidate.frame_slot],
         )

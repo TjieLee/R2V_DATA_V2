@@ -521,9 +521,9 @@ class V3Config:
             raise ValueError(
                 "reference_edit.timeout_seconds must be a positive integer"
             )
-        if not isinstance(self.reference_edit.add_background_to_complete, bool):
-            raise TypeError(
-                "reference_edit.add_background_to_complete must be a boolean"
+        if self.reference_edit.add_background_to_complete is not True:
+            raise ValueError(
+                "reference_edit.add_background_to_complete must be true"
             )
         if self.reference_edit.fallback_policy not in {
             "keep_source",

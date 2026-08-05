@@ -46,7 +46,11 @@ from r2v_data_v2.v3.reference_completion_qwen import (
     QwenImageEdit2511CompletionConfig,
     QwenImageEdit2511ReferenceCompletionBackend,
 )
-from r2v_data_v2.v3.reference_edit import reference_edit_clips
+from r2v_data_v2.v3.reference_edit import (
+    BACKGROUND_PROMPT,
+    COMPLETION_PROMPT_TEMPLATE,
+    reference_edit_clips,
+)
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguBackgroundReview,
     BooguCompletionReview,
@@ -348,13 +352,21 @@ def _decision(scope: str = "full") -> RawEntityReferenceDecision:
             identity_features_visible=False,
             scope_reason="not reusable",
         )
+    completeness = (
+        "complete"
+        if scope == "full"
+        else "repairable"
+        if scope == "repairable"
+        else "local_usable"
+    )
+    reference_scope = "full" if scope == "full" else "local"
     return RawEntityReferenceDecision(
         selected_candidate_id="candidate_1",
         image_quality="high",
-        completeness="complete" if scope == "full" else "local_usable",
-        reference_scope=scope,
+        completeness=completeness,
+        reference_scope=reference_scope,
         visible_region="whole" if scope == "full" else "central",
-        whole_entity_recognizable=(scope in {"full", "local"}),
+        whole_entity_recognizable=scope in {"full", "local"},
         identity_features_visible=True,
         scope_reason="clear visual identity",
     )
@@ -3267,15 +3279,22 @@ class _FailingReferenceEditBackend(_ReferenceEditBackend):
 
 
 class _ReferenceEditJudge:
-    def __init__(self, *, accept: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        accept: bool = True,
+        reject_operations: set[str] | None = None,
+    ) -> None:
         self.accept = accept
+        self.reject_operations = reject_operations or set()
         self.calls: list[str] = []
 
     def review(self, **kwargs: object) -> object:
         operation = str(kwargs["operation"])
         self.calls.append(operation)
+        accepted = self.accept and operation not in self.reject_operations
         values = {
-            field: self.accept
+            field: accepted
             for field in (
                 "same_physical_entity",
                 "identity_preserved",
@@ -3293,12 +3312,12 @@ class _ReferenceEditJudge:
         }
         if operation == "complete_entity":
             return BooguCompletionReview(
-                verdict="accept" if self.accept else "reject",
-                reason="usable" if self.accept else "rejected",
+                verdict="accept" if accepted else "reject",
+                reason="usable" if accepted else "rejected",
                 **values,
             )
         background_values = {
-            field: self.accept
+            field: accepted
             for field in (
                 "exactly_one_target_entity",
                 "identity_preserved",
@@ -3315,8 +3334,8 @@ class _ReferenceEditJudge:
             )
         }
         return BooguBackgroundReview(
-            verdict="accept" if self.accept else "reject",
-            reason="usable" if self.accept else "rejected",
+            verdict="accept" if accepted else "reject",
+            reason="usable" if accepted else "rejected",
             **background_values,
         )
 
@@ -3509,7 +3528,7 @@ def test_reference_edit_does_not_start_worker_without_eligible_entity(
         reference_edit_enabled=True,
     )
     storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge({"e1": "local"}))
+    pair_clips(config, storage, judge=_Judge({"e1": "reject"}))
     backend = _ReferenceEditBackend()
 
     stats = reference_edit_clips(
@@ -3525,8 +3544,155 @@ def test_reference_edit_does_not_start_worker_without_eligible_entity(
     assert stats.worker_starts == 0
     assert backend.start_calls == 0
     assert backend.close_calls == 0
-    assert clip.reference_edit is not None
-    assert clip.reference_edit.entities[0].status == "not_required"
+    assert clip.reference_edit is None
+
+
+def test_repairable_reference_runs_completion_then_background_with_one_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.selected_entity_path("clip-1", "e1")
+    canonical_bytes = canonical.read_bytes()
+    backend = _ReferenceEditBackend()
+    judge = _ReferenceEditJudge()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=judge,
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert stats.entities_accepted == 1
+    assert stats.worker_starts == 1
+    assert backend.start_calls == 1
+    assert backend.close_calls == 1
+    assert judge.calls == ["complete_entity", "add_entity_background"]
+    assert [call["thinking_enabled"] for call in backend.calls] == [True, False]
+    entity_phrase = storage.read_clip("clip-1").annotation.entities[0].phrase
+    assert [call["instruction"] for call in backend.calls] == [
+        COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity_phrase),
+        BACKGROUND_PROMPT,
+    ]
+    edit_dir = storage.reference_edit_dir("clip-1") / "e1"
+    completion_path = edit_dir / "completion_candidate_1k.png"
+    background_path = edit_dir / "background_candidate_1k.png"
+    assert completion_path.is_file()
+    assert background_path.is_file()
+    assert (edit_dir / "completion_metadata.json").is_file()
+    assert (edit_dir / "background_metadata.json").is_file()
+    assert (edit_dir / "final_metadata.json").is_file()
+    assert backend.calls[1]["source_rgb"].tobytes() == (
+        Image.open(completion_path).convert("RGB").tobytes()
+    )
+    background_metadata = json.loads(
+        (edit_dir / "background_metadata.json").read_text(encoding="utf-8")
+    )
+    assert background_metadata["source_image_path"].endswith(
+        "/completion_candidate_1k.png"
+    )
+    assert (edit_dir / "final_reference_1k.png").read_bytes() == (
+        background_path.read_bytes()
+    )
+    state = storage.read_clip("clip-1").reference_edit.entities[0]
+    assert state.operations == ["complete_entity", "add_entity_background"]
+    assert state.background_fallback == "none"
+    assert canonical.read_bytes() == canonical_bytes
+
+
+def test_complete_reference_runs_only_background_with_exact_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    backend = _ReferenceEditBackend()
+
+    reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert len(backend.calls) == 1
+    assert backend.calls[0]["instruction"] == BACKGROUND_PROMPT
+    assert backend.calls[0]["thinking_enabled"] is False
+
+
+def test_local_reference_adds_background_without_promoting_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    source = storage.read_clip("clip-1").references.entities[0]
+    backend = _ReferenceEditBackend()
+
+    reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    reference = storage.read_clip("clip-1").references.entities[0]
+    assert len(backend.calls) == 1
+    assert reference.synthetic is True
+    assert reference.reference_scope == "local"
+    assert reference.visible_region == source.visible_region
+    assert reference.whole_entity_recognizable == source.whole_entity_recognizable
+    assert reference.whole_entity_recognizable is False
+    assert reference.completeness == "local_usable"
+
+
+def test_repairable_background_rejection_falls_back_to_completion_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(
+            reject_operations={"add_entity_background"},
+        ),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    edit_dir = storage.reference_edit_dir("clip-1") / "e1"
+    completion_path = edit_dir / "completion_candidate_1k.png"
+    final_path = edit_dir / "final_reference_1k.png"
+    assert stats.entities_fallback == 1
+    assert len(backend.calls) == 2
+    assert final_path.read_bytes() == completion_path.read_bytes()
+    final_metadata = json.loads(
+        (edit_dir / "final_metadata.json").read_text(encoding="utf-8")
+    )
+    assert final_metadata["background_fallback"] == "completion_candidate"
+    clip = storage.read_clip("clip-1")
+    state = clip.reference_edit.entities[0]
+    assert state.status == "fallback"
+    assert state.fallback_policy == "completion_candidate"
+    assert state.background_fallback == "completion_candidate"
+    assert clip.references.entities[0].synthetic is True
 
 
 def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
@@ -3698,3 +3864,74 @@ def test_sharpness_score_controls_reference_shortlist(
     assert len(candidates) == 1
     assert candidates[0].frame_slot == 4
     assert candidates[0].sharpness_score > 0
+
+
+def test_laplacian_sharpness_uses_two_pixel_eroded_mask() -> None:
+    source = np.full((15, 15, 3), 100, dtype=np.float32)
+    mask = np.zeros((15, 15), dtype=bool)
+    mask[2:13, 2:13] = True
+    source[2, 2:13] = 255
+    source[12, 2:13] = 0
+    source[2:13, 2] = 255
+    source[2:13, 12] = 0
+
+    eroded = pair_module._eroded_sharpness_mask(mask)
+    score = pair_module._masked_sharpness_score(source, mask)
+
+    expected = np.zeros_like(mask)
+    expected[4:11, 4:11] = True
+    assert np.array_equal(eroded, expected)
+    assert score == 0.0
+
+    small = np.ones((5, 6), dtype=bool)
+    assert np.array_equal(pair_module._eroded_sharpness_mask(small), small)
+
+
+def test_reference_shortlist_uses_fixed_production_sort_tuple(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(max_candidates_per_entity=10),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    original = pair_module._candidate_from_frame
+
+    def controlled_candidate(**kwargs: object):
+        candidate = original(**kwargs)
+        slot = candidate.frame_slot
+        return replace(
+            candidate,
+            border_contact_count=slot % 2,
+            area_ratio=(10 - slot // 2) / 20,
+            sharpness_score=float((slot * 3) % 7),
+            normalized_center_distance=float((slot * 5) % 11) / 11,
+            bbox_fill_ratio=float(slot) / 10,
+        )
+
+    monkeypatch.setattr(pair_module, "_candidate_from_frame", controlled_candidate)
+    clip = storage.read_clip("clip-1")
+    candidates = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid="clip-1",
+        entity=clip.annotation.entities[0],
+        frames=storage.read_frames("clip-1"),
+        masks=storage.read_masks("clip-1"),
+    )
+
+    expected = sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.border_contact_count,
+            -candidate.area_ratio,
+            -candidate.sharpness_score,
+            candidate.normalized_center_distance,
+            pair_module._SLOT_PRIORITY_INDEX[candidate.frame_slot],
+        ),
+    )
+    assert [item.frame_slot for item in candidates] == [
+        item.frame_slot for item in expected
+    ]

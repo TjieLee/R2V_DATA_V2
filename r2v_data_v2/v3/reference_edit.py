@@ -10,11 +10,13 @@ from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguReferenceEditBackend,
     BooguReferenceEditJudge,
+    BooguReferenceEditResult,
     BooguSamReviewer,
     BooguSubprocessBackend,
     BooguWorkerConfig,
     QwenBooguReferenceEditJudge,
     Sam3BooguReferenceReviewer,
+    publish_boogu_final_reference,
     run_boogu_reference_edit,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
@@ -53,26 +55,31 @@ class ReferenceEditStats:
         return asdict(self)
 
 
+COMPLETION_PROMPT_TEMPLATE = (
+    "图片中只有一个实体，实体是“{entity_phrase}”。"
+    "补全残缺的部分。不要引入新的实体，风格保持一致。"
+    "如果补全不了，则只保留最能表示该实体的部分，"
+    "去除零散且不合理的部分。"
+)
+BACKGROUND_PROMPT = "给图像添加符合风格的背景，不要增加任何实例。"
+
+
 def _route(reference: EntityReferenceState) -> ReferenceCompleteness:
     if reference.completeness is not None:
         return reference.completeness
     return "complete" if reference.reference_scope == "full" else "local_usable"
 
 
-def _operation(
-    config: V3Config,
-    reference: EntityReferenceState,
-) -> str | None:
+def _operations(reference: EntityReferenceState) -> tuple[str, ...]:
     route = _route(reference)
     if route == "repairable":
-        return "complete_entity"
-    if route == "complete" and config.reference_edit.add_background_to_complete:
-        return "add_entity_background"
-    return None
+        return ("complete_entity", "add_entity_background")
+    if route in {"complete", "local_usable"}:
+        return ("add_entity_background",)
+    return ()
 
 
 def _eligible_references(
-    config: V3Config,
     storage: RunStorage,
     *,
     overwrite: bool,
@@ -101,7 +108,7 @@ def _eligible_references(
                 if overwrite and current.entity_id in previous
                 else current
             )
-            if reference.status == "ready" and _operation(config, reference) is not None:
+            if reference.status == "ready" and _operations(reference):
                 count += 1
     return count
 
@@ -146,16 +153,8 @@ def _rejected_reference(
 
 def _instruction(operation: str, entity: AnnotationEntity) -> str:
     if operation == "complete_entity":
-        return (
-            f"Complete the same {entity.phrase} as one coherent full entity. "
-            "Preserve its identity, visible attributes, proportions, clothing, "
-            "materials, colors, pose continuity, and camera style. Add no second entity."
-        )
-    return (
-        f"Place the same {entity.phrase} on a simple coherent neutral background. "
-        "Preserve the entity exactly, do not extend or complete it, and add no other "
-        "salient entity."
-    )
+        return COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity.phrase)
+    return BACKGROUND_PROMPT
 
 
 def _accepted_reference(
@@ -165,6 +164,7 @@ def _accepted_reference(
     clip_uid: str,
     output_path: Path,
     metadata_path: Path,
+    preserve_local_scope: bool = False,
 ) -> EntityReferenceState:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     source_sha256 = metadata.get("source_image_sha256")
@@ -177,22 +177,37 @@ def _accepted_reference(
     return EntityReferenceState(
         entity_id=reference.entity_id,
         status="ready",
-        reference_scope="full",
-        visible_region="whole",
-        whole_entity_recognizable=True,
-        identity_features_visible=True,
+        reference_scope=(reference.reference_scope if preserve_local_scope else "full"),
+        visible_region=(reference.visible_region if preserve_local_scope else "whole"),
+        whole_entity_recognizable=(
+            reference.whole_entity_recognizable if preserve_local_scope else True
+        ),
+        identity_features_visible=(
+            reference.identity_features_visible if preserve_local_scope else True
+        ),
         scope_reason="accepted_boogu_reference_edit",
         image_path=storage.relative_artifact_path(output_path),
         source_frame_index=reference.source_frame_index,
         source_clip_uid=clip_uid,
         source_entity_id=reference.entity_id,
-        image_quality="high",
-        completeness="complete",
+        image_quality=(reference.image_quality if preserve_local_scope else "high"),
+        completeness=(reference.completeness if preserve_local_scope else "complete"),
         synthetic=True,
         generation_metadata_path=storage.relative_artifact_path(metadata_path),
         generation_source_sha256=source_sha256,
         generation_output_sha256=output_sha256,
     )
+
+
+def _rejection_reason(result: BooguReferenceEditResult) -> str:
+    reason = "boogu_candidate_rejected"
+    if result.rejection_path is None:
+        return reason
+    payload = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    raw_reason = payload.get("reason")
+    if isinstance(raw_reason, str) and raw_reason.strip():
+        return raw_reason.strip()
+    return reason
 
 
 def reference_edit_clips(
@@ -212,7 +227,6 @@ def reference_edit_clips(
 
     counters = {field: 0 for field in ReferenceEditStats.__dataclass_fields__}
     eligible_count = _eligible_references(
-        config,
         storage,
         overwrite=overwrite,
     )
@@ -320,8 +334,8 @@ def reference_edit_clips(
                         raise ValueError("ready reference has no image_path")
                     _resolve_artifact(storage, reference.image_path)
                     route = _route(reference)
-                    operation = _operation(config, reference)
-                    if operation is None:
+                    operations = _operations(reference)
+                    if not operations:
                         final_references.append(reference)
                         edit_states.append(
                             ReferenceEditEntityState(
@@ -337,32 +351,74 @@ def reference_edit_clips(
                     if active_backend is None or active_judge is None:
                         raise RuntimeError("reference edit runtime was not initialized")
                     entity = entities[reference.entity_id]
-                    result = run_boogu_reference_edit(
-                        run_root=storage.root,
-                        clip_uid=clip.clip_uid,
-                        entity_id=reference.entity_id,
-                        operation=operation,
-                        instruction=_instruction(operation, entity),
-                        entity_phrase=entity.phrase,
-                        grounding_prompt=entity.grounding_prompt,
-                        reference_type=entity.reference_type,
-                        backend=active_backend,
-                        judge=active_judge,
-                        sam_reviewer=active_sam,
-                        target_area=config.reference_edit.target_area,
-                        alignment=config.reference_edit.alignment,
-                        model_revision=config.reference_edit.model_revision,
-                        fallback_status=config.reference_edit.fallback_policy,
-                        overwrite=overwrite,
-                    )
-                    if result.status == "accepted":
-                        assert result.final_reference_path is not None
+                    results: dict[str, BooguReferenceEditResult] = {}
+                    source_image_path: Path | None = None
+                    for operation in operations:
+                        result = run_boogu_reference_edit(
+                            run_root=storage.root,
+                            clip_uid=clip.clip_uid,
+                            entity_id=reference.entity_id,
+                            operation=operation,
+                            instruction=_instruction(operation, entity),
+                            entity_phrase=entity.phrase,
+                            grounding_prompt=entity.grounding_prompt,
+                            reference_type=entity.reference_type,
+                            backend=active_backend,
+                            judge=active_judge,
+                            sam_reviewer=active_sam,
+                            target_area=config.reference_edit.target_area,
+                            alignment=config.reference_edit.alignment,
+                            model_revision=config.reference_edit.model_revision,
+                            fallback_status=config.reference_edit.fallback_policy,
+                            source_image_path=source_image_path,
+                            publish_final=False,
+                            overwrite=overwrite,
+                        )
+                        results[operation] = result
+                        if result.status != "accepted":
+                            break
+                        if operation == "complete_entity":
+                            if result.candidate_path is None:
+                                raise RuntimeError(
+                                    "accepted completion has no candidate artifact"
+                                )
+                            source_image_path = result.candidate_path
+
+                    attempted_operations = list(results)
+                    completion_result = results.get("complete_entity")
+                    background_result = results.get("add_entity_background")
+                    if len(results) == len(operations) and all(
+                        result.status == "accepted" for result in results.values()
+                    ):
+                        selected = results[operations[-1]]
+                        if selected.candidate_path is None:
+                            raise RuntimeError(
+                                "accepted reference edit has no candidate artifact"
+                            )
+                        publication = publish_boogu_final_reference(
+                            run_root=storage.root,
+                            clip_uid=clip.clip_uid,
+                            entity_id=reference.entity_id,
+                            candidate_path=selected.candidate_path,
+                            selected_metadata_path=selected.metadata_path,
+                            completion_metadata_path=(
+                                completion_result.metadata_path
+                                if completion_result is not None
+                                else None
+                            ),
+                            background_metadata_path=(
+                                background_result.metadata_path
+                                if background_result is not None
+                                else None
+                            ),
+                        )
                         accepted = _accepted_reference(
                             storage,
                             reference,
                             clip_uid=clip.clip_uid,
-                            output_path=result.final_reference_path,
-                            metadata_path=result.metadata_path,
+                            output_path=publication.final_reference_path,
+                            metadata_path=publication.final_metadata_path,
+                            preserve_local_scope=route == "local_usable",
                         )
                         final_references.append(accepted)
                         edit_states.append(
@@ -373,20 +429,30 @@ def reference_edit_clips(
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
                                 output_image_path=accepted.image_path,
-                                operation=operation,
+                                operation=operations[-1],
                                 metadata_path=accepted.generation_metadata_path,
+                                operations=attempted_operations,
+                                completion_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        completion_result.metadata_path
+                                    )
+                                    if completion_result is not None
+                                    else None
+                                ),
+                                background_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        background_result.metadata_path
+                                    )
+                                    if background_result is not None
+                                    else None
+                                ),
                             )
                         )
                         counters["entities_accepted"] += 1
                         continue
-                    rejection_reason = "boogu_candidate_rejected"
-                    if result.rejection_path is not None:
-                        rejection_payload = json.loads(
-                            result.rejection_path.read_text(encoding="utf-8")
-                        )
-                        raw_reason = rejection_payload.get("reason")
-                        if isinstance(raw_reason, str) and raw_reason.strip():
-                            rejection_reason = raw_reason.strip()
+
+                    rejected_result = results[attempted_operations[-1]]
+                    rejection_reason = _rejection_reason(rejected_result)
                     if rejection_reason.startswith("boogu_reference_edit_failed:"):
                         counters["entities_failed"] += 1
                         storage.append_failure(
@@ -395,9 +461,62 @@ def reference_edit_clips(
                             reason=rejection_reason,
                             details={
                                 "entity_id": reference.entity_id,
-                                "operation": operation,
+                                "operation": rejected_result.operation,
                             },
                         )
+                    if (
+                        route == "repairable"
+                        and completion_result is not None
+                        and completion_result.status == "accepted"
+                        and completion_result.candidate_path is not None
+                        and background_result is not None
+                    ):
+                        publication = publish_boogu_final_reference(
+                            run_root=storage.root,
+                            clip_uid=clip.clip_uid,
+                            entity_id=reference.entity_id,
+                            candidate_path=completion_result.candidate_path,
+                            selected_metadata_path=completion_result.metadata_path,
+                            completion_metadata_path=completion_result.metadata_path,
+                            background_metadata_path=background_result.metadata_path,
+                            background_fallback="completion_candidate",
+                        )
+                        accepted = _accepted_reference(
+                            storage,
+                            reference,
+                            clip_uid=clip.clip_uid,
+                            output_path=publication.final_reference_path,
+                            metadata_path=publication.final_metadata_path,
+                        )
+                        final_references.append(accepted)
+                        edit_states.append(
+                            ReferenceEditEntityState(
+                                entity_id=reference.entity_id,
+                                route=route,
+                                status="fallback",
+                                source_reference=reference,
+                                source_image_path=reference.image_path,
+                                output_image_path=accepted.image_path,
+                                operation="add_entity_background",
+                                metadata_path=accepted.generation_metadata_path,
+                                operations=attempted_operations,
+                                completion_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        completion_result.metadata_path
+                                    )
+                                ),
+                                background_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        background_result.metadata_path
+                                    )
+                                ),
+                                background_fallback="completion_candidate",
+                                fallback_policy="completion_candidate",
+                                reason=rejection_reason,
+                            )
+                        )
+                        counters["entities_fallback"] += 1
+                        continue
                     if config.reference_edit.fallback_policy == "keep_source":
                         final_references.append(reference)
                         edit_states.append(
@@ -408,9 +527,24 @@ def reference_edit_clips(
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
                                 output_image_path=reference.image_path,
-                                operation=operation,
+                                operation=rejected_result.operation,
                                 metadata_path=storage.relative_artifact_path(
-                                    result.metadata_path
+                                    rejected_result.metadata_path
+                                ),
+                                operations=attempted_operations,
+                                completion_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        completion_result.metadata_path
+                                    )
+                                    if completion_result is not None
+                                    else None
+                                ),
+                                background_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        background_result.metadata_path
+                                    )
+                                    if background_result is not None
+                                    else None
                                 ),
                                 fallback_policy="keep_source",
                                 reason=rejection_reason,
@@ -431,9 +565,24 @@ def reference_edit_clips(
                                 status="rejected",
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
-                                operation=operation,
+                                operation=rejected_result.operation,
                                 metadata_path=storage.relative_artifact_path(
-                                    result.metadata_path
+                                    rejected_result.metadata_path
+                                ),
+                                operations=attempted_operations,
+                                completion_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        completion_result.metadata_path
+                                    )
+                                    if completion_result is not None
+                                    else None
+                                ),
+                                background_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        background_result.metadata_path
+                                    )
+                                    if background_result is not None
+                                    else None
                                 ),
                                 fallback_policy="reject_entity",
                                 reason=rejection_reason,

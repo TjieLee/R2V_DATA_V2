@@ -36,6 +36,13 @@ produce a complete new image. The accepted `final_reference_1k.png` is a
 byte-for-byte copy of the native worker candidate. There is no mask paste-back,
 foreground restoration, protected-core restoration, or pixel-identity gate.
 
+The production instructions are fixed:
+
+```text
+图片中只有一个实体，实体是“{entity_phrase}”。补全残缺的部分。不要引入新的实体，风格保持一致。如果补全不了，则只保留最能表示该实体的部分，去除零散且不合理的部分。
+给图像添加符合风格的背景，不要增加任何实例。
+```
+
 SAM3 may re-segment a generated candidate for presence, instance-count, growth,
 and fragmentation diagnostics. Those masks are review-only and cannot modify
 the candidate.
@@ -48,11 +55,12 @@ clips/<clip_uid>/reference_edit/<entity_id>/
   source_input_rgb.png
   completion_candidate_1k.png
   completion_metadata.json
+  completion_rejection.json
   background_candidate_1k.png
   background_metadata.json
+  background_rejection.json
   final_reference_1k.png
   final_metadata.json
-  rejection.json
 ```
 
 Rejected candidates remain diagnostic artifacts. Rejection never changes the
@@ -92,12 +100,17 @@ fake backends and do not load Boogu, CUDA, weights, or real data.
 
 The candidate judge records `image_quality` and one completeness route:
 `complete`, `repairable`, `local_usable`, `severely_incomplete`, or
-`fragmented`. `repairable` enters entity completion, `complete` may receive a
-background, `local_usable` keeps the source-faithful local reference, and the
-two severe outcomes are rejected. Qwen and SAM3 review generated candidates;
-SAM3 masks are review-only. An accepted candidate becomes the entity's
-`final_reference_1k.png`. Rejections follow the configured `keep_source` or
-`reject_entity` policy.
+`fragmented`. `complete` runs only background generation. `repairable` first
+runs completion review, then passes the accepted completion candidate into
+background generation using the same worker. `local_usable` runs background
+generation but retains its local scope and visibility semantics. The two severe
+outcomes do not enter this stage.
+
+Qwen and SAM3 review each generated candidate; SAM3 masks are review-only. If a
+repairable completion passes but background generation fails, the accepted
+completion candidate is published byte-for-byte and `final_metadata.json`
+records `background_fallback=completion_candidate`. Other rejections follow the
+configured `keep_source` or `reject_entity` policy.
 
 ## Validation
 

@@ -903,6 +903,100 @@ class BooguReferenceEditResult:
     fallback_status: str
 
 
+@dataclass(frozen=True)
+class BooguFinalPublication:
+    final_reference_path: Path
+    final_metadata_path: Path
+
+
+def publish_boogu_final_reference(
+    *,
+    run_root: Path,
+    clip_uid: str,
+    entity_id: str,
+    candidate_path: Path,
+    selected_metadata_path: Path,
+    completion_metadata_path: Path | None = None,
+    background_metadata_path: Path | None = None,
+    background_fallback: Literal["completion_candidate"] | None = None,
+) -> BooguFinalPublication:
+    """Publish an accepted native candidate without changing its pixels."""
+
+    clip_uid = _safe_component(clip_uid, "clip_uid")
+    entity_id = _safe_component(entity_id, "entity_id")
+    root = run_root.expanduser().resolve(strict=False)
+    edit_dir = (root / "clips" / clip_uid / "reference_edit" / entity_id).resolve(
+        strict=False
+    )
+
+    def resolve_evidence(path: Path, name: str) -> Path:
+        resolved = path.expanduser().resolve(strict=False)
+        if edit_dir not in resolved.parents or not resolved.is_file():
+            raise ValueError(f"{name} must be an existing entity edit artifact")
+        return resolved
+
+    candidate = resolve_evidence(candidate_path, "candidate_path")
+    selected_metadata = resolve_evidence(
+        selected_metadata_path,
+        "selected_metadata_path",
+    )
+    completion_metadata = (
+        None
+        if completion_metadata_path is None
+        else resolve_evidence(completion_metadata_path, "completion_metadata_path")
+    )
+    background_metadata = (
+        None
+        if background_metadata_path is None
+        else resolve_evidence(background_metadata_path, "background_metadata_path")
+    )
+    if background_fallback is not None and (
+        background_fallback != "completion_candidate"
+        or completion_metadata is None
+        or background_metadata is None
+    ):
+        raise ValueError(
+            "completion-candidate fallback requires completion and background metadata"
+        )
+
+    candidate_bytes = candidate.read_bytes()
+    candidate_rgb = _validated_native_rgb_png(candidate_bytes)
+    candidate_sha256 = _sha256_bytes(candidate_bytes)
+    metadata = json.loads(selected_metadata.read_text(encoding="utf-8"))
+    if (
+        metadata.get("status") != "accepted"
+        or metadata.get("generated_reference_sha256") != candidate_sha256
+    ):
+        raise ValueError("selected Boogu metadata does not accept the final candidate")
+
+    final_path = edit_dir / "final_reference_1k.png"
+    final_metadata_path = edit_dir / "final_metadata.json"
+    _write_bytes_atomic(final_path, candidate_bytes)
+    if final_path.read_bytes() != candidate_bytes:
+        raise RuntimeError("final reference is not the native Boogu candidate")
+    final_metadata = {
+        **metadata,
+        "final_reference_path": final_path.name,
+        "final_reference_sha256": candidate_sha256,
+        "final_dimensions": {
+            "width": candidate_rgb.width,
+            "height": candidate_rgb.height,
+        },
+        "completion_metadata_path": (
+            completion_metadata.name if completion_metadata is not None else None
+        ),
+        "background_metadata_path": (
+            background_metadata.name if background_metadata is not None else None
+        ),
+        "background_fallback": background_fallback,
+    }
+    write_json_atomic(final_metadata_path, final_metadata)
+    return BooguFinalPublication(
+        final_reference_path=final_path,
+        final_metadata_path=final_metadata_path,
+    )
+
+
 def run_boogu_reference_edit(
     *,
     run_root: Path,
@@ -920,6 +1014,8 @@ def run_boogu_reference_edit(
     alignment: int = DEFAULT_ALIGNMENT,
     model_revision: str = BOOGU_MODEL_REVISION,
     fallback_status: str = "canonical_preserved",
+    source_image_path: Path | None = None,
+    publish_final: bool = True,
     overwrite: bool = False,
 ) -> BooguReferenceEditResult:
     """Generate, review, and publish one native Boogu reference artifact."""
@@ -939,6 +1035,13 @@ def run_boogu_reference_edit(
     canonical_path = root / "clips" / clip_uid / "selected" / f"{entity_id}.png"
     if not canonical_path.is_file():
         raise FileNotFoundError(f"canonical reference does not exist: {canonical_path}")
+    actual_source_path = (
+        canonical_path
+        if source_image_path is None
+        else source_image_path.expanduser().resolve(strict=False)
+    )
+    if root not in actual_source_path.parents or not actual_source_path.is_file():
+        raise ValueError("Boogu source image must be an existing run artifact")
     edit_dir = root / "clips" / clip_uid / "reference_edit" / entity_id
     edit_dir.mkdir(parents=True, exist_ok=True)
     candidate_name = (
@@ -955,22 +1058,25 @@ def run_boogu_reference_edit(
     metadata_path = edit_dir / metadata_name
     final_path = edit_dir / "final_reference_1k.png"
     final_metadata_path = edit_dir / "final_metadata.json"
-    rejection_path = edit_dir / "rejection.json"
+    rejection_path = edit_dir / (
+        "completion_rejection.json"
+        if operation == "complete_entity"
+        else "background_rejection.json"
+    )
     if not overwrite and (candidate_path.exists() or metadata_path.exists()):
         raise FileExistsError(f"Boogu edit output already exists: {metadata_path}")
     if overwrite:
-        for stale in (
-            candidate_path,
-            metadata_path,
-            final_path,
-            final_metadata_path,
-            rejection_path,
-        ):
+        stale_paths = [candidate_path, metadata_path, rejection_path]
+        if publish_final:
+            stale_paths.extend((final_path, final_metadata_path))
+        for stale in stale_paths:
             stale.unlink(missing_ok=True)
 
     canonical_bytes = canonical_path.read_bytes()
     canonical_sha256 = _sha256_bytes(canonical_bytes)
-    source_rgba = _load_source_rgba(canonical_bytes)
+    source_bytes = actual_source_path.read_bytes()
+    source_sha256 = _sha256_bytes(source_bytes)
+    source_rgba = _load_source_rgba(source_bytes)
     source_input_rgb = _white_composite(source_rgba)
     width, height = resolve_boogu_1k_size(
         source_rgba.width,
@@ -978,9 +1084,17 @@ def run_boogu_reference_edit(
         target_area=target_area,
         alignment=alignment,
     )
-    source_rgba_path = edit_dir / "source_rgba.png"
-    _write_bytes_atomic(source_rgba_path, canonical_bytes)
-    _save_rgb_png_atomic(edit_dir / "source_input_rgb.png", source_input_rgb)
+    if actual_source_path == canonical_path:
+        source_evidence_path = edit_dir / "source_rgba.png"
+        _write_bytes_atomic(source_evidence_path, source_bytes)
+    else:
+        source_evidence_path = actual_source_path
+    source_input_path = edit_dir / (
+        "completion_source_input_rgb.png"
+        if operation == "complete_entity"
+        else "background_source_input_rgb.png"
+    )
+    _save_rgb_png_atomic(source_input_path, source_input_rgb)
     thinking_enabled = operation == "complete_entity"
 
     output: BooguEditOutput | None = None
@@ -1078,8 +1192,9 @@ def run_boogu_reference_edit(
         "thinking_enabled": thinking_enabled,
         "output_sha256": output_sha256,
         "canonical_source_sha256": canonical_sha256,
-        "source_image_path": source_rgba_path.relative_to(root).as_posix(),
-        "source_image_sha256": canonical_sha256,
+        "source_image_path": source_evidence_path.relative_to(root).as_posix(),
+        "source_image_sha256": source_sha256,
+        "source_input_rgb_path": source_input_path.relative_to(root).as_posix(),
         "generated_reference_sha256": output_sha256,
         "qwen_review": (
             qwen_review.model_dump(mode="json") if qwen_review is not None else None
@@ -1100,28 +1215,37 @@ def run_boogu_reference_edit(
     if accepted:
         if not candidate_path.is_file() or output_sha256 is None:
             raise RuntimeError("accepted Boogu edit has no candidate artifact")
-        _write_bytes_atomic(final_path, candidate_path.read_bytes())
-        if final_path.read_bytes() != candidate_path.read_bytes():
-            raise RuntimeError("final reference is not the native Boogu candidate")
-        final_metadata = {
-            **metadata,
-            "final_reference_path": final_path.name,
-            "final_reference_sha256": output_sha256,
-        }
-        write_json_atomic(final_metadata_path, final_metadata)
+        publication = None
+        if publish_final:
+            publication = publish_boogu_final_reference(
+                run_root=root,
+                clip_uid=clip_uid,
+                entity_id=entity_id,
+                candidate_path=candidate_path,
+                selected_metadata_path=metadata_path,
+                completion_metadata_path=(
+                    metadata_path if operation == "complete_entity" else None
+                ),
+                background_metadata_path=(
+                    metadata_path if operation == "add_entity_background" else None
+                ),
+            )
         rejection_path.unlink(missing_ok=True)
         return BooguReferenceEditResult(
             status="accepted",
             operation=operation,
             candidate_path=candidate_path,
-            final_reference_path=final_path,
+            final_reference_path=(
+                publication.final_reference_path if publication is not None else None
+            ),
             metadata_path=metadata_path,
             rejection_path=None,
             fallback_status="not_used",
         )
 
-    final_path.unlink(missing_ok=True)
-    final_metadata_path.unlink(missing_ok=True)
+    if publish_final:
+        final_path.unlink(missing_ok=True)
+        final_metadata_path.unlink(missing_ok=True)
     rejection = {
         "schema_version": 1,
         "status": "rejected",
@@ -1184,15 +1308,24 @@ def _validated_native_png(
     return candidate
 
 
+def _validated_native_rgb_png(png_bytes: bytes) -> Image.Image:
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as loaded:
+            size = loaded.size
+    except OSError as exc:
+        raise ValueError(f"Boogu output is not a readable image: {exc}") from exc
+    return _validated_native_png(png_bytes, expected_size=size)
+
+
 def _load_source_rgba(source_bytes: bytes) -> Image.Image:
     try:
         with Image.open(io.BytesIO(source_bytes)) as loaded:
             if loaded.format != "PNG":
-                raise ValueError("canonical reference must be PNG")
+                raise ValueError("Boogu source reference must be PNG")
             loaded.load()
             return loaded.convert("RGBA")
     except OSError as exc:
-        raise ValueError(f"canonical reference is not a readable PNG: {exc}") from exc
+        raise ValueError(f"Boogu source reference is not a readable PNG: {exc}") from exc
 
 
 def _white_composite(source_rgba: Image.Image) -> Image.Image:
