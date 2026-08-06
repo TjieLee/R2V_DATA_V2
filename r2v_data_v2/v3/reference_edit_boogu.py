@@ -1219,7 +1219,7 @@ def run_boogu_reference_edit(
                 operation=operation,
                 source_rgba=source_rgba.copy(),
                 candidate_rgb=candidate_rgb.copy(),
-                entity_phrase=grounding_prompt,
+                entity_phrase=entity_phrase,
                 reference_type=reference_type,
             )
             if not isinstance(sam_review, BooguSamReview):

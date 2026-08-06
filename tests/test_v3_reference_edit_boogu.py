@@ -246,6 +246,34 @@ def test_completion_publishes_native_1k_output_without_paste_back(
     assert "candidate_rgb" in sam.calls[0]
 
 
+def test_sam_review_uses_entity_phrase_instead_of_scene_grounding_prompt(
+    tmp_path: Path,
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+    sam = _SamReviewer()
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="ornate wooden panel",
+        grounding_prompt="ornate wooden panel behind a seated man",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=sam,
+    )
+
+    assert result.status == "accepted"
+    assert sam.calls[0]["entity_phrase"] == "ornate wooden panel"
+    assert (
+        sam.calls[0]["entity_phrase"]
+        != "ornate wooden panel behind a seated man"
+    )
+
+
 def test_white_rgb_input_preserves_opaque_pixels_and_whitens_alpha(
     tmp_path: Path,
 ) -> None:
