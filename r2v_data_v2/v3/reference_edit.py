@@ -62,6 +62,12 @@ COMPLETION_PROMPT_TEMPLATE = (
     "去除零散且不合理的部分。"
 )
 BACKGROUND_PROMPT = "给图像添加符合风格的背景，不要增加任何实例。"
+_ENTITY_COUNTER_FIELDS = (
+    "entities_accepted",
+    "entities_fallback",
+    "entities_rejected",
+    "entities_failed",
+)
 
 
 def _route(reference: EntityReferenceState) -> ReferenceCompleteness:
@@ -190,8 +196,12 @@ def _accepted_reference(
         source_frame_index=reference.source_frame_index,
         source_clip_uid=clip_uid,
         source_entity_id=reference.entity_id,
-        image_quality=(reference.image_quality if preserve_local_scope else "high"),
-        completeness=(reference.completeness if preserve_local_scope else "complete"),
+        image_quality=(
+            reference.image_quality or "acceptable"
+            if preserve_local_scope
+            else "high"
+        ),
+        completeness="local_usable" if preserve_local_scope else "complete",
         synthetic=True,
         generation_metadata_path=storage.relative_artifact_path(metadata_path),
         generation_source_sha256=source_sha256,
@@ -302,6 +312,7 @@ def reference_edit_clips(
                 counters["skipped_existing"] += 1
                 continue
             counters["processed"] += 1
+            clip_entity_counters = {field: 0 for field in _ENTITY_COUNTER_FIELDS}
             try:
                 if overwrite:
                     storage.cleanup_reference_edit_artifacts(clip.clip_uid)
@@ -448,13 +459,13 @@ def reference_edit_clips(
                                 ),
                             )
                         )
-                        counters["entities_accepted"] += 1
+                        clip_entity_counters["entities_accepted"] += 1
                         continue
 
                     rejected_result = results[attempted_operations[-1]]
                     rejection_reason = _rejection_reason(rejected_result)
                     if rejection_reason.startswith("boogu_reference_edit_failed:"):
-                        counters["entities_failed"] += 1
+                        clip_entity_counters["entities_failed"] += 1
                         storage.append_failure(
                             stage="reference_edit",
                             clip_uid=clip.clip_uid,
@@ -515,7 +526,7 @@ def reference_edit_clips(
                                 reason=rejection_reason,
                             )
                         )
-                        counters["entities_fallback"] += 1
+                        clip_entity_counters["entities_fallback"] += 1
                         continue
                     if config.reference_edit.fallback_policy == "keep_source":
                         final_references.append(reference)
@@ -550,7 +561,7 @@ def reference_edit_clips(
                                 reason=rejection_reason,
                             )
                         )
-                        counters["entities_fallback"] += 1
+                        clip_entity_counters["entities_fallback"] += 1
                     else:
                         final_references.append(
                             _rejected_reference(
@@ -588,7 +599,7 @@ def reference_edit_clips(
                                 reason=rejection_reason,
                             )
                         )
-                        counters["entities_rejected"] += 1
+                        clip_entity_counters["entities_rejected"] += 1
 
                 retained = [
                     reference.entity_id
@@ -618,6 +629,8 @@ def reference_edit_clips(
                     pairing,
                     ReferenceEditState(status="ready", entities=edit_states),
                 )
+                for field, value in clip_entity_counters.items():
+                    counters[field] += value
             except Exception as exc:  # noqa: BLE001 - isolate clip failures
                 reason = str(exc)
                 storage.write_reference_edit_failure(clip.clip_uid, reason)

@@ -15,6 +15,7 @@ from pydantic import ValidationError
 import r2v_data_v2.v3.config as config_module
 import r2v_data_v2.v3.pair as pair_module
 import r2v_data_v2.v3.reference_completion as completion_module
+import r2v_data_v2.v3.reference_edit as reference_edit_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import (
     PairConfig,
@@ -3655,8 +3656,106 @@ def test_local_reference_adds_background_without_promoting_scope(
     assert reference.reference_scope == "local"
     assert reference.visible_region == source.visible_region
     assert reference.whole_entity_recognizable == source.whole_entity_recognizable
+    assert reference.identity_features_visible == source.identity_features_visible
     assert reference.whole_entity_recognizable is False
+    assert reference.image_quality == source.image_quality
+    assert reference.completeness == source.completeness == "local_usable"
+
+
+def test_legacy_local_reference_publishes_with_normalized_quality_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    clip = storage.read_clip("clip-1")
+    source = clip.references.entities[0].model_copy(
+        update={"image_quality": None, "completeness": None}
+    )
+    assert source.reference_scope == "local"
+    assert source.visible_region != "whole"
+    assert source.synthetic is False
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(
+            entities=[source],
+            background=clip.references.background,
+        ),
+        clip.pairing,
+    )
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    assert stats.failed == 0
+    assert stats.entities_accepted == 1
+    assert clip.reference_edit is not None
+    assert clip.reference_edit.status == "ready"
+    assert clip.reference_edit.entities[0].status == "accepted"
+    assert reference.synthetic is True
+    assert reference.reference_scope == "local"
+    assert reference.visible_region == source.visible_region
+    assert reference.whole_entity_recognizable == source.whole_entity_recognizable
+    assert reference.identity_features_visible == source.identity_features_visible
     assert reference.completeness == "local_usable"
+    assert reference.image_quality == "acceptable"
+    assert reference.generation_metadata_path is not None
+    assert reference.generation_source_sha256 is not None
+    assert reference.generation_output_sha256 is not None
+
+
+def test_failed_clip_does_not_commit_partial_reference_edit_entity_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject", "object"))
+    pair_clips(config, storage, judge=_Judge())
+    original_accepted_reference = reference_edit_module._accepted_reference
+    backend = _ReferenceEditBackend()
+
+    def fail_second_reference(storage_arg, reference, **kwargs):
+        if reference.entity_id == "e2":
+            raise RuntimeError("final reference state construction failed")
+        return original_accepted_reference(storage_arg, reference, **kwargs)
+
+    monkeypatch.setattr(
+        reference_edit_module,
+        "_accepted_reference",
+        fail_second_reference,
+    )
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert len(backend.calls) == 2
+    assert (
+        storage.reference_edit_dir("clip-1")
+        / "e1"
+        / "final_reference_1k.png"
+    ).is_file()
+    assert stats.processed == 1
+    assert stats.failed == 1
+    assert stats.entities_accepted == 0
+    assert stats.entities_fallback == 0
+    assert stats.entities_rejected == 0
+    assert stats.entities_failed == 0
+    assert clip.reference_edit is not None
+    assert clip.reference_edit.status == "failed"
 
 
 def test_repairable_background_rejection_falls_back_to_completion_candidate(
