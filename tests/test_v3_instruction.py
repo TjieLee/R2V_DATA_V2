@@ -29,6 +29,7 @@ from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundAnnotation,
     BackgroundReferenceState,
+    ClipRecord,
     ClipSource,
     CoverageState,
     EntityReferenceState,
@@ -310,6 +311,103 @@ def _issue_codes(
     return {issue.code for issue in issues}
 
 
+def _five_entity_instruction_clip(*, include_background: bool) -> ClipRecord:
+    reference_types = ("subject", "subject", "object", "group", "object")
+    entities = [
+        AnnotationEntity(
+            entity_id=f"e{index}",
+            reference_type=reference_type,
+            phrase=f"entity {index}",
+            grounding_prompt=f"visible entity {index}",
+        )
+        for index, reference_type in enumerate(reference_types, start=1)
+    ]
+    background_annotation = (
+        BackgroundAnnotation(
+            phrase="a quiet plaza",
+            grounding_prompt="the empty quiet plaza",
+        )
+        if include_background
+        else None
+    )
+    references = [
+        EntityReferenceState(
+            entity_id=entity.entity_id,
+            status="ready",
+            reference_scope="full",
+            visible_region="whole",
+            whole_entity_recognizable=True,
+            identity_features_visible=True,
+            scope_reason="clear whole reference",
+            image_path=f"clips/clip-five/selected/{entity.entity_id}.png",
+            source_frame_index=index,
+        )
+        for index, entity in enumerate(entities)
+    ]
+    background_reference = (
+        BackgroundReferenceState(
+            status="clean_raw",
+            source_image_path="clips/clip-five/frames/03.jpg",
+            output_image_path="clips/clip-five/frames/03.jpg",
+            source_frame_slot=3,
+            source_frame_index=30,
+            source_foreground_area_pixels=0,
+            source_foreground_area_ratio=0.0,
+        )
+        if include_background
+        else None
+    )
+    return ClipRecord(
+        clip_uid="clip-five",
+        source=ClipSource(
+            video_path="/mnt/workspace/public/dataset/clip-five.mp4",
+            parent_video_id="parent",
+            clip_suffix="5_0",
+            source_index=0,
+            caption_raw="",
+            metadata={},
+        ),
+        annotation=AnnotationState(
+            status="ready",
+            t2v_caption="Five stable entities remain visible in a quiet plaza.",
+            entities=entities,
+            background=background_annotation,
+        ),
+        coverage=CoverageState(
+            passed=True,
+            qualifying_entity_ids=[entity.entity_id for entity in entities],
+            entity_visibility_summary={
+                entity.entity_id: EntityVisibilitySummary(
+                    status="ready",
+                    visible_frame_slots=list(range(7)),
+                    visible_frame_count=7,
+                    coverage_ratio=0.7,
+                    qualifies=True,
+                    per_frame_area_ratio=[0.1] * 7 + [0.0] * 3,
+                    per_frame_confidence=[0.9] * 7 + [None] * 3,
+                )
+                for entity in entities
+            },
+        ),
+        references=ReferencesState(
+            entities=references,
+            background=background_reference,
+        ),
+        pairing=PairingState(
+            status="ready",
+            retained_entity_ids=[entity.entity_id for entity in entities],
+            tokens={
+                "e1": "<ref_subject_1>",
+                "e2": "<ref_subject_2>",
+                "e3": "<ref_object_1>",
+                "e4": "<ref_group_1>",
+                "e5": "<ref_object_2>",
+            },
+            background_token="<ref_bg_1>" if include_background else None,
+        ),
+    )
+
+
 def test_bindings_follow_pairing_order_and_put_background_last(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -330,6 +428,58 @@ def test_bindings_follow_pairing_order_and_put_background_last(
         "object",
         "background",
     ]
+
+
+@pytest.mark.parametrize("include_background", [False, True])
+def test_five_entity_bindings_and_optional_background_are_not_truncated(
+    include_background: bool,
+) -> None:
+    clip = _five_entity_instruction_clip(include_background=include_background)
+    bindings = build_instruction_bindings(clip)
+    expected_count = 6 if include_background else 5
+    expected_ids = [f"image_{index}" for index in range(1, expected_count + 1)]
+    body = "Use " + ", ".join(
+        f"{{{{image_{index}}}}}" for index in range(1, expected_count + 1)
+    ) + " together in one coherent video."
+    output = RawInstructionOutput(
+        instruction_body_template=body,
+        reference_legend=[
+            {"image_id": image_id, "description": f"stable reference {index}"}
+            for index, image_id in enumerate(expected_ids, start=1)
+        ],
+    )
+
+    issues = validate_instruction_output(
+        output,
+        t2v_caption=clip.annotation.t2v_caption,
+        bindings=bindings,
+        source_transcript=None,
+    )
+    legend = [
+        InstructionLegendEntry(
+            image_id=entry.image_id,
+            description=entry.description,
+        )
+        for entry in output.reference_legend
+    ]
+    rendered = render_instruction_text(body, legend)
+
+    assert [binding.image_id for binding in bindings] == expected_ids
+    assert [binding.image_index for binding in bindings] == list(
+        range(1, expected_count + 1)
+    )
+    assert [binding.entity_id for binding in bindings[:5]] == [
+        "e1",
+        "e2",
+        "e3",
+        "e4",
+        "e5",
+    ]
+    assert issues == []
+    assert f"<Image {expected_count}>" in rendered
+    if include_background:
+        assert bindings[-1].reference_type == "background"
+        assert bindings[-1].entity_id is None
 
 
 def test_instruction_output_schema_uses_english_identifiers_only() -> None:

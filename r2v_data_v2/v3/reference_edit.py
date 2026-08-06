@@ -72,6 +72,7 @@ COMPLETION_PROMPT_TEMPLATE = (
 )
 BACKGROUND_PROMPT = "给图像添加符合风格的背景，不要增加任何实例。"
 _ENTITY_COUNTER_FIELDS = (
+    "entities_eligible",
     "entities_accepted",
     "entities_fallback",
     "entities_rejected",
@@ -101,50 +102,6 @@ def _operations(route: ReferenceCompleteness) -> tuple[str, ...]:
     if route in {"complete", "local_usable"}:
         return ("add_entity_background",)
     return ()
-
-
-def _eligible_references(
-    config: V3Config,
-    storage: RunStorage,
-    *,
-    overwrite: bool,
-) -> int:
-    count = 0
-    for clip in storage.iter_clips():
-        if clip.pairing is None or clip.pairing.status != "ready":
-            continue
-        if clip.reference_edit is not None and not overwrite:
-            continue
-        previous = {
-            item.entity_id: item
-            for item in (
-                clip.reference_edit.entities
-                if clip.reference_edit is not None
-                and clip.reference_edit.status == "ready"
-                else []
-            )
-        }
-        retained = set(clip.pairing.retained_entity_ids)
-        for current in clip.references.entities:
-            if current.entity_id not in retained:
-                continue
-            reference = (
-                previous[current.entity_id].source_reference
-                if overwrite and current.entity_id in previous
-                else current
-            )
-            if reference.status != "ready" or reference.image_path is None:
-                continue
-            geometry = _reference_content_geometry(storage, reference)
-            if _source_gate_reason(config, geometry) is not None:
-                continue
-            route = _route(
-                reference,
-                source_touches_boundary=geometry.touches_canvas_boundary,
-            )
-            if _operations(route):
-                count += 1
-    return count
 
 
 def _resolve_artifact(storage: RunStorage, value: str) -> Path:
@@ -331,12 +288,6 @@ def reference_edit_clips(
         raise ValueError("V3 reference_edit stage is disabled")
 
     counters = {field: 0 for field in ReferenceEditStats.__dataclass_fields__}
-    eligible_count = _eligible_references(
-        config,
-        storage,
-        overwrite=overwrite,
-    )
-    counters["entities_eligible"] = eligible_count
     active_backend = backend
     active_judge = judge
     active_sam = sam_reviewer
@@ -344,60 +295,76 @@ def reference_edit_clips(
     owned_judge: QwenBooguReferenceEditJudge | None = None
     owned_segmenter: Sam3SegmentationBackend | None = None
     started_backend: object | None = None
+    runtime_ready = False
 
-    try:
-        if eligible_count:
-            if active_backend is None:
-                owned_backend = BooguSubprocessBackend(
-                    BooguWorkerConfig(
-                        python_executable=config.reference_edit.python_executable,
-                        code_root=config.reference_edit.code_root,
-                        model_path=config.reference_edit.model_path,
-                        model_revision=config.reference_edit.model_revision,
-                        cuda_visible_devices=(
-                            config.reference_edit.cuda_visible_devices
-                        ),
-                        timeout_seconds=config.reference_edit.timeout_seconds,
-                        temporary_root=storage.reference_edit_temporary_dir(),
-                    )
-                )
-                active_backend = owned_backend
-            starter = getattr(active_backend, "start", None)
-            if callable(starter):
-                starter(stderr_log_path=storage.reference_edit_worker_log_path())
-                started_backend = active_backend
-                counters["worker_starts"] += 1
-            if active_judge is None:
-                judge_config = config.qwen.reference_edit_judge
-                if judge_config is None:
-                    raise ValueError("qwen.reference_edit_judge is not configured")
-                owned_judge = QwenBooguReferenceEditJudge(judge_config)
-                active_judge = owned_judge
-            if active_sam is None:
-                if config.sam3.model_path is None:
-                    raise ValueError(
-                        "sam3.model_path is required for production reference_edit"
-                    )
-                owned_segmenter = Sam3SegmentationBackend(config.sam3)
-                active_sam = Sam3BooguReferenceReviewer(
-                    owned_segmenter,
-                    temporary_root=storage.reference_edit_temporary_dir(),
-                    max_area_growth_ratio=(
-                        config.reference_edit.sam_max_area_growth_ratio
-                    ),
-                    max_significant_components=(
-                        config.reference_edit.sam_max_significant_components
-                    ),
-                    min_candidate_scale_ratio=(
-                        config.reference_edit.min_candidate_scale_ratio
-                    ),
-                    max_candidate_center_shift=(
-                        config.reference_edit.max_candidate_center_shift
-                    ),
-                )
+    def initialize_runtime() -> tuple[
+        BooguReferenceEditBackend,
+        BooguReferenceEditJudge,
+        BooguSamReviewer | None,
+    ]:
+        nonlocal active_backend
+        nonlocal active_judge
+        nonlocal active_sam
+        nonlocal owned_backend
+        nonlocal owned_judge
+        nonlocal owned_segmenter
+        nonlocal started_backend
+        nonlocal runtime_ready
+
+        if runtime_ready:
             assert active_backend is not None
             assert active_judge is not None
+            return active_backend, active_judge, active_sam
+        if active_backend is None:
+            owned_backend = BooguSubprocessBackend(
+                BooguWorkerConfig(
+                    python_executable=config.reference_edit.python_executable,
+                    code_root=config.reference_edit.code_root,
+                    model_path=config.reference_edit.model_path,
+                    model_revision=config.reference_edit.model_revision,
+                    cuda_visible_devices=config.reference_edit.cuda_visible_devices,
+                    timeout_seconds=config.reference_edit.timeout_seconds,
+                    temporary_root=storage.reference_edit_temporary_dir(),
+                )
+            )
+            active_backend = owned_backend
+        if active_judge is None:
+            judge_config = config.qwen.reference_edit_judge
+            if judge_config is None:
+                raise ValueError("qwen.reference_edit_judge is not configured")
+            owned_judge = QwenBooguReferenceEditJudge(judge_config)
+            active_judge = owned_judge
+        if active_sam is None:
+            if config.sam3.model_path is None:
+                raise ValueError(
+                    "sam3.model_path is required for production reference_edit"
+                )
+            owned_segmenter = Sam3SegmentationBackend(config.sam3)
+            active_sam = Sam3BooguReferenceReviewer(
+                owned_segmenter,
+                temporary_root=storage.reference_edit_temporary_dir(),
+                max_area_growth_ratio=(
+                    config.reference_edit.sam_max_area_growth_ratio
+                ),
+                max_significant_components=(
+                    config.reference_edit.sam_max_significant_components
+                ),
+                min_candidate_scale_ratio=(
+                    config.reference_edit.min_candidate_scale_ratio
+                ),
+                max_candidate_center_shift=(
+                    config.reference_edit.max_candidate_center_shift
+                ),
+            )
+        starter = getattr(active_backend, "start", None)
+        if callable(starter):
+            starter(stderr_log_path=storage.reference_edit_worker_log_path())
+            started_backend = active_backend
+            counters["worker_starts"] += 1
+        runtime_ready = True
+        return active_backend, active_judge, active_sam
 
+    try:
         for initial_clip in storage.iter_clips():
             clip = storage.read_clip(initial_clip.clip_uid)
             if (
@@ -443,9 +410,25 @@ def reference_edit_clips(
                     ):
                         final_references.append(reference)
                         continue
+                    initial_route = _route(reference)
+                    if reference.completeness is not None and not _operations(
+                        initial_route
+                    ):
+                        final_references.append(reference)
+                        edit_states.append(
+                            ReferenceEditEntityState(
+                                entity_id=reference.entity_id,
+                                route=initial_route,
+                                status="not_required",
+                                source_reference=reference,
+                                source_image_path=reference.image_path,
+                                output_image_path=reference.image_path,
+                            )
+                        )
+                        continue
+                    clip_entity_counters["entities_eligible"] += 1
                     if reference.image_path is None:
                         raise ValueError("ready reference has no image_path")
-                    _resolve_artifact(storage, reference.image_path)
                     source_geometry = _reference_content_geometry(storage, reference)
                     source_gate_reason = _source_gate_reason(config, source_geometry)
                     route = _route(
@@ -483,20 +466,14 @@ def reference_edit_clips(
                         continue
                     operations = _operations(route)
                     if not operations:
-                        final_references.append(reference)
-                        edit_states.append(
-                            ReferenceEditEntityState(
-                                entity_id=reference.entity_id,
-                                route=route,
-                                status="not_required",
-                                source_reference=reference,
-                                source_image_path=reference.image_path,
-                                output_image_path=reference.image_path,
-                            )
+                        raise RuntimeError(
+                            "eligible reference has no reference-edit operation"
                         )
-                        continue
-                    if active_backend is None or active_judge is None:
-                        raise RuntimeError("reference edit runtime was not initialized")
+                    (
+                        operation_backend,
+                        operation_judge,
+                        operation_sam,
+                    ) = initialize_runtime()
                     entity = entities[reference.entity_id]
                     results: dict[str, BooguReferenceEditResult] = {}
                     source_image_path: Path | None = None
@@ -514,9 +491,9 @@ def reference_edit_clips(
                             entity_phrase=entity.phrase,
                             grounding_prompt=entity.grounding_prompt,
                             reference_type=entity.reference_type,
-                            backend=active_backend,
-                            judge=active_judge,
-                            sam_reviewer=active_sam,
+                            backend=operation_backend,
+                            judge=operation_judge,
+                            sam_reviewer=operation_sam,
                             target_area=config.reference_edit.target_area,
                             alignment=config.reference_edit.alignment,
                             min_source_content_area_pixels=(
@@ -792,6 +769,18 @@ def reference_edit_clips(
                         retained_entity_ids=retained,
                         tokens=_tokens_for_retained(retained, entities),
                         background_token=clip.pairing.background_token,
+                    )
+                classified_entities = sum(
+                    clip_entity_counters[field]
+                    for field in (
+                        "entities_accepted",
+                        "entities_fallback",
+                        "entities_rejected",
+                    )
+                )
+                if classified_entities != clip_entity_counters["entities_eligible"]:
+                    raise RuntimeError(
+                        "reference edit entity outcomes must match eligible count"
                     )
                 storage.write_reference_edit_result(
                     clip.clip_uid,

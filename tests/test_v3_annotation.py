@@ -35,6 +35,9 @@ from r2v_data_v2.v3.config import (
 )
 from r2v_data_v2.v3.manifest import build_manifest
 from r2v_data_v2.v3.schemas import (
+    MAX_ANNOTATION_ENTITIES,
+    AnnotationEntity,
+    AnnotationState,
     ClipRecord,
     CoverageState,
     EntityReferenceState,
@@ -493,20 +496,101 @@ def test_entity_sanitizer_deduplicates_truncates_and_assigns_ids() -> None:
         _entity("Table", reference_type="object"),
         _entity("Band", reference_type="group"),
         _entity("Car", reference_type="object"),
+        _entity("Bicycle", reference_type="object"),
+        _entity("Boat", reference_type="object"),
     ]
 
     entities, warnings = sanitize_entity_candidates(candidates)
 
-    assert [entity.entity_id for entity in entities] == ["e1", "e2", "e3"]
-    assert [entity.phrase for entity in entities] == ["Woman", "Table", "Band"]
+    assert [entity.entity_id for entity in entities] == [
+        "e1",
+        "e2",
+        "e3",
+        "e4",
+        "e5",
+    ]
+    assert [entity.phrase for entity in entities] == [
+        "Woman",
+        "Table",
+        "Band",
+        "Car",
+        "Bicycle",
+    ]
     assert [entity.reference_type for entity in entities] == [
         "subject",
         "object",
         "group",
+        "object",
+        "object",
     ]
     assert "dropped_entity_reference_type:1" in warnings
     assert "dropped_duplicate_entity_phrase:2" in warnings
-    assert "truncated_entity_candidates:3" in warnings
+    assert "truncated_entity_candidates:5" in warnings
+
+
+def test_annotation_state_accepts_five_contiguous_entities() -> None:
+    entities = [
+        AnnotationEntity(
+            entity_id=f"e{index}",
+            reference_type="object",
+            phrase=f"object {index}",
+            grounding_prompt=f"visible object {index}",
+        )
+        for index in range(1, MAX_ANNOTATION_ENTITIES + 1)
+    ]
+
+    annotation = AnnotationState(
+        status="ready",
+        t2v_caption="Five distinct objects remain visible in the scene.",
+        entities=entities,
+    )
+
+    assert [entity.entity_id for entity in annotation.entities] == [
+        "e1",
+        "e2",
+        "e3",
+        "e4",
+        "e5",
+    ]
+
+
+def test_annotation_state_rejects_six_entities() -> None:
+    entities = [
+        AnnotationEntity(
+            entity_id=f"e{index}",
+            reference_type="object",
+            phrase=f"object {index}",
+            grounding_prompt=f"visible object {index}",
+        )
+        for index in range(1, MAX_ANNOTATION_ENTITIES + 2)
+    ]
+
+    with pytest.raises(ValidationError, match="at most 5 entities"):
+        AnnotationState(
+            status="ready",
+            t2v_caption="Six distinct objects remain visible in the scene.",
+            entities=entities,
+        )
+
+
+def test_annotation_state_rejects_noncontiguous_five_entity_ids() -> None:
+    entity_ids = ["e1", "e2", "e3", "e4", "e6"]
+    entities = [
+        AnnotationEntity(
+            entity_id=entity_id,
+            reference_type="object",
+            phrase=f"object {index}",
+            grounding_prompt=f"visible object {index}",
+        )
+        for index, entity_id in enumerate(entity_ids, start=1)
+    ]
+
+    with pytest.raises(ValidationError, match="contiguous and ordered"):
+        AnnotationState(
+            status="ready",
+            t2v_caption="Five distinct objects remain visible in the scene.",
+            entities=entities,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1041,7 +1125,8 @@ def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
 def test_system_prompt_describes_minimal_candidate_contract() -> None:
     normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
 
-    assert "return at most three entities" in normalized
+    assert "return at most five entities" in normalized
+    assert "return at most three entities" not in normalized
     assert "stable, discrete foreground reference candidates" in normalized
     assert "do not output relations" in normalized
     assert "do not include <ref_...> tokens" in normalized

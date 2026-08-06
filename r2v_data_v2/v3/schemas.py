@@ -19,6 +19,7 @@ MASK_SCHEMA_VERSION = "r2v.v3.masks.1"
 RUN_SCHEMA_VERSION = "r2v.v3.run.1"
 DATASET_SCHEMA_VERSION = "r2v.v3.dataset.1"
 SAMPLE_SCHEMA_VERSION = "r2v.v3.sample.1"
+MAX_ANNOTATION_ENTITIES = 5
 
 _REF_TOKEN = re.compile(r"<ref_(?:subject|object|group|bg)_\d+>")
 _ANY_REF_TOKEN = re.compile(r"<ref_[^>]+>")
@@ -140,8 +141,10 @@ class AnnotationState(SchemaModel):
             raise ValueError(
                 "annotation entity_id values must be contiguous and ordered"
             )
-        if len(entity_ids) > 3:
-            raise ValueError("annotation supports at most three entities")
+        if len(entity_ids) > MAX_ANNOTATION_ENTITIES:
+            raise ValueError(
+                f"annotation supports at most {MAX_ANNOTATION_ENTITIES} entities"
+            )
         return self
 
 

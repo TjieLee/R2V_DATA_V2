@@ -1518,7 +1518,10 @@ def pair_clips(
                             )
                         )
                         continue
-                    candidates = build_entity_reference_candidates(
+                    (
+                        candidates,
+                        all_candidates_tiny,
+                    ) = _build_entity_reference_candidates(
                         config,
                         storage,
                         clip_uid=clip.clip_uid,
@@ -1526,16 +1529,6 @@ def pair_clips(
                         frames=frames,
                         masks=masks,
                     )
-                    all_candidates_tiny = False
-                    if not candidates:
-                        _, all_candidates_tiny = _build_entity_reference_candidates(
-                            config,
-                            storage,
-                            clip_uid=clip.clip_uid,
-                            entity=entity,
-                            frames=frames,
-                            masks=masks,
-                        )
                     if not candidates:
                         entity_states.append(
                             _rejected_reference(

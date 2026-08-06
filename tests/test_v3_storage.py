@@ -25,6 +25,7 @@ from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
+    BackgroundAnnotation,
     BackgroundReferenceState,
     BackgroundRemovalAttempt,
     BackgroundRemovalReview,
@@ -316,6 +317,128 @@ def _create_exportable_clip(
             clip_uid,
             ExportState(accepted=True, reason=None),
         )
+
+
+def _create_five_entity_exportable_clip(
+    storage: RunStorage,
+    *,
+    include_background: bool,
+) -> None:
+    clip_uid = "clip-five"
+    entities = [
+        _entity(f"e{index}", f"entity {index}")
+        for index in range(1, 6)
+    ]
+    background_annotation = (
+        BackgroundAnnotation(
+            phrase="a quiet plaza",
+            grounding_prompt="the empty quiet plaza",
+        )
+        if include_background
+        else None
+    )
+    storage.create_clip(
+        clip_uid=clip_uid,
+        source=_clip_source(storage, clip_uid),
+    )
+    storage.write_annotation(
+        clip_uid,
+        AnnotationState(
+            status="ready",
+            t2v_caption="Five distinct entities remain visible in a quiet plaza.",
+            entities=entities,
+            background=background_annotation,
+        ),
+    )
+    storage.write_coverage(
+        clip_uid,
+        CoverageState(
+            passed=True,
+            qualifying_entity_ids=["e1"],
+            entity_visibility_summary={
+                entity.entity_id: _visibility_summary(
+                    7 if entity.entity_id == "e1" else 3,
+                    qualifies=entity.entity_id == "e1",
+                )
+                for entity in entities
+            },
+        ),
+    )
+    references: list[EntityReferenceState] = []
+    for index, entity in enumerate(entities, start=1):
+        path = storage.selected_path(clip_uid, f"{entity.entity_id}.png")
+        Image.new(
+            "RGBA",
+            (12 + index, 10 + index),
+            (10 * index, 20, 30, 128),
+        ).save(path, format="PNG")
+        references.append(
+            EntityReferenceState(
+                entity_id=entity.entity_id,
+                status="ready",
+                reference_scope="full",
+                visible_region="whole",
+                whole_entity_recognizable=True,
+                identity_features_visible=True,
+                scope_reason="clear whole reference",
+                image_path=storage.relative_artifact_path(path),
+                source_frame_index=index,
+            )
+        )
+    background = None
+    background_token = None
+    if include_background:
+        frame_path = storage.frame_path(clip_uid, 3)
+        Image.new("RGB", (14, 9), (40, 50, 60)).save(frame_path, format="JPEG")
+        background = BackgroundReferenceState(
+            status="clean_raw",
+            source_image_path=storage.relative_artifact_path(frame_path),
+            output_image_path=storage.relative_artifact_path(frame_path),
+            source_frame_slot=3,
+            source_frame_index=30,
+            source_foreground_area_pixels=0,
+            source_foreground_area_ratio=0.0,
+        )
+        background_token = "<ref_bg_1>"
+    storage.write_references(
+        clip_uid,
+        ReferencesState(entities=references, background=background),
+    )
+    storage.write_pairing(
+        clip_uid,
+        PairingState(
+            status="ready",
+            retained_entity_ids=[entity.entity_id for entity in entities],
+            tokens={
+                "e1": "<ref_subject_1>",
+                "e2": "<ref_object_1>",
+                "e3": "<ref_object_2>",
+                "e4": "<ref_object_3>",
+                "e5": "<ref_object_4>",
+            },
+            background_token=background_token,
+        ),
+    )
+    binding_count = 6 if include_background else 5
+    body = "Use " + ", ".join(
+        f"{{{{image_{index}}}}}" for index in range(1, binding_count + 1)
+    ) + " together in one coherent video."
+    legend = [
+        InstructionLegendEntry(
+            image_id=f"image_{index}",
+            description=f"stable reference {index}",
+        )
+        for index in range(1, binding_count + 1)
+    ]
+    storage.write_instruction(
+        clip_uid,
+        InstructionState(
+            status="ready",
+            instruction_body_template=body,
+            reference_legend=legend,
+            r2v_instruction=render_instruction_text(body, legend),
+        ),
+    )
 
 
 def _initialize_storage_with_complete_clip(
@@ -1407,6 +1530,49 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     )
     assert "127.0.0.1" not in dataset_text
     assert str(config.resolved_run_root) not in dataset_text
+
+
+@pytest.mark.parametrize("include_background", [False, True])
+def test_exporter_keeps_five_entities_and_optional_sixth_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include_background: bool,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="five-entity-export")
+    _create_five_entity_exportable_clip(
+        storage,
+        include_background=include_background,
+    )
+
+    dataset = DatasetExporter(config, storage).export()
+
+    sample = json.loads(
+        (config.resolved_export_root / "samples.jsonl").read_text(encoding="utf-8")
+    )
+    expected_count = 6 if include_background else 5
+    entity_references = [
+        reference
+        for reference in sample["references"]
+        if reference["type"] == "entity"
+    ]
+    assert dataset.reference_count == expected_count
+    assert len(sample["references"]) == expected_count
+    assert [reference["entity_id"] for reference in entity_references] == [
+        "e1",
+        "e2",
+        "e3",
+        "e4",
+        "e5",
+    ]
+    assert all(
+        (config.resolved_export_root / reference["image_path"]).is_file()
+        for reference in sample["references"]
+    )
+    if include_background:
+        assert sample["references"][-1]["type"] == "background"
+        assert sample["references"][-1]["entity_id"] is None
 
 
 def test_exporter_accepts_entity_only_clip_without_manual_state(

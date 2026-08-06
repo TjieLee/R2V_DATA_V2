@@ -184,7 +184,7 @@ Create source clip records only. Do not copy source videos.
 Use full-video input with the 32B annotation model. Produce:
 
 - `t2v_caption`;
-- up to three provisional entity candidates;
+- up to five provisional entity candidates;
 - optional background semantics.
 
 Do not generate reference tokens or `r2v_instruction` here.
@@ -302,6 +302,11 @@ bbox-area ratio and stay within the configured normalized center distance. A
 background is an optional enhancement: it publishes only when the existing
 Qwen review says that identity, scale, layout, background coherence, and
 reference usefulness pass and the candidate is preferable to the source.
+Tiny ready references still count toward `reference_edit.entities_eligible`,
+then take the deterministic `keep_source` fallback without initializing Boogu,
+Qwen review, or SAM3 runtime. Runtime initialization occurs lazily at the first
+non-tiny entity that actually needs generation and happens at most once per
+stage. Entity counters are committed only with the successful clip result.
 
 #### `instruct`
 
@@ -399,11 +404,11 @@ Qwen's raw response contains no entity IDs:
 ```
 
 `reference_type` is limited to `subject`, `object`, or `group`. After local
-candidate validation, phrase deduplication, and truncation to three candidates,
-code assigns contiguous IDs `e1`, `e2`, and `e3`. Invalid candidates are
-dropped without discarding a valid caption. An invalid background is normalized
-to `null`. A valid caption with zero retained entities is still a ready
-annotation; later stages own reference eligibility and clip rejection.
+candidate validation, phrase deduplication, and truncation to five candidates,
+code assigns contiguous IDs from `e1` through at most `e5`. Invalid candidates
+are dropped without discarding a valid caption. An invalid background is
+normalized to `null`. A valid caption with zero retained entities is still a
+ready annotation; later stages own reference eligibility and clip rejection.
 
 The persisted entity schema contains only `entity_id`, `reference_type`,
 `phrase`, and `grounding_prompt`. Relations and the previous category,
@@ -438,7 +443,7 @@ blacklist. Directly visible wording such as `branches sway slightly`, `sunny`,
 
 Entity candidates are processed in model order. Code strips and normalizes
 candidate text, drops invalid candidates, deduplicates normalized phrases while
-keeping the first occurrence, retains at most three, and assigns entity IDs
+keeping the first occurrence, retains at most five, and assigns entity IDs
 after all filtering. Phrase text is not required to match one exact contiguous
 caption span. Annotation remains separate from final reference eligibility.
 Entity phrases should normally be stable noun phrases rather than actions.
@@ -690,6 +695,12 @@ accepted Boogu sidecar records source, candidate, model, review, and hash
 provenance. Instruction and export consume the final path in `clip.json`, which
 is either the source-faithful selected reference or accepted
 `final_reference_1k.png`.
+
+One clip may retain at most five entity references, one per annotation entity.
+An optional background is separate from that limit, so a final sample may
+contain five entity references plus one background reference, for six total.
+`pair.max_candidates_per_entity: 3` remains the per-entity candidate-frame
+shortlist sent to the visual judge; it is not the per-video reference limit.
 
 A donor must use the exact same `source.parent_video_id`, have a different
 `clip_uid`, ready annotation and pairing, and a retained full, identity-visible

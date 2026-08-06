@@ -673,6 +673,32 @@ def test_pair_rejects_entity_when_every_reference_candidate_is_tiny(
     assert clip.references.entities[0].scope_reason == "tiny_reference_candidates"
 
 
+def test_pair_builds_each_entity_candidate_collection_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    original = pair_module._build_entity_reference_candidates
+    calls = 0
+
+    def counted_builder(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pair_module,
+        "_build_entity_reference_candidates",
+        counted_builder,
+    )
+
+    stats = pair_clips(config, storage, judge=_Judge())
+
+    assert stats.ready == 1
+    assert calls == 1
+
+
 def test_pair_publishes_all_ready_references_and_per_type_tokens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -731,6 +757,33 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         ) as image:
             assert image.mode == "RGBA"
     assert not (storage.clip_dir("clip-1") / "debug" / "pair").exists()
+
+
+def test_pair_retains_five_entities_without_changing_per_entity_shortlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(
+        config,
+        entity_types=("subject", "subject", "object", "group", "object"),
+    )
+
+    stats = pair_clips(config, storage, judge=_Judge())
+
+    clip = storage.read_clip("clip-1")
+    assert config.pair.max_candidates_per_entity == 3
+    assert stats.entities_ready == 5
+    assert clip.pairing is not None
+    assert clip.pairing.retained_entity_ids == ["e1", "e2", "e3", "e4", "e5"]
+    assert clip.pairing.tokens == {
+        "e1": "<ref_subject_1>",
+        "e2": "<ref_subject_2>",
+        "e3": "<ref_object_1>",
+        "e4": "<ref_group_1>",
+        "e5": "<ref_object_2>",
+    }
+    assert len(clip.references.entities) == 5
 
 
 def test_tracking_not_ready_and_local_disabled_become_content_rejections(
@@ -1417,7 +1470,7 @@ def test_ready_tracking_without_a_valid_candidate_uses_sampled_frames(
         pair=PairConfig(same_parent_fallback_enabled=True),
     )
     storage = _same_parent_storage(config)
-    original_builder = pair_module.build_entity_reference_candidates
+    original_builder = pair_module._build_entity_reference_candidates
 
     def without_target_candidates(
         config,
@@ -1429,7 +1482,7 @@ def test_ready_tracking_without_a_valid_candidate_uses_sampled_frames(
         masks,
     ):
         if clip_uid == "target":
-            return []
+            return [], False
         return original_builder(
             config,
             storage,
@@ -1441,7 +1494,7 @@ def test_ready_tracking_without_a_valid_candidate_uses_sampled_frames(
 
     monkeypatch.setattr(
         pair_module,
-        "build_entity_reference_candidates",
+        "_build_entity_reference_candidates",
         without_target_candidates,
     )
     cross = _CrossJudge()
@@ -3905,6 +3958,7 @@ def test_tiny_source_falls_back_without_starting_boogu_worker(
     final = clip.references.entities[0]
     edit = clip.reference_edit.entities[0]
     assert stats.failed == 0
+    assert stats.entities_eligible == 1
     assert stats.entities_fallback == 1
     assert stats.worker_starts == 0
     assert backend.start_calls == 0
@@ -3920,6 +3974,156 @@ def test_tiny_source_falls_back_without_starting_boogu_worker(
     assert metadata["source_tiny"] is True
     assert metadata["final_selection"] == "source"
     assert metadata["final_selection_reason"] == "tiny_source_entity"
+
+
+def test_all_tiny_references_are_eligible_without_initializing_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject", "object"))
+    pair_clips(config, storage, judge=_Judge())
+    gated_config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=128 * 128,
+            min_source_content_long_side_pixels=128,
+        ),
+    )
+    gated_config.validate()
+    backend = _ReferenceEditBackend()
+
+    def unexpected_runtime(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("all-tiny run must not initialize model runtime")
+
+    monkeypatch.setattr(
+        reference_edit_module,
+        "QwenBooguReferenceEditJudge",
+        unexpected_runtime,
+    )
+    monkeypatch.setattr(
+        reference_edit_module,
+        "Sam3SegmentationBackend",
+        unexpected_runtime,
+    )
+
+    stats = reference_edit_clips(
+        gated_config,
+        storage,
+        backend=backend,
+    )
+
+    assert stats.entities_eligible == 2
+    assert stats.entities_fallback == 2
+    assert stats.entities_accepted == 0
+    assert stats.entities_rejected == 0
+    assert stats.entities_failed == 0
+    assert stats.worker_starts == 0
+    assert backend.start_calls == 0
+    assert backend.calls == []
+    assert (
+        stats.entities_accepted
+        + stats.entities_fallback
+        + stats.entities_rejected
+        == stats.entities_eligible
+    )
+
+
+def test_tiny_and_normal_references_share_transactional_eligible_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject", "object"))
+    pair_clips(config, storage, judge=_Judge())
+    Image.new("RGBA", (192, 128), (20, 40, 60, 255)).save(
+        storage.selected_entity_path("clip-1", "e2"),
+        format="PNG",
+    )
+    gated_config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=128 * 128,
+            min_source_content_long_side_pixels=128,
+        ),
+    )
+    gated_config.validate()
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        gated_config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_eligible == 2
+    assert stats.entities_fallback == 1
+    assert stats.entities_accepted == 1
+    assert stats.entities_rejected == 0
+    assert stats.worker_starts == 1
+    assert backend.start_calls == 1
+    assert len(backend.calls) == 1
+    assert [item.status for item in clip.reference_edit.entities] == [
+        "fallback",
+        "accepted",
+    ]
+    assert (
+        stats.entities_accepted
+        + stats.entities_fallback
+        + stats.entities_rejected
+        == stats.entities_eligible
+    )
+
+
+def test_corrupt_reference_failure_is_isolated_before_lazy_runtime_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="reference-edit-isolation")
+    _add_ready_clip(config, storage, clip_uid="clip-a", entity_types=("subject",))
+    _add_ready_clip(config, storage, clip_uid="clip-b", entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    storage.selected_entity_path("clip-a", "e1").write_bytes(b"not a PNG")
+    Image.new("RGBA", (192, 128), (20, 40, 60, 255)).save(
+        storage.selected_entity_path("clip-b", "e1"),
+        format="PNG",
+    )
+    gated_config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=128 * 128,
+            min_source_content_long_side_pixels=128,
+        ),
+    )
+    gated_config.validate()
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        gated_config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert stats.processed == 2
+    assert stats.failed == 1
+    assert stats.entities_eligible == 1
+    assert stats.entities_accepted == 1
+    assert stats.worker_starts == 1
+    assert backend.start_calls == 1
+    assert len(backend.calls) == 1
+    assert storage.read_clip("clip-a").reference_edit.status == "failed"
+    assert storage.read_clip("clip-b").reference_edit.status == "ready"
 
 
 def test_legacy_touching_local_reference_routes_to_repairable(
@@ -4048,6 +4252,7 @@ def test_failed_clip_does_not_commit_partial_reference_edit_entity_counters(
     ).is_file()
     assert stats.processed == 1
     assert stats.failed == 1
+    assert stats.entities_eligible == 0
     assert stats.entities_accepted == 0
     assert stats.entities_fallback == 0
     assert stats.entities_rejected == 0

@@ -15,6 +15,7 @@ from r2v_data_v2.structured_output import (
 )
 from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
 from r2v_data_v2.v3.schemas import (
+    MAX_ANNOTATION_ENTITIES,
     AnnotationEntity,
     AnnotationState,
     BackgroundAnnotation,
@@ -43,8 +44,10 @@ _ENTITY_FIELDS = frozenset(
 )
 _BACKGROUND_FIELDS = frozenset({"phrase", "grounding_prompt"})
 _REFERENCE_TYPES = frozenset({"subject", "object", "group"})
+_ENTITY_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five")
+_ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[MAX_ANNOTATION_ENTITIES]
 
-SYSTEM_PROMPT = """You annotate a complete video for a V3 training-data pipeline.
+SYSTEM_PROMPT = f"""You annotate a complete video for a V3 training-data pipeline.
 
 Return exactly one JSON object matching the supplied minimal schema. Output only
 t2v_caption, entities, and background. Do not output relations, entity_id,
@@ -67,10 +70,11 @@ describe visible facial geometry and pose without inferring determination,
 resolve, triumph, fear, or effort. Do not write "the video shows". Do not include
 <ref_...> tokens or image-number instruction labels.
 
-Return at most three entities. Select only stable, discrete foreground reference
-candidates that SAM3 can localize and track and that could be reused as an
-independent reference image. Fewer than three is preferred when evidence is
-weak. Do not select environmental regions such as sky, ocean, water surface,
+Return at most {_ENTITY_LIMIT_WORD} entities. Select only stable, discrete
+foreground reference candidates that SAM3 can localize and track and that could
+be reused as an independent reference image. Fewer than {_ENTITY_LIMIT_WORD} is
+preferred when evidence is weak. Do not select environmental regions such as
+sky, ocean, water surface,
 ground, roads, or room space; distributed or transient content such as clouds,
 smoke, flame, lighting, shadows, reflections, or weather; content depicted in a
 screen, photo, poster, painting, sculpture, or animation; small attached
@@ -243,11 +247,12 @@ def sanitize_entity_candidates(
             warnings.append(f"dropped_duplicate_entity_phrase:{index}")
             continue
         seen_phrases.add(phrase_key)
-        accepted.append((normalized_type, phrase, grounding_prompt))
-        if len(accepted) == 3:
-            if index + 1 < len(raw_entities):
-                warnings.append("truncated_entity_candidates:3")
+        if len(accepted) == MAX_ANNOTATION_ENTITIES:
+            warnings.append(
+                f"truncated_entity_candidates:{MAX_ANNOTATION_ENTITIES}"
+            )
             break
+        accepted.append((normalized_type, phrase, grounding_prompt))
 
     entities = [
         AnnotationEntity(
