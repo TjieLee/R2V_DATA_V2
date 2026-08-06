@@ -754,11 +754,6 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
             return self
 
     class FakePipeline:
-        def __init__(self) -> None:
-            self.rewriter = SimpleNamespace(
-                to=lambda device: captured.setdefault("rewriter_device", device)
-            )
-
         @classmethod
         def from_pretrained(cls, path: str, **kwargs: object) -> FakePipeline:
             captured["model_path"] = path
@@ -767,6 +762,9 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
 
         def to(self, device: str) -> None:
             captured["device"] = device
+
+        def devices_manager(self, **kwargs: object) -> None:
+            captured["devices_manager"] = kwargs
 
         def __call__(self, **kwargs: object) -> SimpleNamespace:
             captured["call"] = kwargs
@@ -818,13 +816,23 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
     assert isinstance(call, dict)
     assert call["width"] == 1360
     assert call["height"] == 768
+    assert call["device"] == "cuda:0"
+    assert call["rewriter_device"] == "cuda:0"
+    assert call["unload_rewriter_level"] == "keep"
+    assert call["enable_inner_devices_manager"] is False
     assert call["align_res"] is False
     assert call["use_rewrite_text_instruction"] is True
     assert call["input_images"][0][0].size == (19, 23)
     assert call["input_images"][0][0].mode == "RGB"
     assert response["rewritten_instruction"] == "Complete the same object."
     assert response["effective_instruction"] == "Complete the same object."
-    assert captured["rewriter_device"] == "cuda:0"
+    assert captured["devices_manager"] == {
+        "instant_rewriter_device": "cuda:0",
+        "user_set_pipe_device": "cuda:0",
+        "user_set_rewriter_device": "cuda:0",
+        "execution_device": "cuda:0",
+        "unload_rewriter_level": "keep",
+    }
     with Image.open(output_path) as output:
         assert output.size == (1360, 768)
         assert output.mode == "RGB"
@@ -990,6 +998,18 @@ class _SamFailingBackend:
         raise RuntimeError("sam unavailable")
 
 
+class _SamAmbiguousInstancesBackend:
+    def track(self, **kwargs: object) -> EntityTrackResult:
+        del kwargs
+        return EntityTrackResult(
+            status="failed",
+            reason=(
+                "SAM3 returned multiple ambiguous instances for a "
+                "single-entity prompt"
+            ),
+        )
+
+
 def test_production_sam3_boogu_reviewer_is_review_only_and_tracks_ten_frames(
     tmp_path: Path,
 ) -> None:
@@ -1053,6 +1073,7 @@ def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
     ("backend", "expected_failure_kind"),
     [
         (_SamNotFoundBackend(), "not_found"),
+        (_SamAmbiguousInstancesBackend(), "multiple_instances"),
         (_SamFailingBackend(), "backend_failure"),
     ],
 )

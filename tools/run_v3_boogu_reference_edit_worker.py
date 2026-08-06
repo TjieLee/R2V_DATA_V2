@@ -118,10 +118,13 @@ def _load_pipeline(
             local_files_only=True,
         )
         pipeline.to(device)
-        rewriter = getattr(pipeline, "rewriter", None)
-        move_rewriter = getattr(rewriter, "to", None)
-        if callable(move_rewriter):
-            move_rewriter(device)
+        pipeline.devices_manager(
+            instant_rewriter_device=device,
+            user_set_pipe_device=device,
+            user_set_rewriter_device=device,
+            execution_device=device,
+            unload_rewriter_level="keep",
+        )
     return pipeline, torch
 
 
@@ -159,6 +162,10 @@ def _run_loaded_request(
             negative_instruction="",
             width=width,
             height=height,
+            device=device,
+            rewriter_device=device,
+            unload_rewriter_level="keep",
+            enable_inner_devices_manager=False,
             align_res=False,
             max_input_image_pixels=2048 * 2048,
             max_input_image_side_length=2048 * 2,

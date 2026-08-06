@@ -508,8 +508,9 @@ class Sam3BooguReferenceReviewer:
                 diagnostics={"exception_type": type(exc).__name__},
             )
         if result.status != "ready" or not result.observations:
-            failure_kind: SamFailureKind = (
-                "not_found" if result.status == "not_found" else "backend_failure"
+            failure_kind = _sam_track_failure_kind(
+                status=result.status,
+                reason=result.reason,
             )
             return _failed_sam_review(
                 failure_kind=failure_kind,
@@ -592,6 +593,15 @@ def _sam_failure_kind(
     if not fragmentation_ok:
         return "fragmented"
     return "none"
+
+
+def _sam_track_failure_kind(*, status: str, reason: str | None) -> SamFailureKind:
+    if status == "not_found":
+        return "not_found"
+    normalized_reason = (reason or "").casefold()
+    if status == "failed" and "multiple ambiguous instances" in normalized_reason:
+        return "multiple_instances"
+    return "backend_failure"
 
 
 def _significant_component_count(mask: np.ndarray) -> int:
