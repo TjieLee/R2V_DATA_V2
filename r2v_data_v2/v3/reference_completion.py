@@ -448,6 +448,7 @@ def _attempt(
         issues = validate_entity_reference_decision(
             rank_attempt.decision,
             candidate_ids={"candidate_1"},
+            reference_type=entity.reference_type,
         )
         diagnostics.details["reference_ranking"] = {
             "decision": rank_attempt.decision.model_dump(mode="json"),
@@ -536,6 +537,11 @@ def _attempt(
                 visible_region=decision.visible_region,
                 whole_entity_recognizable=decision.whole_entity_recognizable,
                 identity_features_visible=decision.identity_features_visible,
+                viewpoint=decision.viewpoint,
+                independent_reference_value=decision.independent_reference_value,
+                requires_substantial_invention=(
+                    decision.requires_substantial_invention
+                ),
                 scope_reason=decision.scope_reason,
                 image_path=source_state.image_path,
                 source_frame_index=source_state.source_frame_index,

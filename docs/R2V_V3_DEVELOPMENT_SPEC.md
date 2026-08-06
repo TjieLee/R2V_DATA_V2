@@ -270,8 +270,11 @@ or local target reference from an exact `parent_video_id` match after a dedicate
 visual judge accepts the same physical entity. When `reference_edit.enabled` is
 true, pair does not invoke the legacy localized Qwen completion fallback.
 Legacy source and artifacts remain compatible for old runs. Pairing records
-`image_quality` and the completeness route consumed by the later stage. Real
-references remain variable-size, source-faithful RGBA mask-bbox crops.
+`image_quality`, viewpoint, independent reference value, substantial-invention
+risk, and the completeness route consumed by the later stage. Rear-only subject
+views, non-independent environment fragments, and candidates requiring major
+invented identity or structure are rejected before publication. Real references
+remain variable-size, source-faithful RGBA mask-bbox crops.
 Candidate sharpness is the variance of a discrete Laplacian on the original RGB
 frame inside a two-pixel-eroded entity mask, with the original mask used when
 erosion leaves too few pixels. The deterministic shortlist order is border
@@ -418,6 +421,7 @@ ontology are not part of V3 annotation schema version 2.
 ### 7.1 `t2v_caption` requirements
 
 - one flowing English paragraph;
+- 60 to 110 English words recommended, with a hard maximum of 120;
 - literal and chronological;
 - complete visible semantics;
 - actions, camera behavior, environment, lighting, and stable appearance details;
@@ -438,6 +442,8 @@ and `caused by wind` with `unsupported_caption_inference`, which enters the
 existing repair lifecycle. This is not an entity ontology or object-name
 blacklist. Directly visible wording such as `branches sway slightly`, `sunny`,
 `overcast`, `cloudy`, `speaks`, and `talking` remains valid.
+Captions above the hard maximum produce `caption_too_long`; code never silently
+truncates them.
 
 ### 7.2 Candidate sanitation
 
@@ -447,8 +453,15 @@ keeping the first occurrence, retains at most five, and assigns entity IDs
 after all filtering. Phrase text is not required to match one exact contiguous
 caption span. Annotation remains separate from final reference eligibility.
 Entity phrases should normally be stable noun phrases rather than actions.
-Grounding prompts may add location or current pose only when needed to
-distinguish a SAM3 target.
+Phrases should contain 3 to 10 English words and have a hard maximum of 12.
+Grounding prompts should contain 6 to 18 words and have a hard maximum of 24;
+they describe stable appearance and location rather than transient action or an
+inventory of every clothing detail. `seated` and `standing` remain valid stable
+disambiguation. The conservative transient-action check covers `gesturing`,
+`speaking`, `talking`, `turning`, `walking`, `running`, `raising`, `holding up`,
+and `moving his/her hand`. Violations produce `entity_phrase_too_long`,
+`grounding_prompt_too_long`, or `transient_action_in_grounding_prompt` and enter
+the existing repair lifecycle without truncation or local candidate dropping.
 
 ### 7.3 Background stability
 
@@ -469,9 +482,21 @@ Every selected entity candidate receives:
   "visible_region": "whole|head_shoulders|upper_body|lower_body|front|rear|side|central|custom",
   "whole_entity_recognizable": true,
   "identity_features_visible": true,
+  "viewpoint": "front|three_quarter|side|rear|not_applicable",
+  "independent_reference_value": true,
+  "requires_substantial_invention": false,
   "scope_reason": "..."
 }
 ```
+
+Subjects use a directional viewpoint; objects and groups use `not_applicable`.
+Rear-only subjects reject. A side subject is usable only when a face or another
+explicit identity feature is visible. Clothing or a visible back alone is not
+identity evidence. A ready reference must have independent reference value and
+must not require substantial invented content. The three persisted judge fields
+are optional only so legacy `clip.json` records created before this contract
+remain loadable; newly judged ready and rejected states record them, cross-pair
+references inherit them, and reference editing does not alter them.
 
 ### 8.1 `full`
 
@@ -509,6 +534,13 @@ For a local reference:
 
 The current pair stage performs no semantic component pruning. Qwen rejects
 obvious fragmentation or segmentation errors.
+
+Completeness routing is intentionally conservative. `repairable` is limited to
+a minor local low-risk omission, such as a small limb terminal or small object
+part, when identity and most structure already exist. Missing identity, the
+head, most of a body or garment, torso-only/back-only fragments, or any repair
+requiring major invention is `severely_incomplete` and rejects. Bad masks,
+environment fragments, and non-target content are `fragmented` and reject.
 
 ### 8.3 `reject`
 
@@ -780,10 +812,13 @@ The instruction writer returns:
 ```
 
 `instruction_body_template` and every legend description are English. The body
-preserves chronology, action, environment, camera, composition, and lighting,
-and may use the same image placeholder multiple times. It must use every final
-binding at least once. Without `source_transcript`, it cannot invent quoted
-dialogue.
+is normally 80 to 160 English words with a hard maximum of 180. It preserves
+the core action, needed spatial relationships, camera, composition, lighting,
+and chronology without copying the caption or restating full reference
+appearance. It may use the same image placeholder multiple times and must use
+every final binding at least once. Legend descriptions contain stable visual
+appearance only, are normally 8 to 20 words, and have a hard maximum of 24.
+Without `source_transcript`, the body cannot invent quoted dialogue.
 
 Code performs the only presentation-layer conversion:
 
@@ -808,6 +843,12 @@ and do not appear in the structured instruction output or rendered instruction.
 ### 11.4 Instruction validation
 
 Validate raw structured output before deterministic English rendering:
+
+- reject a body above 180 English words with `instruction_body_too_long`;
+- reject a legend description above 24 words with
+  `legend_description_too_long`;
+- send either issue through the existing instruction repair lifecycle without
+  truncating model output;
 
 - the body template is non-empty and uses only exact `{{image_N}}` placeholders;
 - every binding appears at least once; repeated placeholders are allowed;

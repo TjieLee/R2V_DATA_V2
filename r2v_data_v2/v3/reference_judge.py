@@ -38,23 +38,39 @@ is severe, or segmentation is wrong. The context image shows scene placement;
 the isolated crop shows the
 exact proposed reference content.
 
+Classify viewpoint as front, three_quarter, side, rear, or not_applicable.
+Subjects must use a directional viewpoint; objects and groups must use
+not_applicable. Back visibility is not identity visibility, and clothing alone
+is not identity evidence. Reject rear-only subjects. A side-view subject is
+usable only when the face or other explicit identity features remain visible.
+
+independent_reference_value means the isolated visual content is independently
+useful as a generation condition. Reject wall patches, scenery fragments,
+background regions, and non-target mask fragments that have no independent
+reference value. requires_substantial_invention means successful completion
+would need the model to invent major identity or structure. Reject whenever it
+is true; later Boogu capability is never a reason to mark such a crop usable.
+
 Classify image_quality as high, acceptable, or poor. Classify completeness as
 one routing outcome: complete, repairable, local_usable, severely_incomplete,
-or fragmented. complete is a ready full reference. repairable is an
-identity-bearing local reference whose missing structure can plausibly be
-completed by the later reference-edit stage. Mark repairable when a person's
-torso, hips, buttocks, legs, or arms, or a main object structure, is visibly
-cut by the crop or mask boundary. A single connected component is not evidence
-that the entity is complete. local_usable is a stable, useful local identity
-view with no obvious truncation through the torso, hips, limbs, or main object
-structure; it need not pretend that the whole entity is visible and must not be
-sent for generative completion.
-severely_incomplete and fragmented must be rejected. Poor image quality must
-also be rejected.
+or fragmented. complete is mostly whole with clear identity. repairable is
+limited to minor, local, low-risk missing content, such as a small limb
+terminal or small object part, while the source preserves identity and most of
+the main object structure. local_usable is a stable, clean identity-bearing local
+view without key structural truncation and requires no completion.
+severely_incomplete means identity, the head, most of the body, most clothing,
+or another major structure is missing, or completion would require large
+invention. Crops cut through the torso, hips, buttocks, most legs or arms, and
+torso-only or back-only fragments belong here; only a small limb terminal may
+remain repairable. fragmented means a
+bad mask, environment fragment, or non-target content. severely_incomplete and
+fragmented must be rejected. Poor image quality must also be rejected. A
+single connected component is not evidence that the entity is complete.
 
 Do not output tokens or crop coordinates. Return one strict JSON object only
 with selected_candidate_id, image_quality, completeness, reference_scope,
-visible_region, whole_entity_recognizable, identity_features_visible, and
+visible_region, whole_entity_recognizable, identity_features_visible,
+viewpoint, independent_reference_value, requires_substantial_invention, and
 scope_reason."""
 
 
@@ -114,6 +130,7 @@ def validate_entity_reference_decision(
     decision: RawEntityReferenceDecision,
     *,
     candidate_ids: set[str],
+    reference_type: str,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     selected = decision.selected_candidate_id
@@ -146,6 +163,65 @@ def validate_entity_reference_decision(
                 code="poor_quality_not_rejected",
                 field="image_quality",
                 message="poor image quality must reject the reference",
+            )
+        )
+    if reference_type == "subject":
+        if decision.viewpoint == "not_applicable":
+            issues.append(
+                ValidationIssue(
+                    code="subject_viewpoint_required",
+                    field="viewpoint",
+                    message="subject reference requires a directional viewpoint",
+                )
+            )
+        elif decision.viewpoint == "rear" and decision.reference_scope != "reject":
+            issues.append(
+                ValidationIssue(
+                    code="rear_subject_not_rejected",
+                    field="viewpoint",
+                    message="rear-only subject reference must be rejected",
+                )
+            )
+        elif (
+            decision.viewpoint == "side"
+            and not decision.identity_features_visible
+            and decision.reference_scope != "reject"
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="side_subject_requires_identity",
+                    field="identity_features_visible",
+                    message="side subject requires visible identity features",
+                )
+            )
+    elif decision.viewpoint != "not_applicable":
+        issues.append(
+            ValidationIssue(
+                code="non_subject_viewpoint_not_applicable",
+                field="viewpoint",
+                message="object and group viewpoints must be not_applicable",
+            )
+        )
+    if (
+        not decision.independent_reference_value
+        and decision.reference_scope != "reject"
+    ):
+        issues.append(
+            ValidationIssue(
+                code="no_independent_reference_value",
+                field="independent_reference_value",
+                message="candidate without independent reference value must reject",
+            )
+        )
+    if (
+        decision.requires_substantial_invention
+        and decision.reference_scope != "reject"
+    ):
+        issues.append(
+            ValidationIssue(
+                code="substantial_invention_not_rejected",
+                field="requires_substantial_invention",
+                message="candidate requiring substantial invention must reject",
             )
         )
     if decision.reference_scope == "full":
@@ -357,6 +433,7 @@ class QwenEntityReferenceJudge:
                 issues = validate_entity_reference_decision(
                     decision,
                     candidate_ids=set(candidate_ids),
+                    reference_type=entity.reference_type,
                 )
             if decision is not None and not issues:
                 return EntityReferenceDecisionAttempt(

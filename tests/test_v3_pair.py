@@ -346,7 +346,10 @@ def _storage(
     return storage
 
 
-def _decision(scope: str = "full") -> RawEntityReferenceDecision:
+def _decision(
+    scope: str = "full",
+    reference_type: str = "subject",
+) -> RawEntityReferenceDecision:
     if scope == "reject":
         return RawEntityReferenceDecision(
             selected_candidate_id=None,
@@ -356,6 +359,9 @@ def _decision(scope: str = "full") -> RawEntityReferenceDecision:
             visible_region="custom",
             whole_entity_recognizable=False,
             identity_features_visible=False,
+            viewpoint=("front" if reference_type == "subject" else "not_applicable"),
+            independent_reference_value=True,
+            requires_substantial_invention=False,
             scope_reason="not reusable",
         )
     completeness = (
@@ -374,6 +380,9 @@ def _decision(scope: str = "full") -> RawEntityReferenceDecision:
         visible_region="whole" if scope == "full" else "central",
         whole_entity_recognizable=scope in {"full", "local"},
         identity_features_visible=True,
+        viewpoint=("front" if reference_type == "subject" else "not_applicable"),
+        independent_reference_value=True,
+        requires_substantial_invention=False,
         scope_reason="clear visual identity",
     )
 
@@ -390,7 +399,10 @@ class _Judge:
         )
         assert set(source_images) == {item.image_path for item in candidates}
         return EntityReferenceDecisionAttempt(
-            decision=_decision(self.scopes.get(entity.entity_id, "full")),
+            decision=_decision(
+                self.scopes.get(entity.entity_id, "full"),
+                entity.reference_type,
+            ),
             raw_responses=("{}",),
             repair_attempts=1 if entity.entity_id == "e1" else 0,
         )
@@ -671,6 +683,47 @@ def test_pair_rejects_entity_when_every_reference_candidate_is_tiny(
     assert stats.entities_rejected == 1
     assert clip.references.entities[0].status == "rejected"
     assert clip.references.entities[0].scope_reason == "tiny_reference_candidates"
+
+
+def test_pair_does_not_publish_candidate_without_independent_reference_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("object",))
+
+    class NoIndependentValueJudge(_Judge):
+        def decide(self, *, entity, candidates, source_images):
+            assert entity.entity_id == "e1"
+            assert candidates
+            assert source_images
+            return EntityReferenceDecisionAttempt(
+                decision=RawEntityReferenceDecision(
+                    selected_candidate_id=None,
+                    image_quality="acceptable",
+                    completeness="fragmented",
+                    reference_scope="reject",
+                    visible_region="custom",
+                    whole_entity_recognizable=False,
+                    identity_features_visible=False,
+                    viewpoint="not_applicable",
+                    independent_reference_value=False,
+                    requires_substantial_invention=False,
+                    scope_reason="The crop is only an environment fragment.",
+                ),
+                raw_responses=("{}",),
+                repair_attempts=0,
+            )
+
+    stats = pair_clips(config, storage, judge=NoIndependentValueJudge())
+
+    clip = storage.read_clip("clip-1")
+    state = clip.references.entities[0]
+    assert stats.entities_rejected == 1
+    assert state.status == "rejected"
+    assert state.independent_reference_value is False
+    assert state.requires_substantial_invention is False
+    assert not storage.selected_entity_path("clip-1", "e1").exists()
 
 
 def test_pair_builds_each_entity_candidate_collection_once(
@@ -1190,7 +1243,10 @@ class _ClipJudge:
         self.calls.append((clip_uid, entity.entity_id))
         assert set(source_images) == {item.image_path for item in candidates}
         return EntityReferenceDecisionAttempt(
-            decision=_decision(self.scopes.get((clip_uid, entity.entity_id), "full")),
+            decision=_decision(
+                self.scopes.get((clip_uid, entity.entity_id), "full"),
+                entity.reference_type,
+            ),
             raw_responses=("{}",),
             repair_attempts=0,
         )
@@ -1338,6 +1394,15 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
     assert target_reference.source_entity_id == "e1"
     assert target_reference.source_frame_index == (
         donor.references.entities[0].source_frame_index
+    )
+    assert target_reference.viewpoint == donor.references.entities[0].viewpoint
+    assert (
+        target_reference.independent_reference_value
+        == donor.references.entities[0].independent_reference_value
+    )
+    assert (
+        target_reference.requires_substantial_invention
+        == donor.references.entities[0].requires_substantial_invention
     )
     assert donor.references.entities[0].source_clip_uid == "donor"
     assert donor.references.entities[0].source_entity_id == "e1"
@@ -4207,6 +4272,15 @@ def test_legacy_local_reference_publishes_with_normalized_quality_fields(
     assert reference.visible_region == source.visible_region
     assert reference.whole_entity_recognizable == source.whole_entity_recognizable
     assert reference.identity_features_visible == source.identity_features_visible
+    assert reference.viewpoint == source.viewpoint
+    assert (
+        reference.independent_reference_value
+        == source.independent_reference_value
+    )
+    assert (
+        reference.requires_substantial_invention
+        == source.requires_substantial_invention
+    )
     assert reference.completeness == "local_usable"
     assert reference.image_quality == "acceptable"
     assert reference.generation_metadata_path is not None

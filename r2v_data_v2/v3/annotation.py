@@ -30,6 +30,12 @@ _UNSUPPORTED_CAPTION_INFERENCE = re.compile(
     r"\b(?:wind\s+causes|caused\s+by\s+wind)\b",
     flags=re.IGNORECASE,
 )
+_ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*")
+_TRANSIENT_GROUNDING_ACTION = re.compile(
+    r"\b(?:gesturing|speaking|talking|turning|walking|running|raising|"
+    r"holding\s+up)\b|\bmoving\s+(?:his|her|his/her)\s+hand\b",
+    flags=re.IGNORECASE,
+)
 _JSON_FENCE = re.compile(
     r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```",
     flags=re.IGNORECASE,
@@ -58,7 +64,8 @@ tokens, instructions, or any additional ontology fields.
 Write t2v_caption as one complete English paragraph that begins directly with
 visible content and describes actions and shot changes in chronological order.
 Include visible subject appearance, action, scene, composition, camera behavior,
-and lighting. Describe only directly visible content. Do not infer identity,
+and lighting without repetition. Prefer 60 to 110 English words and never
+exceed 120 words. Describe only directly visible content. Do not infer identity,
 weather, emotion, allegiance, intent, mental state, sound, dialogue, or event
 causes. Describe visible motion directly without assigning an unseen cause.
 Write "branches sway slightly" instead of claiming that wind causes movement.
@@ -88,11 +95,14 @@ animal, or character whose identity or appearance should be retained; object for
 one independently referenceable product, vehicle, prop, device, piece of
 furniture, or other object; and group for multiple subjects or objects whose
 stable composition should be retained together. phrase briefly identifies the
-candidate for binding and review. entity.phrase should normally be a stable noun
+candidate for binding and review in 3 to 10 words and must not exceed 12 words.
+entity.phrase should normally be a stable noun
 phrase rather than an action: prefer "man in a light gray military uniform" over
-"military officer speaking at podium". grounding_prompt describes visible
-appearance and may include location or current pose only when needed to
-distinguish the target for SAM3. Both fields must be non-empty and must not
+"military officer speaking at podium". grounding_prompt describes stable visible
+appearance and location in 6 to 18 words and must not exceed 24 words. Do not
+include transient actions or enumerate every clothing detail. A stable seated
+or standing pose is allowed only when needed to distinguish the target for
+SAM3. Both fields must be non-empty and must not
 contain reference tokens.
 
 background is optional. When reliable, describe the overall environment after
@@ -200,6 +210,52 @@ def _clean_text(value: object, *, trim_phrase_punctuation: bool = False) -> str 
 
 def _normalized_phrase(value: str) -> str:
     return " ".join(value.casefold().split()).strip(_PHRASE_EDGE_PUNCTUATION)
+
+
+def _english_word_count(value: str) -> int:
+    return len(_ENGLISH_WORD.findall(value))
+
+
+def _entity_text_issues(raw_entities: object) -> list[ValidationIssue]:
+    if not isinstance(raw_entities, list):
+        return []
+    issues: list[ValidationIssue] = []
+    for index, candidate in enumerate(raw_entities):
+        if not isinstance(candidate, dict):
+            continue
+        phrase = _clean_text(candidate.get("phrase"))
+        if phrase is not None and _english_word_count(phrase) > 12:
+            issues.append(
+                ValidationIssue(
+                    code="entity_phrase_too_long",
+                    field=f"entities.{index}.phrase",
+                    message="entity phrase must not exceed 12 English words",
+                )
+            )
+        grounding_prompt = _clean_text(candidate.get("grounding_prompt"))
+        if grounding_prompt is None:
+            continue
+        if _english_word_count(grounding_prompt) > 24:
+            issues.append(
+                ValidationIssue(
+                    code="grounding_prompt_too_long",
+                    field=f"entities.{index}.grounding_prompt",
+                    message="grounding prompt must not exceed 24 English words",
+                )
+            )
+        action_match = _TRANSIENT_GROUNDING_ACTION.search(grounding_prompt)
+        if action_match is not None:
+            issues.append(
+                ValidationIssue(
+                    code="transient_action_in_grounding_prompt",
+                    field=f"entities.{index}.grounding_prompt",
+                    message=(
+                        "grounding prompt contains a transient action: "
+                        f"{action_match.group(0)}"
+                    ),
+                )
+            )
+    return issues
 
 
 def sanitize_entity_candidates(
@@ -321,6 +377,14 @@ def sanitize_annotation_payload(
             )
         )
     else:
+        if _english_word_count(caption) > 120:
+            issues.append(
+                ValidationIssue(
+                    code="caption_too_long",
+                    field="t2v_caption",
+                    message="t2v_caption must not exceed 120 English words",
+                )
+            )
         inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(caption)
         if inference_match is not None:
             issues.append(
@@ -333,6 +397,7 @@ def sanitize_annotation_payload(
                     ),
                 )
             )
+    issues.extend(_entity_text_issues(raw_payload.get("entities", [])))
     if issues:
         return None, issues, ()
 

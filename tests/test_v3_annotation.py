@@ -714,6 +714,98 @@ def test_directly_visible_caption_language_is_allowed(caption: str) -> None:
     assert annotation.status == "ready"
 
 
+def test_caption_at_120_words_is_allowed() -> None:
+    caption = " ".join(f"visible{index}" for index in range(120))
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(caption=caption)
+    )
+
+    assert issues == []
+    assert annotation is not None
+
+
+def test_caption_over_120_words_enters_repair_validation() -> None:
+    caption = " ".join(f"visible{index}" for index in range(121))
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(caption=caption)
+    )
+
+    assert annotation is None
+    assert {issue.code for issue in issues} == {"caption_too_long"}
+
+
+def test_entity_phrase_over_12_words_enters_repair_validation() -> None:
+    phrase = " ".join(f"detail{index}" for index in range(13))
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(entities=[_entity(phrase, grounding_prompt="stable visible object")])
+    )
+
+    assert annotation is None
+    assert {issue.code for issue in issues} == {"entity_phrase_too_long"}
+
+
+def test_grounding_prompt_over_24_words_enters_repair_validation() -> None:
+    grounding = " ".join(f"feature{index}" for index in range(25))
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(entities=[_entity("a stable object", grounding_prompt=grounding)])
+    )
+
+    assert annotation is None
+    assert {issue.code for issue in issues} == {"grounding_prompt_too_long"}
+
+
+@pytest.mark.parametrize(
+    "grounding_prompt",
+    [
+        "the woman gesturing beside the table",
+        "the man speaking near the podium",
+        "the person holding up a sign",
+        "the woman moving her hand near the chair",
+    ],
+)
+def test_transient_action_in_grounding_prompt_enters_repair_validation(
+    grounding_prompt: str,
+) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            entities=[
+                _entity(
+                    "a visible person",
+                    grounding_prompt=grounding_prompt,
+                )
+            ]
+        )
+    )
+
+    assert annotation is None
+    assert {issue.code for issue in issues} == {
+        "transient_action_in_grounding_prompt"
+    }
+
+
+@pytest.mark.parametrize(
+    "grounding_prompt",
+    [
+        "the seated woman in a yellow coat",
+        "the standing metal floor lamp near the window",
+    ],
+)
+def test_stable_short_grounding_prompt_is_allowed(grounding_prompt: str) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            entities=[
+                _entity(
+                    "a stable foreground reference",
+                    grounding_prompt=grounding_prompt,
+                )
+            ]
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+
+
 @pytest.mark.parametrize(
     "caption",
     [
@@ -760,6 +852,36 @@ def test_caption_semantic_issue_can_be_repaired(
     assert clip.annotation is not None
     assert clip.annotation.status == "ready"
     assert clip.annotation.t2v_caption.startswith("Thin branches")
+
+
+def test_annotation_text_limit_issue_can_be_repaired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    long_caption = " ".join(f"visible{index}" for index in range(121))
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [_payload(caption=long_caption), _payload()],
+        repair_retries=1,
+    )
+
+    assert stats.repaired == 1
+    assert len(client.requests) == 2
+    assert "caption_too_long" in str(client.requests[1])
+    assert clip.annotation is not None
+    assert clip.annotation.status == "ready"
+
+
+def test_annotation_prompt_defines_concise_text_limits() -> None:
+    lowered = " ".join(SYSTEM_PROMPT.lower().split())
+    for phrase in (
+        "never exceed 120 words",
+        "must not exceed 12 words",
+        "must not exceed 24 words",
+        "do not include transient actions",
+    ):
+        assert phrase in lowered
 
 
 def test_empty_caption_is_repaired(

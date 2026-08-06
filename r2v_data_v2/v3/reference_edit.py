@@ -206,6 +206,9 @@ def _rejected_reference(
         scope_reason=reason,
         image_quality=reference.image_quality,
         completeness=reference.completeness,
+        viewpoint=reference.viewpoint,
+        independent_reference_value=reference.independent_reference_value,
+        requires_substantial_invention=reference.requires_substantial_invention,
     )
 
 
@@ -254,6 +257,9 @@ def _accepted_reference(
             else "high"
         ),
         completeness="local_usable" if preserve_local_scope else "complete",
+        viewpoint=reference.viewpoint,
+        independent_reference_value=reference.independent_reference_value,
+        requires_substantial_invention=reference.requires_substantial_invention,
         synthetic=True,
         generation_metadata_path=storage.relative_artifact_path(metadata_path),
         generation_source_sha256=source_sha256,

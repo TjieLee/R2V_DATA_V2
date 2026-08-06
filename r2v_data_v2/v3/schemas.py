@@ -297,6 +297,13 @@ ReferenceCompleteness = Literal[
     "severely_incomplete",
     "fragmented",
 ]
+ReferenceViewpoint = Literal[
+    "front",
+    "three_quarter",
+    "side",
+    "rear",
+    "not_applicable",
+]
 VisibleRegion = Literal[
     "whole",
     "head_shoulders",
@@ -318,6 +325,9 @@ class RawEntityReferenceDecision(SchemaModel):
     visible_region: VisibleRegion
     whole_entity_recognizable: StrictBool
     identity_features_visible: StrictBool
+    viewpoint: ReferenceViewpoint
+    independent_reference_value: StrictBool
+    requires_substantial_invention: StrictBool
     scope_reason: str
 
     @model_validator(mode="after")
@@ -336,6 +346,14 @@ class RawEntityReferenceDecision(SchemaModel):
             raise ValueError("full or local decision requires selected_candidate_id")
         if self.image_quality == "poor" and self.reference_scope != "reject":
             raise ValueError("poor image quality must reject the reference")
+        if not self.independent_reference_value and self.reference_scope != "reject":
+            raise ValueError(
+                "a reference without independent value must be rejected"
+            )
+        if self.requires_substantial_invention and self.reference_scope != "reject":
+            raise ValueError(
+                "a reference requiring substantial invention must be rejected"
+            )
         expected_scope: ReferenceScope
         if self.completeness == "complete":
             expected_scope = "full"
@@ -392,6 +410,9 @@ class EntityReferenceState(SchemaModel):
     source_entity_id: Optional[str] = None
     image_quality: Optional[ReferenceImageQuality] = None
     completeness: Optional[ReferenceCompleteness] = None
+    viewpoint: Optional[ReferenceViewpoint] = None
+    independent_reference_value: Optional[bool] = None
+    requires_substantial_invention: Optional[bool] = None
     synthetic: bool = False
     generation_metadata_path: Optional[str] = None
     generation_source_sha256: Optional[str] = Field(
@@ -419,6 +440,14 @@ class EntityReferenceState(SchemaModel):
                 "entity reference quality and completeness must be set together"
             )
         if self.status == "ready":
+            if self.independent_reference_value is False:
+                raise ValueError(
+                    "ready entity reference requires independent reference value"
+                )
+            if self.requires_substantial_invention is True:
+                raise ValueError(
+                    "ready entity reference cannot require substantial invention"
+                )
             if self.reference_scope == "full":
                 if (
                     self.visible_region != "whole"

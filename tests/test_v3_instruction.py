@@ -510,6 +510,44 @@ def test_english_body_and_legend_are_accepted() -> None:
     assert _issue_codes(output) == set()
 
 
+def test_instruction_body_at_180_words_is_allowed() -> None:
+    words = " ".join(f"detail{index}" for index in range(180))
+    output = _raw_output(
+        body=f"{{{{image_1}}}} {{{{image_2}}}} {{{{image_3}}}} {words}"
+    )
+
+    assert "instruction_body_too_long" not in _issue_codes(output)
+
+
+def test_instruction_body_over_180_words_is_rejected() -> None:
+    words = " ".join(f"detail{index}" for index in range(181))
+    output = _raw_output(
+        body=f"{{{{image_1}}}} {{{{image_2}}}} {{{{image_3}}}} {words}"
+    )
+
+    assert "instruction_body_too_long" in _issue_codes(output)
+
+
+def test_legend_description_over_24_words_is_rejected() -> None:
+    descriptions = [
+        " ".join(f"feature{index}" for index in range(25)),
+        "the stable red bicycle",
+        "the bright plaza environment",
+    ]
+
+    assert "legend_description_too_long" in _issue_codes(
+        _raw_output(descriptions=descriptions)
+    )
+
+
+def test_instruction_prompt_defines_concise_text_limits() -> None:
+    from r2v_data_v2.v3.instruction import SYSTEM_PROMPT
+
+    lowered = SYSTEM_PROMPT.lower()
+    assert "never more than 180 words" in lowered
+    assert "never more than 24 words" in lowered
+
+
 def test_chinese_body_is_rejected() -> None:
     output = _raw_output(
         body="\u5728{{image_3}}\u4e2d\uff0c{{image_1}}\u63a8\u7740{{image_2}}\u524d\u8fdb\u3002"
@@ -779,6 +817,31 @@ def test_unknown_placeholder_can_be_repaired_and_rendered(
         "<Image 2>: the stable appearance of the red bicycle\n"
         "<Image 3>: the bright plaza environment"
     )
+
+
+def test_instruction_length_issue_can_be_repaired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage, clip_uid = _ready_storage(config)
+    long_body = " ".join(f"detail{index}" for index in range(181))
+    invalid = _raw_output(
+        body=(
+            f"{{{{image_1}}}} {{{{image_2}}}} {{{{image_3}}}} {long_body}"
+        )
+    )
+    valid = _raw_output()
+    client = _FakeInstructionClient(
+        config.qwen.instruction_writer,
+        [invalid.model_dump(mode="json"), valid.model_dump(mode="json")],
+    )
+
+    stats = instruct_clips(config, storage, client=client)
+
+    assert stats.repaired == 1
+    assert "instruction_body_too_long" in client.requests[1]
+    assert storage.read_clip(clip_uid).instruction is not None
 
 
 def test_instruction_failure_preserves_ready_annotation(

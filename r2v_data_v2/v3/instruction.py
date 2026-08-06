@@ -45,6 +45,7 @@ _QUOTED_DIALOGUE = re.compile(
     r"\u201c[^\u201d\n]+\u201d|"
     r'"[^"\n]+")'
 )
+_ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*")
 
 SYSTEM_PROMPT = """You write an English reference-conditioned video instruction.
 
@@ -52,10 +53,12 @@ Return exactly one JSON object matching the supplied schema. The input bindings
 are final and immutable. Do not add, remove, reorder, rename, or reinterpret any
 binding. All schema field names, identifiers, and placeholders remain English.
 
-Write instruction_body_template in English. Accurately describe the scene,
-lighting, camera, composition, initial positions, spatial relationships, visible
-actions, and shot changes in chronological order. Use each exact placeholder,
-such as {{image_1}}, at least once. Placeholders may be repeated. In raw output,
+Write a concise instruction_body_template in English, normally 80 to 160 words
+and never more than 180 words. Preserve the core action, needed spatial
+relationships, composition, camera, lighting, and chronological shot changes
+without repeating the caption or restating full entity appearance. Use each exact placeholder,
+such as {{image_1}}, at least once. Normally use each placeholder once, but
+repeat it when needed. In raw output,
 never replace placeholders with rendered labels such as <Image 1>, Image 1, or
 Chinese image-number labels. Do not output <ref_...> tokens. Do not invent shot
 changes for a single continuous shot.
@@ -65,10 +68,11 @@ motion may be described without supplying words. When source_transcript is
 present, only dialogue supported by that transcript may be quoted.
 
 reference_legend must contain exactly one entry for each binding in the same
-order. Copy each binding image_id exactly. Each description must be in English
-and summarize the stable visual appearance that the corresponding reference
-image must preserve. A background description covers the environment and must
-not invent subject actions. Return JSON only."""
+order. Copy each binding image_id exactly. Each description must be in English,
+normally 8 to 20 words and never more than 24 words, and summarize only stable
+visual appearance. Do not include actions or the full scene in an entity legend.
+A background description covers the environment and must not invent subject
+actions. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -162,6 +166,11 @@ def source_transcript_from_metadata(
     return None
 
 
+def _english_word_count(value: str) -> int:
+    without_placeholders = _EXACT_PLACEHOLDER.sub(" ", value)
+    return len(_ENGLISH_WORD.findall(without_placeholders))
+
+
 def validate_instruction_output(
     output: RawInstructionOutput,
     *,
@@ -190,6 +199,14 @@ def validate_instruction_output(
                 message=(
                     "instruction_body_template must not contain CJK characters"
                 ),
+            )
+        )
+    if body and _english_word_count(body) > 180:
+        issues.append(
+            ValidationIssue(
+                code="instruction_body_too_long",
+                field="instruction_body_template",
+                message="instruction body must not exceed 180 English words",
             )
         )
     if _REFERENCE_TOKEN.search(raw_text):
@@ -289,6 +306,14 @@ def validate_instruction_output(
                     code="non_english_legend_description",
                     field=f"reference_legend.{index}.description",
                     message="legend description must not contain CJK characters",
+                )
+            )
+        if _english_word_count(entry.description) > 24:
+            issues.append(
+                ValidationIssue(
+                    code="legend_description_too_long",
+                    field=f"reference_legend.{index}.description",
+                    message="legend description must not exceed 24 English words",
                 )
             )
         if _ANY_PLACEHOLDER.search(entry.description):

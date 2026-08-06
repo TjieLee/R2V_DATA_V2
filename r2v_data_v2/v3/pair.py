@@ -47,6 +47,7 @@ from r2v_data_v2.v3.schemas import (
     ClipRecord,
     EntityReferenceState,
     PairingState,
+    RawEntityReferenceDecision,
     ReferencesState,
     SampledFrame,
     SampledFramesArtifact,
@@ -715,6 +716,9 @@ def validate_entity_reference_artifact(
         "whole_entity_recognizable",
         "identity_features_visible",
         "scope_reason",
+        "viewpoint",
+        "independent_reference_value",
+        "requires_substantial_invention",
         "source_frame_index",
     )
     if any(
@@ -730,7 +734,12 @@ def validate_entity_reference_artifact(
         raise ValueError("cross-pair target artifact bytes do not match donor PNG")
 
 
-def _rejected_reference(entity_id: str, reason: str) -> EntityReferenceState:
+def _rejected_reference(
+    entity_id: str,
+    reason: str,
+    *,
+    decision: RawEntityReferenceDecision | None = None,
+) -> EntityReferenceState:
     return EntityReferenceState(
         entity_id=entity_id,
         status="rejected",
@@ -739,6 +748,15 @@ def _rejected_reference(entity_id: str, reason: str) -> EntityReferenceState:
         whole_entity_recognizable=False,
         identity_features_visible=False,
         scope_reason=reason,
+        image_quality=(decision.image_quality if decision is not None else None),
+        completeness=(decision.completeness if decision is not None else None),
+        viewpoint=(decision.viewpoint if decision is not None else None),
+        independent_reference_value=(
+            decision.independent_reference_value if decision is not None else None
+        ),
+        requires_substantial_invention=(
+            decision.requires_substantial_invention if decision is not None else None
+        ),
         synthetic=False,
     )
 
@@ -1321,6 +1339,13 @@ def _run_same_parent_cross_pair_fallback(
                                 donor_state.identity_features_visible
                             ),
                             scope_reason=donor_state.scope_reason,
+                            viewpoint=donor_state.viewpoint,
+                            independent_reference_value=(
+                                donor_state.independent_reference_value
+                            ),
+                            requires_substantial_invention=(
+                                donor_state.requires_substantial_invention
+                            ),
                             image_path=storage.relative_artifact_path(
                                 storage.selected_entity_path(
                                     target_clip.clip_uid,
@@ -1569,6 +1594,7 @@ def pair_clips(
                     decision_issues = validate_entity_reference_decision(
                         decision,
                         candidate_ids={item.candidate_id for item in candidates},
+                        reference_type=entity.reference_type,
                     )
                     if decision_issues:
                         messages = "; ".join(issue.message for issue in decision_issues)
@@ -1585,6 +1611,13 @@ def pair_clips(
                                 scope_reason=decision.scope_reason,
                                 image_quality=decision.image_quality,
                                 completeness=decision.completeness,
+                                viewpoint=decision.viewpoint,
+                                independent_reference_value=(
+                                    decision.independent_reference_value
+                                ),
+                                requires_substantial_invention=(
+                                    decision.requires_substantial_invention
+                                ),
                                 synthetic=False,
                             )
                         )
@@ -1597,6 +1630,7 @@ def pair_clips(
                             _rejected_reference(
                                 entity.entity_id,
                                 "local_reference_disabled",
+                                decision=decision,
                             )
                         )
                         continue
@@ -1645,6 +1679,13 @@ def pair_clips(
                             source_entity_id=entity.entity_id,
                             image_quality=decision.image_quality,
                             completeness=decision.completeness,
+                            viewpoint=decision.viewpoint,
+                            independent_reference_value=(
+                                decision.independent_reference_value
+                            ),
+                            requires_substantial_invention=(
+                                decision.requires_substantial_invention
+                            ),
                         )
                     )
                 retained = [

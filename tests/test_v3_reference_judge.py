@@ -23,6 +23,7 @@ from r2v_data_v2.v3.reference_judge import (
 )
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
+    EntityReferenceState,
     RawEntityReferenceDecision,
 )
 
@@ -64,6 +65,9 @@ def _payload(**updates: object) -> dict[str, object]:
         "visible_region": "whole",
         "whole_entity_recognizable": True,
         "identity_features_visible": True,
+        "viewpoint": "front",
+        "independent_reference_value": True,
+        "requires_substantial_invention": False,
         "scope_reason": "The whole entity and identity are visible.",
     }
     result.update(updates)
@@ -100,6 +104,22 @@ def test_raw_decision_schema_is_strict(
         RawEntityReferenceDecision.model_validate(_payload(**updates))
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "viewpoint",
+        "independent_reference_value",
+        "requires_substantial_invention",
+    ],
+)
+def test_new_reference_gate_fields_are_required(field: str) -> None:
+    payload = _payload()
+    payload.pop(field)
+
+    with pytest.raises(ValidationError, match=field):
+        RawEntityReferenceDecision.model_validate(payload)
+
+
 def test_reject_decision_contract_is_valid() -> None:
     decision = RawEntityReferenceDecision.model_validate(
         _payload(
@@ -117,6 +137,7 @@ def test_reject_decision_contract_is_valid() -> None:
         validate_entity_reference_decision(
             decision,
             candidate_ids={"candidate_1"},
+            reference_type="subject",
         )
         == []
     )
@@ -199,6 +220,7 @@ def test_request_level_semantic_validation(
     issues = validate_entity_reference_decision(
         decision,
         candidate_ids={"candidate_1"},
+        reference_type="subject",
     )
     assert code in {issue.code for issue in issues}
 
@@ -212,13 +234,187 @@ def test_recognizable_local_reference_is_valid() -> None:
             whole_entity_recognizable=True,
         )
     )
-    assert (
-        validate_entity_reference_decision(
-            decision,
-            candidate_ids={"candidate_1"},
-        )
-        == []
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
+
+
+@pytest.mark.parametrize("viewpoint", ["front", "three_quarter"])
+def test_identity_bearing_subject_viewpoints_are_accepted(viewpoint: str) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(viewpoint=viewpoint)
     )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
+
+
+def test_rear_subject_must_reject() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(viewpoint="rear")
+    )
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    assert {issue.code for issue in issues} == {"rear_subject_not_rejected"}
+
+
+@pytest.mark.parametrize("identity_visible", [True, False])
+def test_side_subject_requires_explicit_identity(identity_visible: bool) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(identity_features_visible=identity_visible, viewpoint="side")
+    )
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    codes = {issue.code for issue in issues}
+    if identity_visible:
+        assert codes == set()
+    else:
+        assert "side_subject_requires_identity" in codes
+        assert "full_requires_identity" in codes
+
+
+@pytest.mark.parametrize("reference_type", ["object", "group"])
+def test_non_subject_viewpoint_is_not_applicable(reference_type: str) -> None:
+    accepted = RawEntityReferenceDecision.model_validate(
+        _payload(viewpoint="not_applicable")
+    )
+    invalid = RawEntityReferenceDecision.model_validate(_payload(viewpoint="front"))
+
+    assert validate_entity_reference_decision(
+        accepted,
+        candidate_ids={"candidate_1"},
+        reference_type=reference_type,
+    ) == []
+    assert "non_subject_viewpoint_not_applicable" in {
+        issue.code
+        for issue in validate_entity_reference_decision(
+            invalid,
+            candidate_ids={"candidate_1"},
+            reference_type=reference_type,
+        )
+    }
+
+
+def test_no_independent_reference_value_must_reject() -> None:
+    with pytest.raises(ValidationError, match="independent value"):
+        RawEntityReferenceDecision.model_validate(
+            _payload(independent_reference_value=False)
+        )
+    rejected = RawEntityReferenceDecision.model_validate(
+        _payload(
+            selected_candidate_id=None,
+            completeness="fragmented",
+            reference_scope="reject",
+            visible_region="custom",
+            whole_entity_recognizable=False,
+            identity_features_visible=False,
+            independent_reference_value=False,
+            scope_reason="The crop is only a wall fragment.",
+        )
+    )
+    assert rejected.selected_candidate_id is None
+
+
+def test_substantial_invention_cannot_route_to_repairable() -> None:
+    with pytest.raises(ValidationError, match="substantial invention"):
+        RawEntityReferenceDecision.model_validate(
+            _payload(
+                completeness="repairable",
+                reference_scope="local",
+                visible_region="central",
+                whole_entity_recognizable=False,
+                requires_substantial_invention=True,
+            )
+        )
+
+
+def test_minor_crop_can_route_to_repairable() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="central",
+            whole_entity_recognizable=True,
+            requires_substantial_invention=False,
+            scope_reason="Only one small limb terminal is missing.",
+        )
+    )
+    assert decision.completeness == "repairable"
+
+
+def test_missing_head_and_most_body_routes_to_severe_rejection() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            selected_candidate_id=None,
+            completeness="severely_incomplete",
+            reference_scope="reject",
+            visible_region="custom",
+            whole_entity_recognizable=False,
+            identity_features_visible=False,
+            requires_substantial_invention=True,
+            scope_reason="The head and most of the body are missing.",
+        )
+    )
+    assert decision.reference_scope == "reject"
+
+
+def test_legacy_reference_state_without_new_judge_fields_loads() -> None:
+    legacy = EntityReferenceState.model_validate(
+        {
+            "entity_id": "e1",
+            "status": "ready",
+            "reference_scope": "full",
+            "visible_region": "whole",
+            "whole_entity_recognizable": True,
+            "identity_features_visible": True,
+            "scope_reason": "legacy ready reference",
+            "image_path": "clips/clip-1/selected/e1.png",
+            "source_frame_index": 5,
+        }
+    )
+    assert legacy.viewpoint is None
+    assert legacy.independent_reference_value is None
+    assert legacy.requires_substantial_invention is None
+
+
+@pytest.mark.parametrize("status", ["ready", "rejected"])
+def test_reference_state_persists_new_judge_fields(status: str) -> None:
+    payload: dict[str, object] = {
+        "entity_id": "e1",
+        "status": status,
+        "reference_scope": "full" if status == "ready" else "reject",
+        "visible_region": "whole" if status == "ready" else "custom",
+        "whole_entity_recognizable": status == "ready",
+        "identity_features_visible": status == "ready",
+        "scope_reason": "strict reference decision",
+        "viewpoint": "front",
+        "independent_reference_value": status == "ready",
+        "requires_substantial_invention": status == "rejected",
+    }
+    if status == "ready":
+        payload.update(
+            image_path="clips/clip-1/selected/e1.png",
+            source_frame_index=5,
+        )
+    state = EntityReferenceState.model_validate(payload)
+    restored = EntityReferenceState.model_validate(state.model_dump(mode="json"))
+    assert restored.viewpoint == "front"
+    assert restored.independent_reference_value is (status == "ready")
+    assert restored.requires_substantial_invention is (status == "rejected")
 
 
 def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
