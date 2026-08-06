@@ -123,20 +123,34 @@ class _Judge:
 
 
 class _SamReviewer:
-    def __init__(self, *, passed: bool = True) -> None:
-        self.passed = passed
+    def __init__(
+        self,
+        *,
+        passed: bool = True,
+        failure_kind: str | None = None,
+    ) -> None:
+        self.failure_kind = failure_kind or ("none" if passed else "fragmented")
         self.calls: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> BooguSamReview:
         self.calls.append(kwargs)
+        kind = self.failure_kind
+        target_present = kind not in {"not_found", "backend_failure"}
         return BooguSamReview(
-            passed=self.passed,
-            target_entity_present=self.passed,
-            exactly_one_target_instance=self.passed,
-            area_growth_acceptable=self.passed,
-            fragmentation_acceptable=self.passed,
-            reason="valid" if self.passed else "fragmented",
-            diagnostics={"mask_path": "review-only.png"},
+            passed=kind == "none",
+            target_entity_present=target_present,
+            exactly_one_target_instance=(
+                target_present and kind != "multiple_instances"
+            ),
+            area_growth_acceptable=(
+                target_present and kind != "excessive_area_growth"
+            ),
+            fragmentation_acceptable=(target_present and kind != "fragmented"),
+            reason="valid" if kind == "none" else kind,
+            diagnostics={
+                "mask_path": "review-only.png",
+                "failure_kind": kind,
+            },
         )
 
 
@@ -359,6 +373,89 @@ def test_failed_sam_review_rejects_but_never_changes_candidate_pixels(
     assert metadata["sam_mask_usage"] == "review_only"
 
 
+def test_background_qwen_accept_and_sam_not_found_accepts_with_warning(
+    tmp_path: Path,
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=_SamReviewer(failure_kind="not_found"),
+    )
+
+    assert result.status == "accepted"
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["sam_review"]["diagnostics"]["failure_kind"] == "not_found"
+    assert metadata["sam_warning"] == "target_not_found"
+
+
+def test_completion_qwen_accept_and_sam_not_found_rejects(tmp_path: Path) -> None:
+    run_root, _, _ = _environment(tmp_path)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=_SamReviewer(failure_kind="not_found"),
+    )
+
+    assert result.status == "rejected"
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["sam_warning"] is None
+
+
+def test_background_sam_multiple_instances_rejects(tmp_path: Path) -> None:
+    run_root, _, _ = _environment(tmp_path)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=_SamReviewer(failure_kind="multiple_instances"),
+    )
+
+    assert result.status == "rejected"
+
+
+def test_qwen_reject_overrides_passing_sam_review(tmp_path: Path) -> None:
+    run_root, _, _ = _environment(tmp_path)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(accept=False),
+        sam_reviewer=_SamReviewer(),
+    )
+
+    assert result.status == "rejected"
+
+
 def test_metadata_records_source_output_dimensions_and_provenance(
     tmp_path: Path,
 ) -> None:
@@ -546,6 +643,79 @@ for line in sys.stdin:
     assert backend.started is False
 
 
+def test_single_generation_error_does_not_terminate_jsonl_worker(
+    tmp_path: Path,
+) -> None:
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        """import json
+import sys
+from PIL import Image
+
+print(json.dumps({"schema_version": 1, "type": "ready", "status": "ok"}), flush=True)
+edit_count = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["type"] == "shutdown":
+        print(json.dumps({"schema_version": 1, "type": "shutdown", "request_id": request["request_id"], "status": "ok"}), flush=True)
+        break
+    edit_count += 1
+    if edit_count == 1:
+        print(json.dumps({"schema_version": 1, "type": "response", "request_id": request["request_id"], "status": "error", "reason": "generation failed"}), flush=True)
+        continue
+    Image.new("RGB", (request["width"], request["height"]), (1, 2, 3)).save(request["output_image_path"], format="PNG")
+    print(json.dumps({
+        "schema_version": 1,
+        "type": "response",
+        "request_id": request["request_id"],
+        "status": "ok",
+        "original_instruction": request["instruction"],
+        "rewritten_instruction": None,
+        "effective_instruction": request["instruction"],
+        "returned_size": [request["width"], request["height"]],
+    }), flush=True)
+""",
+        encoding="utf-8",
+    )
+    code_root = tmp_path / "code"
+    model_path = tmp_path / "model"
+    code_root.mkdir()
+    model_path.mkdir()
+    backend = BooguSubprocessBackend(
+        BooguWorkerConfig(
+            python_executable=Path(sys.executable).resolve(),
+            code_root=code_root.resolve(),
+            model_path=model_path.resolve(),
+            worker_script=worker.resolve(),
+            allowed_server_root=Path("/"),
+            temporary_root=(tmp_path / "temporary").resolve(),
+        )
+    )
+    backend.start(stderr_log_path=tmp_path / "stderr.log")
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        backend.edit(
+            source_rgb=Image.new("RGB", (8, 8)),
+            instruction="First edit.",
+            width=32,
+            height=32,
+            thinking_enabled=False,
+        )
+    assert backend.started is True
+
+    output = backend.edit(
+        source_rgb=Image.new("RGB", (8, 8)),
+        instruction="Second edit.",
+        width=32,
+        height=32,
+        thinking_enabled=False,
+    )
+    backend.close()
+
+    assert output.effective_instruction == "Second edit."
+    assert backend.started is False
+
+
 def test_worker_module_import_does_not_import_torch_or_boogu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -584,6 +754,11 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
             return self
 
     class FakePipeline:
+        def __init__(self) -> None:
+            self.rewriter = SimpleNamespace(
+                to=lambda device: captured.setdefault("rewriter_device", device)
+            )
+
         @classmethod
         def from_pretrained(cls, path: str, **kwargs: object) -> FakePipeline:
             captured["model_path"] = path
@@ -643,11 +818,13 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
     assert isinstance(call, dict)
     assert call["width"] == 1360
     assert call["height"] == 768
+    assert call["align_res"] is False
     assert call["use_rewrite_text_instruction"] is True
     assert call["input_images"][0][0].size == (19, 23)
     assert call["input_images"][0][0].mode == "RGB"
     assert response["rewritten_instruction"] == "Complete the same object."
     assert response["effective_instruction"] == "Complete the same object."
+    assert captured["rewriter_device"] == "cuda:0"
     with Image.open(output_path) as output:
         assert output.size == (1360, 768)
         assert output.mode == "RGB"
@@ -801,6 +978,18 @@ class _SamTrackBackend:
         )
 
 
+class _SamNotFoundBackend:
+    def track(self, **kwargs: object) -> EntityTrackResult:
+        del kwargs
+        return EntityTrackResult(status="not_found")
+
+
+class _SamFailingBackend:
+    def track(self, **kwargs: object) -> EntityTrackResult:
+        del kwargs
+        raise RuntimeError("sam unavailable")
+
+
 def test_production_sam3_boogu_reviewer_is_review_only_and_tracks_ten_frames(
     tmp_path: Path,
 ) -> None:
@@ -827,6 +1016,7 @@ def test_production_sam3_boogu_reviewer_is_review_only_and_tracks_ten_frames(
     )
 
     assert review.passed is True
+    assert review.diagnostics["failure_kind"] == "none"
     assert review.diagnostics["mask_usage"] == "review_only"
     assert len(backend.calls[0]["frame_paths"]) == 10
     assert backend.calls[0]["grounding_prompt"] == "the blue object"
@@ -856,3 +1046,35 @@ def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
 
     assert review.passed is False
     assert review.area_growth_acceptable is False
+    assert review.diagnostics["failure_kind"] == "excessive_area_growth"
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected_failure_kind"),
+    [
+        (_SamNotFoundBackend(), "not_found"),
+        (_SamFailingBackend(), "backend_failure"),
+    ],
+)
+def test_production_sam3_boogu_reviewer_classifies_tracking_failure(
+    tmp_path: Path,
+    backend: object,
+    expected_failure_kind: str,
+) -> None:
+    reviewer = Sam3BooguReferenceReviewer(
+        backend,
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="add_entity_background",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.diagnostics["failure_kind"] == expected_failure_kind

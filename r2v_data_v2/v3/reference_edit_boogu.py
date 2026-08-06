@@ -41,6 +41,14 @@ from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 BooguEditOperation = Literal["complete_entity", "add_entity_background"]
 ReferenceType = Literal["subject", "object", "group"]
 EditStatus = Literal["accepted", "rejected"]
+SamFailureKind = Literal[
+    "none",
+    "not_found",
+    "multiple_instances",
+    "excessive_area_growth",
+    "fragmented",
+    "backend_failure",
+]
 
 BOOGU_MODEL_NAME = "Boogu-Image-0.1-Edit-Turbo"
 BOOGU_MODEL_REVISION = "hotfix-1k-20260708"
@@ -223,6 +231,19 @@ class BooguSamReview(BaseModel):
         )
         if self.passed != expected:
             raise ValueError("SAM review passed must match every quality flag")
+        failure_kind = self.diagnostics.get("failure_kind")
+        allowed_failure_kinds = {
+            "none",
+            "not_found",
+            "multiple_instances",
+            "excessive_area_growth",
+            "fragmented",
+            "backend_failure",
+        }
+        if failure_kind not in allowed_failure_kinds:
+            raise ValueError("SAM review diagnostics require a valid failure_kind")
+        if self.passed != (failure_kind == "none"):
+            raise ValueError("SAM review failure_kind must match passed")
         return self
 
 
@@ -463,29 +484,35 @@ class Sam3BooguReferenceReviewer:
     ) -> BooguSamReview:
         del operation
         self.temporary_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix="sam3-review-",
-            dir=self.temporary_root,
-        ) as temporary_name:
-            directory = Path(temporary_name)
-            frame_paths: list[Path] = []
-            for slot in range(10):
-                path = directory / f"{slot:02d}.jpg"
-                candidate_rgb.save(path, format="JPEG", quality=95, subsampling=0)
-                frame_paths.append(path)
-            result = self.backend.track(
-                frame_paths=frame_paths,
-                entity_id="e1",
-                reference_type=reference_type,
-                grounding_prompt=entity_phrase,
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="sam3-review-",
+                dir=self.temporary_root,
+            ) as temporary_name:
+                directory = Path(temporary_name)
+                frame_paths: list[Path] = []
+                for slot in range(10):
+                    path = directory / f"{slot:02d}.jpg"
+                    candidate_rgb.save(path, format="JPEG", quality=95, subsampling=0)
+                    frame_paths.append(path)
+                result = self.backend.track(
+                    frame_paths=frame_paths,
+                    entity_id="e1",
+                    reference_type=reference_type,
+                    grounding_prompt=entity_phrase,
+                )
+        except Exception as exc:  # noqa: BLE001 - SAM is a fail-closed reviewer
+            return _failed_sam_review(
+                failure_kind="backend_failure",
+                reason=f"sam3_backend_failure:{type(exc).__name__}:{exc}",
+                diagnostics={"exception_type": type(exc).__name__},
             )
         if result.status != "ready" or not result.observations:
-            return BooguSamReview(
-                passed=False,
-                target_entity_present=False,
-                exactly_one_target_instance=False,
-                area_growth_acceptable=False,
-                fragmentation_acceptable=False,
+            failure_kind: SamFailureKind = (
+                "not_found" if result.status == "not_found" else "backend_failure"
+            )
+            return _failed_sam_review(
+                failure_kind=failure_kind,
                 reason=f"sam3_target_not_ready:{result.reason or result.status}",
                 diagnostics={"track_status": result.status},
             )
@@ -507,6 +534,12 @@ class Sam3BooguReferenceReviewer:
         area_ok = area_growth <= self.max_area_growth_ratio
         fragmentation_ok = component_count <= self.max_significant_components
         passed = all((target_present, exactly_one, area_ok, fragmentation_ok))
+        failure_kind = _sam_failure_kind(
+            target_present=target_present,
+            exactly_one=exactly_one,
+            area_ok=area_ok,
+            fragmentation_ok=fragmentation_ok,
+        )
         return BooguSamReview(
             passed=passed,
             target_entity_present=target_present,
@@ -521,8 +554,44 @@ class Sam3BooguReferenceReviewer:
                 "significant_component_count": component_count,
                 "review_slot": observation.slot,
                 "mask_usage": "review_only",
+                "failure_kind": failure_kind,
             },
         )
+
+
+def _failed_sam_review(
+    *,
+    failure_kind: SamFailureKind,
+    reason: str,
+    diagnostics: dict[str, Any],
+) -> BooguSamReview:
+    return BooguSamReview(
+        passed=False,
+        target_entity_present=False,
+        exactly_one_target_instance=False,
+        area_growth_acceptable=False,
+        fragmentation_acceptable=False,
+        reason=reason,
+        diagnostics={**diagnostics, "failure_kind": failure_kind},
+    )
+
+
+def _sam_failure_kind(
+    *,
+    target_present: bool,
+    exactly_one: bool,
+    area_ok: bool,
+    fragmentation_ok: bool,
+) -> SamFailureKind:
+    if not target_present:
+        return "not_found"
+    if not exactly_one:
+        return "multiple_instances"
+    if not area_ok:
+        return "excessive_area_growth"
+    if not fragmentation_ok:
+        return "fragmented"
+    return "none"
 
 
 def _significant_component_count(mask: np.ndarray) -> int:
@@ -743,16 +812,23 @@ class BooguSubprocessBackend:
             try:
                 self._write_request(request)
                 result = self._read_response()
-                if result.get("request_id") != request_id:
-                    raise RuntimeError("Boogu worker response request_id mismatch")
-                if result.get("type") != "response" or result.get("status") != "ok":
-                    raise RuntimeError(
-                        "Boogu worker rejected request: "
-                        f"{result.get('reason', 'invalid response')}"
-                    )
             except Exception:
                 self._terminate()
                 raise
+            if result.get("request_id") != request_id:
+                self._terminate()
+                raise RuntimeError("Boogu worker response request_id mismatch")
+            if result.get("type") != "response":
+                self._terminate()
+                raise RuntimeError("Boogu worker returned an invalid response type")
+            if result.get("status") == "error":
+                raise RuntimeError(
+                    "Boogu worker rejected request: "
+                    f"{result.get('reason', 'generation failed')}"
+                )
+            if result.get("status") != "ok":
+                self._terminate()
+                raise RuntimeError("Boogu worker returned an invalid response status")
             if not output_path.is_file():
                 raise RuntimeError("Boogu worker did not publish its output image")
             output_bytes = output_path.read_bytes()
@@ -1101,6 +1177,7 @@ def run_boogu_reference_edit(
     output_sha256: str | None = None
     qwen_review: BooguQwenReview | None = None
     sam_review: BooguSamReview | None = None
+    sam_warning: str | None = None
     rejection_reason: str | None = None
     try:
         output = backend.edit(
@@ -1137,9 +1214,17 @@ def run_boogu_reference_edit(
             )
             if not isinstance(sam_review, BooguSamReview):
                 raise TypeError("sam_reviewer must return BooguSamReview")
-        accepted = qwen_review.verdict == "accept" and (
-            sam_review is None or sam_review.passed
-        )
+        qwen_accepted = qwen_review.verdict == "accept"
+        sam_accepted = sam_review is None or sam_review.passed
+        if (
+            qwen_accepted
+            and operation == "add_entity_background"
+            and sam_review is not None
+            and sam_review.diagnostics["failure_kind"] == "not_found"
+        ):
+            sam_accepted = True
+            sam_warning = "target_not_found"
+        accepted = qwen_accepted and sam_accepted
         if not accepted:
             rejection_reason = (
                 qwen_review.reason
@@ -1202,6 +1287,7 @@ def run_boogu_reference_edit(
         "sam_review": (
             sam_review.model_dump(mode="json") if sam_review is not None else None
         ),
+        "sam_warning": sam_warning,
         "sam_mask_usage": "review_only",
         "fallback_status": "not_used" if accepted else fallback_status,
         "candidate_path": candidate_name if candidate_path.is_file() else None,

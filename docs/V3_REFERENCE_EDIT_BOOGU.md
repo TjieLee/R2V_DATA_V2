@@ -47,6 +47,14 @@ SAM3 may re-segment a generated candidate for presence, instance-count, growth,
 and fragmentation diagnostics. Those masks are review-only and cannot modify
 the candidate.
 
+Every SAM review records `diagnostics.failure_kind` as `none`, `not_found`,
+`multiple_instances`, `excessive_area_growth`, `fragmented`, or
+`backend_failure`. Qwen rejection always rejects. A passing SAM review follows
+the normal acceptance path. The only SAM failure exception is
+`add_entity_background` with an accepted Qwen review and `not_found`; that
+candidate may publish with `sam_warning: target_not_found`. Completion
+`not_found` and every other SAM failure remain hard rejections.
+
 ## Artifacts
 
 ```text
@@ -91,6 +99,10 @@ reuse this process. The parent sends shutdown after the stage, writes worker
 stderr to a separate run log, and fails closed on timeout, process exit,
 request-ID mismatch, or invalid JSON. When there are no eligible entities, no
 worker is started. `CUDA_VISIBLE_DEVICES` comes from `reference_edit` config.
+The native call uses `align_res=false`, and an exposed instruction rewriter is
+moved explicitly to the same configured device. A valid per-request JSONL error
+rejects only that generation; it does not unload the worker or prevent later
+entities from using the already loaded pipeline.
 
 The worker is the only repository file that imports torch or Boogu, and those
 imports occur once during worker startup. macOS development and unit tests use

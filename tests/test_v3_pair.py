@@ -3350,6 +3350,7 @@ class _ReferenceEditSamReviewer:
             area_growth_acceptable=True,
             fragmentation_acceptable=True,
             reason="valid",
+            diagnostics={"failure_kind": "none"},
         )
 
 
@@ -3705,14 +3706,16 @@ def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
         reference_edit_enabled=True,
     )
     storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    source_reference = storage.read_clip("clip-1").references.entities[0]
     source_path = storage.selected_entity_path("clip-1", "e1")
     source_bytes = source_path.read_bytes()
+    backend = _ReferenceEditBackend()
 
     stats = reference_edit_clips(
         config,
         storage,
-        backend=_ReferenceEditBackend(),
+        backend=backend,
         judge=_ReferenceEditJudge(accept=False),
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
@@ -3723,8 +3726,12 @@ def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
     assert clip.pairing.status == "ready"
     assert clip.reference_edit.entities[0].status == "fallback"
     assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert len(backend.calls) == 1
     assert reference.synthetic is False
     assert reference.image_path == storage.relative_artifact_path(source_path)
+    assert reference.reference_scope == source_reference.reference_scope
+    assert reference.visible_region == source_reference.visible_region
+    assert reference.completeness == source_reference.completeness
     assert source_path.read_bytes() == source_bytes
 
 

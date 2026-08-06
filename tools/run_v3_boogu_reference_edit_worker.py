@@ -118,6 +118,10 @@ def _load_pipeline(
             local_files_only=True,
         )
         pipeline.to(device)
+        rewriter = getattr(pipeline, "rewriter", None)
+        move_rewriter = getattr(rewriter, "to", None)
+        if callable(move_rewriter):
+            move_rewriter(device)
     return pipeline, torch
 
 
@@ -155,7 +159,7 @@ def _run_loaded_request(
             negative_instruction="",
             width=width,
             height=height,
-            align_res=True,
+            align_res=False,
             max_input_image_pixels=2048 * 2048,
             max_input_image_side_length=2048 * 2,
             num_inference_steps=4,
