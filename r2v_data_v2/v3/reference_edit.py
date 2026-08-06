@@ -6,6 +6,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
 
+from PIL import Image
+
+from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguReferenceEditBackend,
@@ -18,6 +21,12 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     Sam3BooguReferenceReviewer,
     publish_boogu_final_reference,
     run_boogu_reference_edit,
+)
+from r2v_data_v2.v3.reference_geometry import (
+    ContentGeometry,
+    content_geometry_from_rgba,
+    source_geometry_metadata,
+    tiny_content_reason,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 from r2v_data_v2.v3.schemas import (
@@ -70,14 +79,23 @@ _ENTITY_COUNTER_FIELDS = (
 )
 
 
-def _route(reference: EntityReferenceState) -> ReferenceCompleteness:
+def _route(
+    reference: EntityReferenceState,
+    *,
+    source_touches_boundary: bool = False,
+) -> ReferenceCompleteness:
     if reference.completeness is not None:
         return reference.completeness
+    if (
+        reference.reference_scope == "local"
+        and not reference.whole_entity_recognizable
+        and source_touches_boundary
+    ):
+        return "repairable"
     return "complete" if reference.reference_scope == "full" else "local_usable"
 
 
-def _operations(reference: EntityReferenceState) -> tuple[str, ...]:
-    route = _route(reference)
+def _operations(route: ReferenceCompleteness) -> tuple[str, ...]:
     if route == "repairable":
         return ("complete_entity", "add_entity_background")
     if route in {"complete", "local_usable"}:
@@ -86,6 +104,7 @@ def _operations(reference: EntityReferenceState) -> tuple[str, ...]:
 
 
 def _eligible_references(
+    config: V3Config,
     storage: RunStorage,
     *,
     overwrite: bool,
@@ -114,7 +133,16 @@ def _eligible_references(
                 if overwrite and current.entity_id in previous
                 else current
             )
-            if reference.status == "ready" and _operations(reference):
+            if reference.status != "ready" or reference.image_path is None:
+                continue
+            geometry = _reference_content_geometry(storage, reference)
+            if _source_gate_reason(config, geometry) is not None:
+                continue
+            route = _route(
+                reference,
+                source_touches_boundary=geometry.touches_canvas_boundary,
+            )
+            if _operations(route):
                 count += 1
     return count
 
@@ -125,6 +153,73 @@ def _resolve_artifact(storage: RunStorage, value: str) -> Path:
     if root not in path.parents or not path.is_file():
         raise ValueError("reference edit input must be an existing run artifact")
     return path
+
+
+def _reference_content_geometry(
+    storage: RunStorage,
+    reference: EntityReferenceState,
+) -> ContentGeometry:
+    if reference.image_path is None:
+        raise ValueError("ready reference has no image_path")
+    path = _resolve_artifact(storage, reference.image_path)
+    with Image.open(path) as opened:
+        if opened.format != "PNG":
+            raise ValueError("reference edit source must be PNG")
+        opened.load()
+        source_rgba = opened.convert("RGBA")
+    return content_geometry_from_rgba(source_rgba)
+
+
+def _source_gate_reason(
+    config: V3Config,
+    geometry: ContentGeometry,
+) -> str | None:
+    return tiny_content_reason(
+        geometry,
+        minimum_area_pixels=config.reference_edit.min_source_content_area_pixels,
+        minimum_long_side_pixels=(
+            config.reference_edit.min_source_content_long_side_pixels
+        ),
+    )
+
+
+def _write_source_selection_metadata(
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    reference: EntityReferenceState,
+    geometry: ContentGeometry,
+    source_gate_reason: str | None,
+    reason: str,
+    operation_metadata_path: Path | None = None,
+) -> Path:
+    if reference.image_path is None:
+        raise ValueError("source selection requires a reference image")
+    source_path = _resolve_artifact(storage, reference.image_path)
+    metadata_path = storage.reference_edit_dir(clip_uid) / reference.entity_id
+    metadata_path.mkdir(parents=True, exist_ok=True)
+    final_metadata_path = metadata_path / "final_metadata.json"
+    payload = {
+        "schema_version": 1,
+        "status": "fallback",
+        "clip_uid": clip_uid,
+        "entity_id": reference.entity_id,
+        "final_selection": "source",
+        "final_selection_reason": reason,
+        "final_reference_path": reference.image_path,
+        "final_reference_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "selected_operation_metadata_path": (
+            storage.relative_artifact_path(operation_metadata_path)
+            if operation_metadata_path is not None
+            else None
+        ),
+        **source_geometry_metadata(
+            geometry,
+            source_gate_reason=source_gate_reason,
+        ),
+    }
+    write_json_atomic(final_metadata_path, payload)
+    return final_metadata_path
 
 
 def _tokens_for_retained(
@@ -237,6 +332,7 @@ def reference_edit_clips(
 
     counters = {field: 0 for field in ReferenceEditStats.__dataclass_fields__}
     eligible_count = _eligible_references(
+        config,
         storage,
         overwrite=overwrite,
     )
@@ -292,6 +388,12 @@ def reference_edit_clips(
                     max_significant_components=(
                         config.reference_edit.sam_max_significant_components
                     ),
+                    min_candidate_scale_ratio=(
+                        config.reference_edit.min_candidate_scale_ratio
+                    ),
+                    max_candidate_center_shift=(
+                        config.reference_edit.max_candidate_center_shift
+                    ),
                 )
             assert active_backend is not None
             assert active_judge is not None
@@ -344,8 +446,42 @@ def reference_edit_clips(
                     if reference.image_path is None:
                         raise ValueError("ready reference has no image_path")
                     _resolve_artifact(storage, reference.image_path)
-                    route = _route(reference)
-                    operations = _operations(reference)
+                    source_geometry = _reference_content_geometry(storage, reference)
+                    source_gate_reason = _source_gate_reason(config, source_geometry)
+                    route = _route(
+                        reference,
+                        source_touches_boundary=(
+                            source_geometry.touches_canvas_boundary
+                        ),
+                    )
+                    if source_gate_reason is not None:
+                        final_metadata_path = _write_source_selection_metadata(
+                            storage,
+                            clip_uid=clip.clip_uid,
+                            reference=reference,
+                            geometry=source_geometry,
+                            source_gate_reason=source_gate_reason,
+                            reason="tiny_source_entity",
+                        )
+                        final_references.append(reference)
+                        edit_states.append(
+                            ReferenceEditEntityState(
+                                entity_id=reference.entity_id,
+                                route=route,
+                                status="fallback",
+                                source_reference=reference,
+                                source_image_path=reference.image_path,
+                                output_image_path=reference.image_path,
+                                metadata_path=storage.relative_artifact_path(
+                                    final_metadata_path
+                                ),
+                                fallback_policy="keep_source",
+                                reason="tiny_source_entity",
+                            )
+                        )
+                        clip_entity_counters["entities_fallback"] += 1
+                        continue
+                    operations = _operations(route)
                     if not operations:
                         final_references.append(reference)
                         edit_states.append(
@@ -364,6 +500,10 @@ def reference_edit_clips(
                     entity = entities[reference.entity_id]
                     results: dict[str, BooguReferenceEditResult] = {}
                     source_image_path: Path | None = None
+                    geometry_source_image_path = _resolve_artifact(
+                        storage,
+                        reference.image_path,
+                    )
                     for operation in operations:
                         result = run_boogu_reference_edit(
                             run_root=storage.root,
@@ -379,9 +519,16 @@ def reference_edit_clips(
                             sam_reviewer=active_sam,
                             target_area=config.reference_edit.target_area,
                             alignment=config.reference_edit.alignment,
+                            min_source_content_area_pixels=(
+                                config.reference_edit.min_source_content_area_pixels
+                            ),
+                            min_source_content_long_side_pixels=(
+                                config.reference_edit.min_source_content_long_side_pixels
+                            ),
                             model_revision=config.reference_edit.model_revision,
                             fallback_status=config.reference_edit.fallback_policy,
                             source_image_path=source_image_path,
+                            geometry_source_image_path=geometry_source_image_path,
                             publish_final=False,
                             overwrite=overwrite,
                         )
@@ -421,6 +568,10 @@ def reference_edit_clips(
                                 background_result.metadata_path
                                 if background_result is not None
                                 else None
+                            ),
+                            final_selection="background_candidate",
+                            final_selection_reason=(
+                                "accepted_background_candidate_preferred_over_source"
                             ),
                         )
                         accepted = _accepted_reference(
@@ -491,6 +642,10 @@ def reference_edit_clips(
                             completion_metadata_path=completion_result.metadata_path,
                             background_metadata_path=background_result.metadata_path,
                             background_fallback="completion_candidate",
+                            final_selection="completion_candidate",
+                            final_selection_reason=(
+                                "background_rejected_completion_candidate_preserved"
+                            ),
                         )
                         accepted = _accepted_reference(
                             storage,
@@ -528,7 +683,25 @@ def reference_edit_clips(
                         )
                         clip_entity_counters["entities_fallback"] += 1
                         continue
-                    if config.reference_edit.fallback_policy == "keep_source":
+                    force_keep_source = (
+                        rejected_result.operation == "add_entity_background"
+                        or route == "repairable"
+                        and completion_result is not None
+                        and completion_result.status != "accepted"
+                    )
+                    if (
+                        force_keep_source
+                        or config.reference_edit.fallback_policy == "keep_source"
+                    ):
+                        final_metadata_path = _write_source_selection_metadata(
+                            storage,
+                            clip_uid=clip.clip_uid,
+                            reference=reference,
+                            geometry=source_geometry,
+                            source_gate_reason=None,
+                            reason=rejection_reason,
+                            operation_metadata_path=rejected_result.metadata_path,
+                        )
                         final_references.append(reference)
                         edit_states.append(
                             ReferenceEditEntityState(
@@ -540,7 +713,7 @@ def reference_edit_clips(
                                 output_image_path=reference.image_path,
                                 operation=rejected_result.operation,
                                 metadata_path=storage.relative_artifact_path(
-                                    rejected_result.metadata_path
+                                    final_metadata_path
                                 ),
                                 operations=attempted_operations,
                                 completion_metadata_path=(

@@ -221,6 +221,20 @@ def test_recognizable_local_reference_is_valid() -> None:
     )
 
 
+def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
+    lowered = SYSTEM_PROMPT.lower()
+    for phrase in (
+        "torso",
+        "hips",
+        "buttocks",
+        "legs",
+        "arms",
+        "single connected component is not evidence",
+        "main object structure",
+    ):
+        assert phrase in lowered
+
+
 def test_request_payload_contains_only_required_evidence() -> None:
     payload = build_entity_reference_request_payload(
         _entity(),

@@ -26,6 +26,10 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     resolve_boogu_1k_size,
     run_boogu_reference_edit,
 )
+from r2v_data_v2.v3.reference_geometry import (
+    content_geometry_from_rgba,
+    tiny_content_reason,
+)
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
@@ -65,7 +69,11 @@ def _completion_review(*, accept: bool = True) -> BooguCompletionReview:
     )
 
 
-def _background_review(*, accept: bool = True) -> BooguBackgroundReview:
+def _background_review(
+    *,
+    accept: bool = True,
+    updates: dict[str, bool] | None = None,
+) -> BooguBackgroundReview:
     values = {
         "exactly_one_target_entity": accept,
         "identity_preserved": accept,
@@ -73,16 +81,22 @@ def _background_review(*, accept: bool = True) -> BooguBackgroundReview:
         "no_duplicate_entity": accept,
         "no_added_salient_entity": accept,
         "no_unintended_completion_or_extension": accept,
+        "subject_scale_preserved": accept,
+        "subject_layout_preserved": accept,
         "background_coherent": accept,
+        "background_improves_reference": accept,
+        "prefer_candidate_over_source": accept,
         "background_style_consistent": accept,
         "no_halo_or_seam": accept,
         "subject_not_severely_redrawn": accept,
         "reference_usable": accept,
         "certain": accept,
     }
+    values.update(updates or {})
+    accepted = all(values.values())
     return BooguBackgroundReview(
-        verdict="accept" if accept else "reject",
-        reason="usable" if accept else "new entity",
+        verdict="accept" if accepted else "reject",
+        reason="usable" if accepted else "candidate is not preferable",
         **values,
     )
 
@@ -111,15 +125,24 @@ class _Backend:
 
 
 class _Judge:
-    def __init__(self, *, accept: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        accept: bool = True,
+        background_updates: dict[str, bool] | None = None,
+    ) -> None:
         self.accept = accept
+        self.background_updates = background_updates
         self.calls: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> BooguCompletionReview | BooguBackgroundReview:
         self.calls.append(kwargs)
         if kwargs["operation"] == "complete_entity":
             return _completion_review(accept=self.accept)
-        return _background_review(accept=self.accept)
+        return _background_review(
+            accept=self.accept,
+            updates=self.background_updates,
+        )
 
 
 class _SamReviewer:
@@ -128,8 +151,10 @@ class _SamReviewer:
         *,
         passed: bool = True,
         failure_kind: str | None = None,
+        geometry: dict[str, object] | None = None,
     ) -> None:
         self.failure_kind = failure_kind or ("none" if passed else "fragmented")
+        self.geometry = geometry or {}
         self.calls: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> BooguSamReview:
@@ -150,6 +175,7 @@ class _SamReviewer:
             diagnostics={
                 "mask_path": "review-only.png",
                 "failure_kind": kind,
+                **self.geometry,
             },
         )
 
@@ -157,7 +183,7 @@ class _SamReviewer:
 def _environment(
     tmp_path: Path,
     *,
-    size: tuple[int, int] = (48, 32),
+    size: tuple[int, int] = (192, 128),
 ) -> tuple[Path, Path, bytes]:
     run_root = tmp_path / "run"
     canonical = run_root / "clips" / "clip-1" / "selected" / "e1.png"
@@ -167,6 +193,26 @@ def _environment(
     image.save(canonical, format="PNG")
     payload = canonical.read_bytes()
     return run_root, canonical, payload
+
+
+def _geometry_diagnostics(
+    reason: str | None,
+    *,
+    scale_ratio: float = 1.0,
+    center_shift: float = 0.0,
+) -> dict[str, object]:
+    return {
+        "source_normalized_bbox": [0.0, 0.0, 1.0, 1.0],
+        "candidate_normalized_bbox": [0.0, 0.0, 1.0, 1.0],
+        "source_normalized_bbox_area": 1.0,
+        "candidate_normalized_bbox_area": scale_ratio,
+        "candidate_scale_ratio": scale_ratio,
+        "source_center_xy": [0.5, 0.5],
+        "candidate_center_xy": [0.5, 0.5],
+        "center_shift": center_shift,
+        "geometry_gate_passed": reason is None,
+        "geometry_rejection_reason": reason,
+    }
 
 
 @pytest.mark.parametrize(
@@ -246,6 +292,48 @@ def test_completion_publishes_native_1k_output_without_paste_back(
     assert "candidate_rgb" in sam.calls[0]
 
 
+def test_tiny_source_fails_before_backend_generation(tmp_path: Path) -> None:
+    run_root, canonical, canonical_bytes = _environment(tmp_path, size=(64, 64))
+    backend = _Backend()
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="small person",
+        reference_type="subject",
+        backend=backend,
+        judge=_Judge(),
+    )
+
+    assert result.status == "rejected"
+    assert backend.calls == []
+    assert canonical.read_bytes() == canonical_bytes
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["source_content_area_pixels"] == 64 * 64
+    assert metadata["source_tiny"] is True
+    assert metadata["source_gate_reason"] != "passed"
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"] == "tiny_source_entity"
+
+
+def test_long_thin_source_is_not_rejected_by_short_side_alone() -> None:
+    source = Image.new("RGBA", (16, 2048), (20, 30, 40, 255))
+    geometry = content_geometry_from_rgba(source)
+
+    assert geometry.area_pixels == 16 * 2048
+    assert (
+        tiny_content_reason(
+            geometry,
+            minimum_area_pixels=128 * 128,
+            minimum_long_side_pixels=128,
+        )
+        is None
+    )
+
+
 def test_sam_review_uses_entity_phrase_instead_of_scene_grounding_prompt(
     tmp_path: Path,
 ) -> None:
@@ -322,6 +410,112 @@ def test_background_uses_thinking_false_and_no_source_restoration(
     assert canonical.read_bytes() == canonical_bytes
     assert result.final_reference_path is not None
     assert result.final_reference_path.read_bytes() == backend.output_bytes
+
+
+@pytest.mark.parametrize(
+    ("reason", "scale_ratio", "center_shift"),
+    [
+        ("entity_scale_collapsed", 0.4, 0.0),
+        ("entity_shifted_off_layout", 1.0, 0.35),
+    ],
+)
+def test_composition_geometry_failure_rejects_candidate_publication(
+    tmp_path: Path,
+    reason: str,
+    scale_ratio: float,
+    center_shift: float,
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+    sam = _SamReviewer(
+        geometry=_geometry_diagnostics(
+            reason,
+            scale_ratio=scale_ratio,
+            center_shift=center_shift,
+        )
+    )
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=sam,
+    )
+
+    assert result.status == "rejected"
+    assert result.final_reference_path is None
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["geometry_gate_passed"] is False
+    assert metadata["geometry_rejection_reason"] == reason
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"] == reason
+
+
+def test_small_composition_change_passes_geometry_gate(tmp_path: Path) -> None:
+    run_root, _, _ = _environment(tmp_path)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(),
+        sam_reviewer=_SamReviewer(
+            geometry=_geometry_diagnostics(None, scale_ratio=0.9, center_shift=0.1)
+        ),
+    )
+
+    assert result.status == "accepted"
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["geometry_gate_passed"] is True
+
+
+@pytest.mark.parametrize(
+    "background_updates",
+    [
+        {"background_improves_reference": False},
+        {"prefer_candidate_over_source": False},
+    ],
+)
+def test_background_must_be_beneficial_and_preferred_over_source(
+    tmp_path: Path,
+    background_updates: dict[str, bool],
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=_Judge(background_updates=background_updates),
+        sam_reviewer=_SamReviewer(),
+    )
+
+    assert result.status == "rejected"
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"] == "background_not_beneficial"
+
+
+def test_background_review_prompt_requires_source_comparison() -> None:
+    prompt = boogu_module._BACKGROUND_REVIEW_PROMPT.lower()
+    assert "scale" in prompt
+    assert "layout" in prompt
+    assert "large meaningless" in prompt
+    assert "clearly preferable" in prompt
 
 
 def test_wrong_native_output_size_fails_closed_and_preserves_canonical(
@@ -502,7 +696,7 @@ def test_metadata_records_source_output_dimensions_and_provenance(
     )
 
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
-    assert metadata["source_dimensions"] == {"width": 48, "height": 32}
+    assert metadata["source_dimensions"] == {"width": 192, "height": 128}
     assert metadata["resolved_output_dimensions"] == {"width": 1248, "height": 832}
     assert metadata["target_area"] == 1024 * 1024
     assert metadata["alignment"] == 16
@@ -1020,6 +1214,22 @@ class _SamNotFoundBackend:
         return EntityTrackResult(status="not_found")
 
 
+class _SamEmptyMaskBackend:
+    def track(self, **kwargs: object) -> EntityTrackResult:
+        del kwargs
+        return EntityTrackResult(
+            status="ready",
+            observations=(
+                BackendMaskObservation(
+                    slot=5,
+                    mask=np.zeros((10, 10), dtype=bool),
+                    confidence=0.9,
+                    object_id="target",
+                ),
+            ),
+        )
+
+
 class _SamFailingBackend:
     def track(self, **kwargs: object) -> EntityTrackResult:
         del kwargs
@@ -1095,6 +1305,119 @@ def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
     assert review.passed is False
     assert review.area_growth_acceptable is False
     assert review.diagnostics["failure_kind"] == "excessive_area_growth"
+
+
+def test_production_sam3_empty_mask_is_not_found_without_fake_geometry(
+    tmp_path: Path,
+) -> None:
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamEmptyMaskBackend(),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="add_entity_background",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.diagnostics["failure_kind"] == "not_found"
+    assert "geometry_gate_passed" not in review.diagnostics
+
+
+def test_production_sam3_review_records_scale_collapse_geometry(
+    tmp_path: Path,
+) -> None:
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[:4, :] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="add_entity_background",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is True
+    assert review.diagnostics["candidate_scale_ratio"] == pytest.approx(0.4)
+    assert review.diagnostics["geometry_gate_passed"] is False
+    assert review.diagnostics["geometry_rejection_reason"] == (
+        "entity_scale_collapsed"
+    )
+
+
+def test_production_sam3_review_records_layout_shift_geometry(
+    tmp_path: Path,
+) -> None:
+    source = Image.new("RGBA", (10, 10), (1, 2, 3, 0))
+    source_alpha = np.zeros((10, 10), dtype=np.uint8)
+    source_alpha[3:7, 3:7] = 255
+    source.putalpha(Image.fromarray(source_alpha, mode="L"))
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[:4, :4] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="complete_entity",
+        source_rgba=source,
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is True
+    assert review.diagnostics["candidate_scale_ratio"] == pytest.approx(1.0)
+    assert review.diagnostics["center_shift"] > 0.20
+    assert review.diagnostics["geometry_rejection_reason"] == (
+        "entity_shifted_off_layout"
+    )
+
+
+def test_production_sam3_review_accepts_small_geometry_change(
+    tmp_path: Path,
+) -> None:
+    source = Image.new("RGBA", (10, 10), (1, 2, 3, 0))
+    source_alpha = np.zeros((10, 10), dtype=np.uint8)
+    source_alpha[2:6, 2:6] = 255
+    source.putalpha(Image.fromarray(source_alpha, mode="L"))
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[3:7, 3:7] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="add_entity_background",
+        source_rgba=source,
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is True
+    assert review.diagnostics["center_shift"] < 0.20
+    assert review.diagnostics["geometry_gate_passed"] is True
+    assert review.diagnostics["geometry_rejection_reason"] is None
 
 
 @pytest.mark.parametrize(

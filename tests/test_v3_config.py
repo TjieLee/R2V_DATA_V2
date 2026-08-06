@@ -23,6 +23,10 @@ def _write_config(
     reference_edit_enabled: bool = False,
     reference_edit_judge: bool = False,
     reference_edit_target_area: int = 1024 * 1024,
+    min_source_content_area_pixels: object = 128 * 128,
+    min_source_content_long_side_pixels: object = 128,
+    min_candidate_scale_ratio: object = 0.60,
+    max_candidate_center_shift: object = 0.20,
 ) -> Path:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -109,6 +113,22 @@ def _write_config(
                 f"  code_root: {writable / 'vendor' / 'Boogu-Image'}",
                 f"  model_path: {writable / 'models' / 'Boogu-Image'}",
                 f"  target_area: {reference_edit_target_area}",
+                (
+                    "  min_source_content_area_pixels: "
+                    f"{str(min_source_content_area_pixels).lower()}"
+                ),
+                (
+                    "  min_source_content_long_side_pixels: "
+                    f"{str(min_source_content_long_side_pixels).lower()}"
+                ),
+                (
+                    "  min_candidate_scale_ratio: "
+                    f"{str(min_candidate_scale_ratio).lower()}"
+                ),
+                (
+                    "  max_candidate_center_shift: "
+                    f"{str(max_candidate_center_shift).lower()}"
+                ),
             ]
         ),
         encoding="utf-8",
@@ -430,6 +450,38 @@ def test_reference_edit_requires_dedicated_qwen_judge(
         load_config(path)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("min_source_content_area_pixels", 0),
+        ("min_source_content_area_pixels", True),
+        ("min_source_content_long_side_pixels", 0),
+        ("min_source_content_long_side_pixels", True),
+        ("min_candidate_scale_ratio", 0.0),
+        ("min_candidate_scale_ratio", 1.1),
+        ("max_candidate_center_shift", -0.1),
+        ("max_candidate_center_shift", 2.0),
+    ],
+)
+def test_reference_edit_geometry_thresholds_are_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    kwargs = {field: value}
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        **kwargs,
+    )
+
+    with pytest.raises((TypeError, ValueError), match=field):
+        load_config(path)
+
+
 def test_reference_edit_config_participates_in_fingerprint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -453,10 +505,41 @@ def test_reference_edit_config_participates_in_fingerprint(
             background_remove_judge=True,
             reference_edit_enabled=True,
             reference_edit_judge=True,
-            reference_edit_target_area=900_000,
+            min_candidate_scale_ratio=0.75,
         )
     )
 
     assert first.reference_edit.enabled is True
     assert first.qwen.reference_edit_judge is not None
     assert first.fingerprint() != second.fingerprint()
+
+
+def test_legacy_config_uses_reference_edit_geometry_defaults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+    )
+    omitted = {
+        "min_source_content_area_pixels",
+        "min_source_content_long_side_pixels",
+        "min_candidate_scale_ratio",
+        "max_candidate_center_shift",
+    }
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not any(line.strip().startswith(f"{name}:") for name in omitted)
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.reference_edit.min_source_content_area_pixels == 128 * 128
+    assert config.reference_edit.min_source_content_long_side_pixels == 128
+    assert config.reference_edit.min_candidate_scale_ratio == 0.60
+    assert config.reference_edit.max_candidate_center_shift == 0.20

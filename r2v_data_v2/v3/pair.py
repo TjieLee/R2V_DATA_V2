@@ -30,6 +30,10 @@ from r2v_data_v2.v3.reference_completion_qwen import (
     QwenLocalizedCompletionJudge,
     QwenReferenceCompletionBackend,
 )
+from r2v_data_v2.v3.reference_geometry import (
+    content_geometry_from_mask,
+    tiny_content_reason,
+)
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     EntityReferenceJudge,
@@ -361,7 +365,7 @@ def _eroded_sharpness_mask(mask: np.ndarray) -> np.ndarray:
     )
 
 
-def build_entity_reference_candidates(
+def _build_entity_reference_candidates(
     config: V3Config,
     storage: RunStorage,
     *,
@@ -369,7 +373,7 @@ def build_entity_reference_candidates(
     entity: AnnotationEntity,
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
-) -> list[EntityReferenceCandidate]:
+) -> tuple[list[EntityReferenceCandidate], bool]:
     if frames.clip_uid != clip_uid or masks.clip_uid != clip_uid:
         raise ValueError("pair input clip_uid does not match its clip")
     if (frames.width, frames.height) != (masks.width, masks.height):
@@ -383,7 +387,7 @@ def build_entity_reference_candidates(
     ):
         raise ValueError("mask artifact entity semantics do not match annotation")
     if tracked.status != "ready":
-        return []
+        return [], False
     if [item.slot for item in tracked.frames] != list(range(10)):
         raise ValueError("tracked entity slots must be ordered from 0 through 9")
     candidates: list[EntityReferenceCandidate] = []
@@ -404,7 +408,22 @@ def build_entity_reference_candidates(
                 frames=frames,
             )
         )
-    candidates.sort(
+    non_tiny_candidates = [
+        candidate
+        for candidate in candidates
+        if tiny_content_reason(
+            content_geometry_from_mask(candidate.mask),
+            minimum_area_pixels=(
+                config.reference_edit.min_source_content_area_pixels
+            ),
+            minimum_long_side_pixels=(
+                config.reference_edit.min_source_content_long_side_pixels
+            ),
+        )
+        is None
+    ]
+    all_candidates_tiny = bool(candidates) and not non_tiny_candidates
+    non_tiny_candidates.sort(
         key=lambda candidate: (
             candidate.border_contact_count,
             -candidate.area_ratio,
@@ -413,11 +432,31 @@ def build_entity_reference_candidates(
             _SLOT_PRIORITY_INDEX[candidate.frame_slot],
         )
     )
-    shortlisted = candidates[: config.pair.max_candidates_per_entity]
+    shortlisted = non_tiny_candidates[: config.pair.max_candidates_per_entity]
     return [
         replace(candidate, candidate_id=f"candidate_{index}")
         for index, candidate in enumerate(shortlisted, start=1)
-    ]
+    ], all_candidates_tiny
+
+
+def build_entity_reference_candidates(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    frames: SampledFramesArtifact,
+    masks: TrackedMasksArtifact,
+) -> list[EntityReferenceCandidate]:
+    candidates, _ = _build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid=clip_uid,
+        entity=entity,
+        frames=frames,
+        masks=masks,
+    )
+    return candidates
 
 
 def _resolve_run_artifact(storage: RunStorage, relative_path: str) -> Path:
@@ -1487,11 +1526,25 @@ def pair_clips(
                         frames=frames,
                         masks=masks,
                     )
+                    all_candidates_tiny = False
+                    if not candidates:
+                        _, all_candidates_tiny = _build_entity_reference_candidates(
+                            config,
+                            storage,
+                            clip_uid=clip.clip_uid,
+                            entity=entity,
+                            frames=frames,
+                            masks=masks,
+                        )
                     if not candidates:
                         entity_states.append(
                             _rejected_reference(
                                 entity.entity_id,
-                                "no_valid_reference_candidate",
+                                (
+                                    "tiny_reference_candidates"
+                                    if all_candidates_tiny
+                                    else "no_valid_reference_candidate"
+                                ),
                             )
                         )
                         continue

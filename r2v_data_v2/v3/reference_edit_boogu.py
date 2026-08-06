@@ -36,6 +36,13 @@ from pydantic import (
 
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.reference_geometry import (
+    composition_geometry_metadata,
+    content_geometry_from_mask,
+    content_geometry_from_rgba,
+    source_geometry_metadata,
+    tiny_content_reason,
+)
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 
 BooguEditOperation = Literal["complete_entity", "add_entity_background"]
@@ -62,8 +69,16 @@ DEFAULT_BOOGU_MODEL_PATH = Path(
 DEFAULT_ALLOWED_SERVER_ROOT = Path("/mnt/workspace/litengjie/data")
 DEFAULT_TARGET_AREA = 1024 * 1024
 DEFAULT_ALIGNMENT = 16
+DEFAULT_MIN_SOURCE_CONTENT_AREA_PIXELS = 128 * 128
+DEFAULT_MIN_SOURCE_CONTENT_LONG_SIDE_PIXELS = 128
+DEFAULT_MIN_CANDIDATE_SCALE_RATIO = 0.60
+DEFAULT_MAX_CANDIDATE_CENTER_SHIFT = 0.20
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class _TinySourceRejected(Exception):
+    pass
 
 
 def resolve_boogu_1k_size(
@@ -170,7 +185,11 @@ class BooguBackgroundReview(BaseModel):
     no_duplicate_entity: StrictBool
     no_added_salient_entity: StrictBool
     no_unintended_completion_or_extension: StrictBool
+    subject_scale_preserved: StrictBool
+    subject_layout_preserved: StrictBool
     background_coherent: StrictBool
+    background_improves_reference: StrictBool
+    prefer_candidate_over_source: StrictBool
     background_style_consistent: StrictBool
     no_halo_or_seam: StrictBool
     subject_not_severely_redrawn: StrictBool
@@ -192,7 +211,11 @@ class BooguBackgroundReview(BaseModel):
             self.no_duplicate_entity,
             self.no_added_salient_entity,
             self.no_unintended_completion_or_extension,
+            self.subject_scale_preserved,
+            self.subject_layout_preserved,
             self.background_coherent,
+            self.background_improves_reference,
+            self.prefer_candidate_over_source,
             self.background_style_consistent,
             self.no_halo_or_seam,
             self.subject_not_severely_redrawn,
@@ -307,10 +330,14 @@ facts only and return one strict JSON object matching the supplied schema."""
 _BACKGROUND_REVIEW_PROMPT = """You review a generated entity reference.
 Image 1 is the source reference and Image 2 adds a clean supporting background.
 Accept only if Image 2 contains exactly the same single target entity, preserves
-its identity and appearance, introduces no duplicate or salient entity, does
-not extend or complete the target unexpectedly, and has a coherent background
-without halos, seams, or severe redraw. Judge visible facts only and return one
-strict JSON object matching the supplied schema."""
+its identity, appearance, scale, and layout, introduces no duplicate or salient
+entity, and does not extend or complete the target unexpectedly. Reject if the
+subject becomes smaller, moves toward a corner, or leaves large meaningless
+empty space. The background must be coherent, improve the reference's
+naturalness, clarity, or usefulness, and make Image 2 clearly preferable to
+Image 1. A technically clean but implausible or unhelpful background must be
+rejected. Judge visible facts only and return one strict JSON object matching
+the supplied schema."""
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -463,15 +490,36 @@ class Sam3BooguReferenceReviewer:
         temporary_root: Path,
         max_area_growth_ratio: float,
         max_significant_components: int,
+        min_candidate_scale_ratio: float = DEFAULT_MIN_CANDIDATE_SCALE_RATIO,
+        max_candidate_center_shift: float = DEFAULT_MAX_CANDIDATE_CENTER_SHIFT,
     ) -> None:
         if not math.isfinite(max_area_growth_ratio) or max_area_growth_ratio < 1:
             raise ValueError("max_area_growth_ratio must be finite and at least 1")
         if max_significant_components < 1:
             raise ValueError("max_significant_components must be positive")
+        if (
+            not isinstance(min_candidate_scale_ratio, float)
+            or not math.isfinite(min_candidate_scale_ratio)
+            or not 0 < min_candidate_scale_ratio <= 1
+        ):
+            raise ValueError(
+                "min_candidate_scale_ratio must be a finite float in (0, 1]"
+            )
+        if (
+            not isinstance(max_candidate_center_shift, float)
+            or not math.isfinite(max_candidate_center_shift)
+            or not 0 <= max_candidate_center_shift <= math.sqrt(2)
+        ):
+            raise ValueError(
+                "max_candidate_center_shift must be a finite float between "
+                "0 and sqrt(2)"
+            )
         self.backend = backend
         self.temporary_root = temporary_root.expanduser().resolve(strict=False)
         self.max_area_growth_ratio = max_area_growth_ratio
         self.max_significant_components = max_significant_components
+        self.min_candidate_scale_ratio = min_candidate_scale_ratio
+        self.max_candidate_center_shift = max_candidate_center_shift
 
     def review(
         self,
@@ -522,6 +570,12 @@ class Sam3BooguReferenceReviewer:
             key=lambda item: (abs(item.slot - 5), item.slot),
         )
         mask = np.asarray(observation.mask, dtype=bool)
+        if mask.shape != (candidate_rgb.height, candidate_rgb.width):
+            return _failed_sam_review(
+                failure_kind="backend_failure",
+                reason="sam3_candidate_mask_dimensions_do_not_match_image",
+                diagnostics={"candidate_mask_shape": list(mask.shape)},
+            )
         source_alpha = np.asarray(source_rgba.getchannel("A"), dtype=np.uint8) > 0
         source_ratio = float(source_alpha.mean())
         candidate_ratio = float(mask.mean())
@@ -541,6 +595,16 @@ class Sam3BooguReferenceReviewer:
             area_ok=area_ok,
             fragmentation_ok=fragmentation_ok,
         )
+        geometry = (
+            composition_geometry_metadata(
+                content_geometry_from_rgba(source_rgba),
+                content_geometry_from_mask(mask),
+                minimum_scale_ratio=self.min_candidate_scale_ratio,
+                maximum_center_shift=self.max_candidate_center_shift,
+            )
+            if target_present
+            else {}
+        )
         return BooguSamReview(
             passed=passed,
             target_entity_present=target_present,
@@ -556,6 +620,7 @@ class Sam3BooguReferenceReviewer:
                 "review_slot": observation.slot,
                 "mask_usage": "review_only",
                 "failure_kind": failure_kind,
+                **geometry,
             },
         )
 
@@ -602,6 +667,53 @@ def _sam_track_failure_kind(*, status: str, reason: str | None) -> SamFailureKin
     if status == "failed" and "multiple ambiguous instances" in normalized_reason:
         return "multiple_instances"
     return "backend_failure"
+
+
+_GEOMETRY_METADATA_FIELDS = (
+    "source_normalized_bbox",
+    "candidate_normalized_bbox",
+    "source_normalized_bbox_area",
+    "candidate_normalized_bbox_area",
+    "candidate_scale_ratio",
+    "source_center_xy",
+    "candidate_center_xy",
+    "center_shift",
+    "geometry_gate_passed",
+    "geometry_rejection_reason",
+)
+
+
+def _sam_geometry_metadata(review: BooguSamReview | None) -> dict[str, object]:
+    if review is None:
+        return {}
+    diagnostics = review.diagnostics
+    present = {
+        field: diagnostics[field]
+        for field in _GEOMETRY_METADATA_FIELDS
+        if field in diagnostics
+    }
+    if not present:
+        return {}
+    if set(present) != set(_GEOMETRY_METADATA_FIELDS):
+        raise ValueError("SAM geometry diagnostics must be complete when present")
+    if not isinstance(present["geometry_gate_passed"], bool):
+        raise TypeError("SAM geometry_gate_passed must be a boolean")
+    reason = present["geometry_rejection_reason"]
+    if reason not in {None, "entity_scale_collapsed", "entity_shifted_off_layout"}:
+        raise ValueError("SAM geometry rejection reason is invalid")
+    if present["geometry_gate_passed"] != (reason is None):
+        raise ValueError("SAM geometry gate result does not match its reason")
+    return present
+
+
+def _background_qwen_rejection_reason(review: BooguBackgroundReview) -> str:
+    if not review.subject_scale_preserved:
+        return "entity_scale_collapsed"
+    if not review.subject_layout_preserved:
+        return "entity_shifted_off_layout"
+    if not review.background_improves_reference or not review.prefer_candidate_over_source:
+        return "background_not_beneficial"
+    return review.reason
 
 
 def _significant_component_count(mask: np.ndarray) -> int:
@@ -1005,11 +1117,17 @@ def publish_boogu_final_reference(
     completion_metadata_path: Path | None = None,
     background_metadata_path: Path | None = None,
     background_fallback: Literal["completion_candidate"] | None = None,
+    final_selection: Literal["background_candidate", "completion_candidate"],
+    final_selection_reason: str,
 ) -> BooguFinalPublication:
     """Publish an accepted native candidate without changing its pixels."""
 
     clip_uid = _safe_component(clip_uid, "clip_uid")
     entity_id = _safe_component(entity_id, "entity_id")
+    final_selection_reason = _nonempty(
+        final_selection_reason,
+        "final_selection_reason",
+    )
     root = run_root.expanduser().resolve(strict=False)
     edit_dir = (root / "clips" / clip_uid / "reference_edit" / entity_id).resolve(
         strict=False
@@ -1075,6 +1193,8 @@ def publish_boogu_final_reference(
             background_metadata.name if background_metadata is not None else None
         ),
         "background_fallback": background_fallback,
+        "final_selection": final_selection,
+        "final_selection_reason": final_selection_reason,
     }
     write_json_atomic(final_metadata_path, final_metadata)
     return BooguFinalPublication(
@@ -1098,9 +1218,14 @@ def run_boogu_reference_edit(
     sam_reviewer: BooguSamReviewer | None = None,
     target_area: int = DEFAULT_TARGET_AREA,
     alignment: int = DEFAULT_ALIGNMENT,
+    min_source_content_area_pixels: int = DEFAULT_MIN_SOURCE_CONTENT_AREA_PIXELS,
+    min_source_content_long_side_pixels: int = (
+        DEFAULT_MIN_SOURCE_CONTENT_LONG_SIDE_PIXELS
+    ),
     model_revision: str = BOOGU_MODEL_REVISION,
     fallback_status: str = "canonical_preserved",
     source_image_path: Path | None = None,
+    geometry_source_image_path: Path | None = None,
     publish_final: bool = True,
     overwrite: bool = False,
 ) -> BooguReferenceEditResult:
@@ -1128,6 +1253,13 @@ def run_boogu_reference_edit(
     )
     if root not in actual_source_path.parents or not actual_source_path.is_file():
         raise ValueError("Boogu source image must be an existing run artifact")
+    geometry_source_path = (
+        actual_source_path
+        if geometry_source_image_path is None
+        else geometry_source_image_path.expanduser().resolve(strict=False)
+    )
+    if root not in geometry_source_path.parents or not geometry_source_path.is_file():
+        raise ValueError("Boogu geometry source must be an existing run artifact")
     edit_dir = root / "clips" / clip_uid / "reference_edit" / entity_id
     edit_dir.mkdir(parents=True, exist_ok=True)
     candidate_name = (
@@ -1163,6 +1295,15 @@ def run_boogu_reference_edit(
     source_bytes = actual_source_path.read_bytes()
     source_sha256 = _sha256_bytes(source_bytes)
     source_rgba = _load_source_rgba(source_bytes)
+    geometry_source_bytes = geometry_source_path.read_bytes()
+    geometry_source_sha256 = _sha256_bytes(geometry_source_bytes)
+    geometry_source_rgba = _load_source_rgba(geometry_source_bytes)
+    source_content_geometry = content_geometry_from_rgba(geometry_source_rgba)
+    source_gate_reason = tiny_content_reason(
+        source_content_geometry,
+        minimum_area_pixels=min_source_content_area_pixels,
+        minimum_long_side_pixels=min_source_content_long_side_pixels,
+    )
     source_input_rgb = _white_composite(source_rgba)
     width, height = resolve_boogu_1k_size(
         source_rgba.width,
@@ -1189,7 +1330,11 @@ def run_boogu_reference_edit(
     sam_review: BooguSamReview | None = None
     sam_warning: str | None = None
     rejection_reason: str | None = None
+    accepted = False
     try:
+        if source_gate_reason is not None:
+            rejection_reason = "tiny_source_entity"
+            raise _TinySourceRejected
         output = backend.edit(
             source_rgb=source_input_rgb.copy(),
             instruction=instruction,
@@ -1217,15 +1362,18 @@ def run_boogu_reference_edit(
         if sam_reviewer is not None:
             sam_review = sam_reviewer.review(
                 operation=operation,
-                source_rgba=source_rgba.copy(),
+                source_rgba=geometry_source_rgba.copy(),
                 candidate_rgb=candidate_rgb.copy(),
                 entity_phrase=entity_phrase,
                 reference_type=reference_type,
             )
             if not isinstance(sam_review, BooguSamReview):
                 raise TypeError("sam_reviewer must return BooguSamReview")
+        geometry_metadata = _sam_geometry_metadata(sam_review)
         qwen_accepted = qwen_review.verdict == "accept"
         sam_accepted = sam_review is None or sam_review.passed
+        if geometry_metadata and not geometry_metadata["geometry_gate_passed"]:
+            sam_accepted = False
         if (
             qwen_accepted
             and operation == "add_entity_background"
@@ -1237,12 +1385,20 @@ def run_boogu_reference_edit(
         accepted = qwen_accepted and sam_accepted
         if not accepted:
             rejection_reason = (
-                qwen_review.reason
+                str(geometry_metadata["geometry_rejection_reason"])
+                if geometry_metadata
+                and not geometry_metadata["geometry_gate_passed"]
+                else _background_qwen_rejection_reason(qwen_review)
+                if isinstance(qwen_review, BooguBackgroundReview)
+                and qwen_review.verdict == "reject"
+                else qwen_review.reason
                 if qwen_review.verdict == "reject"
                 else sam_review.reason
                 if sam_review is not None
                 else "candidate_rejected"
             )
+    except _TinySourceRejected:
+        pass
     except (
         OSError,
         RuntimeError,
@@ -1289,6 +1445,8 @@ def run_boogu_reference_edit(
         "canonical_source_sha256": canonical_sha256,
         "source_image_path": source_evidence_path.relative_to(root).as_posix(),
         "source_image_sha256": source_sha256,
+        "source_geometry_image_path": geometry_source_path.relative_to(root).as_posix(),
+        "source_geometry_image_sha256": geometry_source_sha256,
         "source_input_rgb_path": source_input_path.relative_to(root).as_posix(),
         "generated_reference_sha256": output_sha256,
         "qwen_review": (
@@ -1302,6 +1460,11 @@ def run_boogu_reference_edit(
         "fallback_status": "not_used" if accepted else fallback_status,
         "candidate_path": candidate_name if candidate_path.is_file() else None,
         "worker_metadata": output.worker_metadata if output is not None else {},
+        **source_geometry_metadata(
+            source_content_geometry,
+            source_gate_reason=source_gate_reason,
+        ),
+        **_sam_geometry_metadata(sam_review),
     }
     write_json_atomic(metadata_path, metadata)
 
@@ -1324,6 +1487,16 @@ def run_boogu_reference_edit(
                 ),
                 background_metadata_path=(
                     metadata_path if operation == "add_entity_background" else None
+                ),
+                final_selection=(
+                    "completion_candidate"
+                    if operation == "complete_entity"
+                    else "background_candidate"
+                ),
+                final_selection_reason=(
+                    "accepted_completion_candidate"
+                    if operation == "complete_entity"
+                    else "accepted_background_candidate_preferred_over_source"
                 ),
             )
         rejection_path.unlink(missing_ok=True)

@@ -276,7 +276,11 @@ Candidate sharpness is the variance of a discrete Laplacian on the original RGB
 frame inside a two-pixel-eroded entity mask, with the original mask used when
 erosion leaves too few pixels. The deterministic shortlist order is border
 contact, descending area ratio, descending sharpness, center distance, then the
-fixed slot priority. Bbox fill remains diagnostic metadata only.
+fixed slot priority. Bbox fill remains diagnostic metadata only. Before the
+shortlist is formed, candidates whose alpha/mask content bounding box is below
+the configured area threshold or whose longest side is below the configured
+long-side threshold are removed. If every candidate is tiny, the entity is
+rejected with `tiny_reference_candidates` before the semantic judge runs.
 
 #### `reference_edit`
 
@@ -292,7 +296,12 @@ repairable operations reuse it. Accepted native RGB output is published as
 passes but background generation fails, the completion candidate is the
 explicit fallback. Qwen and SAM3 are independent production guards. SAM3 masks
 are review-only, and no mask paste-back or foreground pixel restoration is
-permitted.
+permitted. Source alpha-bbox geometry rejects tiny inputs before a Boogu
+request. Candidate SAM masks must retain at least the configured normalized
+bbox-area ratio and stay within the configured normalized center distance. A
+background is an optional enhancement: it publishes only when the existing
+Qwen review says that identity, scale, layout, background coherence, and
+reference usefulness pass and the candidate is preferable to the source.
 
 #### `instruct`
 
@@ -1188,6 +1197,10 @@ reference_edit:
   fallback_policy: keep_source
   sam_max_area_growth_ratio: 3.0
   sam_max_significant_components: 4
+  min_source_content_area_pixels: 16384
+  min_source_content_long_side_pixels: 128
+  min_candidate_scale_ratio: 0.60
+  max_candidate_center_shift: 0.20
 
 instruction:
   enabled: true
@@ -1220,6 +1233,9 @@ Validation must reject:
 - enabled `reference_edit` without a dedicated Qwen judge, local worker paths,
   revision `hotfix-1k-20260708`, 16-pixel alignment, positive timeout and target
   area, or an explicit `keep_source|reject_entity` fallback policy;
+- non-positive or non-integer reference-edit source geometry thresholds,
+  `min_candidate_scale_ratio` outside `(0, 1]`, or
+  `max_candidate_center_shift` outside `[0, sqrt(2)]`;
 - nonzero `background.raw_foreground_area_ratio` for V3;
 - an empty `source.limit` unless `source.allow_full_run` is `true`;
 - a non-positive or non-integer `source.limit`;

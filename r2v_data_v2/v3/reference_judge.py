@@ -42,8 +42,13 @@ Classify image_quality as high, acceptable, or poor. Classify completeness as
 one routing outcome: complete, repairable, local_usable, severely_incomplete,
 or fragmented. complete is a ready full reference. repairable is an
 identity-bearing local reference whose missing structure can plausibly be
-completed by the later reference-edit stage. local_usable is useful only as an
-honest local reference and must not be sent for generative completion.
+completed by the later reference-edit stage. Mark repairable when a person's
+torso, hips, buttocks, legs, or arms, or a main object structure, is visibly
+cut by the crop or mask boundary. A single connected component is not evidence
+that the entity is complete. local_usable is a stable, useful local identity
+view with no obvious truncation through the torso, hips, limbs, or main object
+structure; it need not pretend that the whole entity is visible and must not be
+sent for generative completion.
 severely_incomplete and fragmented must be rejected. Poor image quality must
 also be rejected.
 

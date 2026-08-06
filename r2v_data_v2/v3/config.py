@@ -169,6 +169,10 @@ class ReferenceEditConfig:
     fallback_policy: str = "keep_source"
     sam_max_area_growth_ratio: float = 3.0
     sam_max_significant_components: int = 4
+    min_source_content_area_pixels: int = 128 * 128
+    min_source_content_long_side_pixels: int = 128
+    min_candidate_scale_ratio: float = 0.60
+    max_candidate_center_shift: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -555,6 +559,40 @@ class V3Config:
             raise ValueError(
                 "reference_edit.sam_max_significant_components must be a "
                 "positive integer"
+            )
+        for name, value in (
+            (
+                "min_source_content_area_pixels",
+                self.reference_edit.min_source_content_area_pixels,
+            ),
+            (
+                "min_source_content_long_side_pixels",
+                self.reference_edit.min_source_content_long_side_pixels,
+            ),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(
+                    f"reference_edit.{name} must be a positive integer"
+                )
+        minimum_scale = self.reference_edit.min_candidate_scale_ratio
+        if (
+            not isinstance(minimum_scale, float)
+            or not math.isfinite(minimum_scale)
+            or not 0 < minimum_scale <= 1
+        ):
+            raise ValueError(
+                "reference_edit.min_candidate_scale_ratio must be a finite "
+                "float greater than 0 and at most 1"
+            )
+        maximum_shift = self.reference_edit.max_candidate_center_shift
+        if (
+            not isinstance(maximum_shift, float)
+            or not math.isfinite(maximum_shift)
+            or not 0 <= maximum_shift <= math.sqrt(2)
+        ):
+            raise ValueError(
+                "reference_edit.max_candidate_center_shift must be a finite "
+                "float between 0 and sqrt(2)"
             )
 
     def qwen_services(self) -> list[tuple[str, QwenServiceConfig]]:

@@ -47,6 +47,26 @@ SAM3 may re-segment a generated candidate for presence, instance-count, growth,
 and fragmentation diagnostics. Those masks are review-only and cannot modify
 the candidate.
 
+Before generation, source content geometry is measured from the nonzero alpha
+bbox, never from the full transparent or white canvas. Sources with bbox area
+below `16384` pixels or longest bbox side below `128` pixels fall back to the
+unchanged source with `tiny_source_entity`; no Boogu request is sent. The long
+side rule intentionally permits sufficiently large thin objects.
+
+When SAM3 returns a candidate target mask, both bboxes are normalized to their
+own image dimensions. Publication requires:
+
+```text
+candidate_scale_ratio = candidate_normalized_bbox_area / source_normalized_bbox_area
+candidate_scale_ratio >= 0.60
+normalized_center_distance <= 0.20
+```
+
+Scale collapse and layout shift reject with `entity_scale_collapsed` and
+`entity_shifted_off_layout`. If SAM3 cannot produce a mask, no geometry values
+are fabricated; the existing fail-closed or background `not_found` policy
+applies, and Qwen must still affirm subject scale and layout preservation.
+
 Every SAM review records `diagnostics.failure_kind` as `none`, `not_found`,
 `multiple_instances`, `excessive_area_growth`, `fragmented`, or
 `backend_failure`. Qwen rejection always rejects. A passing SAM review follows
@@ -118,11 +138,43 @@ background generation using the same worker. `local_usable` runs background
 generation but retains its local scope and visibility semantics. The two severe
 outcomes do not enter this stage.
 
+Visible truncation through a person's torso, hips, buttocks, legs, or arms, or
+through a main object structure, is `repairable` even when the visible mask is
+one connected component. A stable local identity view without such truncation
+may remain `local_usable`. For legacy local references with no completeness
+value, a non-whole recognizable alpha bbox touching the canvas boundary routes
+to repairable; an explicit `local_usable` value always wins.
+
 Qwen and SAM3 review each generated candidate; SAM3 masks are review-only. If a
 repairable completion passes but background generation fails, the accepted
 completion candidate is published byte-for-byte and `final_metadata.json`
 records `background_fallback=completion_candidate`. Other rejections follow the
-configured `keep_source` or `reject_entity` policy.
+configured `keep_source` or `reject_entity` policy. Background generation is an
+optional enhancement, not a mandatory replacement. Its existing structured
+Qwen review compares source and candidate and must affirm subject scale, subject
+layout, coherent and beneficial background, and that the candidate is
+preferable to the source. Final selection is deterministic:
+
+```text
+repairable: accepted background > accepted completion > source
+complete/local_usable: accepted preferable background > source
+```
+
+`final_metadata.json` records `final_selection` and
+`final_selection_reason`. A source fallback remains non-synthetic and preserves
+the original reference fields and bytes.
+
+## Manual smoke regression checklist
+
+Run these only on the server pilot; the identifiers are review notes and are
+not production conditions.
+
+- Extreme tiny-person source: expect `tiny_source_entity` and no Boogu request.
+- Both examples where the subject shrank into the upper-left: expect the
+  scale/layout gate to reject publication.
+- `b35058...` / `e3`: expect `repairable`; completion failure keeps the source.
+- `b35058...` / `e1`: an implausible background must not replace the source.
+- Duplicate-crab example: duplicate candidate remains a hard rejection.
 
 ## Validation
 

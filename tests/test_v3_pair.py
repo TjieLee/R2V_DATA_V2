@@ -150,9 +150,14 @@ def _config(
                 python_executable=writable / "venvs" / "boogu" / "python",
                 code_root=writable / "vendor" / "Boogu-Image",
                 model_path=writable / "models" / "Boogu-Image-0.1-Edit-Turbo",
+                min_source_content_area_pixels=1,
+                min_source_content_long_side_pixels=1,
             )
             if reference_edit_enabled
-            else ReferenceEditConfig()
+            else ReferenceEditConfig(
+                min_source_content_area_pixels=1,
+                min_source_content_long_side_pixels=1,
+            )
         ),
         debug=config_module.DebugConfig(save_diagnostics=debug),
     )
@@ -559,6 +564,115 @@ def test_candidate_shortlist_is_deterministic_and_renumbered(
     assert len(first) == 3
 
 
+def test_pair_filters_tiny_candidate_before_semantic_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(max_candidates_per_entity=10),
+    )
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=16,
+            min_source_content_long_side_pixels=4,
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject",))
+    original = pair_module._candidate_from_frame
+
+    def candidate_with_one_tiny_slot(**kwargs: object):
+        candidate = original(**kwargs)
+        if candidate.frame_slot != 5:
+            return candidate
+        mask = np.zeros_like(candidate.mask)
+        mask[0, 0] = True
+        return replace(
+            candidate,
+            mask=mask,
+            bbox_xyxy=(0, 0, 1, 1),
+            area_pixels=1,
+            area_ratio=1 / mask.size,
+            bbox_fill_ratio=1.0,
+        )
+
+    monkeypatch.setattr(
+        pair_module,
+        "_candidate_from_frame",
+        candidate_with_one_tiny_slot,
+    )
+    judged_slots: list[int] = []
+
+    class CapturingJudge(_Judge):
+        def decide(self, *, entity, candidates, source_images):
+            judged_slots.extend(candidate.frame_slot for candidate in candidates)
+            return super().decide(
+                entity=entity,
+                candidates=candidates,
+                source_images=source_images,
+            )
+
+    stats = pair_clips(config, storage, judge=CapturingJudge())
+
+    assert stats.ready == 1
+    assert judged_slots
+    assert 5 not in judged_slots
+    assert set(judged_slots).intersection(set(range(10)) - {5})
+
+
+def test_pair_rejects_entity_when_every_reference_candidate_is_tiny(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(max_candidates_per_entity=10),
+    )
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=16,
+            min_source_content_long_side_pixels=4,
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject",))
+    original = pair_module._candidate_from_frame
+
+    def tiny_candidate(**kwargs: object):
+        candidate = original(**kwargs)
+        mask = np.zeros_like(candidate.mask)
+        mask[0, 0] = True
+        return replace(
+            candidate,
+            mask=mask,
+            bbox_xyxy=(0, 0, 1, 1),
+            area_pixels=1,
+            area_ratio=1 / mask.size,
+            bbox_fill_ratio=1.0,
+        )
+
+    monkeypatch.setattr(pair_module, "_candidate_from_frame", tiny_candidate)
+
+    class UnexpectedJudge:
+        def decide(self, **kwargs: object) -> object:
+            del kwargs
+            raise AssertionError("all-tiny candidates must not reach Qwen")
+
+    stats = pair_clips(config, storage, judge=UnexpectedJudge())
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_rejected == 1
+    assert clip.references.entities[0].status == "rejected"
+    assert clip.references.entities[0].scope_reason == "tiny_reference_candidates"
+
+
 def test_pair_publishes_all_ready_references_and_per_type_tokens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -949,6 +1063,9 @@ def test_pipeline_pair_integration_uses_injected_judge(
                 "remove:",
                 f"  base_model_path: {config.remove.base_model_path}",
                 f"  adapter_path: {config.remove.adapter_path}",
+                "reference_edit:",
+                "  min_source_content_area_pixels: 1",
+                "  min_source_content_long_side_pixels: 1",
             ]
         ),
         encoding="utf-8",
@@ -1679,6 +1796,9 @@ def test_pipeline_pair_integration_passes_injected_cross_pair_judge(
                 "remove:",
                 f"  base_model_path: {config.remove.base_model_path}",
                 f"  adapter_path: {config.remove.adapter_path}",
+                "reference_edit:",
+                "  min_source_content_area_pixels: 1",
+                "  min_source_content_long_side_pixels: 1",
             ]
         ),
         encoding="utf-8",
@@ -3285,9 +3405,11 @@ class _ReferenceEditJudge:
         *,
         accept: bool = True,
         reject_operations: set[str] | None = None,
+        background_updates: dict[str, bool] | None = None,
     ) -> None:
         self.accept = accept
         self.reject_operations = reject_operations or set()
+        self.background_updates = background_updates or {}
         self.calls: list[str] = []
 
     def review(self, **kwargs: object) -> object:
@@ -3326,7 +3448,11 @@ class _ReferenceEditJudge:
                 "no_duplicate_entity",
                 "no_added_salient_entity",
                 "no_unintended_completion_or_extension",
+                "subject_scale_preserved",
+                "subject_layout_preserved",
                 "background_coherent",
+                "background_improves_reference",
+                "prefer_candidate_over_source",
                 "background_style_consistent",
                 "no_halo_or_seam",
                 "subject_not_severely_redrawn",
@@ -3334,16 +3460,21 @@ class _ReferenceEditJudge:
                 "certain",
             )
         }
+        background_values.update(self.background_updates)
+        background_accepted = all(background_values.values())
         return BooguBackgroundReview(
-            verdict="accept" if accepted else "reject",
-            reason="usable" if accepted else "rejected",
+            verdict="accept" if background_accepted else "reject",
+            reason="usable" if background_accepted else "rejected",
             **background_values,
         )
 
 
 class _ReferenceEditSamReviewer:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
     def review(self, **kwargs: object) -> BooguSamReview:
-        del kwargs
+        self.calls.append(kwargs)
         return BooguSamReview(
             passed=True,
             target_entity_present=True,
@@ -3353,6 +3484,21 @@ class _ReferenceEditSamReviewer:
             reason="valid",
             diagnostics={"failure_kind": "none"},
         )
+
+
+def _write_touching_local_reference(
+    storage: RunStorage,
+    *,
+    clip_uid: str = "clip-1",
+    entity_id: str = "e1",
+) -> Path:
+    path = storage.selected_entity_path(clip_uid, entity_id)
+    pixels = np.full((64, 64, 4), 255, dtype=np.uint8)
+    pixels[..., 3] = 0
+    pixels[8:64, 12:52, :3] = (40, 80, 120)
+    pixels[8:64, 12:52, 3] = 255
+    Image.fromarray(pixels, mode="RGBA").save(path, format="PNG")
+    return path
 
 
 def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
@@ -3394,6 +3540,14 @@ def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
         assert reference.synthetic is True
         assert reference.image_path is not None
         assert reference.image_path.endswith("/final_reference_1k.png")
+        final_metadata = json.loads(
+            (
+                storage.reference_edit_dir("clip-1")
+                / reference.entity_id
+                / "final_metadata.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert final_metadata["final_selection"] == "background_candidate"
         assert (
             _sha256(storage.selected_entity_path("clip-1", reference.entity_id))
             == (canonical_hashes[reference.entity_id])
@@ -3502,6 +3656,8 @@ def test_pipeline_runs_formal_reference_edit_stage_with_injected_runtime(
                 ),
                 f"  code_root: {config.reference_edit.code_root}",
                 f"  model_path: {config.reference_edit.model_path}",
+                "  min_source_content_area_pixels: 1",
+                "  min_source_content_long_side_pixels: 1",
             ]
         ),
         encoding="utf-8",
@@ -3564,13 +3720,14 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     canonical_bytes = canonical.read_bytes()
     backend = _ReferenceEditBackend()
     judge = _ReferenceEditJudge()
+    sam_reviewer = _ReferenceEditSamReviewer()
 
     stats = reference_edit_clips(
         config,
         storage,
         backend=backend,
         judge=judge,
-        sam_reviewer=_ReferenceEditSamReviewer(),
+        sam_reviewer=sam_reviewer,
     )
 
     assert stats.entities_accepted == 1
@@ -3595,11 +3752,21 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     assert backend.calls[1]["source_rgb"].tobytes() == (
         Image.open(completion_path).convert("RGB").tobytes()
     )
+    assert len(sam_reviewer.calls) == 2
+    with Image.open(canonical) as source:
+        source_size = source.size
+    assert [call["source_rgba"].size for call in sam_reviewer.calls] == [
+        source_size,
+        source_size,
+    ]
     background_metadata = json.loads(
         (edit_dir / "background_metadata.json").read_text(encoding="utf-8")
     )
     assert background_metadata["source_image_path"].endswith(
         "/completion_candidate_1k.png"
+    )
+    assert background_metadata["source_geometry_image_path"].endswith(
+        "/selected/e1.png"
     )
     assert (edit_dir / "final_reference_1k.png").read_bytes() == (
         background_path.read_bytes()
@@ -3632,6 +3799,46 @@ def test_complete_reference_runs_only_background_with_exact_prompt(
     assert backend.calls[0]["thinking_enabled"] is False
 
 
+@pytest.mark.parametrize(
+    "background_updates",
+    [
+        {"background_improves_reference": False},
+        {"prefer_candidate_over_source": False},
+    ],
+)
+def test_background_not_better_than_source_uses_keep_source_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background_updates: dict[str, bool],
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    source = storage.read_clip("clip-1").references.entities[0]
+    source_bytes = (storage.root / source.image_path).read_bytes()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(background_updates=background_updates),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    edit = clip.reference_edit.entities[0]
+    assert stats.entities_fallback == 1
+    assert reference == source
+    assert reference.synthetic is False
+    assert (storage.root / reference.image_path).read_bytes() == source_bytes
+    assert edit.fallback_policy == "keep_source"
+    assert edit.reason == "background_not_beneficial"
+    metadata = json.loads((storage.root / edit.metadata_path).read_text(encoding="utf-8"))
+    assert metadata["final_selection"] == "source"
+    assert metadata["final_selection_reason"] == "background_not_beneficial"
+
+
 def test_local_reference_adds_background_without_promoting_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3640,6 +3847,7 @@ def test_local_reference_adds_background_without_promoting_scope(
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
     source = storage.read_clip("clip-1").references.entities[0]
+    _write_touching_local_reference(storage)
     backend = _ReferenceEditBackend()
 
     reference_edit_clips(
@@ -3660,6 +3868,96 @@ def test_local_reference_adds_background_without_promoting_scope(
     assert reference.whole_entity_recognizable is False
     assert reference.image_quality == source.image_quality
     assert reference.completeness == source.completeness == "local_usable"
+    assert storage.read_clip("clip-1").reference_edit.entities[0].route == (
+        "local_usable"
+    )
+
+
+def test_tiny_source_falls_back_without_starting_boogu_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    source = storage.read_clip("clip-1").references.entities[0]
+    source_bytes = (storage.root / source.image_path).read_bytes()
+    gated_config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            min_source_content_area_pixels=128 * 128,
+            min_source_content_long_side_pixels=128,
+        ),
+    )
+    gated_config.validate()
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        gated_config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    final = clip.references.entities[0]
+    edit = clip.reference_edit.entities[0]
+    assert stats.failed == 0
+    assert stats.entities_fallback == 1
+    assert stats.worker_starts == 0
+    assert backend.start_calls == 0
+    assert backend.calls == []
+    assert clip.reference_edit.status == "ready"
+    assert edit.status == "fallback"
+    assert edit.fallback_policy == "keep_source"
+    assert edit.reason == "tiny_source_entity"
+    assert final == source
+    assert final.synthetic is False
+    assert (storage.root / final.image_path).read_bytes() == source_bytes
+    metadata = json.loads((storage.root / edit.metadata_path).read_text(encoding="utf-8"))
+    assert metadata["source_tiny"] is True
+    assert metadata["final_selection"] == "source"
+    assert metadata["final_selection_reason"] == "tiny_source_entity"
+
+
+def test_legacy_touching_local_reference_routes_to_repairable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    clip = storage.read_clip("clip-1")
+    source = clip.references.entities[0].model_copy(
+        update={"image_quality": None, "completeness": None}
+    )
+    _write_touching_local_reference(storage)
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=[source], background=clip.references.background),
+        clip.pairing,
+    )
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(reject_operations={"complete_entity"}),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    edit = clip.reference_edit.entities[0]
+    assert stats.entities_fallback == 1
+    assert len(backend.calls) == 1
+    assert backend.calls[0]["thinking_enabled"] is True
+    assert edit.route == "repairable"
+    assert edit.operations == ["complete_entity"]
+    assert edit.fallback_policy == "keep_source"
+    assert clip.references.entities[0] == source
 
 
 def test_legacy_local_reference_publishes_with_normalized_quality_fields(
@@ -3772,7 +4070,7 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
         storage,
         backend=backend,
         judge=_ReferenceEditJudge(
-            reject_operations={"add_entity_background"},
+            background_updates={"background_improves_reference": False},
         ),
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
@@ -3787,6 +4085,7 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
         (edit_dir / "final_metadata.json").read_text(encoding="utf-8")
     )
     assert final_metadata["background_fallback"] == "completion_candidate"
+    assert final_metadata["final_selection"] == "completion_candidate"
     clip = storage.read_clip("clip-1")
     state = clip.reference_edit.entities[0]
     assert state.status == "fallback"
@@ -3804,6 +4103,14 @@ def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
         monkeypatch,
         reference_edit_enabled=True,
     )
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            fallback_policy="reject_entity",
+        ),
+    )
+    config.validate()
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
     source_reference = storage.read_clip("clip-1").references.entities[0]
@@ -3832,6 +4139,12 @@ def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
     assert reference.visible_region == source_reference.visible_region
     assert reference.completeness == source_reference.completeness
     assert source_path.read_bytes() == source_bytes
+    source_selection = json.loads(
+        (
+            storage.root / clip.reference_edit.entities[0].metadata_path
+        ).read_text(encoding="utf-8")
+    )
+    assert source_selection["final_selection"] == "source"
 
 
 def test_reference_edit_overwrite_restores_immutable_source_reference(
