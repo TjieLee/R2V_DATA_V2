@@ -14,6 +14,7 @@ from r2v_data_v2.structured_output import (
     ValidationIssue,
 )
 from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
+from r2v_data_v2.v3.phrase_anchor import phrase_matches_caption_span
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
     model_profile_context,
@@ -101,21 +102,26 @@ one independently referenceable product, vehicle, prop, device, piece of
 furniture, or other object; and group for multiple subjects or objects whose
 stable composition should be retained together. phrase briefly identifies the
 candidate for binding and review in 3 to 10 words and must not exceed 12 words.
-entity.phrase should normally be a stable noun
-phrase rather than an action: prefer "man in a light gray military uniform" over
+phrase must be a verbatim, contiguous span from t2v_caption, compared
+case-insensitively after collapsing whitespace and ignoring phrase-edge
+punctuation. Prefer the noun phrase from the entity's first clear caption mention.
+It must be a stable noun phrase rather than an action and sufficiently distinguish
+the target: prefer "man in a light gray military uniform" over
 "military officer speaking at podium". grounding_prompt describes stable visible
 appearance and location in 6 to 18 words and must not exceed 24 words. Do not
 include transient actions or enumerate every clothing detail. A stable seated
 or standing pose is allowed only when needed to distinguish the target for
-SAM3. Both fields must be non-empty and must not
-contain reference tokens.
+SAM3. grounding_prompt need not occur in t2v_caption. Both fields must be
+non-empty and must not contain reference tokens.
 
 background is optional. When reliable, describe the overall environment after
 the principal foreground subjects are removed, using only phrase and
 grounding_prompt. Return background only when one stable environment persists
 through most of the clip. When the video contains a major scene transition
 between different environments, return background=null. Do not repeat the main
-foreground subject. Otherwise return null. Return JSON only."""
+foreground subject. background.phrase must follow the same verbatim contiguous
+t2v_caption span rule as entity.phrase; background.grounding_prompt may remain a
+more detailed stable environment description. Otherwise return null. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -263,6 +269,70 @@ def _entity_text_issues(raw_entities: object) -> list[ValidationIssue]:
     return issues
 
 
+def _phrase_anchor_issues(
+    *,
+    caption: str,
+    raw_entities: object,
+    raw_background: object,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if isinstance(raw_entities, list):
+        for index, candidate in enumerate(raw_entities):
+            if not isinstance(candidate, dict) or set(candidate) != _ENTITY_FIELDS:
+                continue
+            reference_type = _clean_text(candidate.get("reference_type"))
+            phrase = _clean_text(
+                candidate.get("phrase"),
+                trim_phrase_punctuation=True,
+            )
+            grounding_prompt = _clean_text(candidate.get("grounding_prompt"))
+            if (
+                reference_type is None
+                or reference_type.casefold() not in _REFERENCE_TYPES
+                or phrase is None
+                or grounding_prompt is None
+                or _REFERENCE_TOKEN.search(phrase)
+                or _REFERENCE_TOKEN.search(grounding_prompt)
+            ):
+                continue
+            if not phrase_matches_caption_span(phrase=phrase, caption=caption):
+                issues.append(
+                    ValidationIssue(
+                        code="entity_phrase_not_in_caption",
+                        field=f"entities.{index}.phrase",
+                        message=(
+                            "entity phrase must be a contiguous verbatim span "
+                            "from t2v_caption"
+                        ),
+                    )
+                )
+
+    if isinstance(raw_background, dict) and set(raw_background) == _BACKGROUND_FIELDS:
+        phrase = _clean_text(
+            raw_background.get("phrase"),
+            trim_phrase_punctuation=True,
+        )
+        grounding_prompt = _clean_text(raw_background.get("grounding_prompt"))
+        if (
+            phrase is not None
+            and grounding_prompt is not None
+            and not _REFERENCE_TOKEN.search(phrase)
+            and not _REFERENCE_TOKEN.search(grounding_prompt)
+            and not phrase_matches_caption_span(phrase=phrase, caption=caption)
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="background_phrase_not_in_caption",
+                    field="background.phrase",
+                    message=(
+                        "background phrase must be a contiguous verbatim span "
+                        "from t2v_caption"
+                    ),
+                )
+            )
+    return issues
+
+
 def sanitize_entity_candidates(
     raw_entities: object,
 ) -> tuple[list[AnnotationEntity], tuple[str, ...]]:
@@ -403,6 +473,14 @@ def sanitize_annotation_payload(
                 )
             )
     issues.extend(_entity_text_issues(raw_payload.get("entities", [])))
+    if caption is not None:
+        issues.extend(
+            _phrase_anchor_issues(
+                caption=caption,
+                raw_entities=raw_payload.get("entities", []),
+                raw_background=raw_payload.get("background"),
+            )
+        )
     if issues:
         return None, issues, ()
 

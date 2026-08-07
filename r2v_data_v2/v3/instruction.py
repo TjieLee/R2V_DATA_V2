@@ -14,6 +14,7 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig, V3Config
+from r2v_data_v2.v3.phrase_anchor import find_caption_phrase_spans
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
     model_profile_context,
@@ -25,6 +26,7 @@ from r2v_data_v2.v3.schemas import (
     InstructionLegendEntry,
     InstructionState,
     RawInstructionOutput,
+    render_inline_instruction_text,
     render_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
@@ -161,17 +163,6 @@ def build_instruction_bindings(clip: ClipRecord) -> list[InstructionBinding]:
     return bindings
 
 
-def _format_binding_placeholders(bindings: list[InstructionBinding]) -> str:
-    placeholders = [f"{{{{{binding.image_id}}}}}" for binding in bindings]
-    if not placeholders:
-        raise ValueError("deterministic instruction requires at least one binding")
-    if len(placeholders) == 1:
-        return placeholders[0]
-    if len(placeholders) == 2:
-        return f"{placeholders[0]} and {placeholders[1]}"
-    return f"{', '.join(placeholders[:-1])}, and {placeholders[-1]}"
-
-
 def build_deterministic_instruction(
     *,
     t2v_caption: str,
@@ -180,19 +171,29 @@ def build_deterministic_instruction(
     caption = t2v_caption.strip()
     if not caption:
         raise ValueError("deterministic instruction requires a non-empty t2v_caption")
-
-    placeholder_list = _format_binding_placeholders(bindings)
-    reference_noun = "reference" if len(bindings) == 1 else "references"
-    body = (
-        f"Use {placeholder_list} as the visual {reference_noun} defined in the "
-        "legend. Generate a video matching this description while preserving "
-        f"the appearance of the referenced content: {caption}"
-    )
-    if _english_word_count(body) > 180:
-        raise ValueError("deterministic instruction exceeds 180 English words")
+    if not bindings:
+        raise ValueError("deterministic instruction requires at least one binding")
 
     legend: list[InstructionLegendEntry] = []
+    anchors: list[tuple[int, int, InstructionBinding]] = []
     for binding in bindings:
+        spans = find_caption_phrase_spans(
+            phrase=binding.phrase,
+            caption=caption,
+        )
+        if not spans:
+            raise ValueError(
+                f"binding {binding.image_id} phrase is not an exact caption span"
+            )
+        start, end = spans[0]
+        for existing_start, existing_end, existing_binding in anchors:
+            if start < existing_end and existing_start < end:
+                raise ValueError(
+                    "instruction binding caption spans overlap: "
+                    f"{existing_binding.image_id} and {binding.image_id}"
+                )
+        anchors.append((start, end, binding))
+
         description = binding.grounding_prompt.strip()
         if not description:
             raise ValueError(
@@ -204,11 +205,21 @@ def build_deterministic_instruction(
                 description=description,
             )
         )
+
+    body = caption
+    for _, end, binding in sorted(
+        anchors,
+        key=lambda anchor: (anchor[1], anchor[0]),
+        reverse=True,
+    ):
+        body = f"{body[:end]} {{{{{binding.image_id}}}}}{body[end:]}"
+    if _english_word_count(body) > 180:
+        raise ValueError("deterministic instruction exceeds 180 English words")
     return InstructionState(
         status="ready",
         instruction_body_template=body,
         reference_legend=legend,
-        r2v_instruction=render_instruction_text(body, legend),
+        r2v_instruction=render_inline_instruction_text(body),
     )
 
 

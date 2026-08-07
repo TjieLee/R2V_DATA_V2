@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -44,6 +45,7 @@ from r2v_data_v2.v3.schemas import (
     PairingState,
     RawInstructionOutput,
     ReferencesState,
+    render_inline_instruction_text,
     render_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
@@ -435,119 +437,153 @@ def test_bindings_follow_pairing_order_and_put_background_last(
     ]
 
 
-def test_deterministic_instruction_uses_exact_caption_and_binding_legend(
+def test_deterministic_instruction_inlines_one_entity_after_mention(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     bindings = build_instruction_bindings(storage.read_clip(clip_uid))
-    caption = "  A cyclist crosses the plaza in one continuous shot.  "
+    caption = "  A woman in a yellow coat crosses the plaza.  "
 
-    one = build_deterministic_instruction(
+    instruction = build_deterministic_instruction(
         t2v_caption=caption,
         bindings=bindings[:1],
     )
-    two = build_deterministic_instruction(
-        t2v_caption=caption,
-        bindings=bindings[:2],
-    )
 
-    assert one.instruction_body_template == (
-        "Use {{image_1}} as the visual reference defined in the legend. "
-        "Generate a video matching this description while preserving the "
-        "appearance of the referenced content: A cyclist crosses the plaza in "
-        "one continuous shot."
+    assert instruction.instruction_body_template == (
+        "A woman in a yellow coat {{image_1}} crosses the plaza."
     )
-    assert one.instruction_body_template.count("{{image_1}}") == 1
-    assert one.reference_legend == [
+    assert instruction.reference_legend == [
         InstructionLegendEntry(
             image_id="image_1",
             description=bindings[0].grounding_prompt.strip(),
         )
     ]
-    assert two.instruction_body_template.startswith(
-        "Use {{image_1}} and {{image_2}} as the visual references defined in "
-        "the legend."
+    assert instruction.r2v_instruction == (
+        "A woman in a yellow coat <Image 1> crosses the plaza."
     )
-    assert two.instruction_body_template.count("{{image_1}}") == 1
-    assert two.instruction_body_template.count("{{image_2}}") == 1
-    assert two.instruction_body_template.endswith(caption.strip())
-    assert two.r2v_instruction == render_instruction_text(
-        two.instruction_body_template,
-        two.reference_legend,
-    )
+    assert "\n<Image 1>:" not in instruction.r2v_instruction
 
 
-def test_deterministic_instruction_supports_six_ordered_bindings() -> None:
+def test_deterministic_instruction_inlines_entities_and_background_at_mentions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    bindings = build_instruction_bindings(storage.read_clip(clip_uid))
+    caption = (
+        "A woman in a yellow coat walks beside a red bicycle through a bright "
+        "plaza as the camera tracks backward."
+    )
+
+    instruction = build_deterministic_instruction(
+        t2v_caption=caption,
+        bindings=bindings,
+    )
+
+    assert instruction.instruction_body_template == (
+        "A woman in a yellow coat {{image_1}} walks beside a red bicycle "
+        "{{image_2}} through a bright plaza {{image_3}} as the camera tracks "
+        "backward."
+    )
+    assert instruction.r2v_instruction == (
+        "A woman in a yellow coat <Image 1> walks beside a red bicycle <Image 2> "
+        "through a bright plaza <Image 3> as the camera tracks backward."
+    )
+    assert instruction.reference_legend[-1] == InstructionLegendEntry(
+        image_id="image_3",
+        description="the empty bright plaza",
+    )
+    assert not instruction.instruction_body_template.startswith("{{image_")
+
+
+def test_deterministic_instruction_preserves_caption_except_insertions() -> None:
     clip = _five_entity_instruction_clip(include_background=True)
     bindings = build_instruction_bindings(clip)
-    caption = " ".join(f"detail{index}" for index in range(120))
+    caption = (
+        "  Entity 1  stands near entity 2 while entity 3 faces entity 4. "
+        "Entity 5 remains visible in a quiet plaza.  "
+    )
 
     instruction = build_deterministic_instruction(
         t2v_caption=caption,
         bindings=bindings,
     )
     body = instruction.instruction_body_template
-    output = RawInstructionOutput(
-        instruction_body_template=body,
-        reference_legend=[
-            entry.model_dump(mode="json") for entry in instruction.reference_legend
-        ],
-    )
 
     assert len(instruction.reference_legend) == 6
-    assert [entry.image_id for entry in instruction.reference_legend] == [
-        f"image_{index}" for index in range(1, 7)
-    ]
     assert [entry.description for entry in instruction.reference_legend] == [
         binding.grounding_prompt.strip() for binding in bindings
     ]
-    assert instruction.reference_legend[-1].description == (
-        clip.annotation.background.grounding_prompt
-    )
     assert all(body.count(f"{{{{image_{index}}}}}") == 1 for index in range(1, 7))
-    assert [body.index(f"{{{{image_{index}}}}}") for index in range(1, 7)] == sorted(
-        body.index(f"{{{{image_{index}}}}}") for index in range(1, 7)
-    )
-    assert body.startswith(
-        "Use {{image_1}}, {{image_2}}, {{image_3}}, {{image_4}}, "
-        "{{image_5}}, and {{image_6}} as the visual references"
-    )
-    assert "instruction_body_too_long" not in {
-        issue.code
-        for issue in validate_instruction_output(
-            output,
-            t2v_caption=caption,
-            bindings=bindings,
-            source_transcript=None,
-        )
-    }
+    assert re.sub(r" \{\{image_[1-9]\d*\}\}", "", body) == caption.strip()
+    assert "Use " not in body
+    assert "Generate " not in body
 
 
-def test_deterministic_instruction_does_not_expand_phrase_or_use_transcript(
+def test_deterministic_instruction_uses_first_repeated_phrase_occurrence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    storage, clip_uid = _ready_storage(
-        _config(tmp_path, monkeypatch),
-        metadata={"source_transcript": "Do not include this dialogue."},
-    )
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     binding = build_instruction_bindings(storage.read_clip(clip_uid))[0].model_copy(
         update={
-            "phrase": "phrase sentinel that must remain absent",
+            "phrase": "a woman",
             "grounding_prompt": "  stable visible subject  ",
         }
     )
 
     instruction = build_deterministic_instruction(
-        t2v_caption="A subject crosses the frame.",
+        t2v_caption="A woman enters before a woman leaves.",
         bindings=[binding],
     )
 
-    assert "phrase sentinel" not in instruction.instruction_body_template
+    assert instruction.instruction_body_template == (
+        "A woman {{image_1}} enters before a woman leaves."
+    )
     assert "stable visible subject" not in instruction.instruction_body_template
-    assert "Do not include this dialogue" not in instruction.instruction_body_template
     assert instruction.reference_legend[0].description == "stable visible subject"
+
+
+def test_deterministic_instruction_rejects_conflicting_same_span_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    binding = build_instruction_bindings(storage.read_clip(clip_uid))[0]
+    duplicate = binding.model_copy(
+        update={
+            "image_id": "image_2",
+            "image_index": 2,
+            "entity_id": "e2",
+        }
+    )
+
+    with pytest.raises(ValueError, match="caption spans overlap"):
+        build_deterministic_instruction(
+            t2v_caption="A woman in a yellow coat crosses the plaza.",
+            bindings=[binding, duplicate],
+        )
+
+
+def test_deterministic_instruction_rejects_overlapping_phrase_spans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    first, second = build_instruction_bindings(storage.read_clip(clip_uid))[:2]
+    second = second.model_copy(
+        update={
+            "phrase": "yellow coat",
+            "grounding_prompt": "the yellow coat worn by the woman",
+        }
+    )
+
+    with pytest.raises(ValueError, match="caption spans overlap"):
+        build_deterministic_instruction(
+            t2v_caption="A woman in a yellow coat crosses the plaza.",
+            bindings=[first, second],
+        )
 
 
 def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
@@ -566,6 +602,12 @@ def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
         build_deterministic_instruction(
             t2v_caption="A subject moves.",
             bindings=[binding],
+        )
+    missing = binding.model_copy(update={"grounding_prompt": "visible subject"})
+    with pytest.raises(ValueError, match="not an exact caption span"):
+        build_deterministic_instruction(
+            t2v_caption="A bicycle moves.",
+            bindings=[missing],
         )
     with pytest.raises(ValueError, match="at least one binding"):
         build_deterministic_instruction(
@@ -846,6 +888,15 @@ def test_renderer_uses_angle_bracket_english_labels() -> None:
     assert "\u56fe1" not in rendered
 
 
+def test_inline_renderer_replaces_placeholders_without_legend_lines() -> None:
+    rendered = render_inline_instruction_text(
+        "A woman {{image_1}} stands beside an altar {{image_2}}."
+    )
+
+    assert rendered == "A woman <Image 1> stands beside an altar <Image 2>."
+    assert "\n" not in rendered
+
+
 def test_legacy_plain_english_instruction_state_can_be_loaded() -> None:
     state = InstructionState.model_validate(
         {
@@ -914,6 +965,23 @@ def test_new_instruction_state_requires_angle_bracket_rendering() -> None:
                 "Move <Image 1> forward.\n\nImage 1: a red bicycle"
             ),
         )
+
+
+def test_inline_instruction_state_is_valid_without_rendered_legend() -> None:
+    body = "A red bicycle {{image_1}} moves forward."
+    legend = [
+        InstructionLegendEntry(image_id="image_1", description="a red bicycle")
+    ]
+
+    state = InstructionState(
+        status="ready",
+        instruction_body_template=body,
+        reference_legend=legend,
+        r2v_instruction=render_inline_instruction_text(body),
+    )
+
+    assert state.r2v_instruction == "A red bicycle <Image 1> moves forward."
+    assert "<Image 1>:" not in state.r2v_instruction
 
 
 def test_source_transcript_reads_only_explicit_metadata_fields() -> None:
@@ -1235,33 +1303,30 @@ def test_deterministic_builder_uses_existing_final_renderer(
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     bindings = build_instruction_bindings(storage.read_clip(clip_uid))
-    calls: list[tuple[str, list[InstructionLegendEntry]]] = []
-    renderer = instruction_module.render_instruction_text
+    calls: list[str] = []
+    renderer = instruction_module.render_inline_instruction_text
 
-    def recording_renderer(
-        body: str,
-        legend: list[InstructionLegendEntry],
-    ) -> str:
-        calls.append((body, legend))
-        return renderer(body, legend)
+    def recording_renderer(body: str) -> str:
+        calls.append(body)
+        return renderer(body)
 
     monkeypatch.setattr(
         instruction_module,
-        "render_instruction_text",
+        "render_inline_instruction_text",
         recording_renderer,
     )
 
     instruction = instruction_module.build_deterministic_instruction(
-        t2v_caption="A subject crosses the scene.",
+        t2v_caption=(
+            "A woman in a yellow coat walks beside a red bicycle through a "
+            "bright plaza."
+        ),
         bindings=bindings,
     )
 
-    assert calls == [
-        (instruction.instruction_body_template, instruction.reference_legend)
-    ]
+    assert calls == [instruction.instruction_body_template]
     assert instruction.r2v_instruction == renderer(
-        instruction.instruction_body_template,
-        instruction.reference_legend,
+        instruction.instruction_body_template
     )
 
 

@@ -1162,6 +1162,13 @@ def render_instruction_text(
     return f"{rendered_body}\n\n" + "\n".join(legend_lines)
 
 
+def render_inline_instruction_text(instruction_body_template: str) -> str:
+    return _IMAGE_PLACEHOLDER.sub(
+        lambda match: f"<Image {match.group(1).removeprefix('image_')}>",
+        instruction_body_template.strip(),
+    )
+
+
 def _render_legacy_english_instruction_text(
     instruction_body_template: str,
     reference_legend: list[InstructionLegendEntry],
@@ -1263,6 +1270,9 @@ class InstructionState(SchemaModel):
                 "instruction placeholders must exactly match reference legend"
             )
         expected_renderings = {
+            render_inline_instruction_text(self.instruction_body_template),
+        }
+        expected_renderings.update(
             renderer(
                 self.instruction_body_template,
                 self.reference_legend,
@@ -1272,12 +1282,12 @@ class InstructionState(SchemaModel):
                 _render_legacy_english_instruction_text,
                 _render_legacy_instruction_text,
             )
-        }
+        )
         if self.r2v_instruction not in expected_renderings:
             raise ValueError(
-                "r2v_instruction must match deterministic angle-bracket English "
-                "rendering, exact legacy plain English rendering, or exact "
-                "legacy Chinese rendering"
+                "r2v_instruction must match deterministic inline rendering, "
+                "angle-bracket English rendering with legend, exact legacy plain "
+                "English rendering, or exact legacy Chinese rendering"
             )
         return self
 

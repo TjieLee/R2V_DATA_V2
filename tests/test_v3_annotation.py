@@ -19,6 +19,7 @@ from r2v_data_v2.v3.annotation import (
     AnnotationStats,
     QwenAnnotationClient,
     annotate_clips,
+    phrase_matches_caption_span,
     sanitize_annotation_payload,
     sanitize_background,
     sanitize_entity_candidates,
@@ -184,15 +185,31 @@ def _payload(
     background: object = ...,
 ) -> dict[str, object]:
     if entities is None:
-        entities = [
+        default_entities = [
             _entity("A woman in a yellow coat"),
             _entity("a wooden table", reference_type="object"),
         ]
+        entities = [
+            entity
+            for entity in default_entities
+            if phrase_matches_caption_span(
+                phrase=str(entity["phrase"]),
+                caption=caption,
+            )
+        ]
     if background is ...:
-        background = {
+        default_background = {
             "phrase": "a sunlit plaza",
             "grounding_prompt": "the empty sunlit plaza",
         }
+        background = (
+            default_background
+            if phrase_matches_caption_span(
+                phrase=str(default_background["phrase"]),
+                caption=caption,
+            )
+            else None
+        )
     return {
         "t2v_caption": caption,
         "entities": entities,
@@ -695,6 +712,108 @@ def test_annotation_writes_minimal_semantic_fields_only(
     assert "<ref_" not in json.dumps(serialized)
 
 
+def test_phrase_anchor_matching_is_exact_and_case_insensitive() -> None:
+    caption = "A Bald Man   in a light brown robe kneels before an altar."
+
+    assert phrase_matches_caption_span(
+        phrase="  'bald man in a light brown robe.'  ",
+        caption=caption,
+    )
+    assert not phrase_matches_caption_span(
+        phrase="dark wooden altar with carvings",
+        caption=caption,
+    )
+
+
+def test_entity_and_background_phrases_must_anchor_in_caption() -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            caption="A woman crosses a courtyard beside a fountain.",
+            entities=[
+                _entity(
+                    "a red-haired woman",
+                    grounding_prompt="woman with long red hair and a green coat",
+                )
+            ],
+            background={
+                "phrase": "a stone plaza",
+                "grounding_prompt": "wide stone plaza with a central fountain",
+            },
+        )
+    )
+
+    assert annotation is None
+    assert [issue.code for issue in issues] == [
+        "entity_phrase_not_in_caption",
+        "background_phrase_not_in_caption",
+    ]
+
+
+def test_grounding_prompt_need_not_appear_in_caption() -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            caption="A woman crosses a sunlit plaza.",
+            entities=[
+                _entity(
+                    "A woman",
+                    grounding_prompt="woman with a green coat and long red hair",
+                )
+            ],
+            background={
+                "phrase": "a sunlit plaza",
+                "grounding_prompt": "broad limestone plaza with arched colonnades",
+            },
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert annotation.entities[0].grounding_prompt == (
+        "woman with a green coat and long red hair"
+    )
+    assert annotation.background is not None
+    assert annotation.background.grounding_prompt == (
+        "broad limestone plaza with arched colonnades"
+    )
+
+
+def test_phrase_anchor_issue_enters_existing_repair_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = _payload(
+        entities=[
+            _entity(
+                "dark wooden altar with carvings",
+                reference_type="object",
+            )
+        ],
+    )
+    repaired = _payload(
+        entities=[
+            _entity(
+                "a wooden table",
+                reference_type="object",
+                grounding_prompt="dark wooden table with intricate carvings",
+            )
+        ],
+    )
+
+    stats, clip, client = _annotate_payloads(
+        tmp_path,
+        monkeypatch,
+        [invalid, repaired],
+        repair_retries=1,
+    )
+
+    assert stats.processed == 1
+    assert stats.repaired == 1
+    assert len(client.requests) == 2
+    assert "entity_phrase_not_in_caption" in str(client.requests[1])
+    assert clip.annotation is not None
+    assert clip.annotation.entities[0].phrase == "a wooden table"
+
+
 @pytest.mark.parametrize(
     "caption",
     [
@@ -738,7 +857,10 @@ def test_caption_over_120_words_enters_repair_validation() -> None:
 def test_entity_phrase_over_12_words_enters_repair_validation() -> None:
     phrase = " ".join(f"detail{index}" for index in range(13))
     annotation, issues, _ = sanitize_annotation_payload(
-        _payload(entities=[_entity(phrase, grounding_prompt="stable visible object")])
+        _payload(
+            caption=f"A {phrase} remains visible.",
+            entities=[_entity(phrase, grounding_prompt="stable visible object")],
+        )
     )
 
     assert annotation is None
@@ -748,7 +870,10 @@ def test_entity_phrase_over_12_words_enters_repair_validation() -> None:
 def test_grounding_prompt_over_24_words_enters_repair_validation() -> None:
     grounding = " ".join(f"feature{index}" for index in range(25))
     annotation, issues, _ = sanitize_annotation_payload(
-        _payload(entities=[_entity("a stable object", grounding_prompt=grounding)])
+        _payload(
+            caption="A stable object remains visible.",
+            entities=[_entity("a stable object", grounding_prompt=grounding)],
+        )
     )
 
     assert annotation is None
@@ -769,6 +894,7 @@ def test_transient_action_in_grounding_prompt_enters_repair_validation(
 ) -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
+            caption="A visible person stands near a window.",
             entities=[
                 _entity(
                     "a visible person",
@@ -794,6 +920,7 @@ def test_transient_action_in_grounding_prompt_enters_repair_validation(
 def test_stable_short_grounding_prompt_is_allowed(grounding_prompt: str) -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
+            caption="A stable foreground reference stands near a window.",
             entities=[
                 _entity(
                     "a stable foreground reference",
@@ -881,6 +1008,9 @@ def test_annotation_prompt_defines_concise_text_limits() -> None:
         "must not exceed 12 words",
         "must not exceed 24 words",
         "do not include transient actions",
+        "verbatim, contiguous span from t2v_caption",
+        "grounding_prompt need not occur in t2v_caption",
+        "background.phrase must follow the same verbatim contiguous",
     ):
         assert phrase in lowered
 
