@@ -5,7 +5,7 @@ import io
 import json
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from openai import BadRequestError, OpenAI
 from PIL import Image
@@ -163,11 +163,52 @@ class EntityReferenceJudge(Protocol):
     ) -> EntityReferenceDecisionAttempt: ...
 
 
+EvidencePresentationMode = Literal["separate", "paired_card"]
+
+
 def _png_data_url(image: Image.Image) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def build_paired_candidate_evidence_card(
+    context: Image.Image,
+    isolated_crop: Image.Image,
+    *,
+    panel_max_side: int,
+) -> Image.Image:
+    if (
+        isinstance(panel_max_side, bool)
+        or not isinstance(panel_max_side, int)
+        or panel_max_side <= 0
+    ):
+        raise ValueError("candidate card panel_max_side must be a positive integer")
+    if not isinstance(context, Image.Image) or not isinstance(
+        isolated_crop,
+        Image.Image,
+    ):
+        raise TypeError("candidate card inputs must be PIL images")
+
+    card = Image.new(
+        "RGB",
+        (panel_max_side * 2, panel_max_side),
+        (255, 255, 255),
+    )
+    for panel_index, source in enumerate((context, isolated_crop)):
+        thumbnail = source.convert("RGB").copy()
+        thumbnail.thumbnail(
+            (panel_max_side, panel_max_side),
+            Image.Resampling.LANCZOS,
+        )
+        panel_x = panel_index * panel_max_side
+        destination = (
+            panel_x + (panel_max_side - thumbnail.width) // 2,
+            (panel_max_side - thumbnail.height) // 2,
+        )
+        card.paste(thumbnail, destination)
+    return card
 
 
 def subject_has_nontrivial_detached_component(
@@ -585,11 +626,25 @@ class QwenEntityReferenceJudge:
         *,
         repair_retries: int = 1,
         crop_padding_ratio: float = 0.08,
+        evidence_mode: EvidencePresentationMode = "separate",
+        card_panel_max_side: int = 512,
         client: Any | None = None,
     ) -> None:
+        if evidence_mode not in {"separate", "paired_card"}:
+            raise ValueError("candidate judge evidence_mode is invalid")
+        if (
+            isinstance(card_panel_max_side, bool)
+            or not isinstance(card_panel_max_side, int)
+            or card_panel_max_side <= 0
+        ):
+            raise ValueError(
+                "candidate judge card_panel_max_side must be a positive integer"
+            )
         self.config = config
         self.repair_retries = repair_retries
         self.crop_padding_ratio = crop_padding_ratio
+        self.evidence_mode = evidence_mode
+        self.card_panel_max_side = card_panel_max_side
         self.client = client or OpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
@@ -626,16 +681,32 @@ class QwenEntityReferenceJudge:
             )
             isolated = Image.new("RGB", crop.size, (255, 255, 255))
             isolated.paste(crop, mask=crop.getchannel("A"))
-            for label, image in (
-                (
-                    f"Candidate {candidate.candidate_id} context",
-                    context,
-                ),
-                (
-                    f"Candidate {candidate.candidate_id} isolated crop",
-                    isolated,
-                ),
-            ):
+            evidence: tuple[tuple[str, Image.Image], ...]
+            if self.evidence_mode == "paired_card":
+                label = (
+                    f"Candidate {candidate.candidate_id} paired evidence card "
+                    + "(left panel = scene context; right panel = isolated "
+                    + "proposed reference)"
+                )
+                evidence = (
+                    (
+                        label,
+                        build_paired_candidate_evidence_card(
+                            context,
+                            isolated,
+                            panel_max_side=self.card_panel_max_side,
+                        ),
+                    ),
+                )
+            else:
+                evidence = (
+                    (f"Candidate {candidate.candidate_id} context", context),
+                    (
+                        f"Candidate {candidate.candidate_id} isolated crop",
+                        isolated,
+                    ),
+                )
+            for label, image in evidence:
                 content.append({"type": "text", "text": label})
                 content.append(
                     {
@@ -652,6 +723,23 @@ class QwenEntityReferenceJudge:
         profile_context = get_model_profile_context()
         retry_index = profile_context.retry_index
         candidate_count = int(profile_context.metadata.get("candidate_count", 0))
+        evidence_mode = str(
+            profile_context.metadata.get("evidence_mode", self.evidence_mode)
+        )
+        card_panel_max_side = profile_context.metadata.get(
+            "card_panel_max_side",
+            self.card_panel_max_side if evidence_mode == "paired_card" else None,
+        )
+        profile_metadata = {
+            "candidate_count": candidate_count,
+            "context_image_count": candidate_count,
+            "isolated_crop_count": candidate_count,
+            "paired_card_count": (
+                candidate_count if evidence_mode == "paired_card" else 0
+            ),
+            "evidence_mode": evidence_mode,
+            "card_panel_max_side": card_panel_max_side,
+        }
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -679,9 +767,7 @@ class QwenEntityReferenceJudge:
                 model=self.config.model,
                 messages=messages,
                 metadata={
-                    "candidate_count": candidate_count,
-                    "context_image_count": candidate_count,
-                    "isolated_crop_count": candidate_count,
+                    **profile_metadata,
                     "response_format": "json_schema",
                 },
             )
@@ -697,9 +783,7 @@ class QwenEntityReferenceJudge:
                 model=self.config.model,
                 messages=messages,
                 metadata={
-                    "candidate_count": candidate_count,
-                    "context_image_count": candidate_count,
-                    "isolated_crop_count": candidate_count,
+                    **profile_metadata,
                     "response_format": "json_object",
                 },
             )
@@ -744,7 +828,15 @@ class QwenEntityReferenceJudge:
             try:
                 with model_profile_context(
                     retry_index=attempt,
-                    metadata={"candidate_count": len(candidates)},
+                    metadata={
+                        "candidate_count": len(candidates),
+                        "evidence_mode": self.evidence_mode,
+                        "card_panel_max_side": (
+                            self.card_panel_max_side
+                            if self.evidence_mode == "paired_card"
+                            else None
+                        ),
+                    },
                 ):
                     raw = self._request(
                         self._messages(

@@ -27,6 +27,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key")
     parser.add_argument("--save-raw", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--evidence-mode",
+        choices=("baseline", "paired_card"),
+        default="baseline",
+    )
+    parser.add_argument(
+        "--card-panel-max-side",
+        type=int,
+        choices=(384, 512),
+        default=512,
+    )
     return parser
 
 
@@ -41,6 +52,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         api_key=arguments.api_key,
         save_raw=arguments.save_raw,
         fail_fast=arguments.fail_fast,
+        evidence_mode=arguments.evidence_mode,
+        card_panel_max_side=arguments.card_panel_max_side,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary

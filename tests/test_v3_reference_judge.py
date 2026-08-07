@@ -22,6 +22,7 @@ from r2v_data_v2.v3.reference_judge import (
     EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
     build_entity_reference_request_payload,
+    build_paired_candidate_evidence_card,
     subject_has_nontrivial_detached_component,
     validate_entity_reference_decision,
 )
@@ -1230,6 +1231,8 @@ def _judge(
     completions: _Completions,
     *,
     repair_retries: int = 1,
+    evidence_mode: str = "separate",
+    card_panel_max_side: int = 512,
 ) -> QwenEntityReferenceJudge:
     return QwenEntityReferenceJudge(
         QwenServiceConfig(
@@ -1238,6 +1241,8 @@ def _judge(
             max_tokens=500,
         ),
         repair_retries=repair_retries,
+        evidence_mode=evidence_mode,
+        card_panel_max_side=card_panel_max_side,
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
@@ -1272,6 +1277,84 @@ def test_messages_use_ordered_in_memory_context_and_crop_data_urls() -> None:
             assert image.format == "PNG"
     assert call["response_format"]["type"] == "json_schema"
     assert "video_url" not in json.dumps(messages)
+
+
+def test_paired_candidate_card_is_bounded_rgb_and_preserves_sources() -> None:
+    context = Image.new("RGB", (800, 400), (20, 40, 60))
+    isolated = Image.new("RGBA", (100, 200), (80, 100, 120, 170))
+    context_before = (context.mode, context.size, context.tobytes())
+    isolated_before = (isolated.mode, isolated.size, isolated.tobytes())
+
+    card = build_paired_candidate_evidence_card(
+        context,
+        isolated,
+        panel_max_side=384,
+    )
+
+    assert card.mode == "RGB"
+    assert card.size == (768, 384)
+    assert (context.mode, context.size, context.tobytes()) == context_before
+    assert (isolated.mode, isolated.size, isolated.tobytes()) == isolated_before
+    pixels = np.asarray(card)
+    left_nonwhite = np.argwhere(np.any(pixels[:, :384] != 255, axis=2))
+    right_nonwhite = np.argwhere(np.any(pixels[:, 384:] != 255, axis=2))
+    assert tuple(np.ptp(left_nonwhite, axis=0) + 1) == (192, 384)
+    assert tuple(np.ptp(right_nonwhite, axis=0) + 1) == (200, 100)
+
+
+@pytest.mark.parametrize(
+    ("evidence_mode", "expected_image_count"),
+    [("separate", 6), ("paired_card", 3)],
+)
+def test_three_candidates_keep_order_with_selected_evidence_presentation(
+    evidence_mode: str,
+    expected_image_count: int,
+) -> None:
+    completions = _Completions([_payload()])
+    judge = _judge(
+        completions,
+        evidence_mode=evidence_mode,
+        card_panel_max_side=384,
+    )
+    candidates = [_candidate(f"candidate_{index}") for index in range(1, 4)]
+
+    attempt = judge.decide(
+        entity=_entity(),
+        candidates=candidates,
+        source_images=_source_images(),
+    )
+
+    assert attempt.decision.selected_candidate_id == "candidate_1"
+    call = completions.calls[0]
+    content = call["messages"][1]["content"]
+    request_text = content[0]["text"]
+    expected_payload = build_entity_reference_request_payload(
+        _entity(),
+        candidates,
+    )
+    assert request_text.endswith(json.dumps(expected_payload, ensure_ascii=False))
+    labels = [item["text"] for item in content if item["type"] == "text"][1:]
+    assert [label.split()[1] for label in labels] == (
+        [
+            candidate_id
+            for candidate_id in ("candidate_1", "candidate_2", "candidate_3")
+            for _ in range(2)
+        ]
+        if evidence_mode == "separate"
+        else ["candidate_1", "candidate_2", "candidate_3"]
+    )
+    images = [item for item in content if item["type"] == "image_url"]
+    assert len(images) == expected_image_count
+    if evidence_mode == "paired_card":
+        assert all("left panel = scene context" in label for label in labels)
+        for item in images:
+            encoded = item["image_url"]["url"].split(",", 1)[1]
+            with Image.open(BytesIO(base64.b64decode(encoded))) as card:
+                assert card.mode == "RGB"
+                assert card.size == (768, 384)
+    assert call["response_format"]["json_schema"]["schema"] == (
+        RawEntityReferenceDecision.model_json_schema()
+    )
 
 
 def test_structured_repair_includes_original_schema_issues_and_response() -> None:
@@ -1343,6 +1426,40 @@ def test_candidate_judge_repair_profiles_payload_shape_without_mutation(
         == event["metadata"]
         for event in events
     )
+    assert all(event["metadata"]["evidence_mode"] == "separate" for event in events)
+    assert all(event["metadata"]["paired_card_count"] == 0 for event in events)
+
+
+def test_paired_candidate_card_profiles_three_images_and_mode(tmp_path: Path) -> None:
+    completions = _Completions([_payload()])
+    judge = _judge(
+        completions,
+        evidence_mode="paired_card",
+        card_panel_max_side=384,
+    )
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
+        judge.decide(
+            entity=_entity(),
+            candidates=[
+                _candidate(f"candidate_{index}") for index in range(1, 4)
+            ],
+            source_images=_source_images(),
+        )
+
+    event = json.loads(
+        profiler.events_path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert event["input_image_count"] == 3
+    assert event["metadata"] | {
+        "candidate_count": 3,
+        "context_image_count": 3,
+        "isolated_crop_count": 3,
+        "paired_card_count": 3,
+        "evidence_mode": "paired_card",
+        "card_panel_max_side": 384,
+    } == event["metadata"]
 
 
 def test_repair_exhaustion_fails_closed_with_all_raw_responses() -> None:

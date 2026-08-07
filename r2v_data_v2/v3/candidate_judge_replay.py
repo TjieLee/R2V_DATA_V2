@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Literal
 
 from PIL import Image
 
@@ -39,13 +40,49 @@ class BaselineDecision:
     selected_candidate_id: str | None
     completeness: str
     reference_scope: str
+    viewpoint: str
+    identity_features_visible: bool
+    primary_identity_region_visible: bool
+    truncation_severity: str
+    completion_needed_for_reference_use: bool
+    detached_target_fragments_present: bool
+    valid: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {
             "selected_candidate_id": self.selected_candidate_id,
             "completeness": self.completeness,
             "reference_scope": self.reference_scope,
+            "viewpoint": self.viewpoint,
+            "identity_features_visible": self.identity_features_visible,
+            "primary_identity_region_visible": (
+                self.primary_identity_region_visible
+            ),
+            "truncation_severity": self.truncation_severity,
+            "completion_needed_for_reference_use": (
+                self.completion_needed_for_reference_use
+            ),
+            "detached_target_fragments_present": (
+                self.detached_target_fragments_present
+            ),
+            "valid": self.valid,
         }
+
+
+ReplayEvidenceMode = Literal["baseline", "paired_card"]
+
+_DECISION_COMPARISON_FIELDS = (
+    "selected_candidate_id",
+    "completeness",
+    "reference_scope",
+    "viewpoint",
+    "identity_features_visible",
+    "primary_identity_region_visible",
+    "truncation_severity",
+    "completion_needed_for_reference_use",
+    "detached_target_fragments_present",
+    "valid",
+)
 
 
 class ReadOnlyRunStorage(RunStorage):
@@ -163,6 +200,18 @@ def load_baseline_decision(
         selected_candidate_id=decision.selected_candidate_id,
         completeness=decision.completeness,
         reference_scope=decision.reference_scope,
+        viewpoint=decision.viewpoint,
+        identity_features_visible=decision.identity_features_visible,
+        primary_identity_region_visible=(
+            decision.primary_identity_region_visible
+        ),
+        truncation_severity=decision.truncation_severity,
+        completion_needed_for_reference_use=(
+            decision.completion_needed_for_reference_use
+        ),
+        detached_target_fragments_present=(
+            decision.detached_target_fragments_present
+        ),
     )
 
 
@@ -193,8 +242,28 @@ def _result_record(
     attempt: EntityReferenceDecisionAttempt,
     baseline: BaselineDecision | None,
     duration_seconds: float,
+    prompt_tokens: int | None,
+    input_image_count: int | None,
 ) -> dict[str, object]:
     decision = attempt.decision
+    variant = {
+        "selected_candidate_id": decision.selected_candidate_id,
+        "completeness": decision.completeness,
+        "reference_scope": decision.reference_scope,
+        "viewpoint": decision.viewpoint,
+        "identity_features_visible": decision.identity_features_visible,
+        "primary_identity_region_visible": (
+            decision.primary_identity_region_visible
+        ),
+        "truncation_severity": decision.truncation_severity,
+        "completion_needed_for_reference_use": (
+            decision.completion_needed_for_reference_use
+        ),
+        "detached_target_fragments_present": (
+            decision.detached_target_fragments_present
+        ),
+        "valid": True,
+    }
     baseline_value = (
         baseline.to_dict()
         if baseline is not None
@@ -202,6 +271,13 @@ def _result_record(
             "selected_candidate_id": None,
             "completeness": None,
             "reference_scope": None,
+            "viewpoint": None,
+            "identity_features_visible": None,
+            "primary_identity_region_visible": None,
+            "truncation_severity": None,
+            "completion_needed_for_reference_use": None,
+            "detached_target_fragments_present": None,
+            "valid": False,
         }
     )
     return {
@@ -214,6 +290,7 @@ def _result_record(
         "completeness": decision.completeness,
         "reference_scope": decision.reference_scope,
         "viewpoint": decision.viewpoint,
+        "identity_features_visible": decision.identity_features_visible,
         "primary_identity_region_visible": (
             decision.primary_identity_region_visible
         ),
@@ -226,9 +303,13 @@ def _result_record(
             decision.detached_target_fragments_present
         ),
         "repair_attempts": attempt.repair_attempts,
+        "attempt_count": attempt.repair_attempts + 1,
         "duration_seconds": duration_seconds,
+        "prompt_tokens": prompt_tokens,
+        "input_image_count": input_image_count,
         "raw_response_count": len(attempt.raw_responses),
         "baseline": baseline_value,
+        "variant": variant,
     }
 
 
@@ -240,6 +321,8 @@ def _failed_result_record(
     failure: EntityReferenceJudgeFailure,
     baseline: BaselineDecision | None,
     duration_seconds: float,
+    prompt_tokens: int | None,
+    input_image_count: int | None,
 ) -> dict[str, object]:
     baseline_value = (
         baseline.to_dict()
@@ -248,6 +331,13 @@ def _failed_result_record(
             "selected_candidate_id": None,
             "completeness": None,
             "reference_scope": None,
+            "viewpoint": None,
+            "identity_features_visible": None,
+            "primary_identity_region_visible": None,
+            "truncation_severity": None,
+            "completion_needed_for_reference_use": None,
+            "detached_target_fragments_present": None,
+            "valid": False,
         }
     )
     return {
@@ -256,14 +346,64 @@ def _failed_result_record(
         "phrase": entity.phrase,
         "candidate_count": candidate_count,
         "status": "failed",
+        "attempt_count": failure.attempt_count,
         "duration_seconds": duration_seconds,
+        "prompt_tokens": prompt_tokens,
+        "input_image_count": input_image_count,
         "failure": {
             "type": "structured_output_failure",
             "attempt_count": failure.attempt_count,
             "issues": [issue.to_dict() for issue in failure.issues],
         },
         "baseline": baseline_value,
+        "variant": {
+            "selected_candidate_id": None,
+            "completeness": None,
+            "reference_scope": None,
+            "viewpoint": None,
+            "identity_features_visible": None,
+            "primary_identity_region_visible": None,
+            "truncation_severity": None,
+            "completion_needed_for_reference_use": None,
+            "detached_target_fragments_present": None,
+            "valid": False,
+        },
     }
+
+
+def _profile_case_metrics(
+    events_path: Path,
+    *,
+    offset: int,
+) -> tuple[int, int | None, int | None]:
+    with events_path.open("rb") as handle:
+        handle.seek(offset)
+        payload = handle.read()
+        next_offset = handle.tell()
+    events = [json.loads(line) for line in payload.splitlines() if line.strip()]
+    candidate_events = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and event.get("component") == "qwen_candidate_judge"
+    ]
+    prompt_values = [
+        event["prompt_tokens"]
+        for event in candidate_events
+        if isinstance(event.get("prompt_tokens"), int)
+    ]
+    image_values = [
+        event["input_image_count"]
+        for event in candidate_events
+        if isinstance(event.get("input_image_count"), int)
+    ]
+    if image_values and len(set(image_values)) != 1:
+        raise ValueError("candidate judge image count changed within one replay case")
+    return (
+        next_offset,
+        sum(prompt_values) if prompt_values else None,
+        image_values[0] if image_values else None,
+    )
 
 
 def _case_key(record: Mapping[str, object]) -> dict[str, str]:
@@ -277,12 +417,44 @@ def _agreement(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
 
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _profile_average(
+    profile: Mapping[str, object],
+    total_key: str,
+    calls: int,
+) -> float | None:
+    total = profile.get(total_key)
+    if not calls or not isinstance(total, (int, float)):
+        return None
+    return float(total) / calls
+
+
+def _decision_is_accepted(decision: Mapping[str, object]) -> bool:
+    return (
+        decision.get("valid") is True
+        and decision.get("selected_candidate_id") is not None
+        and decision.get("reference_scope") != "reject"
+    )
+
+
 def _summary(
     *,
     model: str,
     records: list[dict[str, object]],
     total_seconds: float,
     profiling_summary: Mapping[str, object],
+    evidence_mode: ReplayEvidenceMode,
+    card_panel_max_side: int,
 ) -> dict[str, object]:
     components = profiling_summary.get("components")
     candidate_profile = (
@@ -306,29 +478,46 @@ def _summary(
     ]
     changed_candidate_cases: list[dict[str, object]] = []
     changed_route_cases: list[dict[str, object]] = []
+    baseline_accept_variant_reject: list[dict[str, object]] = []
+    baseline_reject_variant_accept: list[dict[str, object]] = []
     candidate_matches = 0
+    scope_matches = 0
+    completeness_matches = 0
     route_matches = 0
+    full_decision_matches = 0
     for record in baseline_records:
         baseline = record["baseline"]
+        variant = record.get("variant")
         assert isinstance(baseline, Mapping)
+        if not isinstance(variant, Mapping):
+            raise TypeError("succeeded replay record is missing variant decision")
         candidate_matches += int(
-            record["selected_candidate_id"] == baseline["selected_candidate_id"]
+            variant["selected_candidate_id"] == baseline["selected_candidate_id"]
+        )
+        scope_matches += int(
+            variant["reference_scope"] == baseline["reference_scope"]
+        )
+        completeness_matches += int(
+            variant["completeness"] == baseline["completeness"]
         )
         route_matches += int(
-            record["completeness"] == baseline["completeness"]
-            and record["reference_scope"] == baseline["reference_scope"]
+            variant["completeness"] == baseline["completeness"]
+            and variant["reference_scope"] == baseline["reference_scope"]
         )
-        if record["selected_candidate_id"] != baseline["selected_candidate_id"]:
+        full_decision_matches += int(
+            all(variant[field] == baseline[field] for field in _DECISION_COMPARISON_FIELDS)
+        )
+        if variant["selected_candidate_id"] != baseline["selected_candidate_id"]:
             changed_candidate_cases.append(
                 {
                     **_case_key(record),
                     "baseline": baseline["selected_candidate_id"],
-                    "replay": record["selected_candidate_id"],
+                    "variant": variant["selected_candidate_id"],
                 }
             )
         if (
-            record["completeness"] != baseline["completeness"]
-            or record["reference_scope"] != baseline["reference_scope"]
+            variant["completeness"] != baseline["completeness"]
+            or variant["reference_scope"] != baseline["reference_scope"]
         ):
             changed_route_cases.append(
                 {
@@ -337,12 +526,21 @@ def _summary(
                         "completeness": baseline["completeness"],
                         "reference_scope": baseline["reference_scope"],
                     },
-                    "replay": {
-                        "completeness": record["completeness"],
-                        "reference_scope": record["reference_scope"],
+                    "variant": {
+                        "completeness": variant["completeness"],
+                        "reference_scope": variant["reference_scope"],
                     },
                 }
             )
+        transition = {
+            **_case_key(record),
+            "baseline": dict(baseline),
+            "variant": dict(variant),
+        }
+        if _decision_is_accepted(baseline) and not _decision_is_accepted(variant):
+            baseline_accept_variant_reject.append(transition)
+        if not _decision_is_accepted(baseline) and _decision_is_accepted(variant):
+            baseline_reject_variant_accept.append(transition)
     repair_cases = [
         {**_case_key(record), "repair_attempts": record["repair_attempts"]}
         for record in succeeded_records
@@ -377,8 +575,17 @@ def _summary(
         )
     initial_calls = int(candidate_profile.get("initial_calls", 0))
     repair_calls = int(candidate_profile.get("repair_calls", 0))
+    profile_calls = int(candidate_profile.get("calls", 0))
+    durations = [float(record["duration_seconds"]) for record in records]
     result: dict[str, object] = {
         "model": model,
+        "evidence_mode": evidence_mode,
+        "card_panel_max_side": (
+            card_panel_max_side if evidence_mode == "paired_card" else None
+        ),
+        "attempt_count": len(records),
+        "success_count": len(succeeded_records),
+        "failure_count": len(failed_records),
         "entity_count": len(records),
         "succeeded_entity_count": len(succeeded_records),
         "failed_entity_count": len(failed_records),
@@ -389,18 +596,58 @@ def _summary(
         "failure_issue_histogram": failure_issue_histogram,
         "failed_cases": failed_cases,
         "total_seconds": total_seconds,
+        "mean_seconds": sum(durations) / len(durations) if durations else 0.0,
+        "p50_seconds": _percentile(durations, 0.50),
+        "p95_seconds": _percentile(durations, 0.95),
         "mean_seconds_per_entity": (
-            sum(float(record["duration_seconds"]) for record in records)
-            / len(records)
+            sum(durations) / len(durations)
             if records
             else 0.0
         ),
         "initial_calls": initial_calls,
+        "repair_count": repair_calls,
         "repair_calls": repair_calls,
         "repair_rate": repair_calls / initial_calls if initial_calls else 0.0,
+        "avg_input_image_count": _profile_average(
+            candidate_profile,
+            "input_images_total",
+            profile_calls,
+        ),
+        "avg_input_text_chars": _profile_average(
+            candidate_profile,
+            "input_text_chars_total",
+            profile_calls,
+        ),
+        "avg_prompt_tokens": _profile_average(
+            candidate_profile,
+            "prompt_tokens_total",
+            profile_calls,
+        ),
+        "total_prompt_tokens": candidate_profile.get("prompt_tokens_total"),
+        "avg_completion_tokens": _profile_average(
+            candidate_profile,
+            "completion_tokens_total",
+            profile_calls,
+        ),
         "agreement_denominator": len(baseline_records),
         "candidate_selection_agreement_with_baseline": _agreement(
             candidate_matches,
+            len(baseline_records),
+        ),
+        "selected_candidate_agreement": _agreement(
+            candidate_matches,
+            len(baseline_records),
+        ),
+        "reference_scope_agreement": _agreement(
+            scope_matches,
+            len(baseline_records),
+        ),
+        "completeness_agreement": _agreement(
+            completeness_matches,
+            len(baseline_records),
+        ),
+        "full_decision_exact_agreement": _agreement(
+            full_decision_matches,
             len(baseline_records),
         ),
         "route_agreement_with_baseline": _agreement(
@@ -433,6 +680,8 @@ def _summary(
         ),
         "changed_candidate_cases": changed_candidate_cases,
         "changed_route_cases": changed_route_cases,
+        "baseline_accept_variant_reject": baseline_accept_variant_reject,
+        "baseline_reject_variant_accept": baseline_reject_variant_accept,
         "repair_cases": repair_cases,
         "profiling": {"qwen_candidate_judge": dict(candidate_profile)},
     }
@@ -476,9 +725,19 @@ def run_candidate_judge_replay(
     api_key: str | None = None,
     save_raw: bool = False,
     fail_fast: bool = False,
+    evidence_mode: ReplayEvidenceMode = "baseline",
+    card_panel_max_side: int = 512,
     judge: EntityReferenceJudge | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
+    if evidence_mode not in {"baseline", "paired_card"}:
+        raise ValueError("replay evidence_mode is invalid")
+    if (
+        isinstance(card_panel_max_side, bool)
+        or not isinstance(card_panel_max_side, int)
+        or card_panel_max_side <= 0
+    ):
+        raise ValueError("replay card_panel_max_side must be a positive integer")
     root = run_root.expanduser().resolve(strict=True)
     output = _validated_output_path(output_path, root)
     summary_path = Path(f"{output}.summary.json")
@@ -537,6 +796,12 @@ def run_candidate_judge_replay(
                                 crop_padding_ratio=(
                                     replay_config.pair.crop_padding_ratio
                                 ),
+                                evidence_mode=(
+                                    "paired_card"
+                                    if evidence_mode == "paired_card"
+                                    else "separate"
+                                ),
+                                card_panel_max_side=card_panel_max_side,
                             )
                             active_judge = owned_judge
                         source_images = _load_source_images(storage, candidates)
@@ -546,6 +811,7 @@ def run_candidate_judge_replay(
                             entity_id=entity.entity_id,
                         )
                         started = clock()
+                        profile_offset = profiler.events_path.stat().st_size
                         try:
                             attempt = active_judge.decide(
                                 entity=entity,
@@ -560,6 +826,12 @@ def run_candidate_judge_replay(
                                 ) from exc
                             if fail_fast:
                                 raise
+                            _, prompt_tokens, input_image_count = (
+                                _profile_case_metrics(
+                                    profiler.events_path,
+                                    offset=profile_offset,
+                                )
+                            )
                             records.append(
                                 _failed_result_record(
                                     clip_uid=clip.clip_uid,
@@ -568,6 +840,8 @@ def run_candidate_judge_replay(
                                     failure=exc,
                                     baseline=baseline,
                                     duration_seconds=duration,
+                                    prompt_tokens=prompt_tokens,
+                                    input_image_count=input_image_count,
                                 )
                             )
                             if save_raw:
@@ -583,6 +857,10 @@ def run_candidate_judge_replay(
                         duration = clock() - started
                         if duration < 0:
                             raise ValueError("benchmark clock moved backwards")
+                        _, prompt_tokens, input_image_count = _profile_case_metrics(
+                            profiler.events_path,
+                            offset=profile_offset,
+                        )
                         records.append(
                             _result_record(
                                 clip_uid=clip.clip_uid,
@@ -591,6 +869,8 @@ def run_candidate_judge_replay(
                                 attempt=attempt,
                                 baseline=baseline,
                                 duration_seconds=duration,
+                                prompt_tokens=prompt_tokens,
+                                input_image_count=input_image_count,
                             )
                         )
                         if save_raw:
@@ -614,6 +894,8 @@ def run_candidate_judge_replay(
         records=records,
         total_seconds=total_seconds,
         profiling_summary=profiling_summary,
+        evidence_mode=evidence_mode,
+        card_panel_max_side=card_panel_max_side,
     )
     _write_jsonl_atomic(output, records)
     write_json_atomic(summary_path, summary)

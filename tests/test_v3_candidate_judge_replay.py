@@ -49,6 +49,7 @@ from r2v_data_v2.v3.schemas import (
     TrackedMasksArtifact,
 )
 from r2v_data_v2.v3.storage import RunStorage
+from tools.replay_v3_candidate_judge import _parser
 
 WIDTH = 64
 HEIGHT = 48
@@ -356,10 +357,25 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
         "selected_candidate_id": "candidate_1",
         "completeness": "complete",
         "reference_scope": "full",
+        "viewpoint": "not_applicable",
+        "identity_features_visible": True,
+        "primary_identity_region_visible": True,
+        "truncation_severity": "none",
+        "completion_needed_for_reference_use": False,
+        "detached_target_fragments_present": False,
+        "valid": True,
     }
     assert [item["repair_attempts"] for item in records] == [1, 0]
     assert [item["raw_response_count"] for item in records] == [2, 1]
     assert all("raw_responses" not in item for item in records)
+    assert [item["input_image_count"] for item in records] == [6, 6]
+    assert [item["prompt_tokens"] for item in records] == [200, 100]
+    assert all(item["variant"]["valid"] is True for item in records)
+    assert summary["evidence_mode"] == "baseline"
+    assert summary["card_panel_max_side"] is None
+    assert summary["attempt_count"] == 2
+    assert summary["success_count"] == 2
+    assert summary["failure_count"] == 0
     assert summary["entity_count"] == 2
     assert summary["succeeded_entity_count"] == 2
     assert summary["failed_entity_count"] == 0
@@ -369,7 +385,15 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
     assert summary["initial_calls"] == 2
     assert summary["repair_calls"] == 1
     assert summary["repair_rate"] == pytest.approx(0.5)
+    assert summary["avg_input_image_count"] == 6.0
+    assert summary["avg_prompt_tokens"] == 100.0
+    assert summary["total_prompt_tokens"] == 300
+    assert summary["avg_completion_tokens"] == 20.0
     assert summary["candidate_selection_agreement_with_baseline"] == 0.0
+    assert summary["selected_candidate_agreement"] == 0.0
+    assert summary["reference_scope_agreement"] == pytest.approx(0.5)
+    assert summary["completeness_agreement"] == pytest.approx(0.5)
+    assert summary["full_decision_exact_agreement"] == 0.0
     assert summary["route_agreement_with_baseline"] == pytest.approx(0.5)
     assert summary["reject_count"] == 1
     assert summary["complete_count"] == 1
@@ -381,6 +405,11 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
     assert [item["clip_uid"] for item in summary["changed_route_cases"]] == [
         "clip-b"
     ]
+    assert [
+        item["clip_uid"]
+        for item in summary["baseline_accept_variant_reject"]
+    ] == ["clip-b"]
+    assert summary["baseline_reject_variant_accept"] == []
     assert summary["repair_cases"] == [
         {"clip_uid": "clip-a", "entity_id": "e1", "repair_attempts": 1}
     ]
@@ -680,12 +709,16 @@ def test_replay_constructs_production_judge_and_saves_raw_only_on_request(
             *,
             repair_retries: int,
             crop_padding_ratio: float,
+            evidence_mode: str,
+            card_panel_max_side: int,
         ) -> None:
             created.update(
                 {
                     "service_config": service_config,
                     "repair_retries": repair_retries,
                     "crop_padding_ratio": crop_padding_ratio,
+                    "evidence_mode": evidence_mode,
+                    "card_panel_max_side": card_panel_max_side,
                 }
             )
 
@@ -732,10 +765,61 @@ def test_replay_constructs_production_judge_and_saves_raw_only_on_request(
     assert service_config.max_tokens == config.qwen.candidate_judge.max_tokens
     assert created["repair_retries"] == config.pair.repair_retries
     assert created["crop_padding_ratio"] == config.pair.crop_padding_ratio
+    assert created["evidence_mode"] == "separate"
+    assert created["card_panel_max_side"] == 512
     assert created["closed"] is True
     assert "private raw response" not in output.read_text(encoding="utf-8")
     raw_output = Path(f"{output}.raw.jsonl")
     assert "private raw response" in raw_output.read_text(encoding="utf-8")
+
+
+def test_replay_paired_card_mode_uses_three_images_and_stays_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    _add_clip(storage, "clip-a")
+    before = snapshot_run_files(storage.root)
+    completions = _Completions([json.dumps(_decision().model_dump())])
+    assert config.qwen.candidate_judge is not None
+    judge = QwenEntityReferenceJudge(
+        config.qwen.candidate_judge,
+        repair_retries=config.pair.repair_retries,
+        crop_padding_ratio=config.pair.crop_padding_ratio,
+        evidence_mode="paired_card",
+        card_panel_max_side=384,
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    output = config.run_root.parent / "benchmarks" / "paired-card.jsonl"
+
+    summary = run_candidate_judge_replay(
+        config,
+        run_root=storage.root,
+        base_url="http://127.0.0.1:8001/v1",
+        model="new-model",
+        output_path=output,
+        evidence_mode="paired_card",
+        card_panel_max_side=384,
+        judge=judge,
+    )
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    content = completions.calls[0]["messages"][1]["content"]
+    labels = [item["text"] for item in content if item["type"] == "text"][1:]
+    assert [label.split()[1] for label in labels] == [
+        "candidate_1",
+        "candidate_2",
+        "candidate_3",
+    ]
+    assert sum(item["type"] == "image_url" for item in content) == 3
+    assert record["candidate_count"] == 3
+    assert record["input_image_count"] == 3
+    assert summary["evidence_mode"] == "paired_card"
+    assert summary["card_panel_max_side"] == 384
+    assert summary["avg_input_image_count"] == 3.0
+    assert snapshot_run_files(storage.root) == before
 
 
 def test_replay_rejects_output_inside_source_run(
@@ -755,3 +839,32 @@ def test_replay_rejects_output_inside_source_run(
             output_path=storage.root / "replay.jsonl",
             judge=SimpleNamespace(),
         )
+
+
+def test_replay_cli_defaults_to_baseline_and_accepts_card_sizes() -> None:
+    required = [
+        "--config",
+        "config.yaml",
+        "--run-root",
+        "run",
+        "--base-url",
+        "http://127.0.0.1:8001/v1",
+        "--model",
+        "model",
+        "--output",
+        "results.jsonl",
+    ]
+
+    baseline = _parser().parse_args(required)
+    paired_384 = _parser().parse_args(
+        [*required, "--evidence-mode", "paired_card", "--card-panel-max-side", "384"]
+    )
+    paired_512 = _parser().parse_args(
+        [*required, "--evidence-mode", "paired_card", "--card-panel-max-side", "512"]
+    )
+
+    assert baseline.evidence_mode == "baseline"
+    assert baseline.card_panel_max_side == 512
+    assert paired_384.evidence_mode == "paired_card"
+    assert paired_384.card_panel_max_side == 384
+    assert paired_512.card_panel_max_side == 512
