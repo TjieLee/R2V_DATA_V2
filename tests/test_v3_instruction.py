@@ -585,6 +585,100 @@ def test_sanitized_annotation_markers_bind_in_final_contiguous_order(
     )
 
 
+def test_canonicalized_duplicate_entity_produces_one_image_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    annotation, issues, _ = sanitize_annotation_payload(
+        {
+            "instruction_template": (
+                "{{entity_1}} walks. Later {{entity_1}} stops."
+            ),
+            "entities": [
+                {
+                    "reference_type": "subject",
+                    "phrase": "a man in blue",
+                    "grounding_prompt": "the man wearing blue clothes",
+                }
+            ],
+            "background": None,
+        }
+    )
+
+    assert issues == []
+    assert annotation is not None
+    clip = storage.read_clip(clip_uid)
+    binding = build_instruction_bindings(clip)[0].model_copy(
+        update={"phrase": "a man in blue"}
+    )
+    instruction = build_deterministic_instruction(
+        instruction_template=annotation.instruction_template,
+        entities=annotation.entities,
+        background=None,
+        bindings=[binding],
+    )
+
+    assert instruction.r2v_instruction == (
+        "a man in blue <Image 1> walks. Later a man in blue stops."
+    )
+    assert instruction.r2v_instruction.count("<Image 1>") == 1
+
+
+def test_deterministic_instruction_uses_220_word_annotation_ceiling() -> None:
+    entity = AnnotationEntity(
+        entity_id="e1",
+        reference_type="subject",
+        phrase="a subject",
+        grounding_prompt="the visible subject",
+    )
+    binding = InstructionBinding(
+        image_id="image_1",
+        image_index=1,
+        reference_type="subject",
+        entity_id="e1",
+        phrase="a subject",
+        grounding_prompt="the visible subject",
+    )
+    words = " ".join(f"detail{index}" for index in range(218))
+
+    instruction = build_deterministic_instruction(
+        instruction_template=f"{{{{entity_1}}}} {words}",
+        entities=[entity],
+        background=None,
+        bindings=[binding],
+    )
+
+    assert instruction.status == "ready"
+    assert instruction.r2v_instruction.count("<Image 1>") == 1
+
+
+def test_deterministic_instruction_rejects_over_220_plain_words() -> None:
+    entity = AnnotationEntity(
+        entity_id="e1",
+        reference_type="subject",
+        phrase="a subject",
+        grounding_prompt="the visible subject",
+    )
+    binding = InstructionBinding(
+        image_id="image_1",
+        image_index=1,
+        reference_type="subject",
+        entity_id="e1",
+        phrase="a subject",
+        grounding_prompt="the visible subject",
+    )
+    words = " ".join(f"detail{index}" for index in range(219))
+
+    with pytest.raises(ValueError, match="exceeds 220 English words"):
+        build_deterministic_instruction(
+            instruction_template=f"{{{{entity_1}}}} {words}",
+            entities=[entity],
+            background=None,
+            bindings=[binding],
+        )
+
+
 def test_deterministic_instruction_preserves_template_except_marker_changes() -> None:
     clip = _five_entity_instruction_clip(include_background=True)
     bindings = build_instruction_bindings(clip)

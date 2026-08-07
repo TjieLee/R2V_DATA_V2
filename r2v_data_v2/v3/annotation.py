@@ -65,8 +65,11 @@ _BACKGROUND_FIELDS = frozenset({"phrase", "grounding_prompt"})
 _REFERENCE_TYPES = frozenset({"subject", "object", "group"})
 _ENTITY_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five")
 _ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[MAX_ANNOTATION_ENTITIES]
+_PREFERRED_ENTITY_PHRASE_WORD_LIMIT = 12
+_HARD_ENTITY_PHRASE_WORD_LIMIT = 18
 _PREFERRED_INSTRUCTION_WORD_LIMIT = 120
-_HARD_INSTRUCTION_WORD_LIMIT = 180
+_TARGET_INSTRUCTION_WORD_LIMIT = 180
+_HARD_INSTRUCTION_WORD_LIMIT = 220
 
 SYSTEM_PROMPT = f"""You annotate a complete video for a V3 training-data pipeline.
 
@@ -99,8 +102,9 @@ one independently referenceable product, vehicle, prop, device, piece of
 furniture, or other object; and group for multiple subjects or objects whose
 stable composition should be retained together. phrase briefly identifies the
 candidate for binding, review, and deterministic placeholder substitution in 3
-to 10 words and must not exceed 12 words. phrase is a stable, natural English
-noun phrase rather than an action. Include an article or determiner when
+to 10 words. Keep phrase at or below 12 words as the target and never exceed the
+absolute maximum of 18 words. phrase is a stable, natural English noun phrase
+rather than an action. Include an article or determiner when
 natural, such as "a bald monk in a light brown robe", "an ornate wooden altar",
 or "the three scuba divers". Do not add trailing punctuation, internal markers,
 or transient actions. The phrase need not occur verbatim in instruction_template
@@ -113,8 +117,11 @@ or standing pose is allowed only when needed to distinguish the target for
 SAM3. grounding_prompt need not occur in instruction_template. Both fields must be
 non-empty and must not contain reference tokens.
 
-Do not output an entity proposal unless you can place its corresponding placeholder
-exactly once in instruction_template.
+Do not output an entity proposal unless you can place its corresponding
+placeholder exactly once in instruction_template. Use the placeholder at the
+first clear natural mention of that entity. Later mentions must use pronouns or
+ordinary natural-language references such as "the man" or "the diver". Never
+repeat the same entity placeholder later in the paragraph.
 
 STEP 2: Decide whether one stable background reference is useful.
 background is optional. When reliable, describe the overall environment after
@@ -124,7 +131,8 @@ through most of the clip. When the video contains a major scene transition
 between different environments, return background=null. Do not repeat the main
 foreground subject. Neither background text field must occur verbatim in the
 instruction_template. Do not output a non-null background unless you can place
-{{{{background}}}} exactly once in instruction_template.
+{{{{background}}}} exactly once in instruction_template. Place it at the first
+natural environment mention and never repeat it later in the paragraph.
 
 STEP 3: After the entity and background proposals are fixed, write
 instruction_template as one coherent English paragraph that begins directly
@@ -134,8 +142,9 @@ imperative request: do not write "Use the reference image", "Generate",
 chronological order. Include visible subject appearance, action, scene,
 composition, camera behavior, and lighting without repetition. Prefer roughly
 60 to 120 English content words. Longer descriptions are allowed when needed for
-complete chronology, multiple entities, or shot changes, but never exceed 180
-English content words after every placeholder is replaced by its phrase.
+complete chronology, multiple entities, or shot changes. Target no more than
+180 English content words after every placeholder is replaced by its phrase.
+The absolute validation ceiling is 220 words, not a recommended length.
 Describe only directly visible content. Do not infer identity, weather,
 emotion, allegiance, intent,
 mental state, sound, dialogue, or event causes. Describe visible motion directly
@@ -159,7 +168,9 @@ monk {{{{entity_1}}}} kneels". Treat the placeholder as though the phrase were
 already written there: when phrase is "a white boat", write
 "{{{{entity_1}}}} moves slowly", never "A {{{{entity_1}}}} moves slowly". A
 placeholder may appear at the paragraph start or beside punctuation, but must
-not be embedded inside another word. If background is non-null,
+not be embedded inside another word. Every placeholder must appear exactly
+once; duplicate entity or background placeholders are forbidden. If background
+is non-null,
 {{{{background}}}} MUST appear exactly once and represents the complete
 background phrase in the same way. When background is null, do not include that
 placeholder. Return JSON only."""
@@ -283,12 +294,16 @@ def _entity_text_issues(raw_entities: object) -> list[ValidationIssue]:
         if not isinstance(candidate, dict):
             continue
         phrase = _clean_text(candidate.get("phrase"))
-        if phrase is not None and _english_word_count(phrase) > 12:
+        if (
+            phrase is not None
+            and _english_word_count(phrase)
+            > _HARD_ENTITY_PHRASE_WORD_LIMIT
+        ):
             issues.append(
                 ValidationIssue(
                     code="entity_phrase_too_long",
                     field=f"entities.{index}.phrase",
-                    message="entity phrase must not exceed 12 English words",
+                    message="entity phrase must not exceed 18 English words",
                 )
             )
     return issues
@@ -427,14 +442,13 @@ def _inspect_recognizable_markers(
         if not matches:
             warnings.append(f"dropped_entity_missing_marker:{source_index}")
             continue
-        if len(matches) > 1:
-            warnings.append(f"dropped_entity_duplicate_marker:{source_index}")
-            continue
-        match = matches[0]
-        if _placeholder_is_embedded(
-            template=template,
-            start=match.start(),
-            end=match.end(),
+        if any(
+            _placeholder_is_embedded(
+                template=template,
+                start=match.start(),
+                end=match.end(),
+            )
+            for match in matches
         ):
             warnings.append(
                 f"dropped_entity_embedded_placeholder:{source_index}"
@@ -455,18 +469,17 @@ def _inspect_recognizable_markers(
             warnings.append("removed_unexpected_background_marker")
     elif not background_matches:
         warnings.append("dropped_background_missing_marker")
-    elif len(background_matches) > 1:
-        warnings.append("dropped_background_duplicate_marker")
-    else:
-        match = background_matches[0]
-        if _placeholder_is_embedded(
+    elif any(
+        _placeholder_is_embedded(
             template=template,
             start=match.start(),
             end=match.end(),
-        ):
-            warnings.append("dropped_background_embedded_placeholder")
-        else:
-            background_eligible = True
+        )
+        for match in background_matches
+    ):
+        warnings.append("dropped_background_embedded_placeholder")
+    else:
+        background_eligible = True
 
     return _MarkerEligibility(
         entity_source_indexes=tuple(eligible_indexes),
@@ -530,6 +543,12 @@ def _sanitize_entity_candidates_with_indices(
         if phrase_key in seen_phrases:
             warnings.append(f"dropped_duplicate_entity_phrase:{index}")
             continue
+        phrase_word_count = _english_word_count(phrase)
+        if phrase_word_count > _PREFERRED_ENTITY_PHRASE_WORD_LIMIT:
+            warnings.append(
+                "entity_phrase_over_preferred_length:"
+                f"{source_index}:{phrase_word_count}"
+            )
         seen_phrases.add(phrase_key)
         if len(accepted) == MAX_ANNOTATION_ENTITIES:
             warnings.append(
@@ -588,24 +607,27 @@ def _rewrite_placeholders_after_sanitization(
     }
 
     replacements: list[tuple[int, int, str]] = []
+    retained_placeholder_indexes: set[int] = set()
     for match in _ENTITY_MARKER.finditer(template):
         source_index = int(match.group(1))
         final_index = final_indexes.get(source_index)
-        replacement = (
-            fallback_phrases.get(source_index, "")
-            if final_index is None
-            else f"{{{{entity_{final_index}}}}}"
-        )
+        if (
+            final_index is not None
+            and source_index not in retained_placeholder_indexes
+        ):
+            replacement = f"{{{{entity_{final_index}}}}}"
+            retained_placeholder_indexes.add(source_index)
+        else:
+            replacement = fallback_phrases.get(source_index, "")
         replacements.append((match.start(), match.end(), replacement))
-    if not keep_background:
-        replacements.extend(
-            (
-                match.start(),
-                match.end(),
-                background_fallback_phrase or "",
-            )
-            for match in _BACKGROUND_MARKER.finditer(template)
-        )
+    retained_background_placeholder = False
+    for match in _BACKGROUND_MARKER.finditer(template):
+        if keep_background and not retained_background_placeholder:
+            replacement = "{{background}}"
+            retained_background_placeholder = True
+        else:
+            replacement = background_fallback_phrase or ""
+        replacements.append((match.start(), match.end(), replacement))
 
     rewritten = template
     for start, end, replacement in sorted(replacements, reverse=True):
@@ -755,10 +777,14 @@ def sanitize_annotation_payload(
                 code="instruction_template_too_long",
                 field="instruction_template",
                 message=(
-                    "rendered instruction_template must not exceed 180 "
+                    "rendered instruction_template must not exceed 220 "
                     "English content words"
                 ),
             )
+        )
+    elif word_count > _TARGET_INSTRUCTION_WORD_LIMIT:
+        warnings.append(
+            f"instruction_template_over_target_length:{word_count}"
         )
     elif word_count > _PREFERRED_INSTRUCTION_WORD_LIMIT:
         warnings.append(

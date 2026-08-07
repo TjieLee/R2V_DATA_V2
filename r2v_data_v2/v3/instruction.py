@@ -57,6 +57,7 @@ _QUOTED_DIALOGUE = re.compile(
 _ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*")
 _ENTITY_ID = re.compile(r"e([1-9]\d*)")
 _ANY_INTERNAL_MARKER = re.compile(r"\{\{(?:entity_[^{}]*|background)\}\}")
+_HARD_DETERMINISTIC_INSTRUCTION_WORD_LIMIT = 220
 
 SYSTEM_PROMPT = """You write an English reference-conditioned video instruction.
 
@@ -181,6 +182,13 @@ def build_deterministic_instruction(
         )
     if not bindings:
         raise ValueError("deterministic instruction requires at least one binding")
+    plain_text = render_annotation_plain_text(
+        instruction_template,
+        entities,
+        background,
+    )
+    if _english_word_count(plain_text) > _HARD_DETERMINISTIC_INSTRUCTION_WORD_LIMIT:
+        raise ValueError("deterministic instruction exceeds 220 English words")
 
     entity_bindings: dict[str, InstructionBinding] = {}
     background_binding: InstructionBinding | None = None
@@ -264,8 +272,6 @@ def build_deterministic_instruction(
             )
         )
     body = body.strip()
-    if _english_word_count(body) > 180:
-        raise ValueError("deterministic instruction exceeds 180 English words")
     return InstructionState(
         status="ready",
         instruction_body_template=body,
