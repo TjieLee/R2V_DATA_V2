@@ -70,34 +70,15 @@ _HARD_INSTRUCTION_WORD_LIMIT = 180
 SYSTEM_PROMPT = f"""You annotate a complete video for a V3 training-data pipeline.
 
 Return exactly one JSON object matching the supplied minimal schema. Output only
-instruction_template, entities, and background. Do not output t2v_caption. Do
+entities, background, and instruction_template, in that generation order. Do
+not output t2v_caption. Do
 not output relations, entity_id,
 category, salience, genericity, name_evidence, localization_scope, scene_role,
 representation_mode, visual_scope, separability, selection_reason, reference
 tokens, image_N placeholders, rendered <Image N> labels, or any additional
 ontology fields.
 
-Write instruction_template as one coherent English paragraph that begins
-directly with visible content and describes the target video naturally. It is
-not an imperative request: do not write "Use the reference image", "Generate",
-"Create", or a references section. Describe actions and shot changes in
-chronological order. Include visible subject appearance, action, scene,
-composition, camera behavior, and lighting without repetition. Prefer roughly
-60 to 120 English content words. Longer descriptions are allowed when needed for
-complete chronology, multiple entities, or shot changes, but never exceed 180
-English content words; internal markers do not count.
-Describe only directly visible content. Do not infer identity,
-weather, emotion, allegiance, intent, mental state, sound, dialogue, or event
-causes. Describe visible motion directly without assigning an unseen cause.
-Write "branches sway slightly" instead of claiming that wind causes movement.
-Do not use hedging or causal inference wording such as breeze, wind-induced,
-suggesting, indicating, possibly, probably, or likely. Do not identify a person
-as an enemy, ally, criminal, victim, officer, or another role unless that role
-is explicitly supported by source metadata. For statues and depicted figures,
-describe visible facial geometry and pose without inferring determination,
-resolve, triumph, fear, or effort. Do not write "the video shows". Do not include
-<ref_...> tokens or image-number instruction labels.
-
+STEP 1: Select the reference entity proposals.
 Return at most {_ENTITY_LIMIT_WORD} entities. Select only stable, discrete
 foreground reference candidates that SAM3 can localize and track and that could
 be reused as an independent reference image. Fewer than {_ENTITY_LIMIT_WORD} is
@@ -127,24 +108,53 @@ or standing pose is allowed only when needed to distinguish the target for
 SAM3. grounding_prompt need not occur in instruction_template. Both fields must be
 non-empty and must not contain reference tokens.
 
-Insert exactly one internal marker for every entity in the same array order:
-entities[0] uses {{{{entity_1}}}}, entities[1] uses {{{{entity_2}}}}, and so on
-through at most {{{{entity_5}}}}. Place each marker immediately after that
-entity's first clear mention and before following punctuation. A marker must be
-preceded by exactly one ordinary ASCII space, as in "a woman {{{{entity_1}}}},"
-or "a boat {{{{entity_2}}}}." Do not put a marker at the paragraph start or
-after another marker. The marker is an internal binding, not visible prose.
+Do not output an entity proposal unless you can place its corresponding marker
+exactly once in instruction_template.
 
+STEP 2: Decide whether one stable background reference is useful.
 background is optional. When reliable, describe the overall environment after
 the principal foreground subjects are removed, using only phrase and
 grounding_prompt. Return background only when one stable environment persists
 through most of the clip. When the video contains a major scene transition
 between different environments, return background=null. Do not repeat the main
 foreground subject. Neither background text field must occur verbatim in the
-instruction_template. When background is non-null, place {{{{background}}}}
-exactly once after a clear environment mention, using the same ASCII-space and
-pre-punctuation placement rule. When background is null, do not include that
-marker. Return JSON only."""
+instruction_template. Do not output a non-null background unless you can place
+{{{{background}}}} exactly once in instruction_template.
+
+STEP 3: After the entity and background proposals are fixed, write
+instruction_template as one coherent English paragraph that begins directly
+with visible content and describes the target video naturally. It is not an
+imperative request: do not write "Use the reference image", "Generate",
+"Create", or a references section. Describe actions and shot changes in
+chronological order. Include visible subject appearance, action, scene,
+composition, camera behavior, and lighting without repetition. Prefer roughly
+60 to 120 English content words. Longer descriptions are allowed when needed for
+complete chronology, multiple entities, or shot changes, but never exceed 180
+English content words; internal markers do not count. Describe only directly
+visible content. Do not infer identity, weather, emotion, allegiance, intent,
+mental state, sound, dialogue, or event causes. Describe visible motion directly
+without assigning an unseen cause. Write "branches sway slightly" instead of
+claiming that wind causes movement. Do not use hedging or causal inference
+wording such as breeze, wind-induced, suggesting, indicating, possibly,
+probably, or likely. Do not identify a person as an enemy, ally, criminal,
+victim, officer, or another role unless that role is explicitly supported by
+source metadata. For statues and depicted figures, describe visible facial
+geometry and pose without inferring determination, resolve, triumph, fear, or
+effort. Do not write "the video shows". Do not include <ref_...> tokens or
+image-number instruction labels.
+
+Insert exactly one internal marker for every entity in the same array order:
+entities[0] MUST be marked exactly once with {{{{entity_1}}}}, entities[1] MUST
+be marked exactly once with {{{{entity_2}}}}, and so on through at most
+{{{{entity_5}}}}. Every listed entity must have its marker. Place each marker
+immediately after that entity's first clear mention and before following
+punctuation. A marker must be preceded by exactly one ordinary ASCII space, as
+in "a woman {{{{entity_1}}}}," or "a boat {{{{entity_2}}}}." Do not put a marker
+at the paragraph start or after another marker. The marker is an internal
+binding, not visible prose. If background is non-null, {{{{background}}}} MUST
+appear exactly once after a clear environment mention, using the same
+ASCII-space and pre-punctuation placement rule. When background is null, do not
+include that marker. Return JSON only."""
 
 
 @dataclass(frozen=True)

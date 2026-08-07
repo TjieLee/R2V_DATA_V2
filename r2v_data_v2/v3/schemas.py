@@ -75,9 +75,9 @@ class RawBackgroundAnnotation(SchemaModel):
 
 
 class RawAnnotationPayload(SchemaModel):
-    instruction_template: str
     entities: list[RawAnnotationEntity]
     background: Optional[RawBackgroundAnnotation]
+    instruction_template: str
 
 
 class AnnotationEntity(SchemaModel):

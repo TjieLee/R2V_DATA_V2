@@ -221,9 +221,9 @@ def _payload(
         if marker_sentences:
             template = f"{template} {' '.join(marker_sentences)}"
     return {
-        "instruction_template": template,
         "entities": entities,
         "background": background,
+        "instruction_template": template,
     }
 
 
@@ -466,11 +466,11 @@ def test_source_selection_is_validated_and_fingerprinted(
 def test_minimal_raw_annotation_schema_contains_only_expected_fields() -> None:
     schema = RawAnnotationPayload.model_json_schema()
 
-    assert set(schema["properties"]) == {
-        "instruction_template",
+    assert list(schema["properties"]) == [
         "entities",
         "background",
-    }
+        "instruction_template",
+    ]
     entity_schema = schema["$defs"]["RawAnnotationEntity"]
     background_schema = schema["$defs"]["RawBackgroundAnnotation"]
     assert set(entity_schema["properties"]) == {
@@ -1705,11 +1705,11 @@ def test_qwen_request_uses_full_video_minimal_schema_and_no_resampling(
     }
     response_format = request["response_format"]
     assert response_format["json_schema"]["strict"] is True
-    assert set(response_format["json_schema"]["schema"]["properties"]) == {
-        "instruction_template",
+    assert list(response_format["json_schema"]["schema"]["properties"]) == [
         "entities",
         "background",
-    }
+        "instruction_template",
+    ]
     messages = request["messages"]
     assert messages[-1]["content"][0]["video_url"]["url"] == (
         video.resolve().as_uri()
@@ -1793,6 +1793,28 @@ def test_system_prompt_describes_minimal_candidate_contract() -> None:
     assert "instruction_template" in normalized
     assert "{{entity_1}}" in SYSTEM_PROMPT
     assert "{{background}}" in SYSTEM_PROMPT
+
+
+def test_system_prompt_plans_references_before_writing_template() -> None:
+    normalized = " ".join(SYSTEM_PROMPT.split()).casefold()
+
+    step_1 = normalized.index("step 1: select the reference entity proposals")
+    step_2 = normalized.index(
+        "step 2: decide whether one stable background reference is useful"
+    )
+    step_3 = normalized.index(
+        "step 3: after the entity and background proposals are fixed"
+    )
+    assert step_1 < step_2 < step_3
+    assert (
+        "do not output an entity proposal unless you can place its corresponding "
+        "marker exactly once in instruction_template"
+    ) in normalized
+    assert (
+        "do not output a non-null background unless you can place "
+        "{{background}} exactly once in instruction_template"
+    ) in normalized
+    assert "every listed entity must have its marker" in normalized
 
 
 def test_system_prompt_rejects_inferred_causes_and_multiscene_backgrounds() -> None:
