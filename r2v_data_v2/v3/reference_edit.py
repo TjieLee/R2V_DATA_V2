@@ -216,6 +216,9 @@ def _rejected_reference(
         truncation_severity=reference.truncation_severity,
         discrete_foreground_instance=reference.discrete_foreground_instance,
         mask_matches_target=reference.mask_matches_target,
+        completion_needed_for_reference_use=(
+            reference.completion_needed_for_reference_use
+        ),
     )
 
 
@@ -274,6 +277,9 @@ def _accepted_reference(
         truncation_severity=reference.truncation_severity,
         discrete_foreground_instance=reference.discrete_foreground_instance,
         mask_matches_target=reference.mask_matches_target,
+        completion_needed_for_reference_use=(
+            reference.completion_needed_for_reference_use
+        ),
         synthetic=True,
         generation_metadata_path=storage.relative_artifact_path(metadata_path),
         generation_source_sha256=source_sha256,

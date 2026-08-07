@@ -305,11 +305,15 @@ this hard fragmentation gate.
 The existing single Qwen candidate judgment also reports whether the primary
 identity region and major structure are visible, whether the crop is a discrete
 foreground instance, whether the mask matches the target, and whether
-truncation is `none`, `minor`, or `major`. Code rejects any non-reject result
-with a failed evidence boolean or major truncation. `complete` requires no
-truncation, while `repairable` requires exactly minor truncation. These optional
-fields are persisted in reference state for audit while legacy clip JSON without
-them remains readable.
+truncation is `none`, `minor`, or `major`. It separately reports
+`completion_needed_for_reference_use`, which means generative completion is
+strictly necessary before the visible crop can serve as a training reference.
+Code rejects any non-reject result with a failed evidence boolean or major
+truncation. `complete` requires no truncation and no completion. `local_usable`
+allows none or minor truncation but must not need completion. `repairable`
+requires both minor truncation and completion necessity. These optional fields
+are persisted in reference state for audit while legacy clip JSON without them
+remains readable.
 
 #### `reference_edit`
 
@@ -568,9 +572,15 @@ The pair stage performs only the deterministic severe-fragmentation gate above;
 it does not attempt semantic component pruning. Qwen still judges fragmentation
 and target mismatch from context, isolated crop, and component diagnostics.
 
-Completeness routing is intentionally conservative. `repairable` is limited to
-a minor local low-risk omission, such as a small limb terminal or small object
-part, when identity and most structure already exist. Missing identity, the
+Completeness routing is intentionally conservative. `local_usable` includes
+natural local framing: a coherent head-and-shoulders, upper-body, waist-up,
+side, three-quarter, or similarly identity-bearing region can be independently
+reusable even when the rest of the physical entity is outside the camera frame.
+Partial body visibility alone is not a defect, and minor truncation does not by
+itself imply completion. `repairable` is limited to a minor local low-risk
+omission, such as a clipped hand or foot terminal, short limb edge, or small
+object part, when the omission genuinely prevents reference use and completion
+does not require guessing identity or major structure. Missing identity, the
 head, most of a body or garment, torso-only/back-only fragments, or any repair
 requiring major invention is `severely_incomplete` and rejects. Bad masks,
 environment fragments, and non-target content are `fragmented` and reject.

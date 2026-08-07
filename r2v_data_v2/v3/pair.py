@@ -842,6 +842,7 @@ def validate_entity_reference_artifact(
         "truncation_severity",
         "discrete_foreground_instance",
         "mask_matches_target",
+        "completion_needed_for_reference_use",
         "source_frame_index",
     )
     if any(
@@ -896,6 +897,11 @@ def _rejected_reference(
         ),
         mask_matches_target=(
             decision.mask_matches_target if decision is not None else None
+        ),
+        completion_needed_for_reference_use=(
+            decision.completion_needed_for_reference_use
+            if decision is not None
+            else None
         ),
         synthetic=False,
     )
@@ -1497,6 +1503,9 @@ def _run_same_parent_cross_pair_fallback(
                                 donor_state.discrete_foreground_instance
                             ),
                             mask_matches_target=donor_state.mask_matches_target,
+                            completion_needed_for_reference_use=(
+                                donor_state.completion_needed_for_reference_use
+                            ),
                             image_path=storage.relative_artifact_path(
                                 storage.selected_entity_path(
                                     target_clip.clip_uid,
@@ -1783,6 +1792,9 @@ def pair_clips(
                                     decision.discrete_foreground_instance
                                 ),
                                 mask_matches_target=decision.mask_matches_target,
+                                completion_needed_for_reference_use=(
+                                    decision.completion_needed_for_reference_use
+                                ),
                                 synthetic=False,
                             )
                         )
@@ -1862,6 +1874,9 @@ def pair_clips(
                                 decision.discrete_foreground_instance
                             ),
                             mask_matches_target=decision.mask_matches_target,
+                            completion_needed_for_reference_use=(
+                                decision.completion_needed_for_reference_use
+                            ),
                         )
                     )
                 retained = [

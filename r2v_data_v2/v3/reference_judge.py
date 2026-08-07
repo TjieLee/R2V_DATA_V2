@@ -56,8 +56,16 @@ one routing outcome: complete, repairable, local_usable, severely_incomplete,
 or fragmented. complete is mostly whole with clear identity. repairable is
 limited to minor, local, low-risk missing content, such as a small limb
 terminal or small object part, while the source preserves identity and most of
-the main object structure. local_usable is a stable, clean identity-bearing local
-view without key structural truncation and requires no completion.
+the main object structure and completion is genuinely required before the crop
+is reusable. local_usable includes natural local framing: it is a stable,
+structurally coherent, independently reusable, identity-bearing local view that
+requires no generative completion. It need not show a complete body or object.
+A person shown clearly from the head through the torso or waist can be a valid
+local_usable reference even when the legs or lower body are outside the camera
+framing. Do not classify a coherent portrait, head-and-shoulders view, upper-body
+crop, side view, or three-quarter view as repairable merely because the whole
+body is not visible. The distinction is whether the visible local reference is
+itself reusable, not whether the full physical entity is present.
 severely_incomplete means identity, the head, most of the body, most clothing,
 or another major structure is missing, or completion would require large
 invention. Crops cut through the torso, hips, buttocks, most legs or arms, and
@@ -89,13 +97,22 @@ Multiple large separated components in a non-group mask strongly suggest
 fragmentation or target mismatch. Use the supplied component diagnostics along
 with both the context image and isolated crop.
 
+completion_needed_for_reference_use states whether generative completion is
+strictly necessary before this crop can serve as a training reference. Missing
+legs or lower body outside natural camera framing is not by itself a defect and
+must be false when the visible portrait or local object region is already
+coherent and reusable. Set it true only for a small, real, low-risk truncation,
+such as a clipped hand or foot terminal, short limb edge, or small object edge,
+whose repair is necessary for reference use without guessing identity or major
+structure. Minor truncation does not automatically mean repairable.
+
 Do not output tokens or crop coordinates. Return one strict JSON object only
 with selected_candidate_id, image_quality, completeness, reference_scope,
 visible_region, whole_entity_recognizable, identity_features_visible,
 viewpoint, independent_reference_value, requires_substantial_invention,
 primary_identity_region_visible, major_structure_visible,
-truncation_severity, discrete_foreground_instance, mask_matches_target, and
-scope_reason."""
+truncation_severity, discrete_foreground_instance, mask_matches_target,
+completion_needed_for_reference_use, and scope_reason."""
 
 
 @dataclass(frozen=True)
@@ -324,6 +341,39 @@ def validate_entity_reference_decision(
                 code="repairable_requires_minor_truncation",
                 field="truncation_severity",
                 message="repairable reference requires minor truncation",
+            )
+        )
+    if (
+        decision.completeness == "complete"
+        and decision.completion_needed_for_reference_use
+    ):
+        issues.append(
+            ValidationIssue(
+                code="complete_must_not_need_completion",
+                field="completion_needed_for_reference_use",
+                message="complete reference cannot require completion",
+            )
+        )
+    if (
+        decision.completeness == "local_usable"
+        and decision.completion_needed_for_reference_use
+    ):
+        issues.append(
+            ValidationIssue(
+                code="local_usable_must_not_need_completion",
+                field="completion_needed_for_reference_use",
+                message="local_usable reference cannot require completion",
+            )
+        )
+    if (
+        decision.completeness == "repairable"
+        and not decision.completion_needed_for_reference_use
+    ):
+        issues.append(
+            ValidationIssue(
+                code="repairable_requires_completion",
+                field="completion_needed_for_reference_use",
+                message="repairable reference must require completion for use",
             )
         )
     if decision.reference_scope == "full":

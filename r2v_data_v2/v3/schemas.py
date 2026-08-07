@@ -334,6 +334,7 @@ class RawEntityReferenceDecision(SchemaModel):
     truncation_severity: ReferenceTruncationSeverity
     discrete_foreground_instance: StrictBool
     mask_matches_target: StrictBool
+    completion_needed_for_reference_use: StrictBool
     scope_reason: str
 
     @model_validator(mode="after")
@@ -424,6 +425,7 @@ class EntityReferenceState(SchemaModel):
     truncation_severity: Optional[ReferenceTruncationSeverity] = None
     discrete_foreground_instance: Optional[bool] = None
     mask_matches_target: Optional[bool] = None
+    completion_needed_for_reference_use: Optional[bool] = None
     synthetic: bool = False
     generation_metadata_path: Optional[str] = None
     generation_source_sha256: Optional[str] = Field(

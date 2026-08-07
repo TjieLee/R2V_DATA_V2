@@ -551,6 +551,9 @@ def _attempt(
                     decision.discrete_foreground_instance
                 ),
                 mask_matches_target=decision.mask_matches_target,
+                completion_needed_for_reference_use=(
+                    decision.completion_needed_for_reference_use
+                ),
                 scope_reason=decision.scope_reason,
                 image_path=source_state.image_path,
                 source_frame_index=source_state.source_frame_index,

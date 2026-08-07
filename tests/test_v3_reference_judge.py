@@ -73,6 +73,7 @@ def _payload(**updates: object) -> dict[str, object]:
         "truncation_severity": "none",
         "discrete_foreground_instance": True,
         "mask_matches_target": True,
+        "completion_needed_for_reference_use": False,
         "scope_reason": "The whole entity and identity are visible.",
     }
     result.update(updates)
@@ -120,6 +121,7 @@ def test_raw_decision_schema_is_strict(
         "truncation_severity",
         "discrete_foreground_instance",
         "mask_matches_target",
+        "completion_needed_for_reference_use",
     ],
 )
 def test_new_reference_gate_fields_are_required(field: str) -> None:
@@ -183,6 +185,7 @@ def test_completeness_routes_to_deterministic_reference_scope(
             whole_entity_recognizable=scope == "full",
             identity_features_visible=scope != "reject",
             truncation_severity=("minor" if completeness == "repairable" else "none"),
+            completion_needed_for_reference_use=(completeness == "repairable"),
         )
     )
 
@@ -208,6 +211,7 @@ def test_poor_image_quality_fails_closed() -> None:
                 "reference_scope": "local",
                 "visible_region": "whole",
                 "whole_entity_recognizable": False,
+                "completion_needed_for_reference_use": True,
             },
             "local_must_be_non_whole",
         ),
@@ -219,6 +223,7 @@ def test_poor_image_quality_fails_closed() -> None:
                 "whole_entity_recognizable": False,
                 "identity_features_visible": False,
                 "truncation_severity": "minor",
+                "completion_needed_for_reference_use": True,
             },
             "local_requires_identity",
         ),
@@ -245,6 +250,7 @@ def test_recognizable_local_reference_is_valid() -> None:
             visible_region="central",
             whole_entity_recognizable=True,
             truncation_severity="minor",
+            completion_needed_for_reference_use=True,
         )
     )
     assert validate_entity_reference_decision(
@@ -365,6 +371,7 @@ def test_minor_crop_can_route_to_repairable() -> None:
             whole_entity_recognizable=True,
             requires_substantial_invention=False,
             truncation_severity="minor",
+            completion_needed_for_reference_use=True,
             scope_reason="Only one small limb terminal is missing.",
         )
     )
@@ -391,6 +398,7 @@ def test_minor_crop_can_route_to_repairable() -> None:
                 "visible_region": "central",
                 "whole_entity_recognizable": True,
                 "truncation_severity": "major",
+                "completion_needed_for_reference_use": True,
             },
             "major_truncation_not_rejected",
         ),
@@ -421,6 +429,7 @@ def test_repairable_minor_and_complete_none_are_valid() -> None:
             visible_region="central",
             whole_entity_recognizable=True,
             truncation_severity="minor",
+            completion_needed_for_reference_use=True,
         )
     )
     complete = RawEntityReferenceDecision.model_validate(_payload())
@@ -431,6 +440,180 @@ def test_repairable_minor_and_complete_none_are_valid() -> None:
             candidate_ids={"candidate_1"},
             reference_type="subject",
         ) == []
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_code"),
+    [
+        (
+            {"completion_needed_for_reference_use": True},
+            "complete_must_not_need_completion",
+        ),
+        (
+            {
+                "completeness": "local_usable",
+                "reference_scope": "local",
+                "visible_region": "upper_body",
+                "whole_entity_recognizable": True,
+                "completion_needed_for_reference_use": True,
+            },
+            "local_usable_must_not_need_completion",
+        ),
+        (
+            {
+                "completeness": "repairable",
+                "reference_scope": "local",
+                "visible_region": "upper_body",
+                "whole_entity_recognizable": True,
+                "truncation_severity": "minor",
+                "completion_needed_for_reference_use": False,
+            },
+            "repairable_requires_completion",
+        ),
+    ],
+)
+def test_completion_necessity_matches_routing(
+    updates: dict[str, object],
+    expected_code: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(_payload(**updates))
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    assert expected_code in {issue.code for issue in issues}
+
+
+@pytest.mark.parametrize("truncation_severity", ["none", "minor"])
+def test_local_usable_does_not_require_completion(
+    truncation_severity: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="local_usable",
+            reference_scope="local",
+            visible_region="upper_body",
+            whole_entity_recognizable=True,
+            truncation_severity=truncation_severity,
+            completion_needed_for_reference_use=False,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("visible_region", "viewpoint", "scope_reason"),
+    [
+        ("head_shoulders", "front", "Clear head-and-shoulders portrait."),
+        ("upper_body", "front", "Clear waist-up portrait."),
+        (
+            "upper_body",
+            "front",
+            "Face, head, and coherent upper body are clear; legs are out of frame.",
+        ),
+        ("upper_body", "three_quarter", "Clear three-quarter upper-body view."),
+        ("side", "side", "Clear side upper-body view with visible identity."),
+    ],
+)
+def test_natural_local_subject_framing_is_local_usable(
+    visible_region: str,
+    viewpoint: str,
+    scope_reason: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="local_usable",
+            reference_scope="local",
+            visible_region=visible_region,
+            whole_entity_recognizable=True,
+            viewpoint=viewpoint,
+            truncation_severity="minor",
+            completion_needed_for_reference_use=False,
+            scope_reason=scope_reason,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("reference_type", "scope_reason"),
+    [
+        ("subject", "A clipped hand terminal needs a small safe repair."),
+        ("object", "A clipped object edge needs a small safe repair."),
+    ],
+)
+def test_small_real_defect_can_route_to_repairable(
+    reference_type: str,
+    scope_reason: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="central",
+            whole_entity_recognizable=True,
+            viewpoint=("front" if reference_type == "subject" else "not_applicable"),
+            truncation_severity="minor",
+            completion_needed_for_reference_use=True,
+            scope_reason=scope_reason,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type=reference_type,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("viewpoint", "scope_reason"),
+    [
+        ("front", "The head is missing."),
+        ("rear", "Only a rear view is visible."),
+        ("front", "Only a torso without identity is visible."),
+        ("front", "Most of the body structure is missing."),
+    ],
+)
+def test_major_subject_loss_remains_rejected(
+    viewpoint: str,
+    scope_reason: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            selected_candidate_id=None,
+            completeness="severely_incomplete",
+            reference_scope="reject",
+            visible_region="custom",
+            whole_entity_recognizable=False,
+            identity_features_visible=False,
+            viewpoint=viewpoint,
+            primary_identity_region_visible=False,
+            major_structure_visible=False,
+            truncation_severity="major",
+            completion_needed_for_reference_use=False,
+            scope_reason=scope_reason,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
 
 
 @pytest.mark.parametrize(
@@ -512,6 +695,7 @@ def test_legacy_reference_state_without_new_judge_fields_loads() -> None:
     assert legacy.truncation_severity is None
     assert legacy.discrete_foreground_instance is None
     assert legacy.mask_matches_target is None
+    assert legacy.completion_needed_for_reference_use is None
 
 
 @pytest.mark.parametrize("status", ["ready", "rejected"])
@@ -532,6 +716,7 @@ def test_reference_state_persists_new_judge_fields(status: str) -> None:
         "truncation_severity": "none" if status == "ready" else "major",
         "discrete_foreground_instance": status == "ready",
         "mask_matches_target": status == "ready",
+        "completion_needed_for_reference_use": False,
     }
     if status == "ready":
         payload.update(
@@ -550,10 +735,11 @@ def test_reference_state_persists_new_judge_fields(status: str) -> None:
     )
     assert restored.discrete_foreground_instance is (status == "ready")
     assert restored.mask_matches_target is (status == "ready")
+    assert restored.completion_needed_for_reference_use is False
 
 
 def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
-    lowered = SYSTEM_PROMPT.lower()
+    lowered = " ".join(SYSTEM_PROMPT.lower().split())
     for phrase in (
         "torso",
         "hips",
@@ -562,6 +748,12 @@ def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
         "arms",
         "single connected component is not evidence",
         "main object structure",
+        "natural local framing",
+        "head-and-shoulders",
+        "upper-body",
+        "whole body is not visible",
+        "completion_needed_for_reference_use",
+        "minor truncation does not automatically mean repairable",
     ):
         assert phrase in lowered
 

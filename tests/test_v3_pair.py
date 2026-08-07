@@ -367,6 +367,7 @@ def _decision(
             truncation_severity="major",
             discrete_foreground_instance=False,
             mask_matches_target=False,
+            completion_needed_for_reference_use=False,
             scope_reason="not reusable",
         )
     completeness = (
@@ -393,6 +394,7 @@ def _decision(
         truncation_severity=("minor" if completeness == "repairable" else "none"),
         discrete_foreground_instance=True,
         mask_matches_target=True,
+        completion_needed_for_reference_use=(completeness == "repairable"),
         scope_reason="clear visual identity",
     )
 
@@ -869,6 +871,7 @@ def test_pair_does_not_publish_candidate_without_independent_reference_value(
                     truncation_severity="none",
                     discrete_foreground_instance=False,
                     mask_matches_target=False,
+                    completion_needed_for_reference_use=False,
                     scope_reason="The crop is only an environment fragment.",
                 ),
                 raw_responses=("{}",),
@@ -883,6 +886,7 @@ def test_pair_does_not_publish_candidate_without_independent_reference_value(
     assert state.status == "rejected"
     assert state.independent_reference_value is False
     assert state.requires_substantial_invention is False
+    assert state.completion_needed_for_reference_use is False
     assert not storage.selected_entity_path("clip-1", "e1").exists()
 
 
@@ -961,6 +965,7 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         assert state.truncation_severity == "none"
         assert state.discrete_foreground_instance is True
         assert state.mask_matches_target is True
+        assert state.completion_needed_for_reference_use is False
         validate_entity_reference_artifact(
             config,
             storage,
@@ -1589,6 +1594,10 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
         target_reference.mask_matches_target
         == donor.references.entities[0].mask_matches_target
     )
+    assert (
+        target_reference.completion_needed_for_reference_use
+        == donor.references.entities[0].completion_needed_for_reference_use
+    )
     assert donor.references.entities[0].source_clip_uid == "donor"
     assert donor.references.entities[0].source_entity_id == "e1"
     assert target_path.read_bytes() == donor_path.read_bytes()
@@ -1598,7 +1607,9 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
             storage,
             "target",
             target.annotation.entities[0],
-            target_reference.model_copy(update={"mask_matches_target": False}),
+            target_reference.model_copy(
+                update={"completion_needed_for_reference_use": True}
+            ),
             storage.read_frames("target"),
             storage.read_masks("target"),
         )
@@ -4112,6 +4123,16 @@ def test_complete_reference_runs_only_background_with_exact_prompt(
     assert backend.calls[0]["thinking_enabled"] is False
 
 
+def test_reference_edit_operation_routing_distinguishes_local_and_repairable() -> None:
+    assert reference_edit_module._operations("local_usable") == (
+        "add_entity_background",
+    )
+    assert reference_edit_module._operations("repairable") == (
+        "complete_entity",
+        "add_entity_background",
+    )
+
+
 @pytest.mark.parametrize(
     "background_updates",
     [
@@ -4128,6 +4149,7 @@ def test_background_not_better_than_source_uses_keep_source_fallback(
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge())
     source = storage.read_clip("clip-1").references.entities[0]
+    assert source.completion_needed_for_reference_use is False
     source_bytes = (storage.root / source.image_path).read_bytes()
 
     stats = reference_edit_clips(
@@ -4192,6 +4214,7 @@ def test_local_reference_adds_background_without_promoting_scope(
         == source.discrete_foreground_instance
     )
     assert reference.mask_matches_target == source.mask_matches_target
+    assert reference.completion_needed_for_reference_use is False
     assert storage.read_clip("clip-1").reference_edit.entities[0].route == (
         "local_usable"
     )
@@ -4559,6 +4582,12 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
     config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    assert (
+        storage.read_clip("clip-1")
+        .references.entities[0]
+        .completion_needed_for_reference_use
+        is True
+    )
     backend = _ReferenceEditBackend()
 
     stats = reference_edit_clips(
@@ -4588,6 +4617,7 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
     assert state.fallback_policy == "completion_candidate"
     assert state.background_fallback == "completion_candidate"
     assert clip.references.entities[0].synthetic is True
+    assert clip.references.entities[0].completion_needed_for_reference_use is True
 
 
 def test_repairable_completion_rejection_overrides_keep_source_policy(

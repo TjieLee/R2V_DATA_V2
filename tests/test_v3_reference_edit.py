@@ -23,6 +23,7 @@ def test_reference_edit_rejection_preserves_objective_source_evidence() -> None:
         truncation_severity="minor",
         discrete_foreground_instance=True,
         mask_matches_target=True,
+        completion_needed_for_reference_use=True,
     )
 
     rejected = _rejected_reference(source, "repairable_completion_rejected:test")
@@ -33,3 +34,8 @@ def test_reference_edit_rejection_preserves_objective_source_evidence() -> None:
     assert rejected.truncation_severity == "minor"
     assert rejected.discrete_foreground_instance is True
     assert rejected.mask_matches_target is True
+    assert rejected.completion_needed_for_reference_use is True
+    restored_source = EntityReferenceState.model_validate(
+        source.model_dump(mode="json")
+    )
+    assert restored_source.completion_needed_for_reference_use is True
