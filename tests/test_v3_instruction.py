@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as v3_config_module
 import r2v_data_v2.v3.instruction as instruction_module
+from r2v_data_v2.v3.annotation import sanitize_annotation_payload
 from r2v_data_v2.v3.config import (
     DebugConfig,
     QwenAnnotationConfig,
@@ -512,6 +513,69 @@ def test_deterministic_instruction_inlines_entities_and_background_at_mentions(
         description="the empty bright plaza",
     )
     assert not instruction.instruction_body_template.startswith("{{image_")
+
+
+def test_sanitized_annotation_markers_bind_in_final_contiguous_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    annotation, issues, warnings = sanitize_annotation_payload(
+        {
+            "instruction_template": (
+                "A woman {{entity_1}} sits beside a dog while a boat "
+                "{{entity_3}} passes."
+            ),
+            "entities": [
+                {
+                    "reference_type": "subject",
+                    "phrase": "woman",
+                    "grounding_prompt": "seated woman beside the dog",
+                },
+                {
+                    "reference_type": "subject",
+                    "phrase": "dog",
+                    "grounding_prompt": "dog beside the seated woman",
+                },
+                {
+                    "reference_type": "object",
+                    "phrase": "boat",
+                    "grounding_prompt": "boat passing behind the pair",
+                },
+            ],
+            "background": None,
+        }
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert "dropped_entity_missing_marker:2" in warnings
+    assert [entity.phrase for entity in annotation.entities] == ["woman", "boat"]
+
+    clip = storage.read_clip(clip_uid)
+    assert clip.references is not None
+    assert clip.pairing is not None
+    clip = clip.model_copy(
+        update={
+            "annotation": annotation,
+            "references": clip.references.model_copy(update={"background": None}),
+            "pairing": clip.pairing.model_copy(update={"background_token": None}),
+        }
+    )
+    bindings = build_instruction_bindings(clip)
+    instruction = build_deterministic_instruction(
+        instruction_template=annotation.instruction_template,
+        bindings=bindings,
+    )
+
+    assert [binding.entity_id for binding in bindings] == ["e1", "e2"]
+    assert [binding.phrase for binding in bindings] == ["woman", "boat"]
+    assert instruction.instruction_body_template == (
+        "A woman {{image_1}} sits beside a dog while a boat {{image_2}} passes."
+    )
+    assert instruction.r2v_instruction == (
+        "A woman <Image 1> sits beside a dog while a boat <Image 2> passes."
+    )
 
 
 def test_deterministic_instruction_preserves_template_except_marker_changes() -> None:

@@ -806,21 +806,6 @@ def test_three_entity_markers_are_valid_once_each() -> None:
     ("template", "entities", "issue_code"),
     [
         (
-            "A woman {{entity_1}} stands beside a boat.",
-            [_entity("woman"), _entity("boat", reference_type="object")],
-            "missing_entity_marker",
-        ),
-        (
-            "A woman {{entity_1}} greets the woman {{entity_1}}.",
-            [_entity("woman")],
-            "duplicate_entity_marker",
-        ),
-        (
-            "A woman {{entity_1}} stands near a tower {{entity_4}}.",
-            [_entity("woman")],
-            "unexpected_entity_marker",
-        ),
-        (
             "A woman {{entity_0}} walks.",
             [_entity("woman")],
             "invalid_entity_marker",
@@ -846,33 +831,18 @@ def test_three_entity_markers_are_valid_once_each() -> None:
             "invalid_annotation_reference_token",
         ),
         (
-            "{{entity_1}} A woman walks.",
+            "A woman {{unknown_marker}} walks.",
             [_entity("woman")],
-            "invalid_marker_position",
+            "invalid_entity_marker",
         ),
         (
-            "A woman{{entity_1}} walks.",
+            "A woman {{entity_1 walks.",
             [_entity("woman")],
-            "invalid_marker_position",
-        ),
-        (
-            "A woman  {{entity_1}} walks.",
-            [_entity("woman")],
-            "invalid_marker_position",
-        ),
-        (
-            "A woman {{entity_1}} {{entity_2}} walks.",
-            [_entity("woman"), _entity("companion")],
-            "invalid_marker_position",
-        ),
-        (
-            "A woman {{entity_1}}walks.",
-            [_entity("woman")],
-            "invalid_marker_position",
+            "invalid_entity_marker",
         ),
     ],
 )
-def test_invalid_internal_marker_structures_are_rejected(
+def test_unsafe_internal_marker_structures_are_rejected(
     template: str,
     entities: list[object],
     issue_code: str,
@@ -889,8 +859,160 @@ def test_invalid_internal_marker_structures_are_rejected(
     assert issue_code in {issue.code for issue in issues}
 
 
-def test_zero_entities_forbids_entity_markers() -> None:
-    annotation, issues, _ = sanitize_annotation_payload(
+def test_missing_entity_marker_drops_only_that_proposal_and_renumbers() -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template=(
+                "A woman {{entity_1}} stands beside a dog while a boat "
+                "{{entity_3}} passes."
+            ),
+            entities=[
+                _entity("woman"),
+                _entity("dog"),
+                _entity("boat", reference_type="object"),
+            ],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert [entity.phrase for entity in annotation.entities] == ["woman", "boat"]
+    assert [entity.entity_id for entity in annotation.entities] == ["e1", "e2"]
+    assert annotation.instruction_template == (
+        "A woman {{entity_1}} stands beside a dog while a boat "
+        "{{entity_2}} passes."
+    )
+    assert "dropped_entity_missing_marker:2" in warnings
+
+
+def test_duplicate_entity_marker_drops_proposal_and_all_occurrences() -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template=(
+                "A woman {{entity_1}} watches a dog {{entity_2}} approach the "
+                "same dog {{entity_2}} beside a boat {{entity_3}}."
+            ),
+            entities=[
+                _entity("woman"),
+                _entity("dog"),
+                _entity("boat", reference_type="object"),
+            ],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert [entity.phrase for entity in annotation.entities] == ["woman", "boat"]
+    assert annotation.instruction_template == (
+        "A woman {{entity_1}} watches a dog approach the same dog beside a "
+        "boat {{entity_2}}."
+    )
+    assert "dropped_entity_duplicate_marker:2" in warnings
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "A woman {{entity_1}} stands beside a dog{{entity_2}}.",
+        "A woman {{entity_1}} stands beside a dog  {{entity_2}}.",
+        "A woman {{entity_1}} stands beside a dog {{entity_2}}nearby.",
+        "{{entity_2}} A woman {{entity_1}} stands beside a dog.",
+    ],
+)
+def test_invalid_entity_marker_position_drops_only_that_proposal(
+    template: str,
+) -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template=template,
+            entities=[_entity("woman"), _entity("dog")],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert [entity.phrase for entity in annotation.entities] == ["woman"]
+    assert "{{entity_2}}" not in annotation.instruction_template
+    assert "dropped_entity_invalid_marker_position:2" in warnings
+
+
+def test_unexpected_entity_marker_is_removed_without_extra_entity() -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template="A woman {{entity_1}} stands near a tower {{entity_4}}.",
+            entities=[_entity("woman")],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert [entity.phrase for entity in annotation.entities] == ["woman"]
+    assert annotation.instruction_template == (
+        "A woman {{entity_1}} stands near a tower."
+    )
+    assert "removed_unexpected_entity_marker:4" in warnings
+
+
+def test_invalid_entity_candidate_removes_its_marker_and_renumbers() -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template=(
+                "A woman {{entity_1}} stands beside a region {{entity_2}} and "
+                "a boat {{entity_3}}."
+            ),
+            entities=[
+                _entity("woman"),
+                _entity("region", reference_type="scene"),
+                _entity("boat", reference_type="object"),
+            ],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert [entity.entity_id for entity in annotation.entities] == ["e1", "e2"]
+    assert [entity.phrase for entity in annotation.entities] == ["woman", "boat"]
+    assert annotation.instruction_template == (
+        "A woman {{entity_1}} stands beside a region and a boat {{entity_2}}."
+    )
+    assert "dropped_entity_reference_type:1" in warnings
+
+
+def test_multiple_dropped_entities_leave_contiguous_ids_and_markers() -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template=(
+                "A woman {{entity_1}} sees a dog and a sign {{entity_3}} twice "
+                "{{entity_3}} beside a boat {{entity_4}}."
+            ),
+            entities=[
+                _entity("woman"),
+                _entity("dog"),
+                _entity("sign", reference_type="object"),
+                _entity("boat", reference_type="object"),
+            ],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert [entity.entity_id for entity in annotation.entities] == ["e1", "e2"]
+    assert [entity.phrase for entity in annotation.entities] == ["woman", "boat"]
+    assert annotation.instruction_template.count("{{entity_") == 2
+    assert "{{entity_1}}" in annotation.instruction_template
+    assert "{{entity_2}}" in annotation.instruction_template
+    assert "dropped_entity_missing_marker:2" in warnings
+    assert "dropped_entity_duplicate_marker:3" in warnings
+
+
+def test_zero_entities_removes_unexpected_entity_marker() -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
         _payload(
             template="A plaza contains a stray marker {{entity_1}}.",
             entities=[],
@@ -898,13 +1020,16 @@ def test_zero_entities_forbids_entity_markers() -> None:
         )
     )
 
-    assert annotation is None
-    assert "unexpected_entity_marker" in {issue.code for issue in issues}
+    assert issues == []
+    assert annotation is not None
+    assert annotation.entities == []
+    assert annotation.instruction_template == "A plaza contains a stray marker."
+    assert "removed_unexpected_entity_marker:1" in warnings
 
 
 def test_annotation_word_count_excludes_internal_markers() -> None:
-    words = " ".join(f"visible{index}" for index in range(120))
-    annotation, issues, _ = sanitize_annotation_payload(
+    words = " ".join(f"visible{index}" for index in range(180))
+    annotation, issues, warnings = sanitize_annotation_payload(
         _payload(
             template=f"{words} {{{{entity_1}}}}.",
             entities=[_entity("candidate")],
@@ -914,6 +1039,7 @@ def test_annotation_word_count_excludes_internal_markers() -> None:
 
     assert issues == []
     assert annotation is not None
+    assert "instruction_template_over_preferred_length:180" in warnings
 
 
 def test_background_marker_matches_background_presence() -> None:
@@ -932,32 +1058,68 @@ def test_background_marker_matches_background_presence() -> None:
     assert annotation is not None
     assert annotation.background is not None
 
-    missing, missing_issues, _ = sanitize_annotation_payload(
+    missing, missing_issues, missing_warnings = sanitize_annotation_payload(
         _payload(
             template="A woman {{entity_1}} crosses a sunlit plaza.",
             entities=[_entity("woman")],
             background={"phrase": "plaza", "grounding_prompt": "sunlit plaza"},
         )
     )
-    assert missing is None
-    assert "background_marker_missing" in {
-        issue.code for issue in missing_issues
-    }
+    assert missing_issues == []
+    assert missing is not None
+    assert missing.background is None
+    assert "dropped_background_missing_marker" in missing_warnings
 
-    unexpected, unexpected_issues, _ = sanitize_annotation_payload(
+    unexpected, unexpected_issues, unexpected_warnings = sanitize_annotation_payload(
         _payload(
             template="A woman {{entity_1}} crosses a plaza {{background}}.",
             entities=[_entity("woman")],
             background=None,
         )
     )
-    assert unexpected is None
-    assert "unexpected_background_marker" in {
-        issue.code for issue in unexpected_issues
-    }
+    assert unexpected_issues == []
+    assert unexpected is not None
+    assert unexpected.background is None
+    assert "{{background}}" not in unexpected.instruction_template
+    assert "removed_unexpected_background_marker" in unexpected_warnings
 
 
-def test_marker_issue_enters_existing_repair_lifecycle(
+@pytest.mark.parametrize(
+    ("template", "warning"),
+    [
+        (
+            (
+                "A woman {{entity_1}} crosses a plaza {{background}} and the "
+                "plaza {{background}} remains visible."
+            ),
+            "dropped_background_duplicate_marker",
+        ),
+        (
+            "{{background}} A woman {{entity_1}} crosses a plaza.",
+            "dropped_background_invalid_marker_position",
+        ),
+    ],
+)
+def test_invalid_background_marker_drops_background_and_all_markers(
+    template: str,
+    warning: str,
+) -> None:
+    annotation, issues, warnings = sanitize_annotation_payload(
+        _payload(
+            template=template,
+            entities=[_entity("woman")],
+            background={"phrase": "plaza", "grounding_prompt": "sunlit plaza"},
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert annotation.background is None
+    assert "{{background}}" not in annotation.instruction_template
+    assert warning in warnings
+
+
+def test_missing_marker_is_sanitized_without_repair_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -970,30 +1132,20 @@ def test_marker_issue_enters_existing_repair_lifecycle(
             )
         ],
     )
-    repaired = _payload(
-        template="A wooden table {{entity_1}} remains visible.",
-        entities=[
-            _entity(
-                "a wooden table",
-                reference_type="object",
-                grounding_prompt="dark wooden table with intricate carvings",
-            )
-        ],
-    )
-
     stats, clip, client = _annotate_payloads(
         tmp_path,
         monkeypatch,
-        [invalid, repaired],
+        [invalid],
         repair_retries=1,
     )
 
     assert stats.processed == 1
-    assert stats.repaired == 1
-    assert len(client.requests) == 2
-    assert "missing_entity_marker" in str(client.requests[1])
+    assert stats.repaired == 0
+    assert len(client.requests) == 1
     assert clip.annotation is not None
-    assert clip.annotation.entities[0].phrase == "a wooden table"
+    assert clip.annotation.status == "ready"
+    assert clip.annotation.entities == []
+    assert clip.annotation.instruction_template == "A table remains visible."
 
 
 @pytest.mark.parametrize(
@@ -1016,24 +1168,39 @@ def test_directly_visible_caption_language_is_allowed(caption: str) -> None:
     assert annotation.status == "ready"
 
 
-def test_caption_at_120_words_is_allowed() -> None:
-    caption = " ".join(f"visible{index}" for index in range(120))
-    annotation, issues, _ = sanitize_annotation_payload(
+@pytest.mark.parametrize("word_count", [119, 120, 121, 150, 180])
+def test_instruction_template_soft_and_hard_word_boundaries(
+    word_count: int,
+) -> None:
+    caption = " ".join(f"visible{index}" for index in range(word_count))
+    annotation, issues, warnings = sanitize_annotation_payload(
         _payload(caption=caption)
     )
 
     assert issues == []
     assert annotation is not None
+    if word_count > 120:
+        assert (
+            f"instruction_template_over_preferred_length:{word_count}"
+            in warnings
+        )
+    else:
+        assert not any(
+            warning.startswith("instruction_template_over_preferred_length:")
+            for warning in warnings
+        )
 
 
-def test_caption_over_120_words_enters_repair_validation() -> None:
-    caption = " ".join(f"visible{index}" for index in range(121))
+def test_instruction_template_over_180_words_enters_repair_validation() -> None:
+    caption = " ".join(f"visible{index}" for index in range(181))
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(caption=caption)
     )
 
     assert annotation is None
-    assert {issue.code for issue in issues} == {"caption_too_long"}
+    assert {issue.code for issue in issues} == {
+        "instruction_template_too_long"
+    }
 
 
 def test_entity_phrase_over_12_words_enters_repair_validation() -> None:
@@ -1169,7 +1336,7 @@ def test_annotation_text_limit_issue_can_be_repaired(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    long_caption = " ".join(f"visible{index}" for index in range(121))
+    long_caption = " ".join(f"visible{index}" for index in range(181))
     stats, clip, client = _annotate_payloads(
         tmp_path,
         monkeypatch,
@@ -1179,7 +1346,7 @@ def test_annotation_text_limit_issue_can_be_repaired(
 
     assert stats.repaired == 1
     assert len(client.requests) == 2
-    assert "caption_too_long" in str(client.requests[1])
+    assert "instruction_template_too_long" in str(client.requests[1])
     assert clip.annotation is not None
     assert clip.annotation.status == "ready"
 
@@ -1187,7 +1354,8 @@ def test_annotation_text_limit_issue_can_be_repaired(
 def test_annotation_prompt_defines_concise_text_limits() -> None:
     lowered = " ".join(SYSTEM_PROMPT.lower().split())
     for phrase in (
-        "never exceed 120; internal markers do not count",
+        "prefer roughly 60 to 120 english content words",
+        "never exceed 180 english content words",
         "must not exceed 12 words",
         "must not exceed 24 words",
         "do not include transient actions",

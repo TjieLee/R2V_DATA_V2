@@ -25,7 +25,6 @@ from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundAnnotation,
     RawAnnotationPayload,
-    plain_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
 
@@ -65,6 +64,8 @@ _BACKGROUND_FIELDS = frozenset({"phrase", "grounding_prompt"})
 _REFERENCE_TYPES = frozenset({"subject", "object", "group"})
 _ENTITY_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five")
 _ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[MAX_ANNOTATION_ENTITIES]
+_PREFERRED_INSTRUCTION_WORD_LIMIT = 120
+_HARD_INSTRUCTION_WORD_LIMIT = 180
 
 SYSTEM_PROMPT = f"""You annotate a complete video for a V3 training-data pipeline.
 
@@ -81,8 +82,10 @@ directly with visible content and describes the target video naturally. It is
 not an imperative request: do not write "Use the reference image", "Generate",
 "Create", or a references section. Describe actions and shot changes in
 chronological order. Include visible subject appearance, action, scene,
-composition, camera behavior, and lighting without repetition. Prefer 60 to 110
-English content words and never exceed 120; internal markers do not count.
+composition, camera behavior, and lighting without repetition. Prefer roughly
+60 to 120 English content words. Longer descriptions are allowed when needed for
+complete chronology, multiple entities, or shot changes, but never exceed 180
+English content words; internal markers do not count.
 Describe only directly visible content. Do not infer identity,
 weather, emotion, allegiance, intent, mental state, sound, dialogue, or event
 causes. Describe visible motion directly without assigning an unseen cause.
@@ -323,71 +326,12 @@ def _marker_position_issue(
     return None
 
 
-def _annotation_marker_issues(
+def _annotation_marker_hard_issues(
     *,
     template: str,
-    raw_entities: object,
-    raw_background: object,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    entity_count = len(raw_entities) if isinstance(raw_entities, list) else 0
     entity_matches = list(_ENTITY_MARKER.finditer(template))
-    entity_indexes = [int(match.group(1)) for match in entity_matches]
-
-    for expected_index in range(1, entity_count + 1):
-        count = entity_indexes.count(expected_index)
-        if count == 0:
-            issues.append(
-                ValidationIssue(
-                    code="missing_entity_marker",
-                    field="instruction_template",
-                    message=f"instruction_template is missing {{{{entity_{expected_index}}}}}",
-                )
-            )
-        elif count > 1:
-            issues.append(
-                ValidationIssue(
-                    code="duplicate_entity_marker",
-                    field="instruction_template",
-                    message=f"{{{{entity_{expected_index}}}}} must appear exactly once",
-                )
-            )
-    for index in sorted(set(entity_indexes)):
-        if index > entity_count:
-            issues.append(
-                ValidationIssue(
-                    code="unexpected_entity_marker",
-                    field="instruction_template",
-                    message=f"unexpected entity marker: {{{{entity_{index}}}}}",
-                )
-            )
-
-    background_count = len(_BACKGROUND_MARKER.findall(template))
-    if raw_background is not None and background_count == 0:
-        issues.append(
-            ValidationIssue(
-                code="background_marker_missing",
-                field="instruction_template",
-                message="non-null background requires {{background}} exactly once",
-            )
-        )
-    elif raw_background is not None and background_count > 1:
-        issues.append(
-            ValidationIssue(
-                code="duplicate_background_marker",
-                field="instruction_template",
-                message="{{background}} must appear exactly once",
-            )
-        )
-    elif raw_background is None and background_count:
-        issues.append(
-            ValidationIssue(
-                code="unexpected_background_marker",
-                field="instruction_template",
-                message="null background forbids {{background}}",
-            )
-        )
-
     recognized_spans = {
         match.span() for match in [*entity_matches, *_BACKGROUND_MARKER.finditer(template)]
     }
@@ -432,17 +376,82 @@ def _annotation_marker_issues(
                 message="annotation must not contain <ref_...> tokens",
             )
         )
+    return issues
 
-    for match in [*entity_matches, *_BACKGROUND_MARKER.finditer(template)]:
-        position_issue = _marker_position_issue(
+
+@dataclass(frozen=True)
+class _MarkerEligibility:
+    entity_source_indexes: tuple[int, ...]
+    background_eligible: bool
+    warnings: tuple[str, ...]
+
+
+def _inspect_recognizable_markers(
+    *,
+    template: str,
+    raw_entities: object,
+    raw_background: object,
+) -> _MarkerEligibility:
+    entity_count = len(raw_entities) if isinstance(raw_entities, list) else 0
+    matches_by_index: dict[int, list[re.Match[str]]] = {}
+    for match in _ENTITY_MARKER.finditer(template):
+        matches_by_index.setdefault(int(match.group(1)), []).append(match)
+
+    eligible_indexes: list[int] = []
+    warnings: list[str] = []
+    for source_index in range(1, entity_count + 1):
+        matches = matches_by_index.get(source_index, [])
+        if not matches:
+            warnings.append(f"dropped_entity_missing_marker:{source_index}")
+            continue
+        if len(matches) > 1:
+            warnings.append(f"dropped_entity_duplicate_marker:{source_index}")
+            continue
+        match = matches[0]
+        if _marker_position_issue(
             template=template,
             start=match.start(),
             end=match.end(),
             marker=match.group(0),
-        )
-        if position_issue is not None:
-            issues.append(position_issue)
-    return issues
+        ) is not None:
+            warnings.append(
+                f"dropped_entity_invalid_marker_position:{source_index}"
+            )
+            continue
+        eligible_indexes.append(source_index)
+
+    for source_index in sorted(matches_by_index):
+        if source_index > entity_count:
+            warnings.append(
+                f"removed_unexpected_entity_marker:{source_index}"
+            )
+
+    background_matches = list(_BACKGROUND_MARKER.finditer(template))
+    background_eligible = False
+    if raw_background is None:
+        if background_matches:
+            warnings.append("removed_unexpected_background_marker")
+    elif not background_matches:
+        warnings.append("dropped_background_missing_marker")
+    elif len(background_matches) > 1:
+        warnings.append("dropped_background_duplicate_marker")
+    else:
+        match = background_matches[0]
+        if _marker_position_issue(
+            template=template,
+            start=match.start(),
+            end=match.end(),
+            marker=match.group(0),
+        ) is not None:
+            warnings.append("dropped_background_invalid_marker_position")
+        else:
+            background_eligible = True
+
+    return _MarkerEligibility(
+        entity_source_indexes=tuple(eligible_indexes),
+        background_eligible=background_eligible,
+        warnings=tuple(warnings),
+    )
 
 
 def _sanitize_entity_candidates_with_indices(
@@ -544,19 +553,52 @@ def _rewrite_markers_after_sanitization(
         )
     }
 
-    def replace_entity(match: re.Match[str]) -> str:
-        source_index = int(match.group(1))
-        final_index = final_indexes.get(source_index)
-        return "" if final_index is None else f" {{{{entity_{final_index}}}}}"
-
-    rewritten = re.sub(
-        r" \{\{entity_([1-9]\d*)\}\}",
-        replace_entity,
-        template,
-    )
+    replacements: list[tuple[int, int, str | None]] = []
+    for match in _ENTITY_MARKER.finditer(template):
+        final_index = final_indexes.get(int(match.group(1)))
+        replacement = (
+            None if final_index is None else f"{{{{entity_{final_index}}}}}"
+        )
+        replacements.append((match.start(), match.end(), replacement))
     if not keep_background:
-        rewritten = rewritten.replace(" {{background}}", "")
-    return rewritten
+        replacements.extend(
+            (match.start(), match.end(), None)
+            for match in _BACKGROUND_MARKER.finditer(template)
+        )
+
+    rewritten = template
+    for start, end, replacement in sorted(replacements, reverse=True):
+        if replacement is not None:
+            rewritten = f"{rewritten[:start]}{replacement}{rewritten[end:]}"
+            continue
+        rewritten = _remove_recognizable_marker(
+            rewritten,
+            start=start,
+            end=end,
+        )
+    return rewritten.strip()
+
+
+def _remove_recognizable_marker(
+    value: str,
+    *,
+    start: int,
+    end: int,
+) -> str:
+    left = value[:start]
+    right = value[end:]
+    if left.endswith(" "):
+        left = left.rstrip(" ")
+        if right.startswith(" "):
+            return f"{left} {right.lstrip(' ')}"
+        if right and right[0] not in _PHRASE_EDGE_PUNCTUATION:
+            return f"{left} {right}"
+        return f"{left}{right}"
+    if not left:
+        return right.lstrip(" ")
+    if right and left[-1].isalnum() and right[0].isalnum():
+        return f"{left} {right}"
+    return f"{left}{right}"
 
 
 def sanitize_background(
@@ -596,6 +638,7 @@ def sanitize_annotation_payload(
         raw_payload.get("instruction_template")
     )
     issues: list[ValidationIssue] = []
+    warnings: list[str] = []
     if template is None:
         issues.append(
             ValidationIssue(
@@ -605,17 +648,23 @@ def sanitize_annotation_payload(
             )
         )
     else:
-        plain_text = plain_instruction_text(template)
-        if _english_word_count(plain_text) > 120:
+        plain_text = _ENTITY_MARKER.sub("", template)
+        plain_text = _BACKGROUND_MARKER.sub("", plain_text)
+        word_count = _english_word_count(plain_text)
+        if word_count > _HARD_INSTRUCTION_WORD_LIMIT:
             issues.append(
                 ValidationIssue(
-                    code="caption_too_long",
+                    code="instruction_template_too_long",
                     field="instruction_template",
                     message=(
-                        "instruction_template must not exceed 120 English "
+                        "instruction_template must not exceed 180 English "
                         "content words"
                     ),
                 )
+            )
+        elif word_count > _PREFERRED_INSTRUCTION_WORD_LIMIT:
+            warnings.append(
+                f"instruction_template_over_preferred_length:{word_count}"
             )
         inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(plain_text)
         if inference_match is not None:
@@ -631,24 +680,49 @@ def sanitize_annotation_payload(
                 )
             )
         issues.extend(
-            _annotation_marker_issues(
+            _annotation_marker_hard_issues(
                 template=template,
-                raw_entities=raw_payload.get("entities", []),
-                raw_background=raw_payload.get("background"),
             )
         )
     issues.extend(_entity_text_issues(raw_payload.get("entities", [])))
     if issues:
         return None, issues, ()
 
+    marker_eligibility = _inspect_recognizable_markers(
+        template=template,
+        raw_entities=raw_payload.get("entities", []),
+        raw_background=raw_payload.get("background"),
+    )
     entities, entity_warnings, accepted_source_indexes = (
         _sanitize_entity_candidates_with_indices(
         raw_payload.get("entities", [])
         )
     )
+    marker_eligible_indexes = set(marker_eligibility.entity_source_indexes)
+    accepted_pairs = [
+        (source_index, entity)
+        for source_index, entity in zip(
+            accepted_source_indexes,
+            entities,
+            strict=True,
+        )
+        if source_index in marker_eligible_indexes
+    ]
+    accepted_source_indexes = tuple(
+        source_index for source_index, _entity in accepted_pairs
+    )
+    entities = [
+        entity.model_copy(update={"entity_id": f"e{index}"})
+        for index, (_source_index, entity) in enumerate(
+            accepted_pairs,
+            start=1,
+        )
+    ]
     background, background_warnings = sanitize_background(
         raw_payload.get("background")
     )
+    if not marker_eligibility.background_eligible:
+        background = None
     template = _rewrite_markers_after_sanitization(
         template,
         accepted_source_indexes=accepted_source_indexes,
@@ -663,7 +737,12 @@ def sanitize_annotation_payload(
             background=background,
         ),
         [],
-        (*entity_warnings, *background_warnings),
+        (
+            *warnings,
+            *marker_eligibility.warnings,
+            *entity_warnings,
+            *background_warnings,
+        ),
     )
 
 
