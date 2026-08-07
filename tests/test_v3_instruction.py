@@ -29,6 +29,7 @@ from r2v_data_v2.v3.instruction import (
     source_transcript_from_metadata,
     validate_instruction_output,
 )
+from r2v_data_v2.v3.phrase_anchor import find_legacy_caption_phrase_span
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
@@ -545,6 +546,88 @@ def test_deterministic_instruction_uses_first_repeated_phrase_occurrence(
     assert instruction.reference_legend[0].description == "stable visible subject"
 
 
+@pytest.mark.parametrize(
+    ("caption", "phrase", "expected_span"),
+    [
+        (
+            "A bald man in a light brown robe sits cross-legged.",
+            "bald man in light brown robe",
+            "bald man in a light brown robe",
+        ),
+        (
+            "A scuba diver enters the water. The diver wears a black wetsuit.",
+            "scuba diver in black wetsuit",
+            "scuba diver",
+        ),
+        (
+            "A bald man in a dark gray button-up shirt stands outside.",
+            "bald man in dark gray shirt",
+            "bald man in a dark gray button-up shirt",
+        ),
+        (
+            "A man in elaborate golden armor with wing-like shoulder pieces waits.",
+            "man in ornate golden armor with winged shoulders",
+            "golden armor",
+        ),
+        (
+            "A man in a beige cap, sunglasses on the cap, and a black shirt walks.",
+            "man in beige cap and black shirt",
+            "man in a beige cap, sunglasses on the cap, and a black shirt",
+        ),
+        (
+            "The altar holds a statue beneath a large arched mural.",
+            "large arched mural behind altar",
+            "large arched mural",
+        ),
+        (
+            "Several figures surround a large ornate lantern structure.",
+            "ornate multi-tiered lantern structure",
+            "lantern structure",
+        ),
+    ],
+)
+def test_legacy_phrase_alignment_selects_conservative_caption_span(
+    caption: str,
+    phrase: str,
+    expected_span: str,
+) -> None:
+    span = find_legacy_caption_phrase_span(phrase=phrase, caption=caption)
+
+    assert span is not None
+    assert caption[slice(*span)] == expected_span
+
+
+def test_deterministic_instruction_uses_legacy_span_for_existing_annotation() -> None:
+    binding = InstructionBinding(
+        image_id="image_1",
+        image_index=1,
+        reference_type="subject",
+        entity_id="e1",
+        phrase="bald man in light brown robe",
+        grounding_prompt="bald man wearing a light brown robe and dark beads",
+    )
+
+    instruction = build_deterministic_instruction(
+        t2v_caption="A bald man in a light brown robe sits cross-legged.",
+        bindings=[binding],
+    )
+
+    assert instruction.r2v_instruction == (
+        "A bald man in a light brown robe <Image 1> sits cross-legged."
+    )
+
+
+def test_legacy_phrase_alignment_fails_when_evidence_is_missing_or_ambiguous() -> None:
+    assert find_legacy_caption_phrase_span(
+        phrase="man in dark gray t-shirt",
+        caption="Four men sit around a table in casual shirts.",
+    ) is None
+    assert find_legacy_caption_phrase_span(
+        phrase="red bicycle with basket",
+        caption="A red bicycle waits beside another red bicycle.",
+    ) is None
+
+
 def test_deterministic_instruction_rejects_conflicting_same_span_bindings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -604,7 +687,7 @@ def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
             bindings=[binding],
         )
     missing = binding.model_copy(update={"grounding_prompt": "visible subject"})
-    with pytest.raises(ValueError, match="not an exact caption span"):
+    with pytest.raises(ValueError, match="cannot be anchored to caption"):
         build_deterministic_instruction(
             t2v_caption="A bicycle moves.",
             bindings=[missing],

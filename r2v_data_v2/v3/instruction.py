@@ -14,7 +14,10 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig, V3Config
-from r2v_data_v2.v3.phrase_anchor import find_caption_phrase_spans
+from r2v_data_v2.v3.phrase_anchor import (
+    find_caption_phrase_spans,
+    find_legacy_caption_phrase_span,
+)
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
     model_profile_context,
@@ -181,11 +184,15 @@ def build_deterministic_instruction(
             phrase=binding.phrase,
             caption=caption,
         )
-        if not spans:
+        span = spans[0] if spans else find_legacy_caption_phrase_span(
+            phrase=binding.phrase,
+            caption=caption,
+        )
+        if span is None:
             raise ValueError(
-                f"binding {binding.image_id} phrase is not an exact caption span"
+                f"binding {binding.image_id} phrase cannot be anchored to caption"
             )
-        start, end = spans[0]
+        start, end = span
         for existing_start, existing_end, existing_binding in anchors:
             if start < existing_end and existing_start < end:
                 raise ValueError(
