@@ -219,6 +219,9 @@ def _rejected_reference(
         completion_needed_for_reference_use=(
             reference.completion_needed_for_reference_use
         ),
+        detached_target_fragments_present=(
+            reference.detached_target_fragments_present
+        ),
     )
 
 
@@ -279,6 +282,9 @@ def _accepted_reference(
         mask_matches_target=reference.mask_matches_target,
         completion_needed_for_reference_use=(
             reference.completion_needed_for_reference_use
+        ),
+        detached_target_fragments_present=(
+            reference.detached_target_fragments_present
         ),
         synthetic=True,
         generation_metadata_path=storage.relative_artifact_path(metadata_path),

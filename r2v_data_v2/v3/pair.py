@@ -843,6 +843,7 @@ def validate_entity_reference_artifact(
         "discrete_foreground_instance",
         "mask_matches_target",
         "completion_needed_for_reference_use",
+        "detached_target_fragments_present",
         "source_frame_index",
     )
     if any(
@@ -900,6 +901,11 @@ def _rejected_reference(
         ),
         completion_needed_for_reference_use=(
             decision.completion_needed_for_reference_use
+            if decision is not None
+            else None
+        ),
+        detached_target_fragments_present=(
+            decision.detached_target_fragments_present
             if decision is not None
             else None
         ),
@@ -1506,6 +1512,9 @@ def _run_same_parent_cross_pair_fallback(
                             completion_needed_for_reference_use=(
                                 donor_state.completion_needed_for_reference_use
                             ),
+                            detached_target_fragments_present=(
+                                donor_state.detached_target_fragments_present
+                            ),
                             image_path=storage.relative_artifact_path(
                                 storage.selected_entity_path(
                                     target_clip.clip_uid,
@@ -1758,6 +1767,9 @@ def pair_clips(
                         decision,
                         candidate_ids={item.candidate_id for item in candidates},
                         reference_type=entity.reference_type,
+                        candidate_by_id={
+                            item.candidate_id: item for item in candidates
+                        },
                     )
                     if decision_issues:
                         messages = "; ".join(issue.message for issue in decision_issues)
@@ -1794,6 +1806,9 @@ def pair_clips(
                                 mask_matches_target=decision.mask_matches_target,
                                 completion_needed_for_reference_use=(
                                     decision.completion_needed_for_reference_use
+                                ),
+                                detached_target_fragments_present=(
+                                    decision.detached_target_fragments_present
                                 ),
                                 synthetic=False,
                             )
@@ -1876,6 +1891,9 @@ def pair_clips(
                             mask_matches_target=decision.mask_matches_target,
                             completion_needed_for_reference_use=(
                                 decision.completion_needed_for_reference_use
+                            ),
+                            detached_target_fragments_present=(
+                                decision.detached_target_fragments_present
                             ),
                         )
                     )

@@ -106,13 +106,34 @@ such as a clipped hand or foot terminal, short limb edge, or small object edge,
 whose repair is necessary for reference use without guessing identity or major
 structure. Minor truncation does not automatically mean repairable.
 
+Natural local framing and detached target fragments are different. A coherent
+portrait or upper-body crop can be local_usable when the lower body is simply
+outside the camera framing and no detached target body parts remain elsewhere
+in the mask. If the isolated crop contains non-trivial pieces of the same target
+that are visibly separated from the main body or object, such as floating legs,
+hands, limbs, or clothing/body pieces, this is not natural local framing. Do not
+call a crop local_usable merely because its largest component forms a good
+portrait when non-trivial detached pieces of the same subject remain elsewhere
+in the isolated crop.
+
+When identity and most major structure remain and detached pieces are limited
+and repairable, set detached_target_fragments_present=true,
+truncation_severity=minor, completion_needed_for_reference_use=true, and
+completeness=repairable. Reject when fragmentation or missing structure is
+extensive. Transparent background, natural holes, tiny noise, and naturally
+separate members of a group are not detached target fragments. Use
+significant_component_count, largest_component_ratio,
+second_largest_component_ratio, and nontrivial_detached_component_signal as
+supporting evidence.
+
 Do not output tokens or crop coordinates. Return one strict JSON object only
 with selected_candidate_id, image_quality, completeness, reference_scope,
 visible_region, whole_entity_recognizable, identity_features_visible,
 viewpoint, independent_reference_value, requires_substantial_invention,
 primary_identity_region_visible, major_structure_visible,
 truncation_severity, discrete_foreground_instance, mask_matches_target,
-completion_needed_for_reference_use, and scope_reason."""
+completion_needed_for_reference_use, detached_target_fragments_present, and
+scope_reason."""
 
 
 @dataclass(frozen=True)
@@ -143,6 +164,16 @@ def _png_data_url(image: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def subject_has_nontrivial_detached_component(
+    candidate: EntityReferenceCandidate,
+) -> bool:
+    return (
+        candidate.significant_component_count >= 2
+        and 0.05 <= candidate.second_largest_component_ratio <= 0.20
+        and candidate.largest_component_ratio >= 0.70
+    )
+
+
 def build_entity_reference_request_payload(
     entity: AnnotationEntity,
     candidates: list[EntityReferenceCandidate],
@@ -168,6 +199,10 @@ def build_entity_reference_request_payload(
                 "second_largest_component_ratio": (
                     candidate.second_largest_component_ratio
                 ),
+                "nontrivial_detached_component_signal": (
+                    entity.reference_type == "subject"
+                    and subject_has_nontrivial_detached_component(candidate)
+                ),
             }
             for candidate in candidates
         ],
@@ -179,6 +214,7 @@ def validate_entity_reference_decision(
     *,
     candidate_ids: set[str],
     reference_type: str,
+    candidate_by_id: dict[str, EntityReferenceCandidate] | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     selected = decision.selected_candidate_id
@@ -190,6 +226,16 @@ def validate_entity_reference_decision(
                 message=f"unknown candidate ID: {selected}",
             )
         )
+    selected_candidate = (
+        candidate_by_id.get(selected)
+        if candidate_by_id is not None and selected is not None
+        else None
+    )
+    selected_subject_has_detached_signal = (
+        reference_type == "subject"
+        and selected_candidate is not None
+        and subject_has_nontrivial_detached_component(selected_candidate)
+    )
     expected_scope = {
         "complete": "full",
         "repairable": "local",
@@ -355,6 +401,31 @@ def validate_entity_reference_decision(
             )
         )
     if (
+        decision.completeness == "complete"
+        and decision.detached_target_fragments_present
+    ):
+        issues.append(
+            ValidationIssue(
+                code="complete_has_detached_target_fragments",
+                field="detached_target_fragments_present",
+                message="complete reference cannot contain detached target fragments",
+            )
+        )
+    if (
+        decision.completeness == "complete"
+        and selected_subject_has_detached_signal
+    ):
+        issues.append(
+            ValidationIssue(
+                code="complete_has_detached_subject_fragments",
+                field="selected_candidate_id",
+                message=(
+                    "complete subject cannot select a candidate with a "
+                    "non-trivial detached component"
+                ),
+            )
+        )
+    if (
         decision.completeness == "local_usable"
         and decision.completion_needed_for_reference_use
     ):
@@ -363,6 +434,33 @@ def validate_entity_reference_decision(
                 code="local_usable_must_not_need_completion",
                 field="completion_needed_for_reference_use",
                 message="local_usable reference cannot require completion",
+            )
+        )
+    if (
+        decision.completeness == "local_usable"
+        and decision.detached_target_fragments_present
+    ):
+        issues.append(
+            ValidationIssue(
+                code="local_usable_has_detached_target_fragments",
+                field="detached_target_fragments_present",
+                message=(
+                    "local_usable reference cannot contain detached target fragments"
+                ),
+            )
+        )
+    if (
+        decision.completeness == "local_usable"
+        and selected_subject_has_detached_signal
+    ):
+        issues.append(
+            ValidationIssue(
+                code="local_usable_has_detached_subject_fragments",
+                field="selected_candidate_id",
+                message=(
+                    "local_usable subject cannot select a candidate with a "
+                    "non-trivial detached component"
+                ),
             )
         )
     if (
@@ -586,6 +684,10 @@ class QwenEntityReferenceJudge:
                     decision,
                     candidate_ids=set(candidate_ids),
                     reference_type=entity.reference_type,
+                    candidate_by_id={
+                        candidate.candidate_id: candidate
+                        for candidate in candidates
+                    },
                 )
             if decision is not None and not issues:
                 return EntityReferenceDecisionAttempt(

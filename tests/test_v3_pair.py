@@ -60,6 +60,7 @@ from r2v_data_v2.v3.reference_edit_boogu import (
 )
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
+    subject_has_nontrivial_detached_component,
 )
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
@@ -368,6 +369,7 @@ def _decision(
             discrete_foreground_instance=False,
             mask_matches_target=False,
             completion_needed_for_reference_use=False,
+            detached_target_fragments_present=False,
             scope_reason="not reusable",
         )
     completeness = (
@@ -395,6 +397,7 @@ def _decision(
         discrete_foreground_instance=True,
         mask_matches_target=True,
         completion_needed_for_reference_use=(completeness == "repairable"),
+        detached_target_fragments_present=(completeness == "repairable"),
         scope_reason="clear visual identity",
     )
 
@@ -733,6 +736,34 @@ def test_large_secondary_mask_component_is_severely_fragmented() -> None:
     assert diagnostics.severely_fragmented is True
 
 
+def test_nontrivial_subject_component_signal_stays_below_severe_gate() -> None:
+    candidate = pair_module.EntityReferenceCandidate(
+        candidate_id="candidate_1",
+        entity_id="e1",
+        frame_slot=5,
+        source_frame_index=50,
+        image_path="clips/clip-1/frames/05.jpg",
+        mask=np.ones((4, 4), dtype=bool),
+        bbox_xyxy=(0, 0, 4, 4),
+        area_pixels=16,
+        area_ratio=0.25,
+        bbox_fill_ratio=1.0,
+        border_contact_count=0,
+        normalized_center_distance=0.0,
+        significant_component_count=2,
+        largest_component_ratio=0.88,
+        second_largest_component_ratio=0.10,
+    )
+    diagnostics = pair_module.MaskComponentDiagnostics(
+        significant_component_count=candidate.significant_component_count,
+        largest_component_ratio=candidate.largest_component_ratio,
+        second_largest_component_ratio=candidate.second_largest_component_ratio,
+    )
+
+    assert diagnostics.severely_fragmented is False
+    assert subject_has_nontrivial_detached_component(candidate) is True
+
+
 def test_largest_component_below_threshold_is_severely_fragmented() -> None:
     mask = np.zeros((30, 40), dtype=bool)
     mask[1:6, 1:14] = True
@@ -872,6 +903,7 @@ def test_pair_does_not_publish_candidate_without_independent_reference_value(
                     discrete_foreground_instance=False,
                     mask_matches_target=False,
                     completion_needed_for_reference_use=False,
+                    detached_target_fragments_present=False,
                     scope_reason="The crop is only an environment fragment.",
                 ),
                 raw_responses=("{}",),
@@ -966,6 +998,7 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         assert state.discrete_foreground_instance is True
         assert state.mask_matches_target is True
         assert state.completion_needed_for_reference_use is False
+        assert state.detached_target_fragments_present is False
         validate_entity_reference_artifact(
             config,
             storage,
@@ -1598,6 +1631,10 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
         target_reference.completion_needed_for_reference_use
         == donor.references.entities[0].completion_needed_for_reference_use
     )
+    assert (
+        target_reference.detached_target_fragments_present
+        == donor.references.entities[0].detached_target_fragments_present
+    )
     assert donor.references.entities[0].source_clip_uid == "donor"
     assert donor.references.entities[0].source_entity_id == "e1"
     assert target_path.read_bytes() == donor_path.read_bytes()
@@ -1609,6 +1646,18 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
             target.annotation.entities[0],
             target_reference.model_copy(
                 update={"completion_needed_for_reference_use": True}
+            ),
+            storage.read_frames("target"),
+            storage.read_masks("target"),
+        )
+    with pytest.raises(ValueError, match="did not inherit donor quality fields"):
+        validate_entity_reference_artifact(
+            config,
+            storage,
+            "target",
+            target.annotation.entities[0],
+            target_reference.model_copy(
+                update={"detached_target_fragments_present": True}
             ),
             storage.read_frames("target"),
             storage.read_masks("target"),
@@ -4040,6 +4089,9 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     )
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    source_reference = storage.read_clip("clip-1").references.entities[0]
+    assert source_reference.completion_needed_for_reference_use is True
+    assert source_reference.detached_target_fragments_present is True
     canonical = storage.selected_entity_path("clip-1", "e1")
     canonical_bytes = canonical.read_bytes()
     backend = _ReferenceEditBackend()
@@ -4098,6 +4150,12 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     state = storage.read_clip("clip-1").reference_edit.entities[0]
     assert state.operations == ["complete_entity", "add_entity_background"]
     assert state.background_fallback == "none"
+    assert (
+        storage.read_clip("clip-1")
+        .references.entities[0]
+        .detached_target_fragments_present
+        is True
+    )
     assert canonical.read_bytes() == canonical_bytes
 
 
@@ -4149,6 +4207,7 @@ def test_background_not_better_than_source_uses_keep_source_fallback(
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge())
     source = storage.read_clip("clip-1").references.entities[0]
+    assert source.detached_target_fragments_present is False
     assert source.completion_needed_for_reference_use is False
     source_bytes = (storage.root / source.image_path).read_bytes()
 
@@ -4215,6 +4274,7 @@ def test_local_reference_adds_background_without_promoting_scope(
     )
     assert reference.mask_matches_target == source.mask_matches_target
     assert reference.completion_needed_for_reference_use is False
+    assert reference.detached_target_fragments_present is False
     assert storage.read_clip("clip-1").reference_edit.entities[0].route == (
         "local_usable"
     )
@@ -4618,6 +4678,7 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
     assert state.background_fallback == "completion_candidate"
     assert clip.references.entities[0].synthetic is True
     assert clip.references.entities[0].completion_needed_for_reference_use is True
+    assert clip.references.entities[0].detached_target_fragments_present is True
 
 
 def test_repairable_completion_rejection_overrides_keep_source_policy(

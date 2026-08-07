@@ -449,6 +449,7 @@ def _attempt(
             rank_attempt.decision,
             candidate_ids={"candidate_1"},
             reference_type=entity.reference_type,
+            candidate_by_id={"candidate_1": ranked},
         )
         diagnostics.details["reference_ranking"] = {
             "decision": rank_attempt.decision.model_dump(mode="json"),
@@ -553,6 +554,9 @@ def _attempt(
                 mask_matches_target=decision.mask_matches_target,
                 completion_needed_for_reference_use=(
                     decision.completion_needed_for_reference_use
+                ),
+                detached_target_fragments_present=(
+                    decision.detached_target_fragments_present
                 ),
                 scope_reason=decision.scope_reason,
                 image_path=source_state.image_path,

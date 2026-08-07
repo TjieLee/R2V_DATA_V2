@@ -19,6 +19,7 @@ from r2v_data_v2.v3.reference_judge import (
     EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
     build_entity_reference_request_payload,
+    subject_has_nontrivial_detached_component,
     validate_entity_reference_decision,
 )
 from r2v_data_v2.v3.schemas import (
@@ -37,7 +38,13 @@ def _entity() -> AnnotationEntity:
     )
 
 
-def _candidate(candidate_id: str = "candidate_1") -> EntityReferenceCandidate:
+def _candidate(
+    candidate_id: str = "candidate_1",
+    *,
+    significant_component_count: int = 1,
+    largest_component_ratio: float = 1.0,
+    second_largest_component_ratio: float = 0.0,
+) -> EntityReferenceCandidate:
     mask = np.zeros((5, 6), dtype=bool)
     mask[1:4, 2:5] = True
     return EntityReferenceCandidate(
@@ -53,6 +60,9 @@ def _candidate(candidate_id: str = "candidate_1") -> EntityReferenceCandidate:
         bbox_fill_ratio=1.0,
         border_contact_count=0,
         normalized_center_distance=0.05,
+        significant_component_count=significant_component_count,
+        largest_component_ratio=largest_component_ratio,
+        second_largest_component_ratio=second_largest_component_ratio,
     )
 
 
@@ -74,6 +84,7 @@ def _payload(**updates: object) -> dict[str, object]:
         "discrete_foreground_instance": True,
         "mask_matches_target": True,
         "completion_needed_for_reference_use": False,
+        "detached_target_fragments_present": False,
         "scope_reason": "The whole entity and identity are visible.",
     }
     result.update(updates)
@@ -122,6 +133,7 @@ def test_raw_decision_schema_is_strict(
         "discrete_foreground_instance",
         "mask_matches_target",
         "completion_needed_for_reference_use",
+        "detached_target_fragments_present",
     ],
 )
 def test_new_reference_gate_fields_are_required(field: str) -> None:
@@ -443,6 +455,153 @@ def test_repairable_minor_and_complete_none_are_valid() -> None:
 
 
 @pytest.mark.parametrize(
+    (
+        "significant_component_count",
+        "largest_component_ratio",
+        "second_largest_component_ratio",
+        "expected",
+    ),
+    [
+        (1, 1.0, 0.0, False),
+        (2, 0.95, 0.03, False),
+        (2, 0.88, 0.10, True),
+    ],
+)
+def test_subject_detached_component_signal_uses_nontrivial_gray_zone(
+    significant_component_count: int,
+    largest_component_ratio: float,
+    second_largest_component_ratio: float,
+    expected: bool,
+) -> None:
+    candidate = _candidate(
+        significant_component_count=significant_component_count,
+        largest_component_ratio=largest_component_ratio,
+        second_largest_component_ratio=second_largest_component_ratio,
+    )
+
+    assert subject_has_nontrivial_detached_component(candidate) is expected
+
+
+@pytest.mark.parametrize(
+    ("completeness", "expected_code"),
+    [
+        ("complete", "complete_has_detached_target_fragments"),
+        ("local_usable", "local_usable_has_detached_target_fragments"),
+    ],
+)
+def test_non_repair_routes_reject_declared_detached_target_fragments(
+    completeness: str,
+    expected_code: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness=completeness,
+            reference_scope="full" if completeness == "complete" else "local",
+            visible_region="whole" if completeness == "complete" else "upper_body",
+            detached_target_fragments_present=True,
+        )
+    )
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    assert expected_code in {issue.code for issue in issues}
+
+
+def test_repairable_route_accepts_limited_detached_target_fragments() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="upper_body",
+            truncation_severity="minor",
+            completion_needed_for_reference_use=True,
+            detached_target_fragments_present=True,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
+
+
+def test_selected_subject_fragment_signal_blocks_local_usable() -> None:
+    candidate = _candidate(
+        significant_component_count=2,
+        largest_component_ratio=0.88,
+        second_largest_component_ratio=0.10,
+    )
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="local_usable",
+            reference_scope="local",
+            visible_region="upper_body",
+        )
+    )
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={candidate.candidate_id},
+        reference_type="subject",
+        candidate_by_id={candidate.candidate_id: candidate},
+    )
+
+    assert "local_usable_has_detached_subject_fragments" in {
+        issue.code for issue in issues
+    }
+
+
+def test_selected_subject_fragment_signal_blocks_complete() -> None:
+    candidate = _candidate(
+        significant_component_count=2,
+        largest_component_ratio=0.88,
+        second_largest_component_ratio=0.10,
+    )
+    decision = RawEntityReferenceDecision.model_validate(_payload())
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={candidate.candidate_id},
+        reference_type="subject",
+        candidate_by_id={candidate.candidate_id: candidate},
+    )
+
+    assert "complete_has_detached_subject_fragments" in {
+        issue.code for issue in issues
+    }
+
+
+def test_selected_subject_fragment_signal_allows_repairable_route() -> None:
+    candidate = _candidate(
+        significant_component_count=2,
+        largest_component_ratio=0.88,
+        second_largest_component_ratio=0.10,
+    )
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="upper_body",
+            truncation_severity="minor",
+            completion_needed_for_reference_use=True,
+            detached_target_fragments_present=True,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={candidate.candidate_id},
+        reference_type="subject",
+        candidate_by_id={candidate.candidate_id: candidate},
+    ) == []
+
+
+@pytest.mark.parametrize(
     ("updates", "expected_code"),
     [
         (
@@ -580,6 +739,35 @@ def test_small_real_defect_can_route_to_repairable(
 
 
 @pytest.mark.parametrize(
+    "scope_reason",
+    [
+        "A clear upper body remains with detached trouser and leg pieces.",
+        "A clear upper body remains with one small detached hand.",
+    ],
+)
+def test_limited_detached_subject_parts_route_to_repairable(
+    scope_reason: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="upper_body",
+            truncation_severity="minor",
+            completion_needed_for_reference_use=True,
+            detached_target_fragments_present=True,
+            scope_reason=scope_reason,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
+
+
+@pytest.mark.parametrize(
     ("viewpoint", "scope_reason"),
     [
         ("front", "The head is missing."),
@@ -696,6 +884,7 @@ def test_legacy_reference_state_without_new_judge_fields_loads() -> None:
     assert legacy.discrete_foreground_instance is None
     assert legacy.mask_matches_target is None
     assert legacy.completion_needed_for_reference_use is None
+    assert legacy.detached_target_fragments_present is None
 
 
 @pytest.mark.parametrize("status", ["ready", "rejected"])
@@ -717,6 +906,7 @@ def test_reference_state_persists_new_judge_fields(status: str) -> None:
         "discrete_foreground_instance": status == "ready",
         "mask_matches_target": status == "ready",
         "completion_needed_for_reference_use": False,
+        "detached_target_fragments_present": status == "rejected",
     }
     if status == "ready":
         payload.update(
@@ -736,6 +926,7 @@ def test_reference_state_persists_new_judge_fields(status: str) -> None:
     assert restored.discrete_foreground_instance is (status == "ready")
     assert restored.mask_matches_target is (status == "ready")
     assert restored.completion_needed_for_reference_use is False
+    assert restored.detached_target_fragments_present is (status == "rejected")
 
 
 def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
@@ -753,6 +944,8 @@ def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
         "upper-body",
         "whole body is not visible",
         "completion_needed_for_reference_use",
+        "detached target fragments",
+        "nontrivial_detached_component_signal",
         "minor truncation does not automatically mean repairable",
     ):
         assert phrase in lowered
@@ -780,9 +973,69 @@ def test_request_payload_contains_only_required_evidence() -> None:
                 "significant_component_count": 1,
                 "largest_component_ratio": 1.0,
                 "second_largest_component_ratio": 0.0,
+                "nontrivial_detached_component_signal": False,
             }
         ],
     }
+
+
+def test_request_payload_exposes_subject_fragment_signal_but_not_group_signal() -> None:
+    candidate = _candidate(
+        significant_component_count=2,
+        largest_component_ratio=0.88,
+        second_largest_component_ratio=0.10,
+    )
+
+    subject_payload = build_entity_reference_request_payload(_entity(), [candidate])
+    group_payload = build_entity_reference_request_payload(
+        _entity().model_copy(update={"reference_type": "group"}),
+        [candidate],
+    )
+
+    assert subject_payload["candidates"][0][
+        "nontrivial_detached_component_signal"
+    ] is True
+    assert group_payload["candidates"][0][
+        "nontrivial_detached_component_signal"
+    ] is False
+
+
+def test_subject_fragment_signal_enters_existing_structured_repair_lifecycle() -> None:
+    candidate = _candidate(
+        significant_component_count=2,
+        largest_component_ratio=0.88,
+        second_largest_component_ratio=0.10,
+    )
+    completions = _Completions(
+        [
+            _payload(
+                completeness="local_usable",
+                reference_scope="local",
+                visible_region="upper_body",
+            ),
+            _payload(
+                completeness="repairable",
+                reference_scope="local",
+                visible_region="upper_body",
+                truncation_severity="minor",
+                completion_needed_for_reference_use=True,
+                detached_target_fragments_present=True,
+            ),
+        ]
+    )
+    judge = _judge(completions)
+
+    attempt = judge.decide(
+        entity=_entity(),
+        candidates=[candidate],
+        source_images=_source_images(),
+    )
+
+    assert attempt.repair_attempts == 1
+    assert attempt.decision.completeness == "repairable"
+    assert attempt.decision.detached_target_fragments_present is True
+    repair_text = completions.calls[1]["messages"][1]["content"][0]["text"]
+    assert "local_usable_has_detached_subject_fragments" in repair_text
 
 
 class _Completions:

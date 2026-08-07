@@ -302,6 +302,14 @@ are significant. If this removes every non-tiny candidate, the reason is
 `fragmented_reference_candidates`. Groups retain the diagnostics but bypass
 this hard fragmentation gate.
 
+For subjects only, a non-severe deterministic signal marks the gray zone where
+the main component remains dominant but a non-trivial secondary component may
+be a detached part of the same target. The signal is true when significant
+component count is at least two, largest-component ratio is at least `0.70`,
+and second-largest-component ratio is from `0.05` through `0.20`, inclusive.
+It is included in the existing Qwen request and never rejects a candidate by
+itself. Object and group candidates do not use this deterministic signal.
+
 The existing single Qwen candidate judgment also reports whether the primary
 identity region and major structure are visible, whether the crop is a discrete
 foreground instance, whether the mask matches the target, and whether
@@ -310,10 +318,14 @@ truncation is `none`, `minor`, or `major`. It separately reports
 strictly necessary before the visible crop can serve as a training reference.
 Code rejects any non-reject result with a failed evidence boolean or major
 truncation. `complete` requires no truncation and no completion. `local_usable`
-allows none or minor truncation but must not need completion. `repairable`
-requires both minor truncation and completion necessity. These optional fields
-are persisted in reference state for audit while legacy clip JSON without them
-remains readable.
+allows none or minor truncation but must not need completion or contain detached
+target fragments. A selected subject carrying the deterministic detached-part
+signal cannot publish as `complete` or `local_usable`; the existing structured
+repair retry asks Qwen to correct the route. `repairable` requires minor
+truncation and completion necessity, and may explicitly report
+`detached_target_fragments_present=true` when identity and major structure are
+preserved. These optional state fields are persisted for audit while legacy
+clip JSON without them remains readable.
 
 #### `reference_edit`
 
@@ -577,13 +589,16 @@ natural local framing: a coherent head-and-shoulders, upper-body, waist-up,
 side, three-quarter, or similarly identity-bearing region can be independently
 reusable even when the rest of the physical entity is outside the camera frame.
 Partial body visibility alone is not a defect, and minor truncation does not by
-itself imply completion. `repairable` is limited to a minor local low-risk
-omission, such as a clipped hand or foot terminal, short limb edge, or small
-object part, when the omission genuinely prevents reference use and completion
-does not require guessing identity or major structure. Missing identity, the
-head, most of a body or garment, torso-only/back-only fragments, or any repair
-requiring major invention is `severely_incomplete` and rejects. Bad masks,
-environment fragments, and non-target content are `fragmented` and reject.
+itself imply completion. This natural framing requires a coherent visible region
+without non-trivial pieces of the same target detached elsewhere in the mask.
+`repairable` is limited to a minor local low-risk omission or detached target
+part, such as a clipped hand or foot terminal, short limb edge, detached hand or
+trouser piece, or small object part, when the source still preserves identity
+and major structure and repair does not require guessing them. Missing identity,
+the head, most of a body or garment, torso-only/back-only fragments, or any
+repair requiring major invention is `severely_incomplete` and rejects. Bad
+masks, environment fragments, and non-target content are `fragmented` and
+reject.
 
 ### 8.3 `reject`
 
@@ -598,7 +613,11 @@ Reject when:
 
 Qwen provides semantic scope judgment. Code validates geometry and existing hard gates.
 
-Connected-component count is diagnostic only. It must not independently decide full/local/reject because many valid objects naturally have separated or thin parts.
+Connected-component count alone is diagnostic only because many valid objects
+naturally have separated or thin parts. The bounded subject-only signal combines
+count with largest and second-largest component ratios, and only prevents direct
+`complete` or `local_usable` publication; it does not hard reject or rewrite the
+semantic decision.
 
 ### 8.5 Optional generated fallback
 
@@ -1420,7 +1439,8 @@ python -m ruff check .
 Include fixtures for:
 
 1. a mostly complete picnic table with one clipped peripheral seat -> `full`;
-2. a person with coherent upper body and disconnected lower fragments -> `local`, `upper_body`;
+2. a person with a coherent upper body and non-trivial detached lower fragments
+   -> `repairable`, `upper_body`, completion required;
 3. a mask with only tiny disconnected fragments and no identity features -> `reject`;
 4. a thin valid object with multiple natural components -> not rejected solely for component count.
 
