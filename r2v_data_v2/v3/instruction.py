@@ -161,6 +161,57 @@ def build_instruction_bindings(clip: ClipRecord) -> list[InstructionBinding]:
     return bindings
 
 
+def _format_binding_placeholders(bindings: list[InstructionBinding]) -> str:
+    placeholders = [f"{{{{{binding.image_id}}}}}" for binding in bindings]
+    if not placeholders:
+        raise ValueError("deterministic instruction requires at least one binding")
+    if len(placeholders) == 1:
+        return placeholders[0]
+    if len(placeholders) == 2:
+        return f"{placeholders[0]} and {placeholders[1]}"
+    return f"{', '.join(placeholders[:-1])}, and {placeholders[-1]}"
+
+
+def build_deterministic_instruction(
+    *,
+    t2v_caption: str,
+    bindings: list[InstructionBinding],
+) -> InstructionState:
+    caption = t2v_caption.strip()
+    if not caption:
+        raise ValueError("deterministic instruction requires a non-empty t2v_caption")
+
+    placeholder_list = _format_binding_placeholders(bindings)
+    reference_noun = "reference" if len(bindings) == 1 else "references"
+    body = (
+        f"Use {placeholder_list} as the visual {reference_noun} defined in the "
+        "legend. Generate a video matching this description while preserving "
+        f"the appearance of the referenced content: {caption}"
+    )
+    if _english_word_count(body) > 180:
+        raise ValueError("deterministic instruction exceeds 180 English words")
+
+    legend: list[InstructionLegendEntry] = []
+    for binding in bindings:
+        description = binding.grounding_prompt.strip()
+        if not description:
+            raise ValueError(
+                f"binding {binding.image_id} requires a non-empty grounding_prompt"
+            )
+        legend.append(
+            InstructionLegendEntry(
+                image_id=binding.image_id,
+                description=description,
+            )
+        )
+    return InstructionState(
+        status="ready",
+        instruction_body_template=body,
+        reference_legend=legend,
+        r2v_instruction=render_instruction_text(body, legend),
+    )
+
+
 def source_transcript_from_metadata(
     metadata: dict[str, object],
 ) -> str | None:
@@ -582,10 +633,6 @@ def instruct_clips(
         raise FileNotFoundError(
             "instruct stage requires manifest stage to create clip.json records first"
         )
-    qwen = client or QwenInstructionClient(
-        config.qwen.instruction_writer,
-        repair_retries=config.instruction.repair_retries,
-    )
     processed = skipped_existing = skipped_not_ready = failed = repaired = 0
 
     for clip in clips:
@@ -613,21 +660,28 @@ def instruct_clips(
             continue
         try:
             bindings = build_instruction_bindings(clip)
-            attempt = qwen.write(
-                t2v_caption=clip.annotation.t2v_caption,
-                bindings=bindings,
-                source_transcript=source_transcript_from_metadata(
-                    clip.source.metadata
-                ),
-            )
-            storage.write_instruction(clip.clip_uid, attempt.instruction)
-            _write_debug_response(
-                storage,
-                clip_uid=clip.clip_uid,
-                raw_responses=attempt.raw_responses,
-            )
+            if client is None:
+                instruction = build_deterministic_instruction(
+                    t2v_caption=clip.annotation.t2v_caption,
+                    bindings=bindings,
+                )
+                storage.write_instruction(clip.clip_uid, instruction)
+            else:
+                attempt = client.write(
+                    t2v_caption=clip.annotation.t2v_caption,
+                    bindings=bindings,
+                    source_transcript=source_transcript_from_metadata(
+                        clip.source.metadata
+                    ),
+                )
+                storage.write_instruction(clip.clip_uid, attempt.instruction)
+                _write_debug_response(
+                    storage,
+                    clip_uid=clip.clip_uid,
+                    raw_responses=attempt.raw_responses,
+                )
+                repaired += int(attempt.repair_attempts > 0)
             processed += 1
-            repaired += int(attempt.repair_attempts > 0)
         except InstructionFailure as exc:
             reason = (
                 exc.issues[0].code

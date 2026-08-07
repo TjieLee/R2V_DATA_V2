@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as v3_config_module
+import r2v_data_v2.v3.instruction as instruction_module
 from r2v_data_v2.v3.config import (
+    DebugConfig,
     QwenAnnotationConfig,
     QwenServiceConfig,
     QwenServicesConfig,
@@ -19,6 +22,7 @@ from r2v_data_v2.v3.config import (
 )
 from r2v_data_v2.v3.instruction import (
     QwenInstructionClient,
+    build_deterministic_instruction,
     build_instruction_bindings,
     instruct_clips,
     source_transcript_from_metadata,
@@ -34,6 +38,7 @@ from r2v_data_v2.v3.schemas import (
     CoverageState,
     EntityReferenceState,
     EntityVisibilitySummary,
+    InstructionBinding,
     InstructionLegendEntry,
     InstructionState,
     PairingState,
@@ -428,6 +433,145 @@ def test_bindings_follow_pairing_order_and_put_background_last(
         "object",
         "background",
     ]
+
+
+def test_deterministic_instruction_uses_exact_caption_and_binding_legend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    bindings = build_instruction_bindings(storage.read_clip(clip_uid))
+    caption = "  A cyclist crosses the plaza in one continuous shot.  "
+
+    one = build_deterministic_instruction(
+        t2v_caption=caption,
+        bindings=bindings[:1],
+    )
+    two = build_deterministic_instruction(
+        t2v_caption=caption,
+        bindings=bindings[:2],
+    )
+
+    assert one.instruction_body_template == (
+        "Use {{image_1}} as the visual reference defined in the legend. "
+        "Generate a video matching this description while preserving the "
+        "appearance of the referenced content: A cyclist crosses the plaza in "
+        "one continuous shot."
+    )
+    assert one.instruction_body_template.count("{{image_1}}") == 1
+    assert one.reference_legend == [
+        InstructionLegendEntry(
+            image_id="image_1",
+            description=bindings[0].grounding_prompt.strip(),
+        )
+    ]
+    assert two.instruction_body_template.startswith(
+        "Use {{image_1}} and {{image_2}} as the visual references defined in "
+        "the legend."
+    )
+    assert two.instruction_body_template.count("{{image_1}}") == 1
+    assert two.instruction_body_template.count("{{image_2}}") == 1
+    assert two.instruction_body_template.endswith(caption.strip())
+    assert two.r2v_instruction == render_instruction_text(
+        two.instruction_body_template,
+        two.reference_legend,
+    )
+
+
+def test_deterministic_instruction_supports_six_ordered_bindings() -> None:
+    clip = _five_entity_instruction_clip(include_background=True)
+    bindings = build_instruction_bindings(clip)
+    caption = " ".join(f"detail{index}" for index in range(120))
+
+    instruction = build_deterministic_instruction(
+        t2v_caption=caption,
+        bindings=bindings,
+    )
+    body = instruction.instruction_body_template
+    output = RawInstructionOutput(
+        instruction_body_template=body,
+        reference_legend=[
+            entry.model_dump(mode="json") for entry in instruction.reference_legend
+        ],
+    )
+
+    assert len(instruction.reference_legend) == 6
+    assert [entry.image_id for entry in instruction.reference_legend] == [
+        f"image_{index}" for index in range(1, 7)
+    ]
+    assert [entry.description for entry in instruction.reference_legend] == [
+        binding.grounding_prompt.strip() for binding in bindings
+    ]
+    assert instruction.reference_legend[-1].description == (
+        clip.annotation.background.grounding_prompt
+    )
+    assert all(body.count(f"{{{{image_{index}}}}}") == 1 for index in range(1, 7))
+    assert [body.index(f"{{{{image_{index}}}}}") for index in range(1, 7)] == sorted(
+        body.index(f"{{{{image_{index}}}}}") for index in range(1, 7)
+    )
+    assert body.startswith(
+        "Use {{image_1}}, {{image_2}}, {{image_3}}, {{image_4}}, "
+        "{{image_5}}, and {{image_6}} as the visual references"
+    )
+    assert "instruction_body_too_long" not in {
+        issue.code
+        for issue in validate_instruction_output(
+            output,
+            t2v_caption=caption,
+            bindings=bindings,
+            source_transcript=None,
+        )
+    }
+
+
+def test_deterministic_instruction_does_not_expand_phrase_or_use_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(
+        _config(tmp_path, monkeypatch),
+        metadata={"source_transcript": "Do not include this dialogue."},
+    )
+    binding = build_instruction_bindings(storage.read_clip(clip_uid))[0].model_copy(
+        update={
+            "phrase": "phrase sentinel that must remain absent",
+            "grounding_prompt": "  stable visible subject  ",
+        }
+    )
+
+    instruction = build_deterministic_instruction(
+        t2v_caption="A subject crosses the frame.",
+        bindings=[binding],
+    )
+
+    assert "phrase sentinel" not in instruction.instruction_body_template
+    assert "stable visible subject" not in instruction.instruction_body_template
+    assert "Do not include this dialogue" not in instruction.instruction_body_template
+    assert instruction.reference_legend[0].description == "stable visible subject"
+
+
+def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
+    binding = InstructionBinding.model_construct(
+        image_id="image_1",
+        image_index=1,
+        reference_type="subject",
+        entity_id="e1",
+        phrase="subject",
+        grounding_prompt=" ",
+    )
+
+    with pytest.raises(ValueError, match="non-empty t2v_caption"):
+        build_deterministic_instruction(t2v_caption=" ", bindings=[binding])
+    with pytest.raises(ValueError, match="non-empty grounding_prompt"):
+        build_deterministic_instruction(
+            t2v_caption="A subject moves.",
+            bindings=[binding],
+        )
+    with pytest.raises(ValueError, match="at least one binding"):
+        build_deterministic_instruction(
+            t2v_caption="A subject moves.",
+            bindings=[],
+        )
 
 
 @pytest.mark.parametrize("include_background", [False, True])
@@ -970,6 +1114,195 @@ def test_overwrite_replaces_legacy_instruction_with_angle_brackets(
     assert "<Image 1>" in instruction.r2v_instruction
     assert "\nImage 1:" not in instruction.r2v_instruction
     assert "\u56fe1" not in instruction.r2v_instruction
+
+
+def test_default_instruct_path_is_deterministic_and_writes_no_qwen_debug(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(
+        _config(tmp_path, monkeypatch),
+        debug=DebugConfig(save_diagnostics=True),
+    )
+    storage, clip_uid = _ready_storage(config)
+
+    def fail_if_constructed(*args: object, **kwargs: object) -> None:
+        pytest.fail("default instruction path must not instantiate Qwen")
+
+    monkeypatch.setattr(
+        instruction_module,
+        "QwenInstructionClient",
+        fail_if_constructed,
+    )
+
+    stats = instruct_clips(config, storage)
+
+    instruction = storage.read_clip(clip_uid).instruction
+    assert stats.processed == 1
+    assert stats.repaired == 0
+    assert stats.failed == 0
+    assert instruction is not None
+    assert instruction.status == "ready"
+    assert instruction == InstructionState.model_validate(
+        instruction.model_dump(mode="json")
+    )
+    assert not storage.debug_path(clip_uid, "instruction_raw.json").exists()
+
+
+def test_deterministic_instruct_failure_does_not_fallback_to_qwen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage, clip_uid = _ready_storage(config)
+
+    def fail_builder(**kwargs: object) -> InstructionState:
+        raise ValueError("invalid deterministic instruction state")
+
+    def fail_if_constructed(*args: object, **kwargs: object) -> None:
+        pytest.fail("deterministic failure must not fall back to Qwen")
+
+    monkeypatch.setattr(
+        instruction_module,
+        "build_deterministic_instruction",
+        fail_builder,
+    )
+    monkeypatch.setattr(
+        instruction_module,
+        "QwenInstructionClient",
+        fail_if_constructed,
+    )
+
+    stats = instruct_clips(config, storage)
+
+    instruction = storage.read_clip(clip_uid).instruction
+    failures = [
+        json.loads(line)
+        for line in storage.failures_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert stats.processed == 0
+    assert stats.failed == 1
+    assert stats.repaired == 0
+    assert instruction == InstructionState(
+        status="failed",
+        reason="invalid deterministic instruction state",
+    )
+    assert failures[-1]["stage"] == "instruct"
+    assert failures[-1]["reason"] == "invalid deterministic instruction state"
+
+
+def test_default_instruct_preserves_skip_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage, _ = _ready_storage(config)
+
+    first = instruct_clips(config, storage)
+    second = instruct_clips(config, storage)
+
+    assert first.processed == 1
+    assert second.processed == 0
+    assert second.skipped_existing == 1
+
+    gated_config = replace(
+        config,
+        run_root=config.run_root.parent / "reference-edit-gated",
+        qwen=replace(
+            config.qwen,
+            reference_edit_judge=QwenServiceConfig(
+                model=config.qwen.instruction_writer.model
+            ),
+        ),
+        reference_edit=replace(
+            config.reference_edit,
+            enabled=True,
+            python_executable=config.run_root.parent / "boogu-env" / "python",
+            code_root=config.run_root.parent / "boogu-code",
+            model_path=config.run_root.parent / "boogu-model",
+        ),
+    )
+    gated_storage, _ = _ready_storage(gated_config)
+    gated = instruct_clips(gated_config, gated_storage)
+
+    assert gated.processed == 0
+    assert gated.skipped_not_ready == 1
+
+
+def test_deterministic_builder_uses_existing_final_renderer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    bindings = build_instruction_bindings(storage.read_clip(clip_uid))
+    calls: list[tuple[str, list[InstructionLegendEntry]]] = []
+    renderer = instruction_module.render_instruction_text
+
+    def recording_renderer(
+        body: str,
+        legend: list[InstructionLegendEntry],
+    ) -> str:
+        calls.append((body, legend))
+        return renderer(body, legend)
+
+    monkeypatch.setattr(
+        instruction_module,
+        "render_instruction_text",
+        recording_renderer,
+    )
+
+    instruction = instruction_module.build_deterministic_instruction(
+        t2v_caption="A subject crosses the scene.",
+        bindings=bindings,
+    )
+
+    assert calls == [
+        (instruction.instruction_body_template, instruction.reference_legend)
+    ]
+    assert instruction.r2v_instruction == renderer(
+        instruction.instruction_body_template,
+        instruction.reference_legend,
+    )
+
+
+def test_profiled_default_pipeline_has_no_qwen_instruction_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    _storage, _ = _ready_storage(config)
+
+    def fail_if_constructed(*args: object, **kwargs: object) -> None:
+        pytest.fail("profiled default instruction path must not instantiate Qwen")
+
+    monkeypatch.setattr(
+        instruction_module,
+        "QwenInstructionClient",
+        fail_if_constructed,
+    )
+
+    result = run_pipeline_v3(
+        config_path=_config_path(config, tmp_path),
+        stages=("instruct",),
+        git_commit="instruction-test",
+        profile=True,
+    )
+
+    summary = json.loads(
+        (config.run_root / "profiling" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    events = [
+        json.loads(line)
+        for line in (config.run_root / "profiling" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert result["instruct"]["processed"] == 1
+    assert "qwen_instruction" not in summary["components"]
+    assert all(event.get("component") != "qwen_instruction" for event in events)
+    assert summary["stages"]["instruct"]["calls"] == 1
 
 
 def test_pipeline_runs_instruct_stage_with_fake_client(
