@@ -24,6 +24,7 @@ from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     EntityReferenceJudge,
+    EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
 )
 from r2v_data_v2.v3.schemas import (
@@ -208,6 +209,7 @@ def _result_record(
         "entity_id": entity.entity_id,
         "phrase": entity.phrase,
         "candidate_count": candidate_count,
+        "status": "succeeded",
         "selected_candidate_id": decision.selected_candidate_id,
         "completeness": decision.completeness,
         "reference_scope": decision.reference_scope,
@@ -226,6 +228,40 @@ def _result_record(
         "repair_attempts": attempt.repair_attempts,
         "duration_seconds": duration_seconds,
         "raw_response_count": len(attempt.raw_responses),
+        "baseline": baseline_value,
+    }
+
+
+def _failed_result_record(
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    candidate_count: int,
+    failure: EntityReferenceJudgeFailure,
+    baseline: BaselineDecision | None,
+    duration_seconds: float,
+) -> dict[str, object]:
+    baseline_value = (
+        baseline.to_dict()
+        if baseline is not None
+        else {
+            "selected_candidate_id": None,
+            "completeness": None,
+            "reference_scope": None,
+        }
+    )
+    return {
+        "clip_uid": clip_uid,
+        "entity_id": entity.entity_id,
+        "phrase": entity.phrase,
+        "candidate_count": candidate_count,
+        "status": "failed",
+        "duration_seconds": duration_seconds,
+        "failure": {
+            "type": "structured_output_failure",
+            "attempt_count": failure.attempt_count,
+            "issues": [issue.to_dict() for issue in failure.issues],
+        },
         "baseline": baseline_value,
     }
 
@@ -256,9 +292,15 @@ def _summary(
     )
     if not isinstance(candidate_profile, Mapping):
         candidate_profile = {}
+    succeeded_records = [
+        record for record in records if record.get("status") == "succeeded"
+    ]
+    failed_records = [
+        record for record in records if record.get("status") == "failed"
+    ]
     baseline_records = [
         record
-        for record in records
+        for record in succeeded_records
         if isinstance(record.get("baseline"), Mapping)
         and record["baseline"].get("completeness") is not None
     ]
@@ -303,14 +345,49 @@ def _summary(
             )
     repair_cases = [
         {**_case_key(record), "repair_attempts": record["repair_attempts"]}
-        for record in records
+        for record in succeeded_records
         if int(record["repair_attempts"]) > 0
     ]
+    failure_issue_histogram: dict[str, int] = {}
+    failed_cases: list[dict[str, object]] = []
+    for record in failed_records:
+        failure = record.get("failure")
+        if not isinstance(failure, Mapping):
+            raise TypeError("failed replay record is missing failure metadata")
+        issues = failure.get("issues")
+        if not isinstance(issues, list):
+            raise TypeError("failed replay record is missing structured issues")
+        issue_codes: list[str] = []
+        for issue in issues:
+            if not isinstance(issue, Mapping) or not isinstance(
+                issue.get("code"),
+                str,
+            ):
+                raise TypeError("failed replay issue is malformed")
+            code = str(issue["code"])
+            issue_codes.append(code)
+            failure_issue_histogram[code] = failure_issue_histogram.get(code, 0) + 1
+        failed_cases.append(
+            {
+                **_case_key(record),
+                "phrase": record["phrase"],
+                "attempt_count": failure["attempt_count"],
+                "issue_codes": issue_codes,
+            }
+        )
     initial_calls = int(candidate_profile.get("initial_calls", 0))
     repair_calls = int(candidate_profile.get("repair_calls", 0))
     result: dict[str, object] = {
         "model": model,
         "entity_count": len(records),
+        "succeeded_entity_count": len(succeeded_records),
+        "failed_entity_count": len(failed_records),
+        "structured_failure_count": len(failed_records),
+        "structured_failure_rate": (
+            len(failed_records) / len(records) if records else 0.0
+        ),
+        "failure_issue_histogram": failure_issue_histogram,
+        "failed_cases": failed_cases,
         "total_seconds": total_seconds,
         "mean_seconds_per_entity": (
             sum(float(record["duration_seconds"]) for record in records)
@@ -321,6 +398,7 @@ def _summary(
         "initial_calls": initial_calls,
         "repair_calls": repair_calls,
         "repair_rate": repair_calls / initial_calls if initial_calls else 0.0,
+        "agreement_denominator": len(baseline_records),
         "candidate_selection_agreement_with_baseline": _agreement(
             candidate_matches,
             len(baseline_records),
@@ -330,23 +408,28 @@ def _summary(
             len(baseline_records),
         ),
         "reject_count": sum(
-            record["reference_scope"] == "reject" for record in records
+            record["reference_scope"] == "reject"
+            for record in succeeded_records
         ),
         "complete_count": sum(
-            record["completeness"] == "complete" for record in records
+            record["completeness"] == "complete"
+            for record in succeeded_records
         ),
         "local_usable_count": sum(
-            record["completeness"] == "local_usable" for record in records
+            record["completeness"] == "local_usable"
+            for record in succeeded_records
         ),
         "repairable_count": sum(
-            record["completeness"] == "repairable" for record in records
+            record["completeness"] == "repairable"
+            for record in succeeded_records
         ),
         "severely_incomplete_count": sum(
             record["completeness"] == "severely_incomplete"
-            for record in records
+            for record in succeeded_records
         ),
         "fragmented_count": sum(
-            record["completeness"] == "fragmented" for record in records
+            record["completeness"] == "fragmented"
+            for record in succeeded_records
         ),
         "changed_candidate_cases": changed_candidate_cases,
         "changed_route_cases": changed_route_cases,
@@ -392,6 +475,7 @@ def run_candidate_judge_replay(
     output_path: Path,
     api_key: str | None = None,
     save_raw: bool = False,
+    fail_fast: bool = False,
     judge: EntityReferenceJudge | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
@@ -456,20 +540,49 @@ def run_candidate_judge_replay(
                             )
                             active_judge = owned_judge
                         source_images = _load_source_images(storage, candidates)
-                        started = clock()
-                        attempt = active_judge.decide(
-                            entity=entity,
-                            candidates=candidates,
-                            source_images=source_images,
-                        )
-                        duration = clock() - started
-                        if duration < 0:
-                            raise ValueError("benchmark clock moved backwards")
                         baseline = load_baseline_decision(
                             storage,
                             clip_uid=clip.clip_uid,
                             entity_id=entity.entity_id,
                         )
+                        started = clock()
+                        try:
+                            attempt = active_judge.decide(
+                                entity=entity,
+                                candidates=candidates,
+                                source_images=source_images,
+                            )
+                        except EntityReferenceJudgeFailure as exc:
+                            duration = clock() - started
+                            if duration < 0:
+                                raise ValueError(
+                                    "benchmark clock moved backwards"
+                                ) from exc
+                            if fail_fast:
+                                raise
+                            records.append(
+                                _failed_result_record(
+                                    clip_uid=clip.clip_uid,
+                                    entity=entity,
+                                    candidate_count=len(candidates),
+                                    failure=exc,
+                                    baseline=baseline,
+                                    duration_seconds=duration,
+                                )
+                            )
+                            if save_raw:
+                                raw_records.append(
+                                    {
+                                        "clip_uid": clip.clip_uid,
+                                        "entity_id": entity.entity_id,
+                                        "status": "failed",
+                                        "raw_responses": list(exc.raw_responses),
+                                    }
+                                )
+                            continue
+                        duration = clock() - started
+                        if duration < 0:
+                            raise ValueError("benchmark clock moved backwards")
                         records.append(
                             _result_record(
                                 clip_uid=clip.clip_uid,
@@ -485,6 +598,7 @@ def run_candidate_judge_replay(
                                 {
                                     "clip_uid": clip.clip_uid,
                                     "entity_id": entity.entity_id,
+                                    "status": "succeeded",
                                     "raw_responses": list(attempt.raw_responses),
                                 }
                             )

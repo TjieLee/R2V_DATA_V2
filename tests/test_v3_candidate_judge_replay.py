@@ -12,6 +12,7 @@ from PIL import Image
 import r2v_data_v2.v3.candidate_judge_replay as replay_module
 import r2v_data_v2.v3.config as config_module
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.structured_output import ValidationIssue
 from r2v_data_v2.v3.candidate_judge_replay import (
     load_baseline_decision,
     run_candidate_judge_replay,
@@ -31,6 +32,7 @@ from r2v_data_v2.v3.config import (
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
+    EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
 )
 from r2v_data_v2.v3.schemas import (
@@ -349,6 +351,7 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
         ("clip-b", "e1"),
     ]
     assert [item["candidate_count"] for item in records] == [3, 3]
+    assert [item["status"] for item in records] == ["succeeded", "succeeded"]
     assert records[0]["baseline"] == {
         "selected_candidate_id": "candidate_1",
         "completeness": "complete",
@@ -358,6 +361,11 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
     assert [item["raw_response_count"] for item in records] == [2, 1]
     assert all("raw_responses" not in item for item in records)
     assert summary["entity_count"] == 2
+    assert summary["succeeded_entity_count"] == 2
+    assert summary["failed_entity_count"] == 0
+    assert summary["structured_failure_count"] == 0
+    assert summary["structured_failure_rate"] == 0.0
+    assert summary["agreement_denominator"] == 2
     assert summary["initial_calls"] == 2
     assert summary["repair_calls"] == 1
     assert summary["repair_rate"] == pytest.approx(0.5)
@@ -382,6 +390,250 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
     assert profile["prompt_tokens_total"] == 300
     assert Path(f"{output}.summary.json").is_file()
     assert not Path(f"{output}.raw.jsonl").exists()
+
+
+class _CaseJudge:
+    def __init__(
+        self,
+        outcomes: dict[str, EntityReferenceDecisionAttempt | BaseException],
+    ) -> None:
+        self.outcomes = outcomes
+        self.calls: list[str] = []
+
+    def decide(self, *, entity, candidates, source_images):
+        del candidates, source_images
+        clip_uid = entity.phrase.rsplit(" ", 1)[-1]
+        self.calls.append(clip_uid)
+        outcome = self.outcomes[clip_uid]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _attempt(
+    *,
+    selected_candidate_id: str = "candidate_1",
+) -> EntityReferenceDecisionAttempt:
+    return EntityReferenceDecisionAttempt(
+        decision=_decision(selected_candidate_id=selected_candidate_id),
+        raw_responses=("successful raw response",),
+        repair_attempts=0,
+    )
+
+
+def _structured_failure() -> EntityReferenceJudgeFailure:
+    return EntityReferenceJudgeFailure(
+        raw_responses=["invalid raw one", "invalid raw two"],
+        issues=[
+            ValidationIssue(
+                code="primary_identity_region_not_visible",
+                field="primary_identity_region_visible",
+                message="primary identity region is not visible",
+            ),
+            ValidationIssue(
+                code="primary_identity_region_not_visible",
+                field="reference_scope",
+                message="full scope requires the primary identity region",
+            ),
+            ValidationIssue(
+                code="local_requires_identity",
+                field="identity_features_visible",
+                message="local reference requires visible identity features",
+            ),
+        ],
+    )
+
+
+def test_structured_failure_is_recorded_and_later_cases_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    for clip_uid in ("clip-c", "clip-a", "clip-b"):
+        _add_clip(storage, clip_uid)
+    before = snapshot_run_files(storage.root)
+    judge = _CaseJudge(
+        {
+            "clip-a": _attempt(),
+            "clip-b": _structured_failure(),
+            "clip-c": _attempt(selected_candidate_id="candidate_2"),
+        }
+    )
+    output = config.run_root.parent / "benchmarks" / "failure-replay.jsonl"
+
+    summary = run_candidate_judge_replay(
+        config,
+        run_root=storage.root,
+        base_url="http://127.0.0.1:8001/v1",
+        model="new-model",
+        output_path=output,
+        judge=judge,
+    )
+
+    records = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert judge.calls == ["clip-a", "clip-b", "clip-c"]
+    assert [record["status"] for record in records] == [
+        "succeeded",
+        "failed",
+        "succeeded",
+    ]
+    failed = records[1]
+    assert failed["clip_uid"] == "clip-b"
+    assert failed["failure"]["type"] == "structured_output_failure"
+    assert failed["failure"]["attempt_count"] == 2
+    assert [issue["code"] for issue in failed["failure"]["issues"]] == [
+        "primary_identity_region_not_visible",
+        "primary_identity_region_not_visible",
+        "local_requires_identity",
+    ]
+    assert all("raw_responses" not in record for record in records)
+    assert "invalid raw one" not in output.read_text(encoding="utf-8")
+    assert summary["entity_count"] == 3
+    assert summary["succeeded_entity_count"] == 2
+    assert summary["failed_entity_count"] == 1
+    assert summary["structured_failure_count"] == 1
+    assert summary["structured_failure_rate"] == pytest.approx(1 / 3)
+    assert summary["failure_issue_histogram"] == {
+        "local_requires_identity": 1,
+        "primary_identity_region_not_visible": 2,
+    }
+    assert summary["failed_cases"] == [
+        {
+            "clip_uid": "clip-b",
+            "entity_id": "e1",
+            "phrase": "ornate panel in clip-b",
+            "attempt_count": 2,
+            "issue_codes": [
+                "primary_identity_region_not_visible",
+                "primary_identity_region_not_visible",
+                "local_requires_identity",
+            ],
+        }
+    ]
+    assert summary["agreement_denominator"] == 2
+    assert summary["candidate_selection_agreement_with_baseline"] == 0.5
+    assert summary["route_agreement_with_baseline"] == 1.0
+    assert snapshot_run_files(storage.root) == before
+    assert not Path(f"{output}.raw.jsonl").exists()
+
+    raw_output = config.run_root.parent / "benchmarks" / "failure-raw.jsonl"
+    raw_judge = _CaseJudge(
+        {
+            "clip-a": _attempt(),
+            "clip-b": _structured_failure(),
+            "clip-c": _attempt(selected_candidate_id="candidate_2"),
+        }
+    )
+    run_candidate_judge_replay(
+        config,
+        run_root=storage.root,
+        base_url="http://127.0.0.1:8001/v1",
+        model="new-model",
+        output_path=raw_output,
+        save_raw=True,
+        judge=raw_judge,
+    )
+    raw_records = [
+        json.loads(line)
+        for line in Path(f"{raw_output}.raw.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert raw_records[1] == {
+        "clip_uid": "clip-b",
+        "entity_id": "e1",
+        "status": "failed",
+        "raw_responses": ["invalid raw one", "invalid raw two"],
+    }
+    assert snapshot_run_files(storage.root) == before
+
+
+def test_real_judge_failure_keeps_http_profiling_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    _add_clip(storage, "clip-a")
+    _add_clip(storage, "clip-b")
+    completions = _Completions(
+        [
+            "{}",
+            "{}",
+            json.dumps(_decision().model_dump()),
+        ]
+    )
+    assert config.qwen.candidate_judge is not None
+    judge = QwenEntityReferenceJudge(
+        config.qwen.candidate_judge,
+        repair_retries=config.pair.repair_retries,
+        crop_padding_ratio=config.pair.crop_padding_ratio,
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    output = config.run_root.parent / "benchmarks" / "profiled-failure.jsonl"
+
+    summary = run_candidate_judge_replay(
+        config,
+        run_root=storage.root,
+        base_url="http://127.0.0.1:8001/v1",
+        model="new-model",
+        output_path=output,
+        judge=judge,
+    )
+
+    records = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["status"] for record in records] == ["failed", "succeeded"]
+    assert summary["initial_calls"] == 2
+    assert summary["repair_calls"] == 1
+    assert summary["structured_failure_count"] == 1
+    profile = summary["profiling"]["qwen_candidate_judge"]
+    assert profile["calls"] == 3
+    assert profile["successful_calls"] == 3
+    assert profile["input_images_total"] == 18
+
+
+@pytest.mark.parametrize(
+    ("failure", "fail_fast"),
+    [
+        (_structured_failure(), True),
+        (RuntimeError("programming failure"), False),
+    ],
+)
+def test_fail_fast_and_non_structured_errors_still_raise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    fail_fast: bool,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    _add_clip(storage, "clip-a")
+    output = config.run_root.parent / "benchmarks" / "abort.jsonl"
+    judge = _CaseJudge({"clip-a": failure})
+
+    with pytest.raises(type(failure), match=str(failure)):
+        run_candidate_judge_replay(
+            config,
+            run_root=storage.root,
+            base_url="http://127.0.0.1:8001/v1",
+            model="new-model",
+            output_path=output,
+            fail_fast=fail_fast,
+            judge=judge,
+        )
+
+    assert not output.exists()
+    assert not Path(f"{output}.summary.json").exists()
 
 
 def test_baseline_uses_final_response_and_accepts_json_fence(

@@ -26,6 +26,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--api-key")
     parser.add_argument("--save-raw", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
     return parser
 
 
@@ -39,6 +40,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         output_path=arguments.output,
         api_key=arguments.api_key,
         save_raw=arguments.save_raw,
+        fail_fast=arguments.fail_fast,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary
