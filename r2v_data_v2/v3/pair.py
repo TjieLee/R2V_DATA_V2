@@ -86,6 +86,12 @@ class EntityReferenceCandidate:
 
 
 @dataclass(frozen=True)
+class MaskComponent:
+    area_pixels: int
+    bbox_xyxy: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
 class MaskComponentDiagnostics:
     significant_component_count: int
     largest_component_ratio: float
@@ -153,18 +159,23 @@ def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int]:
     )
 
 
-def _foreground_component_areas(mask: np.ndarray) -> list[int]:
+def _foreground_components(mask: np.ndarray) -> tuple[MaskComponent, ...]:
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2 or not binary.any():
         raise ValueError("component diagnostics require a non-empty 2D mask")
 
     parents: list[int] = []
     run_areas: list[int] = []
+    run_bboxes: list[tuple[int, int, int, int]] = []
 
-    def make_set(area: int) -> int:
+    def make_set(
+        area: int,
+        bbox_xyxy: tuple[int, int, int, int],
+    ) -> int:
         label = len(parents)
         parents.append(label)
         run_areas.append(area)
+        run_bboxes.append(bbox_xyxy)
         return label
 
     def find(label: int) -> int:
@@ -184,7 +195,7 @@ def _foreground_component_areas(mask: np.ndarray) -> list[int]:
             parents[max(first_root, second_root)] = min(first_root, second_root)
 
     previous_runs: list[tuple[int, int, int]] = []
-    for row in binary:
+    for row_index, row in enumerate(binary):
         padded = np.pad(row.astype(np.int8, copy=False), (1, 1))
         transitions = np.diff(padded)
         starts = np.flatnonzero(transitions == 1)
@@ -192,7 +203,10 @@ def _foreground_component_areas(mask: np.ndarray) -> list[int]:
         current_runs: list[tuple[int, int, int]] = []
         previous_index = 0
         for start, end in zip(starts.tolist(), ends.tolist()):
-            label = make_set(end - start)
+            label = make_set(
+                end - start,
+                (start, row_index, end, row_index + 1),
+            )
             while (
                 previous_index < len(previous_runs)
                 and previous_runs[previous_index][1] < start
@@ -209,14 +223,38 @@ def _foreground_component_areas(mask: np.ndarray) -> list[int]:
         previous_runs = current_runs
 
     component_areas: dict[int, int] = {}
+    component_bboxes: dict[int, tuple[int, int, int, int]] = {}
     for label, area in enumerate(run_areas):
         root = find(label)
         component_areas[root] = component_areas.get(root, 0) + area
-    return sorted(component_areas.values(), reverse=True)
+        x1, y1, x2, y2 = run_bboxes[label]
+        previous = component_bboxes.get(root)
+        if previous is not None:
+            x1 = min(x1, previous[0])
+            y1 = min(y1, previous[1])
+            x2 = max(x2, previous[2])
+            y2 = max(y2, previous[3])
+        component_bboxes[root] = (x1, y1, x2, y2)
+    return tuple(
+        sorted(
+            (
+                MaskComponent(
+                    area_pixels=area,
+                    bbox_xyxy=component_bboxes[root],
+                )
+                for root, area in component_areas.items()
+            ),
+            key=lambda component: (
+                -component.area_pixels,
+                component.bbox_xyxy,
+            ),
+        )
+    )
 
 
 def mask_component_diagnostics(mask: np.ndarray) -> MaskComponentDiagnostics:
-    component_areas = _foreground_component_areas(mask)
+    components = _foreground_components(mask)
+    component_areas = [component.area_pixels for component in components]
     total_area = sum(component_areas)
     significant_area = max(16.0, total_area * 0.02)
     return MaskComponentDiagnostics(

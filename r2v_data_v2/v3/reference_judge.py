@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -167,10 +168,63 @@ def _png_data_url(image: Image.Image) -> str:
 def subject_has_nontrivial_detached_component(
     candidate: EntityReferenceCandidate,
 ) -> bool:
-    return (
+    existing_large_signal = (
         candidate.significant_component_count >= 2
         and 0.05 <= candidate.second_largest_component_ratio <= 0.20
         and candidate.largest_component_ratio >= 0.70
+    )
+    if existing_large_signal:
+        return True
+
+    from r2v_data_v2.v3.pair import _foreground_components
+
+    components = _foreground_components(candidate.mask)
+    if len(components) < 2:
+        return False
+    main, secondary = components[:2]
+    total_foreground = sum(component.area_pixels for component in components)
+    secondary_ratio = secondary.area_pixels / total_foreground
+    if not (0.005 <= secondary_ratio < 0.05) or secondary.area_pixels < 64:
+        return False
+
+    main_x1, main_y1, main_x2, main_y2 = main.bbox_xyxy
+    secondary_x1, secondary_y1, secondary_x2, secondary_y2 = secondary.bbox_xyxy
+    main_long_side = max(main_x2 - main_x1, main_y2 - main_y1)
+    secondary_long_side = max(
+        secondary_x2 - secondary_x1,
+        secondary_y2 - secondary_y1,
+    )
+    if secondary_long_side < max(12.0, 0.08 * main_long_side):
+        return False
+
+    gap_x = max(
+        main_x1 - secondary_x2,
+        secondary_x1 - main_x2,
+        0,
+    )
+    gap_y = max(
+        main_y1 - secondary_y2,
+        secondary_y1 - main_y2,
+        0,
+    )
+    if math.hypot(gap_x, gap_y) < max(4.0, 0.02 * main_long_side):
+        return False
+
+    union_x1 = min(main_x1, secondary_x1)
+    union_y1 = min(main_y1, secondary_y1)
+    union_x2 = max(main_x2, secondary_x2)
+    union_y2 = max(main_y2, secondary_y2)
+    main_bbox_area = (main_x2 - main_x1) * (main_y2 - main_y1)
+    union_bbox_area = (union_x2 - union_x1) * (union_y2 - union_y1)
+    maximum_extension = max(
+        main_x1 - union_x1,
+        main_y1 - union_y1,
+        union_x2 - main_x2,
+        union_y2 - main_y2,
+    )
+    return (
+        union_bbox_area / main_bbox_area >= 1.15
+        or maximum_extension >= 0.10 * main_long_side
     )
 
 

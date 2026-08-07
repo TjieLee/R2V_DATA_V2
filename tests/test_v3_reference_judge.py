@@ -12,6 +12,7 @@ from openai import BadRequestError
 from PIL import Image
 from pydantic import ValidationError
 
+import r2v_data_v2.v3.pair as pair_module
 from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.pair import EntityReferenceCandidate
 from r2v_data_v2.v3.reference_judge import (
@@ -64,6 +65,50 @@ def _candidate(
         largest_component_ratio=largest_component_ratio,
         second_largest_component_ratio=second_largest_component_ratio,
     )
+
+
+def _candidate_with_mask(mask: np.ndarray) -> EntityReferenceCandidate:
+    rows, columns = np.nonzero(mask)
+    diagnostics = pair_module.mask_component_diagnostics(mask)
+    return EntityReferenceCandidate(
+        candidate_id="candidate_1",
+        entity_id="e1",
+        frame_slot=5,
+        source_frame_index=50,
+        image_path="clips/clip-1/frames/05.jpg",
+        mask=mask,
+        bbox_xyxy=(
+            int(columns.min()),
+            int(rows.min()),
+            int(columns.max()) + 1,
+            int(rows.max()) + 1,
+        ),
+        area_pixels=int(np.count_nonzero(mask)),
+        area_ratio=float(np.mean(mask)),
+        bbox_fill_ratio=1.0,
+        border_contact_count=0,
+        normalized_center_distance=0.05,
+        significant_component_count=diagnostics.significant_component_count,
+        largest_component_ratio=diagnostics.largest_component_ratio,
+        second_largest_component_ratio=(
+            diagnostics.second_largest_component_ratio
+        ),
+    )
+
+
+def _mask_with_main(
+    *,
+    shape: tuple[int, int] = (180, 180),
+    main_bbox: tuple[int, int, int, int] = (20, 20, 100, 100),
+    secondary_bbox: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    x1, y1, x2, y2 = main_bbox
+    mask[y1:y2, x1:x2] = True
+    if secondary_bbox is not None:
+        x1, y1, x2, y2 = secondary_bbox
+        mask[y1:y2, x1:x2] = True
+    return mask
 
 
 def _payload(**updates: object) -> dict[str, object]:
@@ -480,6 +525,114 @@ def test_subject_detached_component_signal_uses_nontrivial_gray_zone(
     )
 
     assert subject_has_nontrivial_detached_component(candidate) is expected
+
+
+@pytest.mark.parametrize(
+    ("secondary_bbox", "expected"),
+    [
+        (None, False),
+        ((130, 120, 142, 128), True),
+        ((101, 50, 113, 56), False),
+        ((130, 120, 135, 125), False),
+        ((130, 120, 138, 128), False),
+    ],
+)
+def test_small_spatial_subject_component_signal(
+    secondary_bbox: tuple[int, int, int, int] | None,
+    expected: bool,
+) -> None:
+    candidate = _candidate_with_mask(
+        _mask_with_main(secondary_bbox=secondary_bbox)
+    )
+
+    assert subject_has_nontrivial_detached_component(candidate) is expected
+
+
+def test_far_component_below_half_percent_does_not_trigger() -> None:
+    candidate = _candidate_with_mask(
+        _mask_with_main(
+            shape=(260, 260),
+            main_bbox=(20, 20, 200, 140),
+            secondary_bbox=(225, 180, 237, 186),
+        )
+    )
+
+    assert candidate.second_largest_component_ratio < 0.005
+    assert subject_has_nontrivial_detached_component(candidate) is False
+
+
+def test_two_percent_component_with_short_bbox_does_not_trigger() -> None:
+    candidate = _candidate_with_mask(
+        _mask_with_main(
+            shape=(140, 140),
+            main_bbox=(20, 20, 76, 76),
+            secondary_bbox=(100, 100, 108, 108),
+        )
+    )
+
+    assert candidate.second_largest_component_ratio == pytest.approx(
+        64 / (56 * 56 + 64)
+    )
+    assert subject_has_nontrivial_detached_component(candidate) is False
+
+
+@pytest.mark.parametrize(
+    "secondary_bbox",
+    [
+        (130, 120, 142, 128),
+        (125, 115, 130, 145),
+    ],
+)
+def test_one_to_three_percent_spatially_detached_limb_triggers(
+    secondary_bbox: tuple[int, int, int, int],
+) -> None:
+    candidate = _candidate_with_mask(
+        _mask_with_main(secondary_bbox=secondary_bbox)
+    )
+
+    assert 0.01 <= candidate.second_largest_component_ratio <= 0.03
+    assert subject_has_nontrivial_detached_component(candidate) is True
+
+
+def test_small_spatial_signal_blocks_local_but_allows_repairable() -> None:
+    candidate = _candidate_with_mask(
+        _mask_with_main(secondary_bbox=(130, 120, 142, 128))
+    )
+    local = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="local_usable",
+            reference_scope="local",
+            visible_region="upper_body",
+        )
+    )
+    repairable = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="upper_body",
+            truncation_severity="minor",
+            completion_needed_for_reference_use=True,
+            detached_target_fragments_present=True,
+        )
+    )
+    candidate_by_id = {candidate.candidate_id: candidate}
+
+    local_issues = validate_entity_reference_decision(
+        local,
+        candidate_ids=set(candidate_by_id),
+        reference_type="subject",
+        candidate_by_id=candidate_by_id,
+    )
+
+    assert "local_usable_has_detached_subject_fragments" in {
+        issue.code for issue in local_issues
+    }
+    assert validate_entity_reference_decision(
+        repairable,
+        candidate_ids=set(candidate_by_id),
+        reference_type="subject",
+        candidate_by_id=candidate_by_id,
+    ) == []
 
 
 @pytest.mark.parametrize(
@@ -979,23 +1132,24 @@ def test_request_payload_contains_only_required_evidence() -> None:
     }
 
 
-def test_request_payload_exposes_subject_fragment_signal_but_not_group_signal() -> None:
-    candidate = _candidate(
-        significant_component_count=2,
-        largest_component_ratio=0.88,
-        second_largest_component_ratio=0.10,
+@pytest.mark.parametrize("non_subject_type", ["object", "group"])
+def test_request_payload_applies_fragment_signal_only_to_subject(
+    non_subject_type: str,
+) -> None:
+    candidate = _candidate_with_mask(
+        _mask_with_main(secondary_bbox=(130, 120, 142, 128))
     )
 
     subject_payload = build_entity_reference_request_payload(_entity(), [candidate])
-    group_payload = build_entity_reference_request_payload(
-        _entity().model_copy(update={"reference_type": "group"}),
+    non_subject_payload = build_entity_reference_request_payload(
+        _entity().model_copy(update={"reference_type": non_subject_type}),
         [candidate],
     )
 
     assert subject_payload["candidates"][0][
         "nontrivial_detached_component_signal"
     ] is True
-    assert group_payload["candidates"][0][
+    assert non_subject_payload["candidates"][0][
         "nontrivial_detached_component_signal"
     ] is False
 

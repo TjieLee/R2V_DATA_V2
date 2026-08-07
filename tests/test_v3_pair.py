@@ -724,6 +724,19 @@ def test_tiny_natural_fragment_is_not_significant() -> None:
     assert diagnostics.severely_fragmented is False
 
 
+def test_component_geometry_records_area_and_bbox() -> None:
+    mask = np.zeros((40, 60), dtype=bool)
+    mask[3:23, 4:24] = True
+    mask[30:36, 45:57] = True
+
+    components = pair_module._foreground_components(mask)
+
+    assert [(component.area_pixels, component.bbox_xyxy) for component in components] == [
+        (400, (4, 3, 24, 23)),
+        (72, (45, 30, 57, 36)),
+    ]
+
+
 def test_large_secondary_mask_component_is_severely_fragmented() -> None:
     mask = np.zeros((20, 30), dtype=bool)
     mask[1:11, 1:10] = True
