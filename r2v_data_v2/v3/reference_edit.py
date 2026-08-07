@@ -209,6 +209,13 @@ def _rejected_reference(
         viewpoint=reference.viewpoint,
         independent_reference_value=reference.independent_reference_value,
         requires_substantial_invention=reference.requires_substantial_invention,
+        primary_identity_region_visible=(
+            reference.primary_identity_region_visible
+        ),
+        major_structure_visible=reference.major_structure_visible,
+        truncation_severity=reference.truncation_severity,
+        discrete_foreground_instance=reference.discrete_foreground_instance,
+        mask_matches_target=reference.mask_matches_target,
     )
 
 
@@ -260,6 +267,13 @@ def _accepted_reference(
         viewpoint=reference.viewpoint,
         independent_reference_value=reference.independent_reference_value,
         requires_substantial_invention=reference.requires_substantial_invention,
+        primary_identity_region_visible=(
+            reference.primary_identity_region_visible
+        ),
+        major_structure_visible=reference.major_structure_visible,
+        truncation_severity=reference.truncation_severity,
+        discrete_foreground_instance=reference.discrete_foreground_instance,
+        mask_matches_target=reference.mask_matches_target,
         synthetic=True,
         generation_metadata_path=storage.relative_artifact_path(metadata_path),
         generation_source_sha256=source_sha256,
@@ -612,6 +626,44 @@ def reference_edit_clips(
                     if (
                         route == "repairable"
                         and completion_result is not None
+                        and completion_result.status != "accepted"
+                    ):
+                        completion_rejection_reason = (
+                            "repairable_completion_rejected:"
+                            f"{rejection_reason}"
+                        )
+                        final_references.append(
+                            _rejected_reference(
+                                reference,
+                                completion_rejection_reason,
+                            )
+                        )
+                        edit_states.append(
+                            ReferenceEditEntityState(
+                                entity_id=reference.entity_id,
+                                route=route,
+                                status="rejected",
+                                source_reference=reference,
+                                source_image_path=reference.image_path,
+                                operation="complete_entity",
+                                metadata_path=storage.relative_artifact_path(
+                                    completion_result.metadata_path
+                                ),
+                                operations=attempted_operations,
+                                completion_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        completion_result.metadata_path
+                                    )
+                                ),
+                                fallback_policy="reject_entity",
+                                reason=completion_rejection_reason,
+                            )
+                        )
+                        clip_entity_counters["entities_rejected"] += 1
+                        continue
+                    if (
+                        route == "repairable"
+                        and completion_result is not None
                         and completion_result.status == "accepted"
                         and completion_result.candidate_path is not None
                         and background_result is not None
@@ -668,9 +720,6 @@ def reference_edit_clips(
                         continue
                     force_keep_source = (
                         rejected_result.operation == "add_entity_background"
-                        or route == "repairable"
-                        and completion_result is not None
-                        and completion_result.status != "accepted"
                     )
                     if (
                         force_keep_source
@@ -767,7 +816,7 @@ def reference_edit_clips(
                 if not set(retained).intersection(qualifying):
                     pairing = PairingState(
                         status="rejected",
-                        reason="no_qualifying_reference_after_reference_edit",
+                        reason="no_qualifying_ready_reference",
                     )
                 else:
                     pairing = PairingState(

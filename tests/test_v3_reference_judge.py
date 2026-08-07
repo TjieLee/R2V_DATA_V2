@@ -68,6 +68,11 @@ def _payload(**updates: object) -> dict[str, object]:
         "viewpoint": "front",
         "independent_reference_value": True,
         "requires_substantial_invention": False,
+        "primary_identity_region_visible": True,
+        "major_structure_visible": True,
+        "truncation_severity": "none",
+        "discrete_foreground_instance": True,
+        "mask_matches_target": True,
         "scope_reason": "The whole entity and identity are visible.",
     }
     result.update(updates)
@@ -110,6 +115,11 @@ def test_raw_decision_schema_is_strict(
         "viewpoint",
         "independent_reference_value",
         "requires_substantial_invention",
+        "primary_identity_region_visible",
+        "major_structure_visible",
+        "truncation_severity",
+        "discrete_foreground_instance",
+        "mask_matches_target",
     ],
 )
 def test_new_reference_gate_fields_are_required(field: str) -> None:
@@ -172,6 +182,7 @@ def test_completeness_routes_to_deterministic_reference_scope(
             ),
             whole_entity_recognizable=scope == "full",
             identity_features_visible=scope != "reject",
+            truncation_severity=("minor" if completeness == "repairable" else "none"),
         )
     )
 
@@ -207,6 +218,7 @@ def test_poor_image_quality_fails_closed() -> None:
                 "visible_region": "central",
                 "whole_entity_recognizable": False,
                 "identity_features_visible": False,
+                "truncation_severity": "minor",
             },
             "local_requires_identity",
         ),
@@ -232,6 +244,7 @@ def test_recognizable_local_reference_is_valid() -> None:
             reference_scope="local",
             visible_region="central",
             whole_entity_recognizable=True,
+            truncation_severity="minor",
         )
     )
     assert validate_entity_reference_decision(
@@ -338,6 +351,7 @@ def test_substantial_invention_cannot_route_to_repairable() -> None:
                 visible_region="central",
                 whole_entity_recognizable=False,
                 requires_substantial_invention=True,
+                truncation_severity="minor",
             )
         )
 
@@ -350,10 +364,114 @@ def test_minor_crop_can_route_to_repairable() -> None:
             visible_region="central",
             whole_entity_recognizable=True,
             requires_substantial_invention=False,
+            truncation_severity="minor",
             scope_reason="Only one small limb terminal is missing.",
         )
     )
     assert decision.completeness == "repairable"
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_code"),
+    [
+        (
+            {"primary_identity_region_visible": False},
+            "primary_identity_region_not_visible",
+        ),
+        ({"major_structure_visible": False}, "major_structure_not_visible"),
+        (
+            {"discrete_foreground_instance": False},
+            "non_discrete_foreground_instance",
+        ),
+        ({"mask_matches_target": False}, "mask_target_mismatch"),
+        (
+            {
+                "completeness": "repairable",
+                "reference_scope": "local",
+                "visible_region": "central",
+                "whole_entity_recognizable": True,
+                "truncation_severity": "major",
+            },
+            "major_truncation_not_rejected",
+        ),
+        ({"truncation_severity": "minor"}, "complete_truncation_mismatch"),
+        ({"truncation_severity": "major"}, "complete_truncation_mismatch"),
+    ],
+)
+def test_objective_evidence_fails_closed(
+    updates: dict[str, object],
+    expected_code: str,
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(_payload(**updates))
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    assert expected_code in {issue.code for issue in issues}
+
+
+def test_repairable_minor_and_complete_none_are_valid() -> None:
+    repairable = RawEntityReferenceDecision.model_validate(
+        _payload(
+            completeness="repairable",
+            reference_scope="local",
+            visible_region="central",
+            whole_entity_recognizable=True,
+            truncation_severity="minor",
+        )
+    )
+    complete = RawEntityReferenceDecision.model_validate(_payload())
+
+    for decision in (repairable, complete):
+        assert validate_entity_reference_decision(
+            decision,
+            candidate_ids={"candidate_1"},
+            reference_type="subject",
+        ) == []
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "discrete_foreground_instance": False,
+            "scope_reason": "The crop is an environment fragment.",
+        },
+        {
+            "mask_matches_target": False,
+            "scope_reason": "The snorkel mask is dominated by unrelated equipment.",
+        },
+        {
+            "primary_identity_region_visible": False,
+            "major_structure_visible": False,
+            "truncation_severity": "major",
+            "scope_reason": "Only a torso and back remain visible.",
+        },
+    ],
+)
+def test_rejected_objective_evidence_is_representable(
+    updates: dict[str, object],
+) -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            selected_candidate_id=None,
+            completeness="severely_incomplete",
+            reference_scope="reject",
+            visible_region="custom",
+            whole_entity_recognizable=False,
+            identity_features_visible=False,
+            **updates,
+        )
+    )
+
+    assert validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    ) == []
 
 
 def test_missing_head_and_most_body_routes_to_severe_rejection() -> None:
@@ -389,6 +507,11 @@ def test_legacy_reference_state_without_new_judge_fields_loads() -> None:
     assert legacy.viewpoint is None
     assert legacy.independent_reference_value is None
     assert legacy.requires_substantial_invention is None
+    assert legacy.primary_identity_region_visible is None
+    assert legacy.major_structure_visible is None
+    assert legacy.truncation_severity is None
+    assert legacy.discrete_foreground_instance is None
+    assert legacy.mask_matches_target is None
 
 
 @pytest.mark.parametrize("status", ["ready", "rejected"])
@@ -404,6 +527,11 @@ def test_reference_state_persists_new_judge_fields(status: str) -> None:
         "viewpoint": "front",
         "independent_reference_value": status == "ready",
         "requires_substantial_invention": status == "rejected",
+        "primary_identity_region_visible": status == "ready",
+        "major_structure_visible": status == "ready",
+        "truncation_severity": "none" if status == "ready" else "major",
+        "discrete_foreground_instance": status == "ready",
+        "mask_matches_target": status == "ready",
     }
     if status == "ready":
         payload.update(
@@ -415,6 +543,13 @@ def test_reference_state_persists_new_judge_fields(status: str) -> None:
     assert restored.viewpoint == "front"
     assert restored.independent_reference_value is (status == "ready")
     assert restored.requires_substantial_invention is (status == "rejected")
+    assert restored.primary_identity_region_visible is (status == "ready")
+    assert restored.major_structure_visible is (status == "ready")
+    assert restored.truncation_severity == (
+        "none" if status == "ready" else "major"
+    )
+    assert restored.discrete_foreground_instance is (status == "ready")
+    assert restored.mask_matches_target is (status == "ready")
 
 
 def test_prompt_distinguishes_repairable_from_stable_local_views() -> None:
@@ -450,6 +585,9 @@ def test_request_payload_contains_only_required_evidence() -> None:
                 "bbox_fill_ratio": 1.0,
                 "border_contact_count": 0,
                 "sharpness_score": 0.0,
+                "significant_component_count": 1,
+                "largest_component_ratio": 1.0,
+                "second_largest_component_ratio": 0.0,
             }
         ],
     }

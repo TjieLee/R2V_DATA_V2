@@ -67,10 +67,34 @@ bad mask, environment fragment, or non-target content. severely_incomplete and
 fragmented must be rejected. Poor image quality must also be rejected. A
 single connected component is not evidence that the entity is complete.
 
+Report objective visual evidence separately. primary_identity_region_visible
+means a subject's face, head, or another genuinely identity-bearing region is
+visible; a back, clothing, trousers, or torso silhouette alone is insufficient.
+For objects and groups it means the primary recognizable visual region is
+present. major_structure_visible means most of the coherent subject or object
+structure remains, rather than only a torso, back, partial clothing, or
+disconnected pieces. Classify truncation_severity as none, minor, or major.
+repairable permits only minor truncation. Missing identity regions, back-only or
+torso-only subjects, and substantial missing body or object structure are major
+and must reject. Boogu's ability to invent content is never a reason to retain a
+majorly truncated source.
+
+discrete_foreground_instance is false for environment regions, wall or terrain
+patches, water surfaces, background architecture or murals, negative space, and
+other scene fragments that are not independently reusable foreground instances.
+Judge visual structure, not an object-name blacklist. mask_matches_target is
+false when the crop mainly depicts another entity or contains large unrelated
+regions, such as a snorkel mask dominated by unrelated diving equipment.
+Multiple large separated components in a non-group mask strongly suggest
+fragmentation or target mismatch. Use the supplied component diagnostics along
+with both the context image and isolated crop.
+
 Do not output tokens or crop coordinates. Return one strict JSON object only
 with selected_candidate_id, image_quality, completeness, reference_scope,
 visible_region, whole_entity_recognizable, identity_features_visible,
-viewpoint, independent_reference_value, requires_substantial_invention, and
+viewpoint, independent_reference_value, requires_substantial_invention,
+primary_identity_region_visible, major_structure_visible,
+truncation_severity, discrete_foreground_instance, mask_matches_target, and
 scope_reason."""
 
 
@@ -120,6 +144,13 @@ def build_entity_reference_request_payload(
                 "bbox_fill_ratio": candidate.bbox_fill_ratio,
                 "border_contact_count": candidate.border_contact_count,
                 "sharpness_score": candidate.sharpness_score,
+                "significant_component_count": (
+                    candidate.significant_component_count
+                ),
+                "largest_component_ratio": candidate.largest_component_ratio,
+                "second_largest_component_ratio": (
+                    candidate.second_largest_component_ratio
+                ),
             }
             for candidate in candidates
         ],
@@ -222,6 +253,77 @@ def validate_entity_reference_decision(
                 code="substantial_invention_not_rejected",
                 field="requires_substantial_invention",
                 message="candidate requiring substantial invention must reject",
+            )
+        )
+    if (
+        not decision.primary_identity_region_visible
+        and decision.reference_scope != "reject"
+    ):
+        issues.append(
+            ValidationIssue(
+                code="primary_identity_region_not_visible",
+                field="primary_identity_region_visible",
+                message="non-reject reference requires its primary identity region",
+            )
+        )
+    if not decision.major_structure_visible and decision.reference_scope != "reject":
+        issues.append(
+            ValidationIssue(
+                code="major_structure_not_visible",
+                field="major_structure_visible",
+                message="non-reject reference requires visible major structure",
+            )
+        )
+    if (
+        not decision.discrete_foreground_instance
+        and decision.reference_scope != "reject"
+    ):
+        issues.append(
+            ValidationIssue(
+                code="non_discrete_foreground_instance",
+                field="discrete_foreground_instance",
+                message="non-discrete scene content must reject",
+            )
+        )
+    if not decision.mask_matches_target and decision.reference_scope != "reject":
+        issues.append(
+            ValidationIssue(
+                code="mask_target_mismatch",
+                field="mask_matches_target",
+                message="a mask that does not match the target must reject",
+            )
+        )
+    if decision.truncation_severity == "major" and (
+        decision.reference_scope != "reject"
+        or decision.selected_candidate_id is not None
+    ):
+        issues.append(
+            ValidationIssue(
+                code="major_truncation_not_rejected",
+                field="truncation_severity",
+                message="major truncation must reject without selecting a candidate",
+            )
+        )
+    if (
+        decision.completeness == "complete"
+        and decision.truncation_severity != "none"
+    ):
+        issues.append(
+            ValidationIssue(
+                code="complete_truncation_mismatch",
+                field="truncation_severity",
+                message="complete reference requires truncation_severity=none",
+            )
+        )
+    if (
+        decision.completeness == "repairable"
+        and decision.truncation_severity != "minor"
+    ):
+        issues.append(
+            ValidationIssue(
+                code="repairable_requires_minor_truncation",
+                field="truncation_severity",
+                message="repairable reference requires minor truncation",
             )
         )
     if decision.reference_scope == "full":

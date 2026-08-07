@@ -40,6 +40,7 @@ from r2v_data_v2.v3.schemas import (
     MaskRle,
     SampledFrame,
     SampledFramesArtifact,
+    TrackedEntityMasks,
     TrackedMasksArtifact,
 )
 from r2v_data_v2.v3.segment import segment_clips
@@ -345,6 +346,41 @@ def _ready(
         observations=tuple(observations),
         group_tracks_verified=group_tracks_verified,
     )
+
+
+def _published_track(
+    entity_id: str,
+    masks_by_slot: dict[int, np.ndarray],
+    *,
+    reference_type: str = "subject",
+    confidence: float = 0.9,
+) -> TrackedEntityMasks:
+    entity = _entity(entity_id, reference_type=reference_type)
+    first_mask = next(iter(masks_by_slot.values()))
+    return v3_segment_module._entity_masks_from_result(
+        entity,
+        _ready(
+            [
+                BackendMaskObservation(
+                    slot=slot,
+                    mask=mask,
+                    confidence=confidence,
+                    object_id=f"track-{entity_id}",
+                )
+                for slot, mask in masks_by_slot.items()
+            ]
+        ),
+        height=first_mask.shape[0],
+        width=first_mask.shape[1],
+    )
+
+
+def _overlap_mask_pair(intersection_pixels: int) -> tuple[np.ndarray, np.ndarray]:
+    first = np.zeros((1, 200), dtype=bool)
+    second = np.zeros((1, 200), dtype=bool)
+    first[:, :100] = True
+    second[:, 100 - intersection_pixels : 200 - intersection_pixels] = True
+    return first, second
 
 
 @pytest.mark.parametrize(
@@ -1240,3 +1276,154 @@ def test_pipeline_accepts_fake_segment_backend_and_runs_rank(
     coverage = storage.read_clip("clip-1").coverage
     assert coverage is not None
     assert coverage.passed is True
+
+
+def test_cross_entity_duplicate_requires_sustained_overlap() -> None:
+    first_mask = np.zeros((1, 200), dtype=bool)
+    second_mask = np.zeros((1, 200), dtype=bool)
+    first_mask[:, :195] = True
+    second_mask[:, 5:] = True
+    duplicate = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: first_mask for slot in range(5)}),
+        "e2",
+        _published_track("e2", {slot: second_mask for slot in range(5)}),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+    single_frame = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {0: first_mask}),
+        "e2",
+        _published_track("e2", {0: second_mask}),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+
+    assert duplicate.is_duplicate is True
+    assert duplicate.common_valid_frame_count == 5
+    assert duplicate.median_mask_iou == pytest.approx(0.95)
+    assert single_frame.is_duplicate is False
+
+
+def test_cross_entity_duplicate_requires_median_iou_threshold() -> None:
+    first_mask, lower_overlap = _overlap_mask_pair(90)
+    decision = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: first_mask for slot in range(3)}),
+        "e2",
+        _published_track("e2", {slot: lower_overlap for slot in range(3)}),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+
+    assert decision.median_mask_iou < 0.85
+    assert decision.is_duplicate is False
+
+
+def test_cross_entity_duplicate_requires_high_overlap_frame_fraction() -> None:
+    pairs = [
+        _overlap_mask_pair(intersection)
+        for intersection in (100, 98, 95, 88, 88)
+    ]
+    decision = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: pair[0] for slot, pair in enumerate(pairs)}),
+        "e2",
+        _published_track("e2", {slot: pair[1] for slot, pair in enumerate(pairs)}),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+
+    assert decision.median_mask_iou >= 0.85
+    assert decision.high_overlap_frame_ratio == pytest.approx(3 / 5)
+    assert decision.is_duplicate is False
+
+
+def test_cross_entity_duplicate_winner_uses_track_quality_then_order() -> None:
+    mask = np.ones((8, 8), dtype=bool)
+    more_frames = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: mask for slot in range(5)}, confidence=0.7),
+        "e2",
+        _published_track("e2", {slot: mask for slot in range(4)}, confidence=0.99),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+    higher_confidence = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: mask for slot in range(4)}, confidence=0.7),
+        "e2",
+        _published_track("e2", {slot: mask for slot in range(4)}, confidence=0.9),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+    earlier_annotation = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: mask for slot in range(4)}),
+        "e2",
+        _published_track("e2", {slot: mask for slot in range(4)}),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+
+    assert more_frames.winner_entity_id == "e1"
+    assert higher_confidence.winner_entity_id == "e2"
+    assert earlier_annotation.winner_entity_id == "e1"
+
+
+def test_group_tracks_are_excluded_from_cross_entity_duplicate_gate() -> None:
+    mask = np.ones((8, 8), dtype=bool)
+    decision = v3_segment_module.compare_cross_entity_tracks(
+        "e1",
+        _published_track("e1", {slot: mask for slot in range(5)}),
+        "e2",
+        _published_track(
+            "e2",
+            {slot: mask for slot in range(5)},
+            reference_type="group",
+        ),
+        first_annotation_index=0,
+        second_annotation_index=1,
+    )
+
+    assert decision.is_duplicate is False
+
+
+def test_segment_marks_duplicate_loser_failed_without_reordering_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entities = [_entity("e1"), _entity("e2")]
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=entities,
+    )
+    mask = _mask()
+    backend = FakeSegmentationBackend(
+        {
+            entity.entity_id: _ready(
+                [
+                    BackendMaskObservation(
+                        slot=slot,
+                        mask=mask,
+                        confidence=0.9,
+                        object_id=f"track-{entity.entity_id}",
+                    )
+                    for slot in range(5)
+                ]
+            )
+            for entity in entities
+        }
+    )
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+    artifact = storage.read_masks("clip-1")
+
+    assert list(artifact.entities) == ["e1", "e2"]
+    assert artifact.entities["e1"].status == "ready"
+    assert artifact.entities["e2"].status == "failed"
+    assert artifact.entities["e2"].reason == "duplicate_cross_entity_track:e1"
+    assert stats.entities_ready == 1
+    assert stats.entities_failed == 1

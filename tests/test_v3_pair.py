@@ -362,6 +362,11 @@ def _decision(
             viewpoint=("front" if reference_type == "subject" else "not_applicable"),
             independent_reference_value=True,
             requires_substantial_invention=False,
+            primary_identity_region_visible=False,
+            major_structure_visible=False,
+            truncation_severity="major",
+            discrete_foreground_instance=False,
+            mask_matches_target=False,
             scope_reason="not reusable",
         )
     completeness = (
@@ -383,6 +388,11 @@ def _decision(
         viewpoint=("front" if reference_type == "subject" else "not_applicable"),
         independent_reference_value=True,
         requires_substantial_invention=False,
+        primary_identity_region_visible=True,
+        major_structure_visible=True,
+        truncation_severity=("minor" if completeness == "repairable" else "none"),
+        discrete_foreground_instance=True,
+        mask_matches_target=True,
         scope_reason="clear visual identity",
     )
 
@@ -685,6 +695,151 @@ def test_pair_rejects_entity_when_every_reference_candidate_is_tiny(
     assert clip.references.entities[0].scope_reason == "tiny_reference_candidates"
 
 
+def test_mask_component_diagnostics_accept_single_component() -> None:
+    mask = np.zeros((30, 30), dtype=bool)
+    mask[5:25, 7:23] = True
+
+    diagnostics = pair_module.mask_component_diagnostics(mask)
+
+    assert diagnostics.significant_component_count == 1
+    assert diagnostics.largest_component_ratio == 1.0
+    assert diagnostics.second_largest_component_ratio == 0.0
+    assert diagnostics.severely_fragmented is False
+
+
+def test_tiny_natural_fragment_is_not_significant() -> None:
+    mask = np.zeros((50, 50), dtype=bool)
+    mask[2:32, 2:32] = True
+    mask[40:42, 40:45] = True
+
+    diagnostics = pair_module.mask_component_diagnostics(mask)
+
+    assert diagnostics.significant_component_count == 1
+    assert diagnostics.second_largest_component_ratio < 0.02
+    assert diagnostics.severely_fragmented is False
+
+
+def test_large_secondary_mask_component_is_severely_fragmented() -> None:
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[1:11, 1:10] = True
+    mask[1:6, 16:22] = True
+
+    diagnostics = pair_module.mask_component_diagnostics(mask)
+
+    assert diagnostics.largest_component_ratio == pytest.approx(0.75)
+    assert diagnostics.second_largest_component_ratio > 0.20
+    assert diagnostics.severely_fragmented is True
+
+
+def test_largest_component_below_threshold_is_severely_fragmented() -> None:
+    mask = np.zeros((30, 40), dtype=bool)
+    mask[1:6, 1:14] = True
+    mask[1:4, 20:25] = True
+    mask[10:12, 20:25] = True
+    mask[18:20, 20:25] = True
+
+    diagnostics = pair_module.mask_component_diagnostics(mask)
+
+    assert diagnostics.largest_component_ratio == pytest.approx(0.65)
+    assert diagnostics.second_largest_component_ratio == pytest.approx(0.15)
+    assert diagnostics.significant_component_count == 1
+    assert diagnostics.severely_fragmented is True
+
+
+def test_more_than_three_significant_components_is_fragmented() -> None:
+    mask = np.zeros((40, 40), dtype=bool)
+    mask[1:11, 1:17] = True
+    for top, left in ((1, 25), (12, 25), (23, 25)):
+        mask[top : top + 4, left : left + 4] = True
+
+    diagnostics = pair_module.mask_component_diagnostics(mask)
+
+    assert diagnostics.significant_component_count == 4
+    assert diagnostics.largest_component_ratio > 0.70
+    assert diagnostics.second_largest_component_ratio < 0.20
+    assert diagnostics.severely_fragmented is True
+
+
+@pytest.mark.parametrize(
+    ("reference_type", "expected_count"),
+    [("subject", 0), ("object", 0), ("group", 10)],
+)
+def test_fragmentation_gate_bypasses_only_group_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference_type: str,
+    expected_count: int,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(max_candidates_per_entity=10),
+    )
+    storage = _storage(config, entity_types=(reference_type,))
+    original = pair_module._candidate_from_frame
+
+    def fragmented_candidate(**kwargs: object):
+        return replace(
+            original(**kwargs),
+            significant_component_count=4,
+            largest_component_ratio=0.60,
+            second_largest_component_ratio=0.25,
+        )
+
+    monkeypatch.setattr(
+        pair_module,
+        "_candidate_from_frame",
+        fragmented_candidate,
+    )
+    clip = storage.read_clip("clip-1")
+
+    candidates = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid="clip-1",
+        entity=clip.annotation.entities[0],
+        frames=storage.read_frames("clip-1"),
+        masks=storage.read_masks("clip-1"),
+    )
+
+    assert len(candidates) == expected_count
+
+
+def test_all_fragmented_candidates_use_specific_rejection_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    original = pair_module._candidate_from_frame
+
+    def fragmented_candidate(**kwargs: object):
+        return replace(
+            original(**kwargs),
+            significant_component_count=2,
+            largest_component_ratio=0.65,
+            second_largest_component_ratio=0.35,
+        )
+
+    monkeypatch.setattr(
+        pair_module,
+        "_candidate_from_frame",
+        fragmented_candidate,
+    )
+
+    class UnexpectedJudge:
+        def decide(self, **kwargs: object) -> object:
+            del kwargs
+            raise AssertionError("fragmented candidates must not reach Qwen")
+
+    stats = pair_clips(config, storage, judge=UnexpectedJudge())
+    state = storage.read_clip("clip-1").references.entities[0]
+
+    assert stats.entities_rejected == 1
+    assert state.status == "rejected"
+    assert state.scope_reason == "fragmented_reference_candidates"
+
+
 def test_pair_does_not_publish_candidate_without_independent_reference_value(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -709,6 +864,11 @@ def test_pair_does_not_publish_candidate_without_independent_reference_value(
                     viewpoint="not_applicable",
                     independent_reference_value=False,
                     requires_substantial_invention=False,
+                    primary_identity_region_visible=False,
+                    major_structure_visible=False,
+                    truncation_severity="none",
+                    discrete_foreground_instance=False,
+                    mask_matches_target=False,
                     scope_reason="The crop is only an environment fragment.",
                 ),
                 raw_responses=("{}",),
@@ -796,6 +956,11 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         "e3",
     ]
     for entity, state in zip(clip.annotation.entities, clip.references.entities):
+        assert state.primary_identity_region_visible is True
+        assert state.major_structure_visible is True
+        assert state.truncation_severity == "none"
+        assert state.discrete_foreground_instance is True
+        assert state.mask_matches_target is True
         validate_entity_reference_artifact(
             config,
             storage,
@@ -1404,9 +1569,39 @@ def test_same_parent_fallback_copies_exact_donor_and_target_semantics(
         target_reference.requires_substantial_invention
         == donor.references.entities[0].requires_substantial_invention
     )
+    assert (
+        target_reference.primary_identity_region_visible
+        == donor.references.entities[0].primary_identity_region_visible
+    )
+    assert (
+        target_reference.major_structure_visible
+        == donor.references.entities[0].major_structure_visible
+    )
+    assert (
+        target_reference.truncation_severity
+        == donor.references.entities[0].truncation_severity
+    )
+    assert (
+        target_reference.discrete_foreground_instance
+        == donor.references.entities[0].discrete_foreground_instance
+    )
+    assert (
+        target_reference.mask_matches_target
+        == donor.references.entities[0].mask_matches_target
+    )
     assert donor.references.entities[0].source_clip_uid == "donor"
     assert donor.references.entities[0].source_entity_id == "e1"
     assert target_path.read_bytes() == donor_path.read_bytes()
+    with pytest.raises(ValueError, match="did not inherit donor quality fields"):
+        validate_entity_reference_artifact(
+            config,
+            storage,
+            "target",
+            target.annotation.entities[0],
+            target_reference.model_copy(update={"mask_matches_target": False}),
+            storage.read_frames("target"),
+            storage.read_masks("target"),
+        )
     with Image.open(target_path) as image:
         assert image.format == "PNG"
         assert image.mode == "RGBA"
@@ -1547,7 +1742,7 @@ def test_ready_tracking_without_a_valid_candidate_uses_sampled_frames(
         masks,
     ):
         if clip_uid == "target":
-            return [], False
+            return [], False, False
         return original_builder(
             config,
             storage,
@@ -3986,6 +4181,17 @@ def test_local_reference_adds_background_without_promoting_scope(
     assert reference.whole_entity_recognizable is False
     assert reference.image_quality == source.image_quality
     assert reference.completeness == source.completeness == "local_usable"
+    assert (
+        reference.primary_identity_region_visible
+        == source.primary_identity_region_visible
+    )
+    assert reference.major_structure_visible == source.major_structure_visible
+    assert reference.truncation_severity == source.truncation_severity
+    assert (
+        reference.discrete_foreground_instance
+        == source.discrete_foreground_instance
+    )
+    assert reference.mask_matches_target == source.mask_matches_target
     assert storage.read_clip("clip-1").reference_edit.entities[0].route == (
         "local_usable"
     )
@@ -4191,7 +4397,7 @@ def test_corrupt_reference_failure_is_isolated_before_lazy_runtime_start(
     assert storage.read_clip("clip-b").reference_edit.status == "ready"
 
 
-def test_legacy_touching_local_reference_routes_to_repairable(
+def test_legacy_touching_local_completion_rejection_rejects_entity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4209,6 +4415,8 @@ def test_legacy_touching_local_reference_routes_to_repairable(
         clip.pairing,
     )
     backend = _ReferenceEditBackend()
+    source_path = storage.selected_entity_path("clip-1", "e1")
+    source_bytes = source_path.read_bytes()
 
     stats = reference_edit_clips(
         config,
@@ -4220,13 +4428,22 @@ def test_legacy_touching_local_reference_routes_to_repairable(
 
     clip = storage.read_clip("clip-1")
     edit = clip.reference_edit.entities[0]
-    assert stats.entities_fallback == 1
+    assert stats.entities_fallback == 0
+    assert stats.entities_rejected == 1
     assert len(backend.calls) == 1
     assert backend.calls[0]["thinking_enabled"] is True
     assert edit.route == "repairable"
     assert edit.operations == ["complete_entity"]
-    assert edit.fallback_policy == "keep_source"
-    assert clip.references.entities[0] == source
+    assert edit.status == "rejected"
+    assert edit.fallback_policy == "reject_entity"
+    assert edit.reason.startswith("repairable_completion_rejected:")
+    assert clip.references.entities[0].status == "rejected"
+    assert clip.references.entities[0].image_path is None
+    assert clip.pairing.status == "rejected"
+    assert clip.pairing.reason == "no_qualifying_ready_reference"
+    assert clip.pairing.retained_entity_ids == []
+    assert clip.pairing.tokens == {}
+    assert source_path.read_bytes() == source_bytes
 
 
 def test_legacy_local_reference_publishes_with_normalized_quality_fields(
@@ -4373,7 +4590,7 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
     assert clip.references.entities[0].synthetic is True
 
 
-def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
+def test_repairable_completion_rejection_overrides_keep_source_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4407,23 +4624,19 @@ def test_rejected_reference_edit_uses_explicit_keep_source_fallback(
 
     clip = storage.read_clip("clip-1")
     reference = clip.references.entities[0]
-    assert stats.entities_fallback == 1
-    assert clip.pairing.status == "ready"
-    assert clip.reference_edit.entities[0].status == "fallback"
-    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert stats.entities_fallback == 0
+    assert stats.entities_rejected == 1
+    assert clip.pairing.status == "rejected"
+    assert clip.pairing.reason == "no_qualifying_ready_reference"
+    assert clip.reference_edit.entities[0].status == "rejected"
+    assert clip.reference_edit.entities[0].fallback_policy == "reject_entity"
     assert len(backend.calls) == 1
     assert reference.synthetic is False
-    assert reference.image_path == storage.relative_artifact_path(source_path)
-    assert reference.reference_scope == source_reference.reference_scope
-    assert reference.visible_region == source_reference.visible_region
-    assert reference.completeness == source_reference.completeness
+    assert reference.status == "rejected"
+    assert reference.image_path is None
+    assert reference.scope_reason.startswith("repairable_completion_rejected:")
     assert source_path.read_bytes() == source_bytes
-    source_selection = json.loads(
-        (
-            storage.root / clip.reference_edit.entities[0].metadata_path
-        ).read_text(encoding="utf-8")
-    )
-    assert source_selection["final_selection"] == "source"
+    assert source_reference.status == "ready"
 
 
 def test_reference_edit_overwrite_restores_immutable_source_reference(
@@ -4499,6 +4712,66 @@ def test_reference_edit_worker_failure_is_logged_and_falls_back(
     assert failures[-1]["stage"] == "reference_edit"
     assert failures[-1]["details"]["entity_id"] == "e1"
     assert failures[-1]["reason"].startswith("boogu_reference_edit_failed:")
+
+
+def test_repairable_completion_backend_failure_rejects_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    source_path = storage.selected_entity_path("clip-1", "e1")
+    source_bytes = source_path.read_bytes()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_FailingReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_failed == 1
+    assert stats.entities_rejected == 1
+    assert stats.entities_fallback == 0
+    assert clip.references.entities[0].status == "rejected"
+    assert clip.reference_edit.entities[0].status == "rejected"
+    assert clip.reference_edit.entities[0].reason.startswith(
+        "repairable_completion_rejected:boogu_reference_edit_failed:"
+    )
+    assert clip.pairing.status == "rejected"
+    assert clip.pairing.reason == "no_qualifying_ready_reference"
+    assert source_path.read_bytes() == source_bytes
+
+
+def test_local_usable_background_rejection_keeps_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    source = storage.read_clip("clip-1").references.entities[0]
+    source_path = storage.selected_entity_path("clip-1", "e1")
+    source_bytes = source_path.read_bytes()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(accept=False),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_fallback == 1
+    assert stats.entities_rejected == 0
+    assert clip.references.entities[0] == source
+    assert clip.reference_edit.entities[0].status == "fallback"
+    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert source_path.read_bytes() == source_bytes
 
 
 def test_production_pair_bypasses_legacy_completion_fallback(

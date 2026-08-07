@@ -297,6 +297,7 @@ ReferenceCompleteness = Literal[
     "severely_incomplete",
     "fragmented",
 ]
+ReferenceTruncationSeverity = Literal["none", "minor", "major"]
 ReferenceViewpoint = Literal[
     "front",
     "three_quarter",
@@ -328,6 +329,11 @@ class RawEntityReferenceDecision(SchemaModel):
     viewpoint: ReferenceViewpoint
     independent_reference_value: StrictBool
     requires_substantial_invention: StrictBool
+    primary_identity_region_visible: StrictBool
+    major_structure_visible: StrictBool
+    truncation_severity: ReferenceTruncationSeverity
+    discrete_foreground_instance: StrictBool
+    mask_matches_target: StrictBool
     scope_reason: str
 
     @model_validator(mode="after")
@@ -413,6 +419,11 @@ class EntityReferenceState(SchemaModel):
     viewpoint: Optional[ReferenceViewpoint] = None
     independent_reference_value: Optional[bool] = None
     requires_substantial_invention: Optional[bool] = None
+    primary_identity_region_visible: Optional[bool] = None
+    major_structure_visible: Optional[bool] = None
+    truncation_severity: Optional[ReferenceTruncationSeverity] = None
+    discrete_foreground_instance: Optional[bool] = None
+    mask_matches_target: Optional[bool] = None
     synthetic: bool = False
     generation_metadata_path: Optional[str] = None
     generation_source_sha256: Optional[str] = Field(
@@ -447,6 +458,26 @@ class EntityReferenceState(SchemaModel):
             if self.requires_substantial_invention is True:
                 raise ValueError(
                     "ready entity reference cannot require substantial invention"
+                )
+            if self.primary_identity_region_visible is False:
+                raise ValueError(
+                    "ready entity reference requires its primary identity region"
+                )
+            if self.major_structure_visible is False:
+                raise ValueError(
+                    "ready entity reference requires visible major structure"
+                )
+            if self.truncation_severity == "major":
+                raise ValueError(
+                    "ready entity reference cannot have major truncation"
+                )
+            if self.discrete_foreground_instance is False:
+                raise ValueError(
+                    "ready entity reference requires a discrete foreground instance"
+                )
+            if self.mask_matches_target is False:
+                raise ValueError(
+                    "ready entity reference mask must match its target"
                 )
             if self.reference_scope == "full":
                 if (

@@ -542,6 +542,15 @@ def _attempt(
                 requires_substantial_invention=(
                     decision.requires_substantial_invention
                 ),
+                primary_identity_region_visible=(
+                    decision.primary_identity_region_visible
+                ),
+                major_structure_visible=decision.major_structure_visible,
+                truncation_severity=decision.truncation_severity,
+                discrete_foreground_instance=(
+                    decision.discrete_foreground_instance
+                ),
+                mask_matches_target=decision.mask_matches_target,
                 scope_reason=decision.scope_reason,
                 image_path=source_state.image_path,
                 source_frame_index=source_state.source_frame_index,

@@ -44,6 +44,19 @@ class SegmentStats:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CrossEntityDuplicateDecision:
+    first_entity_id: str
+    second_entity_id: str
+    common_valid_frame_count: int
+    high_overlap_frame_count: int
+    high_overlap_frame_ratio: float
+    median_mask_iou: float
+    is_duplicate: bool
+    winner_entity_id: str | None = None
+    loser_entity_id: str | None = None
+
+
 def _empty_rle(height: int, width: int) -> MaskRle:
     return encode_binary_mask(np.zeros((height, width), dtype=bool))
 
@@ -97,6 +110,163 @@ def _failed_entity(
         frames=_empty_frames(height, width),
         reason=reason,
     )
+
+
+def _valid_track_frames(track: TrackedEntityMasks) -> list[TrackedMaskFrame]:
+    return [
+        frame
+        for frame in track.frames
+        if frame.present and frame.track_valid and frame.area_pixels > 0
+    ]
+
+
+def _track_quality(
+    track: TrackedEntityMasks,
+    *,
+    annotation_index: int,
+) -> tuple[int, float, int]:
+    frames = _valid_track_frames(track)
+    confidences = [
+        float(frame.confidence)
+        for frame in frames
+        if frame.confidence is not None
+    ]
+    median_confidence = float(np.median(confidences)) if confidences else -math.inf
+    return len(frames), median_confidence, -annotation_index
+
+
+def compare_cross_entity_tracks(
+    first_entity_id: str,
+    first: TrackedEntityMasks,
+    second_entity_id: str,
+    second: TrackedEntityMasks,
+    *,
+    first_annotation_index: int,
+    second_annotation_index: int,
+    minimum_common_frames: int = 3,
+    high_overlap_iou: float = 0.80,
+    median_duplicate_iou: float = 0.85,
+    minimum_high_overlap_ratio: float = 0.75,
+) -> CrossEntityDuplicateDecision:
+    """Compare two published tracks without changing either artifact."""
+    if first.reference_type == "group" or second.reference_type == "group":
+        return CrossEntityDuplicateDecision(
+            first_entity_id=first_entity_id,
+            second_entity_id=second_entity_id,
+            common_valid_frame_count=0,
+            high_overlap_frame_count=0,
+            high_overlap_frame_ratio=0.0,
+            median_mask_iou=0.0,
+            is_duplicate=False,
+        )
+    if first.status != "ready" or second.status != "ready":
+        return CrossEntityDuplicateDecision(
+            first_entity_id=first_entity_id,
+            second_entity_id=second_entity_id,
+            common_valid_frame_count=0,
+            high_overlap_frame_count=0,
+            high_overlap_frame_ratio=0.0,
+            median_mask_iou=0.0,
+            is_duplicate=False,
+        )
+
+    first_by_slot = {frame.slot: frame for frame in _valid_track_frames(first)}
+    second_by_slot = {frame.slot: frame for frame in _valid_track_frames(second)}
+    ious: list[float] = []
+    for slot in sorted(first_by_slot.keys() & second_by_slot.keys()):
+        first_mask = decode_binary_mask(first_by_slot[slot].rle)
+        second_mask = decode_binary_mask(second_by_slot[slot].rle)
+        intersection = int(np.count_nonzero(first_mask & second_mask))
+        union = int(np.count_nonzero(first_mask | second_mask))
+        if union > 0:
+            ious.append(intersection / union)
+
+    common_count = len(ious)
+    high_count = sum(value >= high_overlap_iou for value in ious)
+    high_ratio = high_count / common_count if common_count else 0.0
+    median_iou = float(np.median(ious)) if ious else 0.0
+    is_duplicate = (
+        common_count >= minimum_common_frames
+        and median_iou >= median_duplicate_iou
+        and high_ratio >= minimum_high_overlap_ratio
+    )
+    winner: str | None = None
+    loser: str | None = None
+    if is_duplicate:
+        first_quality = _track_quality(
+            first,
+            annotation_index=first_annotation_index,
+        )
+        second_quality = _track_quality(
+            second,
+            annotation_index=second_annotation_index,
+        )
+        if first_quality >= second_quality:
+            winner, loser = first_entity_id, second_entity_id
+        else:
+            winner, loser = second_entity_id, first_entity_id
+    return CrossEntityDuplicateDecision(
+        first_entity_id=first_entity_id,
+        second_entity_id=second_entity_id,
+        common_valid_frame_count=common_count,
+        high_overlap_frame_count=high_count,
+        high_overlap_frame_ratio=high_ratio,
+        median_mask_iou=median_iou,
+        is_duplicate=is_duplicate,
+        winner_entity_id=winner,
+        loser_entity_id=loser,
+    )
+
+
+def _deduplicate_cross_entity_tracks(
+    entities: list[AnnotationEntity],
+    tracks: dict[str, TrackedEntityMasks],
+    *,
+    height: int,
+    width: int,
+) -> dict[str, TrackedEntityMasks]:
+    annotation_index = {
+        entity.entity_id: index for index, entity in enumerate(entities)
+    }
+    ranked_ids = sorted(
+        (
+            entity.entity_id
+            for entity in entities
+            if tracks[entity.entity_id].status == "ready"
+            and entity.reference_type != "group"
+        ),
+        key=lambda entity_id: _track_quality(
+            tracks[entity_id],
+            annotation_index=annotation_index[entity_id],
+        ),
+        reverse=True,
+    )
+    entities_by_id = {entity.entity_id: entity for entity in entities}
+    deduplicated = dict(tracks)
+    for winner_position, winner_id in enumerate(ranked_ids):
+        if deduplicated[winner_id].status != "ready":
+            continue
+        for loser_id in ranked_ids[winner_position + 1 :]:
+            if deduplicated[loser_id].status != "ready":
+                continue
+            decision = compare_cross_entity_tracks(
+                winner_id,
+                deduplicated[winner_id],
+                loser_id,
+                deduplicated[loser_id],
+                first_annotation_index=annotation_index[winner_id],
+                second_annotation_index=annotation_index[loser_id],
+            )
+            if not decision.is_duplicate:
+                continue
+            assert decision.winner_entity_id == winner_id
+            deduplicated[loser_id] = _failed_entity(
+                entities_by_id[loser_id],
+                height=height,
+                width=width,
+                reason=f"duplicate_cross_entity_track:{winner_id}",
+            )
+    return deduplicated
 
 
 def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int]:
@@ -451,6 +621,14 @@ def _segment_clips_with_backend(
                         details={"entity_id": entity.entity_id},
                     )
                 tracked_entities[entity.entity_id] = entity_masks
+
+            tracked_entities = _deduplicate_cross_entity_tracks(
+                annotation.entities,
+                tracked_entities,
+                height=frames.height,
+                width=frames.width,
+            )
+            for entity_masks in tracked_entities.values():
                 if entity_masks.status == "ready":
                     ready_count += 1
                 elif entity_masks.status == "not_found":

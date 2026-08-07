@@ -80,6 +80,24 @@ class EntityReferenceCandidate:
     border_contact_count: int
     normalized_center_distance: float
     sharpness_score: float = 0.0
+    significant_component_count: int = 1
+    largest_component_ratio: float = 1.0
+    second_largest_component_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
+class MaskComponentDiagnostics:
+    significant_component_count: int
+    largest_component_ratio: float
+    second_largest_component_ratio: float
+
+    @property
+    def severely_fragmented(self) -> bool:
+        return (
+            self.largest_component_ratio < 0.70
+            or self.second_largest_component_ratio > 0.20
+            or self.significant_component_count > 3
+        )
 
 
 @dataclass(frozen=True)
@@ -132,6 +150,83 @@ def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int]:
         int(rows.min()),
         int(columns.max()) + 1,
         int(rows.max()) + 1,
+    )
+
+
+def _foreground_component_areas(mask: np.ndarray) -> list[int]:
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 2 or not binary.any():
+        raise ValueError("component diagnostics require a non-empty 2D mask")
+
+    parents: list[int] = []
+    run_areas: list[int] = []
+
+    def make_set(area: int) -> int:
+        label = len(parents)
+        parents.append(label)
+        run_areas.append(area)
+        return label
+
+    def find(label: int) -> int:
+        root = label
+        while parents[root] != root:
+            root = parents[root]
+        while parents[label] != label:
+            parent = parents[label]
+            parents[label] = root
+            label = parent
+        return root
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parents[max(first_root, second_root)] = min(first_root, second_root)
+
+    previous_runs: list[tuple[int, int, int]] = []
+    for row in binary:
+        padded = np.pad(row.astype(np.int8, copy=False), (1, 1))
+        transitions = np.diff(padded)
+        starts = np.flatnonzero(transitions == 1)
+        ends = np.flatnonzero(transitions == -1)
+        current_runs: list[tuple[int, int, int]] = []
+        previous_index = 0
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            label = make_set(end - start)
+            while (
+                previous_index < len(previous_runs)
+                and previous_runs[previous_index][1] < start
+            ):
+                previous_index += 1
+            overlap_index = previous_index
+            while (
+                overlap_index < len(previous_runs)
+                and previous_runs[overlap_index][0] <= end
+            ):
+                union(label, previous_runs[overlap_index][2])
+                overlap_index += 1
+            current_runs.append((start, end, label))
+        previous_runs = current_runs
+
+    component_areas: dict[int, int] = {}
+    for label, area in enumerate(run_areas):
+        root = find(label)
+        component_areas[root] = component_areas.get(root, 0) + area
+    return sorted(component_areas.values(), reverse=True)
+
+
+def mask_component_diagnostics(mask: np.ndarray) -> MaskComponentDiagnostics:
+    component_areas = _foreground_component_areas(mask)
+    total_area = sum(component_areas)
+    significant_area = max(16.0, total_area * 0.02)
+    return MaskComponentDiagnostics(
+        significant_component_count=sum(
+            area >= significant_area for area in component_areas
+        ),
+        largest_component_ratio=component_areas[0] / total_area,
+        second_largest_component_ratio=(
+            component_areas[1] / total_area if len(component_areas) > 1 else 0.0
+        ),
     )
 
 
@@ -309,6 +404,7 @@ def _candidate_from_frame(
         )
     )
     sharpness_score = _masked_sharpness_score(source, binary)
+    component_diagnostics = mask_component_diagnostics(binary)
     return EntityReferenceCandidate(
         candidate_id="candidate_0",
         entity_id=entity.entity_id,
@@ -323,6 +419,13 @@ def _candidate_from_frame(
         border_contact_count=border_contact,
         normalized_center_distance=center_distance,
         sharpness_score=sharpness_score,
+        significant_component_count=(
+            component_diagnostics.significant_component_count
+        ),
+        largest_component_ratio=component_diagnostics.largest_component_ratio,
+        second_largest_component_ratio=(
+            component_diagnostics.second_largest_component_ratio
+        ),
     )
 
 
@@ -374,7 +477,7 @@ def _build_entity_reference_candidates(
     entity: AnnotationEntity,
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
-) -> tuple[list[EntityReferenceCandidate], bool]:
+) -> tuple[list[EntityReferenceCandidate], bool, bool]:
     if frames.clip_uid != clip_uid or masks.clip_uid != clip_uid:
         raise ValueError("pair input clip_uid does not match its clip")
     if (frames.width, frames.height) != (masks.width, masks.height):
@@ -388,7 +491,7 @@ def _build_entity_reference_candidates(
     ):
         raise ValueError("mask artifact entity semantics do not match annotation")
     if tracked.status != "ready":
-        return [], False
+        return [], False, False
     if [item.slot for item in tracked.frames] != list(range(10)):
         raise ValueError("tracked entity slots must be ordered from 0 through 9")
     candidates: list[EntityReferenceCandidate] = []
@@ -424,7 +527,22 @@ def _build_entity_reference_candidates(
         is None
     ]
     all_candidates_tiny = bool(candidates) and not non_tiny_candidates
-    non_tiny_candidates.sort(
+    eligible_candidates = [
+        candidate
+        for candidate in non_tiny_candidates
+        if entity.reference_type == "group"
+        or not MaskComponentDiagnostics(
+            significant_component_count=candidate.significant_component_count,
+            largest_component_ratio=candidate.largest_component_ratio,
+            second_largest_component_ratio=(
+                candidate.second_largest_component_ratio
+            ),
+        ).severely_fragmented
+    ]
+    all_non_tiny_candidates_fragmented = (
+        bool(non_tiny_candidates) and not eligible_candidates
+    )
+    eligible_candidates.sort(
         key=lambda candidate: (
             candidate.border_contact_count,
             -candidate.area_ratio,
@@ -433,11 +551,11 @@ def _build_entity_reference_candidates(
             _SLOT_PRIORITY_INDEX[candidate.frame_slot],
         )
     )
-    shortlisted = non_tiny_candidates[: config.pair.max_candidates_per_entity]
+    shortlisted = eligible_candidates[: config.pair.max_candidates_per_entity]
     return [
         replace(candidate, candidate_id=f"candidate_{index}")
         for index, candidate in enumerate(shortlisted, start=1)
-    ], all_candidates_tiny
+    ], all_candidates_tiny, all_non_tiny_candidates_fragmented
 
 
 def build_entity_reference_candidates(
@@ -449,7 +567,7 @@ def build_entity_reference_candidates(
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
 ) -> list[EntityReferenceCandidate]:
-    candidates, _ = _build_entity_reference_candidates(
+    candidates, _, _ = _build_entity_reference_candidates(
         config,
         storage,
         clip_uid=clip_uid,
@@ -719,6 +837,11 @@ def validate_entity_reference_artifact(
         "viewpoint",
         "independent_reference_value",
         "requires_substantial_invention",
+        "primary_identity_region_visible",
+        "major_structure_visible",
+        "truncation_severity",
+        "discrete_foreground_instance",
+        "mask_matches_target",
         "source_frame_index",
     )
     if any(
@@ -756,6 +879,23 @@ def _rejected_reference(
         ),
         requires_substantial_invention=(
             decision.requires_substantial_invention if decision is not None else None
+        ),
+        primary_identity_region_visible=(
+            decision.primary_identity_region_visible
+            if decision is not None
+            else None
+        ),
+        major_structure_visible=(
+            decision.major_structure_visible if decision is not None else None
+        ),
+        truncation_severity=(
+            decision.truncation_severity if decision is not None else None
+        ),
+        discrete_foreground_instance=(
+            decision.discrete_foreground_instance if decision is not None else None
+        ),
+        mask_matches_target=(
+            decision.mask_matches_target if decision is not None else None
         ),
         synthetic=False,
     )
@@ -1346,6 +1486,17 @@ def _run_same_parent_cross_pair_fallback(
                             requires_substantial_invention=(
                                 donor_state.requires_substantial_invention
                             ),
+                            primary_identity_region_visible=(
+                                donor_state.primary_identity_region_visible
+                            ),
+                            major_structure_visible=(
+                                donor_state.major_structure_visible
+                            ),
+                            truncation_severity=donor_state.truncation_severity,
+                            discrete_foreground_instance=(
+                                donor_state.discrete_foreground_instance
+                            ),
+                            mask_matches_target=donor_state.mask_matches_target,
                             image_path=storage.relative_artifact_path(
                                 storage.selected_entity_path(
                                     target_clip.clip_uid,
@@ -1546,6 +1697,7 @@ def pair_clips(
                     (
                         candidates,
                         all_candidates_tiny,
+                        all_candidates_fragmented,
                     ) = _build_entity_reference_candidates(
                         config,
                         storage,
@@ -1561,6 +1713,8 @@ def pair_clips(
                                 (
                                     "tiny_reference_candidates"
                                     if all_candidates_tiny
+                                    else "fragmented_reference_candidates"
+                                    if all_candidates_fragmented
                                     else "no_valid_reference_candidate"
                                 ),
                             )
@@ -1618,6 +1772,17 @@ def pair_clips(
                                 requires_substantial_invention=(
                                     decision.requires_substantial_invention
                                 ),
+                                primary_identity_region_visible=(
+                                    decision.primary_identity_region_visible
+                                ),
+                                major_structure_visible=(
+                                    decision.major_structure_visible
+                                ),
+                                truncation_severity=decision.truncation_severity,
+                                discrete_foreground_instance=(
+                                    decision.discrete_foreground_instance
+                                ),
+                                mask_matches_target=decision.mask_matches_target,
                                 synthetic=False,
                             )
                         )
@@ -1686,6 +1851,17 @@ def pair_clips(
                             requires_substantial_invention=(
                                 decision.requires_substantial_invention
                             ),
+                            primary_identity_region_visible=(
+                                decision.primary_identity_region_visible
+                            ),
+                            major_structure_visible=(
+                                decision.major_structure_visible
+                            ),
+                            truncation_severity=decision.truncation_severity,
+                            discrete_foreground_instance=(
+                                decision.discrete_foreground_instance
+                            ),
+                            mask_matches_target=decision.mask_matches_target,
                         )
                     )
                 retained = [

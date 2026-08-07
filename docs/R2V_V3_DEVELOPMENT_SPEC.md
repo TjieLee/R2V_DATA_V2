@@ -219,6 +219,15 @@ SAM3. Single-subject, single-object, and current first-pass group tracking
 retain exactly one identity rather than unioning unrelated detections.
 Multi-object groups remain unverified and are rejected.
 
+After all annotation entities have been tracked, non-group ready tracks are
+compared across entity IDs. A pair is a duplicate only with at least three
+common present-valid frames, median mask IoU at least `0.85`, and at least 75%
+of common frames at IoU `>= 0.80`. The track with more present-valid frames is
+retained, followed by higher median published object confidence and then earlier
+annotation order. The loser remains in artifact order with `status=failed` and
+`reason=duplicate_cross_entity_track:<winner_entity_id>`. Masks are never
+unioned by this gate, and group tracks are excluded.
+
 SAM3 `out_probs` values are published object-score diagnostics propagated with
 the track. They are not independently estimated per-frame tracking confidence,
 and temporal visibility must not threshold on them. Visibility continues to
@@ -284,6 +293,23 @@ shortlist is formed, candidates whose alpha/mask content bounding box is below
 the configured area threshold or whose longest side is below the configured
 long-side threshold are removed. If every candidate is tiny, the entity is
 rejected with `tiny_reference_candidates` before the semantic judge runs.
+For each non-tiny candidate, NumPy connected-component diagnostics record the
+significant component count and the largest two component area ratios. A
+component is significant at `max(16 pixels, 2% of foreground area)`. Non-group
+candidates are filtered before the shortlist when the largest component is
+below `0.70`, the second-largest exceeds `0.20`, or more than three components
+are significant. If this removes every non-tiny candidate, the reason is
+`fragmented_reference_candidates`. Groups retain the diagnostics but bypass
+this hard fragmentation gate.
+
+The existing single Qwen candidate judgment also reports whether the primary
+identity region and major structure are visible, whether the crop is a discrete
+foreground instance, whether the mask matches the target, and whether
+truncation is `none`, `minor`, or `major`. Code rejects any non-reject result
+with a failed evidence boolean or major truncation. `complete` requires no
+truncation, while `repairable` requires exactly minor truncation. These optional
+fields are persisted in reference state for audit while legacy clip JSON without
+them remains readable.
 
 #### `reference_edit`
 
@@ -310,6 +336,12 @@ then take the deterministic `keep_source` fallback without initializing Boogu,
 Qwen review, or SAM3 runtime. Runtime initialization occurs lazily at the first
 non-tiny entity that actually needs generation and happens at most once per
 stage. Entity counters are committed only with the successful clip result.
+If a `repairable` completion is rejected or fails, its source remains immutable
+on disk but the entity is rejected and removed from retained pairing IDs and
+tokens. `keep_source` does not override this publication gate. If completion is
+accepted and only the later background operation fails, the accepted completion
+candidate remains the explicit fallback. Complete and local-usable background
+failures continue to keep their source references.
 
 #### `instruct`
 
@@ -532,8 +564,9 @@ For a local reference:
 - store the visible region explicitly;
 - never describe the result as a full-body or complete-object reference.
 
-The current pair stage performs no semantic component pruning. Qwen rejects
-obvious fragmentation or segmentation errors.
+The pair stage performs only the deterministic severe-fragmentation gate above;
+it does not attempt semantic component pruning. Qwen still judges fragmentation
+and target mismatch from context, isolated crop, and component diagnostics.
 
 Completeness routing is intentionally conservative. `repairable` is limited to
 a minor local low-risk omission, such as a small limb terminal or small object
