@@ -23,6 +23,8 @@ from r2v_data_v2.v3.pair import (
 )
 from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.reference_judge import (
+    COMPACT_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
     EntityReferenceDecisionAttempt,
     EntityReferenceJudge,
     EntityReferenceJudgeFailure,
@@ -70,6 +72,7 @@ class BaselineDecision:
 
 
 ReplayEvidenceMode = Literal["baseline", "paired_card"]
+ReplayPromptMode = Literal["baseline", "compact_v1"]
 
 _DECISION_COMPARISON_FIELDS = (
     "selected_candidate_id",
@@ -455,6 +458,8 @@ def _summary(
     profiling_summary: Mapping[str, object],
     evidence_mode: ReplayEvidenceMode,
     card_panel_max_side: int,
+    prompt_mode: ReplayPromptMode,
+    system_prompt_chars: int,
 ) -> dict[str, object]:
     components = profiling_summary.get("components")
     candidate_profile = (
@@ -478,6 +483,7 @@ def _summary(
     ]
     changed_candidate_cases: list[dict[str, object]] = []
     changed_route_cases: list[dict[str, object]] = []
+    changed_full_decision_cases: list[dict[str, object]] = []
     baseline_accept_variant_reject: list[dict[str, object]] = []
     baseline_reject_variant_accept: list[dict[str, object]] = []
     candidate_matches = 0
@@ -507,6 +513,21 @@ def _summary(
         full_decision_matches += int(
             all(variant[field] == baseline[field] for field in _DECISION_COMPARISON_FIELDS)
         )
+        field_differences = {
+            field: {
+                "baseline": baseline[field],
+                "variant": variant[field],
+            }
+            for field in _DECISION_COMPARISON_FIELDS
+            if variant[field] != baseline[field]
+        }
+        if field_differences:
+            changed_full_decision_cases.append(
+                {
+                    **_case_key(record),
+                    "differences": field_differences,
+                }
+            )
         if variant["selected_candidate_id"] != baseline["selected_candidate_id"]:
             changed_candidate_cases.append(
                 {
@@ -580,6 +601,8 @@ def _summary(
     result: dict[str, object] = {
         "model": model,
         "evidence_mode": evidence_mode,
+        "prompt_mode": prompt_mode,
+        "system_prompt_chars": system_prompt_chars,
         "card_panel_max_side": (
             card_panel_max_side if evidence_mode == "paired_card" else None
         ),
@@ -680,6 +703,7 @@ def _summary(
         ),
         "changed_candidate_cases": changed_candidate_cases,
         "changed_route_cases": changed_route_cases,
+        "changed_full_decision_cases": changed_full_decision_cases,
         "baseline_accept_variant_reject": baseline_accept_variant_reject,
         "baseline_reject_variant_accept": baseline_reject_variant_accept,
         "repair_cases": repair_cases,
@@ -727,11 +751,16 @@ def run_candidate_judge_replay(
     fail_fast: bool = False,
     evidence_mode: ReplayEvidenceMode = "baseline",
     card_panel_max_side: int = 512,
+    prompt_mode: ReplayPromptMode = "baseline",
     judge: EntityReferenceJudge | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     if evidence_mode not in {"baseline", "paired_card"}:
         raise ValueError("replay evidence_mode is invalid")
+    if prompt_mode not in {"baseline", "compact_v1"}:
+        raise ValueError("replay prompt_mode is invalid")
+    if prompt_mode == "compact_v1" and evidence_mode != "baseline":
+        raise ValueError("compact_v1 replay requires baseline evidence mode")
     if (
         isinstance(card_panel_max_side, bool)
         or not isinstance(card_panel_max_side, int)
@@ -748,6 +777,9 @@ def run_candidate_judge_replay(
         base_url=base_url,
         model=model,
         api_key=api_key,
+    )
+    system_prompt = (
+        COMPACT_SYSTEM_PROMPT if prompt_mode == "compact_v1" else SYSTEM_PROMPT
     )
     storage = ReadOnlyRunStorage(replay_config)
     run = storage.read_run()
@@ -802,6 +834,8 @@ def run_candidate_judge_replay(
                                     else "separate"
                                 ),
                                 card_panel_max_side=card_panel_max_side,
+                                system_prompt=system_prompt,
+                                prompt_mode=prompt_mode,
                             )
                             active_judge = owned_judge
                         source_images = _load_source_images(storage, candidates)
@@ -896,6 +930,8 @@ def run_candidate_judge_replay(
         profiling_summary=profiling_summary,
         evidence_mode=evidence_mode,
         card_panel_max_side=card_panel_max_side,
+        prompt_mode=prompt_mode,
+        system_prompt_chars=len(system_prompt),
     )
     _write_jsonl_atomic(output, records)
     write_json_atomic(summary_path, summary)

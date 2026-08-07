@@ -18,6 +18,7 @@ from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.pair import EntityReferenceCandidate
 from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.reference_judge import (
+    COMPACT_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
@@ -1233,6 +1234,8 @@ def _judge(
     repair_retries: int = 1,
     evidence_mode: str = "separate",
     card_panel_max_side: int = 512,
+    system_prompt: str = SYSTEM_PROMPT,
+    prompt_mode: str = "baseline",
 ) -> QwenEntityReferenceJudge:
     return QwenEntityReferenceJudge(
         QwenServiceConfig(
@@ -1243,6 +1246,8 @@ def _judge(
         repair_retries=repair_retries,
         evidence_mode=evidence_mode,
         card_panel_max_side=card_panel_max_side,
+        system_prompt=system_prompt,
+        prompt_mode=prompt_mode,
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
@@ -1277,6 +1282,75 @@ def test_messages_use_ordered_in_memory_context_and_crop_data_urls() -> None:
             assert image.format == "PNG"
     assert call["response_format"]["type"] == "json_schema"
     assert "video_url" not in json.dumps(messages)
+
+
+def test_compact_prompt_keeps_separate_images_payload_schema_and_validation() -> None:
+    candidates = [_candidate(f"candidate_{index}") for index in range(1, 4)]
+    baseline_completions = _Completions([_payload()])
+    compact_completions = _Completions([_payload()])
+    baseline_judge = _judge(baseline_completions)
+    compact_judge = _judge(
+        compact_completions,
+        system_prompt=COMPACT_SYSTEM_PROMPT,
+        prompt_mode="compact_v1",
+    )
+
+    baseline = baseline_judge.decide(
+        entity=_entity(),
+        candidates=candidates,
+        source_images=_source_images(),
+    )
+    compact = compact_judge.decide(
+        entity=_entity(),
+        candidates=candidates,
+        source_images=_source_images(),
+    )
+
+    baseline_call = baseline_completions.calls[0]
+    compact_call = compact_completions.calls[0]
+    baseline_content = baseline_call["messages"][1]["content"]
+    compact_content = compact_call["messages"][1]["content"]
+    assert baseline_call["messages"][0]["content"] == SYSTEM_PROMPT
+    assert compact_call["messages"][0]["content"] == COMPACT_SYSTEM_PROMPT
+    assert baseline_content[0]["text"] == compact_content[0]["text"]
+    assert [
+        item["text"] for item in baseline_content[1:] if item["type"] == "text"
+    ] == [item["text"] for item in compact_content[1:] if item["type"] == "text"]
+    assert sum(item["type"] == "image_url" for item in compact_content) == 6
+    baseline_schema = baseline_call["response_format"]["json_schema"]["schema"]
+    compact_schema = compact_call["response_format"]["json_schema"]["schema"]
+    assert baseline_schema == compact_schema
+    assert compact_schema == (
+        RawEntityReferenceDecision.model_json_schema()
+    )
+    assert baseline.decision == compact.decision
+    assert validate_entity_reference_decision(
+        compact.decision,
+        candidate_ids={candidate.candidate_id for candidate in candidates},
+        reference_type="subject",
+        candidate_by_id={candidate.candidate_id: candidate for candidate in candidates},
+    ) == []
+
+
+def test_compact_prompt_preserves_required_semantics_and_is_shorter() -> None:
+    normalized = " ".join(COMPACT_SYSTEM_PROMPT.casefold().split())
+    for fragment in (
+        "visible evidence only",
+        "reject a rear subject",
+        "local_usable",
+        "repairable",
+        "severely_incomplete",
+        "fragmented",
+        "major truncation",
+        "independent reference value",
+        "substantial invention",
+        "detached fragments",
+        "nontrivial_detached_component_signal",
+        "context image shows scene placement",
+        "isolated crop shows the actual content",
+    ):
+        assert fragment in normalized
+    assert len(COMPACT_SYSTEM_PROMPT) < len(SYSTEM_PROMPT) * 0.60
 
 
 def test_paired_candidate_card_is_bounded_rgb_and_preserves_sources() -> None:
@@ -1428,6 +1502,34 @@ def test_candidate_judge_repair_profiles_payload_shape_without_mutation(
     )
     assert all(event["metadata"]["evidence_mode"] == "separate" for event in events)
     assert all(event["metadata"]["paired_card_count"] == 0 for event in events)
+    assert all(event["metadata"]["prompt_mode"] == "baseline" for event in events)
+
+
+def test_compact_prompt_profiles_mode_with_six_images(tmp_path: Path) -> None:
+    completions = _Completions([_payload()])
+    judge = _judge(
+        completions,
+        system_prompt=COMPACT_SYSTEM_PROMPT,
+        prompt_mode="compact_v1",
+    )
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
+        judge.decide(
+            entity=_entity(),
+            candidates=[
+                _candidate(f"candidate_{index}") for index in range(1, 4)
+            ],
+            source_images=_source_images(),
+        )
+
+    event = json.loads(
+        profiler.events_path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert event["input_image_count"] == 6
+    assert event["metadata"]["candidate_count"] == 3
+    assert event["metadata"]["evidence_mode"] == "separate"
+    assert event["metadata"]["prompt_mode"] == "compact_v1"
 
 
 def test_paired_candidate_card_profiles_three_images_and_mode(tmp_path: Path) -> None:

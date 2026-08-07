@@ -142,6 +142,81 @@ completion_needed_for_reference_use, detached_target_fragments_present, and
 scope_reason."""
 
 
+COMPACT_SYSTEM_PROMPT = """Task
+Select the best reference candidate for one known entity, or reject all.
+Candidate IDs and order are immutable. Judge visible evidence only; never infer
+identity, body parts, structure, or accessories outside the images.
+
+Evidence
+The context image shows scene placement and mask-target correctness. The
+isolated crop shows the actual content proposed as a reusable reference. Minor
+border contact, natural holes, or multiple natural components alone do not make
+a candidate incomplete. Use visual structure rather than an object-name
+blacklist.
+
+Hard rejection rules
+Reject poor image quality; an invisible primary identity region; severe
+fragmentation, wrong content, or a mask that does not match the target; a
+rear-only subject; a side subject without visible identity; content with no
+independent reference value; any candidate requiring substantial invention; a
+major truncation; completeness severely_incomplete or fragmented; or content
+that is not a discrete foreground instance. A back, clothing, or torso
+silhouette alone is not identity evidence. Environment regions, scenery
+patches, negative space, and unrelated mask fragments are not independent
+foreground references. Multiple large separated components in a non-group mask
+support fragmentation or target mismatch, but diagnostics never replace visual
+judgment.
+
+Completeness routing
+- complete: mostly whole, identity clear, major structure visible, and no
+  meaningful truncation.
+- local_usable: natural coherent local framing that is identity-bearing and
+  independently reusable without generative completion. A portrait,
+  head-and-shoulders, upper-body, or waist-up view may be local_usable when legs
+  outside the frame do not damage the visible reference.
+- repairable: identity and most major structure remain; only a minor, local,
+  low-risk part is missing; and completion is genuinely required for reuse.
+- severely_incomplete: major identity, body, clothing, or object structure is
+  missing, or large invention would be required.
+- fragmented: bad mask, disconnected unusable content, environment fragment,
+  or wrong target content.
+Reject severely_incomplete and fragmented. Missing lower body outside natural
+framing is not by itself repairable. completion_needed_for_reference_use is true
+only when a small real truncation must be repaired without inventing identity or
+major structure. truncation_severity is none, minor, or major; repairable permits
+only minor truncation, while major truncation rejects.
+
+Subject and viewpoint rules
+Subjects use front, three_quarter, side, or rear. Objects and groups use
+not_applicable. Reject a rear subject. A side subject is usable only when the
+face or another explicit identity feature is visible. For objects and groups,
+primary_identity_region_visible means the main recognizable region is present.
+major_structure_visible means most coherent structure remains.
+
+Detached fragments
+Detached fragments are non-trivial same-target pieces separated from the main
+entity. If detached fragments are present, complete and local_usable are
+invalid. When identity and major structure remain and detached damage is
+limited, use repairable with detached_target_fragments_present=true,
+truncation_severity=minor, and completion_needed_for_reference_use=true;
+otherwise reject. Transparent background, natural holes, tiny noise, and
+naturally separate group members are not detached fragments. Use
+significant_component_count, largest_component_ratio,
+second_largest_component_ratio, and nontrivial_detached_component_signal only
+as supporting evidence.
+
+Output requirements
+Classify image_quality as high, acceptable, or poor. Return exactly one strict
+JSON object with every existing field: selected_candidate_id, image_quality,
+completeness, reference_scope, visible_region, whole_entity_recognizable,
+identity_features_visible, viewpoint, independent_reference_value,
+requires_substantial_invention, primary_identity_region_visible,
+major_structure_visible, truncation_severity, discrete_foreground_instance,
+mask_matches_target, completion_needed_for_reference_use,
+detached_target_fragments_present, and scope_reason. Do not output tokens or crop
+coordinates."""
+
+
 @dataclass(frozen=True)
 class EntityReferenceDecisionAttempt:
     decision: RawEntityReferenceDecision
@@ -164,6 +239,7 @@ class EntityReferenceJudge(Protocol):
 
 
 EvidencePresentationMode = Literal["separate", "paired_card"]
+CandidateJudgePromptMode = Literal["baseline", "compact_v1"]
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -628,6 +704,8 @@ class QwenEntityReferenceJudge:
         crop_padding_ratio: float = 0.08,
         evidence_mode: EvidencePresentationMode = "separate",
         card_panel_max_side: int = 512,
+        system_prompt: str = SYSTEM_PROMPT,
+        prompt_mode: CandidateJudgePromptMode = "baseline",
         client: Any | None = None,
     ) -> None:
         if evidence_mode not in {"separate", "paired_card"}:
@@ -640,11 +718,17 @@ class QwenEntityReferenceJudge:
             raise ValueError(
                 "candidate judge card_panel_max_side must be a positive integer"
             )
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise ValueError("candidate judge system_prompt must be non-empty text")
+        if prompt_mode not in {"baseline", "compact_v1"}:
+            raise ValueError("candidate judge prompt_mode is invalid")
         self.config = config
         self.repair_retries = repair_retries
         self.crop_padding_ratio = crop_padding_ratio
         self.evidence_mode = evidence_mode
         self.card_panel_max_side = card_panel_max_side
+        self.system_prompt = system_prompt
+        self.prompt_mode = prompt_mode
         self.client = client or OpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
@@ -715,7 +799,7 @@ class QwenEntityReferenceJudge:
                     }
                 )
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": content},
         ]
 
@@ -739,6 +823,9 @@ class QwenEntityReferenceJudge:
             ),
             "evidence_mode": evidence_mode,
             "card_panel_max_side": card_panel_max_side,
+            "prompt_mode": str(
+                profile_context.metadata.get("prompt_mode", self.prompt_mode)
+            ),
         }
         parameters: dict[str, Any] = {
             "model": self.config.model,
@@ -836,6 +923,7 @@ class QwenEntityReferenceJudge:
                             if self.evidence_mode == "paired_card"
                             else None
                         ),
+                        "prompt_mode": self.prompt_mode,
                     },
                 ):
                     raw = self._request(

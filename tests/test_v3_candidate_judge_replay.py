@@ -31,6 +31,8 @@ from r2v_data_v2.v3.config import (
 )
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.reference_judge import (
+    COMPACT_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
     EntityReferenceDecisionAttempt,
     EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
@@ -372,6 +374,8 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
     assert [item["prompt_tokens"] for item in records] == [200, 100]
     assert all(item["variant"]["valid"] is True for item in records)
     assert summary["evidence_mode"] == "baseline"
+    assert summary["prompt_mode"] == "baseline"
+    assert summary["system_prompt_chars"] == len(SYSTEM_PROMPT)
     assert summary["card_panel_max_side"] is None
     assert summary["attempt_count"] == 2
     assert summary["success_count"] == 2
@@ -410,6 +414,9 @@ def test_candidate_judge_replay_is_read_only_and_summarizes_changes(
         for item in summary["baseline_accept_variant_reject"]
     ] == ["clip-b"]
     assert summary["baseline_reject_variant_accept"] == []
+    assert [
+        item["clip_uid"] for item in summary["changed_full_decision_cases"]
+    ] == ["clip-a", "clip-b"]
     assert summary["repair_cases"] == [
         {"clip_uid": "clip-a", "entity_id": "e1", "repair_attempts": 1}
     ]
@@ -711,6 +718,8 @@ def test_replay_constructs_production_judge_and_saves_raw_only_on_request(
             crop_padding_ratio: float,
             evidence_mode: str,
             card_panel_max_side: int,
+            system_prompt: str,
+            prompt_mode: str,
         ) -> None:
             created.update(
                 {
@@ -719,6 +728,8 @@ def test_replay_constructs_production_judge_and_saves_raw_only_on_request(
                     "crop_padding_ratio": crop_padding_ratio,
                     "evidence_mode": evidence_mode,
                     "card_panel_max_side": card_panel_max_side,
+                    "system_prompt": system_prompt,
+                    "prompt_mode": prompt_mode,
                 }
             )
 
@@ -767,6 +778,8 @@ def test_replay_constructs_production_judge_and_saves_raw_only_on_request(
     assert created["crop_padding_ratio"] == config.pair.crop_padding_ratio
     assert created["evidence_mode"] == "separate"
     assert created["card_panel_max_side"] == 512
+    assert created["system_prompt"] == SYSTEM_PROMPT
+    assert created["prompt_mode"] == "baseline"
     assert created["closed"] is True
     assert "private raw response" not in output.read_text(encoding="utf-8")
     raw_output = Path(f"{output}.raw.jsonl")
@@ -822,6 +835,71 @@ def test_replay_paired_card_mode_uses_three_images_and_stays_read_only(
     assert snapshot_run_files(storage.root) == before
 
 
+def test_replay_compact_prompt_keeps_six_images_and_reports_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    _add_clip(storage, "clip-a")
+    before = snapshot_run_files(storage.root)
+    completions = _Completions([json.dumps(_decision().model_dump())])
+    assert config.qwen.candidate_judge is not None
+    judge = QwenEntityReferenceJudge(
+        config.qwen.candidate_judge,
+        repair_retries=config.pair.repair_retries,
+        crop_padding_ratio=config.pair.crop_padding_ratio,
+        system_prompt=COMPACT_SYSTEM_PROMPT,
+        prompt_mode="compact_v1",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    output = config.run_root.parent / "benchmarks" / "compact-prompt.jsonl"
+
+    summary = run_candidate_judge_replay(
+        config,
+        run_root=storage.root,
+        base_url="http://127.0.0.1:8001/v1",
+        model="new-model",
+        output_path=output,
+        prompt_mode="compact_v1",
+        judge=judge,
+    )
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    call = completions.calls[0]
+    content = call["messages"][1]["content"]
+    assert call["messages"][0]["content"] == COMPACT_SYSTEM_PROMPT
+    assert sum(item["type"] == "image_url" for item in content) == 6
+    assert record["input_image_count"] == 6
+    assert summary["evidence_mode"] == "baseline"
+    assert summary["prompt_mode"] == "compact_v1"
+    assert summary["system_prompt_chars"] == len(COMPACT_SYSTEM_PROMPT)
+    assert summary["avg_input_image_count"] == 6.0
+    assert snapshot_run_files(storage.root) == before
+
+
+def test_compact_prompt_replay_rejects_paired_card_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+
+    with pytest.raises(ValueError, match="requires baseline evidence mode"):
+        run_candidate_judge_replay(
+            config,
+            run_root=storage.root,
+            base_url="http://127.0.0.1:8001/v1",
+            model="new-model",
+            output_path=config.run_root.parent / "benchmarks" / "invalid.jsonl",
+            evidence_mode="paired_card",
+            prompt_mode="compact_v1",
+            judge=SimpleNamespace(),
+        )
+
+
 def test_replay_rejects_output_inside_source_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -862,9 +940,14 @@ def test_replay_cli_defaults_to_baseline_and_accepts_card_sizes() -> None:
     paired_512 = _parser().parse_args(
         [*required, "--evidence-mode", "paired_card", "--card-panel-max-side", "512"]
     )
+    compact = _parser().parse_args(
+        [*required, "--prompt-mode", "compact_v1"]
+    )
 
     assert baseline.evidence_mode == "baseline"
     assert baseline.card_panel_max_side == 512
+    assert baseline.prompt_mode == "baseline"
     assert paired_384.evidence_mode == "paired_card"
     assert paired_384.card_panel_max_side == 384
     assert paired_512.card_panel_max_side == 512
+    assert compact.prompt_mode == "compact_v1"

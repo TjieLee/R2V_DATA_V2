@@ -38,6 +38,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=(384, 512),
         default=512,
     )
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("baseline", "compact_v1"),
+        default="baseline",
+    )
     return parser
 
 
@@ -54,6 +59,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         fail_fast=arguments.fail_fast,
         evidence_mode=arguments.evidence_mode,
         card_panel_max_side=arguments.card_panel_max_side,
+        prompt_mode=arguments.prompt_mode,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary
