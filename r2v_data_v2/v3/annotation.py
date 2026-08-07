@@ -14,6 +14,11 @@ from r2v_data_v2.structured_output import (
     ValidationIssue,
 )
 from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
+from r2v_data_v2.v3.profiling import (
+    get_model_profile_context,
+    model_profile_context,
+    profiled_openai_call,
+)
 from r2v_data_v2.v3.schemas import (
     MAX_ANNOTATION_ENTITIES,
     AnnotationEntity,
@@ -493,6 +498,8 @@ class QwenAnnotationClient:
         ]
 
     def _request(self, messages: list[dict[str, object]]) -> str:
+        profile_context = get_model_profile_context()
+        retry_index = profile_context.retry_index
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -503,21 +510,37 @@ class QwenAnnotationClient:
             "extra_body": _video_processor_extra_body(self.config),
         }
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "v3_annotation",
-                        "strict": True,
-                        "schema": RawAnnotationPayload.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_annotation",
+                            "strict": True,
+                            "schema": RawAnnotationPayload.model_json_schema(),
+                        },
                     },
-                },
+                ),
+                component="qwen_annotation",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={"response_format": "json_schema"},
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component="qwen_annotation",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={"response_format": "json_object"},
             )
         content = response.choices[0].message.content
         if not content:
@@ -548,12 +571,13 @@ class QwenAnnotationClient:
                 )
             )
             try:
-                raw = self._request(
-                    self._messages(
-                        video_path=video_path,
-                        request_text=request_text,
+                with model_profile_context(retry_index=attempt):
+                    raw = self._request(
+                        self._messages(
+                            video_path=video_path,
+                            request_text=request_text,
+                        )
                     )
-                )
             except Exception as exc:
                 raise AnnotationFailure(
                     raw_responses=raw_responses,

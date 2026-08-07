@@ -14,6 +14,7 @@ from r2v_data_v2.v3.mask_codec import (
     decode_binary_mask,
     encode_binary_mask,
 )
+from r2v_data_v2.v3.profiling import profile_model_call
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
@@ -595,12 +596,23 @@ def _segment_clips_with_backend(
             tracked_entities: dict[str, TrackedEntityMasks] = {}
             for entity in annotation.entities:
                 try:
-                    result = backend.track(
-                        frame_paths=frame_paths,
-                        entity_id=entity.entity_id,
-                        reference_type=entity.reference_type,
-                        grounding_prompt=entity.grounding_prompt,
-                    )
+                    with profile_model_call(
+                        component="sam3_segment_track",
+                        operation="track",
+                        retry_index=0,
+                        model=type(backend).__name__,
+                        metadata={
+                            "clip_uid": clip.clip_uid,
+                            "entity_id": entity.entity_id,
+                            "reference_type": entity.reference_type,
+                        },
+                    ):
+                        result = backend.track(
+                            frame_paths=frame_paths,
+                            entity_id=entity.entity_id,
+                            reference_type=entity.reference_type,
+                            grounding_prompt=entity.grounding_prompt,
+                        )
                     entity_masks = _entity_masks_from_result(
                         entity,
                         result,

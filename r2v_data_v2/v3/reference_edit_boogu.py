@@ -36,6 +36,12 @@ from pydantic import (
 
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.profiling import (
+    get_model_profile_context,
+    model_profile_context,
+    profile_model_call,
+    profiled_openai_call,
+)
 from r2v_data_v2.v3.reference_geometry import (
     composition_geometry_metadata,
     content_geometry_from_mask,
@@ -418,7 +424,11 @@ class QwenBooguReferenceEditJudge:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ]
-        raw = self._request(messages, model)
+        with model_profile_context(
+            retry_index=0,
+            metadata={"edit_operation": operation},
+        ):
+            raw = self._request(messages, model)
         for attempt in range(self.repair_retries + 1):
             try:
                 return model.model_validate_json(raw)
@@ -436,7 +446,11 @@ class QwenBooguReferenceEditJudge:
                         ),
                     },
                 ]
-                raw = self._request(repair_messages, model)
+                with model_profile_context(
+                    retry_index=attempt + 1,
+                    metadata={"edit_operation": operation},
+                ):
+                    raw = self._request(repair_messages, model)
         raise AssertionError("unreachable")
 
     def _request(
@@ -444,6 +458,9 @@ class QwenBooguReferenceEditJudge:
         messages: list[dict[str, object]],
         model: type[BooguCompletionReview | BooguBackgroundReview],
     ) -> str:
+        profile_context = get_model_profile_context()
+        retry_index = profile_context.retry_index
+        operation = str(profile_context.metadata.get("edit_operation", "unknown"))
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -453,21 +470,51 @@ class QwenBooguReferenceEditJudge:
             "max_tokens": self.config.max_tokens,
         }
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "v3_boogu_reference_edit_review",
-                        "strict": True,
-                        "schema": model.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_boogu_reference_edit_review",
+                            "strict": True,
+                            "schema": model.model_json_schema(),
+                        },
                     },
+                ),
+                component=(
+                    "qwen_boogu_completion_review"
+                    if operation == "complete_entity"
+                    else "qwen_boogu_background_review"
+                ),
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={
+                    "edit_operation": operation,
+                    "response_format": "json_schema",
                 },
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component=(
+                    "qwen_boogu_completion_review"
+                    if operation == "complete_entity"
+                    else "qwen_boogu_background_review"
+                ),
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={
+                    "edit_operation": operation,
+                    "response_format": "json_object",
+                },
             )
         raw = response.choices[0].message.content
         if not raw:
@@ -1335,13 +1382,30 @@ def run_boogu_reference_edit(
         if source_gate_reason is not None:
             rejection_reason = "tiny_source_entity"
             raise _TinySourceRejected
-        output = backend.edit(
-            source_rgb=source_input_rgb.copy(),
-            instruction=instruction,
-            width=width,
-            height=height,
-            thinking_enabled=thinking_enabled,
-        )
+        with profile_model_call(
+            component=(
+                "boogu_complete_entity"
+                if operation == "complete_entity"
+                else "boogu_add_entity_background"
+            ),
+            operation=operation,
+            retry_index=0,
+            model=type(backend).__name__,
+            input_text_chars=len(instruction),
+            input_image_count=1,
+            metadata={
+                "width": width,
+                "height": height,
+                "thinking_enabled": thinking_enabled,
+            },
+        ):
+            output = backend.edit(
+                source_rgb=source_input_rgb.copy(),
+                instruction=instruction,
+                width=width,
+                height=height,
+                thinking_enabled=thinking_enabled,
+            )
         if output.original_instruction != instruction:
             raise RuntimeError("backend changed original instruction metadata")
         candidate_rgb = _validated_native_png(
@@ -1360,13 +1424,22 @@ def run_boogu_reference_edit(
         )
         _validate_qwen_review_type(operation, qwen_review)
         if sam_reviewer is not None:
-            sam_review = sam_reviewer.review(
+            with profile_model_call(
+                component="sam3_boogu_review",
                 operation=operation,
-                source_rgba=geometry_source_rgba.copy(),
-                candidate_rgb=candidate_rgb.copy(),
-                entity_phrase=entity_phrase,
-                reference_type=reference_type,
-            )
+                retry_index=0,
+                model=type(sam_reviewer).__name__,
+                input_text_chars=len(entity_phrase),
+                input_image_count=2,
+                metadata={"reference_type": reference_type},
+            ):
+                sam_review = sam_reviewer.review(
+                    operation=operation,
+                    source_rgba=geometry_source_rgba.copy(),
+                    candidate_rgb=candidate_rgb.copy(),
+                    entity_phrase=entity_phrase,
+                    reference_type=reference_type,
+                )
             if not isinstance(sam_review, BooguSamReview):
                 raise TypeError("sam_reviewer must return BooguSamReview")
         geometry_metadata = _sam_geometry_metadata(sam_review)

@@ -14,6 +14,7 @@ from PIL import Image
 
 import r2v_data_v2.v3.reference_edit_boogu as boogu_module
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguBackgroundReview,
     BooguCompletionReview,
@@ -710,6 +711,61 @@ def test_metadata_records_source_output_dimensions_and_provenance(
     assert canonical.read_bytes() == canonical_bytes
 
 
+def test_boogu_operations_and_sam_reviews_are_profiled_separately(
+    tmp_path: Path,
+) -> None:
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+    complete_root, _, _ = _environment(tmp_path / "complete")
+    background_root, _, _ = _environment(tmp_path / "background")
+
+    with active_profiler(profiler):
+        complete = run_boogu_reference_edit(
+            run_root=complete_root,
+            clip_uid="clip-1",
+            entity_id="e1",
+            operation="complete_entity",
+            instruction="Complete it.",
+            entity_phrase="object",
+            reference_type="object",
+            backend=_Backend(),
+            judge=_Judge(),
+            sam_reviewer=_SamReviewer(),
+        )
+        background = run_boogu_reference_edit(
+            run_root=background_root,
+            clip_uid="clip-1",
+            entity_id="e1",
+            operation="add_entity_background",
+            instruction="Add a background.",
+            entity_phrase="object",
+            reference_type="object",
+            backend=_Backend(),
+            judge=_Judge(),
+            sam_reviewer=_SamReviewer(),
+        )
+
+    assert complete.status == "accepted"
+    assert background.status == "accepted"
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["component"] for event in events] == [
+        "boogu_complete_entity",
+        "sam3_boogu_review",
+        "boogu_add_entity_background",
+        "sam3_boogu_review",
+    ]
+    assert [
+        event["operation"]
+        for event in events
+        if event["component"] == "sam3_boogu_review"
+    ] == ["complete_entity", "add_entity_background"]
+    assert events[0]["metadata"]["thinking_enabled"] is True
+    assert events[0]["metadata"]["width"] == 1248
+    assert events[0]["metadata"]["height"] == 832
+
+
 def test_subprocess_backend_invokes_configured_python_directly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1159,6 +1215,20 @@ class _ReviewCompletions:
         )
 
 
+class _SequencedReviewCompletions:
+    def __init__(self, payloads: list[dict[str, object] | str]) -> None:
+        self.payloads = iter(payloads)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        payload = next(self.payloads)
+        raw = payload if isinstance(payload, str) else json.dumps(payload)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=raw))]
+        )
+
+
 def test_production_qwen_boogu_reviewer_uses_structured_two_image_review() -> None:
     payload = _completion_review().model_dump(mode="json")
     completions = _ReviewCompletions(payload)
@@ -1186,6 +1256,59 @@ def test_production_qwen_boogu_reviewer_uses_structured_two_image_review() -> No
     user_content = call["messages"][1]["content"]
     assert sum(item["type"] == "image_url" for item in user_content) == 2
     assert not any("mask" in str(item).lower() for item in user_content)
+
+
+def test_qwen_boogu_review_repair_and_operations_are_profiled(
+    tmp_path: Path,
+) -> None:
+    completions = _SequencedReviewCompletions(
+        [
+            "{}",
+            _completion_review().model_dump(mode="json"),
+            _background_review().model_dump(mode="json"),
+        ]
+    )
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+    images = {
+        "source_rgba": Image.new("RGBA", (12, 10), (1, 2, 3, 255)),
+        "source_input_rgb": Image.new("RGB", (12, 10), (1, 2, 3)),
+        "candidate_rgb": Image.new("RGB", (32, 32), (4, 5, 6)),
+    }
+
+    with active_profiler(profiler):
+        completion = judge.review(
+            operation="complete_entity",
+            entity_phrase="a person in a blue coat",
+            reference_type="subject",
+            **images,
+        )
+        background = judge.review(
+            operation="add_entity_background",
+            entity_phrase="a person in a blue coat",
+            reference_type="subject",
+            **images,
+        )
+
+    assert completion.verdict == "accept"
+    assert background.verdict == "accept"
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["component"] for event in events] == [
+        "qwen_boogu_completion_review",
+        "qwen_boogu_completion_review",
+        "qwen_boogu_background_review",
+    ]
+    assert [event["retry_index"] for event in events] == [0, 1, 0]
+    assert all(event["input_image_count"] == 2 for event in events)
 
 
 class _SamTrackBackend:

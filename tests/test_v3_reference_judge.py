@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -15,6 +16,7 @@ from pydantic import ValidationError
 import r2v_data_v2.v3.pair as pair_module
 from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.pair import EntityReferenceCandidate
+from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.reference_judge import (
     SYSTEM_PROMPT,
     EntityReferenceJudgeFailure,
@@ -1295,6 +1297,52 @@ def test_structured_repair_includes_original_schema_issues_and_response() -> Non
     assert "JSON Schema" in repair_text
     assert "full_requires_whole" in repair_text
     assert "upper_body" in repair_text
+
+
+def test_candidate_judge_repair_profiles_payload_shape_without_mutation(
+    tmp_path: Path,
+) -> None:
+    candidate = _candidate()
+    entity = _entity()
+    payload_before = build_entity_reference_request_payload(entity, [candidate])
+    completions = _Completions(
+        [
+            _payload(visible_region="upper_body"),
+            _payload(),
+        ]
+    )
+    judge = _judge(completions)
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
+        attempt = judge.decide(
+            entity=entity,
+            candidates=[candidate],
+            source_images=_source_images(),
+        )
+
+    assert attempt.repair_attempts == 1
+    assert build_entity_reference_request_payload(entity, [candidate]) == payload_before
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["component"] for event in events] == [
+        "qwen_candidate_judge",
+        "qwen_candidate_judge",
+    ]
+    assert [event["retry_index"] for event in events] == [0, 1]
+    assert all(event["input_image_count"] == 2 for event in events)
+    assert all(
+        event["metadata"]
+        | {
+            "candidate_count": 1,
+            "context_image_count": 1,
+            "isolated_crop_count": 1,
+        }
+        == event["metadata"]
+        for event in events
+    )
 
 
 def test_repair_exhaustion_fails_closed_with_all_raw_responses() -> None:

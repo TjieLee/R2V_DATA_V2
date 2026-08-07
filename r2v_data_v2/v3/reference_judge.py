@@ -17,6 +17,11 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.profiling import (
+    get_model_profile_context,
+    model_profile_context,
+    profiled_openai_call,
+)
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     RawEntityReferenceDecision,
@@ -644,6 +649,9 @@ class QwenEntityReferenceJudge:
         ]
 
     def _request(self, messages: list[dict[str, object]]) -> str:
+        profile_context = get_model_profile_context()
+        retry_index = profile_context.retry_index
+        candidate_count = int(profile_context.metadata.get("candidate_count", 0))
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -653,21 +661,47 @@ class QwenEntityReferenceJudge:
             "max_tokens": self.config.max_tokens,
         }
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "v3_entity_reference_decision",
-                        "strict": True,
-                        "schema": RawEntityReferenceDecision.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_entity_reference_decision",
+                            "strict": True,
+                            "schema": RawEntityReferenceDecision.model_json_schema(),
+                        },
                     },
+                ),
+                component="qwen_candidate_judge",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={
+                    "candidate_count": candidate_count,
+                    "context_image_count": candidate_count,
+                    "isolated_crop_count": candidate_count,
+                    "response_format": "json_schema",
                 },
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component="qwen_candidate_judge",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={
+                    "candidate_count": candidate_count,
+                    "context_image_count": candidate_count,
+                    "isolated_crop_count": candidate_count,
+                    "response_format": "json_object",
+                },
             )
         result = response.choices[0].message.content
         if not result:
@@ -708,14 +742,18 @@ class QwenEntityReferenceJudge:
                     json_schema=(RawEntityReferenceDecision.model_json_schema()),
                 )
             try:
-                raw = self._request(
-                    self._messages(
-                        entity=entity,
-                        candidates=candidates,
-                        source_images=source_images,
-                        request_text=request_text,
+                with model_profile_context(
+                    retry_index=attempt,
+                    metadata={"candidate_count": len(candidates)},
+                ):
+                    raw = self._request(
+                        self._messages(
+                            entity=entity,
+                            candidates=candidates,
+                            source_images=source_images,
+                            request_text=request_text,
+                        )
                     )
-                )
             except Exception as exc:
                 raise EntityReferenceJudgeFailure(
                     raw_responses=raw_responses,

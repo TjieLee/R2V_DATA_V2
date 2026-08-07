@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
@@ -26,6 +27,7 @@ from r2v_data_v2.v3.mask_codec import (
     decode_binary_mask,
     encode_binary_mask,
 )
+from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.rank import build_coverage_state
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
@@ -453,6 +455,51 @@ def test_segment_uses_grounding_prompt_and_writes_ten_computed_slots(
     assert frame.area_ratio == pytest.approx(float(mask.mean()))
     assert frame.bbox_xyxy == (2, 3, 7, 9)
     assert np.array_equal(decode_binary_mask(frame.rle), mask)
+
+
+def test_segment_profiles_one_track_call_per_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entities = [_entity("e1"), _entity("e2", reference_type="object")]
+    storage, _ = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=entities,
+    )
+    mask = _mask()
+    backend = FakeSegmentationBackend(
+        {
+            entity.entity_id: _ready(
+                [
+                    BackendMaskObservation(
+                        slot=4,
+                        mask=mask,
+                        confidence=0.83,
+                        object_id=f"track-{entity.entity_id}",
+                    )
+                ]
+            )
+            for entity in entities
+        }
+    )
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
+        stats = segment_clips(storage.config, storage, backend=backend)
+
+    assert stats.processed == 1
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 2
+    assert {event["component"] for event in events} == {"sam3_segment_track"}
+    assert {event["metadata"]["entity_id"] for event in events} == {"e1", "e2"}
+    assert {event["metadata"]["reference_type"] for event in events} == {
+        "subject",
+        "object",
+    }
 
 
 def test_one_entity_failure_does_not_block_other_entities(

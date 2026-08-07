@@ -8,6 +8,7 @@ from openai import BadRequestError, OpenAI
 from PIL import Image
 
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.profiling import profiled_openai_call
 from r2v_data_v2.v3.schemas import BackgroundRemovalReview
 
 SYSTEM_PROMPT = """You are the semantic quality guard for background removal.
@@ -114,21 +115,37 @@ class QwenBackgroundRemovalJudge:
             "max_tokens": self.config.max_tokens,
         }
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "v3_background_removal_review",
-                        "strict": True,
-                        "schema": BackgroundRemovalReview.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_background_removal_review",
+                            "strict": True,
+                            "schema": BackgroundRemovalReview.model_json_schema(),
+                        },
                     },
-                },
+                ),
+                component="qwen_background_remove_judge",
+                operation="initial",
+                retry_index=0,
+                model=self.config.model,
+                messages=messages,
+                metadata={"response_format": "json_schema"},
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component="qwen_background_remove_judge",
+                operation="initial",
+                retry_index=0,
+                model=self.config.model,
+                messages=messages,
+                metadata={"response_format": "json_object"},
             )
         content = response.choices[0].message.content
         if not content:

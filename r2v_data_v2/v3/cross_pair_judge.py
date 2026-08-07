@@ -16,6 +16,11 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.profiling import (
+    get_model_profile_context,
+    model_profile_context,
+    profiled_openai_call,
+)
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     RawCrossPairDecision,
@@ -183,6 +188,11 @@ class QwenCrossPairJudge:
         ]
 
     def _request(self, messages: list[dict[str, object]]) -> str:
+        profile_context = get_model_profile_context()
+        retry_index = profile_context.retry_index
+        target_evidence_mode = str(
+            profile_context.metadata.get("target_evidence_mode", "unknown")
+        )
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -192,21 +202,43 @@ class QwenCrossPairJudge:
             "max_tokens": self.config.max_tokens,
         }
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "v3_cross_pair_decision",
-                        "strict": True,
-                        "schema": RawCrossPairDecision.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_cross_pair_decision",
+                            "strict": True,
+                            "schema": RawCrossPairDecision.model_json_schema(),
+                        },
                     },
+                ),
+                component="qwen_cross_pair_judge",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={
+                    "target_evidence_mode": target_evidence_mode,
+                    "response_format": "json_schema",
                 },
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component="qwen_cross_pair_judge",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={
+                    "target_evidence_mode": target_evidence_mode,
+                    "response_format": "json_object",
+                },
             )
         result = response.choices[0].message.content
         if not result:
@@ -249,15 +281,19 @@ class QwenCrossPairJudge:
                     json_schema=RawCrossPairDecision.model_json_schema(),
                 )
             try:
-                raw = self._request(
-                    self._messages(
-                        target_evidence_mode=target_evidence_mode,
-                        target_context_image=target_context_image,
-                        target_entity_crop=target_entity_crop,
-                        donor_reference_image=donor_reference_image,
-                        request_text=request_text,
+                with model_profile_context(
+                    retry_index=attempt,
+                    metadata={"target_evidence_mode": target_evidence_mode},
+                ):
+                    raw = self._request(
+                        self._messages(
+                            target_evidence_mode=target_evidence_mode,
+                            target_context_image=target_context_image,
+                            target_entity_crop=target_entity_crop,
+                            donor_reference_image=donor_reference_image,
+                            request_text=request_text,
+                        )
                     )
-                )
             except Exception as exc:
                 raise CrossPairJudgeFailure(
                     raw_responses=raw_responses,

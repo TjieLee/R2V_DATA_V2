@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
@@ -13,6 +14,7 @@ from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
 from r2v_data_v2.v3.instruction import InstructionClient, instruct_clips
 from r2v_data_v2.v3.manifest import build_manifest
 from r2v_data_v2.v3.pair import pair_clips
+from r2v_data_v2.v3.profiling import V3Profiler, active_profiler, profile_stage
 from r2v_data_v2.v3.qwen_image_edit_backend import BackgroundRemovalBackend
 from r2v_data_v2.v3.rank import rank_temporal_coverage
 from r2v_data_v2.v3.reference_completion_qwen import (
@@ -96,6 +98,7 @@ def run_pipeline_v3(
     reference_edit_backend: BooguReferenceEditBackend | None = None,
     reference_edit_judge: BooguReferenceEditJudge | None = None,
     reference_edit_sam_reviewer: BooguSamReviewer | None = None,
+    profile: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -113,6 +116,9 @@ def run_pipeline_v3(
     config = load_config(config_path)
     storage = RunStorage(config)
     run = storage.initialize(git_commit=git_commit or _git_commit())
+    profiler = (
+        V3Profiler(storage.root, git_commit=run.git_commit) if profile else None
+    )
     results: dict[str, object] = {
         "run": {
             "run_id": run.run_id,
@@ -120,82 +126,101 @@ def run_pipeline_v3(
             "config_hash": run.config_hash,
         }
     }
-    for stage in ordered_stages:
-        if stage == "manifest":
-            results[stage] = build_manifest(config, storage).to_dict()
-        elif stage == "annotate":
-            results[stage] = annotate_clips(
-                config,
-                storage,
-                overwrite=overwrite,
-                client=annotation_client,
-            ).to_dict()
-        elif stage == "frames":
-            results[stage] = sample_frames(
-                config,
-                storage,
-                overwrite=overwrite,
-                decoder=frame_decoder,
-            ).to_dict()
-        elif stage == "segment":
-            results[stage] = segment_clips(
-                config,
-                storage,
-                overwrite=overwrite,
-                backend=segmentation_backend,
-            ).to_dict()
-        elif stage == "rank":
-            results[stage] = rank_temporal_coverage(
-                config,
-                storage,
-                overwrite=overwrite,
-            ).to_dict()
-        elif stage == "background":
-            results[stage] = build_background_candidates(
-                config,
-                storage,
-                overwrite=overwrite,
-            ).to_dict()
-        elif stage == "remove":
-            results[stage] = remove_backgrounds(
-                config,
-                storage,
-                overwrite=overwrite,
-                backend=background_removal_backend,
-                judge=background_removal_judge,
-            ).to_dict()
-        elif stage == "pair":
-            results[stage] = pair_clips(
-                config,
-                storage,
-                overwrite=overwrite,
-                judge=entity_reference_judge,
-                cross_pair_judge=cross_pair_judge,
-                completion_backend=reference_completion_backend,
-                completion_judge=reference_completion_judge,
-                completion_segmentation_backend=segmentation_backend,
-            ).to_dict()
-        elif stage == "reference_edit":
-            results[stage] = reference_edit_clips(
-                config,
-                storage,
-                overwrite=overwrite,
-                backend=reference_edit_backend,
-                judge=reference_edit_judge,
-                sam_reviewer=reference_edit_sam_reviewer,
-            ).to_dict()
-        elif stage == "instruct":
-            results[stage] = instruct_clips(
-                config,
-                storage,
-                overwrite=overwrite,
-                client=instruction_client,
-            ).to_dict()
-        else:
-            dataset = DatasetExporter(config, storage).export(overwrite=overwrite)
-            results[stage] = dataset.model_dump(mode="json")
-    results["completed_stages"] = list(ordered_stages)
-    return results
+    pipeline_error: BaseException | None = None
+    profiler_context = active_profiler(profiler) if profiler else nullcontext()
+    try:
+        with profiler_context:
+            for stage in ordered_stages:
+                with profile_stage(stage) as stage_profile:
+                    if stage == "manifest":
+                        results[stage] = build_manifest(config, storage).to_dict()
+                    elif stage == "annotate":
+                        results[stage] = annotate_clips(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            client=annotation_client,
+                        ).to_dict()
+                    elif stage == "frames":
+                        results[stage] = sample_frames(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            decoder=frame_decoder,
+                        ).to_dict()
+                    elif stage == "segment":
+                        results[stage] = segment_clips(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            backend=segmentation_backend,
+                        ).to_dict()
+                    elif stage == "rank":
+                        results[stage] = rank_temporal_coverage(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                        ).to_dict()
+                    elif stage == "background":
+                        results[stage] = build_background_candidates(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                        ).to_dict()
+                    elif stage == "remove":
+                        results[stage] = remove_backgrounds(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            backend=background_removal_backend,
+                            judge=background_removal_judge,
+                        ).to_dict()
+                    elif stage == "pair":
+                        results[stage] = pair_clips(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            judge=entity_reference_judge,
+                            cross_pair_judge=cross_pair_judge,
+                            completion_backend=reference_completion_backend,
+                            completion_judge=reference_completion_judge,
+                            completion_segmentation_backend=segmentation_backend,
+                        ).to_dict()
+                    elif stage == "reference_edit":
+                        results[stage] = reference_edit_clips(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            backend=reference_edit_backend,
+                            judge=reference_edit_judge,
+                            sam_reviewer=reference_edit_sam_reviewer,
+                        ).to_dict()
+                    elif stage == "instruct":
+                        results[stage] = instruct_clips(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            client=instruction_client,
+                        ).to_dict()
+                    else:
+                        dataset = DatasetExporter(config, storage).export(
+                            overwrite=overwrite
+                        )
+                        results[stage] = dataset.model_dump(mode="json")
+                    stage_profile.set_counters(results[stage])
+            results["completed_stages"] = list(ordered_stages)
+            return results
+    except BaseException as exc:
+        pipeline_error = exc
+        raise
+    finally:
+        if profiler is not None:
+            try:
+                profiler.write_summary()
+            except Exception as exc:
+                if pipeline_error is None:
+                    raise
+                pipeline_error.add_note(f"profiling summary write failed: {exc}")
 
 
 def main() -> None:
@@ -217,12 +242,18 @@ def main() -> None:
         action="store_true",
         help="allow replacement of an existing final dataset during export",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="record observational stage and model-call profiling artifacts",
+    )
     args = parser.parse_args()
     stages = tuple(part.strip() for part in args.stages.split(",") if part.strip())
     result = run_pipeline_v3(
         config_path=args.config,
         stages=stages,
         overwrite=args.overwrite,
+        profile=args.profile,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

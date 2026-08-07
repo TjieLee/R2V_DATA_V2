@@ -34,6 +34,7 @@ from r2v_data_v2.v3.config import (
     V3Config,
 )
 from r2v_data_v2.v3.manifest import build_manifest
+from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
 from r2v_data_v2.v3.schemas import (
     MAX_ANNOTATION_ENTITIES,
     AnnotationEntity,
@@ -1177,6 +1178,22 @@ class _StrictFallbackCompletionsStub(_CompletionsStub):
         )
 
 
+class _SequencedCompletionsStub:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = iter(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=next(self.responses))
+                )
+            ]
+        )
+
+
 def test_qwen_request_uses_full_video_minimal_schema_and_no_resampling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1242,6 +1259,45 @@ def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
     assert len(completions.calls) == 2
     assert completions.calls[0]["response_format"]["type"] == "json_schema"
     assert completions.calls[1]["response_format"] == {"type": "json_object"}
+
+
+def test_annotation_repair_profiles_each_real_http_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, repair_retries=1)
+    video = _video(config)
+    completions = _SequencedCompletionsStub(
+        ["{}", json.dumps(_payload())]
+    )
+    client = QwenAnnotationClient(
+        config.qwen.annotation,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        ),
+    )
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
+        result = client.annotate(
+            video_path=video,
+            caption_raw="draft",
+            metadata={},
+        )
+
+    assert result.annotation.status == "ready"
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["component"] for event in events] == [
+        "qwen_annotation",
+        "qwen_annotation",
+    ]
+    assert [event["retry_index"] for event in events] == [0, 1]
+    assert [event["operation"] for event in events] == ["initial", "repair"]
+    assert all(event["input_image_count"] == 0 for event in events)
+    assert all(event["metadata"]["video_input"] is True for event in events)
 
 
 def test_system_prompt_describes_minimal_candidate_contract() -> None:

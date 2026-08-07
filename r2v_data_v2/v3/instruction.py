@@ -14,6 +14,11 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig, V3Config
+from r2v_data_v2.v3.profiling import (
+    get_model_profile_context,
+    model_profile_context,
+    profiled_openai_call,
+)
 from r2v_data_v2.v3.schemas import (
     ClipRecord,
     InstructionBinding,
@@ -432,6 +437,7 @@ class QwenInstructionClient:
         )
 
     def _request(self, request_text: str) -> str:
+        retry_index = get_model_profile_context().retry_index
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": [
@@ -444,21 +450,37 @@ class QwenInstructionClient:
             "max_tokens": self.config.max_tokens,
         }
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "v3_instruction",
-                        "strict": True,
-                        "schema": RawInstructionOutput.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_instruction",
+                            "strict": True,
+                            "schema": RawInstructionOutput.model_json_schema(),
+                        },
                     },
-                },
+                ),
+                component="qwen_instruction",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=parameters["messages"],
+                metadata={"response_format": "json_schema"},
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component="qwen_instruction",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=parameters["messages"],
+                metadata={"response_format": "json_object"},
             )
         content = response.choices[0].message.content
         if not content:
@@ -490,7 +512,8 @@ class QwenInstructionClient:
                 )
             )
             try:
-                raw = self._request(request_text)
+                with model_profile_context(retry_index=attempt):
+                    raw = self._request(request_text)
             except Exception as exc:
                 raise InstructionFailure(
                     raw_responses=raw_responses,
