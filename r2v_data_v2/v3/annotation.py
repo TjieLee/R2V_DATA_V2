@@ -14,7 +14,6 @@ from r2v_data_v2.structured_output import (
     ValidationIssue,
 )
 from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
-from r2v_data_v2.v3.phrase_anchor import phrase_matches_caption_span
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
     model_profile_context,
@@ -26,10 +25,18 @@ from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundAnnotation,
     RawAnnotationPayload,
+    plain_instruction_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
 
 _REFERENCE_TOKEN = re.compile(r"<ref_[^>]+>", flags=re.IGNORECASE)
+_ENTITY_MARKER = re.compile(r"\{\{entity_([1-9]\d*)\}\}")
+_BACKGROUND_MARKER = re.compile(r"\{\{background\}\}")
+_BRACED_MARKER = re.compile(r"\{\{([^{}]*)\}\}")
+_ANNOTATION_IMAGE_MARKER = re.compile(
+    r"\{\{image_[^{}]*\}\}|<Image\s+\d+>",
+    flags=re.IGNORECASE,
+)
 _UNSUPPORTED_CAPTION_INFERENCE = re.compile(
     r"\b(?:breeze|wind-induced|suggesting|indicating|possibly|probably|likely|"
     r"enemy|determination|resolve|triumph)\b|"
@@ -62,16 +69,21 @@ _ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[MAX_ANNOTATION_ENTITIES]
 SYSTEM_PROMPT = f"""You annotate a complete video for a V3 training-data pipeline.
 
 Return exactly one JSON object matching the supplied minimal schema. Output only
-t2v_caption, entities, and background. Do not output relations, entity_id,
+instruction_template, entities, and background. Do not output t2v_caption. Do
+not output relations, entity_id,
 category, salience, genericity, name_evidence, localization_scope, scene_role,
 representation_mode, visual_scope, separability, selection_reason, reference
-tokens, instructions, or any additional ontology fields.
+tokens, image_N placeholders, rendered <Image N> labels, or any additional
+ontology fields.
 
-Write t2v_caption as one complete English paragraph that begins directly with
-visible content and describes actions and shot changes in chronological order.
-Include visible subject appearance, action, scene, composition, camera behavior,
-and lighting without repetition. Prefer 60 to 110 English words and never
-exceed 120 words. Describe only directly visible content. Do not infer identity,
+Write instruction_template as one coherent English paragraph that begins
+directly with visible content and describes the target video naturally. It is
+not an imperative request: do not write "Use the reference image", "Generate",
+"Create", or a references section. Describe actions and shot changes in
+chronological order. Include visible subject appearance, action, scene,
+composition, camera behavior, and lighting without repetition. Prefer 60 to 110
+English content words and never exceed 120; internal markers do not count.
+Describe only directly visible content. Do not infer identity,
 weather, emotion, allegiance, intent, mental state, sound, dialogue, or event
 causes. Describe visible motion directly without assigning an unseen cause.
 Write "branches sway slightly" instead of claiming that wind causes movement.
@@ -102,26 +114,34 @@ one independently referenceable product, vehicle, prop, device, piece of
 furniture, or other object; and group for multiple subjects or objects whose
 stable composition should be retained together. phrase briefly identifies the
 candidate for binding and review in 3 to 10 words and must not exceed 12 words.
-phrase must be a verbatim, contiguous span from t2v_caption, compared
-case-insensitively after collapsing whitespace and ignoring phrase-edge
-punctuation. Prefer the noun phrase from the entity's first clear caption mention.
-It must be a stable noun phrase rather than an action and sufficiently distinguish
+phrase is a stable concise label and need not occur verbatim in
+instruction_template. It must be a stable noun phrase rather than an action and sufficiently distinguish
 the target: prefer "man in a light gray military uniform" over
 "military officer speaking at podium". grounding_prompt describes stable visible
 appearance and location in 6 to 18 words and must not exceed 24 words. Do not
 include transient actions or enumerate every clothing detail. A stable seated
 or standing pose is allowed only when needed to distinguish the target for
-SAM3. grounding_prompt need not occur in t2v_caption. Both fields must be
+SAM3. grounding_prompt need not occur in instruction_template. Both fields must be
 non-empty and must not contain reference tokens.
+
+Insert exactly one internal marker for every entity in the same array order:
+entities[0] uses {{{{entity_1}}}}, entities[1] uses {{{{entity_2}}}}, and so on
+through at most {{{{entity_5}}}}. Place each marker immediately after that
+entity's first clear mention and before following punctuation. A marker must be
+preceded by exactly one ordinary ASCII space, as in "a woman {{{{entity_1}}}},"
+or "a boat {{{{entity_2}}}}." Do not put a marker at the paragraph start or
+after another marker. The marker is an internal binding, not visible prose.
 
 background is optional. When reliable, describe the overall environment after
 the principal foreground subjects are removed, using only phrase and
 grounding_prompt. Return background only when one stable environment persists
 through most of the clip. When the video contains a major scene transition
 between different environments, return background=null. Do not repeat the main
-foreground subject. background.phrase must follow the same verbatim contiguous
-t2v_caption span rule as entity.phrase; background.grounding_prompt may remain a
-more detailed stable environment description. Otherwise return null. Return JSON only."""
+foreground subject. Neither background text field must occur verbatim in the
+instruction_template. When background is non-null, place {{{{background}}}}
+exactly once after a clear environment mention, using the same ASCII-space and
+pre-punctuation placement rule. When background is null, do not include that
+marker. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -219,6 +239,13 @@ def _clean_text(value: object, *, trim_phrase_punctuation: bool = False) -> str 
     return cleaned or None
 
 
+def _clean_instruction_template(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
 def _normalized_phrase(value: str) -> str:
     return " ".join(value.casefold().split()).strip(_PHRASE_EDGE_PUNCTUATION)
 
@@ -269,77 +296,162 @@ def _entity_text_issues(raw_entities: object) -> list[ValidationIssue]:
     return issues
 
 
-def _phrase_anchor_issues(
+def _marker_position_issue(
     *,
-    caption: str,
+    template: str,
+    start: int,
+    end: int,
+    marker: str,
+) -> ValidationIssue | None:
+    prefix = template[:start]
+    suffix = template[end:]
+    if (
+        start == 0
+        or prefix[-1:] != " "
+        or prefix[-2:-1] == " "
+        or prefix.rstrip().endswith("}}")
+        or suffix
+        and not (suffix[0].isspace() or suffix[0] in _PHRASE_EDGE_PUNCTUATION)
+    ):
+        return ValidationIssue(
+            code="invalid_marker_position",
+            field="instruction_template",
+            message=(
+                f"{marker} must follow a visible mention after one ASCII space"
+            ),
+        )
+    return None
+
+
+def _annotation_marker_issues(
+    *,
+    template: str,
     raw_entities: object,
     raw_background: object,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    if isinstance(raw_entities, list):
-        for index, candidate in enumerate(raw_entities):
-            if not isinstance(candidate, dict) or set(candidate) != _ENTITY_FIELDS:
-                continue
-            reference_type = _clean_text(candidate.get("reference_type"))
-            phrase = _clean_text(
-                candidate.get("phrase"),
-                trim_phrase_punctuation=True,
-            )
-            grounding_prompt = _clean_text(candidate.get("grounding_prompt"))
-            if (
-                reference_type is None
-                or reference_type.casefold() not in _REFERENCE_TYPES
-                or phrase is None
-                or grounding_prompt is None
-                or _REFERENCE_TOKEN.search(phrase)
-                or _REFERENCE_TOKEN.search(grounding_prompt)
-            ):
-                continue
-            if not phrase_matches_caption_span(phrase=phrase, caption=caption):
-                issues.append(
-                    ValidationIssue(
-                        code="entity_phrase_not_in_caption",
-                        field=f"entities.{index}.phrase",
-                        message=(
-                            "entity phrase must be a contiguous verbatim span "
-                            "from t2v_caption"
-                        ),
-                    )
-                )
+    entity_count = len(raw_entities) if isinstance(raw_entities, list) else 0
+    entity_matches = list(_ENTITY_MARKER.finditer(template))
+    entity_indexes = [int(match.group(1)) for match in entity_matches]
 
-    if isinstance(raw_background, dict) and set(raw_background) == _BACKGROUND_FIELDS:
-        phrase = _clean_text(
-            raw_background.get("phrase"),
-            trim_phrase_punctuation=True,
-        )
-        grounding_prompt = _clean_text(raw_background.get("grounding_prompt"))
-        if (
-            phrase is not None
-            and grounding_prompt is not None
-            and not _REFERENCE_TOKEN.search(phrase)
-            and not _REFERENCE_TOKEN.search(grounding_prompt)
-            and not phrase_matches_caption_span(phrase=phrase, caption=caption)
-        ):
+    for expected_index in range(1, entity_count + 1):
+        count = entity_indexes.count(expected_index)
+        if count == 0:
             issues.append(
                 ValidationIssue(
-                    code="background_phrase_not_in_caption",
-                    field="background.phrase",
-                    message=(
-                        "background phrase must be a contiguous verbatim span "
-                        "from t2v_caption"
-                    ),
+                    code="missing_entity_marker",
+                    field="instruction_template",
+                    message=f"instruction_template is missing {{{{entity_{expected_index}}}}}",
                 )
             )
+        elif count > 1:
+            issues.append(
+                ValidationIssue(
+                    code="duplicate_entity_marker",
+                    field="instruction_template",
+                    message=f"{{{{entity_{expected_index}}}}} must appear exactly once",
+                )
+            )
+    for index in sorted(set(entity_indexes)):
+        if index > entity_count:
+            issues.append(
+                ValidationIssue(
+                    code="unexpected_entity_marker",
+                    field="instruction_template",
+                    message=f"unexpected entity marker: {{{{entity_{index}}}}}",
+                )
+            )
+
+    background_count = len(_BACKGROUND_MARKER.findall(template))
+    if raw_background is not None and background_count == 0:
+        issues.append(
+            ValidationIssue(
+                code="background_marker_missing",
+                field="instruction_template",
+                message="non-null background requires {{background}} exactly once",
+            )
+        )
+    elif raw_background is not None and background_count > 1:
+        issues.append(
+            ValidationIssue(
+                code="duplicate_background_marker",
+                field="instruction_template",
+                message="{{background}} must appear exactly once",
+            )
+        )
+    elif raw_background is None and background_count:
+        issues.append(
+            ValidationIssue(
+                code="unexpected_background_marker",
+                field="instruction_template",
+                message="null background forbids {{background}}",
+            )
+        )
+
+    recognized_spans = {
+        match.span() for match in [*entity_matches, *_BACKGROUND_MARKER.finditer(template)]
+    }
+    for match in _BRACED_MARKER.finditer(template):
+        if match.span() in recognized_spans:
+            continue
+        marker = match.group(0)
+        code = (
+            "invalid_annotation_image_marker"
+            if match.group(1).casefold().startswith("image_")
+            else "invalid_entity_marker"
+        )
+        issues.append(
+            ValidationIssue(
+                code=code,
+                field="instruction_template",
+                message=f"invalid annotation marker: {marker}",
+            )
+        )
+    remainder = _BRACED_MARKER.sub("", template)
+    if "{{" in remainder or "}}" in remainder:
+        issues.append(
+            ValidationIssue(
+                code="invalid_entity_marker",
+                field="instruction_template",
+                message="instruction_template contains malformed marker braces",
+            )
+        )
+    if _ANNOTATION_IMAGE_MARKER.search(template):
+        issues.append(
+            ValidationIssue(
+                code="invalid_annotation_image_marker",
+                field="instruction_template",
+                message="annotation must not contain image_N or <Image N>",
+            )
+        )
+    if _REFERENCE_TOKEN.search(template):
+        issues.append(
+            ValidationIssue(
+                code="invalid_annotation_reference_token",
+                field="instruction_template",
+                message="annotation must not contain <ref_...> tokens",
+            )
+        )
+
+    for match in [*entity_matches, *_BACKGROUND_MARKER.finditer(template)]:
+        position_issue = _marker_position_issue(
+            template=template,
+            start=match.start(),
+            end=match.end(),
+            marker=match.group(0),
+        )
+        if position_issue is not None:
+            issues.append(position_issue)
     return issues
 
 
-def sanitize_entity_candidates(
+def _sanitize_entity_candidates_with_indices(
     raw_entities: object,
-) -> tuple[list[AnnotationEntity], tuple[str, ...]]:
+) -> tuple[list[AnnotationEntity], tuple[str, ...], tuple[int, ...]]:
     if not isinstance(raw_entities, list):
-        return [], ("dropped_invalid_entities_collection",)
+        return [], ("dropped_invalid_entities_collection",), ()
 
-    accepted: list[tuple[str, str, str]] = []
+    accepted: list[tuple[int, str, str, str]] = []
     seen_phrases: set[str] = set()
     warnings: list[str] = []
     for index, candidate in enumerate(raw_entities):
@@ -383,7 +495,7 @@ def sanitize_entity_candidates(
                 f"truncated_entity_candidates:{MAX_ANNOTATION_ENTITIES}"
             )
             break
-        accepted.append((normalized_type, phrase, grounding_prompt))
+        accepted.append((index + 1, normalized_type, phrase, grounding_prompt))
 
     entities = [
         AnnotationEntity(
@@ -392,12 +504,59 @@ def sanitize_entity_candidates(
             phrase=phrase,
             grounding_prompt=grounding_prompt,
         )
-        for index, (reference_type, phrase, grounding_prompt) in enumerate(
+        for index, (
+            _source_index,
+            reference_type,
+            phrase,
+            grounding_prompt,
+        ) in enumerate(
             accepted,
             start=1,
         )
     ]
-    return entities, tuple(warnings)
+    return (
+        entities,
+        tuple(warnings),
+        tuple(source_index for source_index, *_ in accepted),
+    )
+
+
+def sanitize_entity_candidates(
+    raw_entities: object,
+) -> tuple[list[AnnotationEntity], tuple[str, ...]]:
+    entities, warnings, _ = _sanitize_entity_candidates_with_indices(
+        raw_entities
+    )
+    return entities, warnings
+
+
+def _rewrite_markers_after_sanitization(
+    template: str,
+    *,
+    accepted_source_indexes: tuple[int, ...],
+    keep_background: bool,
+) -> str:
+    final_indexes = {
+        source_index: final_index
+        for final_index, source_index in enumerate(
+            accepted_source_indexes,
+            start=1,
+        )
+    }
+
+    def replace_entity(match: re.Match[str]) -> str:
+        source_index = int(match.group(1))
+        final_index = final_indexes.get(source_index)
+        return "" if final_index is None else f" {{{{entity_{final_index}}}}}"
+
+    rewritten = re.sub(
+        r" \{\{entity_([1-9]\d*)\}\}",
+        replace_entity,
+        template,
+    )
+    if not keep_background:
+        rewritten = rewritten.replace(" {{background}}", "")
+    return rewritten
 
 
 def sanitize_background(
@@ -433,67 +592,73 @@ def sanitize_background(
 def sanitize_annotation_payload(
     raw_payload: dict[str, object],
 ) -> tuple[AnnotationState | None, list[ValidationIssue], tuple[str, ...]]:
-    caption = _clean_text(raw_payload.get("t2v_caption"))
+    template = _clean_instruction_template(
+        raw_payload.get("instruction_template")
+    )
     issues: list[ValidationIssue] = []
-    if caption is None:
+    if template is None:
         issues.append(
             ValidationIssue(
-                code="empty_t2v_caption",
-                field="t2v_caption",
-                message="t2v_caption must be a non-empty string",
-            )
-        )
-    elif _REFERENCE_TOKEN.search(caption):
-        issues.append(
-            ValidationIssue(
-                code="reference_token_in_annotation",
-                field="t2v_caption",
-                message="t2v_caption must not contain reference tokens",
+                code="empty_instruction_template",
+                field="instruction_template",
+                message="instruction_template must be a non-empty string",
             )
         )
     else:
-        if _english_word_count(caption) > 120:
+        plain_text = plain_instruction_text(template)
+        if _english_word_count(plain_text) > 120:
             issues.append(
                 ValidationIssue(
                     code="caption_too_long",
-                    field="t2v_caption",
-                    message="t2v_caption must not exceed 120 English words",
+                    field="instruction_template",
+                    message=(
+                        "instruction_template must not exceed 120 English "
+                        "content words"
+                    ),
                 )
             )
-        inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(caption)
+        inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(plain_text)
         if inference_match is not None:
             issues.append(
                 ValidationIssue(
                     code="unsupported_caption_inference",
-                    field="t2v_caption",
+                    field="instruction_template",
                     message=(
-                        "t2v_caption contains unsupported inference language: "
+                        "instruction_template contains unsupported inference "
+                        "language: "
                         f"{inference_match.group(0)}"
                     ),
                 )
             )
-    issues.extend(_entity_text_issues(raw_payload.get("entities", [])))
-    if caption is not None:
         issues.extend(
-            _phrase_anchor_issues(
-                caption=caption,
+            _annotation_marker_issues(
+                template=template,
                 raw_entities=raw_payload.get("entities", []),
                 raw_background=raw_payload.get("background"),
             )
         )
+    issues.extend(_entity_text_issues(raw_payload.get("entities", [])))
     if issues:
         return None, issues, ()
 
-    entities, entity_warnings = sanitize_entity_candidates(
+    entities, entity_warnings, accepted_source_indexes = (
+        _sanitize_entity_candidates_with_indices(
         raw_payload.get("entities", [])
+        )
     )
     background, background_warnings = sanitize_background(
         raw_payload.get("background")
     )
+    template = _rewrite_markers_after_sanitization(
+        template,
+        accepted_source_indexes=accepted_source_indexes,
+        keep_background=background is not None,
+    )
     return (
         AnnotationState(
             status="ready",
-            t2v_caption=caption,
+            instruction_template=template,
+            t2v_caption="",
             entities=entities,
             background=background,
         ),
@@ -529,7 +694,7 @@ def _repair_request(
         "Repair only the top-level structured-output problems listed below. "
         "Reinspect the same complete video and return the complete minimal JSON "
         "object. Do not add relations, entity IDs, ontology fields, reference "
-        "tokens, or instruction fields.\n"
+        "tokens, image placeholders, or fields outside the schema.\n"
         f"Original request:\n{original_request}\n"
         "JSON Schema:\n"
         f"{json.dumps(RawAnnotationPayload.model_json_schema(), ensure_ascii=False)}\n"

@@ -33,6 +33,7 @@ from r2v_data_v2.v3.schemas import (
     RunRecord,
     SampledFramesArtifact,
     TrackedMasksArtifact,
+    plain_instruction_text,
 )
 
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -910,7 +911,11 @@ class DatasetExporter:
         return DatasetSample(
             sample_id=clip.clip_uid,
             target_video=clip.source.video_path,
-            t2v_caption=clip.annotation.t2v_caption,
+            t2v_caption=(
+                plain_instruction_text(clip.annotation.instruction_template)
+                if clip.annotation.instruction_template
+                else clip.annotation.t2v_caption
+            ),
             r2v_instruction=clip.instruction.r2v_instruction,
             references=dataset_references,
             source={

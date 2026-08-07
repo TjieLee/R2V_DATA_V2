@@ -1191,6 +1191,41 @@ def test_legacy_clip_without_export_state_can_be_read(
     assert storage.read_clip("legacy-clip").export == ExportState()
 
 
+def test_legacy_clip_annotation_without_instruction_template_can_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    storage.create_clip(
+        clip_uid="legacy-annotation",
+        source=_clip_source(storage, "legacy-annotation"),
+    )
+    storage.write_annotation(
+        "legacy-annotation",
+        AnnotationState(
+            status="ready",
+            t2v_caption="A legacy subject remains visible.",
+        ),
+    )
+    payload = storage.read_clip("legacy-annotation").model_dump(mode="json")
+    annotation = payload["annotation"]
+    assert isinstance(annotation, dict)
+    annotation.pop("instruction_template")
+    storage.clip_path("legacy-annotation").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+    loaded = storage.read_clip("legacy-annotation")
+    assert loaded.annotation is not None
+    assert loaded.annotation.instruction_template == ""
+    assert loaded.annotation.t2v_caption == (
+        "A legacy subject remains visible."
+    )
+
+
 def test_clip_cross_section_validator_rejects_inconsistent_bindings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -29,7 +29,6 @@ from r2v_data_v2.v3.instruction import (
     source_transcript_from_metadata,
     validate_instruction_output,
 )
-from r2v_data_v2.v3.phrase_anchor import find_legacy_caption_phrase_span
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
@@ -121,6 +120,7 @@ def _ready_storage(
     config: V3Config,
     *,
     metadata: dict[str, object] | None = None,
+    legacy_annotation: bool = False,
 ) -> tuple[RunStorage, str]:
     storage = RunStorage(config)
     storage.initialize(git_commit="instruction-test")
@@ -140,9 +140,16 @@ def _ready_storage(
         clip_uid,
         AnnotationState(
             status="ready",
+            instruction_template="" if legacy_annotation else (
+                "A woman in a yellow coat {{entity_1}} walks beside a red "
+                "bicycle {{entity_2}} through a bright plaza {{background}} "
+                "as the camera tracks backward."
+            ),
             t2v_caption=(
                 "A woman in a yellow coat walks beside a red bicycle through "
                 "a bright plaza as the camera tracks backward."
+                if legacy_annotation
+                else ""
             ),
             entities=[
                 AnnotationEntity(
@@ -377,7 +384,15 @@ def _five_entity_instruction_clip(*, include_background: bool) -> ClipRecord:
         ),
         annotation=AnnotationState(
             status="ready",
-            t2v_caption="Five stable entities remain visible in a quiet plaza.",
+            instruction_template=(
+                "Entity 1 {{entity_1}} stands near entity 2 {{entity_2}} while "
+                "entity 3 {{entity_3}} faces entity 4 {{entity_4}}. Entity 5 "
+                "{{entity_5}} remains visible in a quiet plaza {{background}}."
+                if include_background
+                else "Entity 1 {{entity_1}} stands near entity 2 {{entity_2}} "
+                "while entity 3 {{entity_3}} faces entity 4 {{entity_4}}. "
+                "Entity 5 {{entity_5}} remains visible in a quiet plaza."
+            ),
             entities=entities,
             background=background_annotation,
         ),
@@ -444,10 +459,10 @@ def test_deterministic_instruction_inlines_one_entity_after_mention(
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     bindings = build_instruction_bindings(storage.read_clip(clip_uid))
-    caption = "  A woman in a yellow coat crosses the plaza.  "
+    template = "  A woman in a yellow coat {{entity_1}} crosses the plaza.  "
 
     instruction = build_deterministic_instruction(
-        t2v_caption=caption,
+        instruction_template=template,
         bindings=bindings[:1],
     )
 
@@ -472,13 +487,14 @@ def test_deterministic_instruction_inlines_entities_and_background_at_mentions(
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     bindings = build_instruction_bindings(storage.read_clip(clip_uid))
-    caption = (
-        "A woman in a yellow coat walks beside a red bicycle through a bright "
-        "plaza as the camera tracks backward."
+    template = (
+        "A woman in a yellow coat {{entity_1}} walks beside a red bicycle "
+        "{{entity_2}} through a bright plaza {{background}} as the camera "
+        "tracks backward."
     )
 
     instruction = build_deterministic_instruction(
-        t2v_caption=caption,
+        instruction_template=template,
         bindings=bindings,
     )
 
@@ -498,16 +514,13 @@ def test_deterministic_instruction_inlines_entities_and_background_at_mentions(
     assert not instruction.instruction_body_template.startswith("{{image_")
 
 
-def test_deterministic_instruction_preserves_caption_except_insertions() -> None:
+def test_deterministic_instruction_preserves_template_except_marker_changes() -> None:
     clip = _five_entity_instruction_clip(include_background=True)
     bindings = build_instruction_bindings(clip)
-    caption = (
-        "  Entity 1  stands near entity 2 while entity 3 faces entity 4. "
-        "Entity 5 remains visible in a quiet plaza.  "
-    )
+    template = f"  {clip.annotation.instruction_template}  "
 
     instruction = build_deterministic_instruction(
-        t2v_caption=caption,
+        instruction_template=template,
         bindings=bindings,
     )
     body = instruction.instruction_body_template
@@ -517,156 +530,183 @@ def test_deterministic_instruction_preserves_caption_except_insertions() -> None
         binding.grounding_prompt.strip() for binding in bindings
     ]
     assert all(body.count(f"{{{{image_{index}}}}}") == 1 for index in range(1, 7))
-    assert re.sub(r" \{\{image_[1-9]\d*\}\}", "", body) == caption.strip()
+    assert re.sub(r" \{\{image_[1-9]\d*\}\}", "", body) == re.sub(
+        r" \{\{(?:entity_[1-9]\d*|background)\}\}",
+        "",
+        template.strip(),
+    )
     assert "Use " not in body
     assert "Generate " not in body
 
 
-def test_deterministic_instruction_uses_first_repeated_phrase_occurrence(
+def test_deterministic_instruction_ignores_phrase_for_text_location(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     binding = build_instruction_bindings(storage.read_clip(clip_uid))[0].model_copy(
         update={
-            "phrase": "a woman",
+            "phrase": "a phrase absent from the template",
             "grounding_prompt": "  stable visible subject  ",
         }
     )
 
     instruction = build_deterministic_instruction(
-        t2v_caption="A woman enters before a woman leaves.",
+        instruction_template=(
+            "A woman {{entity_1}} enters before another woman leaves."
+        ),
         bindings=[binding],
     )
 
     assert instruction.instruction_body_template == (
-        "A woman {{image_1}} enters before a woman leaves."
+        "A woman {{image_1}} enters before another woman leaves."
     )
     assert "stable visible subject" not in instruction.instruction_body_template
     assert instruction.reference_legend[0].description == "stable visible subject"
 
 
-@pytest.mark.parametrize(
-    ("caption", "phrase", "expected_span"),
-    [
-        (
-            "A bald man in a light brown robe sits cross-legged.",
-            "bald man in light brown robe",
-            "bald man in a light brown robe",
-        ),
-        (
-            "A scuba diver enters the water. The diver wears a black wetsuit.",
-            "scuba diver in black wetsuit",
-            "scuba diver",
-        ),
-        (
-            "A bald man in a dark gray button-up shirt stands outside.",
-            "bald man in dark gray shirt",
-            "bald man in a dark gray button-up shirt",
-        ),
-        (
-            "A man in elaborate golden armor with wing-like shoulder pieces waits.",
-            "man in ornate golden armor with winged shoulders",
-            "golden armor",
-        ),
-        (
-            "A man in a beige cap, sunglasses on the cap, and a black shirt walks.",
-            "man in beige cap and black shirt",
-            "man in a beige cap, sunglasses on the cap, and a black shirt",
-        ),
-        (
-            "The altar holds a statue beneath a large arched mural.",
-            "large arched mural behind altar",
-            "large arched mural",
-        ),
-        (
-            "Several figures surround a large ornate lantern structure.",
-            "ornate multi-tiered lantern structure",
-            "lantern structure",
-        ),
-    ],
-)
-def test_legacy_phrase_alignment_selects_conservative_caption_span(
-    caption: str,
-    phrase: str,
-    expected_span: str,
-) -> None:
-    span = find_legacy_caption_phrase_span(phrase=phrase, caption=caption)
-
-    assert span is not None
-    assert caption[slice(*span)] == expected_span
-
-
-def test_deterministic_instruction_uses_legacy_span_for_existing_annotation() -> None:
-    binding = InstructionBinding(
-        image_id="image_1",
-        image_index=1,
-        reference_type="subject",
-        entity_id="e1",
-        phrase="bald man in light brown robe",
-        grounding_prompt="bald man wearing a light brown robe and dark beads",
-    )
-
-    instruction = build_deterministic_instruction(
-        t2v_caption="A bald man in a light brown robe sits cross-legged.",
-        bindings=[binding],
-    )
-
-    assert instruction.r2v_instruction == (
-        "A bald man in a light brown robe <Image 1> sits cross-legged."
-    )
-
-
-def test_legacy_phrase_alignment_fails_when_evidence_is_missing_or_ambiguous() -> None:
-    assert find_legacy_caption_phrase_span(
-        phrase="man in dark gray t-shirt",
-        caption="Four men sit around a table in casual shirts.",
-    ) is None
-    assert find_legacy_caption_phrase_span(
-        phrase="red bicycle with basket",
-        caption="A red bicycle waits beside another red bicycle.",
-    ) is None
-
-
-def test_deterministic_instruction_rejects_conflicting_same_span_bindings(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    binding = build_instruction_bindings(storage.read_clip(clip_uid))[0]
-    duplicate = binding.model_copy(
-        update={
-            "image_id": "image_2",
-            "image_index": 2,
-            "entity_id": "e2",
-        }
-    )
-
-    with pytest.raises(ValueError, match="caption spans overlap"):
-        build_deterministic_instruction(
-            t2v_caption="A woman in a yellow coat crosses the plaza.",
-            bindings=[binding, duplicate],
-        )
-
-
-def test_deterministic_instruction_rejects_overlapping_phrase_spans(
+def test_deterministic_instruction_filters_markers_and_renumbers_images(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
     first, second = build_instruction_bindings(storage.read_clip(clip_uid))[:2]
-    second = second.model_copy(
+    second_only = second.model_copy(
         update={
-            "phrase": "yellow coat",
-            "grounding_prompt": "the yellow coat worn by the woman",
+            "image_id": "image_1",
+            "image_index": 1,
         }
     )
 
-    with pytest.raises(ValueError, match="caption spans overlap"):
-        build_deterministic_instruction(
-            t2v_caption="A woman in a yellow coat crosses the plaza.",
-            bindings=[first, second],
-        )
+    first_only = build_deterministic_instruction(
+        instruction_template=(
+            "A man {{entity_1}} stands beside a boat {{entity_2}}."
+        ),
+        bindings=[first],
+    )
+    assert first_only.r2v_instruction == (
+        "A man <Image 1> stands beside a boat."
+    )
+
+    retained_second = build_deterministic_instruction(
+        instruction_template=(
+            "A man {{entity_1}} stands beside a boat {{entity_2}}."
+        ),
+        bindings=[second_only],
+    )
+    assert retained_second.r2v_instruction == (
+        "A man stands beside a boat <Image 1>."
+    )
+    assert "  " not in first_only.instruction_body_template
+    assert "{{entity_" not in retained_second.instruction_body_template
+
+
+def test_removed_markers_preserve_punctuation_and_visible_entity_text() -> None:
+    binding = InstructionBinding(
+        image_id="image_1",
+        image_index=1,
+        reference_type="object",
+        entity_id="e2",
+        phrase="boat label absent from prose",
+        grounding_prompt="small white boat beside the man",
+    )
+
+    instruction = build_deterministic_instruction(
+        instruction_template=(
+            "A man {{entity_1}}, wearing a coat, stands beside a boat "
+            "{{entity_2}}."
+        ),
+        bindings=[binding],
+    )
+
+    assert instruction.r2v_instruction == (
+        "A man, wearing a coat, stands beside a boat <Image 1>."
+    )
+    assert "  " not in instruction.instruction_body_template
+
+
+def test_entity_one_and_three_are_renumbered_contiguously() -> None:
+    clip = _five_entity_instruction_clip(include_background=False)
+    first, _, third, *_ = build_instruction_bindings(clip)
+    third = third.model_copy(
+        update={"image_id": "image_2", "image_index": 2}
+    )
+
+    instruction = build_deterministic_instruction(
+        instruction_template=clip.annotation.instruction_template,
+        bindings=[first, third],
+    )
+
+    assert "Entity 1 {{image_1}}" in instruction.instruction_body_template
+    assert "entity 3 {{image_2}}" in instruction.instruction_body_template
+    assert "{{image_3}}" not in instruction.instruction_body_template
+    assert "{{entity_" not in instruction.instruction_body_template
+    assert re.findall(r"<Image ([1-9]\d*)>", instruction.r2v_instruction) == [
+        "1",
+        "2",
+    ]
+    assert len(instruction.reference_legend) == 2
+
+
+def test_background_marker_is_retained_or_removed_by_final_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
+    entity, _, background = build_instruction_bindings(
+        storage.read_clip(clip_uid)
+    )
+    background = background.model_copy(
+        update={"image_id": "image_2", "image_index": 2}
+    )
+    template = (
+        "A woman {{entity_1}} crosses a plaza {{background}} while a bicycle "
+        "{{entity_2}} remains nearby."
+    )
+
+    retained = build_deterministic_instruction(
+        instruction_template=template,
+        bindings=[entity, background],
+    )
+    removed = build_deterministic_instruction(
+        instruction_template=template,
+        bindings=[entity],
+    )
+
+    assert retained.r2v_instruction == (
+        "A woman <Image 1> crosses a plaza <Image 2> while a bicycle remains "
+        "nearby."
+    )
+    assert removed.r2v_instruction == (
+        "A woman <Image 1> crosses a plaza while a bicycle remains nearby."
+    )
+    assert [entry.image_id for entry in retained.reference_legend] == [
+        "image_1",
+        "image_2",
+    ]
+
+
+def test_deterministic_instruction_uses_final_binding_order() -> None:
+    clip = _five_entity_instruction_clip(include_background=False)
+    bindings = build_instruction_bindings(clip)
+    entity_three = bindings[2].model_copy(
+        update={"image_id": "image_1", "image_index": 1}
+    )
+    entity_one = bindings[0].model_copy(
+        update={"image_id": "image_2", "image_index": 2}
+    )
+
+    instruction = build_deterministic_instruction(
+        instruction_template=clip.annotation.instruction_template,
+        bindings=[entity_three, entity_one],
+    )
+
+    assert "Entity 1 {{image_2}}" in instruction.instruction_body_template
+    assert "entity 3 {{image_1}}" in instruction.instruction_body_template
+    assert [entry.image_id for entry in instruction.reference_legend] == [
+        "image_1",
+        "image_2",
+    ]
 
 
 def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
@@ -679,22 +719,25 @@ def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
         grounding_prompt=" ",
     )
 
-    with pytest.raises(ValueError, match="non-empty t2v_caption"):
-        build_deterministic_instruction(t2v_caption=" ", bindings=[binding])
+    with pytest.raises(ValueError, match="non-empty instruction_template"):
+        build_deterministic_instruction(
+            instruction_template=" ",
+            bindings=[binding],
+        )
     with pytest.raises(ValueError, match="non-empty grounding_prompt"):
         build_deterministic_instruction(
-            t2v_caption="A subject moves.",
+            instruction_template="A subject {{entity_1}} moves.",
             bindings=[binding],
         )
     missing = binding.model_copy(update={"grounding_prompt": "visible subject"})
-    with pytest.raises(ValueError, match="cannot be anchored to caption"):
+    with pytest.raises(ValueError, match="marker must appear exactly once"):
         build_deterministic_instruction(
-            t2v_caption="A bicycle moves.",
+            instruction_template="A bicycle moves.",
             bindings=[missing],
         )
     with pytest.raises(ValueError, match="at least one binding"):
         build_deterministic_instruction(
-            t2v_caption="A subject moves.",
+            instruction_template="A subject {{entity_1}} moves.",
             bindings=[],
         )
 
@@ -720,7 +763,7 @@ def test_five_entity_bindings_and_optional_background_are_not_truncated(
 
     issues = validate_instruction_output(
         output,
-        t2v_caption=clip.annotation.t2v_caption,
+        t2v_caption="Five stable entities remain visible in a quiet plaza.",
         bindings=bindings,
         source_transcript=None,
     )
@@ -746,6 +789,10 @@ def test_five_entity_bindings_and_optional_background_are_not_truncated(
     ]
     assert issues == []
     assert f"<Image {expected_count}>" in rendered
+    rendered_body = rendered.split("\n\n", 1)[0]
+    assert re.findall(r"<Image ([1-9]\d*)>", rendered_body) == [
+        str(index) for index in range(1, len(bindings) + 1)
+    ]
     if include_background:
         assert bindings[-1].reference_type == "background"
         assert bindings[-1].entity_id is None
@@ -1342,6 +1389,24 @@ def test_deterministic_instruct_failure_does_not_fallback_to_qwen(
     assert failures[-1]["reason"] == "invalid deterministic instruction state"
 
 
+def test_legacy_annotation_without_template_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage, clip_uid = _ready_storage(config, legacy_annotation=True)
+
+    stats = instruct_clips(config, storage)
+
+    instruction = storage.read_clip(clip_uid).instruction
+    assert stats.failed == 1
+    assert stats.processed == 0
+    assert instruction == InstructionState(
+        status="failed",
+        reason="legacy_annotation_missing_instruction_template",
+    )
+
+
 def test_default_instruct_preserves_skip_gates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1400,9 +1465,9 @@ def test_deterministic_builder_uses_existing_final_renderer(
     )
 
     instruction = instruction_module.build_deterministic_instruction(
-        t2v_caption=(
-            "A woman in a yellow coat walks beside a red bicycle through a "
-            "bright plaza."
+        instruction_template=(
+            "A woman in a yellow coat {{entity_1}} walks beside a red bicycle "
+            "{{entity_2}} through a bright plaza {{background}}."
         ),
         bindings=bindings,
     )

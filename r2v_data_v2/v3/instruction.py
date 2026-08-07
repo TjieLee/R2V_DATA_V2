@@ -14,10 +14,6 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig, V3Config
-from r2v_data_v2.v3.phrase_anchor import (
-    find_caption_phrase_spans,
-    find_legacy_caption_phrase_span,
-)
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
     model_profile_context,
@@ -29,6 +25,7 @@ from r2v_data_v2.v3.schemas import (
     InstructionLegendEntry,
     InstructionState,
     RawInstructionOutput,
+    plain_instruction_text,
     render_inline_instruction_text,
     render_instruction_text,
 )
@@ -56,6 +53,10 @@ _QUOTED_DIALOGUE = re.compile(
     r'"[^"\n]+")'
 )
 _ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*")
+_ENTITY_ID = re.compile(r"e([1-9]\d*)")
+_INTERNAL_ENTITY_MARKER = re.compile(r" \{\{entity_[1-9]\d*\}\}")
+_INTERNAL_BACKGROUND_MARKER = re.compile(r" \{\{background\}\}")
+_ANY_INTERNAL_MARKER = re.compile(r"\{\{(?:entity_[^{}]*|background)\}\}")
 
 SYSTEM_PROMPT = """You write an English reference-conditioned video instruction.
 
@@ -168,38 +169,33 @@ def build_instruction_bindings(clip: ClipRecord) -> list[InstructionBinding]:
 
 def build_deterministic_instruction(
     *,
-    t2v_caption: str,
+    instruction_template: str,
     bindings: list[InstructionBinding],
 ) -> InstructionState:
-    caption = t2v_caption.strip()
-    if not caption:
-        raise ValueError("deterministic instruction requires a non-empty t2v_caption")
+    body = instruction_template.strip()
+    if not body:
+        raise ValueError(
+            "deterministic instruction requires a non-empty instruction_template"
+        )
     if not bindings:
         raise ValueError("deterministic instruction requires at least one binding")
 
     legend: list[InstructionLegendEntry] = []
-    anchors: list[tuple[int, int, InstructionBinding]] = []
     for binding in bindings:
-        spans = find_caption_phrase_spans(
-            phrase=binding.phrase,
-            caption=caption,
-        )
-        span = spans[0] if spans else find_legacy_caption_phrase_span(
-            phrase=binding.phrase,
-            caption=caption,
-        )
-        if span is None:
-            raise ValueError(
-                f"binding {binding.image_id} phrase cannot be anchored to caption"
-            )
-        start, end = span
-        for existing_start, existing_end, existing_binding in anchors:
-            if start < existing_end and existing_start < end:
+        if binding.reference_type == "background":
+            marker = "{{background}}"
+        else:
+            match = _ENTITY_ID.fullmatch(binding.entity_id or "")
+            if match is None:
                 raise ValueError(
-                    "instruction binding caption spans overlap: "
-                    f"{existing_binding.image_id} and {binding.image_id}"
+                    f"binding {binding.image_id} has an invalid entity_id"
                 )
-        anchors.append((start, end, binding))
+            marker = f"{{{{entity_{match.group(1)}}}}}"
+        if body.count(marker) != 1:
+            raise ValueError(
+                f"binding {binding.image_id} marker must appear exactly once: {marker}"
+            )
+        body = body.replace(marker, f"{{{{{binding.image_id}}}}}")
 
         description = binding.grounding_prompt.strip()
         if not description:
@@ -213,13 +209,14 @@ def build_deterministic_instruction(
             )
         )
 
-    body = caption
-    for _, end, binding in sorted(
-        anchors,
-        key=lambda anchor: (anchor[1], anchor[0]),
-        reverse=True,
-    ):
-        body = f"{body[:end]} {{{{{binding.image_id}}}}}{body[end:]}"
+    body = _INTERNAL_ENTITY_MARKER.sub(
+        "",
+        body,
+    )
+    body = _INTERNAL_BACKGROUND_MARKER.sub("", body)
+    if _ANY_INTERNAL_MARKER.search(body):
+        raise ValueError("instruction contains an invalid internal marker")
+    body = body.strip()
     if _english_word_count(body) > 180:
         raise ValueError("deterministic instruction exceeds 180 English words")
     return InstructionState(
@@ -679,14 +676,25 @@ def instruct_clips(
         try:
             bindings = build_instruction_bindings(clip)
             if client is None:
+                if not clip.annotation.instruction_template:
+                    raise ValueError(
+                        "legacy_annotation_missing_instruction_template"
+                    )
                 instruction = build_deterministic_instruction(
-                    t2v_caption=clip.annotation.t2v_caption,
+                    instruction_template=clip.annotation.instruction_template,
                     bindings=bindings,
                 )
                 storage.write_instruction(clip.clip_uid, instruction)
             else:
+                source_text = (
+                    plain_instruction_text(
+                        clip.annotation.instruction_template
+                    )
+                    if clip.annotation.instruction_template
+                    else clip.annotation.t2v_caption
+                )
                 attempt = client.write(
-                    t2v_caption=clip.annotation.t2v_caption,
+                    t2v_caption=source_text,
                     bindings=bindings,
                     source_transcript=source_transcript_from_metadata(
                         clip.source.metadata

@@ -19,7 +19,6 @@ from r2v_data_v2.v3.annotation import (
     AnnotationStats,
     QwenAnnotationClient,
     annotate_clips,
-    phrase_matches_caption_span,
     sanitize_annotation_payload,
     sanitize_background,
     sanitize_entity_candidates,
@@ -177,41 +176,52 @@ def _entity(
 
 def _payload(
     *,
-    caption: str = (
-        "A woman in a yellow coat walks beside a wooden table through a "
-        "sunlit plaza as the camera tracks backward."
-    ),
+    template: str | None = None,
+    caption: str | None = None,
     entities: list[object] | None = None,
     background: object = ...,
 ) -> dict[str, object]:
-    if entities is None:
-        default_entities = [
+    caption_was_supplied = caption is not None
+    text_was_supplied = template is not None or caption is not None
+    if template is None:
+        template = caption
+    if entities is None and not text_was_supplied:
+        entities = [
             _entity("A woman in a yellow coat"),
             _entity("a wooden table", reference_type="object"),
         ]
-        entities = [
-            entity
-            for entity in default_entities
-            if phrase_matches_caption_span(
-                phrase=str(entity["phrase"]),
-                caption=caption,
-            )
-        ]
+    elif entities is None:
+        entities = []
     if background is ...:
-        default_background = {
-            "phrase": "a sunlit plaza",
-            "grounding_prompt": "the empty sunlit plaza",
-        }
         background = (
-            default_background
-            if phrase_matches_caption_span(
-                phrase=str(default_background["phrase"]),
-                caption=caption,
-            )
+            {
+                "phrase": "a sunlit plaza",
+                "grounding_prompt": "the empty sunlit plaza",
+            }
+            if not text_was_supplied
             else None
         )
+    if template is None:
+        mentions = [
+            f"A visible candidate {index} {{{{entity_{index}}}}} remains present."
+            for index in range(1, len(entities) + 1)
+        ]
+        if background is not None:
+            mentions.append("The scene is a sunlit plaza {{background}}.")
+        template = " ".join(mentions) or "A quiet scene remains visible."
+    elif caption_was_supplied:
+        marker_sentences = [
+            f"Candidate {index} {{{{entity_{index}}}}} remains visible."
+            for index in range(1, len(entities) + 1)
+        ]
+        if background is not None:
+            marker_sentences.append(
+                "The stable environment {{background}} remains visible."
+            )
+        if marker_sentences:
+            template = f"{template} {' '.join(marker_sentences)}"
     return {
-        "t2v_caption": caption,
+        "instruction_template": template,
         "entities": entities,
         "background": background,
     }
@@ -457,7 +467,7 @@ def test_minimal_raw_annotation_schema_contains_only_expected_fields() -> None:
     schema = RawAnnotationPayload.model_json_schema()
 
     assert set(schema["properties"]) == {
-        "t2v_caption",
+        "instruction_template",
         "entities",
         "background",
     }
@@ -559,7 +569,10 @@ def test_annotation_state_accepts_five_contiguous_entities() -> None:
 
     annotation = AnnotationState(
         status="ready",
-        t2v_caption="Five distinct objects remain visible in the scene.",
+        instruction_template=" ".join(
+            f"Object {index} {{{{entity_{index}}}}} remains visible."
+            for index in range(1, 6)
+        ),
         entities=entities,
     )
 
@@ -570,6 +583,39 @@ def test_annotation_state_accepts_five_contiguous_entities() -> None:
         "e4",
         "e5",
     ]
+
+
+def test_annotation_state_loads_legacy_caption_without_template() -> None:
+    annotation = AnnotationState.model_validate(
+        {
+            "status": "ready",
+            "t2v_caption": "A legacy caption remains available.",
+            "entities": [],
+            "background": None,
+            "reason": None,
+        }
+    )
+
+    assert annotation.instruction_template == ""
+    assert annotation.t2v_caption == "A legacy caption remains available."
+
+
+def test_annotation_state_rejects_two_published_text_sources() -> None:
+    with pytest.raises(ValidationError, match="exactly one"):
+        AnnotationState(
+            status="ready",
+            instruction_template="A new template is visible.",
+            t2v_caption="A second caption is visible.",
+        )
+
+
+def test_failed_annotation_cannot_publish_instruction_template() -> None:
+    with pytest.raises(ValidationError, match="must not publish"):
+        AnnotationState(
+            status="failed",
+            instruction_template="A leaked template.",
+            reason="annotation_failed",
+        )
 
 
 def test_annotation_state_rejects_six_entities() -> None:
@@ -586,7 +632,7 @@ def test_annotation_state_rejects_six_entities() -> None:
     with pytest.raises(ValidationError, match="at most 5 entities"):
         AnnotationState(
             status="ready",
-            t2v_caption="Six distinct objects remain visible in the scene.",
+            instruction_template="Six objects remain visible.",
             entities=entities,
         )
 
@@ -606,7 +652,7 @@ def test_annotation_state_rejects_noncontiguous_five_entity_ids() -> None:
     with pytest.raises(ValidationError, match="contiguous and ordered"):
         AnnotationState(
             status="ready",
-            t2v_caption="Five distinct objects remain visible in the scene.",
+            instruction_template="Five objects remain visible.",
             entities=entities,
         )
 
@@ -633,7 +679,7 @@ def test_invalid_entity_candidate_is_dropped_locally(
 
 def test_zero_valid_entities_still_produces_ready_annotation() -> None:
     annotation, issues, _ = sanitize_annotation_payload(
-        _payload(entities=[None, _entity("", grounding_prompt="person")])
+        _payload(entities=[])
     )
 
     assert issues == []
@@ -697,6 +743,7 @@ def test_annotation_writes_minimal_semantic_fields_only(
     serialized = clip.annotation.model_dump(mode="json")
     assert set(serialized) == {
         "status",
+        "instruction_template",
         "t2v_caption",
         "entities",
         "background",
@@ -710,55 +757,170 @@ def test_annotation_writes_minimal_semantic_fields_only(
     }
     assert "relations" not in json.dumps(serialized)
     assert "<ref_" not in json.dumps(serialized)
+    assert clip.annotation.instruction_template
+    assert clip.annotation.t2v_caption == ""
 
 
-def test_phrase_anchor_matching_is_exact_and_case_insensitive() -> None:
-    caption = "A Bald Man   in a light brown robe kneels before an altar."
-
-    assert phrase_matches_caption_span(
-        phrase="  'bald man in a light brown robe.'  ",
-        caption=caption,
-    )
-    assert not phrase_matches_caption_span(
-        phrase="dark wooden altar with carvings",
-        caption=caption,
-    )
-
-
-def test_entity_and_background_phrases_must_anchor_in_caption() -> None:
+def test_phrase_and_grounding_prompt_need_not_appear_in_template() -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
-            caption="A woman crosses a courtyard beside a fountain.",
+            template="A visible figure {{entity_1}} crosses a courtyard.",
             entities=[
                 _entity(
                     "a red-haired woman",
                     grounding_prompt="woman with long red hair and a green coat",
                 )
             ],
-            background={
-                "phrase": "a stone plaza",
-                "grounding_prompt": "wide stone plaza with a central fountain",
-            },
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert annotation.entities[0].phrase == "a red-haired woman"
+    assert annotation.entities[0].grounding_prompt.endswith("green coat")
+
+
+def test_three_entity_markers_are_valid_once_each() -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            template=(
+                "A woman {{entity_1}} stands beside a boat {{entity_2}} near "
+                "a tower {{entity_3}}."
+            ),
+            entities=[
+                _entity("woman"),
+                _entity("boat", reference_type="object"),
+                _entity("tower", reference_type="object"),
+            ],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+    assert annotation.instruction_template.count("{{entity_") == 3
+
+
+@pytest.mark.parametrize(
+    ("template", "entities", "issue_code"),
+    [
+        (
+            "A woman {{entity_1}} stands beside a boat.",
+            [_entity("woman"), _entity("boat", reference_type="object")],
+            "missing_entity_marker",
+        ),
+        (
+            "A woman {{entity_1}} greets the woman {{entity_1}}.",
+            [_entity("woman")],
+            "duplicate_entity_marker",
+        ),
+        (
+            "A woman {{entity_1}} stands near a tower {{entity_4}}.",
+            [_entity("woman")],
+            "unexpected_entity_marker",
+        ),
+        (
+            "A woman {{entity_0}} walks.",
+            [_entity("woman")],
+            "invalid_entity_marker",
+        ),
+        (
+            "A woman {{ entity_1 }} walks.",
+            [_entity("woman")],
+            "invalid_entity_marker",
+        ),
+        (
+            "A woman {{image_1}} walks.",
+            [_entity("woman")],
+            "invalid_annotation_image_marker",
+        ),
+        (
+            "A woman <Image 1> walks.",
+            [_entity("woman")],
+            "invalid_annotation_image_marker",
+        ),
+        (
+            "A woman <ref_subject_1> walks.",
+            [_entity("woman")],
+            "invalid_annotation_reference_token",
+        ),
+        (
+            "{{entity_1}} A woman walks.",
+            [_entity("woman")],
+            "invalid_marker_position",
+        ),
+        (
+            "A woman{{entity_1}} walks.",
+            [_entity("woman")],
+            "invalid_marker_position",
+        ),
+        (
+            "A woman  {{entity_1}} walks.",
+            [_entity("woman")],
+            "invalid_marker_position",
+        ),
+        (
+            "A woman {{entity_1}} {{entity_2}} walks.",
+            [_entity("woman"), _entity("companion")],
+            "invalid_marker_position",
+        ),
+        (
+            "A woman {{entity_1}}walks.",
+            [_entity("woman")],
+            "invalid_marker_position",
+        ),
+    ],
+)
+def test_invalid_internal_marker_structures_are_rejected(
+    template: str,
+    entities: list[object],
+    issue_code: str,
+) -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            template=template,
+            entities=entities,
+            background=None,
         )
     )
 
     assert annotation is None
-    assert [issue.code for issue in issues] == [
-        "entity_phrase_not_in_caption",
-        "background_phrase_not_in_caption",
-    ]
+    assert issue_code in {issue.code for issue in issues}
 
 
-def test_grounding_prompt_need_not_appear_in_caption() -> None:
+def test_zero_entities_forbids_entity_markers() -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
-            caption="A woman crosses a sunlit plaza.",
-            entities=[
-                _entity(
-                    "A woman",
-                    grounding_prompt="woman with a green coat and long red hair",
-                )
-            ],
+            template="A plaza contains a stray marker {{entity_1}}.",
+            entities=[],
+            background=None,
+        )
+    )
+
+    assert annotation is None
+    assert "unexpected_entity_marker" in {issue.code for issue in issues}
+
+
+def test_annotation_word_count_excludes_internal_markers() -> None:
+    words = " ".join(f"visible{index}" for index in range(120))
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            template=f"{words} {{{{entity_1}}}}.",
+            entities=[_entity("candidate")],
+            background=None,
+        )
+    )
+
+    assert issues == []
+    assert annotation is not None
+
+
+def test_background_marker_matches_background_presence() -> None:
+    annotation, issues, _ = sanitize_annotation_payload(
+        _payload(
+            template="A woman {{entity_1}} crosses a sunlit plaza {{background}}.",
+            entities=[_entity("woman")],
             background={
                 "phrase": "a sunlit plaza",
                 "grounding_prompt": "broad limestone plaza with arched colonnades",
@@ -768,20 +930,39 @@ def test_grounding_prompt_need_not_appear_in_caption() -> None:
 
     assert issues == []
     assert annotation is not None
-    assert annotation.entities[0].grounding_prompt == (
-        "woman with a green coat and long red hair"
-    )
     assert annotation.background is not None
-    assert annotation.background.grounding_prompt == (
-        "broad limestone plaza with arched colonnades"
+
+    missing, missing_issues, _ = sanitize_annotation_payload(
+        _payload(
+            template="A woman {{entity_1}} crosses a sunlit plaza.",
+            entities=[_entity("woman")],
+            background={"phrase": "plaza", "grounding_prompt": "sunlit plaza"},
+        )
     )
+    assert missing is None
+    assert "background_marker_missing" in {
+        issue.code for issue in missing_issues
+    }
+
+    unexpected, unexpected_issues, _ = sanitize_annotation_payload(
+        _payload(
+            template="A woman {{entity_1}} crosses a plaza {{background}}.",
+            entities=[_entity("woman")],
+            background=None,
+        )
+    )
+    assert unexpected is None
+    assert "unexpected_background_marker" in {
+        issue.code for issue in unexpected_issues
+    }
 
 
-def test_phrase_anchor_issue_enters_existing_repair_lifecycle(
+def test_marker_issue_enters_existing_repair_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     invalid = _payload(
+        template="A table remains visible.",
         entities=[
             _entity(
                 "dark wooden altar with carvings",
@@ -790,6 +971,7 @@ def test_phrase_anchor_issue_enters_existing_repair_lifecycle(
         ],
     )
     repaired = _payload(
+        template="A wooden table {{entity_1}} remains visible.",
         entities=[
             _entity(
                 "a wooden table",
@@ -809,7 +991,7 @@ def test_phrase_anchor_issue_enters_existing_repair_lifecycle(
     assert stats.processed == 1
     assert stats.repaired == 1
     assert len(client.requests) == 2
-    assert "entity_phrase_not_in_caption" in str(client.requests[1])
+    assert "missing_entity_marker" in str(client.requests[1])
     assert clip.annotation is not None
     assert clip.annotation.entities[0].phrase == "a wooden table"
 
@@ -979,7 +1161,8 @@ def test_caption_semantic_issue_can_be_repaired(
     assert "unsupported_caption_inference" in str(client.requests[1])
     assert clip.annotation is not None
     assert clip.annotation.status == "ready"
-    assert clip.annotation.t2v_caption.startswith("Thin branches")
+    assert clip.annotation.instruction_template.startswith("Thin branches")
+    assert clip.annotation.t2v_caption == ""
 
 
 def test_annotation_text_limit_issue_can_be_repaired(
@@ -1004,13 +1187,13 @@ def test_annotation_text_limit_issue_can_be_repaired(
 def test_annotation_prompt_defines_concise_text_limits() -> None:
     lowered = " ".join(SYSTEM_PROMPT.lower().split())
     for phrase in (
-        "never exceed 120 words",
+        "never exceed 120; internal markers do not count",
         "must not exceed 12 words",
         "must not exceed 24 words",
         "do not include transient actions",
-        "verbatim, contiguous span from t2v_caption",
-        "grounding_prompt need not occur in t2v_caption",
-        "background.phrase must follow the same verbatim contiguous",
+        "phrase is a stable concise label and need not occur verbatim",
+        "grounding_prompt need not occur in instruction_template",
+        "place each marker immediately after that entity's first clear mention",
     ):
         assert phrase in lowered
 
@@ -1047,7 +1230,7 @@ def test_empty_caption_after_repair_marks_annotation_failed(
     assert stats.failed == 1
     assert clip.annotation is not None
     assert clip.annotation.status == "failed"
-    assert clip.annotation.reason == "empty_t2v_caption"
+    assert clip.annotation.reason == "empty_instruction_template"
 
 
 def test_invalid_json_enters_repair_lifecycle(
@@ -1079,7 +1262,7 @@ def test_caption_reference_token_fails_closed(
 
     assert stats.failed == 1
     assert clip.annotation is not None
-    assert clip.annotation.reason == "reference_token_in_annotation"
+    assert clip.annotation.reason == "invalid_annotation_reference_token"
 
 
 def test_changed_annotation_invalidates_all_downstream_state(
@@ -1355,7 +1538,7 @@ def test_qwen_request_uses_full_video_minimal_schema_and_no_resampling(
     response_format = request["response_format"]
     assert response_format["json_schema"]["strict"] is True
     assert set(response_format["json_schema"]["schema"]["properties"]) == {
-        "t2v_caption",
+        "instruction_template",
         "entities",
         "background",
     }
@@ -1439,6 +1622,9 @@ def test_system_prompt_describes_minimal_candidate_contract() -> None:
     assert "do not output relations" in normalized
     assert "do not include <ref_...> tokens" in normalized
     assert "name ontology" in normalized
+    assert "instruction_template" in normalized
+    assert "{{entity_1}}" in SYSTEM_PROMPT
+    assert "{{background}}" in SYSTEM_PROMPT
 
 
 def test_system_prompt_rejects_inferred_causes_and_multiscene_backgrounds() -> None:

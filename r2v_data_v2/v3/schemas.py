@@ -41,6 +41,10 @@ _PLAIN_ENGLISH_IMAGE_INDEX = re.compile(
     r"(?<!<)\bImage\s+([1-9]\d*)\b(?!>)",
     flags=re.IGNORECASE,
 )
+_ANNOTATION_ENTITY_MARKER_WITH_SPACE = re.compile(
+    r" \{\{entity_[1-9]\d*\}\}"
+)
+_ANNOTATION_BACKGROUND_MARKER_WITH_SPACE = re.compile(r" \{\{background\}\}")
 
 
 class SchemaModel(BaseModel):
@@ -71,7 +75,7 @@ class RawBackgroundAnnotation(SchemaModel):
 
 
 class RawAnnotationPayload(SchemaModel):
-    t2v_caption: str
+    instruction_template: str
     entities: list[RawAnnotationEntity]
     background: Optional[RawBackgroundAnnotation]
 
@@ -111,13 +115,14 @@ class BackgroundAnnotation(SchemaModel):
 
 
 class AnnotationPayload(SchemaModel):
-    t2v_caption: str
+    instruction_template: str
     entities: list[AnnotationEntity] = Field(default_factory=list)
     background: Optional[BackgroundAnnotation] = None
 
 
 class AnnotationState(SchemaModel):
     status: Literal["ready", "failed"]
+    instruction_template: str = ""
     t2v_caption: str = ""
     entities: list[AnnotationEntity] = Field(default_factory=list)
     background: Optional[BackgroundAnnotation] = None
@@ -127,12 +132,25 @@ class AnnotationState(SchemaModel):
     def validate_state(self) -> AnnotationState:
         if _ANY_REF_TOKEN.search(self.t2v_caption):
             raise ValueError("t2v_caption must not contain reference tokens")
-        if self.status == "ready" and not self.t2v_caption.strip():
-            raise ValueError("ready annotation requires a non-empty t2v_caption")
+        if _ANY_REF_TOKEN.search(self.instruction_template):
+            raise ValueError(
+                "instruction_template must not contain reference tokens"
+            )
+        if self.status == "ready":
+            has_template = bool(self.instruction_template.strip())
+            has_legacy_caption = bool(self.t2v_caption.strip())
+            if has_template == has_legacy_caption:
+                raise ValueError(
+                    "ready annotation requires exactly one of instruction_template "
+                    "or legacy t2v_caption"
+                )
         if self.status == "failed" and not self.reason:
             raise ValueError("failed annotation requires a reason")
         if self.status == "failed" and (
-            self.t2v_caption or self.entities or self.background is not None
+            self.instruction_template
+            or self.t2v_caption
+            or self.entities
+            or self.background is not None
         ):
             raise ValueError("failed annotation must not publish semantic content")
         entity_ids = [entity.entity_id for entity in self.entities]
@@ -146,6 +164,13 @@ class AnnotationState(SchemaModel):
                 f"annotation supports at most {MAX_ANNOTATION_ENTITIES} entities"
             )
         return self
+
+
+def plain_instruction_text(instruction_template: str) -> str:
+    """Remove valid internal annotation markers without rewriting other text."""
+    value = _ANNOTATION_ENTITY_MARKER_WITH_SPACE.sub("", instruction_template)
+    value = _ANNOTATION_BACKGROUND_MARKER_WITH_SPACE.sub("", value)
+    return value.strip()
 
 
 class SampledFrame(SchemaModel):
