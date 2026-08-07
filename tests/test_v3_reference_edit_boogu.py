@@ -103,12 +103,20 @@ def _background_review(
 
 
 class _Backend:
-    def __init__(self, *, returned_size: tuple[int, int] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        returned_size: tuple[int, int] | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.returned_size = returned_size
+        self.events = events
         self.calls: list[dict[str, object]] = []
         self.output_bytes: bytes | None = None
 
     def edit(self, **kwargs: object) -> BooguEditOutput:
+        if self.events is not None:
+            self.events.append("boogu")
         self.calls.append(kwargs)
         width = int(kwargs["width"])
         height = int(kwargs["height"])
@@ -131,12 +139,16 @@ class _Judge:
         *,
         accept: bool = True,
         background_updates: dict[str, bool] | None = None,
+        events: list[str] | None = None,
     ) -> None:
         self.accept = accept
         self.background_updates = background_updates
+        self.events = events
         self.calls: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> BooguCompletionReview | BooguBackgroundReview:
+        if self.events is not None:
+            self.events.append("qwen")
         self.calls.append(kwargs)
         if kwargs["operation"] == "complete_entity":
             return _completion_review(accept=self.accept)
@@ -153,12 +165,16 @@ class _SamReviewer:
         passed: bool = True,
         failure_kind: str | None = None,
         geometry: dict[str, object] | None = None,
+        events: list[str] | None = None,
     ) -> None:
         self.failure_kind = failure_kind or ("none" if passed else "fragmented")
         self.geometry = geometry or {}
+        self.events = events
         self.calls: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> BooguSamReview:
+        if self.events is not None:
+            self.events.append("sam")
         self.calls.append(kwargs)
         kind = self.failure_kind
         target_present = kind not in {"not_found", "backend_failure"}
@@ -179,6 +195,11 @@ class _SamReviewer:
                 **self.geometry,
             },
         )
+
+
+class _FailIfCalledJudge:
+    def review(self, **kwargs: object) -> BooguCompletionReview | BooguBackgroundReview:
+        raise AssertionError(f"Qwen review must be skipped: {kwargs['operation']}")
 
 
 def _environment(
@@ -444,7 +465,7 @@ def test_composition_geometry_failure_rejects_candidate_publication(
         entity_phrase="object",
         reference_type="object",
         backend=_Backend(),
-        judge=_Judge(),
+        judge=_FailIfCalledJudge(),
         sam_reviewer=sam,
     )
 
@@ -453,6 +474,10 @@ def test_composition_geometry_failure_rejects_candidate_publication(
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["geometry_gate_passed"] is False
     assert metadata["geometry_rejection_reason"] == reason
+    assert metadata["qwen_review"] is None
+    assert metadata["qwen_review_skipped_reason"] == (
+        f"geometry_hard_failure:{reason}"
+    )
     rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
     assert rejection["reason"] == reason
 
@@ -600,6 +625,7 @@ def test_background_qwen_accept_and_sam_not_found_accepts_with_warning(
     tmp_path: Path,
 ) -> None:
     run_root, _, _ = _environment(tmp_path)
+    judge = _Judge()
 
     result = run_boogu_reference_edit(
         run_root=run_root,
@@ -610,14 +636,40 @@ def test_background_qwen_accept_and_sam_not_found_accepts_with_warning(
         entity_phrase="object",
         reference_type="object",
         backend=_Backend(),
-        judge=_Judge(),
+        judge=judge,
         sam_reviewer=_SamReviewer(failure_kind="not_found"),
     )
 
     assert result.status == "accepted"
+    assert len(judge.calls) == 1
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["sam_review"]["diagnostics"]["failure_kind"] == "not_found"
     assert metadata["sam_warning"] == "target_not_found"
+    assert metadata["qwen_review_skipped_reason"] is None
+
+
+def test_background_qwen_reject_and_sam_not_found_rejects(tmp_path: Path) -> None:
+    run_root, _, _ = _environment(tmp_path)
+    judge = _Judge(accept=False)
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=judge,
+        sam_reviewer=_SamReviewer(failure_kind="not_found"),
+    )
+
+    assert result.status == "rejected"
+    assert len(judge.calls) == 1
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["sam_warning"] is None
+    assert metadata["qwen_review_skipped_reason"] is None
 
 
 def test_completion_qwen_accept_and_sam_not_found_rejects(tmp_path: Path) -> None:
@@ -641,8 +693,21 @@ def test_completion_qwen_accept_and_sam_not_found_rejects(tmp_path: Path) -> Non
     assert metadata["sam_warning"] is None
 
 
-def test_background_sam_multiple_instances_rejects(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "multiple_instances",
+        "excessive_area_growth",
+        "fragmented",
+        "backend_failure",
+    ],
+)
+def test_background_sam_hard_failure_rejects_without_qwen(
+    tmp_path: Path,
+    failure_kind: str,
+) -> None:
     run_root, _, _ = _environment(tmp_path)
+    events: list[str] = []
 
     result = run_boogu_reference_edit(
         run_root=run_root,
@@ -652,16 +717,26 @@ def test_background_sam_multiple_instances_rejects(tmp_path: Path) -> None:
         instruction="Add a background.",
         entity_phrase="object",
         reference_type="object",
-        backend=_Backend(),
-        judge=_Judge(),
-        sam_reviewer=_SamReviewer(failure_kind="multiple_instances"),
+        backend=_Backend(events=events),
+        judge=_FailIfCalledJudge(),
+        sam_reviewer=_SamReviewer(failure_kind=failure_kind, events=events),
     )
 
     assert result.status == "rejected"
+    assert result.candidate_path is not None
+    assert events == ["boogu", "sam"]
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["qwen_review"] is None
+    assert metadata["qwen_review_skipped_reason"] == (
+        f"sam_hard_failure:{failure_kind}"
+    )
+    rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
+    assert rejection["reason"] == f"sam_hard_failure:{failure_kind}"
 
 
 def test_qwen_reject_overrides_passing_sam_review(tmp_path: Path) -> None:
     run_root, _, _ = _environment(tmp_path)
+    judge = _Judge(accept=False)
 
     result = run_boogu_reference_edit(
         run_root=run_root,
@@ -672,11 +747,49 @@ def test_qwen_reject_overrides_passing_sam_review(tmp_path: Path) -> None:
         entity_phrase="object",
         reference_type="object",
         backend=_Backend(),
-        judge=_Judge(accept=False),
+        judge=judge,
         sam_reviewer=_SamReviewer(),
     )
 
     assert result.status == "rejected"
+    assert len(judge.calls) == 1
+
+
+def test_boogu_review_order_is_operation_specific(tmp_path: Path) -> None:
+    background_events: list[str] = []
+    background_root, _, _ = _environment(tmp_path / "background")
+    background = run_boogu_reference_edit(
+        run_root=background_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a background.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(events=background_events),
+        judge=_Judge(events=background_events),
+        sam_reviewer=_SamReviewer(events=background_events),
+    )
+
+    completion_events: list[str] = []
+    completion_root, _, _ = _environment(tmp_path / "completion")
+    completion = run_boogu_reference_edit(
+        run_root=completion_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(events=completion_events),
+        judge=_Judge(events=completion_events),
+        sam_reviewer=_SamReviewer(events=completion_events),
+    )
+
+    assert background.status == "accepted"
+    assert background_events == ["boogu", "sam", "qwen"]
+    assert completion.status == "accepted"
+    assert completion_events == ["boogu", "qwen", "sam"]
 
 
 def test_metadata_records_source_output_dimensions_and_provenance(
@@ -764,6 +877,62 @@ def test_boogu_operations_and_sam_reviews_are_profiled_separately(
     assert events[0]["metadata"]["thinking_enabled"] is True
     assert events[0]["metadata"]["width"] == 1248
     assert events[0]["metadata"]["height"] == 832
+
+
+def test_background_hard_gate_omits_only_qwen_profile_event(tmp_path: Path) -> None:
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+    normal_root, _, _ = _environment(tmp_path / "normal")
+    hard_failure_root, _, _ = _environment(tmp_path / "hard-failure")
+    completions = _ReviewCompletions(
+        _background_review().model_dump(mode="json")
+    )
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+    with active_profiler(profiler):
+        normal = run_boogu_reference_edit(
+            run_root=normal_root,
+            clip_uid="clip-1",
+            entity_id="e1",
+            operation="add_entity_background",
+            instruction="Add a background.",
+            entity_phrase="object",
+            reference_type="object",
+            backend=_Backend(),
+            judge=judge,
+            sam_reviewer=_SamReviewer(),
+        )
+        hard_failure = run_boogu_reference_edit(
+            run_root=hard_failure_root,
+            clip_uid="clip-1",
+            entity_id="e1",
+            operation="add_entity_background",
+            instruction="Add a background.",
+            entity_phrase="object",
+            reference_type="object",
+            backend=_Backend(),
+            judge=_FailIfCalledJudge(),
+            sam_reviewer=_SamReviewer(failure_kind="fragmented"),
+        )
+
+    assert normal.status == "accepted"
+    assert hard_failure.status == "rejected"
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["component"] for event in events] == [
+        "boogu_add_entity_background",
+        "sam3_boogu_review",
+        "qwen_boogu_background_review",
+        "boogu_add_entity_background",
+        "sam3_boogu_review",
+    ]
 
 
 def test_subprocess_backend_invokes_configured_python_directly(

@@ -753,6 +753,22 @@ def _sam_geometry_metadata(review: BooguSamReview | None) -> dict[str, object]:
     return present
 
 
+def _background_qwen_skip_reason(
+    review: BooguSamReview | None,
+    geometry_metadata: dict[str, object],
+) -> str | None:
+    if review is not None:
+        failure_kind = review.diagnostics["failure_kind"]
+        if not review.passed and failure_kind != "not_found":
+            return f"sam_hard_failure:{failure_kind}"
+    if geometry_metadata and not geometry_metadata["geometry_gate_passed"]:
+        return (
+            "geometry_hard_failure:"
+            f"{geometry_metadata['geometry_rejection_reason']}"
+        )
+    return None
+
+
 def _background_qwen_rejection_reason(review: BooguBackgroundReview) -> str:
     if not review.subject_scale_preserved:
         return "entity_scale_collapsed"
@@ -1374,6 +1390,7 @@ def run_boogu_reference_edit(
     output: BooguEditOutput | None = None
     output_sha256: str | None = None
     qwen_review: BooguQwenReview | None = None
+    qwen_review_skipped_reason: str | None = None
     sam_review: BooguSamReview | None = None
     sam_warning: str | None = None
     rejection_reason: str | None = None
@@ -1414,16 +1431,22 @@ def run_boogu_reference_edit(
         )
         _write_bytes_atomic(candidate_path, output.png_bytes)
         output_sha256 = _sha256_bytes(output.png_bytes)
-        qwen_review = judge.review(
-            operation=operation,
-            source_rgba=source_rgba.copy(),
-            source_input_rgb=source_input_rgb.copy(),
-            candidate_rgb=candidate_rgb.copy(),
-            entity_phrase=entity_phrase,
-            reference_type=reference_type,
-        )
-        _validate_qwen_review_type(operation, qwen_review)
-        if sam_reviewer is not None:
+
+        def run_qwen_review() -> BooguQwenReview:
+            review = judge.review(
+                operation=operation,
+                source_rgba=source_rgba.copy(),
+                source_input_rgb=source_input_rgb.copy(),
+                candidate_rgb=candidate_rgb.copy(),
+                entity_phrase=entity_phrase,
+                reference_type=reference_type,
+            )
+            _validate_qwen_review_type(operation, review)
+            return review
+
+        def run_sam_review() -> BooguSamReview | None:
+            if sam_reviewer is None:
+                return None
             with profile_model_call(
                 component="sam3_boogu_review",
                 operation=operation,
@@ -1433,17 +1456,32 @@ def run_boogu_reference_edit(
                 input_image_count=2,
                 metadata={"reference_type": reference_type},
             ):
-                sam_review = sam_reviewer.review(
+                review = sam_reviewer.review(
                     operation=operation,
                     source_rgba=geometry_source_rgba.copy(),
                     candidate_rgb=candidate_rgb.copy(),
                     entity_phrase=entity_phrase,
                     reference_type=reference_type,
                 )
-            if not isinstance(sam_review, BooguSamReview):
+            if not isinstance(review, BooguSamReview):
                 raise TypeError("sam_reviewer must return BooguSamReview")
-        geometry_metadata = _sam_geometry_metadata(sam_review)
-        qwen_accepted = qwen_review.verdict == "accept"
+            return review
+
+        if operation == "add_entity_background":
+            sam_review = run_sam_review()
+            geometry_metadata = _sam_geometry_metadata(sam_review)
+            qwen_review_skipped_reason = _background_qwen_skip_reason(
+                sam_review,
+                geometry_metadata,
+            )
+            if qwen_review_skipped_reason is None:
+                qwen_review = run_qwen_review()
+        else:
+            qwen_review = run_qwen_review()
+            sam_review = run_sam_review()
+            geometry_metadata = _sam_geometry_metadata(sam_review)
+
+        qwen_accepted = qwen_review is not None and qwen_review.verdict == "accept"
         sam_accepted = sam_review is None or sam_review.passed
         if geometry_metadata and not geometry_metadata["geometry_gate_passed"]:
             sam_accepted = False
@@ -1461,11 +1499,13 @@ def run_boogu_reference_edit(
                 str(geometry_metadata["geometry_rejection_reason"])
                 if geometry_metadata
                 and not geometry_metadata["geometry_gate_passed"]
+                else qwen_review_skipped_reason
+                if qwen_review_skipped_reason is not None
                 else _background_qwen_rejection_reason(qwen_review)
                 if isinstance(qwen_review, BooguBackgroundReview)
                 and qwen_review.verdict == "reject"
                 else qwen_review.reason
-                if qwen_review.verdict == "reject"
+                if qwen_review is not None and qwen_review.verdict == "reject"
                 else sam_review.reason
                 if sam_review is not None
                 else "candidate_rejected"
@@ -1525,6 +1565,7 @@ def run_boogu_reference_edit(
         "qwen_review": (
             qwen_review.model_dump(mode="json") if qwen_review is not None else None
         ),
+        "qwen_review_skipped_reason": qwen_review_skipped_reason,
         "sam_review": (
             sam_review.model_dump(mode="json") if sam_review is not None else None
         ),
