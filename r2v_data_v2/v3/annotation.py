@@ -25,6 +25,7 @@ from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundAnnotation,
     RawAnnotationPayload,
+    render_annotation_plain_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
 
@@ -97,10 +98,14 @@ animal, or character whose identity or appearance should be retained; object for
 one independently referenceable product, vehicle, prop, device, piece of
 furniture, or other object; and group for multiple subjects or objects whose
 stable composition should be retained together. phrase briefly identifies the
-candidate for binding and review in 3 to 10 words and must not exceed 12 words.
-phrase is a stable concise label and need not occur verbatim in
-instruction_template. It must be a stable noun phrase rather than an action and sufficiently distinguish
-the target: prefer "man in a light gray military uniform" over
+candidate for binding, review, and deterministic placeholder substitution in 3
+to 10 words and must not exceed 12 words. phrase is a stable, natural English
+noun phrase rather than an action. Include an article or determiner when
+natural, such as "a bald monk in a light brown robe", "an ornate wooden altar",
+or "the three scuba divers". Do not add trailing punctuation, internal markers,
+or transient actions. The phrase need not occur verbatim in instruction_template
+because its placeholder represents the phrase itself. It must sufficiently
+distinguish the target: prefer "a man in a light gray military uniform" over
 "military officer speaking at podium". grounding_prompt describes stable visible
 appearance and location in 6 to 18 words and must not exceed 24 words. Do not
 include transient actions or enumerate every clothing detail. A stable seated
@@ -108,7 +113,7 @@ or standing pose is allowed only when needed to distinguish the target for
 SAM3. grounding_prompt need not occur in instruction_template. Both fields must be
 non-empty and must not contain reference tokens.
 
-Do not output an entity proposal unless you can place its corresponding marker
+Do not output an entity proposal unless you can place its corresponding placeholder
 exactly once in instruction_template.
 
 STEP 2: Decide whether one stable background reference is useful.
@@ -130,8 +135,9 @@ chronological order. Include visible subject appearance, action, scene,
 composition, camera behavior, and lighting without repetition. Prefer roughly
 60 to 120 English content words. Longer descriptions are allowed when needed for
 complete chronology, multiple entities, or shot changes, but never exceed 180
-English content words; internal markers do not count. Describe only directly
-visible content. Do not infer identity, weather, emotion, allegiance, intent,
+English content words after every placeholder is replaced by its phrase.
+Describe only directly visible content. Do not infer identity, weather,
+emotion, allegiance, intent,
 mental state, sound, dialogue, or event causes. Describe visible motion directly
 without assigning an unseen cause. Write "branches sway slightly" instead of
 claiming that wind causes movement. Do not use hedging or causal inference
@@ -143,18 +149,20 @@ geometry and pose without inferring determination, resolve, triumph, fear, or
 effort. Do not write "the video shows". Do not include <ref_...> tokens or
 image-number instruction labels.
 
-Insert exactly one internal marker for every entity in the same array order:
-entities[0] MUST be marked exactly once with {{{{entity_1}}}}, entities[1] MUST
-be marked exactly once with {{{{entity_2}}}}, and so on through at most
-{{{{entity_5}}}}. Every listed entity must have its marker. Place each marker
-immediately after that entity's first clear mention and before following
-punctuation. A marker must be preceded by exactly one ordinary ASCII space, as
-in "a woman {{{{entity_1}}}}," or "a boat {{{{entity_2}}}}." Do not put a marker
-at the paragraph start or after another marker. The marker is an internal
-binding, not visible prose. If background is non-null, {{{{background}}}} MUST
-appear exactly once after a clear environment mention, using the same
-ASCII-space and pre-punctuation placement rule. When background is null, do not
-include that marker. Return JSON only."""
+Insert exactly one internal placeholder for every entity in the same array
+order: entities[0] MUST use {{{{entity_1}}}} exactly once, entities[1] MUST use
+{{{{entity_2}}}} exactly once, and so on through at most
+{{{{entity_5}}}}. Every listed entity must have its placeholder. Each
+{{{{entity_N}}}} placeholder represents that entity's complete phrase and must
+replace the noun phrase itself. Write "{{{{entity_1}}}} kneels" rather than "a
+monk {{{{entity_1}}}} kneels". Treat the placeholder as though the phrase were
+already written there: when phrase is "a white boat", write
+"{{{{entity_1}}}} moves slowly", never "A {{{{entity_1}}}} moves slowly". A
+placeholder may appear at the paragraph start or beside punctuation, but must
+not be embedded inside another word. If background is non-null,
+{{{{background}}}} MUST appear exactly once and represents the complete
+background phrase in the same way. When background is null, do not include that
+placeholder. Return JSON only."""
 
 
 @dataclass(frozen=True)
@@ -283,57 +291,62 @@ def _entity_text_issues(raw_entities: object) -> list[ValidationIssue]:
                     message="entity phrase must not exceed 12 English words",
                 )
             )
-        grounding_prompt = _clean_text(candidate.get("grounding_prompt"))
-        if grounding_prompt is None:
-            continue
-        if _english_word_count(grounding_prompt) > 24:
-            issues.append(
-                ValidationIssue(
-                    code="grounding_prompt_too_long",
-                    field=f"entities.{index}.grounding_prompt",
-                    message="grounding prompt must not exceed 24 English words",
-                )
-            )
-        action_match = _TRANSIENT_GROUNDING_ACTION.search(grounding_prompt)
-        if action_match is not None:
-            issues.append(
-                ValidationIssue(
-                    code="transient_action_in_grounding_prompt",
-                    field=f"entities.{index}.grounding_prompt",
-                    message=(
-                        "grounding prompt contains a transient action: "
-                        f"{action_match.group(0)}"
-                    ),
-                )
-            )
     return issues
 
 
-def _marker_position_issue(
+def _safe_entity_fallback_phrases(
+    raw_entities: object,
+) -> dict[int, str]:
+    if not isinstance(raw_entities, list):
+        return {}
+    phrases: dict[int, str] = {}
+    for source_index, candidate in enumerate(raw_entities, start=1):
+        if not isinstance(candidate, dict):
+            continue
+        phrase = _clean_text(
+            candidate.get("phrase"),
+            trim_phrase_punctuation=True,
+        )
+        if (
+            phrase is None
+            or _REFERENCE_TOKEN.search(phrase)
+            or "{{" in phrase
+            or "}}" in phrase
+        ):
+            continue
+        phrases[source_index] = phrase
+    return phrases
+
+
+def _safe_background_fallback_phrase(raw_background: object) -> str | None:
+    if not isinstance(raw_background, dict):
+        return None
+    phrase = _clean_text(
+        raw_background.get("phrase"),
+        trim_phrase_punctuation=True,
+    )
+    if (
+        phrase is None
+        or _REFERENCE_TOKEN.search(phrase)
+        or "{{" in phrase
+        or "}}" in phrase
+    ):
+        return None
+    return phrase
+
+
+def _placeholder_is_embedded(
     *,
     template: str,
     start: int,
     end: int,
-    marker: str,
-) -> ValidationIssue | None:
-    prefix = template[:start]
-    suffix = template[end:]
-    if (
-        start == 0
-        or prefix[-1:] != " "
-        or prefix[-2:-1] == " "
-        or prefix.rstrip().endswith("}}")
-        or suffix
-        and not (suffix[0].isspace() or suffix[0] in _PHRASE_EDGE_PUNCTUATION)
-    ):
-        return ValidationIssue(
-            code="invalid_marker_position",
-            field="instruction_template",
-            message=(
-                f"{marker} must follow a visible mention after one ASCII space"
-            ),
-        )
-    return None
+) -> bool:
+    before = template[start - 1] if start else ""
+    after = template[end] if end < len(template) else ""
+    return bool(
+        before and (before.isalnum() or before == "_")
+        or after and (after.isalnum() or after == "_")
+    )
 
 
 def _annotation_marker_hard_issues(
@@ -418,14 +431,13 @@ def _inspect_recognizable_markers(
             warnings.append(f"dropped_entity_duplicate_marker:{source_index}")
             continue
         match = matches[0]
-        if _marker_position_issue(
+        if _placeholder_is_embedded(
             template=template,
             start=match.start(),
             end=match.end(),
-            marker=match.group(0),
-        ) is not None:
+        ):
             warnings.append(
-                f"dropped_entity_invalid_marker_position:{source_index}"
+                f"dropped_entity_embedded_placeholder:{source_index}"
             )
             continue
         eligible_indexes.append(source_index)
@@ -447,13 +459,12 @@ def _inspect_recognizable_markers(
         warnings.append("dropped_background_duplicate_marker")
     else:
         match = background_matches[0]
-        if _marker_position_issue(
+        if _placeholder_is_embedded(
             template=template,
             start=match.start(),
             end=match.end(),
-            marker=match.group(0),
-        ) is not None:
-            warnings.append("dropped_background_invalid_marker_position")
+        ):
+            warnings.append("dropped_background_embedded_placeholder")
         else:
             background_eligible = True
 
@@ -495,6 +506,17 @@ def _sanitize_entity_candidates_with_indices(
             continue
         if grounding_prompt is None:
             warnings.append(f"dropped_entity_grounding_prompt:{index}")
+            continue
+        source_index = index + 1
+        if _english_word_count(grounding_prompt) > 24:
+            warnings.append(
+                f"dropped_entity_grounding_prompt_too_long:{source_index}"
+            )
+            continue
+        if _TRANSIENT_GROUNDING_ACTION.search(grounding_prompt) is not None:
+            warnings.append(
+                f"dropped_entity_transient_grounding_action:{source_index}"
+            )
             continue
         if _REFERENCE_TOKEN.search(phrase) or _REFERENCE_TOKEN.search(
             grounding_prompt
@@ -549,11 +571,13 @@ def sanitize_entity_candidates(
     return entities, warnings
 
 
-def _rewrite_markers_after_sanitization(
+def _rewrite_placeholders_after_sanitization(
     template: str,
     *,
     accepted_source_indexes: tuple[int, ...],
+    fallback_phrases: dict[int, str],
     keep_background: bool,
+    background_fallback_phrase: str | None,
 ) -> str:
     final_indexes = {
         source_index: final_index
@@ -563,52 +587,38 @@ def _rewrite_markers_after_sanitization(
         )
     }
 
-    replacements: list[tuple[int, int, str | None]] = []
+    replacements: list[tuple[int, int, str]] = []
     for match in _ENTITY_MARKER.finditer(template):
-        final_index = final_indexes.get(int(match.group(1)))
+        source_index = int(match.group(1))
+        final_index = final_indexes.get(source_index)
         replacement = (
-            None if final_index is None else f"{{{{entity_{final_index}}}}}"
+            fallback_phrases.get(source_index, "")
+            if final_index is None
+            else f"{{{{entity_{final_index}}}}}"
         )
         replacements.append((match.start(), match.end(), replacement))
     if not keep_background:
         replacements.extend(
-            (match.start(), match.end(), None)
+            (
+                match.start(),
+                match.end(),
+                background_fallback_phrase or "",
+            )
             for match in _BACKGROUND_MARKER.finditer(template)
         )
 
     rewritten = template
     for start, end, replacement in sorted(replacements, reverse=True):
-        if replacement is not None:
-            rewritten = f"{rewritten[:start]}{replacement}{rewritten[end:]}"
-            continue
-        rewritten = _remove_recognizable_marker(
-            rewritten,
+        if _placeholder_is_embedded(
+            template=rewritten,
             start=start,
             end=end,
-        )
+        ):
+            replacement = f" {replacement} "
+        rewritten = f"{rewritten[:start]}{replacement}{rewritten[end:]}"
+    rewritten = re.sub(r"[ \t]{2,}", " ", rewritten)
+    rewritten = re.sub(r" +([,.;:!?])", r"\1", rewritten)
     return rewritten.strip()
-
-
-def _remove_recognizable_marker(
-    value: str,
-    *,
-    start: int,
-    end: int,
-) -> str:
-    left = value[:start]
-    right = value[end:]
-    if left.endswith(" "):
-        left = left.rstrip(" ")
-        if right.startswith(" "):
-            return f"{left} {right.lstrip(' ')}"
-        if right and right[0] not in _PHRASE_EDGE_PUNCTUATION:
-            return f"{left} {right}"
-        return f"{left}{right}"
-    if not left:
-        return right.lstrip(" ")
-    if right and left[-1].isalnum() and right[0].isalnum():
-        return f"{left} {right}"
-    return f"{left}{right}"
 
 
 def sanitize_background(
@@ -632,6 +642,10 @@ def sanitize_background(
         or _REFERENCE_TOKEN.search(grounding_prompt)
     ):
         return None, ("dropped_invalid_background",)
+    if _english_word_count(grounding_prompt) > 24:
+        return None, ("dropped_background_grounding_prompt_too_long",)
+    if _TRANSIENT_GROUNDING_ACTION.search(grounding_prompt) is not None:
+        return None, ("dropped_background_transient_grounding_action",)
     return (
         BackgroundAnnotation(
             phrase=phrase,
@@ -658,37 +672,6 @@ def sanitize_annotation_payload(
             )
         )
     else:
-        plain_text = _ENTITY_MARKER.sub("", template)
-        plain_text = _BACKGROUND_MARKER.sub("", plain_text)
-        word_count = _english_word_count(plain_text)
-        if word_count > _HARD_INSTRUCTION_WORD_LIMIT:
-            issues.append(
-                ValidationIssue(
-                    code="instruction_template_too_long",
-                    field="instruction_template",
-                    message=(
-                        "instruction_template must not exceed 180 English "
-                        "content words"
-                    ),
-                )
-            )
-        elif word_count > _PREFERRED_INSTRUCTION_WORD_LIMIT:
-            warnings.append(
-                f"instruction_template_over_preferred_length:{word_count}"
-            )
-        inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(plain_text)
-        if inference_match is not None:
-            issues.append(
-                ValidationIssue(
-                    code="unsupported_caption_inference",
-                    field="instruction_template",
-                    message=(
-                        "instruction_template contains unsupported inference "
-                        "language: "
-                        f"{inference_match.group(0)}"
-                    ),
-                )
-            )
         issues.extend(
             _annotation_marker_hard_issues(
                 template=template,
@@ -702,6 +685,9 @@ def sanitize_annotation_payload(
         template=template,
         raw_entities=raw_payload.get("entities", []),
         raw_background=raw_payload.get("background"),
+    )
+    fallback_phrases = _safe_entity_fallback_phrases(
+        raw_payload.get("entities", [])
     )
     entities, entity_warnings, accepted_source_indexes = (
         _sanitize_entity_candidates_with_indices(
@@ -733,19 +719,67 @@ def sanitize_annotation_payload(
     )
     if not marker_eligibility.background_eligible:
         background = None
-    template = _rewrite_markers_after_sanitization(
+    template = _rewrite_placeholders_after_sanitization(
         template,
         accepted_source_indexes=accepted_source_indexes,
+        fallback_phrases=fallback_phrases,
         keep_background=background is not None,
-    )
-    return (
-        AnnotationState(
-            status="ready",
-            instruction_template=template,
-            t2v_caption="",
-            entities=entities,
-            background=background,
+        background_fallback_phrase=_safe_background_fallback_phrase(
+            raw_payload.get("background")
         ),
+    )
+    if not template:
+        return None, [
+            ValidationIssue(
+                code="empty_instruction_template",
+                field="instruction_template",
+                message="instruction_template is empty after sanitization",
+            )
+        ], ()
+    annotation = AnnotationState(
+        status="ready",
+        instruction_template=template,
+        t2v_caption="",
+        entities=entities,
+        background=background,
+    )
+    plain_text = render_annotation_plain_text(
+        annotation.instruction_template,
+        annotation.entities,
+        annotation.background,
+    )
+    word_count = _english_word_count(plain_text)
+    if word_count > _HARD_INSTRUCTION_WORD_LIMIT:
+        issues.append(
+            ValidationIssue(
+                code="instruction_template_too_long",
+                field="instruction_template",
+                message=(
+                    "rendered instruction_template must not exceed 180 "
+                    "English content words"
+                ),
+            )
+        )
+    elif word_count > _PREFERRED_INSTRUCTION_WORD_LIMIT:
+        warnings.append(
+            f"instruction_template_over_preferred_length:{word_count}"
+        )
+    inference_match = _UNSUPPORTED_CAPTION_INFERENCE.search(plain_text)
+    if inference_match is not None:
+        issues.append(
+            ValidationIssue(
+                code="unsupported_caption_inference",
+                field="instruction_template",
+                message=(
+                    "rendered instruction_template contains unsupported "
+                    f"inference language: {inference_match.group(0)}"
+                ),
+            )
+        )
+    if issues:
+        return None, issues, ()
+    return (
+        annotation,
         [],
         (
             *warnings,

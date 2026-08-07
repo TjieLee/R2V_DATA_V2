@@ -20,12 +20,14 @@ from r2v_data_v2.v3.profiling import (
     profiled_openai_call,
 )
 from r2v_data_v2.v3.schemas import (
+    AnnotationEntity,
+    BackgroundAnnotation,
     ClipRecord,
     InstructionBinding,
     InstructionLegendEntry,
     InstructionState,
     RawInstructionOutput,
-    plain_instruction_text,
+    render_annotation_plain_text,
     render_inline_instruction_text,
     render_instruction_text,
 )
@@ -54,8 +56,6 @@ _QUOTED_DIALOGUE = re.compile(
 )
 _ENGLISH_WORD = re.compile(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*")
 _ENTITY_ID = re.compile(r"e([1-9]\d*)")
-_INTERNAL_ENTITY_MARKER = re.compile(r" \{\{entity_[1-9]\d*\}\}")
-_INTERNAL_BACKGROUND_MARKER = re.compile(r" \{\{background\}\}")
 _ANY_INTERNAL_MARKER = re.compile(r"\{\{(?:entity_[^{}]*|background)\}\}")
 
 SYSTEM_PROMPT = """You write an English reference-conditioned video instruction.
@@ -170,6 +170,8 @@ def build_instruction_bindings(clip: ClipRecord) -> list[InstructionBinding]:
 def build_deterministic_instruction(
     *,
     instruction_template: str,
+    entities: list[AnnotationEntity],
+    background: BackgroundAnnotation | None,
     bindings: list[InstructionBinding],
 ) -> InstructionState:
     body = instruction_template.strip()
@@ -180,23 +182,76 @@ def build_deterministic_instruction(
     if not bindings:
         raise ValueError("deterministic instruction requires at least one binding")
 
-    legend: list[InstructionLegendEntry] = []
+    entity_bindings: dict[str, InstructionBinding] = {}
+    background_binding: InstructionBinding | None = None
     for binding in bindings:
         if binding.reference_type == "background":
-            marker = "{{background}}"
+            if background_binding is not None:
+                raise ValueError(
+                    "deterministic instruction has duplicate background bindings"
+                )
+            background_binding = binding
         else:
             match = _ENTITY_ID.fullmatch(binding.entity_id or "")
             if match is None:
                 raise ValueError(
                     f"binding {binding.image_id} has an invalid entity_id"
                 )
-            marker = f"{{{{entity_{match.group(1)}}}}}"
-        if body.count(marker) != 1:
-            raise ValueError(
-                f"binding {binding.image_id} marker must appear exactly once: {marker}"
-            )
-        body = body.replace(marker, f"{{{{{binding.image_id}}}}}")
+            if binding.entity_id in entity_bindings:
+                raise ValueError(
+                    "deterministic instruction has duplicate binding: "
+                    f"{binding.entity_id}"
+                )
+            entity_bindings[binding.entity_id] = binding
 
+    consumed_binding_ids: set[str] = set()
+    for index, entity in enumerate(entities, start=1):
+        placeholder = f"{{{{entity_{index}}}}}"
+        if body.count(placeholder) != 1:
+            raise ValueError(
+                "annotation entity placeholder must appear exactly once: "
+                f"{placeholder}"
+            )
+        binding = entity_bindings.get(entity.entity_id)
+        replacement = entity.phrase
+        if binding is not None:
+            replacement = f"{replacement} {{{{{binding.image_id}}}}}"
+            consumed_binding_ids.add(binding.image_id)
+        body = body.replace(placeholder, replacement)
+
+    if background is None:
+        if "{{background}}" in body:
+            raise ValueError(
+                "annotation without background contains {{background}}"
+            )
+    else:
+        if body.count("{{background}}") != 1:
+            raise ValueError(
+                "annotation background placeholder must appear exactly once"
+            )
+        replacement = background.phrase
+        if background_binding is not None:
+            replacement = (
+                f"{replacement} {{{{{background_binding.image_id}}}}}"
+            )
+            consumed_binding_ids.add(background_binding.image_id)
+        body = body.replace("{{background}}", replacement)
+
+    missing_binding_ids = [
+        binding.image_id
+        for binding in bindings
+        if binding.image_id not in consumed_binding_ids
+    ]
+    if missing_binding_ids:
+        raise ValueError(
+            "instruction bindings are absent from annotation semantics: "
+            f"{', '.join(missing_binding_ids)}"
+        )
+    if _ANY_INTERNAL_MARKER.search(body):
+        raise ValueError("instruction contains an invalid internal placeholder")
+
+    legend: list[InstructionLegendEntry] = []
+    for binding in bindings:
         description = binding.grounding_prompt.strip()
         if not description:
             raise ValueError(
@@ -208,14 +263,6 @@ def build_deterministic_instruction(
                 description=description,
             )
         )
-
-    body = _INTERNAL_ENTITY_MARKER.sub(
-        "",
-        body,
-    )
-    body = _INTERNAL_BACKGROUND_MARKER.sub("", body)
-    if _ANY_INTERNAL_MARKER.search(body):
-        raise ValueError("instruction contains an invalid internal marker")
     body = body.strip()
     if _english_word_count(body) > 180:
         raise ValueError("deterministic instruction exceeds 180 English words")
@@ -682,13 +729,17 @@ def instruct_clips(
                     )
                 instruction = build_deterministic_instruction(
                     instruction_template=clip.annotation.instruction_template,
+                    entities=clip.annotation.entities,
+                    background=clip.annotation.background,
                     bindings=bindings,
                 )
                 storage.write_instruction(clip.clip_uid, instruction)
             else:
                 source_text = (
-                    plain_instruction_text(
-                        clip.annotation.instruction_template
+                    render_annotation_plain_text(
+                        clip.annotation.instruction_template,
+                        clip.annotation.entities,
+                        clip.annotation.background,
                     )
                     if clip.annotation.instruction_template
                     else clip.annotation.t2v_caption

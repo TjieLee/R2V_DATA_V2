@@ -142,9 +142,8 @@ def _ready_storage(
         AnnotationState(
             status="ready",
             instruction_template="" if legacy_annotation else (
-                "A woman in a yellow coat {{entity_1}} walks beside a red "
-                "bicycle {{entity_2}} through a bright plaza {{background}} "
-                "as the camera tracks backward."
+                "{{entity_1}} walks beside {{entity_2}} through "
+                "{{background}} as the camera tracks backward."
             ),
             t2v_caption=(
                 "A woman in a yellow coat walks beside a red bicycle through "
@@ -386,13 +385,13 @@ def _five_entity_instruction_clip(*, include_background: bool) -> ClipRecord:
         annotation=AnnotationState(
             status="ready",
             instruction_template=(
-                "Entity 1 {{entity_1}} stands near entity 2 {{entity_2}} while "
-                "entity 3 {{entity_3}} faces entity 4 {{entity_4}}. Entity 5 "
-                "{{entity_5}} remains visible in a quiet plaza {{background}}."
+                "{{entity_1}} stands near {{entity_2}} while {{entity_3}} "
+                "faces {{entity_4}}. {{entity_5}} remains visible in "
+                "{{background}}."
                 if include_background
-                else "Entity 1 {{entity_1}} stands near entity 2 {{entity_2}} "
-                "while entity 3 {{entity_3}} faces entity 4 {{entity_4}}. "
-                "Entity 5 {{entity_5}} remains visible in a quiet plaza."
+                else "{{entity_1}} stands near {{entity_2}} while "
+                "{{entity_3}} faces {{entity_4}}. {{entity_5}} remains "
+                "visible in a quiet plaza."
             ),
             entities=entities,
             background=background_annotation,
@@ -454,21 +453,25 @@ def test_bindings_follow_pairing_order_and_put_background_last(
     ]
 
 
-def test_deterministic_instruction_inlines_one_entity_after_mention(
+def test_deterministic_instruction_inlines_one_entity_at_mention(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    bindings = build_instruction_bindings(storage.read_clip(clip_uid))
-    template = "  A woman in a yellow coat {{entity_1}} crosses the plaza.  "
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    bindings = build_instruction_bindings(clip)
+    template = "  {{entity_1}} crosses the plaza.  "
 
     instruction = build_deterministic_instruction(
         instruction_template=template,
+        entities=clip.annotation.entities[:1],
+        background=None,
         bindings=bindings[:1],
     )
 
     assert instruction.instruction_body_template == (
-        "A woman in a yellow coat {{image_1}} crosses the plaza."
+        "a woman in a yellow coat {{image_1}} crosses the plaza."
     )
     assert instruction.reference_legend == [
         InstructionLegendEntry(
@@ -477,7 +480,7 @@ def test_deterministic_instruction_inlines_one_entity_after_mention(
         )
     ]
     assert instruction.r2v_instruction == (
-        "A woman in a yellow coat <Image 1> crosses the plaza."
+        "a woman in a yellow coat <Image 1> crosses the plaza."
     )
     assert "\n<Image 1>:" not in instruction.r2v_instruction
 
@@ -487,25 +490,28 @@ def test_deterministic_instruction_inlines_entities_and_background_at_mentions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    bindings = build_instruction_bindings(storage.read_clip(clip_uid))
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    bindings = build_instruction_bindings(clip)
     template = (
-        "A woman in a yellow coat {{entity_1}} walks beside a red bicycle "
-        "{{entity_2}} through a bright plaza {{background}} as the camera "
-        "tracks backward."
+        "{{entity_1}} walks beside {{entity_2}} through {{background}} as "
+        "the camera tracks backward."
     )
 
     instruction = build_deterministic_instruction(
         instruction_template=template,
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=bindings,
     )
 
     assert instruction.instruction_body_template == (
-        "A woman in a yellow coat {{image_1}} walks beside a red bicycle "
+        "a woman in a yellow coat {{image_1}} walks beside a red bicycle "
         "{{image_2}} through a bright plaza {{image_3}} as the camera tracks "
         "backward."
     )
     assert instruction.r2v_instruction == (
-        "A woman in a yellow coat <Image 1> walks beside a red bicycle <Image 2> "
+        "a woman in a yellow coat <Image 1> walks beside a red bicycle <Image 2> "
         "through a bright plaza <Image 3> as the camera tracks backward."
     )
     assert instruction.reference_legend[-1] == InstructionLegendEntry(
@@ -523,8 +529,7 @@ def test_sanitized_annotation_markers_bind_in_final_contiguous_order(
     annotation, issues, warnings = sanitize_annotation_payload(
         {
             "instruction_template": (
-                "A woman {{entity_1}} sits beside a dog while a boat "
-                "{{entity_3}} passes."
+                "{{entity_1}} sits beside a dog while {{entity_3}} passes."
             ),
             "entities": [
                 {
@@ -565,16 +570,18 @@ def test_sanitized_annotation_markers_bind_in_final_contiguous_order(
     bindings = build_instruction_bindings(clip)
     instruction = build_deterministic_instruction(
         instruction_template=annotation.instruction_template,
+        entities=annotation.entities,
+        background=annotation.background,
         bindings=bindings,
     )
 
     assert [binding.entity_id for binding in bindings] == ["e1", "e2"]
     assert [binding.phrase for binding in bindings] == ["woman", "boat"]
     assert instruction.instruction_body_template == (
-        "A woman {{image_1}} sits beside a dog while a boat {{image_2}} passes."
+        "woman {{image_1}} sits beside a dog while boat {{image_2}} passes."
     )
     assert instruction.r2v_instruction == (
-        "A woman <Image 1> sits beside a dog while a boat <Image 2> passes."
+        "woman <Image 1> sits beside a dog while boat <Image 2> passes."
     )
 
 
@@ -585,6 +592,8 @@ def test_deterministic_instruction_preserves_template_except_marker_changes() ->
 
     instruction = build_deterministic_instruction(
         instruction_template=template,
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=bindings,
     )
     body = instruction.instruction_body_template
@@ -594,21 +603,23 @@ def test_deterministic_instruction_preserves_template_except_marker_changes() ->
         binding.grounding_prompt.strip() for binding in bindings
     ]
     assert all(body.count(f"{{{{image_{index}}}}}") == 1 for index in range(1, 7))
-    assert re.sub(r" \{\{image_[1-9]\d*\}\}", "", body) == re.sub(
-        r" \{\{(?:entity_[1-9]\d*|background)\}\}",
-        "",
-        template.strip(),
+    plain_body = re.sub(r" \{\{image_[1-9]\d*\}\}", "", body)
+    assert plain_body == (
+        "entity 1 stands near entity 2 while entity 3 faces entity 4. "
+        "entity 5 remains visible in a quiet plaza."
     )
     assert "Use " not in body
     assert "Generate " not in body
 
 
-def test_deterministic_instruction_ignores_phrase_for_text_location(
+def test_deterministic_instruction_uses_annotation_phrase_not_binding_phrase(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    binding = build_instruction_bindings(storage.read_clip(clip_uid))[0].model_copy(
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    binding = build_instruction_bindings(clip)[0].model_copy(
         update={
             "phrase": "a phrase absent from the template",
             "grounding_prompt": "  stable visible subject  ",
@@ -616,14 +627,17 @@ def test_deterministic_instruction_ignores_phrase_for_text_location(
     )
 
     instruction = build_deterministic_instruction(
-        instruction_template=(
-            "A woman {{entity_1}} enters before another woman leaves."
-        ),
+        instruction_template="{{entity_1}} enters before another woman leaves.",
+        entities=clip.annotation.entities[:1],
+        background=None,
         bindings=[binding],
     )
 
     assert instruction.instruction_body_template == (
-        "A woman {{image_1}} enters before another woman leaves."
+        "a woman in a yellow coat {{image_1}} enters before another woman leaves."
+    )
+    assert "a phrase absent from the template" not in (
+        instruction.instruction_body_template
     )
     assert "stable visible subject" not in instruction.instruction_body_template
     assert instruction.reference_legend[0].description == "stable visible subject"
@@ -634,7 +648,9 @@ def test_deterministic_instruction_filters_markers_and_renumbers_images(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    first, second = build_instruction_bindings(storage.read_clip(clip_uid))[:2]
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    first, second = build_instruction_bindings(clip)[:2]
     second_only = second.model_copy(
         update={
             "image_id": "image_1",
@@ -643,29 +659,43 @@ def test_deterministic_instruction_filters_markers_and_renumbers_images(
     )
 
     first_only = build_deterministic_instruction(
-        instruction_template=(
-            "A man {{entity_1}} stands beside a boat {{entity_2}}."
-        ),
+        instruction_template="{{entity_1}} stands beside {{entity_2}}.",
+        entities=clip.annotation.entities,
+        background=None,
         bindings=[first],
     )
     assert first_only.r2v_instruction == (
-        "A man <Image 1> stands beside a boat."
+        "a woman in a yellow coat <Image 1> stands beside a red bicycle."
     )
 
     retained_second = build_deterministic_instruction(
-        instruction_template=(
-            "A man {{entity_1}} stands beside a boat {{entity_2}}."
-        ),
+        instruction_template="{{entity_1}} stands beside {{entity_2}}.",
+        entities=clip.annotation.entities,
+        background=None,
         bindings=[second_only],
     )
     assert retained_second.r2v_instruction == (
-        "A man stands beside a boat <Image 1>."
+        "a woman in a yellow coat stands beside a red bicycle <Image 1>."
     )
     assert "  " not in first_only.instruction_body_template
     assert "{{entity_" not in retained_second.instruction_body_template
 
 
-def test_removed_markers_preserve_punctuation_and_visible_entity_text() -> None:
+def test_nonretained_placeholder_preserves_phrase_and_punctuation() -> None:
+    entities = [
+        AnnotationEntity(
+            entity_id="e1",
+            reference_type="subject",
+            phrase="a man wearing a coat",
+            grounding_prompt="the man wearing a coat",
+        ),
+        AnnotationEntity(
+            entity_id="e2",
+            reference_type="object",
+            phrase="a boat",
+            grounding_prompt="small white boat beside the man",
+        ),
+    ]
     binding = InstructionBinding(
         image_id="image_1",
         image_index=1,
@@ -676,15 +706,14 @@ def test_removed_markers_preserve_punctuation_and_visible_entity_text() -> None:
     )
 
     instruction = build_deterministic_instruction(
-        instruction_template=(
-            "A man {{entity_1}}, wearing a coat, stands beside a boat "
-            "{{entity_2}}."
-        ),
+        instruction_template="{{entity_1}}, stands beside {{entity_2}}.",
+        entities=entities,
+        background=None,
         bindings=[binding],
     )
 
     assert instruction.r2v_instruction == (
-        "A man, wearing a coat, stands beside a boat <Image 1>."
+        "a man wearing a coat, stands beside a boat <Image 1>."
     )
     assert "  " not in instruction.instruction_body_template
 
@@ -698,10 +727,12 @@ def test_entity_one_and_three_are_renumbered_contiguously() -> None:
 
     instruction = build_deterministic_instruction(
         instruction_template=clip.annotation.instruction_template,
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=[first, third],
     )
 
-    assert "Entity 1 {{image_1}}" in instruction.instruction_body_template
+    assert "entity 1 {{image_1}}" in instruction.instruction_body_template
     assert "entity 3 {{image_2}}" in instruction.instruction_body_template
     assert "{{image_3}}" not in instruction.instruction_body_template
     assert "{{entity_" not in instruction.instruction_body_template
@@ -717,32 +748,36 @@ def test_background_marker_is_retained_or_removed_by_final_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    entity, _, background = build_instruction_bindings(
-        storage.read_clip(clip_uid)
-    )
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    entity, _, background = build_instruction_bindings(clip)
     background = background.model_copy(
         update={"image_id": "image_2", "image_index": 2}
     )
     template = (
-        "A woman {{entity_1}} crosses a plaza {{background}} while a bicycle "
-        "{{entity_2}} remains nearby."
+        "{{entity_1}} crosses {{background}} while {{entity_2}} remains nearby."
     )
 
     retained = build_deterministic_instruction(
         instruction_template=template,
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=[entity, background],
     )
     removed = build_deterministic_instruction(
         instruction_template=template,
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=[entity],
     )
 
     assert retained.r2v_instruction == (
-        "A woman <Image 1> crosses a plaza <Image 2> while a bicycle remains "
-        "nearby."
+        "a woman in a yellow coat <Image 1> crosses a bright plaza <Image 2> "
+        "while a red bicycle remains nearby."
     )
     assert removed.r2v_instruction == (
-        "A woman <Image 1> crosses a plaza while a bicycle remains nearby."
+        "a woman in a yellow coat <Image 1> crosses a bright plaza while a red "
+        "bicycle remains nearby."
     )
     assert [entry.image_id for entry in retained.reference_legend] == [
         "image_1",
@@ -762,10 +797,12 @@ def test_deterministic_instruction_uses_final_binding_order() -> None:
 
     instruction = build_deterministic_instruction(
         instruction_template=clip.annotation.instruction_template,
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=[entity_three, entity_one],
     )
 
-    assert "Entity 1 {{image_2}}" in instruction.instruction_body_template
+    assert "entity 1 {{image_2}}" in instruction.instruction_body_template
     assert "entity 3 {{image_1}}" in instruction.instruction_body_template
     assert [entry.image_id for entry in instruction.reference_legend] == [
         "image_1",
@@ -774,6 +811,14 @@ def test_deterministic_instruction_uses_final_binding_order() -> None:
 
 
 def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
+    entities = [
+        AnnotationEntity(
+            entity_id="e1",
+            reference_type="subject",
+            phrase="a subject",
+            grounding_prompt="visible subject",
+        )
+    ]
     binding = InstructionBinding.model_construct(
         image_id="image_1",
         image_index=1,
@@ -786,24 +831,49 @@ def test_deterministic_instruction_fails_closed_on_invalid_inputs() -> None:
     with pytest.raises(ValueError, match="non-empty instruction_template"):
         build_deterministic_instruction(
             instruction_template=" ",
+            entities=entities,
+            background=None,
             bindings=[binding],
         )
     with pytest.raises(ValueError, match="non-empty grounding_prompt"):
         build_deterministic_instruction(
-            instruction_template="A subject {{entity_1}} moves.",
+            instruction_template="{{entity_1}} moves.",
+            entities=entities,
+            background=None,
             bindings=[binding],
         )
     missing = binding.model_copy(update={"grounding_prompt": "visible subject"})
-    with pytest.raises(ValueError, match="marker must appear exactly once"):
+    with pytest.raises(ValueError, match="placeholder must appear exactly once"):
         build_deterministic_instruction(
             instruction_template="A bicycle moves.",
+            entities=entities,
+            background=None,
             bindings=[missing],
         )
     with pytest.raises(ValueError, match="at least one binding"):
         build_deterministic_instruction(
-            instruction_template="A subject {{entity_1}} moves.",
+            instruction_template="{{entity_1}} moves.",
+            entities=entities,
+            background=None,
             bindings=[],
         )
+
+
+def test_legacy_marker_after_mention_clip_schema_remains_loadable() -> None:
+    clip = _five_entity_instruction_clip(include_background=False)
+    payload = clip.model_dump(mode="json")
+    payload["annotation"]["instruction_template"] = (
+        "Entity 1 {{entity_1}} stands near entity 2 {{entity_2}} while "
+        "entity 3 {{entity_3}} faces entity 4 {{entity_4}}. Entity 5 "
+        "{{entity_5}} remains visible."
+    )
+
+    loaded = ClipRecord.model_validate(payload)
+
+    assert loaded.annotation is not None
+    assert loaded.annotation.instruction_template == (
+        payload["annotation"]["instruction_template"]
+    )
 
 
 @pytest.mark.parametrize("include_background", [False, True])
@@ -1514,7 +1584,9 @@ def test_deterministic_builder_uses_existing_final_renderer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage, clip_uid = _ready_storage(_config(tmp_path, monkeypatch))
-    bindings = build_instruction_bindings(storage.read_clip(clip_uid))
+    clip = storage.read_clip(clip_uid)
+    assert clip.annotation is not None
+    bindings = build_instruction_bindings(clip)
     calls: list[str] = []
     renderer = instruction_module.render_inline_instruction_text
 
@@ -1530,9 +1602,10 @@ def test_deterministic_builder_uses_existing_final_renderer(
 
     instruction = instruction_module.build_deterministic_instruction(
         instruction_template=(
-            "A woman in a yellow coat {{entity_1}} walks beside a red bicycle "
-            "{{entity_2}} through a bright plaza {{background}}."
+            "{{entity_1}} walks beside {{entity_2}} through {{background}}."
         ),
+        entities=clip.annotation.entities,
+        background=clip.annotation.background,
         bindings=bindings,
     )
 

@@ -45,6 +45,8 @@ _ANNOTATION_ENTITY_MARKER_WITH_SPACE = re.compile(
     r" \{\{entity_[1-9]\d*\}\}"
 )
 _ANNOTATION_BACKGROUND_MARKER_WITH_SPACE = re.compile(r" \{\{background\}\}")
+_ANNOTATION_ENTITY_PLACEHOLDER = re.compile(r"\{\{entity_[1-9]\d*\}\}")
+_ANNOTATION_BACKGROUND_PLACEHOLDER = re.compile(r"\{\{background\}\}")
 
 
 class SchemaModel(BaseModel):
@@ -170,6 +172,24 @@ def plain_instruction_text(instruction_template: str) -> str:
     """Remove valid internal annotation markers without rewriting other text."""
     value = _ANNOTATION_ENTITY_MARKER_WITH_SPACE.sub("", instruction_template)
     value = _ANNOTATION_BACKGROUND_MARKER_WITH_SPACE.sub("", value)
+    return value.strip()
+
+
+def render_annotation_plain_text(
+    instruction_template: str,
+    entities: list[AnnotationEntity],
+    background: Optional[BackgroundAnnotation],
+) -> str:
+    """Substitute V3 mention placeholders with their annotation phrases."""
+    value = instruction_template
+    for index, entity in enumerate(entities, start=1):
+        value = value.replace(f"{{{{entity_{index}}}}}", entity.phrase)
+    if background is not None:
+        value = value.replace("{{background}}", background.phrase)
+    if _ANNOTATION_ENTITY_PLACEHOLDER.search(
+        value
+    ) or _ANNOTATION_BACKGROUND_PLACEHOLDER.search(value):
+        raise ValueError("annotation contains an unbound internal placeholder")
     return value.strip()
 
 
