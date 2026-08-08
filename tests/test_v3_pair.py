@@ -62,6 +62,11 @@ from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     subject_has_nontrivial_detached_component,
 )
+from r2v_data_v2.v3.reference_prefilter import (
+    NEAR_SILHOUETTE_RULE,
+    ReferencePrefilterDecision,
+    ReferencePrefilterResult,
+)
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
@@ -591,6 +596,205 @@ def test_candidate_shortlist_is_deterministic_and_renumbered(
     assert len(first) == 3
 
 
+def _prefilter_result(
+    candidates: list[pair_module.EntityReferenceCandidate],
+    retained_ids: tuple[str, ...],
+) -> ReferencePrefilterResult[pair_module.EntityReferenceCandidate]:
+    decisions = tuple(
+        ReferencePrefilterDecision(
+            candidate_id=candidate.candidate_id,
+            flagged=candidate.candidate_id not in retained_ids,
+            flagged_by=(
+                (NEAR_SILHOUETTE_RULE,)
+                if candidate.candidate_id not in retained_ids
+                else ()
+            ),
+            technical_metrics={"status": "succeeded"},
+            laplacian_ratio=1.0,
+            tenengrad_ratio=1.0,
+            relative_blur_v2_applicable=len(candidates) == 3,
+            relative_blur_v2_inapplicable_reason=(
+                None if len(candidates) == 3 else "requires_three_candidates"
+            ),
+        )
+        for candidate in candidates
+    )
+    return ReferencePrefilterResult(
+        original_candidates=tuple(candidates),
+        retained_candidates=tuple(
+            candidate
+            for candidate in candidates
+            if candidate.candidate_id in retained_ids
+        ),
+        decisions=decisions,
+    )
+
+
+@pytest.mark.parametrize(
+    ("before_count", "retained_ids", "transition_counter"),
+    [
+        (3, ("candidate_1", "candidate_3"), "prefilter_entities_3_to_2"),
+        (3, ("candidate_2",), "prefilter_entities_3_to_1"),
+        (3, (), "prefilter_entities_3_to_0"),
+        (2, ("candidate_2",), "prefilter_entities_2_to_1"),
+        (2, (), "prefilter_entities_2_to_0"),
+    ],
+)
+def test_pair_routes_prefiltered_candidate_subsets_without_renumbering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before_count: int,
+    retained_ids: tuple[str, ...],
+    transition_counter: str,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(reference_prefilter_mode="conservative_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    original_builder = pair_module._build_entity_reference_candidates
+
+    def limited_builder(*args: object, **kwargs: object):
+        candidates, all_tiny, all_fragmented = original_builder(*args, **kwargs)
+        return candidates[:before_count], all_tiny, all_fragmented
+
+    monkeypatch.setattr(
+        pair_module,
+        "_build_entity_reference_candidates",
+        limited_builder,
+    )
+
+    def deterministic_prefilter(entity, candidates, source_images):
+        assert entity.reference_type == "subject"
+        assert len(candidates) == before_count
+        assert set(source_images) == {candidate.image_path for candidate in candidates}
+        return _prefilter_result(candidates, retained_ids)
+
+    monkeypatch.setattr(
+        pair_module,
+        "prefilter_entity_reference_candidates",
+        deterministic_prefilter,
+    )
+    source_load_calls = 0
+    original_loader = pair_module._load_source_images
+
+    def counted_loader(*args: object, **kwargs: object):
+        nonlocal source_load_calls
+        source_load_calls += 1
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(pair_module, "_load_source_images", counted_loader)
+
+    class SubsetJudge:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def decide(self, *, entity, candidates, source_images):
+            candidate_ids = [candidate.candidate_id for candidate in candidates]
+            self.calls.append(candidate_ids)
+            assert {candidate.image_path for candidate in candidates}.issubset(
+                source_images
+            )
+            decision = _decision(reference_type=entity.reference_type).model_copy(
+                update={"selected_candidate_id": candidate_ids[0]}
+            )
+            return EntityReferenceDecisionAttempt(
+                decision=decision,
+                raw_responses=("{}",),
+                repair_attempts=0,
+            )
+
+    judge = SubsetJudge()
+    stats = pair_clips(config, storage, judge=judge)
+
+    assert source_load_calls == 1
+    assert stats.prefilter_candidates_examined == before_count
+    assert stats.prefilter_candidates_filtered == before_count - len(retained_ids)
+    assert getattr(stats, transition_counter) == 1
+    assert stats.prefilter_qwen_calls_skipped == int(not retained_ids)
+    clip = storage.read_clip("clip-1")
+    debug = json.loads(
+        (storage.pair_debug_dir("clip-1", "e1") / "prefilter.json").read_text()
+    )
+    assert debug["original_candidate_ids"] == [
+        f"candidate_{index}" for index in range(1, before_count + 1)
+    ]
+    assert debug["retained_candidate_ids"] == list(retained_ids)
+    if retained_ids:
+        assert judge.calls == [list(retained_ids)]
+        assert clip.references.entities[0].status == "ready"
+        assert clip.references.entities[0].source_frame_index is not None
+    else:
+        assert judge.calls == []
+        assert clip.references.entities[0].status == "rejected"
+        assert (
+            clip.references.entities[0].scope_reason
+            == "reference_prefilter_all_candidates_filtered"
+        )
+
+
+def test_pair_prefilter_mode_off_preserves_original_judge_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, pair=PairConfig())
+    storage = _storage(config, entity_types=("subject",))
+    monkeypatch.setattr(
+        pair_module,
+        "prefilter_entity_reference_candidates",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled prefilter must not run")
+        ),
+    )
+    judge = _Judge()
+
+    stats = pair_clips(config, storage, judge=judge)
+
+    assert judge.calls == [("e1", ["candidate_1", "candidate_2", "candidate_3"])]
+    assert stats.prefilter_candidates_examined == 0
+    assert stats.prefilter_candidates_filtered == 0
+    assert stats.prefilter_fail_open_entities == 0
+
+
+def test_pair_prefilter_exception_fails_open_to_original_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(reference_prefilter_mode="conservative_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+
+    def fail_prefilter(*args: object, **kwargs: object):
+        del args, kwargs
+        raise RuntimeError("metric computation failed")
+
+    monkeypatch.setattr(
+        pair_module,
+        "prefilter_entity_reference_candidates",
+        fail_prefilter,
+    )
+    judge = _Judge()
+
+    stats = pair_clips(config, storage, judge=judge)
+
+    assert judge.calls == [("e1", ["candidate_1", "candidate_2", "candidate_3"])]
+    assert stats.prefilter_candidates_examined == 3
+    assert stats.prefilter_candidates_filtered == 0
+    assert stats.prefilter_fail_open_entities == 1
+    debug = json.loads(
+        (storage.pair_debug_dir("clip-1", "e1") / "prefilter.json").read_text()
+    )
+    assert debug["prefilter_fail_open"] is True
+    assert debug["reason"] == "reference_prefilter_failed_open"
+    assert debug["error"] == "metric computation failed"
+
+
 def test_pair_filters_tiny_candidate_before_semantic_judge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -989,6 +1193,17 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         "completion_attempted": 0,
         "completion_ready": 0,
         "completion_rejected": 0,
+        "prefilter_candidates_examined": 0,
+        "prefilter_candidates_filtered": 0,
+        "prefilter_near_silhouette_filtered": 0,
+        "prefilter_relative_blur_v2_filtered": 0,
+        "prefilter_entities_3_to_2": 0,
+        "prefilter_entities_3_to_1": 0,
+        "prefilter_entities_3_to_0": 0,
+        "prefilter_entities_2_to_1": 0,
+        "prefilter_entities_2_to_0": 0,
+        "prefilter_qwen_calls_skipped": 0,
+        "prefilter_fail_open_entities": 0,
     }
     assert clip.pairing == PairingState(
         status="ready",

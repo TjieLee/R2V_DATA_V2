@@ -1605,19 +1605,78 @@ def test_bad_request_falls_back_to_json_object_without_network() -> None:
 @pytest.mark.parametrize(
     "candidate_ids",
     [
-        [],
-        [_candidate("candidate_2")],
-        [_candidate(), _candidate("candidate_3")],
+        ["candidate_1", "candidate_2", "candidate_3"],
+        ["candidate_1", "candidate_3"],
+        ["candidate_2", "candidate_3"],
+        ["candidate_1"],
+        ["candidate_2"],
+        ["candidate_3"],
     ],
 )
-def test_candidate_ids_must_be_nonempty_contiguous_and_ordered(
-    candidate_ids: list[EntityReferenceCandidate],
+def test_candidate_ids_allow_ordered_noncontiguous_subsets(
+    candidate_ids: list[str],
 ) -> None:
-    judge = _judge(_Completions([_payload()]))
-    with pytest.raises(ValueError, match="requires candidates|contiguous"):
+    completions = _Completions(
+        [_payload(selected_candidate_id=candidate_ids[0])]
+    )
+    judge = _judge(completions)
+
+    attempt = judge.decide(
+        entity=_entity(),
+        candidates=[_candidate(candidate_id) for candidate_id in candidate_ids],
+        source_images=_source_images(),
+    )
+
+    assert attempt.decision.selected_candidate_id == candidate_ids[0]
+    content = completions.calls[0]["messages"][1]["content"]
+    image_count = sum(item["type"] == "image_url" for item in content)
+    assert image_count == len(candidate_ids) * 2
+
+
+def test_noncontiguous_subset_profiles_only_retained_candidate_evidence(
+    tmp_path: Path,
+) -> None:
+    completions = _Completions(
+        [_payload(selected_candidate_id="candidate_3")]
+    )
+    judge = _judge(completions)
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
         judge.decide(
             entity=_entity(),
-            candidates=candidate_ids,
+            candidates=[_candidate("candidate_1"), _candidate("candidate_3")],
+            source_images=_source_images(),
+        )
+
+    event = json.loads(
+        profiler.events_path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert event["input_image_count"] == 4
+    assert event["metadata"]["candidate_count"] == 2
+    assert event["metadata"]["context_image_count"] == 2
+    assert event["metadata"]["isolated_crop_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "candidate_ids",
+    [
+        [],
+        ["candidate_1", "candidate_1"],
+        ["candidate_3", "candidate_1"],
+        ["candidate_0"],
+        ["candidate_x"],
+        ["other_1"],
+    ],
+)
+def test_candidate_ids_reject_empty_duplicate_reverse_or_invalid(
+    candidate_ids: list[str],
+) -> None:
+    judge = _judge(_Completions([_payload()]))
+    with pytest.raises(ValueError, match="requires candidates|invalid|unique"):
+        judge.decide(
+            entity=_entity(),
+            candidates=[_candidate(candidate_id) for candidate_id in candidate_ids],
             source_images=_source_images(),
         )
 

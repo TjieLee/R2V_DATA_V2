@@ -113,6 +113,7 @@ class ReferenceScopeConfig:
 @dataclass(frozen=True)
 class PairConfig:
     enabled: bool = True
+    reference_prefilter_mode: str = "off"
     max_candidates_per_entity: int = 3
     crop_padding_ratio: float = 0.08
     repair_retries: int = 1
@@ -339,6 +340,10 @@ class V3Config:
         if self.pair.enabled and self.qwen.candidate_judge is None:
             raise ValueError(
                 "qwen.candidate_judge is required when pair.enabled is true"
+            )
+        if self.pair.reference_prefilter_mode not in {"off", "conservative_v1"}:
+            raise ValueError(
+                "pair.reference_prefilter_mode must be off or conservative_v1"
             )
         if (
             not isinstance(self.pair.max_candidates_per_entity, int)
@@ -798,6 +803,9 @@ def load_config(path: str | Path) -> V3Config:
         raw.get("reference_edit"),
         "reference_edit",
     )
+    pair_values = _mapping(raw.get("pair"), "pair")
+    if pair_values.get("reference_prefilter_mode") is False:
+        pair_values["reference_prefilter_mode"] = "off"
     sam3_values = _mapping(raw.get("sam3"), "sam3")
     if "model_path" in sam3_values:
         model_path = sam3_values["model_path"]
@@ -856,7 +864,7 @@ def load_config(path: str | Path) -> V3Config:
         ),
         pair=_build(
             PairConfig,
-            _mapping(raw.get("pair"), "pair"),
+            pair_values,
             "pair",
         ),
         background=_build(

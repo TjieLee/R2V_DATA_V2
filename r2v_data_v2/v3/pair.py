@@ -41,6 +41,12 @@ from r2v_data_v2.v3.reference_judge import (
     QwenEntityReferenceJudge,
     validate_entity_reference_decision,
 )
+from r2v_data_v2.v3.reference_prefilter import (
+    NEAR_SILHOUETTE_RULE,
+    RELATIVE_BLUR_V2_RULE,
+    ReferencePrefilterResult,
+    prefilter_entity_reference_candidates,
+)
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -124,6 +130,17 @@ class PairStats:
     completion_attempted: int = 0
     completion_ready: int = 0
     completion_rejected: int = 0
+    prefilter_candidates_examined: int = 0
+    prefilter_candidates_filtered: int = 0
+    prefilter_near_silhouette_filtered: int = 0
+    prefilter_relative_blur_v2_filtered: int = 0
+    prefilter_entities_3_to_2: int = 0
+    prefilter_entities_3_to_1: int = 0
+    prefilter_entities_3_to_0: int = 0
+    prefilter_entities_2_to_1: int = 0
+    prefilter_entities_2_to_0: int = 0
+    prefilter_qwen_calls_skipped: int = 0
+    prefilter_fail_open_entities: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -1018,6 +1035,82 @@ def _write_debug_attempt(
     )
 
 
+def _write_prefilter_debug(
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    original_candidates: list[EntityReferenceCandidate],
+    result: ReferencePrefilterResult[EntityReferenceCandidate] | None,
+    error: Exception | None = None,
+) -> None:
+    if not storage.config.debug.save_diagnostics:
+        return
+    if (result is None) == (error is None):
+        raise ValueError("prefilter debug requires exactly one result or error")
+    payload: dict[str, object] = {
+        "entity_id": entity.entity_id,
+        "reference_type": entity.reference_type,
+        "original_candidate_ids": [
+            candidate.candidate_id for candidate in original_candidates
+        ],
+        "prefilter_fail_open": error is not None,
+    }
+    if result is not None:
+        payload.update(
+            {
+                "retained_candidate_ids": [
+                    candidate.candidate_id
+                    for candidate in result.retained_candidates
+                ],
+                "candidates": [
+                    decision.to_dict() for decision in result.decisions
+                ],
+            }
+        )
+    else:
+        assert error is not None
+        payload.update(
+            {
+                "retained_candidate_ids": [
+                    candidate.candidate_id for candidate in original_candidates
+                ],
+                "reason": "reference_prefilter_failed_open",
+                "error": str(error),
+            }
+        )
+    directory = storage.pair_debug_dir(clip_uid, entity.entity_id)
+    write_json_atomic(directory / "prefilter.json", payload)
+
+
+def _record_prefilter_stats(
+    counters: dict[str, int],
+    result: ReferencePrefilterResult[EntityReferenceCandidate],
+) -> None:
+    before = len(result.original_candidates)
+    after = len(result.retained_candidates)
+    counters["prefilter_candidates_examined"] += before
+    counters["prefilter_candidates_filtered"] += result.filtered_count
+    counters["prefilter_near_silhouette_filtered"] += sum(
+        NEAR_SILHOUETTE_RULE in decision.flagged_by
+        for decision in result.decisions
+    )
+    counters["prefilter_relative_blur_v2_filtered"] += sum(
+        RELATIVE_BLUR_V2_RULE in decision.flagged_by
+        for decision in result.decisions
+    )
+    transition_key = {
+        (3, 2): "prefilter_entities_3_to_2",
+        (3, 1): "prefilter_entities_3_to_1",
+        (3, 0): "prefilter_entities_3_to_0",
+        (2, 1): "prefilter_entities_2_to_1",
+        (2, 0): "prefilter_entities_2_to_0",
+    }.get((before, after))
+    if transition_key is not None:
+        counters[transition_key] += 1
+    counters["prefilter_qwen_calls_skipped"] += int(after == 0)
+
+
 def _validate_pair_inputs(
     clip: ClipRecord,
     frames: SampledFramesArtifact,
@@ -1776,6 +1869,48 @@ def pair_clips(
                             )
                         )
                         continue
+                    source_images = _load_source_images(storage, candidates)
+                    judged_candidates = candidates
+                    if config.pair.reference_prefilter_mode == "conservative_v1":
+                        try:
+                            prefilter_result = prefilter_entity_reference_candidates(
+                                entity,
+                                candidates,
+                                source_images,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - required fail-open
+                            counters["prefilter_candidates_examined"] += len(
+                                candidates
+                            )
+                            counters["prefilter_fail_open_entities"] += 1
+                            _write_prefilter_debug(
+                                storage,
+                                clip_uid=clip.clip_uid,
+                                entity=entity,
+                                original_candidates=candidates,
+                                result=None,
+                                error=exc,
+                            )
+                        else:
+                            _record_prefilter_stats(counters, prefilter_result)
+                            _write_prefilter_debug(
+                                storage,
+                                clip_uid=clip.clip_uid,
+                                entity=entity,
+                                original_candidates=candidates,
+                                result=prefilter_result,
+                            )
+                            judged_candidates = list(
+                                prefilter_result.retained_candidates
+                            )
+                            if not judged_candidates:
+                                entity_states.append(
+                                    _rejected_reference(
+                                        entity.entity_id,
+                                        "reference_prefilter_all_candidates_filtered",
+                                    )
+                                )
+                                continue
                     if active_judge is None:
                         judge_config = config.qwen.candidate_judge
                         if judge_config is None:
@@ -1786,10 +1921,9 @@ def pair_clips(
                             crop_padding_ratio=config.pair.crop_padding_ratio,
                         )
                         active_judge = owned_judge
-                    source_images = _load_source_images(storage, candidates)
                     attempt = active_judge.decide(
                         entity=entity,
-                        candidates=candidates,
+                        candidates=judged_candidates,
                         source_images=source_images,
                     )
                     counters["repaired"] += int(attempt.repair_attempts > 0)
@@ -1797,16 +1931,18 @@ def pair_clips(
                         storage,
                         clip_uid=clip.clip_uid,
                         entity=entity,
-                        candidates=candidates,
+                        candidates=judged_candidates,
                         attempt=attempt,
                     )
                     decision = attempt.decision
                     decision_issues = validate_entity_reference_decision(
                         decision,
-                        candidate_ids={item.candidate_id for item in candidates},
+                        candidate_ids={
+                            item.candidate_id for item in judged_candidates
+                        },
                         reference_type=entity.reference_type,
                         candidate_by_id={
-                            item.candidate_id: item for item in candidates
+                            item.candidate_id: item for item in judged_candidates
                         },
                     )
                     if decision_issues:
@@ -1866,7 +2002,7 @@ def pair_clips(
                         continue
                     selected = next(
                         candidate
-                        for candidate in candidates
+                        for candidate in judged_candidates
                         if candidate.candidate_id == decision.selected_candidate_id
                     )
                     source = source_images[selected.image_path]

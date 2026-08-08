@@ -4,7 +4,9 @@ import base64
 import io
 import json
 import math
+import re
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from openai import BadRequestError, OpenAI
@@ -889,11 +891,18 @@ class QwenEntityReferenceJudge:
         if not candidates:
             raise ValueError("entity reference judge requires candidates")
         candidate_ids = [candidate.candidate_id for candidate in candidates]
-        if candidate_ids != [
-            f"candidate_{index}" for index in range(1, len(candidates) + 1)
-        ]:
+        candidate_numbers: list[int] = []
+        for candidate_id in candidate_ids:
+            match = re.fullmatch(r"candidate_([1-9]\d*)", candidate_id)
+            if match is None:
+                raise ValueError("entity reference candidate ID is invalid")
+            candidate_numbers.append(int(match.group(1)))
+        if any(
+            current >= following
+            for current, following in pairwise(candidate_numbers)
+        ):
             raise ValueError(
-                "entity reference candidates must be contiguous and ordered"
+                "entity reference candidate IDs must be unique and naturally ordered"
             )
         payload = build_entity_reference_request_payload(entity, candidates)
         original_request = (

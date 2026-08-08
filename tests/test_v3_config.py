@@ -19,6 +19,7 @@ def _write_config(
     cross_pair_judge: bool = False,
     same_parent_fallback_enabled: bool = False,
     same_parent_max_donor_references: object = 8,
+    reference_prefilter_mode: object = "off",
     synthetic_completion_enabled: object = False,
     reference_edit_enabled: bool = False,
     reference_edit_judge: bool = False,
@@ -95,6 +96,7 @@ def _write_config(
                 ),
                 "pair:",
                 f"  enabled: {str(pair_enabled).lower()}",
+                f"  reference_prefilter_mode: {reference_prefilter_mode}",
                 (
                     "  same_parent_fallback_enabled: "
                     f"{str(same_parent_fallback_enabled).lower()}"
@@ -188,6 +190,63 @@ def test_disabled_pair_does_not_require_candidate_judge(
     )
 
     assert load_config(path).qwen.candidate_judge is None
+
+
+@pytest.mark.parametrize("mode", ["off", "conservative_v1"])
+def test_reference_prefilter_mode_accepts_versioned_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        reference_prefilter_mode=mode,
+    )
+
+    assert load_config(path).pair.reference_prefilter_mode == mode
+
+
+def test_reference_prefilter_mode_rejects_unknown_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        reference_prefilter_mode="tuned_thresholds",
+    )
+
+    with pytest.raises(ValueError, match="reference_prefilter_mode"):
+        load_config(path)
+
+
+def test_reference_prefilter_mode_participates_in_config_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        reference_prefilter_mode="off",
+    )
+    disabled = load_config(path)
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        reference_prefilter_mode="conservative_v1",
+    )
+    enabled = load_config(path)
+
+    assert disabled.fingerprint() != enabled.fingerprint()
 
 
 def test_disabled_remove_does_not_require_background_remove_judge(

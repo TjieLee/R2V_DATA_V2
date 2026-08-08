@@ -440,6 +440,71 @@ run root has been checked. Add observational profiling with `--profile`:
 Profiling writes `profiling/events.jsonl` and `profiling/summary.json` under the
 configured run root. It does not change environment setup.
 
+### Conservative reference prefilter rollout
+
+The production reference prefilter is versioned and disabled by default:
+
+```yaml
+pair:
+  reference_prefilter_mode: "off"  # or conservative_v1
+```
+
+`conservative_v1` applies only the frozen `subject_near_silhouette_v1` and
+`subject_relative_blur_v2` rules before the Qwen candidate judge. It uses the
+main R2V virtual environment and deterministic foreground-only cheap CV. It
+does not load another model or start another worker. SCRFD, MediaPipe, face
+evidence, and pose evidence remain `AUDIT ONLY` and are never production
+prefilter inputs. Object and group references are not filtered by either rule.
+
+Validate the opt-in mode with a fresh full20 run on the server. Never overwrite
+the known baseline `full20-samfirst-bg-20260808-021450`. The following creates a
+sibling config with independent run and export roots while preserving all other
+frozen production settings:
+
+```bash
+export PREFILTER_BASE_CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/full20-samfirst-bg-20260808-021450.yaml"
+export PREFILTER_BASE_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/full20-samfirst-bg-20260808-021450"
+export PREFILTER_STAMP="$(date +%Y%m%d-%H%M%S)"
+export PREFILTER_CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/full20-prefilter-${PREFILTER_STAMP}.yaml"
+export PREFILTER_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/full20-prefilter-${PREFILTER_STAMP}"
+export PREFILTER_EXPORT="/mnt/workspace/litengjie/data/r2v_v3_exports/full20-prefilter-${PREFILTER_STAMP}"
+
+test -f "$PREFILTER_BASE_CONFIG" || echo "ERROR: missing baseline config"
+test -d "$PREFILTER_BASE_RUN" || echo "ERROR: missing baseline run"
+test ! -e "$PREFILTER_RUN" || echo "ERROR: target run already exists"
+test ! -e "$PREFILTER_EXPORT" || echo "ERROR: target export already exists"
+
+"$MAIN_PYTHON" - \
+  "$PREFILTER_BASE_CONFIG" "$PREFILTER_CONFIG" \
+  "$PREFILTER_RUN" "$PREFILTER_EXPORT" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+source, destination, run_root, export_root = map(Path, sys.argv[1:])
+config = yaml.safe_load(source.read_text(encoding="utf-8"))
+config["run_root"] = str(run_root)
+config["export_root"] = str(export_root)
+config.setdefault("pair", {})["reference_prefilter_mode"] = "conservative_v1"
+destination.write_text(
+    yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+)
+PY
+
+"$MAIN_PYTHON" run_pipeline_v3.py \
+  --config "$PREFILTER_CONFIG" \
+  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,instruct,export \
+  --profile
+```
+
+Require the fresh run to finish through export. Compare its pair/reference-edit
+states, selected references, export count, candidate-judge call count, input
+image count, and total candidate-judge duration against `PREFILTER_BASE_RUN`.
+For retained subsets, profiling must report the post-filter candidate count and
+exactly two evidence images per retained candidate. Explain every difference;
+do not infer server results from local tests.
+
 Before `reference_edit`, verify Qwen health, SAM3 import, Boogu paths and GPU,
 and absence of a stale worker. The stage starts one persistent Boogu JSONL worker
 and reuses it for eligible entities. The worker's production settings remain:
@@ -606,8 +671,9 @@ without altering candidates, Qwen calls, routing, references, or exports. The
 values. `subject_relative_blur_v1` is deprecated after a clear high-detail
 candidate satisfied its relative-only thresholds. The current
 `subject_relative_blur_v2` condition requires both relative blur evidence and
-absolute values of at most 50 Laplacian variance and 1500 mean Tenengrad. Both
-active conditions remain shadow-only experiments, not production thresholds.
+absolute values of at most 50 Laplacian variance and 1500 mean Tenengrad. The
+shadow tools remain audit-only; the same two frozen rules are also available in
+production only through the explicit `conservative_v1` mode documented above.
 
 ```bash
 export SHADOW_SIMULATION="$AUDIT_ROOT/prefilter-shadow-$STAMP.json"

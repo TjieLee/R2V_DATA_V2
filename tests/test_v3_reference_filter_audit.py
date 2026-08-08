@@ -13,6 +13,7 @@ from PIL import Image, ImageFilter
 import r2v_data_v2.v3.config as config_module
 import r2v_data_v2.v3.pair as pair_module
 import r2v_data_v2.v3.reference_filter_audit as audit_module
+import r2v_data_v2.v3.reference_quality as quality_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import (
     DebugConfig,
@@ -780,6 +781,13 @@ def test_cheap_foreground_metrics_measure_darkness_and_contrast() -> None:
     assert checker_metrics["rms_contrast"] > dark_metrics["rms_contrast"]
     assert checker_metrics["laplacian_variance"] > 0
     assert checker_metrics["tenengrad_mean"] >= 0
+
+
+def test_audit_uses_shared_production_cheap_foreground_metrics() -> None:
+    assert (
+        audit_module.cheap_foreground_technical_metrics
+        is quality_module.cheap_foreground_technical_metrics
+    )
 
 
 def test_cheap_foreground_metrics_distinguish_sharp_and_blurred_checker() -> None:
