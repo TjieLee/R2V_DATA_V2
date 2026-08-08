@@ -602,8 +602,12 @@ extreme-pose cases. It supplies human evidence only; this task sets no gate.
 
 This simulation reads an existing candidate audit and estimates evidence changes
 without altering candidates, Qwen calls, routing, references, or exports. The
-`subject_near_silhouette_v1` and `subject_relative_blur_v1` conditions are
-20-case experimental shadow conditions, not production thresholds.
+`subject_near_silhouette_v1` condition is frozen at its original experimental
+values. `subject_relative_blur_v1` is deprecated after a clear high-detail
+candidate satisfied its relative-only thresholds. The current
+`subject_relative_blur_v2` condition requires both relative blur evidence and
+absolute values of at most 50 Laplacian variance and 1500 mean Tenengrad. Both
+active conditions remain shadow-only experiments, not production thresholds.
 
 ```bash
 export SHADOW_SIMULATION="$AUDIT_ROOT/prefilter-shadow-$STAMP.json"
@@ -622,13 +626,78 @@ export SHADOW_REVIEW="$REVIEW_ROOT/prefilter-shadow-$STAMP"
   --mode all
 ```
 
-Available simulation rule modes are `near_silhouette`, `relative_blur`, and
-`all`. Review modes are `near_silhouette`, `relative_blur`,
+Available simulation rule modes are `near_silhouette`, `relative_blur_v2`, and
+`all`. Review modes are `near_silhouette`, `relative_blur_v2`,
 `qwen_selected_flagged`, `all_candidates_flagged`, and `all`. An
 `all_candidates_flagged` state estimates one potentially skippable Qwen call but
 does not skip the call or reject the entity. Pose, DINOv2, and SigLIP2 evidence
 never triggers either shadow condition. Review every shadow case and validate a
 larger audit set before discussing production integration.
+
+### Large-run prefilter shadow validation
+
+Run this only on the server. Start with the known candidate and inspect it before
+selecting it; do not assume an older V3 artifact layout is compatible:
+
+```bash
+export LARGE_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/production500-s0-20260804-030702-d5f42ae5"
+test -f "$LARGE_RUN/run.json" || echo "ERROR: missing large-run run.json"
+find "$LARGE_RUN/clips" -mindepth 2 -maxdepth 3 -type d -name pair -print \
+  | head -20
+```
+
+Set `SOURCE_RUN` to the selected compatible run and `SOURCE_CONFIG` to its exact
+original config. If the preferred run is incompatible, inspect only immediate
+children below `/mnt/workspace/litengjie/data/r2v_v3_runs`; do not search outside
+that root. Require completed pair/candidate artifacts and substantially more
+candidates than the full20 audit.
+
+Use the source snapshot procedure above, then run only cheap CV and optional
+SCRFD/MediaPipe evidence. Do not enable DINOv2, SigLIP2, Qwen, pair, or
+reference-edit stages:
+
+```bash
+export LARGE_AUDIT="$AUDIT_ROOT/prefilter-large-cheap-cv-$STAMP"
+export LARGE_SIMULATION="$AUDIT_ROOT/prefilter-large-shadow-v2-$STAMP.json"
+
+"$MAIN_PYTHON" tools/audit_v3_reference_filters.py \
+  --config "$SOURCE_CONFIG" \
+  --run-root "$SOURCE_RUN" \
+  --output-root "$LARGE_AUDIT" \
+  --artifact-scope candidates \
+  --technical-metrics cheap_cv \
+  --subject-pose-backend scrfd_mediapipe \
+  --subject-pose-python "$POSE_PYTHON" \
+  --subject-pose-code-root "$POSE_ADAPTER_ROOT" \
+  --subject-pose-model-path "$POSE_MODEL_ROOT"
+
+"$MAIN_PYTHON" tools/simulate_v3_reference_prefilter.py \
+  --audit-root "$LARGE_AUDIT" \
+  --output "$LARGE_SIMULATION" \
+  --rule all
+```
+
+Generate only flagged-case boards. Separate mode outputs keep each review set
+small; when a set is large, review at most the first 20-30 deterministic boards
+while retaining the complete case list in the simulation JSON:
+
+```bash
+for MODE in near_silhouette relative_blur_v2 qwen_selected_flagged all_candidates_flagged; do
+  "$MAIN_PYTHON" tools/build_v3_prefilter_shadow_review_board.py \
+    --run-root "$SOURCE_RUN" \
+    --audit-root "$LARGE_AUDIT" \
+    --simulation "$LARGE_SIMULATION" \
+    --output-root "$REVIEW_ROOT/prefilter-large-${MODE}-$STAMP" \
+    --mode "$MODE" \
+    --max-cases 30
+done
+```
+
+Before interpreting results, require both
+`summary.by_reference_type.object.combined_flag_count` and
+`summary.by_reference_type.group.combined_flag_count` to equal zero. Compare the
+before/after source snapshots exactly. These checks still do not authorize a
+production filter.
 
 ## 11. Known technical-only evidence
 

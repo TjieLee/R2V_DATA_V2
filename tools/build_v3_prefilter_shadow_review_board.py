@@ -26,7 +26,7 @@ from tools.build_v3_disagreement_review_board import (
 
 ReviewMode = Literal[
     "near_silhouette",
-    "relative_blur",
+    "relative_blur_v2",
     "qwen_selected_flagged",
     "all_candidates_flagged",
     "all",
@@ -57,12 +57,18 @@ def _parser() -> argparse.ArgumentParser:
         "--mode",
         choices=(
             "near_silhouette",
-            "relative_blur",
+            "relative_blur_v2",
             "qwen_selected_flagged",
             "all_candidates_flagged",
             "all",
         ),
         default="all",
+    )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=30,
+        help="Maximum deterministic flagged cases to render; full lists remain in simulation JSON",
     )
     return parser
 
@@ -132,6 +138,17 @@ def _case_key(value: Mapping[str, object]) -> tuple[str, str, str]:
     )
 
 
+def _relative_blur_rule(candidate: Mapping[str, object]) -> tuple[bool, str | None]:
+    if "relative_blur_v2_flag" in candidate:
+        enabled = candidate.get("relative_blur_v2_flag") is True
+        return enabled, "subject_relative_blur_v2" if enabled else None
+    enabled = candidate.get("relative_blur_flag") is True
+    return (
+        enabled,
+        "subject_relative_blur_v1 (legacy/deprecated)" if enabled else None,
+    )
+
+
 def _selected_cases(
     simulation: Mapping[str, object],
     *,
@@ -152,10 +169,11 @@ def _selected_cases(
         assert isinstance(candidate, dict)
         entity_key = (str(candidate["clip_uid"]), str(candidate["entity_id"]))
         reasons = []
+        relative_blur_flag, relative_blur_rule = _relative_blur_rule(candidate)
         if candidate.get("near_silhouette_flag") is True:
             reasons.append("subject_near_silhouette_v1")
-        if candidate.get("relative_blur_flag") is True:
-            reasons.append("subject_relative_blur_v1")
+        if relative_blur_rule is not None:
+            reasons.append(relative_blur_rule)
         qwen_selected_flagged = bool(
             candidate.get("current_qwen_selected")
             and candidate.get("shadow_flagged")
@@ -163,7 +181,7 @@ def _selected_cases(
         all_candidates_flagged = entity_key in all_flagged_entities
         include = {
             "near_silhouette": bool(candidate.get("near_silhouette_flag")),
-            "relative_blur": bool(candidate.get("relative_blur_flag")),
+            "relative_blur_v2": relative_blur_flag,
             "qwen_selected_flagged": qwen_selected_flagged,
             "all_candidates_flagged": all_candidates_flagged,
             "all": bool(candidate.get("shadow_flagged")),
@@ -308,9 +326,9 @@ def _render_case(
             f"{_format_metric(_mapping_metric(technical, 'dark_fraction_32'))}"
         ),
         (
-            "laplacian="
+            "laplacian_variance="
             f"{_format_metric(_mapping_metric(technical, 'laplacian_variance'))}   "
-            "tenengrad="
+            "tenengrad_mean="
             f"{_format_metric(_mapping_metric(technical, 'tenengrad_mean'))}"
         ),
         (
@@ -386,15 +404,18 @@ def build_prefilter_shadow_review_board(
     simulation: Path,
     output_root: Path,
     mode: ReviewMode = "all",
+    max_cases: int = 30,
 ) -> dict[str, object]:
     if mode not in {
         "near_silhouette",
-        "relative_blur",
+        "relative_blur_v2",
         "qwen_selected_flagged",
         "all_candidates_flagged",
         "all",
     }:
         raise ValueError(f"unsupported shadow review mode: {mode}")
+    if isinstance(max_cases, bool) or max_cases <= 0:
+        raise ValueError("max_cases must be a positive integer")
     source_run = _validated_input_root(run_root, label="run_root")
     source_audit = _validated_input_root(audit_root, label="audit_root")
     source_simulation = _validated_simulation(simulation)
@@ -409,7 +430,8 @@ def build_prefilter_shadow_review_board(
     }
     before_simulation = _sha256(source_simulation)
     simulation_value = _load_simulation(source_simulation, source_audit)
-    cases = _selected_cases(simulation_value, mode=mode)
+    matching_cases = _selected_cases(simulation_value, mode=mode)
+    cases = matching_cases[:max_cases]
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
     if temporary.exists():
@@ -437,6 +459,8 @@ def build_prefilter_shadow_review_board(
             "qwen_calls_added": 0,
             "mode": mode,
             "case_count": len(cases),
+            "matching_case_count": len(matching_cases),
+            "max_cases": max_cases,
             "run_root": str(source_run),
             "audit_root": str(source_audit),
             "simulation": str(source_simulation),
@@ -486,6 +510,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         simulation=arguments.simulation,
         output_root=arguments.output_root,
         mode=arguments.mode,
+        max_cases=arguments.max_cases,
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary

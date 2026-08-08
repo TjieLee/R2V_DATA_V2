@@ -16,11 +16,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from r2v_data_v2.v3.reference_filter_audit import snapshot_run_files
 
-RuleMode = Literal["near_silhouette", "relative_blur", "all"]
+RuleMode = Literal["near_silhouette", "relative_blur_v2", "all"]
 
 ALLOWED_AUDIT_ROOT = Path("/mnt/workspace/litengjie/data/r2v_v3_audits")
 NEAR_SILHOUETTE_RULE = "subject_near_silhouette_v1"
-RELATIVE_BLUR_RULE = "subject_relative_blur_v1"
+RELATIVE_BLUR_V2_RULE = "subject_relative_blur_v2"
 REFERENCE_TYPES = ("subject", "object", "group")
 
 
@@ -32,7 +32,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--rule",
-        choices=("near_silhouette", "relative_blur", "all"),
+        choices=("near_silhouette", "relative_blur_v2", "all"),
         default="all",
     )
     return parser
@@ -119,27 +119,33 @@ def _safe_ratio(value: float | None, maximum: float | None) -> float | None:
     return value / maximum
 
 
-def _subject_relative_blur(
+def _subject_relative_blur_v2(
     reference_type: str,
     laplacian_ratio: float | None,
     tenengrad_ratio: float | None,
+    laplacian_variance: float | None,
+    tenengrad_mean: float | None,
 ) -> bool:
     return bool(
         reference_type == "subject"
         and laplacian_ratio is not None
         and tenengrad_ratio is not None
+        and laplacian_variance is not None
+        and tenengrad_mean is not None
         and laplacian_ratio <= 0.35
         and tenengrad_ratio <= 0.50
+        and laplacian_variance <= 50
+        and tenengrad_mean <= 1500
     )
 
 
 def _enabled_rules(mode: RuleMode) -> tuple[str, ...]:
     if mode == "near_silhouette":
         return (NEAR_SILHOUETTE_RULE,)
-    if mode == "relative_blur":
-        return (RELATIVE_BLUR_RULE,)
+    if mode == "relative_blur_v2":
+        return (RELATIVE_BLUR_V2_RULE,)
     if mode == "all":
-        return (NEAR_SILHOUETTE_RULE, RELATIVE_BLUR_RULE)
+        return (NEAR_SILHOUETTE_RULE, RELATIVE_BLUR_V2_RULE)
     raise ValueError(f"unsupported shadow rule mode: {mode}")
 
 
@@ -161,7 +167,7 @@ def _empty_summary() -> dict[str, int]:
     return {
         "candidate_count": 0,
         "near_silhouette_flag_count": 0,
-        "relative_blur_flag_count": 0,
+        "relative_blur_v2_flag_count": 0,
         "combined_flag_count": 0,
         "entity_count": 0,
         "entity_unchanged_count": 0,
@@ -185,8 +191,8 @@ def _increment_summary(
     summary["near_silhouette_flag_count"] += sum(
         bool(candidate["near_silhouette_flag"]) for candidate in candidates
     )
-    summary["relative_blur_flag_count"] += sum(
-        bool(candidate["relative_blur_flag"]) for candidate in candidates
+    summary["relative_blur_v2_flag_count"] += sum(
+        bool(candidate["relative_blur_v2_flag"]) for candidate in candidates
     )
     summary["combined_flag_count"] += int(entity["flagged_count"])
     summary["entity_count"] += 1
@@ -274,18 +280,20 @@ def _build_simulation(
                 reference_type,
                 record.get("technical_quality"),
             )
-            blur_condition = _subject_relative_blur(
+            blur_condition = _subject_relative_blur_v2(
                 reference_type,
                 laplacian_ratio,
                 tenengrad_ratio,
+                laplacian,
+                tenengrad,
             )
             near_flag = near_condition and NEAR_SILHOUETTE_RULE in enabled
-            blur_flag = blur_condition and RELATIVE_BLUR_RULE in enabled
+            blur_flag = blur_condition and RELATIVE_BLUR_V2_RULE in enabled
             flagged_by = []
             if near_flag:
                 flagged_by.append(NEAR_SILHOUETTE_RULE)
             if blur_flag:
-                flagged_by.append(RELATIVE_BLUR_RULE)
+                flagged_by.append(RELATIVE_BLUR_V2_RULE)
             technical = record.get("technical_quality")
             pose = record.get("subject_pose")
             result = {
@@ -299,7 +307,7 @@ def _build_simulation(
                 "crop_padding_ratio": record.get("crop_padding_ratio"),
                 "current_qwen_selected": bool(record.get("is_current_selected")),
                 "near_silhouette_flag": near_flag,
-                "relative_blur_flag": blur_flag,
+                "relative_blur_v2_flag": blur_flag,
                 "shadow_flagged": bool(flagged_by),
                 "flagged_by": flagged_by,
                 "technical_metrics": (
@@ -376,11 +384,21 @@ def _build_simulation(
         if before_images
         else 0.0
     )
+    summary["flagged_candidate_rate"] = (
+        summary["combined_flag_count"] / summary["candidate_count"]
+        if summary["candidate_count"]
+        else 0.0
+    )
     for values in by_type.values():
         type_before = values["potential_input_images_before"]
         values["potential_input_image_reduction_rate"] = (
             values["potential_input_images_reduced"] / type_before
             if type_before
+            else 0.0
+        )
+        values["flagged_candidate_rate"] = (
+            values["combined_flag_count"] / values["candidate_count"]
+            if values["candidate_count"]
             else 0.0
         )
     summary["by_reference_type"] = by_type
@@ -389,7 +407,9 @@ def _build_simulation(
         candidate for candidate in candidate_results if candidate["near_silhouette_flag"]
     ]
     blur_cases = [
-        candidate for candidate in candidate_results if candidate["relative_blur_flag"]
+        candidate
+        for candidate in candidate_results
+        if candidate["relative_blur_v2_flag"]
     ]
     selected_cases = [
         candidate
@@ -409,19 +429,20 @@ def _build_simulation(
         )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "audit_only": True,
         "production_filtering_applied": False,
         "qwen_calls_added": 0,
         "rule_mode": rule,
         "rules_enabled": list(enabled),
+        "deprecated_rules": ["subject_relative_blur_v1"],
         "source_audit_root": str(audit_root),
         "candidates": candidate_results,
         "entities": entity_results,
         "summary": summary,
         "review_lists": {
             "near_silhouette_cases": near_cases,
-            "relative_blur_cases": blur_cases,
+            "relative_blur_v2_cases": blur_cases,
             "qwen_selected_flagged_cases": selected_cases,
             "all_candidates_flagged_cases": all_flagged_cases,
         },

@@ -25,6 +25,7 @@ from tools.build_v3_prefilter_shadow_review_board import (
 )
 from tools.simulate_v3_reference_prefilter import (
     _subject_near_silhouette,
+    _subject_relative_blur_v2,
     simulate_reference_prefilter,
 )
 
@@ -345,6 +346,43 @@ def test_near_silhouette_requires_all_four_conditions(
     assert _subject_near_silhouette("subject", technical) is expected
 
 
+@pytest.mark.parametrize(
+    (
+        "reference_type",
+        "laplacian_ratio",
+        "tenengrad_ratio",
+        "laplacian_variance",
+        "tenengrad_mean",
+        "expected",
+    ),
+    [
+        ("subject", 0.35, 0.50, 50.0, 1500.0, True),
+        ("subject", 0.30, 0.45, 256.0, 5420.0, False),
+        ("subject", 0.60, 0.70, 25.0, 1000.0, False),
+        ("object", 0.10, 0.10, 5.0, 100.0, False),
+        ("group", 0.10, 0.10, 5.0, 100.0, False),
+    ],
+)
+def test_relative_blur_v2_requires_relative_and_absolute_subject_evidence(
+    reference_type: str,
+    laplacian_ratio: float,
+    tenengrad_ratio: float,
+    laplacian_variance: float,
+    tenengrad_mean: float,
+    expected: bool,
+) -> None:
+    assert (
+        _subject_relative_blur_v2(
+            reference_type,
+            laplacian_ratio,
+            tenengrad_ratio,
+            laplacian_variance,
+            tenengrad_mean,
+        )
+        is expected
+    )
+
+
 def test_shadow_cli_defaults_to_all_rules_and_review_cases() -> None:
     simulation_arguments = simulator_module._parser().parse_args(
         ["--audit-root", "audit", "--output", "simulation.json"]
@@ -364,6 +402,7 @@ def test_shadow_cli_defaults_to_all_rules_and_review_cases() -> None:
 
     assert simulation_arguments.rule == "all"
     assert board_arguments.mode == "all"
+    assert board_arguments.max_cases == 30
 
 
 def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
@@ -387,7 +426,10 @@ def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
         for candidate in candidates
         if candidate["reference_type"] in {"object", "group"}
     ]
-    assert all(candidate["relative_blur_flag"] is False for candidate in object_and_group)
+    assert all(
+        candidate["relative_blur_v2_flag"] is False
+        for candidate in object_and_group
+    )
     assert all(candidate["near_silhouette_flag"] is False for candidate in object_and_group)
     blur_candidate = next(
         candidate
@@ -397,7 +439,7 @@ def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
     )
     assert blur_candidate["laplacian_ratio"] == pytest.approx(0.3)
     assert blur_candidate["tenengrad_ratio"] == pytest.approx(0.45)
-    assert blur_candidate["relative_blur_flag"] is True
+    assert blur_candidate["relative_blur_v2_flag"] is True
     assert blur_candidate["subject_pose_evidence"]["face_detected"] is True
 
     entities = {
@@ -415,7 +457,7 @@ def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
     summary = simulation["summary"]
     assert summary["candidate_count"] == 15
     assert summary["near_silhouette_flag_count"] == 3
-    assert summary["relative_blur_flag_count"] == 3
+    assert summary["relative_blur_v2_flag_count"] == 3
     assert summary["combined_flag_count"] == 6
     assert summary["entity_count"] == 5
     assert summary["entity_unchanged_count"] == 2
@@ -427,12 +469,13 @@ def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
     assert summary["potential_input_images_after"] == 18
     assert summary["potential_input_images_reduced"] == 12
     assert summary["potential_qwen_calls_skipped"] == 1
+    assert summary["flagged_candidate_rate"] == pytest.approx(6 / 15)
     assert summary["by_reference_type"]["object"]["combined_flag_count"] == 0
     assert summary["by_reference_type"]["group"]["combined_flag_count"] == 0
 
     review_lists = simulation["review_lists"]
     assert len(review_lists["near_silhouette_cases"]) == 3
-    assert len(review_lists["relative_blur_cases"]) == 3
+    assert len(review_lists["relative_blur_v2_cases"]) == 3
     assert len(review_lists["qwen_selected_flagged_cases"]) == 2
     assert len(review_lists["all_candidates_flagged_cases"]) == 1
     assert review_lists["all_candidates_flagged_cases"][0]["candidates"][0][
@@ -451,18 +494,47 @@ def test_rule_selection_disables_the_other_shadow_condition(
     )
 
     assert simulation["summary"]["near_silhouette_flag_count"] == 3
-    assert simulation["summary"]["relative_blur_flag_count"] == 0
+    assert simulation["summary"]["relative_blur_v2_flag_count"] == 0
     assert all(
-        candidate["relative_blur_flag"] is False
+        candidate["relative_blur_v2_flag"] is False
         for candidate in simulation["candidates"]
     )
+
+
+def test_review_board_marks_legacy_relative_blur_simulation_as_deprecated() -> None:
+    simulation = {
+        "candidates": [
+            {
+                "clip_uid": "clip-legacy",
+                "entity_id": "e1",
+                "candidate_id": "candidate_1",
+                "relative_blur_flag": True,
+                "shadow_flagged": True,
+                "current_qwen_selected": False,
+            }
+        ],
+        "entities": [
+            {
+                "clip_uid": "clip-legacy",
+                "entity_id": "e1",
+                "shadow_state": "3_to_2",
+            }
+        ],
+    }
+
+    cases = board_module._selected_cases(simulation, mode="relative_blur_v2")
+
+    assert len(cases) == 1
+    assert cases[0]["shadow_rules"] == [
+        "subject_relative_blur_v1 (legacy/deprecated)"
+    ]
 
 
 @pytest.mark.parametrize(
     ("mode", "expected_count"),
     [
         ("near_silhouette", 3),
-        ("relative_blur", 3),
+        ("relative_blur_v2", 3),
         ("qwen_selected_flagged", 2),
         ("all_candidates_flagged", 3),
         ("all", 6),
@@ -500,6 +572,7 @@ def test_shadow_review_board_modes_and_read_only_inputs(
     )
 
     assert summary["case_count"] == expected_count
+    assert summary["matching_case_count"] == expected_count
     assert summary["qwen_calls_added"] == 0
     assert summary["all_inputs_unchanged"] is True
     assert all(snapshot_run_files(root) == before[root] for root in before)
@@ -511,12 +584,41 @@ def test_shadow_review_board_modes_and_read_only_inputs(
         with Image.open(output / cases[0]["board_path"]) as board:
             assert board.size == (1320, 760)
     assert any("shadow rules:" in label for label in labels)
+    if mode in {"relative_blur_v2", "all"}:
+        assert any("subject_relative_blur_v2" in label for label in labels)
+    assert any("laplacian_variance=" in label for label in labels)
+    assert any("tenengrad_mean=" in label for label in labels)
     assert any("lap_ratio=" in label for label in labels)
     forbidden = {"pass", "fail", "drop", "reject"}
     assert not any(label.strip().lower() in forbidden for label in labels)
     assert "V3 Prefilter Shadow Review" in (
         output / "review_index.html"
     ).read_text(encoding="utf-8")
+
+
+def test_shadow_review_board_deterministically_limits_rendered_cases(
+    shadow_inputs: tuple[Path, Path, Path, Path],
+) -> None:
+    run_root, audit_root, audit_parent, review_parent = shadow_inputs
+    simulation_path = audit_parent / "simulation-limited.json"
+    simulate_reference_prefilter(audit_root=audit_root, output=simulation_path)
+
+    summary = build_prefilter_shadow_review_board(
+        run_root=run_root,
+        audit_root=audit_root,
+        simulation=simulation_path,
+        output_root=review_parent / "limited",
+        mode="all",
+        max_cases=1,
+    )
+
+    assert summary["matching_case_count"] == 6
+    assert summary["case_count"] == 1
+    assert summary["max_cases"] == 1
+    cases = json.loads(
+        (review_parent / "limited" / "review_cases.json").read_text()
+    )
+    assert [case["clip_uid"] for case in cases] == ["clip-blur-one"]
 
 
 def test_shadow_tools_contain_no_model_or_production_calls() -> None:
