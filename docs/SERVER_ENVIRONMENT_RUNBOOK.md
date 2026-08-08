@@ -1,6 +1,6 @@
 # R2V V3 Server Environment Runbook
 
-Last updated: 2026-08-06
+Last updated: 2026-08-08
 
 This file is the single source of truth for the Linux server environment used by the V3 pipeline. Update it whenever a virtual environment, source checkout, model path, service endpoint, GPU assignment, startup command, preflight check, or run-root rule changes. Do not reconstruct these values from chat history.
 
@@ -223,6 +223,16 @@ python run_pipeline_v3.py \
   --stages reference_edit \
   --overwrite \
   2>&1 | tee "$PILOT_LOG"
+```
+
+`run_pipeline_v3.py` also supports the optional `--profile` flag. Add it only when observational stage/model-call profiling is wanted; it does not replace any environment export or preflight check. Profiling artifacts are written under the current run root as `profiling/events.jsonl` and `profiling/summary.json`.
+
+```bash
+python run_pipeline_v3.py \
+  --config "$PILOT_CONFIG" \
+  --stages reference_edit \
+  --overwrite \
+  --profile
 ```
 
 Do not start until the pilot paths are valid, SAM3 imports, Qwen responds, no stale worker remains, and the current commit matches `run.json` or a new run root is used.
