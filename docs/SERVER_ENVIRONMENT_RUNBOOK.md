@@ -41,14 +41,14 @@ venv, or import the Boogu runtime into the main R2V process.
 | Component | Purpose | Code/runtime | Model/checkpoint | Endpoint | Scope | Status and notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | R2V main pipeline | V3 orchestration | `/mnt/workspace/litengjie/data/R2V_DATA_V2`; `.venv/bin/python` | Configured local models | Qwen client | Production | Paths CONFIRMED; versions UNVERIFIED |
-| Qwen3-VL / vLLM | Structured VLM requests | vLLM executable and Python env UNVERIFIED | `/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct` | `http://127.0.0.1:8000/v1` | Production service | Model and endpoint CONFIRMED; exact launch runtime UNVERIFIED |
+| Qwen3-VL / vLLM | Structured VLM requests | `/usr/bin/python3 /usr/local/bin/vllm`; resolved Python `/usr/bin/python3.12` | `/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct` | `http://127.0.0.1:8000/v1` | Production service | Launch command and runtime versions CONFIRMED; TP workers used H200 GPUs 0-3 at validation time |
 | SAM3 | Tracking and review | `/mnt/workspace/litengjie/data/vendor/sam3`, imported through `PYTHONPATH` | `/mnt/workspace/public/pretrained/facebook/sam3/sam3.pt` | In-process | Production | Paths CONFIRMED; checkout revision UNVERIFIED |
 | Boogu Image | Reference editing | `/mnt/workspace/litengjie/data/vendor/Boogu-Image`; `/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python` | `/mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708` | Persistent JSONL worker | Production | Source revision `25f8f888298224a94e5ec2abafb98abea9031a0d`; model revision `hotfix-1k-20260708` |
 | DINOv2-large | Representativeness evidence | Main R2V `.venv`; `tools/reference_filter_adapters/transformers_embedding` | `/mnt/workspace/public/pretrained/facebook/dinov2-large` | External audit worker | Audit only | Image encoder only; not a production selector |
 | SigLIP2 | Representativeness evidence | Main R2V `.venv`; same adapter | `/mnt/workspace/litengjie/data/models/siglip2-base-patch16-naflex` | External audit worker | Audit only | Image encoder only; text encoder is not used by this audit |
 | SCRFD | Face detection | Pose venv; `tools/reference_filter_adapters/subject_pose` | `/mnt/workspace/public/pretrained/face_analysis/models/scrfd_10g_bnkps.onnx` | External audit worker | Audit only | Supplied server probe confirms dynamic input and 9 outputs at `640x640` |
-| MediaPipe Face Landmarker | Head pose | Pose venv; same adapter | `/mnt/workspace/public/pretrained/face_analysis/models/face_landmarker_v2_with_blendshapes.task` | External audit worker | Audit only | Real model/API load remains UNVERIFIED in this update |
-| Pose venv | Isolated SCRFD/MediaPipe runtime | `/mnt/workspace/litengjie/data/venvs/r2v-reference-filter/bin/python` | Face-analysis model root above | None | Audit only | Must always run with `env -u PYTHONPATH`; exact versions UNVERIFIED |
+| MediaPipe Face Landmarker | Head pose | Pose venv; same adapter | `/mnt/workspace/public/pretrained/face_analysis/models/face_landmarker_v2_with_blendshapes.task` | External audit worker | Audit only | Model and API creation CONFIRMED; explicit `close()` remains mandatory |
+| Pose venv | Isolated SCRFD/MediaPipe runtime | `/mnt/workspace/litengjie/data/venvs/r2v-reference-filter/bin/python` | Face-analysis model root above | None | Audit only | Versions and clean `pip check` CONFIRMED; must always run with `env -u PYTHONPATH` |
 | OneAlign | No active use | Runtime UNVERIFIED | `/mnt/workspace/public/pretrained/q-future/one-align` | None | Not active | Roughly 16 GB mPLUG-Owl2-family model; unsuitable for the cheap prefilter goal |
 
 The public dataset and pretrained roots are read-only. Never create caches,
@@ -183,12 +183,53 @@ The tracked repository confirms that full-video service startup must include:
 --allowed-local-media-path /mnt/workspace/public/dataset
 ```
 
-The exact vLLM executable, Python environment, version, served-model name,
-tensor-parallel size, dtype, maximum model length, GPU memory utilization, and
-`trust-remote-code` setting are `UNVERIFIED`. The repository's 8B README example
-is not the 32B production command and must not be reused as one. Until the
-following server inspection is captured, this runbook does not authorize a
-vLLM restart from a guessed command.
+Confirmed vLLM runtime:
+
+```text
+command entry point: /usr/bin/python3 /usr/local/bin/vllm
+resolved executable: /usr/bin/python3.12
+Python:              3.12.3
+torch:               2.11.0+cu130
+vllm:                0.24.0
+served model name:   /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+tensor parallel:     4
+max model length:    32768
+max sequences:       1
+GPU memory fraction: 0.90
+execution mode:      enforce eager
+```
+
+The following options were not explicitly set in the confirmed launch command:
+
+```text
+dtype:                not explicitly set in confirmed launch command
+trust_remote_code:    not explicitly set in confirmed launch command
+CUDA_VISIBLE_DEVICES: not explicitly set in confirmed launch command
+```
+
+At validation time, the four active tensor-parallel workers mapped to GPU
+indices `0,1,2,3`; all four devices were NVIDIA H200 GPUs. This observed mapping
+does not imply an unrecorded `CUDA_VISIBLE_DEVICES` setting.
+
+Exact confirmed cold-start command:
+
+```bash
+/usr/bin/python3 /usr/local/bin/vllm serve \
+  /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
+  --served-model-name /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --tensor-parallel-size 4 \
+  --media-io-kwargs '{"video":{"num_frames":-1}}' \
+  --allowed-local-media-path /mnt/workspace/public/dataset \
+  --max-model-len 32768 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.90 \
+  --enforce-eager
+```
+
+The repository's 8B README example is not the production command and must not
+be reused as one.
 
 When the service is running, identify it without broad process termination:
 
@@ -205,8 +246,8 @@ printf '\n'
 ```
 
 Use `/proc/<PID>/environ` only when necessary and never copy credentials or
-tokens into tracked documentation. Record the exact executable, command line,
-and these versions before replacing the `UNVERIFIED` values above:
+tokens into tracked documentation. Reconfirm the executable and versions after
+any service environment change:
 
 ```bash
 VLLM_EXE="$(readlink -f "/proc/$VLLM_PID/exe")"
@@ -226,10 +267,9 @@ Health check:
 curl -fsS --noproxy '*' http://127.0.0.1:8000/v1/models
 ```
 
-Before any future confirmed launch, inspect GPU occupancy with `nvidia-smi` and
-apply `CUDA_VISIBLE_DEVICES=...` only to that single launch command. The exact
-launch command must be copied from confirmed server process or deployment
-records into this section; it is intentionally not fabricated in this update.
+Before launch, inspect GPU occupancy with `nvidia-smi`. Do not add or infer
+`CUDA_VISIBLE_DEVICES`, dtype, or `trust-remote-code` unless the deployed command
+is deliberately changed and revalidated.
 
 For shutdown, first print and inspect `/proc/$VLLM_PID/cmdline`, then terminate
 that specific PID with `kill -TERM "$VLLM_PID"`. Never use `pkill -f python`, a
@@ -255,6 +295,18 @@ Every pose command must remove the production shell's `PYTHONPATH`:
 ```bash
 env -u PYTHONPATH "$POSE_PYTHON" -m pip check
 env -u PYTHONPATH "$POSE_PYTHON" -m pip show sam3
+```
+
+Confirmed pose runtime:
+
+```text
+Python:      3.12.3
+numpy:       2.5.1
+Pillow:      12.3.0
+opencv/cv2:  5.0.0
+onnxruntime: 1.28.0
+mediapipe:   1.0.0
+pip check:   No broken requirements found.
 ```
 
 The expected `sam3` result is `Package(s) not found`. Do not install SAM3 here.
@@ -324,12 +376,12 @@ reference-filter worker calls an adapter scorer's optional `close()` method from
 a single `finally` block on shutdown, stdin EOF, or worker exit. DINOv2 and
 SigLIP2 adapters do not need to implement `close()`.
 
-Supplied server evidence already confirms that the SCRFD ONNX file loads and a
-`(1,3,640,640)` probe returns 9 tensors with rows `12800`, `3200`, and `800` for
-score, bbox, and 5-landmark heads. The adapter now uses fixed `640x640` for
-dynamic H/W. Real adapter load, Face Landmarker load, detection rate, pose
-runtime, and exact package versions remain `UNVERIFIED` until the commands above
-are run on the server.
+Server evidence confirms that the SCRFD ONNX file and MediaPipe FaceLandmarker
+both load successfully. A `(1,3,640,640)` SCRFD probe returns 9 tensors with rows
+`12800`, `3200`, and `800` for score, bbox, and 5-landmark heads. The adapter uses
+fixed `640x640` for dynamic H/W. Package versions and dependency consistency are
+confirmed above. Real candidate detection rate and per-image pose runtime remain
+`UNVERIFIED` until the candidate audit is completed.
 
 ## 7. Cold-start order
 
