@@ -1182,6 +1182,119 @@ def _selected_analysis(records: list[dict[str, object]]) -> dict[str, object]:
     return result
 
 
+def _selected_representativeness_rank_analysis(
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for record in records:
+        if record["artifact_scope"] != "candidate":
+            continue
+        groups.setdefault(
+            (str(record["clip_uid"]), str(record["entity_id"])),
+            [],
+        ).append(record)
+    cases: list[dict[str, object]] = []
+    for (clip_uid, entity_id), group in sorted(groups.items()):
+        selected = next(
+            (record for record in group if record["is_current_selected"]),
+            None,
+        )
+        scored = [
+            (record, score)
+            for record in group
+            if (
+                score := _successful_metric(
+                    record,
+                    "embedding",
+                    "representativeness_score",
+                )
+            )
+            is not None
+        ]
+        if selected is None or len(scored) != len(group):
+            continue
+        ranked = sorted(
+            scored,
+            key=lambda item: (-item[1], str(item[0].get("candidate_id"))),
+        )
+        selected_rank = next(
+            index
+            for index, (record, _) in enumerate(ranked, start=1)
+            if record is selected
+        )
+        baseline = selected.get("production_baseline")
+        cases.append(
+            {
+                "clip_uid": clip_uid,
+                "entity_id": entity_id,
+                "reference_type": selected["reference_type"],
+                "production_selected_candidate_id": selected["candidate_id"],
+                "selected_rank": selected_rank,
+                "candidate_count": len(group),
+                "representativeness_values": [
+                    {
+                        "candidate_id": record["candidate_id"],
+                        "representativeness_score": score,
+                    }
+                    for record, score in sorted(
+                        scored,
+                        key=lambda item: str(item[0].get("candidate_id")),
+                    )
+                ],
+                "production_completeness": (
+                    baseline.get("completeness")
+                    if isinstance(baseline, Mapping)
+                    else None
+                ),
+                "production_reference_scope": (
+                    baseline.get("reference_scope")
+                    if isinstance(baseline, Mapping)
+                    else None
+                ),
+                "production_viewpoint": (
+                    baseline.get("viewpoint")
+                    if isinstance(baseline, Mapping)
+                    else None
+                ),
+            }
+        )
+
+    def summarize(values: list[dict[str, object]]) -> dict[str, object]:
+        counts = {
+            f"selected_rank_{rank}_count": sum(
+                case["selected_rank"] == rank for case in values
+            )
+            for rank in (1, 2, 3)
+        }
+        denominator = len(values)
+        return {
+            "entity_count": denominator,
+            **counts,
+            "selected_rank_1_rate": (
+                counts["selected_rank_1_count"] / denominator
+                if denominator
+                else None
+            ),
+        }
+
+    by_reference_type = {
+        reference_type: summarize(
+            [case for case in cases if case["reference_type"] == reference_type]
+        )
+        for reference_type in ("subject", "object", "group")
+    }
+    return {
+        **summarize(cases),
+        "by_reference_type": by_reference_type,
+        "cases": cases,
+        "selected_rank_last_cases": [
+            case
+            for case in cases
+            if case["selected_rank"] == case["candidate_count"]
+        ],
+    }
+
+
 def _pose_by_production_viewpoint(
     records: list[dict[str, object]],
 ) -> dict[str, object]:
@@ -1329,6 +1442,17 @@ def _summary(
         for record in records
         if (str(record["clip_uid"]), str(record["entity_id"])) in _FOCUS_CASES
     ]
+    visual_runtime = _runtime_summary(runtimes["embedding"])
+    mean_embedding_seconds = visual_runtime["mean_s"]
+    visual_runtime["estimated_seconds_per_three_candidate_entity"] = (
+        float(mean_embedding_seconds) * 3
+        if isinstance(mean_embedding_seconds, (int, float))
+        else None
+    )
+    visual_runtime["embedding_seconds_per_entity"] = visual_runtime[
+        "estimated_seconds_per_three_candidate_entity"
+    ]
+    visual_runtime["candidate_images_per_entity_assumption"] = 3
     return {
         "schema_version": 1,
         "audit_only": True,
@@ -1357,6 +1481,31 @@ def _summary(
                 "representativeness_score",
                 "inter_entity_margin",
             ),
+        ),
+        "embedding_dimensions": sorted(
+            {
+                int(dimension)
+                for record in records
+                if (
+                    dimension := _successful_metric(
+                        record,
+                        "embedding",
+                        "embedding_dimension",
+                    )
+                )
+                is not None
+            }
+        ),
+        "representativeness_definition": {
+            "formula": "mean cosine similarity to other same-entity candidates",
+            "centroid_value_equivalent": False,
+            "centroid_rank_equivalent": True,
+            "centroid_rank_equivalence_scope": (
+                "same normalized candidate set with a nonzero centroid"
+            ),
+        },
+        "selected_representativeness_rank": (
+            _selected_representativeness_rank_analysis(candidates)
         ),
         "subject_pose": {
             "face_detect_rate": (
@@ -1445,7 +1594,7 @@ def _summary(
         },
         "runtime": {
             "quality_model": _runtime_summary(runtimes["quality"]),
-            "visual_encoder": _runtime_summary(runtimes["embedding"]),
+            "visual_encoder": visual_runtime,
             "subject_pose": _runtime_summary(runtimes["subject_pose"]),
             "qwen_candidate_reference_mean_seconds": "approximately 10-12",
         },

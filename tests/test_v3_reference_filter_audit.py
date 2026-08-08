@@ -522,6 +522,24 @@ def test_quality_embedding_and_pose_features_remain_independent(
     assert summary["selected_vs_non_selected"][
         "selected_is_highest_quality_denominator"
     ] == 3
+    assert summary["embedding_dimensions"] == [2]
+    assert summary["representativeness_definition"] == {
+        "formula": "mean cosine similarity to other same-entity candidates",
+        "centroid_value_equivalent": False,
+        "centroid_rank_equivalent": True,
+        "centroid_rank_equivalence_scope": (
+            "same normalized candidate set with a nonzero centroid"
+        ),
+    }
+    rank = summary["selected_representativeness_rank"]
+    assert rank["entity_count"] == 3
+    assert rank["selected_rank_1_count"] == 3
+    assert rank["selected_rank_1_rate"] == 1.0
+    assert rank["by_reference_type"]["object"]["selected_rank_1_rate"] == 1.0
+    assert rank["selected_rank_last_cases"] == []
+    assert summary["runtime"]["visual_encoder"][
+        "estimated_seconds_per_three_candidate_entity"
+    ] == pytest.approx(0.06)
 
 
 def test_single_entity_margin_is_null_and_cosine_is_exact(
@@ -689,3 +707,43 @@ def test_cli_defaults_all_model_backends_to_none() -> None:
     assert arguments.embedding_backend == "none"
     assert arguments.subject_pose_backend == "none"
     assert arguments.discover_local_models is False
+
+
+def test_selected_representativeness_rank_records_last_place_anomaly() -> None:
+    records = []
+    for candidate_id, score in (
+        ("candidate_1", 0.1),
+        ("candidate_2", 0.9),
+        ("candidate_3", 0.5),
+    ):
+        records.append(
+            {
+                "clip_uid": "clip-a",
+                "entity_id": "e1",
+                "reference_type": "object",
+                "artifact_scope": "candidate",
+                "candidate_id": candidate_id,
+                "is_current_selected": candidate_id == "candidate_1",
+                "embedding": {
+                    "status": "succeeded",
+                    "representativeness_score": score,
+                },
+                "production_baseline": {
+                    "completeness": "complete",
+                    "reference_scope": "full",
+                    "viewpoint": "not_applicable",
+                },
+            }
+        )
+
+    result = audit_module._selected_representativeness_rank_analysis(records)
+
+    assert result["selected_rank_3_count"] == 1
+    assert result["selected_rank_1_rate"] == 0.0
+    assert result["by_reference_type"]["object"]["selected_rank_3_count"] == 1
+    assert result["selected_rank_last_cases"] == result["cases"]
+    assert result["cases"][0]["representativeness_values"] == [
+        {"candidate_id": "candidate_1", "representativeness_score": 0.1},
+        {"candidate_id": "candidate_2", "representativeness_score": 0.9},
+        {"candidate_id": "candidate_3", "representativeness_score": 0.5},
+    ]
