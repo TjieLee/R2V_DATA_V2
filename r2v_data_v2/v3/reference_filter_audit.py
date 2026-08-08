@@ -64,6 +64,7 @@ _FOCUS_CASES = frozenset(
 )
 
 ArtifactScope = Literal["candidates", "final", "both"]
+TechnicalMetricsMode = Literal["none", "cheap_cv"]
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,11 @@ class SubjectPoseObservation:
     runtime_seconds: float
     subject_view_quality_score: float | None = None
     raw_metrics: Mapping[str, object] | None = None
+    face_count: int | None = None
+    scrfd_success: bool | None = None
+    face_landmarker_success: bool | None = None
+    scrfd_runtime_seconds: float | None = None
+    face_landmarker_runtime_seconds: float | None = None
 
     def __post_init__(self) -> None:
         numeric = (
@@ -154,6 +160,8 @@ class SubjectPoseObservation:
             self.pitch,
             self.roll,
             self.subject_view_quality_score,
+            self.scrfd_runtime_seconds,
+            self.face_landmarker_runtime_seconds,
         )
         if any(value is not None and not math.isfinite(value) for value in numeric):
             raise ValueError("subject pose values must be finite when present")
@@ -167,8 +175,20 @@ class SubjectPoseObservation:
             raise ValueError("face area ratio must be between zero and one")
         if not math.isfinite(self.runtime_seconds) or self.runtime_seconds < 0:
             raise ValueError("subject pose runtime must be finite and non-negative")
+        if any(
+            value is not None and value < 0
+            for value in (
+                self.scrfd_runtime_seconds,
+                self.face_landmarker_runtime_seconds,
+            )
+        ):
+            raise ValueError("subject component runtimes must be non-negative")
         if not self.pose_backend.strip() or not self.model_name.strip():
             raise ValueError("pose backend and model name must not be empty")
+        if self.face_count is not None and self.face_count < 0:
+            raise ValueError("face count must be non-negative")
+        if self.face_detected and self.face_count == 0:
+            raise ValueError("a detected face requires a positive face count")
 
 
 class ReferenceQualityScorer(Protocol):
@@ -335,6 +355,17 @@ class ExternalReferenceFilterScorer:
                 result.get("subject_view_quality_score")
             ),
             raw_metrics=_mapping_value(result.get("raw_metrics")),
+            face_count=_optional_int(result.get("face_count")),
+            scrfd_success=_optional_bool(result.get("scrfd_success")),
+            face_landmarker_success=_optional_bool(
+                result.get("face_landmarker_success")
+            ),
+            scrfd_runtime_seconds=_optional_float(
+                result.get("scrfd_runtime_seconds")
+            ),
+            face_landmarker_runtime_seconds=_optional_float(
+                result.get("face_landmarker_runtime_seconds")
+            ),
         )
 
     def close(self) -> None:
@@ -366,6 +397,10 @@ def _optional_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _optional_int(value: object) -> int | None:
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class ReadOnlyAuditStorage(RunStorage):
     def frame_path(self, clip_uid: str, frame_slot: int) -> Path:
         self._require_clip(clip_uid)
@@ -379,6 +414,8 @@ class _Artifact:
     record: dict[str, object]
     image: Image.Image
     image_sha256: str
+    foreground_rgb: np.ndarray | None = None
+    foreground_mask: np.ndarray | None = None
     embedding_vector: np.ndarray | None = None
 
 
@@ -413,6 +450,129 @@ def _white_composite(image: Image.Image) -> Image.Image:
     rgba = image.convert("RGBA")
     background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
     return Image.alpha_composite(background, rgba).convert("RGB")
+
+
+def _erode_binary_mask(mask: np.ndarray, pixels: int) -> np.ndarray:
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 2 or not binary.any():
+        raise ValueError("foreground mask must be a non-empty two-dimensional array")
+    if pixels < 0:
+        raise ValueError("mask erosion pixels must be non-negative")
+    if pixels == 0:
+        return binary.copy()
+    size = pixels * 2 + 1
+    padded = np.pad(binary, pixels, mode="constant", constant_values=False)
+    eroded = np.ones_like(binary, dtype=bool)
+    for row_offset in range(size):
+        for column_offset in range(size):
+            eroded &= padded[
+                row_offset : row_offset + binary.shape[0],
+                column_offset : column_offset + binary.shape[1],
+            ]
+    return eroded
+
+
+def cheap_foreground_technical_metrics(
+    source_rgb: np.ndarray,
+    foreground_mask: np.ndarray,
+) -> dict[str, object]:
+    source = np.asarray(source_rgb)
+    mask = np.asarray(foreground_mask, dtype=bool)
+    if source.ndim != 3 or source.shape[2] != 3 or source.dtype != np.uint8:
+        raise ValueError("technical metric source must be an H-W uint8 RGB array")
+    if mask.shape != source.shape[:2] or not mask.any():
+        raise ValueError("technical metric mask must match source and be non-empty")
+
+    source_float = source.astype(np.float64, copy=False)
+    luma = (
+        0.299 * source_float[..., 0]
+        + 0.587 * source_float[..., 1]
+        + 0.114 * source_float[..., 2]
+    )
+    foreground_luma = luma[mask]
+    foreground_rgb = source_float[mask]
+    channel_max = np.max(foreground_rgb, axis=1)
+    channel_min = np.min(foreground_rgb, axis=1)
+    saturation = np.divide(
+        channel_max - channel_min,
+        channel_max,
+        out=np.zeros_like(channel_max),
+        where=channel_max > 0,
+    )
+
+    gradient_mask = _erode_binary_mask(mask, 2)
+    gradient_mask_fallback = not gradient_mask.any()
+    if gradient_mask_fallback:
+        gradient_mask = mask
+    padded = np.pad(luma, 1, mode="edge")
+    laplacian = (
+        padded[:-2, 1:-1]
+        + padded[2:, 1:-1]
+        + padded[1:-1, :-2]
+        + padded[1:-1, 2:]
+        - 4.0 * padded[1:-1, 1:-1]
+    )
+    sobel_x = (
+        -padded[:-2, :-2]
+        + padded[:-2, 2:]
+        - 2.0 * padded[1:-1, :-2]
+        + 2.0 * padded[1:-1, 2:]
+        - padded[2:, :-2]
+        + padded[2:, 2:]
+    )
+    sobel_y = (
+        -padded[:-2, :-2]
+        - 2.0 * padded[:-2, 1:-1]
+        - padded[:-2, 2:]
+        + padded[2:, :-2]
+        + 2.0 * padded[2:, 1:-1]
+        + padded[2:, 2:]
+    )
+    gradient_squared = sobel_x * sobel_x + sobel_y * sobel_y
+    gradient_magnitude = np.sqrt(gradient_squared)
+    rows, columns = np.nonzero(mask)
+    percentiles = np.quantile(
+        foreground_luma,
+        (0.05, 0.10, 0.50, 0.90, 0.95),
+    )
+    values: dict[str, object] = {
+        "status": "succeeded",
+        "backend": "cheap_cv",
+        "foreground_pixel_count": int(mask.sum()),
+        "luma_mean": float(np.mean(foreground_luma)),
+        "luma_std": float(np.std(foreground_luma)),
+        "luma_p05": float(percentiles[0]),
+        "luma_p10": float(percentiles[1]),
+        "luma_p50": float(percentiles[2]),
+        "luma_p90": float(percentiles[3]),
+        "luma_p95": float(percentiles[4]),
+        "dark_fraction_16": float(np.mean(foreground_luma <= 16.0)),
+        "dark_fraction_32": float(np.mean(foreground_luma <= 32.0)),
+        "dark_fraction_48": float(np.mean(foreground_luma <= 48.0)),
+        "black_clip_fraction": float(np.mean(foreground_luma <= 1.0)),
+        "white_clip_fraction": float(np.mean(foreground_luma >= 254.0)),
+        "rms_contrast": float(np.std(foreground_luma)),
+        "laplacian_variance": float(np.var(laplacian[gradient_mask])),
+        "tenengrad_mean": float(np.mean(gradient_squared[gradient_mask])),
+        "edge_density": float(
+            np.mean(gradient_magnitude[gradient_mask] >= 20.0)
+        ),
+        "saturation_mean": float(np.mean(saturation)),
+        "saturation_std": float(np.std(saturation)),
+        "foreground_bbox_width": int(columns.max() - columns.min() + 1),
+        "foreground_bbox_height": int(rows.max() - rows.min() + 1),
+        "gradient_mask_erosion_pixels": 2,
+        "gradient_foreground_pixel_count": int(gradient_mask.sum()),
+        "gradient_mask_fallback": gradient_mask_fallback,
+        "edge_threshold_luma": 20.0,
+    }
+    if not all(
+        math.isfinite(value)
+        for value in values.values()
+        if isinstance(value, float)
+    ):
+        raise ValueError("technical metrics must be finite")
+    return values
 
 
 def _resolve_run_artifact(root: Path, relative_path: str) -> Path:
@@ -764,12 +924,21 @@ def _collect_artifacts(
                 for candidate in candidates:
                     source_path = _resolve_run_artifact(root, candidate.image_path)
                     source = _load_rgb(source_path)
-                    crop, _ = pair_module.build_reference_crop(
+                    crop, crop_box = pair_module.build_reference_crop(
                         source,
                         candidate.mask,
                         crop_padding_ratio=config.pair.crop_padding_ratio,
                     )
                     image = _white_composite(crop)
+                    left, top, right, bottom = crop_box
+                    source_crop = np.asarray(source, dtype=np.uint8)[
+                        top:bottom,
+                        left:right,
+                    ].copy()
+                    mask_crop = np.asarray(candidate.mask, dtype=bool)[
+                        top:bottom,
+                        left:right,
+                    ].copy()
                     detached_signal = bool(
                         _subject_detached_signal(candidate, pair_module)
                         if entity.reference_type == "subject"
@@ -782,11 +951,14 @@ def _collect_artifacts(
                         baseline=baseline,
                         detached_signal=detached_signal,
                     )
+                    record["crop_padding_ratio"] = config.pair.crop_padding_ratio
                     artifacts.append(
                         _Artifact(
                             record=record,
                             image=image,
                             image_sha256=_image_sha256(image),
+                            foreground_rgb=source_crop,
+                            foreground_mask=mask_crop,
                         )
                     )
         if include_final:
@@ -841,9 +1013,15 @@ def _quality_dict(observation: QualityObservation) -> dict[str, object]:
 
 
 def _pose_dict(observation: SubjectPoseObservation) -> dict[str, object]:
+    face_count = (
+        observation.face_count
+        if observation.face_count is not None
+        else int(observation.face_detected)
+    )
     return {
         "status": "succeeded",
         "face_detected": observation.face_detected,
+        "face_count": face_count,
         "face_detection_confidence": observation.face_detection_confidence,
         "face_bbox_area_ratio": observation.face_bbox_area_ratio,
         "head_visible": observation.head_visible,
@@ -853,6 +1031,12 @@ def _pose_dict(observation: SubjectPoseObservation) -> dict[str, object]:
         "pose_backend": observation.pose_backend,
         "model_name": observation.model_name,
         "runtime_seconds": observation.runtime_seconds,
+        "scrfd_success": observation.scrfd_success,
+        "face_landmarker_success": observation.face_landmarker_success,
+        "scrfd_runtime_seconds": observation.scrfd_runtime_seconds,
+        "face_landmarker_runtime_seconds": (
+            observation.face_landmarker_runtime_seconds
+        ),
         "subject_view_quality_score": observation.subject_view_quality_score,
         "raw_metrics": dict(observation.raw_metrics or {}),
     }
@@ -870,6 +1054,7 @@ def _embedding_cache_path(
 def _score_artifacts(
     artifacts: list[_Artifact],
     *,
+    technical_metrics: TechnicalMetricsMode,
     quality_backend: str,
     embedding_backend: str,
     subject_pose_backend: str,
@@ -880,9 +1065,53 @@ def _score_artifacts(
     fail_fast: bool,
     clock: Callable[[], float],
 ) -> dict[str, list[float]]:
-    runtimes = {"quality": [], "embedding": [], "subject_pose": []}
+    runtimes = {
+        "technical_metrics": [],
+        "quality": [],
+        "embedding": [],
+        "subject_pose": [],
+    }
     for artifact in artifacts:
         record = artifact.record
+        if technical_metrics == "none":
+            pass
+        elif artifact.record["artifact_scope"] != "candidate":
+            record["technical_quality"] = {
+                "status": "not_applicable",
+                "reason": "foreground mask is only available for candidates",
+            }
+        else:
+            started = clock()
+            try:
+                if artifact.foreground_rgb is None or artifact.foreground_mask is None:
+                    raise ValueError("candidate foreground evidence is unavailable")
+                technical = cheap_foreground_technical_metrics(
+                    artifact.foreground_rgb,
+                    artifact.foreground_mask,
+                )
+                elapsed = clock() - started
+                if elapsed < 0:
+                    raise ValueError("audit clock moved backwards")
+                technical["runtime_seconds"] = elapsed
+                existing_sharpness = record.get("sharpness_score")
+                technical["existing_sharpness_score"] = (
+                    float(existing_sharpness)
+                    if isinstance(existing_sharpness, (int, float))
+                    else None
+                )
+                record["technical_quality"] = technical
+                runtimes["technical_metrics"].append(elapsed)
+            except Exception as exc:
+                elapsed = max(0.0, clock() - started)
+                runtimes["technical_metrics"].append(elapsed)
+                if fail_fast:
+                    raise
+                record["technical_quality"] = _failure(
+                    "cheap_cv",
+                    exc,
+                    elapsed,
+                )
+
         if quality_backend == "none":
             record["quality"] = {"status": "disabled", "backend": "none"}
         elif quality_scorer is None:
@@ -1409,10 +1638,78 @@ def _review_list(
     ]
 
 
+def _extreme_review_list(
+    records: list[dict[str, object]],
+    section: str,
+    field: str,
+    *,
+    descending: bool = False,
+    absolute: bool = False,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    values = [
+        (record, value)
+        for record in records
+        if (value := _successful_metric(record, section, field)) is not None
+    ]
+    values.sort(
+        key=lambda item: (
+            -(abs(item[1]) if absolute else item[1])
+            if descending
+            else (abs(item[1]) if absolute else item[1]),
+            str(item[0]["clip_uid"]),
+            str(item[0]["entity_id"]),
+            str(item[0].get("candidate_id")),
+        )
+    )
+    return [
+        {
+            "clip_uid": record["clip_uid"],
+            "entity_id": record["entity_id"],
+            "reference_type": record["reference_type"],
+            "artifact_scope": record["artifact_scope"],
+            "candidate_id": record.get("candidate_id"),
+            "value": value,
+        }
+        for record, value in values[:limit]
+    ]
+
+
+def _no_face_review_list(
+    records: list[dict[str, object]],
+    *,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    values = [
+        record
+        for record in records
+        if isinstance(record.get("subject_pose"), Mapping)
+        and record["subject_pose"].get("status") == "succeeded"
+        and record["subject_pose"].get("scrfd_success") is not False
+        and record["subject_pose"].get("face_detected") is False
+    ]
+    values.sort(
+        key=lambda record: (
+            str(record["clip_uid"]),
+            str(record["entity_id"]),
+            str(record.get("candidate_id")),
+        )
+    )
+    return [
+        {
+            "clip_uid": record["clip_uid"],
+            "entity_id": record["entity_id"],
+            "reference_type": record["reference_type"],
+            "artifact_scope": record["artifact_scope"],
+            "candidate_id": record.get("candidate_id"),
+        }
+        for record in values[:limit]
+    ]
 def _summary(
     records: list[dict[str, object]],
     *,
     artifact_scope: ArtifactScope,
+    technical_metrics: TechnicalMetricsMode,
     quality_backend: str,
     embedding_backend: str,
     subject_pose_backend: str,
@@ -1422,6 +1719,9 @@ def _summary(
 ) -> dict[str, object]:
     candidates = [
         record for record in records if record["artifact_scope"] == "candidate"
+    ]
+    subject_candidates = [
+        record for record in candidates if record["reference_type"] == "subject"
     ]
     subjects = [record for record in records if record["reference_type"] == "subject"]
     face_detected = [
@@ -1436,6 +1736,15 @@ def _summary(
         for record in subjects
         if isinstance(record.get("subject_pose"), Mapping)
         and record["subject_pose"].get("status") == "succeeded"
+    ]
+    candidate_pose_succeeded = [
+        record
+        for record in pose_succeeded
+        if record in subject_candidates
+        and record["subject_pose"].get("scrfd_success") is not False
+    ]
+    candidate_face_detected = [
+        record for record in face_detected if record in subject_candidates
     ]
     focus_cases = [
         record
@@ -1463,6 +1772,7 @@ def _summary(
         "final_reference_count": len(records) - len(candidates),
         "source_run_unchanged": source_unchanged,
         "backends": {
+            "technical_metrics": technical_metrics,
             "quality": quality_backend,
             "embedding": embedding_backend,
             "subject_pose": subject_pose_backend,
@@ -1473,6 +1783,31 @@ def _summary(
             "quality",
             ("quality_score", "aesthetic_score"),
         ),
+        "technical_quality_distributions": {
+            field: _distribution(
+                [
+                    value
+                    for record in candidates
+                    if (
+                        value := _successful_metric(
+                            record,
+                            "technical_quality",
+                            field,
+                        )
+                    )
+                    is not None
+                ]
+            )
+            for field in (
+                "luma_mean",
+                "dark_fraction_16",
+                "dark_fraction_32",
+                "rms_contrast",
+                "laplacian_variance",
+                "tenengrad_mean",
+                "edge_density",
+            )
+        },
         "embedding_distributions": _distributions_by_type(
             records,
             "embedding",
@@ -1508,9 +1843,11 @@ def _summary(
             _selected_representativeness_rank_analysis(candidates)
         ),
         "subject_pose": {
+            "subject_count": len(subject_candidates),
+            "face_detect_count": len(candidate_face_detected),
             "face_detect_rate": (
-                len(face_detected) / len(pose_succeeded)
-                if pose_succeeded
+                len(candidate_face_detected) / len(candidate_pose_succeeded)
+                if candidate_pose_succeeded
                 else None
             ),
             "face_area_ratio": _distribution(
@@ -1551,6 +1888,16 @@ def _summary(
                     is not None
                 ]
             ),
+            "roll": _distribution(
+                [
+                    value
+                    for record in subjects
+                    if (
+                        value := _successful_metric(record, "subject_pose", "roll")
+                    )
+                    is not None
+                ]
+            ),
             "production_viewpoint_association": _pose_by_production_viewpoint(
                 subjects
             ),
@@ -1559,6 +1906,45 @@ def _summary(
         "production_route_analysis": _route_analysis(records),
         "focus_cases": focus_cases,
         "review_lists": {
+            "darkest_candidates": _extreme_review_list(
+                candidates,
+                "technical_quality",
+                "luma_mean",
+            ),
+            "highest_dark_fraction_candidates": _extreme_review_list(
+                candidates,
+                "technical_quality",
+                "dark_fraction_32",
+                descending=True,
+            ),
+            "lowest_laplacian_candidates": _extreme_review_list(
+                candidates,
+                "technical_quality",
+                "laplacian_variance",
+            ),
+            "lowest_tenengrad_candidates": _extreme_review_list(
+                candidates,
+                "technical_quality",
+                "tenengrad_mean",
+            ),
+            "lowest_contrast_candidates": _extreme_review_list(
+                candidates,
+                "technical_quality",
+                "rms_contrast",
+            ),
+            "no_face_candidates": _no_face_review_list(subject_candidates),
+            "smallest_face_candidates": _extreme_review_list(
+                subject_candidates,
+                "subject_pose",
+                "face_bbox_area_ratio",
+            ),
+            "largest_abs_yaw_candidates": _extreme_review_list(
+                subject_candidates,
+                "subject_pose",
+                "yaw",
+                descending=True,
+                absolute=True,
+            ),
             "bottom_10_percent_quality": _review_list(
                 records,
                 "quality",
@@ -1593,9 +1979,38 @@ def _summary(
             ),
         },
         "runtime": {
+            "technical_metrics": _runtime_summary(runtimes["technical_metrics"]),
             "quality_model": _runtime_summary(runtimes["quality"]),
             "visual_encoder": visual_runtime,
             "subject_pose": _runtime_summary(runtimes["subject_pose"]),
+            "scrfd": _runtime_summary(
+                [
+                    value
+                    for record in subject_candidates
+                    if (
+                        value := _successful_metric(
+                            record,
+                            "subject_pose",
+                            "scrfd_runtime_seconds",
+                        )
+                    )
+                    is not None
+                ]
+            ),
+            "face_landmarker": _runtime_summary(
+                [
+                    value
+                    for record in subject_candidates
+                    if (
+                        value := _successful_metric(
+                            record,
+                            "subject_pose",
+                            "face_landmarker_runtime_seconds",
+                        )
+                    )
+                    is not None
+                ]
+            ),
             "qwen_candidate_reference_mean_seconds": "approximately 10-12",
         },
         "thresholds_applied": False,
@@ -1638,6 +2053,7 @@ def run_reference_filter_audit(
     run_root: Path,
     output_root: Path,
     artifact_scope: ArtifactScope = "both",
+    technical_metrics: TechnicalMetricsMode = "none",
     quality_backend: str = "none",
     embedding_backend: str = "none",
     subject_pose_backend: str = "none",
@@ -1650,6 +2066,8 @@ def run_reference_filter_audit(
 ) -> dict[str, object]:
     if artifact_scope not in {"candidates", "final", "both"}:
         raise ValueError("audit artifact_scope is invalid")
+    if technical_metrics not in {"none", "cheap_cv"}:
+        raise ValueError("audit technical_metrics mode is invalid")
     source = run_root.expanduser().resolve(strict=True)
     destination = _validated_output_root(output_root, source)
     before = snapshot_run_files(source)
@@ -1666,6 +2084,7 @@ def run_reference_filter_audit(
         artifacts = _collect_artifacts(replay_config, storage, artifact_scope)
         runtimes = _score_artifacts(
             artifacts,
+            technical_metrics=technical_metrics,
             quality_backend=quality_backend,
             embedding_backend=embedding_backend,
             subject_pose_backend=subject_pose_backend,
@@ -1685,6 +2104,7 @@ def run_reference_filter_audit(
         summary = _summary(
             records,
             artifact_scope=artifact_scope,
+            technical_metrics=technical_metrics,
             quality_backend=quality_backend,
             embedding_backend=embedding_backend,
             subject_pose_backend=subject_pose_backend,

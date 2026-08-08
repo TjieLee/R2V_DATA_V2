@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
 
 import r2v_data_v2.v3.config as config_module
 import r2v_data_v2.v3.pair as pair_module
@@ -30,6 +30,7 @@ from r2v_data_v2.v3.reference_filter_audit import (
     ExternalReferenceFilterScorer,
     QualityObservation,
     SubjectPoseObservation,
+    cheap_foreground_technical_metrics,
     cosine_similarity,
     discover_local_models,
     run_reference_filter_audit,
@@ -366,8 +367,12 @@ class FakePoseScorer:
     backend = "fake_pose"
     model_name = "fake-subject-pose"
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     def inspect(self, image: Image.Image) -> SubjectPoseObservation:
         del image
+        self.calls += 1
         return SubjectPoseObservation(
             face_detected=True,
             face_detection_confidence=0.95,
@@ -380,6 +385,8 @@ class FakePoseScorer:
             model_name=self.model_name,
             runtime_seconds=0.03,
             subject_view_quality_score=0.8,
+            scrfd_runtime_seconds=0.01,
+            face_landmarker_runtime_seconds=0.02,
         )
 
 
@@ -443,6 +450,7 @@ def test_audit_is_read_only_and_reuses_production_candidate_order(
     assert summary["final_reference_count"] == 3
     assert summary["qwen_calls_added"] == 0
     candidates = [item for item in records if item["artifact_scope"] == "candidate"]
+    assert all("technical_quality" not in item for item in candidates)
     assert [item["candidate_id"] for item in candidates] == [
         "candidate_1",
         "candidate_2",
@@ -466,7 +474,8 @@ def test_quality_embedding_and_pose_features_remain_independent(
     storage.initialize(git_commit="source-run")
     _add_clip(storage)
     output = audit_module.ALLOWED_AUDIT_ROOT / "audit-features"
-    run_reference_filter_audit(
+    pose_scorer = FakePoseScorer()
+    summary = run_reference_filter_audit(
         config,
         run_root=storage.root,
         output_root=output,
@@ -476,7 +485,7 @@ def test_quality_embedding_and_pose_features_remain_independent(
         subject_pose_backend="fake_pose",
         quality_scorer=FakeQualityScorer(),
         embedding_scorer=FakeEmbeddingScorer(_embedding_vectors()),
-        subject_pose_scorer=FakePoseScorer(),
+        subject_pose_scorer=pose_scorer,
     )
     records = _records(output)
     first = records[0]
@@ -487,6 +496,9 @@ def test_quality_embedding_and_pose_features_remain_independent(
     assert first["embedding"]["max_other_entity_similarity"] == pytest.approx(0.0)
     assert first["embedding"]["inter_entity_margin"] == pytest.approx(0.8)
     assert first["subject_pose"]["yaw"] == -35.0
+    assert pose_scorer.calls == 3
+    assert summary["runtime"]["scrfd"]["calls"] == 3
+    assert summary["runtime"]["face_landmarker"]["calls"] == 3
     object_records = [item for item in records if item["reference_type"] == "object"]
     group_records = [item for item in records if item["reference_type"] == "group"]
     assert all(item["subject_pose"]["status"] == "not_applicable" for item in object_records)
@@ -703,10 +715,176 @@ def test_cli_defaults_all_model_backends_to_none() -> None:
         ]
     )
     assert arguments.artifact_scope == "both"
+    assert arguments.technical_metrics == "none"
     assert arguments.quality_backend == "none"
     assert arguments.embedding_backend == "none"
     assert arguments.subject_pose_backend == "none"
     assert arguments.discover_local_models is False
+
+
+def test_cheap_foreground_metrics_measure_darkness_and_contrast() -> None:
+    mask = np.ones((24, 24), dtype=bool)
+    dark = np.full((24, 24, 3), 8, dtype=np.uint8)
+    bright = np.full((24, 24, 3), 240, dtype=np.uint8)
+    checker = np.indices((24, 24)).sum(axis=0) % 2
+    checker_rgb = np.repeat((checker * 255).astype(np.uint8)[..., None], 3, axis=2)
+
+    dark_metrics = cheap_foreground_technical_metrics(dark, mask)
+    bright_metrics = cheap_foreground_technical_metrics(bright, mask)
+    checker_metrics = cheap_foreground_technical_metrics(checker_rgb, mask)
+
+    assert dark_metrics["foreground_pixel_count"] == 24 * 24
+    assert dark_metrics["luma_mean"] == pytest.approx(8.0)
+    assert dark_metrics["dark_fraction_16"] == 1.0
+    assert bright_metrics["luma_mean"] == pytest.approx(240.0)
+    assert bright_metrics["dark_fraction_16"] == 0.0
+    assert checker_metrics["rms_contrast"] > dark_metrics["rms_contrast"]
+    assert checker_metrics["laplacian_variance"] > 0
+    assert checker_metrics["tenengrad_mean"] >= 0
+
+
+def test_cheap_foreground_metrics_distinguish_sharp_and_blurred_checker() -> None:
+    yy, xx = np.indices((64, 64))
+    checker = (((xx // 4) + (yy // 4)) % 2 * 255).astype(np.uint8)
+    sharp = np.repeat(checker[..., None], 3, axis=2)
+    blurred = np.asarray(
+        Image.fromarray(sharp, mode="RGB").filter(ImageFilter.GaussianBlur(radius=2)),
+        dtype=np.uint8,
+    )
+    mask = np.ones((64, 64), dtype=bool)
+
+    sharp_metrics = cheap_foreground_technical_metrics(sharp, mask)
+    blurred_metrics = cheap_foreground_technical_metrics(blurred, mask)
+
+    assert sharp_metrics["laplacian_variance"] > blurred_metrics[
+        "laplacian_variance"
+    ]
+    assert sharp_metrics["tenengrad_mean"] > blurred_metrics["tenengrad_mean"]
+    assert 0 <= sharp_metrics["edge_density"] <= 1
+    assert 0 <= blurred_metrics["edge_density"] <= 1
+
+
+def test_cheap_metrics_ignore_pixels_outside_foreground() -> None:
+    mask = np.zeros((32, 32), dtype=bool)
+    mask[6:26, 7:25] = True
+    yy, xx = np.indices((32, 32))
+    foreground = np.stack(
+        ((xx * 7) % 256, (yy * 9) % 256, ((xx + yy) * 5) % 256),
+        axis=2,
+    ).astype(np.uint8)
+    white_background = np.full_like(foreground, 255)
+    black_background = np.zeros_like(foreground)
+    white_background[mask] = foreground[mask]
+    black_background[mask] = foreground[mask]
+
+    white_metrics = cheap_foreground_technical_metrics(white_background, mask)
+    black_metrics = cheap_foreground_technical_metrics(black_background, mask)
+
+    assert white_metrics == black_metrics
+
+
+def test_cheap_metrics_record_gradient_mask_fallback_for_tiny_foreground() -> None:
+    source = np.full((9, 9, 3), 120, dtype=np.uint8)
+    mask = np.zeros((9, 9), dtype=bool)
+    mask[3:6, 3:6] = True
+
+    metrics = cheap_foreground_technical_metrics(source, mask)
+
+    assert metrics["gradient_mask_fallback"] is True
+    assert metrics["gradient_foreground_pixel_count"] == 9
+
+
+def test_cheap_metrics_integrate_without_quality_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    _add_clip(storage)
+    output = audit_module.ALLOWED_AUDIT_ROOT / "audit-cheap-technical"
+
+    summary = run_reference_filter_audit(
+        config,
+        run_root=storage.root,
+        output_root=output,
+        artifact_scope="candidates",
+        technical_metrics="cheap_cv",
+    )
+
+    records = _records(output)
+    assert all(record["technical_quality"]["status"] == "succeeded" for record in records)
+    assert all(record["quality"]["status"] == "disabled" for record in records)
+    assert summary["backends"]["technical_metrics"] == "cheap_cv"
+    assert summary["technical_quality_distributions"]["luma_mean"] is not None
+    assert summary["runtime"]["technical_metrics"]["calls"] == 9
+    assert len(summary["review_lists"]["darkest_candidates"]) == 9
+
+
+def test_cheap_metric_failure_is_recorded_and_other_candidates_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="source-run")
+    _add_clip(storage, reference_types=("subject",))
+    original = audit_module.cheap_foreground_technical_metrics
+    calls = 0
+
+    def fail_second(source: np.ndarray, mask: np.ndarray) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("synthetic metric failure")
+        return original(source, mask)
+
+    monkeypatch.setattr(audit_module, "cheap_foreground_technical_metrics", fail_second)
+    output = audit_module.ALLOWED_AUDIT_ROOT / "audit-cheap-failure"
+
+    run_reference_filter_audit(
+        config,
+        run_root=storage.root,
+        output_root=output,
+        artifact_scope="candidates",
+        technical_metrics="cheap_cv",
+    )
+
+    statuses = [record["technical_quality"]["status"] for record in _records(output)]
+    assert statuses == ["succeeded", "failed", "succeeded"]
+
+
+def test_no_face_review_list_excludes_scrfd_backend_failure() -> None:
+    common = {
+        "clip_uid": "clip-a",
+        "entity_id": "e1",
+        "reference_type": "subject",
+        "artifact_scope": "candidate",
+    }
+    records = [
+        {
+            **common,
+            "candidate_id": "candidate_1",
+            "subject_pose": {
+                "status": "succeeded",
+                "scrfd_success": True,
+                "face_detected": False,
+            },
+        },
+        {
+            **common,
+            "candidate_id": "candidate_2",
+            "subject_pose": {
+                "status": "succeeded",
+                "scrfd_success": False,
+                "face_detected": False,
+            },
+        },
+    ]
+
+    result = audit_module._no_face_review_list(records)
+
+    assert [item["candidate_id"] for item in result] == ["candidate_1"]
 
 
 def test_selected_representativeness_rank_records_last_place_anomaly() -> None:

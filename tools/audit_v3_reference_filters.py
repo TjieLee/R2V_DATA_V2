@@ -29,6 +29,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("candidates", "final", "both"),
         default="both",
     )
+    parser.add_argument(
+        "--technical-metrics",
+        choices=("none", "cheap_cv"),
+        default="none",
+    )
     parser.add_argument("--quality-backend", default="none")
     parser.add_argument("--quality-python", type=Path)
     parser.add_argument("--quality-code-root", type=Path)
@@ -74,6 +79,41 @@ def _external_scorer(
     )
 
 
+def _print_review_summary(summary: dict[str, object]) -> None:
+    review_lists = summary.get("review_lists")
+    runtime = summary.get("runtime")
+    review_values = review_lists if isinstance(review_lists, dict) else {}
+    runtime_values = runtime if isinstance(runtime, dict) else {}
+    print("===== TECHNICAL EXTREMES =====", file=sys.stderr)
+    for key in (
+        "darkest_candidates",
+        "highest_dark_fraction_candidates",
+        "lowest_laplacian_candidates",
+        "lowest_tenengrad_candidates",
+        "lowest_contrast_candidates",
+    ):
+        print(
+            f"{key}: {json.dumps(review_values.get(key, []), ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    print("===== SUBJECT VISIBILITY =====", file=sys.stderr)
+    for key in (
+        "no_face_candidates",
+        "smallest_face_candidates",
+        "largest_abs_yaw_candidates",
+    ):
+        print(
+            f"{key}: {json.dumps(review_values.get(key, []), ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+    print("===== RUNTIME =====", file=sys.stderr)
+    for key in ("technical_metrics", "subject_pose", "scrfd", "face_landmarker"):
+        print(
+            f"{key}: {json.dumps(runtime_values.get(key, {}), ensure_ascii=False)}",
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     scorers: list[ExternalReferenceFilterScorer] = []
@@ -98,6 +138,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             run_root=arguments.run_root,
             output_root=arguments.output_root,
             artifact_scope=arguments.artifact_scope,
+            technical_metrics=arguments.technical_metrics,
             quality_backend=arguments.quality_backend,
             embedding_backend=arguments.embedding_backend,
             subject_pose_backend=arguments.subject_pose_backend,
@@ -110,6 +151,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     finally:
         for scorer in reversed(scorers):
             scorer.close()
+    _print_review_summary(summary)
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return summary
 
