@@ -505,6 +505,84 @@ For retained subsets, profiling must report the post-filter candidate count and
 exactly two evidence images per retained candidate. Explain every difference;
 do not infer server results from local tests.
 
+### Final background binding guard
+
+The final background guard is versioned and disabled by default:
+
+```yaml
+pair:
+  background_final_guard_mode: "off"  # or qwen_v1
+```
+
+`qwen_v1` uses Qwen3-VL with exactly five images: the final full background and
+four deterministic `upper_left`, `upper_right`, `lower_left`, and `lower_right`
+tiles. The request contains only the annotation background phrase and grounding
+prompt. It contains no forbidden-entity list, entity phrases, masks, source
+comparison, embedding evidence, face evidence, or pose evidence.
+
+The guard runs only after entity pairing is otherwise ready. An explicit reject,
+request failure, timeout, malformed structured output, or unexpected guard error
+removes only `<ref_bg_1>` from the pairing. It does not reject the entity sample
+and does not rewrite the `clean_raw` or `ready_removed` background state. Profile
+events use component `qwen_background_final_guard` with `image_count=5` and
+`tile_count=4`.
+
+The RC production configuration must explicitly contain the following values;
+do not infer or silently change device allocation:
+
+```yaml
+qwen:
+  annotation:
+    repair_retries: 2
+  background_final_judge:
+    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+
+pair:
+  repair_retries: 2
+  reference_prefilter_mode: conservative_v1
+  background_final_guard_mode: qwen_v1
+
+remove:
+  device: cuda:4
+
+reference_edit:
+  cuda_visible_devices: "6"
+```
+
+The confirmed vLLM service occupies physical GPUs `0,1,2,3`; Boogu uses physical
+GPU `6`. Keep the existing remover LoRA and its GPU `4` settings unchanged.
+
+Replay the guard against the existing RC2 bound backgrounds before a new large
+production run. Set `RC2_CONFIG` to the exact config associated with that run;
+do not edit the source run or reuse it as an output directory:
+
+```bash
+export RC2_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/rc2-100-20260808-233059"
+export RC2_CONFIG="/path/to/the/exact/rc2-config.yaml"
+export RC2_STAMP="$(date +%Y%m%d-%H%M%S)"
+export RC2_REPLAY="/mnt/workspace/litengjie/data/r2v_v3_audits/background-final-rc2-${RC2_STAMP}.jsonl"
+export RC2_SNAPSHOT="/mnt/workspace/litengjie/data/r2v_v3_audits/background-final-rc2-${RC2_STAMP}-source.sha256"
+
+test -d "$RC2_RUN" || echo "ERROR: missing RC2 run"
+test -f "$RC2_CONFIG" || echo "ERROR: missing exact RC2 config"
+find "$RC2_RUN" -type f -print0 | sort -z | xargs -0 sha256sum > "$RC2_SNAPSHOT.before"
+
+"$MAIN_PYTHON" tools/replay_v3_background_final_guard.py \
+  --config "$RC2_CONFIG" \
+  --run-root "$RC2_RUN" \
+  --base-url "$QWEN_BASE_URL" \
+  --model "$QWEN_MODEL_PATH" \
+  --output "$RC2_REPLAY"
+
+find "$RC2_RUN" -type f -print0 | sort -z | xargs -0 sha256sum > "$RC2_SNAPSHOT.after"
+diff -u "$RC2_SNAPSHOT.before" "$RC2_SNAPSHOT.after"
+```
+
+Review all records and `<output>.summary.json`. The replay calls Qwen only for
+currently bound, ready backgrounds and writes only to the requested output and
+its sibling summary. After replay sanity review, use three to five targeted fresh
+samples for routing validation; do not immediately rerun a fresh 100-sample job.
+
 Before `reference_edit`, verify Qwen health, SAM3 import, Boogu paths and GPU,
 and absence of a stale worker. The stage starts one persistent Boogu JSONL worker
 and reuses it for eligible entities. The worker's production settings remain:

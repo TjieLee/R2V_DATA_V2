@@ -835,7 +835,17 @@ def _publish(
         storage.write_references_and_pairing(
             clip_uid,
             ReferencesState(entities=states, background=clip.references.background),
-            _pairing_from_references(clip, states),
+            _pairing_from_references(
+                clip,
+                states,
+                bind_ready_background=(
+                    storage.config.pair.background_final_guard_mode == "off"
+                    or (
+                        clip.pairing is not None
+                        and clip.pairing.background_token is not None
+                    )
+                ),
+            ),
         )
     except Exception:
         if reference_moved:

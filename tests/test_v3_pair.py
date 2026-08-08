@@ -17,6 +17,10 @@ import r2v_data_v2.v3.pair as pair_module
 import r2v_data_v2.v3.reference_completion as completion_module
 import r2v_data_v2.v3.reference_edit as reference_edit_module
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.background_final_guard import (
+    FinalBackgroundJudgeFailure,
+    FinalBackgroundReviewAttempt,
+)
 from r2v_data_v2.v3.config import (
     PairConfig,
     QwenAnnotationConfig,
@@ -76,9 +80,12 @@ from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundAnnotation,
     BackgroundReferenceState,
+    BackgroundRemovalAttempt,
+    BackgroundRemovalReview,
     ClipSource,
     CoverageState,
     EntityVisibilitySummary,
+    FinalBackgroundReview,
     InstructionLegendEntry,
     InstructionState,
     PairingState,
@@ -132,6 +139,12 @@ def _config(
             instruction_writer=QwenServiceConfig(model=model),
             candidate_judge=QwenServiceConfig(model=model),
             background_remove_judge=QwenServiceConfig(model=model),
+            background_final_judge=(
+                QwenServiceConfig(model=model)
+                if pair is not None
+                and pair.background_final_guard_mode == "qwen_v1"
+                else None
+            ),
             cross_pair_judge=(
                 QwenServiceConfig(model=model)
                 if pair is not None and pair.same_parent_fallback_enabled
@@ -1204,6 +1217,10 @@ def test_pair_publishes_all_ready_references_and_per_type_tokens(
         "prefilter_entities_2_to_0": 0,
         "prefilter_qwen_calls_skipped": 0,
         "prefilter_fail_open_entities": 0,
+        "background_final_guard_attempted": 0,
+        "background_final_guard_accepted": 0,
+        "background_final_guard_rejected": 0,
+        "background_final_guard_failed_closed": 0,
     }
     assert clip.pairing == PairingState(
         status="ready",
@@ -1385,6 +1402,354 @@ def test_clean_background_is_validated_and_bound_last(
 
     assert stats.backgrounds_bound == 1
     assert storage.read_clip("clip-1").pairing.background_token == "<ref_bg_1>"
+
+
+def _install_clean_background(storage: RunStorage) -> BackgroundReferenceState:
+    clip = storage.read_clip("clip-1")
+    assert clip.annotation is not None
+    annotation = clip.annotation.model_copy(
+        update={
+            "background": BackgroundAnnotation(
+                phrase="a stone courtyard",
+                grounding_prompt="the stone courtyard and surrounding walls",
+            )
+        }
+    )
+    write_json_atomic(
+        storage.clip_path("clip-1"),
+        clip.model_copy(update={"annotation": annotation}).model_dump(mode="json"),
+    )
+    background = BackgroundReferenceState(
+        status="clean_raw",
+        source_image_path="clips/clip-1/frames/00.jpg",
+        output_image_path="clips/clip-1/frames/00.jpg",
+        source_frame_slot=0,
+        source_frame_index=0,
+        source_foreground_area_pixels=0,
+        source_foreground_area_ratio=0.0,
+    )
+    storage.write_references(
+        "clip-1",
+        ReferencesState(background=background),
+    )
+    return background
+
+
+def _final_background_review(*, accepted: bool) -> FinalBackgroundReview:
+    return FinalBackgroundReview(
+        verdict="accept" if accepted else "reject",
+        background_matches_description=True,
+        no_unexpected_foreground_subject=accepted,
+        usable_background_information=True,
+        no_obvious_artifacts=True,
+        reason="usable background" if accepted else "foreground remains",
+    )
+
+
+class _FinalBackgroundJudge:
+    def __init__(
+        self,
+        *,
+        accepted: bool = True,
+        error: Exception | None = None,
+    ) -> None:
+        self.accepted = accepted
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+
+    def review(self, **kwargs: object) -> FinalBackgroundReviewAttempt:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        review = _final_background_review(accepted=self.accepted)
+        return FinalBackgroundReviewAttempt(
+            review=review,
+            raw_response=review.model_dump_json(),
+        )
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_final_background_guard_only_controls_background_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    accepted: bool,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    original_background = _install_clean_background(storage)
+    final_judge = _FinalBackgroundJudge(accepted=accepted)
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        background_final_judge=final_judge,
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1"]
+    assert clip.pairing.tokens == {"e1": "<ref_subject_1>"}
+    assert clip.pairing.background_token == (
+        "<ref_bg_1>" if accepted else None
+    )
+    assert clip.references.background == original_background
+    assert stats.background_final_guard_attempted == 1
+    assert stats.background_final_guard_accepted == int(accepted)
+    assert stats.background_final_guard_rejected == int(not accepted)
+    assert stats.background_final_guard_failed_closed == 0
+    assert stats.failed == 0
+    assert len(final_judge.calls) == 1
+    assert final_judge.calls[0]["background_phrase"] == "a stone courtyard"
+    debug = json.loads(
+        (
+            storage.clip_dir("clip-1")
+            / "debug"
+            / "background_final_guard.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert debug["bound_after_guard"] is accepted
+    assert debug["verdict"] == ("accept" if accepted else "reject")
+    bindings = build_instruction_bindings(clip)
+    assert [binding.reference_type for binding in bindings] == (
+        ["subject", "background"] if accepted else ["subject"]
+    )
+
+
+def test_ready_removed_background_is_eligible_for_final_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    clip = storage.read_clip("clip-1")
+    background = clip.references.background
+    assert background is not None
+    output_sha256 = "a" * 64
+    review = BackgroundRemovalReview(
+        verdict="accept",
+        foreground_absent=True,
+        foreground_not_reconstructed=True,
+        no_new_salient_entity=True,
+        background_only_in_repaired_region=True,
+        background_continuity_ok=True,
+        no_visible_artifacts=True,
+        reason="clean removal",
+    )
+    ready_removed = BackgroundReferenceState(
+        status="ready_removed",
+        source_image_path=background.source_image_path,
+        output_image_path=background.output_image_path,
+        source_frame_slot=0,
+        source_frame_index=0,
+        source_mask_path="clips/clip-1/background/source_mask_fake.png",
+        generation_mask_path="clips/clip-1/background/generation_mask_fake.png",
+        source_foreground_area_pixels=1,
+        source_foreground_area_ratio=1 / (WIDTH * HEIGHT),
+        removal_backend="qwen-image-edit",
+        removal_seed=0,
+        generation_mask_dilation_pixels=1,
+        generation_mask_area_pixels=2,
+        generation_mask_area_ratio=2 / (WIDTH * HEIGHT),
+        output_sha256=output_sha256,
+        removal_attempts=[
+            BackgroundRemovalAttempt(
+                seed=0,
+                status="accepted",
+                runtime_seconds=1.0,
+                candidate_sha256=output_sha256,
+                review=review,
+            )
+        ],
+    )
+    storage.write_references(
+        "clip-1",
+        ReferencesState(background=ready_removed),
+    )
+    monkeypatch.setattr(
+        pair_module,
+        "validate_background_reference",
+        lambda *args, **kwargs: None,
+    )
+    final_judge = _FinalBackgroundJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        background_final_judge=final_judge,
+    )
+
+    assert stats.background_final_guard_accepted == 1
+    assert storage.read_clip("clip-1").pairing.background_token == "<ref_bg_1>"
+    assert final_judge.calls[0]["background_status"] == "ready_removed"
+
+
+def test_final_background_guard_failure_closes_background_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+        debug=True,
+    )
+    storage = _storage(config, entity_types=("subject",))
+    original_background = _install_clean_background(storage)
+    failure = FinalBackgroundJudgeFailure(
+        "structured output invalid",
+        raw_response="{bad json",
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        background_final_judge=_FinalBackgroundJudge(error=failure),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.background_token is None
+    assert clip.pairing.retained_entity_ids == ["e1"]
+    assert clip.references.background == original_background
+    assert stats.background_final_guard_attempted == 1
+    assert stats.background_final_guard_failed_closed == 1
+    assert stats.background_final_guard_accepted == 0
+    assert stats.background_final_guard_rejected == 0
+    assert stats.failed == 0
+    debug = json.loads(
+        (
+            storage.clip_dir("clip-1")
+            / "debug"
+            / "background_final_guard.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert debug["raw_response"] == "{bad json"
+    assert debug["error"] == "structured output invalid"
+    assert debug["bound_after_guard"] is False
+
+
+def test_final_background_guard_is_not_called_for_rejected_pairing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    final_judge = _FinalBackgroundJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(scopes={"e1": "reject"}),
+        background_final_judge=final_judge,
+    )
+
+    assert storage.read_clip("clip-1").pairing.status == "rejected"
+    assert final_judge.calls == []
+    assert stats.background_final_guard_attempted == 0
+
+
+def test_final_background_guard_is_not_called_for_pending_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    storage.write_references(
+        "clip-1",
+        ReferencesState(
+            background=BackgroundReferenceState(
+                status="pending_remove",
+                source_image_path="clips/clip-1/frames/00.jpg",
+                source_frame_slot=0,
+                source_frame_index=0,
+                source_mask_path="clips/clip-1/background/source_mask_fake.png",
+                source_foreground_area_pixels=1,
+                source_foreground_area_ratio=1 / (WIDTH * HEIGHT),
+            )
+        ),
+    )
+    final_judge = _FinalBackgroundJudge()
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        background_final_judge=final_judge,
+    )
+
+    assert storage.read_clip("clip-1").pairing.status == "ready"
+    assert storage.read_clip("clip-1").pairing.background_token is None
+    assert final_judge.calls == []
+    assert stats.background_final_guard_attempted == 0
+
+
+def test_mode_off_never_calls_final_background_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    final_judge = _FinalBackgroundJudge(
+        error=AssertionError("disabled guard must not run")
+    )
+
+    stats = pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        background_final_judge=final_judge,
+    )
+
+    assert storage.read_clip("clip-1").pairing.background_token == "<ref_bg_1>"
+    assert final_judge.calls == []
+    assert stats.background_final_guard_attempted == 0
+
+
+def test_existing_ready_pairing_may_leave_ready_background_unbound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        pair=PairConfig(background_final_guard_mode="qwen_v1"),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    _install_clean_background(storage)
+    pair_clips(
+        config,
+        storage,
+        judge=_Judge(),
+        background_final_judge=_FinalBackgroundJudge(accepted=False),
+    )
+
+    skipped = pair_clips(config, storage, judge=_Judge())
+
+    assert skipped.skipped_existing == 1
+    assert skipped.failed == 0
 
 
 def test_valid_existing_is_skipped_and_corruption_fails_closed(

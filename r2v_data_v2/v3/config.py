@@ -74,6 +74,7 @@ class QwenServicesConfig:
     instruction_writer: QwenServiceConfig = field(default_factory=QwenServiceConfig)
     candidate_judge: QwenServiceConfig | None = None
     background_remove_judge: QwenServiceConfig | None = None
+    background_final_judge: QwenServiceConfig | None = None
     cross_pair_judge: QwenServiceConfig | None = None
     reference_edit_judge: QwenServiceConfig | None = None
 
@@ -114,6 +115,7 @@ class ReferenceScopeConfig:
 class PairConfig:
     enabled: bool = True
     reference_prefilter_mode: str = "off"
+    background_final_guard_mode: str = "off"
     max_candidates_per_entity: int = 3
     crop_padding_ratio: float = 0.08
     repair_retries: int = 1
@@ -344,6 +346,18 @@ class V3Config:
         if self.pair.reference_prefilter_mode not in {"off", "conservative_v1"}:
             raise ValueError(
                 "pair.reference_prefilter_mode must be off or conservative_v1"
+            )
+        if self.pair.background_final_guard_mode not in {"off", "qwen_v1"}:
+            raise ValueError(
+                "pair.background_final_guard_mode must be off or qwen_v1"
+            )
+        if (
+            self.pair.background_final_guard_mode == "qwen_v1"
+            and self.qwen.background_final_judge is None
+        ):
+            raise ValueError(
+                "qwen.background_final_judge is required when "
+                "pair.background_final_guard_mode is qwen_v1"
             )
         if (
             not isinstance(self.pair.max_candidates_per_entity, int)
@@ -608,6 +622,7 @@ class V3Config:
         for name in (
             "candidate_judge",
             "background_remove_judge",
+            "background_final_judge",
             "cross_pair_judge",
             "reference_edit_judge",
         ):
@@ -765,6 +780,7 @@ def load_config(path: str | Path) -> V3Config:
             "instruction_writer",
             "candidate_judge",
             "background_remove_judge",
+            "background_final_judge",
             "cross_pair_judge",
             "reference_edit_judge",
         }
@@ -789,6 +805,10 @@ def load_config(path: str | Path) -> V3Config:
             qwen_values.get("background_remove_judge"),
             field_name="qwen.background_remove_judge",
         ),
+        background_final_judge=_parse_optional_service(
+            qwen_values.get("background_final_judge"),
+            field_name="qwen.background_final_judge",
+        ),
         cross_pair_judge=_parse_optional_service(
             qwen_values.get("cross_pair_judge"),
             field_name="qwen.cross_pair_judge",
@@ -806,6 +826,8 @@ def load_config(path: str | Path) -> V3Config:
     pair_values = _mapping(raw.get("pair"), "pair")
     if pair_values.get("reference_prefilter_mode") is False:
         pair_values["reference_prefilter_mode"] = "off"
+    if pair_values.get("background_final_guard_mode") is False:
+        pair_values["background_final_guard_mode"] = "off"
     sam3_values = _mapping(raw.get("sam3"), "sam3")
     if "model_path" in sam3_values:
         model_path = sam3_values["model_path"]

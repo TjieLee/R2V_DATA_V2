@@ -13,6 +13,12 @@ from PIL import Image, ImageDraw
 
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.background import validate_background_reference
+from r2v_data_v2.v3.background_final_guard import (
+    FinalBackgroundJudge,
+    FinalBackgroundJudgeFailure,
+    QwenFinalBackgroundJudge,
+    load_final_background_image,
+)
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.cross_pair_judge import (
     CrossPairDecisionAttempt,
@@ -50,6 +56,7 @@ from r2v_data_v2.v3.reference_prefilter import (
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
+    BackgroundReferenceState,
     ClipRecord,
     EntityReferenceState,
     PairingState,
@@ -141,9 +148,177 @@ class PairStats:
     prefilter_entities_2_to_0: int = 0
     prefilter_qwen_calls_skipped: int = 0
     prefilter_fail_open_entities: int = 0
+    background_final_guard_attempted: int = 0
+    background_final_guard_accepted: int = 0
+    background_final_guard_rejected: int = 0
+    background_final_guard_failed_closed: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
+
+
+class _BackgroundFinalGuardRuntime:
+    def __init__(
+        self,
+        config: V3Config,
+        storage: RunStorage,
+        counters: dict[str, int],
+        judge: FinalBackgroundJudge | None,
+    ) -> None:
+        self.config = config
+        self.storage = storage
+        self.counters = counters
+        self.active_judge = judge
+        self.owned_judge: QwenFinalBackgroundJudge | None = None
+        self.evaluated_clip_uids: set[str] = set()
+
+    def _judge(self) -> FinalBackgroundJudge:
+        if self.active_judge is None:
+            service = self.config.qwen.background_final_judge
+            if service is None:
+                raise RuntimeError("final background judge is not configured")
+            self.owned_judge = QwenFinalBackgroundJudge(service)
+            self.active_judge = self.owned_judge
+        return self.active_judge
+
+    def _write_debug(
+        self,
+        *,
+        clip: ClipRecord,
+        background: BackgroundReferenceState,
+        review: object | None,
+        raw_response: str | None,
+        error: Exception | None,
+        bound_after_guard: bool,
+    ) -> None:
+        if not self.config.debug.save_diagnostics:
+            return
+        annotation_background = (
+            clip.annotation.background if clip.annotation is not None else None
+        )
+        payload: dict[str, object] = {
+            "clip_uid": clip.clip_uid,
+            "background_status": background.status,
+            "background_phrase": (
+                annotation_background.phrase
+                if annotation_background is not None
+                else None
+            ),
+            "background_grounding_prompt": (
+                annotation_background.grounding_prompt
+                if annotation_background is not None
+                else None
+            ),
+            "mode": self.config.pair.background_final_guard_mode,
+            "verdict": None,
+            "background_matches_description": None,
+            "no_unexpected_foreground_subject": None,
+            "usable_background_information": None,
+            "no_obvious_artifacts": None,
+            "reason": str(error) if error is not None else None,
+            "raw_response": raw_response,
+            "error": str(error) if error is not None else None,
+            "bound_after_guard": bound_after_guard,
+        }
+        if review is not None:
+            review_payload = review.model_dump(mode="json")
+            payload.update(review_payload)
+        destination = (
+            self.storage.clip_dir(clip.clip_uid)
+            / "debug"
+            / "background_final_guard.json"
+        )
+        try:
+            write_json_atomic(destination, payload)
+        except Exception:  # noqa: BLE001,S110 - diagnostics cannot reject a sample
+            pass
+
+    def token_for_ready_pairing(
+        self,
+        *,
+        clip: ClipRecord,
+        frames: SampledFramesArtifact,
+    ) -> str | None:
+        background = clip.references.background
+        if background is None or background.status not in {
+            "clean_raw",
+            "ready_removed",
+        }:
+            return None
+        if self.config.pair.background_final_guard_mode == "off":
+            validate_background_reference(
+                self.storage,
+                clip.clip_uid,
+                background,
+                frames=frames,
+            )
+            return "<ref_bg_1>"
+
+        self.evaluated_clip_uids.add(clip.clip_uid)
+        self.counters["background_final_guard_attempted"] += 1
+        raw_response: str | None = None
+        try:
+            validate_background_reference(
+                self.storage,
+                clip.clip_uid,
+                background,
+                frames=frames,
+            )
+            annotation_background = (
+                clip.annotation.background if clip.annotation is not None else None
+            )
+            if annotation_background is None:
+                raise ValueError("ready background has no annotation semantics")
+            image = load_final_background_image(
+                self.storage,
+                clip_uid=clip.clip_uid,
+                background=background,
+            )
+            attempt = self._judge().review(
+                image=image,
+                background_phrase=annotation_background.phrase,
+                background_grounding_prompt=(
+                    annotation_background.grounding_prompt
+                ),
+                background_status=background.status,
+            )
+            raw_response = attempt.raw_response
+        except Exception as exc:  # noqa: BLE001 - background-only fail closed
+            if isinstance(exc, FinalBackgroundJudgeFailure):
+                raw_response = exc.raw_response
+            self.counters["background_final_guard_failed_closed"] += 1
+            self._write_debug(
+                clip=clip,
+                background=background,
+                review=None,
+                raw_response=raw_response,
+                error=exc,
+                bound_after_guard=False,
+            )
+            return None
+
+        accepted = attempt.review.verdict == "accept"
+        self.counters[
+            "background_final_guard_accepted"
+            if accepted
+            else "background_final_guard_rejected"
+        ] += 1
+        self._write_debug(
+            clip=clip,
+            background=background,
+            review=attempt.review,
+            raw_response=raw_response,
+            error=None,
+            bound_after_guard=accepted,
+        )
+        return "<ref_bg_1>" if accepted else None
+
+    def close(self) -> None:
+        if self.owned_judge is not None:
+            try:
+                self.owned_judge.close()
+            except Exception:  # noqa: BLE001,S110 - cleanup cannot reject samples
+                pass
 
 
 def _validate_source_and_mask(
@@ -1172,12 +1347,6 @@ def _validate_existing_pairing(
             background,
             frames=frames,
         )
-    elif (
-        clip.pairing.status == "ready"
-        and background is not None
-        and background.status in {"clean_raw", "ready_removed"}
-    ):
-        raise ValueError("ready background was not bound")
 
 
 @dataclass(frozen=True)
@@ -1385,6 +1554,8 @@ def _write_cross_pair_debug(
 def _pairing_from_references(
     clip: ClipRecord,
     entity_states: list[EntityReferenceState],
+    *,
+    bind_ready_background: bool,
 ) -> PairingState:
     if clip.annotation is None or clip.coverage is None:
         raise ValueError("cross-pair target inputs are incomplete")
@@ -1398,7 +1569,8 @@ def _pairing_from_references(
     background = clip.references.background
     background_token = (
         "<ref_bg_1>"
-        if background is not None
+        if bind_ready_background
+        and background is not None
         and background.status in {"clean_raw", "ready_removed"}
         else None
     )
@@ -1468,6 +1640,7 @@ def _run_same_parent_cross_pair_fallback(
     target_clip_uids: set[str],
     counters: dict[str, int],
     judge: CrossPairJudge | None,
+    background_guard: _BackgroundFinalGuardRuntime,
 ) -> None:
     if not config.pair.same_parent_fallback_enabled or not target_clip_uids:
         return
@@ -1667,7 +1840,22 @@ def _run_same_parent_cross_pair_fallback(
                     states_by_id[entity.entity_id]
                     for entity in target_clip.annotation.entities
                 ]
-                pairing = _pairing_from_references(target_clip, entity_states)
+                pairing = _pairing_from_references(
+                    target_clip,
+                    entity_states,
+                    bind_ready_background=False,
+                )
+                if pairing.status == "ready":
+                    pairing = pairing.model_copy(
+                        update={
+                            "background_token": (
+                                background_guard.token_for_ready_pairing(
+                                    clip=target_clip,
+                                    frames=target_frames,
+                                )
+                            )
+                        }
+                    )
                 references = ReferencesState(
                     entities=entity_states,
                     background=target_clip.references.background,
@@ -1777,6 +1965,7 @@ def pair_clips(
     completion_backend: QwenReferenceCompletionBackend | None = None,
     completion_judge: QwenLocalizedCompletionJudge | None = None,
     completion_segmentation_backend: SegmentationBackend | None = None,
+    background_final_judge: FinalBackgroundJudge | None = None,
 ) -> PairStats:
     config.validate()
     if storage.root != config.resolved_run_root:
@@ -1787,6 +1976,12 @@ def pair_clips(
     cross_pair_targets: set[str] = set()
     active_judge = judge
     owned_judge: QwenEntityReferenceJudge | None = None
+    background_guard = _BackgroundFinalGuardRuntime(
+        config,
+        storage,
+        counters,
+        background_final_judge,
+    )
     try:
         for initial_clip in storage.iter_clips():
             clip = storage.read_clip(initial_clip.clip_uid)
@@ -2076,25 +2271,16 @@ def pair_clips(
                     for state in entity_states
                     if state.status == "ready"
                 ]
-                background = clip.references.background
-                background_token: str | None = None
-                if background is not None and background.status in {
-                    "clean_raw",
-                    "ready_removed",
-                }:
-                    validate_background_reference(
-                        storage,
-                        clip.clip_uid,
-                        background,
-                        frames=frames,
-                    )
-                    background_token = "<ref_bg_1>"
                 if not set(retained).intersection(clip.coverage.qualifying_entity_ids):
                     pairing = PairingState(
                         status="rejected",
                         reason="no_qualifying_ready_reference",
                     )
                 else:
+                    background_token = background_guard.token_for_ready_pairing(
+                        clip=clip,
+                        frames=frames,
+                    )
                     entity_by_id = {
                         entity.entity_id: entity for entity in clip.annotation.entities
                     }
@@ -2106,7 +2292,7 @@ def pair_clips(
                     )
                 references = ReferencesState(
                     entities=entity_states,
-                    background=background,
+                    background=clip.references.background,
                 )
                 _publish_pair_result(
                     config,
@@ -2141,6 +2327,7 @@ def pair_clips(
             target_clip_uids=cross_pair_targets,
             counters=counters,
             judge=cross_pair_judge,
+            background_guard=background_guard,
         )
         if not config.reference_edit.enabled:
             completion_stats = run_reference_completion_fallbacks(
@@ -2155,9 +2342,40 @@ def pair_clips(
             counters["completion_attempted"] += completion_stats.attempted
             counters["completion_ready"] += completion_stats.ready
             counters["completion_rejected"] += completion_stats.rejected
+        if config.pair.background_final_guard_mode == "qwen_v1":
+            for clip_uid in sorted(
+                cross_pair_targets - background_guard.evaluated_clip_uids
+            ):
+                completed_clip = storage.read_clip(clip_uid)
+                if (
+                    completed_clip.pairing is None
+                    or completed_clip.pairing.status != "ready"
+                    or not completed_clip.pairing.retained_entity_ids
+                ):
+                    continue
+                background = completed_clip.references.background
+                if background is None or background.status not in {
+                    "clean_raw",
+                    "ready_removed",
+                }:
+                    continue
+                completed_frames = validate_sampled_frames(storage, clip_uid)
+                background_token = background_guard.token_for_ready_pairing(
+                    clip=completed_clip,
+                    frames=completed_frames,
+                )
+                if background_token is not None:
+                    storage.write_pairing(
+                        clip_uid,
+                        completed_clip.pairing.model_copy(
+                            update={"background_token": background_token}
+                        ),
+                    )
+                    counters["backgrounds_bound"] += 1
     finally:
         if owned_judge is not None:
             owned_judge.close()
+        background_guard.close()
     stats = PairStats(**counters)
     storage.update_stage_counts("pair", stats.to_dict())
     return stats

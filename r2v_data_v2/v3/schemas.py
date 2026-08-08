@@ -630,6 +630,34 @@ class BackgroundRemovalReview(SchemaModel):
         return self
 
 
+class FinalBackgroundReview(SchemaModel):
+    verdict: Literal["accept", "reject"]
+    background_matches_description: StrictBool
+    no_unexpected_foreground_subject: StrictBool
+    usable_background_information: StrictBool
+    no_obvious_artifacts: StrictBool
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_review(self) -> FinalBackgroundReview:
+        if not self.reason.strip():
+            raise ValueError("final background review reason must not be empty")
+        all_passed = all(
+            (
+                self.background_matches_description,
+                self.no_unexpected_foreground_subject,
+                self.usable_background_information,
+                self.no_obvious_artifacts,
+            )
+        )
+        expected = "accept" if all_passed else "reject"
+        if self.verdict != expected:
+            raise ValueError(
+                "final background verdict must accept if and only if all checks pass"
+            )
+        return self
+
+
 class BackgroundRemovalAttempt(SchemaModel):
     seed: int = Field(ge=0)
     status: Literal["accepted", "rejected", "failed"]

@@ -14,12 +14,14 @@ def _write_config(
     *,
     candidate_judge: bool,
     background_remove_judge: bool,
+    background_final_judge: bool = False,
     pair_enabled: bool = True,
     remove_enabled: bool = True,
     cross_pair_judge: bool = False,
     same_parent_fallback_enabled: bool = False,
     same_parent_max_donor_references: object = 8,
     reference_prefilter_mode: object = "off",
+    background_final_guard_mode: object = "off",
     synthetic_completion_enabled: object = False,
     reference_edit_enabled: bool = False,
     reference_edit_judge: bool = False,
@@ -64,6 +66,13 @@ def _write_config(
                 f"    model: {model}",
             ]
         )
+    if background_final_judge:
+        qwen_lines.extend(
+            [
+                "  background_final_judge:",
+                f"    model: {model}",
+            ]
+        )
     if cross_pair_judge:
         qwen_lines.extend(
             [
@@ -97,6 +106,7 @@ def _write_config(
                 "pair:",
                 f"  enabled: {str(pair_enabled).lower()}",
                 f"  reference_prefilter_mode: {reference_prefilter_mode}",
+                f"  background_final_guard_mode: {background_final_guard_mode}",
                 (
                     "  same_parent_fallback_enabled: "
                     f"{str(same_parent_fallback_enabled).lower()}"
@@ -243,6 +253,83 @@ def test_reference_prefilter_mode_participates_in_config_fingerprint(
         candidate_judge=True,
         background_remove_judge=True,
         reference_prefilter_mode="conservative_v1",
+    )
+    enabled = load_config(path)
+
+    assert disabled.fingerprint() != enabled.fingerprint()
+
+
+@pytest.mark.parametrize("mode", ["off", "qwen_v1"])
+def test_background_final_guard_mode_accepts_versioned_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        background_final_judge=mode == "qwen_v1",
+        background_final_guard_mode=mode,
+    )
+
+    assert load_config(path).pair.background_final_guard_mode == mode
+
+
+def test_background_final_guard_requires_dedicated_qwen_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        background_final_judge=False,
+        background_final_guard_mode="qwen_v1",
+    )
+
+    with pytest.raises(ValueError, match="background_final_judge"):
+        load_config(path)
+
+
+def test_background_final_guard_rejects_unknown_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        background_final_judge=True,
+        background_final_guard_mode="semantic_v2",
+    )
+
+    with pytest.raises(ValueError, match="background_final_guard_mode"):
+        load_config(path)
+
+
+def test_background_final_guard_mode_participates_in_config_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        background_final_guard_mode="off",
+    )
+    disabled = load_config(path)
+    _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        background_final_judge=True,
+        background_final_guard_mode="qwen_v1",
     )
     enabled = load_config(path)
 

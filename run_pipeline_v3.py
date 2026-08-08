@@ -8,6 +8,7 @@ from pathlib import Path
 
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.background import build_background_candidates
+from r2v_data_v2.v3.background_final_guard import FinalBackgroundJudge
 from r2v_data_v2.v3.config import load_config
 from r2v_data_v2.v3.cross_pair_judge import CrossPairJudge
 from r2v_data_v2.v3.frames import FrameDecoder, sample_frames
@@ -93,6 +94,7 @@ def run_pipeline_v3(
     background_removal_judge: BackgroundRemovalJudge | None = None,
     entity_reference_judge: EntityReferenceJudge | None = None,
     cross_pair_judge: CrossPairJudge | None = None,
+    background_final_judge: FinalBackgroundJudge | None = None,
     reference_completion_backend: QwenReferenceCompletionBackend | None = None,
     reference_completion_judge: QwenLocalizedCompletionJudge | None = None,
     reference_edit_backend: BooguReferenceEditBackend | None = None,
@@ -185,6 +187,7 @@ def run_pipeline_v3(
                             completion_backend=reference_completion_backend,
                             completion_judge=reference_completion_judge,
                             completion_segmentation_backend=segmentation_backend,
+                            background_final_judge=background_final_judge,
                         ).to_dict()
                     elif stage == "reference_edit":
                         results[stage] = reference_edit_clips(
