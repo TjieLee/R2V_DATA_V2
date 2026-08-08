@@ -598,6 +598,38 @@ Observe, but do not hardcode, the diver case
 The extreme board must render darkest, blur, no-face, small-face, and
 extreme-pose cases. It supplies human evidence only; this task sets no gate.
 
+### Conservative prefilter shadow simulation
+
+This simulation reads an existing candidate audit and estimates evidence changes
+without altering candidates, Qwen calls, routing, references, or exports. The
+`subject_near_silhouette_v1` and `subject_relative_blur_v1` conditions are
+20-case experimental shadow conditions, not production thresholds.
+
+```bash
+export SHADOW_SIMULATION="$AUDIT_ROOT/prefilter-shadow-$STAMP.json"
+export SHADOW_REVIEW="$REVIEW_ROOT/prefilter-shadow-$STAMP"
+
+"$MAIN_PYTHON" tools/simulate_v3_reference_prefilter.py \
+  --audit-root "$POSE_AUDIT" \
+  --output "$SHADOW_SIMULATION" \
+  --rule all
+
+"$MAIN_PYTHON" tools/build_v3_prefilter_shadow_review_board.py \
+  --run-root "$SOURCE_RUN" \
+  --audit-root "$POSE_AUDIT" \
+  --simulation "$SHADOW_SIMULATION" \
+  --output-root "$SHADOW_REVIEW" \
+  --mode all
+```
+
+Available simulation rule modes are `near_silhouette`, `relative_blur`, and
+`all`. Review modes are `near_silhouette`, `relative_blur`,
+`qwen_selected_flagged`, `all_candidates_flagged`, and `all`. An
+`all_candidates_flagged` state estimates one potentially skippable Qwen call but
+does not skip the call or reject the entity. Pose, DINOv2, and SigLIP2 evidence
+never triggers either shadow condition. Review every shadow case and validate a
+larger audit set before discussing production integration.
+
 ## 11. Known technical-only evidence
 
 The existing 51-candidate cheap-CV audit had broad distributions:
