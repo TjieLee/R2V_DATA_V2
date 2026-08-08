@@ -84,35 +84,40 @@ def _call_scorer(scorer: object, kind: str, image: Image.Image) -> dict[str, obj
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     scorer = _load_adapter(arguments)
-    for line in sys.stdin:
-        request_id: object = None
-        try:
-            request = json.loads(line)
-            if not isinstance(request, dict):
-                raise TypeError("worker request must be an object")
-            request_id = request.get("request_id")
-            if request.get("shutdown") is True:
-                return 0
-            encoded = request.get("image_png_hex")
-            if not isinstance(encoded, str):
-                raise TypeError("worker request image_png_hex must be a string")
-            with Image.open(io.BytesIO(bytes.fromhex(encoded))) as opened:
-                opened.load()
-                image = opened.convert("RGB")
-            response = {
-                "request_id": request_id,
-                "status": "ok",
-                "result": _call_scorer(scorer, arguments.kind, image),
-            }
-        except Exception as exc:  # noqa: BLE001 - isolate one audit request
-            response = {
-                "request_id": request_id,
-                "status": "failed",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-        sys.stdout.flush()
-    return 0
+    try:
+        for line in sys.stdin:
+            request_id: object = None
+            try:
+                request = json.loads(line)
+                if not isinstance(request, dict):
+                    raise TypeError("worker request must be an object")
+                request_id = request.get("request_id")
+                if request.get("shutdown") is True:
+                    return 0
+                encoded = request.get("image_png_hex")
+                if not isinstance(encoded, str):
+                    raise TypeError("worker request image_png_hex must be a string")
+                with Image.open(io.BytesIO(bytes.fromhex(encoded))) as opened:
+                    opened.load()
+                    image = opened.convert("RGB")
+                response = {
+                    "request_id": request_id,
+                    "status": "ok",
+                    "result": _call_scorer(scorer, arguments.kind, image),
+                }
+            except Exception as exc:  # noqa: BLE001 - isolate one audit request
+                response = {
+                    "request_id": request_id,
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        return 0
+    finally:
+        close_method = getattr(scorer, "close", None)
+        if callable(close_method):
+            close_method()
 
 
 if __name__ == "__main__":

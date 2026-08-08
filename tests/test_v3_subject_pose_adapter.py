@@ -49,6 +49,7 @@ class FakeLandmarker:
     def __init__(self, matrix: np.ndarray | Exception | None) -> None:
         self.matrix = matrix
         self.calls = 0
+        self.close_calls = 0
 
     def detect(self, image: object) -> object:
         assert isinstance(image, FakeMediaPipe.Image)
@@ -57,6 +58,9 @@ class FakeLandmarker:
             raise self.matrix
         matrices = [] if self.matrix is None else [self.matrix]
         return SimpleNamespace(facial_transformation_matrixes=matrices)
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def _detection(
@@ -188,6 +192,18 @@ def test_scrfd_failure_is_reported_without_fake_no_face_success() -> None:
     assert result["head_visible"] is None
     assert landmarker.calls == 0
     assert "onnx failure" in result["raw_metrics"]["scrfd_error"]
+
+
+def test_subject_pose_scorer_closes_landmarker_once_and_rejects_inspection() -> None:
+    scorer, _, landmarker = _scorer([], np.eye(4))
+
+    scorer.close()
+    scorer.close()
+
+    assert landmarker.close_calls == 1
+    assert scorer.landmarker is None
+    with pytest.raises(RuntimeError, match="subject pose scorer is closed"):
+        scorer.inspect(Image.new("RGB", (80, 60), "white"))
 
 
 def test_load_scorer_uses_exact_local_paths_and_cpu_provider(

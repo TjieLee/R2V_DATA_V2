@@ -305,12 +305,24 @@ scorer = adapter.load_scorer(
     model_path=Path(sys.argv[2]),
     local_files_only=True,
 )
-print("scrfd_model_input_shape", scorer.detector.model_input_shape)
-print("scrfd_dynamic_spatial", scorer.detector.dynamic_spatial)
-print("scrfd_inference_size", scorer.detector.input_width, scorer.detector.input_height)
-print("POSE MODEL LOAD PASS")
+try:
+    print("scrfd_model_input_shape", scorer.detector.model_input_shape)
+    print("scrfd_dynamic_spatial", scorer.detector.dynamic_spatial)
+    print("scrfd_inference_size", scorer.detector.input_width, scorer.detector.input_height)
+    print("POSE MODEL LOAD PASS")
+finally:
+    scorer.close()
+del scorer
+import gc
+gc.collect()
 PY
 ```
+
+MediaPipe Task lifecycle is explicit. `FaceLandmarker.close()` must run before
+interpreter teardown; do not rely on `FaceLandmarker.__del__`. The external
+reference-filter worker calls an adapter scorer's optional `close()` method from
+a single `finally` block on shutdown, stdin EOF, or worker exit. DINOv2 and
+SigLIP2 adapters do not need to implement `close()`.
 
 Supplied server evidence already confirms that the SCRFD ONNX file loads and a
 `(1,3,640,640)` probe returns 9 tensors with rows `12800`, `3200`, and `800` for

@@ -295,7 +295,7 @@ class _ScrfdMediaPipeScorer:
         self,
         *,
         detector: _ScrfdDetector,
-        landmarker: Any,
+        landmarker: Any | None,
         mediapipe: Any,
         model_root: Path,
     ) -> None:
@@ -307,7 +307,18 @@ class _ScrfdMediaPipeScorer:
     def eval(self) -> _ScrfdMediaPipeScorer:
         return self
 
+    def close(self) -> None:
+        landmarker = self.landmarker
+        if landmarker is None:
+            return
+        try:
+            landmarker.close()
+        finally:
+            self.landmarker = None
+
     def inspect(self, image: Image.Image) -> dict[str, object]:
+        if self.landmarker is None:
+            raise RuntimeError("subject pose scorer is closed")
         started = time.monotonic()
         rgb = image.convert("RGB")
         raw_metrics: dict[str, object] = {
