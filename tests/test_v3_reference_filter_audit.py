@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -701,6 +702,44 @@ def load_scorer(*, kind, backend, model_path, local_files_only):
     assert result.quality_score == 0.7
     assert result.aesthetic_score == 0.3
     assert result.raw_metrics == {"offline": True}
+
+
+def test_external_worker_removes_parent_pythonpath_and_stays_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_environment: dict[str, str] = {}
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        returncode = 0
+
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
+        del args
+        captured_environment.update(kwargs["env"])
+        return FakeProcess()
+
+    monkeypatch.setenv("PYTHONPATH", "/fake/sam3:/fake/r2v")
+    monkeypatch.setattr(audit_module.subprocess, "Popen", fake_popen)
+
+    ExternalReferenceFilterScorer(
+        kind="subject_pose",
+        backend="scrfd_mediapipe",
+        python_executable=tmp_path / "pose-python",
+        code_root=tmp_path / "adapter",
+        model_path=tmp_path / "models",
+    )
+
+    assert os.environ["PYTHONPATH"] == "/fake/sam3:/fake/r2v"
+    assert "PYTHONPATH" not in captured_environment
+    assert captured_environment["HF_HUB_OFFLINE"] == "1"
+    assert captured_environment["TRANSFORMERS_OFFLINE"] == "1"
+    assert captured_environment["HF_DATASETS_OFFLINE"] == "1"
 
 
 def test_cli_defaults_all_model_backends_to_none() -> None:

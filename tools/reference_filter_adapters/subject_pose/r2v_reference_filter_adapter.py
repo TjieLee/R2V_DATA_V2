@@ -14,6 +14,7 @@ _LANDMARKER_FILENAME = "face_landmarker_v2_with_blendshapes.task"
 _DETECTION_THRESHOLD = 0.5
 _NMS_THRESHOLD = 0.4
 _SCRFD_STRIDES = (8, 16, 32)
+_DYNAMIC_SCRFD_INPUT_SIZE = 640
 
 
 def _load_runtime_dependencies() -> tuple[Any, Any]:
@@ -115,6 +116,18 @@ def _distance_to_landmarks(
     return landmarks
 
 
+def _json_safe_onnx_dimension(value: object) -> int | str | None:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return int(value)
+    return str(value)
+
+
+def _is_static_integer_dimension(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 class _ScrfdDetector:
     def __init__(self, model_path: Path, onnxruntime: Any) -> None:
         self.session = onnxruntime.InferenceSession(
@@ -125,12 +138,30 @@ class _ScrfdDetector:
         if len(inputs) != 1:
             raise ValueError("SCRFD must expose exactly one image input")
         shape = tuple(inputs[0].shape)
-        if len(shape) != 4 or not all(isinstance(value, int) for value in shape[2:]):
-            raise ValueError("SCRFD input must have static NCHW spatial dimensions")
-        self.input_height = int(shape[2])
-        self.input_width = int(shape[3])
-        if self.input_height <= 0 or self.input_width <= 0:
-            raise ValueError("SCRFD input dimensions must be positive")
+        if len(shape) != 4:
+            raise ValueError("SCRFD input must have rank-four NCHW dimensions")
+        batch, channels, declared_height, declared_width = shape
+        if _is_static_integer_dimension(batch) and batch != 1:
+            raise ValueError("SCRFD static batch dimension must equal one")
+        if _is_static_integer_dimension(channels) and channels != 3:
+            raise ValueError("SCRFD static channel dimension must equal three")
+        for dimension in (declared_height, declared_width):
+            if _is_static_integer_dimension(dimension) and dimension <= 0:
+                raise ValueError("SCRFD static spatial dimensions must be positive")
+
+        self.model_input_shape = [
+            _json_safe_onnx_dimension(value) for value in shape
+        ]
+        self.dynamic_spatial = not (
+            _is_static_integer_dimension(declared_height)
+            and _is_static_integer_dimension(declared_width)
+        )
+        if self.dynamic_spatial:
+            self.input_height = _DYNAMIC_SCRFD_INPUT_SIZE
+            self.input_width = _DYNAMIC_SCRFD_INPUT_SIZE
+        else:
+            self.input_height = int(declared_height)
+            self.input_width = int(declared_width)
         self.input_name = str(inputs[0].name)
         self.provider = "CPUExecutionProvider"
 
@@ -282,6 +313,10 @@ class _ScrfdMediaPipeScorer:
         raw_metrics: dict[str, object] = {
             "provider": self.detector.provider,
             "device": "cpu",
+            "scrfd_model_input_shape": self.detector.model_input_shape,
+            "scrfd_dynamic_spatial": self.detector.dynamic_spatial,
+            "scrfd_inference_width": self.detector.input_width,
+            "scrfd_inference_height": self.detector.input_height,
             "angle_unit": "degree",
             "angle_convention": (
                 "R=Rz(roll)Ry(yaw)Rx(pitch); positive angles follow the "

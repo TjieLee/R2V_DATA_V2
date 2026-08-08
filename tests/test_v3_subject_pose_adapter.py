@@ -32,6 +32,10 @@ class FakeDetector:
     ) -> None:
         self.detections = detections
         self.calls = 0
+        self.model_input_shape = [1, 3, 640, 640]
+        self.dynamic_spatial = False
+        self.input_width = 640
+        self.input_height = 640
 
     def detect(self, image: Image.Image) -> list[adapter._FaceDetection]:
         assert image.mode == "RGB"
@@ -136,6 +140,10 @@ def test_face_selection_is_deterministic_and_pose_uses_degrees() -> None:
     assert result["raw_metrics"]["selected_face_bbox"] == [35.0, 20.0, 85.0, 80.0]
     assert result["raw_metrics"]["provider"] == "CPUExecutionProvider"
     assert result["raw_metrics"]["device"] == "cpu"
+    assert result["raw_metrics"]["scrfd_model_input_shape"] == [1, 3, 640, 640]
+    assert result["raw_metrics"]["scrfd_dynamic_spatial"] is False
+    assert result["raw_metrics"]["scrfd_inference_width"] == 640
+    assert result["raw_metrics"]["scrfd_inference_height"] == 640
 
 
 def test_no_face_does_not_call_landmarker_or_invent_head_visibility() -> None:
@@ -274,6 +282,138 @@ def test_scrfd_decoder_uses_mock_onnxruntime_outputs_deterministically(
     assert selected is not None
     assert selected.confidence == pytest.approx(0.85)
     assert selected.bbox_xyxy == pytest.approx((8.0, 8.0, 24.0, 24.0))
+
+
+def _scrfd_detector_for_shape(
+    tmp_path: Path,
+    shape: list[object],
+    *,
+    outputs: list[np.ndarray] | None = None,
+    received_tensors: list[np.ndarray] | None = None,
+) -> adapter._ScrfdDetector:
+    class FakeSession:
+        def get_inputs(self) -> list[object]:
+            return [SimpleNamespace(shape=shape, name="input.1")]
+
+        def run(
+            self,
+            requested_outputs: object,
+            inputs: dict[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            assert requested_outputs is None
+            if received_tensors is not None:
+                received_tensors.append(inputs["input.1"])
+            assert outputs is not None
+            return outputs
+
+    class FakeOnnxRuntime:
+        @staticmethod
+        def InferenceSession(path: str, *, providers: list[str]) -> FakeSession:
+            assert path == str(tmp_path / "scrfd.onnx")
+            assert providers == ["CPUExecutionProvider"]
+            return FakeSession()
+
+    return adapter._ScrfdDetector(tmp_path / "scrfd.onnx", FakeOnnxRuntime)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dynamic", "height", "width"),
+    [
+        ([1, 3, 640, 640], False, 640, 640),
+        ([1, 3, "height", "width"], True, 640, 640),
+        ([1, 3, None, None], True, 640, 640),
+        ([None, "channels", "height", 960], True, 640, 640),
+    ],
+)
+def test_scrfd_accepts_static_and_dynamic_onnx_input_shapes(
+    tmp_path: Path,
+    shape: list[object],
+    dynamic: bool,
+    height: int,
+    width: int,
+) -> None:
+    detector = _scrfd_detector_for_shape(tmp_path, shape)
+
+    assert detector.model_input_shape == shape
+    assert detector.dynamic_spatial is dynamic
+    assert detector.input_height == height
+    assert detector.input_width == width
+
+
+@pytest.mark.parametrize(
+    ("shape", "message"),
+    [
+        ([1, 3, 640], "rank-four"),
+        ([1, 4, 640, 640], "channel"),
+        ([2, 3, 640, 640], "batch"),
+        ([1, 3, 0, 640], "positive"),
+    ],
+)
+def test_scrfd_rejects_invalid_static_onnx_dimensions(
+    tmp_path: Path,
+    shape: list[object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _scrfd_detector_for_shape(tmp_path, shape)
+
+
+def test_dynamic_scrfd_uses_640_square_and_backprojects_geometry(
+    tmp_path: Path,
+) -> None:
+    score_outputs: list[np.ndarray] = []
+    bbox_outputs: list[np.ndarray] = []
+    landmark_outputs: list[np.ndarray] = []
+    for stride in (8, 16, 32):
+        count = (640 // stride) * (640 // stride) * 2
+        score_outputs.append(np.zeros((count, 1), dtype=np.float32))
+        bbox_outputs.append(np.zeros((count, 4), dtype=np.float32))
+        landmark_outputs.append(np.zeros((count, 10), dtype=np.float32))
+
+    # Anchor index 820 corresponds to grid (10, 5), first of two anchors.
+    detection_index = (5 * (640 // 8) + 10) * 2
+    score_outputs[0][detection_index, 0] = 0.95
+    bbox_outputs[0][detection_index] = 2.0
+    landmark_outputs[0][detection_index] = np.array(
+        [1, 0, 0, 1, -1, 0, 0, -1, 1, 1],
+        dtype=np.float32,
+    )
+    received_tensors: list[np.ndarray] = []
+    detector = _scrfd_detector_for_shape(
+        tmp_path,
+        [1, 3, "height", "width"],
+        outputs=[*score_outputs, *bbox_outputs, *landmark_outputs],
+        received_tensors=received_tensors,
+    )
+
+    source = Image.new("RGB", (320, 160), (20, 40, 60))
+    detections = detector.detect(source)
+
+    assert len(received_tensors) == 1
+    assert received_tensors[0].shape == (1, 3, 640, 640)
+    np.testing.assert_allclose(
+        received_tensors[0][0, :, 0, 0],
+        np.asarray([(20 - 127.5) / 128, (40 - 127.5) / 128, (60 - 127.5) / 128]),
+    )
+    np.testing.assert_allclose(
+        received_tensors[0][0, :, 639, 639],
+        np.full(3, -127.5 / 128),
+    )
+    assert len(detections) == 1
+    assert detections[0].confidence == pytest.approx(0.95)
+    assert detections[0].bbox_xyxy == pytest.approx((32.0, 12.0, 48.0, 28.0))
+    np.testing.assert_allclose(
+        np.asarray(detections[0].landmarks_5),
+        np.asarray(
+            (
+                (44.0, 20.0),
+                (40.0, 24.0),
+                (36.0, 20.0),
+                (40.0, 16.0),
+                (44.0, 24.0),
+            )
+        ),
+    )
 
 
 def test_load_scorer_fails_when_exact_local_model_is_missing(tmp_path: Path) -> None:

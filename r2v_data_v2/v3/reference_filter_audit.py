@@ -236,6 +236,7 @@ class ExternalReferenceFilterScorer:
             "run_v3_reference_filter_worker.py"
         )
         environment = dict(os.environ)
+        environment.pop("PYTHONPATH", None)
         environment.update(
             {
                 "HF_HUB_OFFLINE": "1",
