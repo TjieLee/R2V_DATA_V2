@@ -91,13 +91,21 @@ def load_final_background_image(
         raise ValueError("final background guard requires a ready background")
     if background.output_image_path is None:
         raise ValueError("ready background is missing output_image_path")
-    relative = Path(background.output_image_path)
-    if relative.is_absolute():
-        raise ValueError("background output_image_path must be relative to run_root")
+    artifact = Path(background.output_image_path).expanduser()
+    if ".." in artifact.parts:
+        raise ValueError("background output_image_path cannot contain path traversal")
     root = storage.root.resolve(strict=True)
-    path = (root / relative).resolve(strict=True)
-    if root not in path.parents or not path.is_file():
-        raise ValueError("background output image is outside run_root or missing")
+    if not artifact.is_absolute() and artifact.parts[:1] == ("frames",):
+        candidate = storage.clip_dir(clip_uid) / artifact
+    else:
+        candidate = artifact if artifact.is_absolute() else root / artifact
+    path = candidate.resolve(strict=False)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("background output image must remain inside run_root") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"background output image is missing: {path}")
     with Image.open(path) as opened:
         image = opened.convert("RGB")
         image.load()

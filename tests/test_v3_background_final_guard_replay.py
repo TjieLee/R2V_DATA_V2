@@ -146,8 +146,8 @@ def _add_bound_clip(
         ],
         background=BackgroundReferenceState(
             status="clean_raw",
-            source_image_path=storage.relative_artifact_path(frame_path),
-            output_image_path=storage.relative_artifact_path(frame_path),
+            source_image_path="frames/00.jpg",
+            output_image_path="frames/00.jpg",
             source_frame_slot=0,
             source_frame_index=0,
             source_foreground_area_pixels=0,

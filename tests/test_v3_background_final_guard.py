@@ -17,6 +17,7 @@ from r2v_data_v2.v3.background_final_guard import (
     TILE_NAMES,
     QwenFinalBackgroundJudge,
     deterministic_background_tiles,
+    load_final_background_image,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
@@ -71,6 +72,105 @@ def _data_url_image(value: str) -> Image.Image:
         image = opened.convert("RGB")
         image.load()
     return image
+
+
+def _background(*, status: str, output_image_path: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        status=status,
+        output_image_path=output_image_path,
+    )
+
+
+def _storage(root: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        root=root,
+        clip_dir=lambda clip_uid: root / "clips" / clip_uid,
+    )
+
+
+def test_load_final_background_resolves_clean_raw_frames_from_clip_dir(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    frame_path = root / "clips" / "clip-1" / "frames" / "07.jpg"
+    frame_path.parent.mkdir(parents=True)
+    Image.new("RGB", (7, 5), (20, 40, 60)).save(frame_path, format="JPEG")
+
+    image = load_final_background_image(
+        _storage(root),
+        clip_uid="clip-1",
+        background=_background(
+            status="clean_raw",
+            output_image_path="frames/07.jpg",
+        ),
+    )
+
+    assert image.size == (7, 5)
+    assert image.mode == "RGB"
+
+
+def test_load_final_background_resolves_ready_removed_from_run_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    output_path = root / "clips" / "clip-1" / "selected" / "bg_removed.png"
+    output_path.parent.mkdir(parents=True)
+    Image.new("RGB", (9, 6), (30, 50, 70)).save(output_path, format="PNG")
+
+    image = load_final_background_image(
+        _storage(root),
+        clip_uid="clip-1",
+        background=_background(
+            status="ready_removed",
+            output_image_path="clips/clip-1/selected/bg_removed.png",
+        ),
+    )
+
+    assert image.size == (9, 6)
+    assert image.mode == "RGB"
+
+
+def test_load_final_background_fails_when_artifact_is_missing(tmp_path: Path) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="background output image is missing"):
+        load_final_background_image(
+            _storage(root),
+            clip_uid="clip-1",
+            background=_background(
+                status="clean_raw",
+                output_image_path="frames/07.jpg",
+            ),
+        )
+
+
+def test_load_final_background_rejects_traversal_and_outside_run(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    root.mkdir()
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (4, 4), "white").save(outside, format="PNG")
+
+    with pytest.raises(ValueError, match="path traversal"):
+        load_final_background_image(
+            _storage(root),
+            clip_uid="clip-1",
+            background=_background(
+                status="clean_raw",
+                output_image_path="frames/../../../outside.png",
+            ),
+        )
+    with pytest.raises(ValueError, match="remain inside run_root"):
+        load_final_background_image(
+            _storage(root),
+            clip_uid="clip-1",
+            background=_background(
+                status="ready_removed",
+                output_image_path=str(outside),
+            ),
+        )
 
 
 def test_final_background_prompt_stays_short_and_generic() -> None:
