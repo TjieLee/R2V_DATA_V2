@@ -34,6 +34,8 @@ HEIGHT = 60
 
 ENTITY_CASES = (
     ("clip-near", "e1", "subject"),
+    ("clip-near-two", "e1", "subject"),
+    ("clip-two-one", "e1", "subject"),
     ("clip-blur-one", "e1", "subject"),
     ("clip-blur-two", "e1", "subject"),
     ("clip-object", "e1", "object"),
@@ -118,6 +120,49 @@ def _audit_records() -> list[dict[str, object]]:
                     tenengrad=80.0,
                 ),
                 selected_candidate_index=3,
+            )
+        )
+    for index in range(1, 3):
+        records.append(
+            _record(
+                clip_uid="clip-near-two",
+                entity_id="e1",
+                reference_type="subject",
+                candidate_index=index,
+                technical=_technical(
+                    luma=10.0,
+                    dark_fraction=0.97,
+                    laplacian=4.0,
+                    tenengrad=80.0,
+                ),
+                selected_candidate_index=2,
+            )
+        )
+    for index, technical in enumerate(
+        (
+            _technical(
+                luma=10.0,
+                dark_fraction=0.97,
+                laplacian=4.0,
+                tenengrad=40.0,
+            ),
+            _technical(
+                luma=90.0,
+                dark_fraction=0.0,
+                laplacian=100.0,
+                tenengrad=100.0,
+            ),
+        ),
+        start=1,
+    ):
+        records.append(
+            _record(
+                clip_uid="clip-two-one",
+                entity_id="e1",
+                reference_type="subject",
+                candidate_index=index,
+                technical=technical,
+                selected_candidate_index=2,
             )
         )
     for clip_uid, values, selected in (
@@ -441,12 +486,33 @@ def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
     assert blur_candidate["tenengrad_ratio"] == pytest.approx(0.45)
     assert blur_candidate["relative_blur_v2_flag"] is True
     assert blur_candidate["subject_pose_evidence"]["face_detected"] is True
+    two_candidate = next(
+        candidate
+        for candidate in candidates
+        if candidate["clip_uid"] == "clip-two-one"
+        and candidate["candidate_id"] == "candidate_1"
+    )
+    assert two_candidate["candidate_count_before"] == 2
+    assert two_candidate["near_silhouette_flag"] is True
+    assert two_candidate["laplacian_ratio"] == pytest.approx(0.04)
+    assert two_candidate["tenengrad_ratio"] == pytest.approx(0.4)
+    assert two_candidate["relative_blur_v2_flag"] is False
+    assert two_candidate["relative_blur_v2_applicable"] is False
+    assert (
+        two_candidate["relative_blur_v2_inapplicable_reason"]
+        == "requires_three_candidates"
+    )
 
     entities = {
         entity["clip_uid"]: entity for entity in simulation["entities"]
     }
-    assert entities["clip-near"]["shadow_state"] == "all_candidates_flagged"
+    assert entities["clip-near"]["shadow_state"] == "3_to_0"
+    assert entities["clip-near"]["all_candidates_flagged"] is True
     assert entities["clip-near"]["estimated_qwen_call_skippable"] is True
+    assert entities["clip-near-two"]["shadow_state"] == "2_to_0"
+    assert entities["clip-near-two"]["all_candidates_flagged"] is True
+    assert entities["clip-two-one"]["shadow_state"] == "2_to_1"
+    assert entities["clip-two-one"]["relative_blur_v2_applicable"] is False
     assert entities["clip-blur-one"]["shadow_state"] == "3_to_2"
     assert entities["clip-blur-one"]["potential_image_reduction"] == 2
     assert entities["clip-blur-two"]["shadow_state"] == "3_to_1"
@@ -455,29 +521,33 @@ def test_simulation_counts_shadow_states_and_evidence_without_mutating_audit(
     assert entities["clip-group"]["shadow_state"] == "unchanged"
 
     summary = simulation["summary"]
-    assert summary["candidate_count"] == 15
-    assert summary["near_silhouette_flag_count"] == 3
+    assert summary["candidate_count"] == 19
+    assert summary["near_silhouette_flag_count"] == 6
     assert summary["relative_blur_v2_flag_count"] == 3
-    assert summary["combined_flag_count"] == 6
-    assert summary["entity_count"] == 5
+    assert summary["combined_flag_count"] == 9
+    assert summary["entity_count"] == 7
+    assert summary["entity_2_candidate_count"] == 2
+    assert summary["entity_3_candidate_count"] == 5
     assert summary["entity_unchanged_count"] == 2
     assert summary["entity_3_to_2_count"] == 1
     assert summary["entity_3_to_1_count"] == 1
-    assert summary["entity_all_flagged_count"] == 1
-    assert summary["qwen_selected_flagged_count"] == 2
-    assert summary["potential_input_images_before"] == 30
-    assert summary["potential_input_images_after"] == 18
-    assert summary["potential_input_images_reduced"] == 12
-    assert summary["potential_qwen_calls_skipped"] == 1
-    assert summary["flagged_candidate_rate"] == pytest.approx(6 / 15)
+    assert summary["entity_2_to_1_count"] == 1
+    assert summary["entity_2_to_0_count"] == 1
+    assert summary["entity_all_flagged_count"] == 2
+    assert summary["qwen_selected_flagged_count"] == 3
+    assert summary["potential_input_images_before"] == 38
+    assert summary["potential_input_images_after"] == 20
+    assert summary["potential_input_images_reduced"] == 18
+    assert summary["potential_qwen_calls_skipped"] == 2
+    assert summary["flagged_candidate_rate"] == pytest.approx(9 / 19)
     assert summary["by_reference_type"]["object"]["combined_flag_count"] == 0
     assert summary["by_reference_type"]["group"]["combined_flag_count"] == 0
 
     review_lists = simulation["review_lists"]
-    assert len(review_lists["near_silhouette_cases"]) == 3
+    assert len(review_lists["near_silhouette_cases"]) == 6
     assert len(review_lists["relative_blur_v2_cases"]) == 3
-    assert len(review_lists["qwen_selected_flagged_cases"]) == 2
-    assert len(review_lists["all_candidates_flagged_cases"]) == 1
+    assert len(review_lists["qwen_selected_flagged_cases"]) == 3
+    assert len(review_lists["all_candidates_flagged_cases"]) == 2
     assert review_lists["all_candidates_flagged_cases"][0]["candidates"][0][
         "technical_metrics"
     ]["luma_mean"] == 10.0
@@ -493,7 +563,7 @@ def test_rule_selection_disables_the_other_shadow_condition(
         rule="near_silhouette",
     )
 
-    assert simulation["summary"]["near_silhouette_flag_count"] == 3
+    assert simulation["summary"]["near_silhouette_flag_count"] == 6
     assert simulation["summary"]["relative_blur_v2_flag_count"] == 0
     assert all(
         candidate["relative_blur_v2_flag"] is False
@@ -533,11 +603,11 @@ def test_review_board_marks_legacy_relative_blur_simulation_as_deprecated() -> N
 @pytest.mark.parametrize(
     ("mode", "expected_count"),
     [
-        ("near_silhouette", 3),
+        ("near_silhouette", 6),
         ("relative_blur_v2", 3),
-        ("qwen_selected_flagged", 2),
-        ("all_candidates_flagged", 3),
-        ("all", 6),
+        ("qwen_selected_flagged", 3),
+        ("all_candidates_flagged", 5),
+        ("all", 9),
     ],
 )
 def test_shadow_review_board_modes_and_read_only_inputs(
@@ -584,8 +654,14 @@ def test_shadow_review_board_modes_and_read_only_inputs(
         with Image.open(output / cases[0]["board_path"]) as board:
             assert board.size == (1320, 760)
     assert any("shadow rules:" in label for label in labels)
+    assert any("candidate_count_before=" in label for label in labels)
     if mode in {"relative_blur_v2", "all"}:
         assert any("subject_relative_blur_v2" in label for label in labels)
+    if mode == "all":
+        assert any(
+            label == "relative_blur_v2 = not applicable (requires 3 candidates)"
+            for label in labels
+        )
     assert any("laplacian_variance=" in label for label in labels)
     assert any("tenengrad_mean=" in label for label in labels)
     assert any("lap_ratio=" in label for label in labels)
@@ -612,7 +688,7 @@ def test_shadow_review_board_deterministically_limits_rendered_cases(
         max_cases=1,
     )
 
-    assert summary["matching_case_count"] == 6
+    assert summary["matching_case_count"] == 9
     assert summary["case_count"] == 1
     assert summary["max_cases"] == 1
     cases = json.loads(

@@ -150,17 +150,13 @@ def _enabled_rules(mode: RuleMode) -> tuple[str, ...]:
 
 
 def _entity_state(before: int, after: int) -> str:
-    if before != 3:
-        raise ValueError("shadow simulation requires three candidates per entity")
+    if before not in {2, 3}:
+        raise ValueError("shadow simulation requires two or three candidates per entity")
+    if after < 0 or after > before:
+        raise ValueError("shadow candidate counts are inconsistent")
     if after == before:
         return "unchanged"
-    if after == 2:
-        return "3_to_2"
-    if after == 1:
-        return "3_to_1"
-    if after == 0:
-        return "all_candidates_flagged"
-    raise ValueError("shadow candidate counts are inconsistent")
+    return f"{before}_to_{after}"
 
 
 def _empty_summary() -> dict[str, int]:
@@ -170,9 +166,13 @@ def _empty_summary() -> dict[str, int]:
         "relative_blur_v2_flag_count": 0,
         "combined_flag_count": 0,
         "entity_count": 0,
+        "entity_2_candidate_count": 0,
+        "entity_3_candidate_count": 0,
         "entity_unchanged_count": 0,
         "entity_3_to_2_count": 0,
         "entity_3_to_1_count": 0,
+        "entity_2_to_1_count": 0,
+        "entity_2_to_0_count": 0,
         "entity_all_flagged_count": 0,
         "qwen_selected_flagged_count": 0,
         "potential_input_images_before": 0,
@@ -196,13 +196,21 @@ def _increment_summary(
     )
     summary["combined_flag_count"] += int(entity["flagged_count"])
     summary["entity_count"] += 1
+    before_count = int(entity["candidate_count_before"])
+    summary[f"entity_{before_count}_candidate_count"] += 1
     state_key = {
         "unchanged": "entity_unchanged_count",
         "3_to_2": "entity_3_to_2_count",
         "3_to_1": "entity_3_to_1_count",
-        "all_candidates_flagged": "entity_all_flagged_count",
-    }[str(entity["shadow_state"])]
-    summary[state_key] += 1
+        "3_to_0": None,
+        "2_to_1": "entity_2_to_1_count",
+        "2_to_0": "entity_2_to_0_count",
+    }.get(str(entity["shadow_state"]))
+    if state_key is None and entity["shadow_state"] not in {"3_to_0"}:
+        raise ValueError("shadow entity state is unsupported")
+    if state_key is not None:
+        summary[state_key] += 1
+    summary["entity_all_flagged_count"] += int(entity["all_candidates_flagged"])
     summary["qwen_selected_flagged_count"] += sum(
         bool(candidate["current_qwen_selected"])
         and bool(candidate["shadow_flagged"])
@@ -252,6 +260,11 @@ def _build_simulation(
         selected_count = sum(bool(record.get("is_current_selected")) for record in group)
         if selected_count > 1:
             raise ValueError("entity candidates contain multiple Qwen selections")
+        before_count = len(group)
+        if before_count not in {2, 3}:
+            raise ValueError(
+                "shadow simulation requires two or three candidates per entity"
+            )
 
         laplacians = [
             _finite_metric(record.get("technical_quality"), "laplacian_variance")
@@ -274,13 +287,21 @@ def _build_simulation(
             strict=True,
         ):
             reference_type = str(record["reference_type"])
+            relative_blur_applicable = (
+                before_count == 3 and reference_type == "subject"
+            )
+            relative_blur_inapplicable_reason = None
+            if before_count != 3:
+                relative_blur_inapplicable_reason = "requires_three_candidates"
+            elif reference_type != "subject":
+                relative_blur_inapplicable_reason = "subject_only"
             laplacian_ratio = _safe_ratio(laplacian, max_laplacian)
             tenengrad_ratio = _safe_ratio(tenengrad, max_tenengrad)
             near_condition = _subject_near_silhouette(
                 reference_type,
                 record.get("technical_quality"),
             )
-            blur_condition = _subject_relative_blur_v2(
+            blur_condition = relative_blur_applicable and _subject_relative_blur_v2(
                 reference_type,
                 laplacian_ratio,
                 tenengrad_ratio,
@@ -305,9 +326,14 @@ def _build_simulation(
                 "frame_slot": record.get("frame_slot"),
                 "source_frame_index": record.get("source_frame_index"),
                 "crop_padding_ratio": record.get("crop_padding_ratio"),
+                "candidate_count_before": before_count,
                 "current_qwen_selected": bool(record.get("is_current_selected")),
                 "near_silhouette_flag": near_flag,
                 "relative_blur_v2_flag": blur_flag,
+                "relative_blur_v2_applicable": relative_blur_applicable,
+                "relative_blur_v2_inapplicable_reason": (
+                    relative_blur_inapplicable_reason
+                ),
                 "shadow_flagged": bool(flagged_by),
                 "flagged_by": flagged_by,
                 "technical_metrics": (
@@ -323,7 +349,6 @@ def _build_simulation(
             candidate_results.append(result)
 
         flagged_count = sum(bool(result["shadow_flagged"]) for result in group_results)
-        before_count = len(group_results)
         after_count = before_count - flagged_count
         remaining_ids = [
             str(result["candidate_id"])
@@ -348,6 +373,17 @@ def _build_simulation(
                     for result in group_results
                 ),
                 "shadow_state": _entity_state(before_count, after_count),
+                "all_candidates_flagged": after_count == 0,
+                "relative_blur_v2_applicable": (
+                    before_count == 3 and next(iter(reference_types)) == "subject"
+                ),
+                "relative_blur_v2_inapplicable_reason": (
+                    "requires_three_candidates"
+                    if before_count != 3
+                    else "subject_only"
+                    if next(iter(reference_types)) != "subject"
+                    else None
+                ),
                 "estimated_qwen_call_skippable": after_count == 0,
                 "baseline_input_images": baseline_images,
                 "shadow_input_images": shadow_images,
@@ -418,7 +454,7 @@ def _build_simulation(
     ]
     all_flagged_cases = []
     for entity in entity_results:
-        if entity["shadow_state"] != "all_candidates_flagged":
+        if not entity["all_candidates_flagged"]:
             continue
         key = (str(entity["clip_uid"]), str(entity["entity_id"]))
         all_flagged_cases.append(

@@ -162,7 +162,10 @@ def _selected_cases(
         (str(entity["clip_uid"]), str(entity["entity_id"]))
         for entity in entities_value
         if isinstance(entity, Mapping)
-        and entity.get("shadow_state") == "all_candidates_flagged"
+        and (
+            entity.get("all_candidates_flagged") is True
+            or entity.get("shadow_state") == "all_candidates_flagged"
+        )
     }
     cases: list[dict[str, object]] = []
     for candidate in candidates_value:
@@ -276,6 +279,7 @@ def _render_case(
     title_lines = (
         f"{case['clip_uid']} / {case['entity_id']} / {case['candidate_id']}",
         f"{case['reference_type']} / {case.get('phrase')}",
+        f"candidate_count_before={case.get('candidate_count_before', 'n/a')}",
         f"shadow rules: {rules}",
         f"Qwen selected? {'yes' if case['current_qwen_selected'] else 'no'}",
     )
@@ -319,7 +323,19 @@ def _render_case(
     )
     technical = case.get("technical_metrics")
     pose = case.get("subject_pose_evidence")
+    relative_blur_reason = case.get("relative_blur_v2_inapplicable_reason")
+    if relative_blur_reason == "requires_three_candidates":
+        relative_blur_status = (
+            "relative_blur_v2 = not applicable (requires 3 candidates)"
+        )
+    elif case.get("relative_blur_v2_applicable") is True:
+        relative_blur_status = "relative_blur_v2 = applicable"
+    elif "relative_blur_v2_flag" not in case and "relative_blur_flag" in case:
+        relative_blur_status = "relative_blur_v2 = legacy v1 evidence (deprecated)"
+    else:
+        relative_blur_status = "relative_blur_v2 = not applicable"
     lines = [
+        relative_blur_status,
         (
             f"luma={_format_metric(_mapping_metric(technical, 'luma_mean'))}   "
             "dark_fraction_32="
