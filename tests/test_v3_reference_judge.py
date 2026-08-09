@@ -22,6 +22,8 @@ from r2v_data_v2.v3.reference_judge import (
     SYSTEM_PROMPT,
     EntityReferenceJudgeFailure,
     QwenEntityReferenceJudge,
+    _CandidateJudgeContextOverflow,
+    _context_overflow_from_bad_request,
     build_entity_reference_request_payload,
     build_paired_candidate_evidence_card,
     subject_has_nontrivial_detached_component,
@@ -332,6 +334,51 @@ def test_identity_bearing_subject_viewpoints_are_accepted(viewpoint: str) -> Non
         candidate_ids={"candidate_1"},
         reference_type="subject",
     ) == []
+
+
+def test_rejected_subject_may_use_not_applicable_viewpoint() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(
+            selected_candidate_id=None,
+            image_quality="poor",
+            completeness="fragmented",
+            reference_scope="reject",
+            visible_region="custom",
+            whole_entity_recognizable=False,
+            identity_features_visible=False,
+            viewpoint="not_applicable",
+            independent_reference_value=False,
+            primary_identity_region_visible=False,
+            major_structure_visible=False,
+            truncation_severity="major",
+            discrete_foreground_instance=False,
+            mask_matches_target=False,
+            scope_reason="No usable subject view is visible.",
+        )
+    )
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    assert "subject_viewpoint_required" not in {issue.code for issue in issues}
+    assert issues == []
+
+
+def test_usable_subject_still_requires_directional_viewpoint() -> None:
+    decision = RawEntityReferenceDecision.model_validate(
+        _payload(viewpoint="not_applicable")
+    )
+
+    issues = validate_entity_reference_decision(
+        decision,
+        candidate_ids={"candidate_1"},
+        reference_type="subject",
+    )
+
+    assert {issue.code for issue in issues} == {"subject_viewpoint_required"}
 
 
 def test_rear_subject_must_reject() -> None:
@@ -1199,7 +1246,7 @@ def test_subject_fragment_signal_enters_existing_structured_repair_lifecycle() -
 class _Completions:
     def __init__(
         self,
-        responses: list[dict[str, object] | str],
+        responses: list[dict[str, object] | str | BaseException],
         *,
         strict_failure: bool = False,
     ) -> None:
@@ -1222,6 +1269,8 @@ class _Completions:
                 body={},
             )
         response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
         raw = response if isinstance(response, str) else json.dumps(response)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=raw))]
@@ -1250,6 +1299,40 @@ def _judge(
         prompt_mode=prompt_mode,
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
+
+
+def _bad_request(message: str) -> BadRequestError:
+    return BadRequestError(
+        message,
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST",
+                "http://127.0.0.1:8000/v1/chat/completions",
+            ),
+        ),
+        body={"message": message},
+    )
+
+
+def _context_overflow(input_length: int, max_context_length: int) -> BadRequestError:
+    return _bad_request(
+        f"Input length ({input_length}) exceeds model's maximum context length "
+        f"({max_context_length})"
+    )
+
+
+def _call_evidence(call: dict[str, object]) -> tuple[list[str], list[Image.Image]]:
+    content = call["messages"][1]["content"]
+    labels = [item["text"] for item in content if item["type"] == "text"][1:]
+    images: list[Image.Image] = []
+    for item in content:
+        if item["type"] != "image_url":
+            continue
+        encoded = item["image_url"]["url"].split(",", 1)[1]
+        with Image.open(BytesIO(base64.b64decode(encoded))) as opened:
+            images.append(opened.convert("RGB").copy())
+    return labels, images
 
 
 def test_messages_use_ordered_in_memory_context_and_crop_data_urls() -> None:
@@ -1503,6 +1586,11 @@ def test_candidate_judge_repair_profiles_payload_shape_without_mutation(
     assert all(event["metadata"]["evidence_mode"] == "separate" for event in events)
     assert all(event["metadata"]["paired_card_count"] == 0 for event in events)
     assert all(event["metadata"]["prompt_mode"] == "baseline" for event in events)
+    assert all(event["metadata"]["evidence_scale"] == 1.0 for event in events)
+    assert all(
+        event["metadata"]["context_overflow_retry_index"] == 0
+        for event in events
+    )
 
 
 def test_compact_prompt_profiles_mode_with_six_images(tmp_path: Path) -> None:
@@ -1600,6 +1688,154 @@ def test_bad_request_falls_back_to_json_object_without_network() -> None:
         "json_schema",
         "json_object",
     ]
+
+
+def test_context_length_bad_request_is_recognized_with_reported_lengths() -> None:
+    overflow = _context_overflow_from_bad_request(_context_overflow(40_123, 32_768))
+
+    assert overflow is not None
+    assert overflow.input_length == 40_123
+    assert overflow.max_context_length == 32_768
+
+
+def test_context_overflow_recovers_without_json_object_or_structured_repair(
+    tmp_path: Path,
+) -> None:
+    completions = _Completions(
+        [
+            _context_overflow(40_000, 32_768),
+            _payload(),
+        ]
+    )
+    judge = _judge(completions, repair_retries=0)
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+    candidates = [_candidate(f"candidate_{index}") for index in range(1, 4)]
+    source_images = _source_images()
+    source_before = {
+        key: (image.mode, image.size, image.tobytes())
+        for key, image in source_images.items()
+    }
+
+    with active_profiler(profiler):
+        attempt = judge.decide(
+            entity=_entity(),
+            candidates=candidates,
+            source_images=source_images,
+        )
+
+    assert attempt.repair_attempts == 0
+    assert len(attempt.raw_responses) == 1
+    assert [call["response_format"]["type"] for call in completions.calls] == [
+        "json_schema",
+        "json_schema",
+    ]
+    first_labels, first_images = _call_evidence(completions.calls[0])
+    second_labels, second_images = _call_evidence(completions.calls[1])
+    assert first_labels == second_labels == [
+        f"Candidate candidate_{candidate_index} {evidence_kind}"
+        for candidate_index in range(1, 4)
+        for evidence_kind in ("context", "isolated crop")
+    ]
+    assert len(first_images) == len(second_images) == 6
+    assert all(
+        reduced.width <= original.width and reduced.height <= original.height
+        for original, reduced in zip(first_images, second_images, strict=True)
+    )
+    assert any(
+        reduced.size != original.size
+        for original, reduced in zip(first_images, second_images, strict=True)
+    )
+    assert completions.calls[0]["messages"][1]["content"][0]["text"] == (
+        completions.calls[1]["messages"][1]["content"][0]["text"]
+    )
+    assert {
+        key: (image.mode, image.size, image.tobytes())
+        for key, image in source_images.items()
+    } == source_before
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(events) == 2
+    assert [event["retry_index"] for event in events] == [0, 0]
+    assert [
+        event["metadata"]["context_overflow_retry_index"] for event in events
+    ] == [0, 1]
+    assert events[0]["metadata"]["evidence_scale"] == 1.0
+    assert 0.5 <= events[1]["metadata"]["evidence_scale"] < 1.0
+    assert events[1]["metadata"]["reported_input_length"] == 40_000
+    assert events[1]["metadata"]["reported_max_context_length"] == 32_768
+    assert all(event["input_image_count"] == 6 for event in events)
+    assert all(event["metadata"]["candidate_count"] == 3 for event in events)
+    assert all(
+        event["metadata"]["context_image_count"] == 3 for event in events
+    )
+    assert all(
+        event["metadata"]["isolated_crop_count"] == 3 for event in events
+    )
+
+
+def test_second_context_overflow_uses_new_report_to_reduce_scale_again(
+    tmp_path: Path,
+) -> None:
+    completions = _Completions(
+        [
+            _context_overflow(40_000, 32_768),
+            _context_overflow(35_000, 32_768),
+            _payload(),
+        ]
+    )
+    judge = _judge(completions, repair_retries=0)
+    profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
+
+    with active_profiler(profiler):
+        attempt = judge.decide(
+            entity=_entity(),
+            candidates=[
+                _candidate(f"candidate_{index}") for index in range(1, 4)
+            ],
+            source_images=_source_images(),
+        )
+
+    assert attempt.repair_attempts == 0
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    scales = [float(event["metadata"]["evidence_scale"]) for event in events]
+    assert len(scales) == 3
+    assert 1.0 == scales[0] > scales[1] > scales[2] >= 0.5
+    assert [
+        event["metadata"]["context_overflow_retry_index"] for event in events
+    ] == [0, 1, 2]
+    assert events[2]["metadata"]["reported_input_length"] == 35_000
+    assert events[2]["metadata"]["reported_max_context_length"] == 32_768
+
+
+def test_context_overflow_recovery_exhaustion_fails_closed() -> None:
+    completions = _Completions(
+        [_context_overflow(40_000, 32_768) for _ in range(3)]
+    )
+    judge = _judge(completions, repair_retries=1)
+
+    with pytest.raises(EntityReferenceJudgeFailure) as error:
+        judge.decide(
+            entity=_entity(),
+            candidates=[
+                _candidate(f"candidate_{index}") for index in range(1, 4)
+            ],
+            source_images=_source_images(),
+        )
+
+    assert len(completions.calls) == 3
+    assert all(
+        call["response_format"]["type"] == "json_schema"
+        for call in completions.calls
+    )
+    assert error.value.attempt_count == 1
+    assert error.value.raw_responses == []
+    assert error.value.issues[0].code == "qwen_request_failed"
+    assert isinstance(error.value.__cause__, _CandidateJudgeContextOverflow)
 
 
 @pytest.mark.parametrize(

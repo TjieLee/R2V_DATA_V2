@@ -243,6 +243,75 @@ class EntityReferenceJudge(Protocol):
 EvidencePresentationMode = Literal["separate", "paired_card"]
 CandidateJudgePromptMode = Literal["baseline", "compact_v1"]
 
+TARGET_CONTEXT_FRACTION = 0.85
+MIN_EVIDENCE_SCALE = 0.50
+MAX_CONTEXT_OVERFLOW_RETRIES = 2
+_CONTEXT_LENGTH_PATTERN = re.compile(
+    r"Input length\s*\(\s*([\d,]+)\s*\)\s*exceeds model's maximum "
+    r"context length\s*\(\s*([\d,]+)\s*\)",
+    flags=re.IGNORECASE,
+)
+
+
+class _CandidateJudgeContextOverflow(RuntimeError):
+    def __init__(self, *, input_length: int, max_context_length: int) -> None:
+        self.input_length = input_length
+        self.max_context_length = max_context_length
+        super().__init__(
+            "candidate judge input length "
+            f"{input_length} exceeds maximum context length {max_context_length}"
+        )
+
+
+def _context_overflow_from_bad_request(
+    error: BadRequestError,
+) -> _CandidateJudgeContextOverflow | None:
+    parts = [str(error)]
+    body = getattr(error, "body", None)
+    if body is not None:
+        try:
+            parts.append(json.dumps(body, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            parts.append(str(body))
+    match = _CONTEXT_LENGTH_PATTERN.search("\n".join(parts))
+    if match is None:
+        return None
+    input_length = int(match.group(1).replace(",", ""))
+    max_context_length = int(match.group(2).replace(",", ""))
+    if input_length <= 0 or max_context_length <= 0:
+        return None
+    return _CandidateJudgeContextOverflow(
+        input_length=input_length,
+        max_context_length=max_context_length,
+    )
+
+
+def _next_evidence_scale(
+    current_scale: float,
+    *,
+    input_length: int,
+    max_context_length: int,
+) -> float | None:
+    proposed = current_scale * math.sqrt(
+        (TARGET_CONTEXT_FRACTION * max_context_length) / input_length
+    )
+    next_scale = max(MIN_EVIDENCE_SCALE, min(current_scale, proposed))
+    if not math.isfinite(next_scale) or next_scale >= current_scale:
+        return None
+    return next_scale
+
+
+def _resize_evidence_for_presentation(
+    image: Image.Image,
+    *,
+    evidence_scale: float,
+) -> Image.Image:
+    if evidence_scale == 1.0:
+        return image
+    width = max(1, round(image.width * evidence_scale))
+    height = max(1, round(image.height * evidence_scale))
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
 
 def _png_data_url(image: Image.Image) -> str:
     buffer = io.BytesIO()
@@ -438,7 +507,10 @@ def validate_entity_reference_decision(
             )
         )
     if reference_type == "subject":
-        if decision.viewpoint == "not_applicable":
+        if (
+            decision.viewpoint == "not_applicable"
+            and decision.reference_scope != "reject"
+        ):
             issues.append(
                 ValidationIssue(
                     code="subject_viewpoint_required",
@@ -744,6 +816,7 @@ class QwenEntityReferenceJudge:
         candidates: list[EntityReferenceCandidate],
         source_images: dict[str, Image.Image],
         request_text: str,
+        evidence_scale: float = 1.0,
     ) -> list[dict[str, object]]:
         from r2v_data_v2.v3.pair import (
             build_candidate_context_image,
@@ -793,11 +866,15 @@ class QwenEntityReferenceJudge:
                     ),
                 )
             for label, image in evidence:
+                presentation = _resize_evidence_for_presentation(
+                    image,
+                    evidence_scale=evidence_scale,
+                )
                 content.append({"type": "text", "text": label})
                 content.append(
                     {
                         "type": "image_url",
-                        "image_url": {"url": _png_data_url(image)},
+                        "image_url": {"url": _png_data_url(presentation)},
                     }
                 )
         return [
@@ -805,7 +882,15 @@ class QwenEntityReferenceJudge:
             {"role": "user", "content": content},
         ]
 
-    def _request(self, messages: list[dict[str, object]]) -> str:
+    def _request(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        evidence_scale: float = 1.0,
+        context_overflow_retry_index: int = 0,
+        reported_input_length: int | None = None,
+        reported_max_context_length: int | None = None,
+    ) -> str:
         profile_context = get_model_profile_context()
         retry_index = profile_context.retry_index
         candidate_count = int(profile_context.metadata.get("candidate_count", 0))
@@ -828,7 +913,15 @@ class QwenEntityReferenceJudge:
             "prompt_mode": str(
                 profile_context.metadata.get("prompt_mode", self.prompt_mode)
             ),
+            "evidence_scale": evidence_scale,
+            "context_overflow_retry_index": context_overflow_retry_index,
         }
+        if reported_input_length is not None:
+            profile_metadata["reported_input_length"] = reported_input_length
+        if reported_max_context_length is not None:
+            profile_metadata["reported_max_context_length"] = (
+                reported_max_context_length
+            )
         parameters: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -860,22 +953,31 @@ class QwenEntityReferenceJudge:
                     "response_format": "json_schema",
                 },
             )
-        except BadRequestError:
-            response = profiled_openai_call(
-                lambda: self.client.chat.completions.create(
-                    **parameters,
-                    response_format={"type": "json_object"},
-                ),
-                component="qwen_candidate_judge",
-                operation="initial" if retry_index == 0 else "repair",
-                retry_index=retry_index,
-                model=self.config.model,
-                messages=messages,
-                metadata={
-                    **profile_metadata,
-                    "response_format": "json_object",
-                },
-            )
+        except BadRequestError as error:
+            overflow = _context_overflow_from_bad_request(error)
+            if overflow is not None:
+                raise overflow from error
+            try:
+                response = profiled_openai_call(
+                    lambda: self.client.chat.completions.create(
+                        **parameters,
+                        response_format={"type": "json_object"},
+                    ),
+                    component="qwen_candidate_judge",
+                    operation="initial" if retry_index == 0 else "repair",
+                    retry_index=retry_index,
+                    model=self.config.model,
+                    messages=messages,
+                    metadata={
+                        **profile_metadata,
+                        "response_format": "json_object",
+                    },
+                )
+            except BadRequestError as fallback_error:
+                overflow = _context_overflow_from_bad_request(fallback_error)
+                if overflow is not None:
+                    raise overflow from fallback_error
+                raise
         result = response.choices[0].message.content
         if not result:
             raise RuntimeError("Qwen returned an empty entity reference decision")
@@ -921,28 +1023,64 @@ class QwenEntityReferenceJudge:
                     validation_issues=issues,
                     json_schema=(RawEntityReferenceDecision.model_json_schema()),
                 )
+            evidence_scale = 1.0
+            reported_input_length: int | None = None
+            reported_max_context_length: int | None = None
             try:
-                with model_profile_context(
-                    retry_index=attempt,
-                    metadata={
-                        "candidate_count": len(candidates),
-                        "evidence_mode": self.evidence_mode,
-                        "card_panel_max_side": (
-                            self.card_panel_max_side
-                            if self.evidence_mode == "paired_card"
-                            else None
-                        ),
-                        "prompt_mode": self.prompt_mode,
-                    },
+                for overflow_retry_index in range(
+                    MAX_CONTEXT_OVERFLOW_RETRIES + 1
                 ):
-                    raw = self._request(
-                        self._messages(
-                            entity=entity,
-                            candidates=candidates,
-                            source_images=source_images,
-                            request_text=request_text,
-                        )
-                    )
+                    with model_profile_context(
+                        retry_index=attempt,
+                        metadata={
+                            "candidate_count": len(candidates),
+                            "evidence_mode": self.evidence_mode,
+                            "card_panel_max_side": (
+                                self.card_panel_max_side
+                                if self.evidence_mode == "paired_card"
+                                else None
+                            ),
+                            "prompt_mode": self.prompt_mode,
+                        },
+                    ):
+                        try:
+                            raw = self._request(
+                                self._messages(
+                                    entity=entity,
+                                    candidates=candidates,
+                                    source_images=source_images,
+                                    request_text=request_text,
+                                    evidence_scale=evidence_scale,
+                                ),
+                                evidence_scale=evidence_scale,
+                                context_overflow_retry_index=(
+                                    overflow_retry_index
+                                ),
+                                reported_input_length=reported_input_length,
+                                reported_max_context_length=(
+                                    reported_max_context_length
+                                ),
+                            )
+                        except _CandidateJudgeContextOverflow as overflow:
+                            if (
+                                overflow_retry_index
+                                >= MAX_CONTEXT_OVERFLOW_RETRIES
+                            ):
+                                raise
+                            next_scale = _next_evidence_scale(
+                                evidence_scale,
+                                input_length=overflow.input_length,
+                                max_context_length=overflow.max_context_length,
+                            )
+                            if next_scale is None:
+                                raise
+                            evidence_scale = next_scale
+                            reported_input_length = overflow.input_length
+                            reported_max_context_length = (
+                                overflow.max_context_length
+                            )
+                            continue
+                        break
             except Exception as exc:
                 raise EntityReferenceJudgeFailure(
                     raw_responses=raw_responses,
