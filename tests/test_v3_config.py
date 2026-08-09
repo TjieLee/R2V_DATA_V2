@@ -26,6 +26,7 @@ def _write_config(
     reference_edit_enabled: bool = False,
     reference_edit_judge: bool = False,
     reference_edit_target_area: int = 1024 * 1024,
+    scale_collapse_fallback_guard_mode: object = "off",
     min_source_content_area_pixels: object = 128 * 128,
     min_source_content_long_side_pixels: object = 128,
     min_candidate_scale_ratio: object = 0.60,
@@ -125,6 +126,10 @@ def _write_config(
                 f"  code_root: {writable / 'vendor' / 'Boogu-Image'}",
                 f"  model_path: {writable / 'models' / 'Boogu-Image'}",
                 f"  target_area: {reference_edit_target_area}",
+                (
+                    "  scale_collapse_fallback_guard_mode: "
+                    f'"{scale_collapse_fallback_guard_mode}"'
+                ),
                 (
                     "  min_source_content_area_pixels: "
                     f"{str(min_source_content_area_pixels).lower()}"
@@ -658,6 +663,53 @@ def test_reference_edit_config_participates_in_fingerprint(
     assert first.reference_edit.enabled is True
     assert first.qwen.reference_edit_judge is not None
     assert first.fingerprint() != second.fingerprint()
+
+
+def test_scale_collapse_fallback_guard_defaults_off_and_affects_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disabled = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+            reference_edit_enabled=True,
+            reference_edit_judge=True,
+        )
+    )
+    enabled = load_config(
+        _write_config(
+            tmp_path,
+            monkeypatch,
+            candidate_judge=True,
+            background_remove_judge=True,
+            reference_edit_enabled=True,
+            reference_edit_judge=True,
+            scale_collapse_fallback_guard_mode="qwen_v1",
+        )
+    )
+
+    assert disabled.reference_edit.scale_collapse_fallback_guard_mode == "off"
+    assert enabled.reference_edit.scale_collapse_fallback_guard_mode == "qwen_v1"
+    assert disabled.fingerprint() != enabled.fingerprint()
+
+
+def test_scale_collapse_fallback_guard_rejects_unknown_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_config(
+        tmp_path,
+        monkeypatch,
+        candidate_judge=True,
+        background_remove_judge=True,
+        scale_collapse_fallback_guard_mode="always",
+    )
+
+    with pytest.raises(ValueError, match="scale_collapse_fallback_guard_mode"):
+        load_config(path)
 
 
 def test_legacy_config_uses_reference_edit_geometry_defaults(

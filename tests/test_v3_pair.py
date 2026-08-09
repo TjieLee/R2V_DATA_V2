@@ -75,6 +75,11 @@ from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
 )
+from r2v_data_v2.v3.scale_collapse_fallback_guard import (
+    ScaleCollapseFallbackJudgeFailure,
+    ScaleCollapseFallbackReview,
+    ScaleCollapseFallbackReviewAttempt,
+)
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
@@ -4452,6 +4457,56 @@ class _ReferenceEditSamReviewer:
         )
 
 
+class _ScaleCollapseFallbackJudge:
+    def __init__(
+        self,
+        *,
+        rejected_phrases: set[str] | None = None,
+        failure: ScaleCollapseFallbackJudgeFailure | None = None,
+    ) -> None:
+        self.rejected_phrases = rejected_phrases or set()
+        self.failure = failure
+        self.calls: list[dict[str, object]] = []
+
+    def review(self, **kwargs: object) -> ScaleCollapseFallbackReviewAttempt:
+        self.calls.append(kwargs)
+        if self.failure is not None:
+            raise self.failure
+        accepted = str(kwargs["entity_phrase"]) not in self.rejected_phrases
+        review = ScaleCollapseFallbackReview(
+            verdict="accept" if accepted else "reject",
+            identity_or_primary_region_visible=accepted,
+            coherent_structure=accepted,
+            independent_reference_value=accepted,
+            not_severely_fragmented=accepted,
+            reason="usable source" if accepted else "fragmented source",
+        )
+        return ScaleCollapseFallbackReviewAttempt(
+            review=review,
+            raw_responses=(review.model_dump_json(),),
+        )
+
+
+class _MultipleInstanceSamReviewer:
+    def review(self, **kwargs: object) -> BooguSamReview:
+        del kwargs
+        return BooguSamReview(
+            passed=False,
+            target_entity_present=True,
+            exactly_one_target_instance=False,
+            area_growth_acceptable=True,
+            fragmentation_acceptable=True,
+            reason="multiple instances",
+            diagnostics={"failure_kind": "multiple_instances"},
+        )
+
+
+class _BrokenReferenceEditJudge:
+    def review(self, **kwargs: object) -> object:
+        del kwargs
+        raise ValueError("malformed Qwen Boogu review")
+
+
 def _write_touching_local_reference(
     storage: RunStorage,
     *,
@@ -5456,6 +5511,273 @@ def test_local_usable_background_rejection_keeps_source(
     assert clip.reference_edit.entities[0].status == "fallback"
     assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
     assert source_path.read_bytes() == source_bytes
+
+
+def test_scale_collapse_guard_off_preserves_keep_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    source = storage.read_clip("clip-1").references.entities[0]
+    guard = _ScaleCollapseFallbackJudge()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(
+            background_updates={"subject_scale_preserved": False}
+        ),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        scale_collapse_judge=guard,
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert clip.references.entities[0] == source
+    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert clip.reference_edit.entities[0].reason == "entity_scale_collapsed"
+    assert stats.scale_collapse_guard_attempted == 0
+    assert guard.calls == []
+
+
+def test_scale_collapse_guard_accept_keeps_source_and_writes_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+        debug=True,
+    )
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            scale_collapse_fallback_guard_mode="qwen_v1",
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    source = storage.read_clip("clip-1").references.entities[0]
+    source_path = storage.root / source.image_path
+    guard = _ScaleCollapseFallbackJudge()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(
+            background_updates={"subject_scale_preserved": False}
+        ),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        scale_collapse_judge=guard,
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert clip.references.entities[0] == source
+    assert clip.references.entities[0].synthetic is False
+    assert stats.scale_collapse_guard_attempted == 1
+    assert stats.scale_collapse_guard_accepted == 1
+    assert stats.scale_collapse_guard_rejected == 0
+    assert stats.scale_collapse_guard_failed_open == 0
+    assert len(guard.calls) == 1
+    reviewed = guard.calls[0]["image"]
+    with Image.open(source_path) as opened:
+        assert reviewed.mode == opened.mode
+        assert reviewed.size == opened.size
+        assert reviewed.tobytes() == opened.tobytes()
+    diagnostic = json.loads(
+        (
+            storage.reference_edit_dir("clip-1")
+            / "e1"
+            / "scale_collapse_fallback_guard.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostic["verdict"] == "accept"
+    assert diagnostic["final_action"] == "keep_source"
+    assert diagnostic["raw_response"]
+    assert diagnostic["error"] is None
+
+
+def test_scale_collapse_guard_rejects_only_qualifying_entity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            scale_collapse_fallback_guard_mode="qwen_v1",
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(
+            background_updates={"subject_scale_preserved": False}
+        ),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        scale_collapse_judge=_ScaleCollapseFallbackJudge(
+            rejected_phrases={"entity 1"}
+        ),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert stats.entities_rejected == 1
+    assert stats.entities_fallback == 0
+    assert stats.scale_collapse_guard_attempted == 1
+    assert stats.scale_collapse_guard_rejected == 1
+    assert clip.references.entities[0].status == "rejected"
+    assert clip.reference_edit.entities[0].fallback_policy == "reject_entity"
+    assert clip.pairing.status == "rejected"
+    assert clip.pairing.reason == "no_qualifying_ready_reference"
+
+
+def test_scale_collapse_guard_rejects_one_while_qualifying_reference_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            scale_collapse_fallback_guard_mode="qwen_v1",
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject", "object"))
+    pair_clips(
+        config,
+        storage,
+        judge=_Judge({"e1": "local_incomplete", "e2": "local_incomplete"}),
+    )
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(
+            background_updates={"subject_scale_preserved": False}
+        ),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        scale_collapse_judge=_ScaleCollapseFallbackJudge(
+            rejected_phrases={"entity 2"}
+        ),
+    )
+
+    clip = storage.read_clip("clip-1")
+    by_id = {reference.entity_id: reference for reference in clip.references.entities}
+    assert stats.scale_collapse_guard_attempted == 2
+    assert stats.scale_collapse_guard_accepted == 1
+    assert stats.scale_collapse_guard_rejected == 1
+    assert by_id["e1"].status == "ready"
+    assert by_id["e2"].status == "rejected"
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1"]
+
+
+def test_scale_collapse_guard_technical_failure_fails_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            scale_collapse_fallback_guard_mode="qwen_v1",
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    source = storage.read_clip("clip-1").references.entities[0]
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(
+            background_updates={"subject_scale_preserved": False}
+        ),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        scale_collapse_judge=_ScaleCollapseFallbackJudge(
+            failure=ScaleCollapseFallbackJudgeFailure("endpoint unavailable")
+        ),
+    )
+
+    clip = storage.read_clip("clip-1")
+    assert clip.references.entities[0] == source
+    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert stats.scale_collapse_guard_attempted == 1
+    assert stats.scale_collapse_guard_failed_open == 1
+    assert stats.scale_collapse_guard_accepted == 0
+    assert stats.scale_collapse_guard_rejected == 0
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "multiple_instances",
+        "background_not_beneficial",
+        "entity_shifted_off_layout",
+        "generic_boogu_judge_failure",
+    ],
+)
+def test_scale_collapse_guard_is_not_invoked_for_other_rejections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            scale_collapse_fallback_guard_mode="qwen_v1",
+        ),
+    )
+    config.validate()
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
+    main_judge: object = _ReferenceEditJudge()
+    sam_reviewer: object = _ReferenceEditSamReviewer()
+    if failure_kind == "multiple_instances":
+        sam_reviewer = _MultipleInstanceSamReviewer()
+    elif failure_kind == "background_not_beneficial":
+        main_judge = _ReferenceEditJudge(
+            background_updates={"background_improves_reference": False}
+        )
+    elif failure_kind == "entity_shifted_off_layout":
+        main_judge = _ReferenceEditJudge(
+            background_updates={"subject_layout_preserved": False}
+        )
+    else:
+        main_judge = _BrokenReferenceEditJudge()
+    guard = _ScaleCollapseFallbackJudge()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=main_judge,
+        sam_reviewer=sam_reviewer,
+        scale_collapse_judge=guard,
+    )
+
+    assert stats.scale_collapse_guard_attempted == 0
+    assert guard.calls == []
 
 
 def test_production_pair_bypasses_legacy_completion_fallback(

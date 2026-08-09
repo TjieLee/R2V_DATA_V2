@@ -170,6 +170,7 @@ class ReferenceEditConfig:
     timeout_seconds: int = 3600
     add_background_to_complete: bool = True
     fallback_policy: str = "keep_source"
+    scale_collapse_fallback_guard_mode: str = "off"
     sam_max_area_growth_ratio: float = 3.0
     sam_max_significant_components: int = 4
     min_source_content_area_pixels: int = 128 * 128
@@ -554,6 +555,14 @@ class V3Config:
         }:
             raise ValueError(
                 "reference_edit.fallback_policy must be keep_source or reject_entity"
+            )
+        if self.reference_edit.scale_collapse_fallback_guard_mode not in {
+            "off",
+            "qwen_v1",
+        }:
+            raise ValueError(
+                "reference_edit.scale_collapse_fallback_guard_mode must be "
+                "off or qwen_v1"
             )
         if (
             not isinstance(self.reference_edit.sam_max_area_growth_ratio, float)

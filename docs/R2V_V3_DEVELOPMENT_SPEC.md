@@ -1309,6 +1309,7 @@ reference_edit:
   timeout_seconds: 3600
   add_background_to_complete: true
   fallback_policy: keep_source
+  scale_collapse_fallback_guard_mode: "off"
   sam_max_area_growth_ratio: 3.0
   sam_max_significant_components: 4
   min_source_content_area_pixels: 16384

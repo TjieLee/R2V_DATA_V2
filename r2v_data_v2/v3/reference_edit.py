@@ -29,6 +29,13 @@ from r2v_data_v2.v3.reference_geometry import (
     tiny_content_reason,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
+from r2v_data_v2.v3.scale_collapse_fallback_guard import (
+    QwenScaleCollapseFallbackJudge,
+    ScaleCollapseFallbackJudge,
+    ScaleCollapseFallbackJudgeFailure,
+    ScaleCollapseFallbackReviewAttempt,
+    load_source_reference_image,
+)
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     EntityReferenceState,
@@ -59,6 +66,10 @@ class ReferenceEditStats:
     entities_rejected: int = 0
     entities_failed: int = 0
     worker_starts: int = 0
+    scale_collapse_guard_attempted: int = 0
+    scale_collapse_guard_accepted: int = 0
+    scale_collapse_guard_rejected: int = 0
+    scale_collapse_guard_failed_open: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -77,6 +88,16 @@ _ENTITY_COUNTER_FIELDS = (
     "entities_fallback",
     "entities_rejected",
     "entities_failed",
+)
+_SCALE_COLLAPSE_GUARD_COUNTER_FIELDS = (
+    "scale_collapse_guard_attempted",
+    "scale_collapse_guard_accepted",
+    "scale_collapse_guard_rejected",
+    "scale_collapse_guard_failed_open",
+)
+_CLIP_COUNTER_FIELDS = (
+    *_ENTITY_COUNTER_FIELDS,
+    *_SCALE_COLLAPSE_GUARD_COUNTER_FIELDS,
 )
 
 
@@ -304,6 +325,52 @@ def _rejection_reason(result: BooguReferenceEditResult) -> str:
     return reason
 
 
+def _write_scale_collapse_guard_diagnostic(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    attempt: ScaleCollapseFallbackReviewAttempt | None,
+    error: ScaleCollapseFallbackJudgeFailure | None,
+    final_action: str,
+) -> None:
+    if not config.debug.save_diagnostics:
+        return
+    review = attempt.review.model_dump(mode="json") if attempt is not None else {}
+    raw_response = attempt.raw_response if attempt is not None else None
+    if error is not None and error.raw_responses:
+        raw_response = error.raw_responses[-1]
+    path = (
+        storage.reference_edit_dir(clip_uid)
+        / entity.entity_id
+        / "scale_collapse_fallback_guard.json"
+    )
+    write_json_atomic(
+        path,
+        {
+            "clip_uid": clip_uid,
+            "entity_id": entity.entity_id,
+            "reference_type": entity.reference_type,
+            "entity_phrase": entity.phrase,
+            "mode": "qwen_v1",
+            "verdict": review.get("verdict"),
+            "identity_or_primary_region_visible": review.get(
+                "identity_or_primary_region_visible"
+            ),
+            "coherent_structure": review.get("coherent_structure"),
+            "independent_reference_value": review.get(
+                "independent_reference_value"
+            ),
+            "not_severely_fragmented": review.get("not_severely_fragmented"),
+            "reason": review.get("reason"),
+            "raw_response": raw_response,
+            "error": str(error) if error is not None else None,
+            "final_action": final_action,
+        },
+    )
+
+
 def reference_edit_clips(
     config: V3Config,
     storage: RunStorage,
@@ -312,6 +379,7 @@ def reference_edit_clips(
     backend: BooguReferenceEditBackend | None = None,
     judge: BooguReferenceEditJudge | None = None,
     sam_reviewer: BooguSamReviewer | None = None,
+    scale_collapse_judge: ScaleCollapseFallbackJudge | None = None,
 ) -> ReferenceEditStats:
     config.validate()
     if storage.root != config.resolved_run_root:
@@ -323,11 +391,26 @@ def reference_edit_clips(
     active_backend = backend
     active_judge = judge
     active_sam = sam_reviewer
+    active_scale_collapse_judge = scale_collapse_judge
     owned_backend: BooguSubprocessBackend | None = None
     owned_judge: QwenBooguReferenceEditJudge | None = None
     owned_segmenter: Sam3SegmentationBackend | None = None
+    owned_scale_collapse_judge: QwenScaleCollapseFallbackJudge | None = None
     started_backend: object | None = None
     runtime_ready = False
+
+    def get_scale_collapse_judge() -> ScaleCollapseFallbackJudge:
+        nonlocal active_scale_collapse_judge
+        nonlocal owned_scale_collapse_judge
+        if active_scale_collapse_judge is None:
+            judge_config = config.qwen.reference_edit_judge
+            if judge_config is None:
+                raise ValueError("qwen.reference_edit_judge is not configured")
+            owned_scale_collapse_judge = QwenScaleCollapseFallbackJudge(
+                judge_config
+            )
+            active_scale_collapse_judge = owned_scale_collapse_judge
+        return active_scale_collapse_judge
 
     def initialize_runtime() -> tuple[
         BooguReferenceEditBackend,
@@ -413,7 +496,7 @@ def reference_edit_clips(
                 counters["skipped_existing"] += 1
                 continue
             counters["processed"] += 1
-            clip_entity_counters = {field: 0 for field in _ENTITY_COUNTER_FIELDS}
+            clip_entity_counters = {field: 0 for field in _CLIP_COUNTER_FIELDS}
             try:
                 if overwrite:
                     storage.cleanup_reference_edit_artifacts(clip.clip_uid)
@@ -737,6 +820,89 @@ def reference_edit_clips(
                         force_keep_source
                         or config.reference_edit.fallback_policy == "keep_source"
                     ):
+                        guard_rejected = False
+                        if (
+                            rejected_result.operation == "add_entity_background"
+                            and rejection_reason == "entity_scale_collapsed"
+                            and config.reference_edit.scale_collapse_fallback_guard_mode
+                            == "qwen_v1"
+                        ):
+                            clip_entity_counters[
+                                "scale_collapse_guard_attempted"
+                            ] += 1
+                            guard_attempt: (
+                                ScaleCollapseFallbackReviewAttempt | None
+                            ) = None
+                            guard_error: (
+                                ScaleCollapseFallbackJudgeFailure | None
+                            ) = None
+                            try:
+                                guard_attempt = get_scale_collapse_judge().review(
+                                    image=load_source_reference_image(
+                                        storage,
+                                        reference.image_path,
+                                    ),
+                                    reference_type=entity.reference_type,
+                                    entity_phrase=entity.phrase,
+                                )
+                            except ScaleCollapseFallbackJudgeFailure as exc:
+                                guard_error = exc
+                                clip_entity_counters[
+                                    "scale_collapse_guard_failed_open"
+                                ] += 1
+                            else:
+                                guard_rejected = (
+                                    guard_attempt.review.verdict == "reject"
+                                )
+                                outcome = (
+                                    "scale_collapse_guard_rejected"
+                                    if guard_rejected
+                                    else "scale_collapse_guard_accepted"
+                                )
+                                clip_entity_counters[outcome] += 1
+                            _write_scale_collapse_guard_diagnostic(
+                                config,
+                                storage,
+                                clip_uid=clip.clip_uid,
+                                entity=entity,
+                                attempt=guard_attempt,
+                                error=guard_error,
+                                final_action=(
+                                    "reject_entity"
+                                    if guard_rejected
+                                    else "keep_source"
+                                ),
+                            )
+                        if guard_rejected:
+                            guard_reason = "scale_collapse_source_guard_rejected"
+                            final_references.append(
+                                _rejected_reference(reference, guard_reason)
+                            )
+                            edit_states.append(
+                                ReferenceEditEntityState(
+                                    entity_id=reference.entity_id,
+                                    route=route,
+                                    status="rejected",
+                                    source_reference=reference,
+                                    source_image_path=reference.image_path,
+                                    operation=rejected_result.operation,
+                                    metadata_path=storage.relative_artifact_path(
+                                        rejected_result.metadata_path
+                                    ),
+                                    operations=attempted_operations,
+                                    background_metadata_path=(
+                                        storage.relative_artifact_path(
+                                            background_result.metadata_path
+                                        )
+                                        if background_result is not None
+                                        else None
+                                    ),
+                                    fallback_policy="reject_entity",
+                                    reason=guard_reason,
+                                )
+                            )
+                            clip_entity_counters["entities_rejected"] += 1
+                            continue
                         final_metadata_path = _write_source_selection_metadata(
                             storage,
                             clip_uid=clip.clip_uid,
@@ -883,9 +1049,17 @@ def reference_edit_clips(
             owned_judge.close()
         if owned_segmenter is not None:
             owned_segmenter.close()
+        if owned_scale_collapse_judge is not None:
+            owned_scale_collapse_judge.close()
         if close_error is not None:
             raise close_error
 
     stats = ReferenceEditStats(**counters)
+    if stats.scale_collapse_guard_attempted != (
+        stats.scale_collapse_guard_accepted
+        + stats.scale_collapse_guard_rejected
+        + stats.scale_collapse_guard_failed_open
+    ):
+        raise RuntimeError("scale-collapse guard outcomes must match attempts")
     storage.update_stage_counts("reference_edit", stats.to_dict())
     return stats
