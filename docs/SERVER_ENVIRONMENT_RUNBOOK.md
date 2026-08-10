@@ -702,8 +702,9 @@ candidate with reason `entity_scale_collapsed`, and the normal fallback would be
 - `not_severely_fragmented`
 
 All four must be true to accept. Guard accept preserves `keep_source`; guard
-reject rejects that entity. A technical, model, or structured-output failure is
-fail-open and preserves `keep_source`. Profiling uses component
+reject rejects that entity. A Qwen request, model-response, or structured-output
+failure is fail-open and preserves `keep_source`. Source artifact/path errors are
+not covered by this fail-open behavior. Profiling uses component
 `qwen_scale_collapse_fallback_guard`.
 
 The confirmed historical `prod1000` replay produced:
@@ -771,9 +772,11 @@ progress. SAM3 is in-process, so the absence of a separate SAM3 process in
 ### Read-only stage progress
 
 This compact inspection reads each `clip.json` plus durable stage artifacts. It
-shows total manifest clips and uses annotation-ready clips as the effective
-frames denominator. `run.json` stage counts are generally committed only when a
-stage finishes, so do not treat them as real-time progress for an active stage.
+reports annotation completion separately from annotation success, and uses
+annotation-ready clips as the effective denominator for frames, segment, and
+rank. Downstream stages use the number of clips actually eligible for that
+stage. `run.json` stage counts are generally committed only when a stage
+finishes, so do not treat them as real-time progress for an active stage.
 
 ```bash
 "$MAIN_PYTHON" - "$PROD_RUN" <<'PY'
@@ -790,11 +793,16 @@ for path in sorted((root / "clips").glob("*/clip.json")):
         print(f"WARN unreadable {path}: {exc}")
 
 total = len(records)
-annotation_ready = sum(
-    (record.get("annotation") or {}).get("status") == "ready"
-    for _, record in records
+annotation_statuses = [
+    (record.get("annotation") or {}).get("status") for _, record in records
+]
+annotation_done = sum(status is not None for status in annotation_statuses)
+annotation_ready = sum(status == "ready" for status in annotation_statuses)
+annotation_failed = sum(status == "failed" for status in annotation_statuses)
+
+frames = sum(
+    (path.parent / "frames" / "frames.json").is_file() for path, _ in records
 )
-frames = sum((path.parent / "frames" / "frames.json").is_file() for path, _ in records)
 segment = sum((path.parent / "masks.rle.json").is_file() for path, _ in records)
 rank = sum(record.get("coverage") is not None for _, record in records)
 rank_pass = sum(
@@ -805,8 +813,16 @@ background = sum(
     for _, record in records
 )
 pair = sum(record.get("pairing") is not None for _, record in records)
+pair_ready = sum(
+    (record.get("pairing") or {}).get("status") == "ready"
+    for _, record in records
+)
 reference_edit = sum(
     record.get("reference_edit") is not None for _, record in records
+)
+reference_edit_ready = sum(
+    (record.get("reference_edit") or {}).get("status") == "ready"
+    for _, record in records
 )
 instruction = sum(record.get("instruction") is not None for _, record in records)
 
@@ -814,17 +830,39 @@ def pct(value, denominator):
     return 0.0 if denominator == 0 else 100.0 * value / denominator
 
 print(f"Manifest       {total}")
-print(f"Annotate       {annotation_ready}/{total} ({pct(annotation_ready, total):.1f}%)")
 print(
-    f"Frames         {frames}/{annotation_ready} "
-    f"annotation-ready ({pct(frames, annotation_ready):.1f}%); manifest={total}"
+    f"Annotate       {annotation_done}/{total} "
+    f"({pct(annotation_done, total):.1f}%); "
+    f"ready={annotation_ready} failed={annotation_failed}"
 )
-print(f"Segment        {segment}/{total} ({pct(segment, total):.1f}%)")
-print(f"Rank           {rank}/{total}; passed={rank_pass}")
-print(f"Background     {background}/{total}")
-print(f"Pair           {pair}/{total}")
-print(f"Reference Edit {reference_edit}/{total}")
-print(f"Instruction    {instruction}/{total}")
+print(
+    f"Frames         {frames}/{annotation_ready} annotation-ready "
+    f"({pct(frames, annotation_ready):.1f}%)"
+)
+print(
+    f"Segment        {segment}/{annotation_ready} annotation-ready "
+    f"({pct(segment, annotation_ready):.1f}%)"
+)
+print(
+    f"Rank           {rank}/{annotation_ready} annotation-ready "
+    f"({pct(rank, annotation_ready):.1f}%); passed={rank_pass}"
+)
+print(
+    f"Background     {background}/{rank_pass} rank-passed "
+    f"({pct(background, rank_pass):.1f}%)"
+)
+print(
+    f"Pair           {pair}/{rank_pass} rank-passed "
+    f"({pct(pair, rank_pass):.1f}%); ready={pair_ready}"
+)
+print(
+    f"Reference Edit {reference_edit}/{pair_ready} pair-ready "
+    f"({pct(reference_edit, pair_ready):.1f}%); ready={reference_edit_ready}"
+)
+print(
+    f"Instruction    {instruction}/{reference_edit_ready} reference-edit-ready "
+    f"({pct(instruction, reference_edit_ready):.1f}%)"
+)
 PY
 ```
 
