@@ -1,6 +1,6 @@
 # R2V V3 Server Environment Runbook
 
-Last updated: 2026-08-08
+Last updated: 2026-08-10
 
 This file is the single source of truth for the Linux server environment used by
 the V3 pipeline. Update it whenever a runtime, source checkout, model path,
@@ -54,6 +54,50 @@ venv, or import the Boogu runtime into the main R2V process.
 The public dataset and pretrained roots are read-only. Never create caches,
 temporary files, lock files, or modified artifacts below either root.
 
+### Current production baseline
+
+The production code baseline validated before `prod5000` is:
+
+```text
+f4cdec251095ba3fd70c57f0a4082c58e5a67101
+```
+
+It includes the `conservative_v1` subject candidate prefilter, candidate-judge
+context-overflow recovery, the `qwen_v1` final background binding guard, and the
+`qwen_v1` scale-collapse source fallback guard. Later documentation-only commits
+may move repository `HEAD` without changing this validated behavior. Operators
+must record both the production code baseline and any later docs-only `HEAD`.
+
+The following is a dated operational example, not a permanent default:
+
+```text
+run name:    prod5000-20260809-171855
+config:      /mnt/workspace/litengjie/data/r2v_v3_configs/prod5000-20260809-171855.yaml
+run root:    /mnt/workspace/litengjie/data/r2v_v3_runs/prod5000-20260809-171855
+start_index: 1145
+limit:       5000
+```
+
+No temporary process ID is part of this record. On 2026-08-10 this running batch
+still had `sam3.device: cuda`, so SAM3 resolved to physical GPU 0 alongside vLLM
+TP0. The run was left unchanged because available memory remained sufficient.
+Every next production batch must explicitly set `sam3.device: cuda:5`.
+
+### Preferred production GPU allocation
+
+| Physical GPU | Assignment |
+| --- | --- |
+| 0-3 | Qwen3-VL vLLM tensor-parallel workers |
+| 4 | Background remover, `remove.device: cuda:4` |
+| 5 | SAM3, `sam3.device: cuda:5` |
+| 6 | Boogu, `reference_edit.cuda_visible_devices: "6"` |
+| 7 | Spare |
+
+`sam3.device: cuda` usually resolves to `cuda:0` in the pipeline process. Do not
+leave it implicit in the next production config. SAM3 runs in-process inside
+`run_pipeline_v3.py`, so `nvitop` normally attributes its memory to the main
+pipeline Python process rather than showing a separate process named `sam3`.
+
 ## 3. Start a fresh production shell
 
 Do not enable `set -e`, `set -u`, or `set -o pipefail` in an interactive
@@ -76,6 +120,13 @@ export SAM3_CODE_ROOT="/mnt/workspace/litengjie/data/vendor/sam3"
 export SAM3_MODEL_PATH="/mnt/workspace/public/pretrained/facebook/sam3/sam3.pt"
 export QWEN_MODEL_PATH="/mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct"
 export QWEN_BASE_URL="http://127.0.0.1:8000/v1"
+export V3_CONFIG_ROOT="/mnt/workspace/litengjie/data/r2v_v3_configs"
+export V3_RUN_ROOT="/mnt/workspace/litengjie/data/r2v_v3_runs"
+export V3_EXPORT_ROOT="/mnt/workspace/litengjie/data/r2v_v3_exports"
+export V3_LOG_ROOT="/mnt/workspace/litengjie/data/r2v_v3_logs"
+export V3_AUDIT_ROOT="/mnt/workspace/litengjie/data/r2v_v3_audits"
+export V3_REVIEW_ROOT="/mnt/workspace/litengjie/data/r2v_v3_reviews"
+export V3_SMOKE_ROOT="/mnt/workspace/litengjie/data/r2v_v3_smokes"
 export NO_PROXY="127.0.0.1,localhost"
 export no_proxy="127.0.0.1,localhost"
 export PYTHONPATH="$SAM3_CODE_ROOT:$R2V_REPO_ROOT:${PYTHONPATH:-}"
@@ -403,44 +454,127 @@ specific PID with `kill -TERM`. Do not use broad `pkill` commands.
 
 ## 8. Pipeline launch and profiling
 
-Set explicit machine-local paths after validating them:
+Set exact paths for the selected batch. The config and run below identify the
+confirmed `prod5000` example. Copy `PROD_EXPORT` from that config and choose an
+explicit log path; do not infer either from an older run:
 
 ```bash
-export CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/UNVERIFIED.yaml"
-test -f "$CONFIG" || echo "ERROR: invalid config"
+export PROD_CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/prod5000-20260809-171855.yaml"
+export PROD_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/prod5000-20260809-171855"
+export PROD_EXPORT="<exact export_root from selected config>"
+export PROD_LOG="/mnt/workspace/litengjie/data/r2v_v3_logs/<chosen-log-name>.log"
+
+test -f "$PROD_CONFIG" || echo "ERROR: invalid production config"
+curl -fsS --noproxy '*' http://127.0.0.1:8000/v1/models
+git rev-parse HEAD
+git branch --show-current
 ```
 
-The CLI runs only explicitly requested stages. A standard full sequence is:
+Inspect the selected config and device assignment before launch:
 
 ```bash
-"$MAIN_PYTHON" run_pipeline_v3.py \
-  --config "$CONFIG" \
-  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,instruct,export
+"$MAIN_PYTHON" - "$PROD_CONFIG" <<'PY'
+from pathlib import Path
+import sys
+
+import yaml
+
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+def nested(*keys):
+    value = config
+    for key in keys:
+        value = value.get(key, {}) if isinstance(value, dict) else {}
+    return value if value != {} else None
+
+for label, keys in (
+    ("run_root", ("run_root",)),
+    ("export_root", ("export_root",)),
+    ("source.start_index", ("source", "start_index")),
+    ("source.limit", ("source", "limit")),
+    ("sam3.device", ("sam3", "device")),
+    ("remove.device", ("remove", "device")),
+    (
+        "reference_edit.cuda_visible_devices",
+        ("reference_edit", "cuda_visible_devices"),
+    ),
+    ("pair.reference_prefilter_mode", ("pair", "reference_prefilter_mode")),
+    (
+        "pair.background_final_guard_mode",
+        ("pair", "background_final_guard_mode"),
+    ),
+    (
+        "reference_edit.scale_collapse_fallback_guard_mode",
+        ("reference_edit", "scale_collapse_fallback_guard_mode"),
+    ),
+):
+    print(f"{label}={nested(*keys)!r}")
+PY
 ```
 
-Run a bounded stage subset when validating a downstream change:
+The production config must explicitly contain this frozen fragment. These are
+production selections, not dataclass defaults; several modes deliberately
+default to off:
+
+```yaml
+qwen:
+  annotation:
+    repair_retries: 2
+
+sam3:
+  device: cuda:5
+
+coverage:
+  required_visible_frames: 7
+
+pair:
+  repair_retries: 2
+  max_candidates_per_entity: 3
+  crop_padding_ratio: 0.08
+  reference_prefilter_mode: conservative_v1
+  background_final_guard_mode: qwen_v1
+
+background:
+  max_pending_remove_area_ratio: 0.50
+
+remove:
+  device: cuda:4
+  candidate_seeds: [0, 17]
+  generation_mask_dilation_pixels: 16
+  max_generation_mask_area_ratio: 0.65
+
+reference_edit:
+  cuda_visible_devices: "6"
+  scale_collapse_fallback_guard_mode: qwen_v1
+```
+
+Recommended full production launch:
 
 ```bash
-"$MAIN_PYTHON" run_pipeline_v3.py \
-  --config "$CONFIG" \
-  --stages manifest,annotate
+mkdir -p /mnt/workspace/litengjie/data/r2v_v3_logs
+
+nohup "$MAIN_PYTHON" run_pipeline_v3.py \
+  --config "$PROD_CONFIG" \
+  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,instruct,export \
+  --profile \
+  > "$PROD_LOG" 2>&1 &
+
+PROD_PID=$!
+echo "$PROD_PID" > "${PROD_LOG}.pid"
+
+ps -fp "$PROD_PID"
+test -f "$PROD_RUN/run.json" && echo "RUN INITIALIZED PASS"
+test -f "$PROD_RUN/profiling/events.jsonl" && echo "PROFILING PASS"
 ```
 
-Add `--overwrite` only when regeneration is explicitly intended and the target
-run root has been checked. Add observational profiling with `--profile`:
-
-```bash
-"$MAIN_PYTHON" run_pipeline_v3.py \
-  --config "$CONFIG" \
-  --stages reference_edit \
-  --overwrite \
-  --profile
-```
-
+`nohup: ignoring input` is normal. The pipeline does not continuously print
+stage progress to stdout. The CLI runs only explicitly requested stages. Use a
+bounded subset for a downstream validation, and add `--overwrite` only when
+regeneration is explicitly intended and the target run root has been checked.
 Profiling writes `profiling/events.jsonl` and `profiling/summary.json` under the
-configured run root. It does not change environment setup.
+configured run root.
 
-### Conservative reference prefilter rollout
+### Conservative reference prefilter
 
 The production reference prefilter is versioned and disabled by default:
 
@@ -456,54 +590,43 @@ does not load another model or start another worker. SCRFD, MediaPipe, face
 evidence, and pose evidence remain `AUDIT ONLY` and are never production
 prefilter inputs. Object and group references are not filtered by either rule.
 
-Validate the opt-in mode with a fresh full20 run on the server. Never overwrite
-the known baseline `full20-samfirst-bg-20260808-021450`. The following creates a
-sibling config with independent run and export roots while preserving all other
-frozen production settings:
+`subject_near_silhouette_v1` flags a subject only when all are true:
 
-```bash
-export PREFILTER_BASE_CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/full20-samfirst-bg-20260808-021450.yaml"
-export PREFILTER_BASE_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/full20-samfirst-bg-20260808-021450"
-export PREFILTER_STAMP="$(date +%Y%m%d-%H%M%S)"
-export PREFILTER_CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/full20-prefilter-${PREFILTER_STAMP}.yaml"
-export PREFILTER_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/full20-prefilter-${PREFILTER_STAMP}"
-export PREFILTER_EXPORT="/mnt/workspace/litengjie/data/r2v_v3_exports/full20-prefilter-${PREFILTER_STAMP}"
-
-test -f "$PREFILTER_BASE_CONFIG" || echo "ERROR: missing baseline config"
-test -d "$PREFILTER_BASE_RUN" || echo "ERROR: missing baseline run"
-test ! -e "$PREFILTER_RUN" || echo "ERROR: target run already exists"
-test ! -e "$PREFILTER_EXPORT" || echo "ERROR: target export already exists"
-
-"$MAIN_PYTHON" - \
-  "$PREFILTER_BASE_CONFIG" "$PREFILTER_CONFIG" \
-  "$PREFILTER_RUN" "$PREFILTER_EXPORT" <<'PY'
-from pathlib import Path
-import sys
-import yaml
-
-source, destination, run_root, export_root = map(Path, sys.argv[1:])
-config = yaml.safe_load(source.read_text(encoding="utf-8"))
-config["run_root"] = str(run_root)
-config["export_root"] = str(export_root)
-config.setdefault("pair", {})["reference_prefilter_mode"] = "conservative_v1"
-destination.write_text(
-    yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-    encoding="utf-8",
-)
-PY
-
-"$MAIN_PYTHON" run_pipeline_v3.py \
-  --config "$PREFILTER_CONFIG" \
-  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,instruct,export \
-  --profile
+```text
+luma_mean <= 15
+dark_fraction_32 >= 0.95
+laplacian_variance <= 5
+tenengrad_mean <= 100
 ```
 
-Require the fresh run to finish through export. Compare its pair/reference-edit
-states, selected references, export count, candidate-judge call count, input
-image count, and total candidate-judge duration against `PREFILTER_BASE_RUN`.
-For retained subsets, profiling must report the post-filter candidate count and
-exactly two evidence images per retained candidate. Explain every difference;
-do not infer server results from local tests.
+`subject_relative_blur_v2` applies only when the original candidate count is
+exactly three, and flags a subject only when all are true:
+
+```text
+laplacian_ratio <= 0.35
+tenengrad_ratio <= 0.50
+laplacian_variance <= 50
+tenengrad_mean <= 1500
+```
+
+The ratios are computed against the original three candidates before any
+filtering. Object and group candidates are never filtered by either rule.
+Prefilter computation failures are fail-open. Candidate IDs are preserved and
+may be non-contiguous after filtering.
+
+### Candidate-judge context-overflow recovery
+
+The current bounded recovery values are:
+
+```text
+TARGET_CONTEXT_FRACTION = 0.85
+MIN_EVIDENCE_SCALE = 0.50
+MAX_CONTEXT_OVERFLOW_RETRIES = 2
+```
+
+Overflow resizing is presentation-only for Qwen evidence. It never resizes or
+replaces stored reference artifacts. Overflow retries are independent of
+structured-output repair retries.
 
 ### Final background binding guard
 
@@ -520,41 +643,18 @@ tiles. The request contains only the annotation background phrase and grounding
 prompt. It contains no forbidden-entity list, entity phrases, masks, source
 comparison, embedding evidence, face evidence, or pose evidence.
 
-The guard runs only after entity pairing is otherwise ready. An explicit reject,
-request failure, timeout, malformed structured output, or unexpected guard error
-removes only `<ref_bg_1>` from the pairing. It does not reject the entity sample
-and does not rewrite the `clean_raw` or `ready_removed` background state. Profile
-events use component `qwen_background_final_guard` with `image_count=5` and
-`tile_count=4`.
+Eligible background states are `clean_raw` and `ready_removed`. The review checks
+that the expected background matches, no unexpected foreground subject remains,
+the image contains usable background information, and no obvious artifact is
+present. An explicit reject, request failure, timeout, malformed structured
+output, or unexpected guard error removes only `<ref_bg_1>` from pairing. It does
+not reject the entity sample and does not rewrite the stored background state.
+Profile events use component `qwen_background_final_guard` with `image_count=5`
+and `tile_count=4`.
 
-The RC production configuration must explicitly contain the following values;
-do not infer or silently change device allocation:
-
-```yaml
-qwen:
-  annotation:
-    repair_retries: 2
-  background_final_judge:
-    model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
-
-pair:
-  repair_retries: 2
-  reference_prefilter_mode: conservative_v1
-  background_final_guard_mode: qwen_v1
-
-remove:
-  device: cuda:4
-
-reference_edit:
-  cuda_visible_devices: "6"
-```
-
-The confirmed vLLM service occupies physical GPUs `0,1,2,3`; Boogu uses physical
-GPU `6`. Keep the existing remover LoRA and its GPU `4` settings unchanged.
-
-Replay the guard against the existing RC2 bound backgrounds before a new large
-production run. Set `RC2_CONFIG` to the exact config associated with that run;
-do not edit the source run or reuse it as an output directory:
+The following is the preserved historical RC2 validation recipe, not a current
+rollout prerequisite. Set `RC2_CONFIG` to the exact config associated with that
+run; do not edit the source run or reuse it as an output directory:
 
 ```bash
 export RC2_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/rc2-100-20260808-233059"
@@ -580,8 +680,57 @@ diff -u "$RC2_SNAPSHOT.before" "$RC2_SNAPSHOT.after"
 
 Review all records and `<output>.summary.json`. The replay calls Qwen only for
 currently bound, ready backgrounds and writes only to the requested output and
-its sibling summary. After replay sanity review, use three to five targeted fresh
-samples for routing validation; do not immediately rerun a fresh 100-sample job.
+its sibling summary.
+
+### Scale-collapse source fallback guard
+
+This guard is disabled by default and must be enabled explicitly:
+
+```yaml
+reference_edit:
+  scale_collapse_fallback_guard_mode: qwen_v1
+```
+
+It runs only when `operation == add_entity_background`, Boogu rejects the
+candidate with reason `entity_scale_collapsed`, and the normal fallback would be
+`keep_source`. Evidence is exactly one source reference image plus the
+`reference_type` and entity phrase. The four review flags are:
+
+- `identity_or_primary_region_visible`
+- `coherent_structure`
+- `independent_reference_value`
+- `not_severely_fragmented`
+
+All four must be true to accept. Guard accept preserves `keep_source`; guard
+reject rejects that entity. A technical, model, or structured-output failure is
+fail-open and preserves `keep_source`. Profiling uses component
+`qwen_scale_collapse_fallback_guard`.
+
+The confirmed historical `prod1000` replay produced:
+
+```text
+candidate_count=38
+accepted=30
+rejected=8
+failed=0
+```
+
+That replay validated the guard against actual `entity_scale_collapsed`
+artifacts. To replay a selected source run read-only, place the output outside
+the source `run_root`:
+
+```bash
+export SCALE_REPLAY="/mnt/workspace/litengjie/data/r2v_v3_audits/scale-collapse-$(date +%Y%m%d-%H%M%S).jsonl"
+
+"$MAIN_PYTHON" tools/replay_v3_scale_collapse_fallback_guard.py \
+  --config "$PROD_CONFIG" \
+  --run-root "$PROD_RUN" \
+  --base-url "$QWEN_BASE_URL" \
+  --model "$QWEN_MODEL_PATH" \
+  --output "$SCALE_REPLAY"
+```
+
+The replay never writes into the source run.
 
 Before `reference_edit`, verify Qwen health, SAM3 import, Boogu paths and GPU,
 and absence of a stale worker. The stage starts one persistent Boogu JSONL worker
@@ -595,35 +744,141 @@ enable_inner_devices_manager=False
 unload_rewriter_level=keep
 ```
 
+### Common production monitoring commands
+
+```bash
+pgrep -af "run_pipeline_v3.py"
+
+nvitop
+nvidia-smi
+
+tail -n 80 "$PROD_LOG"
+tail -f "$PROD_LOG"
+
+find "$PROD_RUN/clips" -name masks.rle.json | wc -l
+
+grep -c '"component":"sam3_segment_track"' \
+  "$PROD_RUN/profiling/events.jsonl"
+
+grep '"component":"sam3_segment_track"' \
+  "$PROD_RUN/profiling/events.jsonl" | tail -5
+```
+
+Run the `masks.rle.json` count twice about 60 seconds apart to confirm SAM3
+progress. SAM3 is in-process, so the absence of a separate SAM3 process in
+`nvitop` is expected.
+
+### Read-only stage progress
+
+This compact inspection reads each `clip.json` plus durable stage artifacts. It
+shows total manifest clips and uses annotation-ready clips as the effective
+frames denominator. `run.json` stage counts are generally committed only when a
+stage finishes, so do not treat them as real-time progress for an active stage.
+
+```bash
+"$MAIN_PYTHON" - "$PROD_RUN" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1])
+records = []
+for path in sorted((root / "clips").glob("*/clip.json")):
+    try:
+        records.append((path, json.loads(path.read_text(encoding="utf-8"))))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARN unreadable {path}: {exc}")
+
+total = len(records)
+annotation_ready = sum(
+    (record.get("annotation") or {}).get("status") == "ready"
+    for _, record in records
+)
+frames = sum((path.parent / "frames" / "frames.json").is_file() for path, _ in records)
+segment = sum((path.parent / "masks.rle.json").is_file() for path, _ in records)
+rank = sum(record.get("coverage") is not None for _, record in records)
+rank_pass = sum(
+    bool((record.get("coverage") or {}).get("passed")) for _, record in records
+)
+background = sum(
+    (record.get("references") or {}).get("background") is not None
+    for _, record in records
+)
+pair = sum(record.get("pairing") is not None for _, record in records)
+reference_edit = sum(
+    record.get("reference_edit") is not None for _, record in records
+)
+instruction = sum(record.get("instruction") is not None for _, record in records)
+
+def pct(value, denominator):
+    return 0.0 if denominator == 0 else 100.0 * value / denominator
+
+print(f"Manifest       {total}")
+print(f"Annotate       {annotation_ready}/{total} ({pct(annotation_ready, total):.1f}%)")
+print(
+    f"Frames         {frames}/{annotation_ready} "
+    f"annotation-ready ({pct(frames, annotation_ready):.1f}%); manifest={total}"
+)
+print(f"Segment        {segment}/{total} ({pct(segment, total):.1f}%)")
+print(f"Rank           {rank}/{total}; passed={rank_pass}")
+print(f"Background     {background}/{total}")
+print(f"Pair           {pair}/{total}")
+print(f"Reference Edit {reference_edit}/{total}")
+print(f"Instruction    {instruction}/{total}")
+PY
+```
+
+### Profiling summary
+
+Group completed model calls by component for a quick runtime breakdown:
+
+```bash
+"$MAIN_PYTHON" - "$PROD_RUN/profiling/events.jsonl" <<'PY'
+from collections import defaultdict
+from pathlib import Path
+import json
+import sys
+
+grouped = defaultdict(lambda: [0, 0.0])
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    event = json.loads(line)
+    if event.get("kind") != "model_call":
+        continue
+    component = str(event.get("component", "unknown"))
+    grouped[component][0] += 1
+    grouped[component][1] += float(event.get("duration_seconds", 0.0))
+
+print(f"{'component':48} {'calls':>8} {'hours':>12}")
+for component in sorted(grouped):
+    calls, seconds = grouped[component]
+    print(f"{component:48} {calls:8d} {seconds / 3600:12.3f}")
+PY
+```
+
 ## 9. Run identity and reconnect recovery
 
 `run.json` binds `run_id`, Git commit, config hash, model identifiers, and source
 manifest. Do not reuse a run root with a different identity. Prefer a new run
 root; never edit `run.json` casually.
 
-Shell variables do not survive reconnects. Recover a known pilot only from its
-selection file:
+Shell variables do not survive reconnects. Restore all paths explicitly after a
+reconnect:
 
 ```bash
-export PILOT_ROOT="$({
-  find /mnt/workspace/litengjie/data/r2v_v3_runs \
-    -mindepth 2 -maxdepth 2 -name pilot_selection.json -print
-} | xargs -r ls -1t | head -1 | xargs -r dirname)"
+export PROD_CONFIG="/mnt/workspace/litengjie/data/r2v_v3_configs/<exact-run-name>.yaml"
+export PROD_RUN="/mnt/workspace/litengjie/data/r2v_v3_runs/<exact-run-name>"
+export PROD_EXPORT="/mnt/workspace/litengjie/data/r2v_v3_exports/<exact-run-name>"
+export PROD_LOG="/mnt/workspace/litengjie/data/r2v_v3_logs/<exact-run-name>.log"
 
-export PILOT_CONFIG="$("$MAIN_PYTHON" - "$PILOT_ROOT/pilot_selection.json" <<'PY'
-from pathlib import Path
-import json
-import sys
-print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["config_path"])
-PY
-)"
-
-printf 'PILOT_ROOT=%s\nPILOT_CONFIG=%s\n' "$PILOT_ROOT" "$PILOT_CONFIG"
-test -d "$PILOT_ROOT" || echo "ERROR: missing pilot root"
-test -f "$PILOT_CONFIG" || echo "ERROR: missing pilot config"
+printf 'PROD_CONFIG=%s\nPROD_RUN=%s\nPROD_EXPORT=%s\nPROD_LOG=%s\n' \
+  "$PROD_CONFIG" "$PROD_RUN" "$PROD_EXPORT" "$PROD_LOG"
+test -f "$PROD_CONFIG" || echo "ERROR: missing production config"
+test -f "$PROD_RUN/run.json" || echo "ERROR: missing run.json"
 ```
 
-An empty config variable resolves to the repository directory and causes
+For a known production batch, recover paths from its exact timestamped name.
+Never rely on variables surviving reconnects or use broad filesystem guesses.
+An empty config variable can resolve to the repository directory and cause
 `IsADirectoryError`.
 
 ## 10. Optional audit and diagnostics
@@ -837,11 +1092,11 @@ for MODE in near_silhouette relative_blur_v2 qwen_selected_flagged all_candidate
 done
 ```
 
-Before interpreting results, require both
+Before interpreting historical shadow results, require both
 `summary.by_reference_type.object.combined_flag_count` and
 `summary.by_reference_type.group.combined_flag_count` to equal zero. Compare the
-before/after source snapshots exactly. These checks still do not authorize a
-production filter.
+before/after source snapshots exactly. These audit checks do not authorize any
+change to the now-frozen production filter.
 
 ## 11. Known technical-only evidence
 
@@ -857,6 +1112,31 @@ tenengrad_mean:     min 58.34, p50 1430.56, p90 5419.57, max 12501.47
 `thresholds_applied=false`. These observations do not justify a production gate.
 
 ## 12. Failure signatures
+
+### No separate SAM3 process in `nvitop`
+
+Expected. SAM3 is loaded inside `run_pipeline_v3.py` and its memory is attributed
+to the main pipeline Python process.
+
+### GPU 0 shows about 5 GiB under the pipeline process beside vLLM TP0
+
+This can be SAM3 when `sam3.device: cuda`. The running `prod5000` example was
+left unchanged because memory remained sufficient. Set `sam3.device: cuda:5`
+explicitly for future production batches.
+
+### `profiling/events.jsonl` is missing
+
+The run was probably not started with `--profile` or did not initialize. Missing
+profiling data is not, by itself, evidence of a model failure.
+
+### The configured run root does not exist
+
+The config may have been generated without launching the pipeline. Do not accept
+an apparent `0 attempted / PASS` when `run.json` or `clips/` does not exist.
+
+### `nohup: ignoring input`
+
+This is a normal `nohup` message and not a pipeline failure.
 
 ### `SCRFD input must have static NCHW spatial dimensions`
 
@@ -884,7 +1164,34 @@ Keep `align_res=False`; use `pipeline.devices_manager(...)`; pass matching
 The commit, config hash, model identifiers, source manifest, or run ID differs.
 Use a new run root rather than weakening identity validation.
 
-## 13. Maintenance checklist
+## 13. Safety rules
+
+- Never force push, rebase a shared branch, or use `git reset --hard`.
+- Do not delete unknown or untracked server files.
+- Never use a broad `pkill -f python`; inspect and terminate only specific PIDs.
+- Do not globally export `CUDA_VISIBLE_DEVICES`.
+- Treat public dataset and pretrained roots as read-only.
+- Write audit and replay output outside source runs.
+- Never overwrite source or canonical artifacts.
+- Do not paste masks back into generated references or restore foreground pixels.
+- Do not resize generated Boogu artifacts back to source dimensions.
+
+The following untracked files were observed historically and must not be treated
+as a cleanup list:
+
+```text
+configs/server.pilot80.explore.yaml
+configs/server.pilot80.inpaint.yaml
+nohup.out
+server_env.sh
+server_env.sh.bad-20260806-135431
+```
+
+Unknown or untracked server files may contain active local configuration or
+operational evidence. Do not remove them unless their ownership and purpose have
+been explicitly verified.
+
+## 14. Maintenance checklist
 
 Before giving or executing server commands:
 
