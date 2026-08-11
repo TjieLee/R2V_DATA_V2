@@ -6,14 +6,20 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-H3_AUDIO_BINDING_SCHEMA_VERSION = "r2v.h3.audio_binding.1"
-H3_AUDIO_IR_SCHEMA_VERSION = "r2v.h3.audio_ir.1"
+H3_AUDIO_BINDING_SCHEMA_VERSION = "r2v.h3.audio_binding.2"
+H3_AUDIO_IR_SCHEMA_VERSION = "r2v.h3.audio_ir.2"
 
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
 _FACE_TRACK_ID = re.compile(r"face_[1-9]\d*")
 _PICTURE_ID = re.compile(r"picture_[1-9]\d*")
 _SUBJECT_ID = re.compile(r"subject_[1-9]\d*")
 _AUDIO_ID = re.compile(r"audio_[1-9]\d*")
+_VOICE_REFERENCE_ID = re.compile(r"voice_reference_[1-9]\d*")
+_H3_TASK_COMPONENT_ORDER = (
+    "reference_generation",
+    "audio_reference",
+    "audio_reuse",
+)
 
 
 class SchemaModel(BaseModel):
@@ -50,12 +56,32 @@ class AudioTrackMetadata(SchemaModel):
         return self
 
 
+class FaceGeometrySample(SchemaModel):
+    frame_index: int = Field(ge=0)
+    timestamp: float = Field(ge=0)
+    bbox_xyxy: tuple[float, float, float, float]
+    confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_geometry(self) -> FaceGeometrySample:
+        x1, y1, x2, y2 = self.bbox_xyxy
+        if not all(math.isfinite(value) for value in self.bbox_xyxy):
+            raise ValueError("face geometry bbox values must be finite")
+        if not (0 <= x1 < x2 and 0 <= y1 < y2):
+            raise ValueError("face geometry bbox must have positive bounded extent")
+        return self
+
+
 class FaceTrack(SchemaModel):
     face_track_id: str
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
     sample_count: int = Field(gt=0)
     mean_detection_confidence: float = Field(ge=0, le=1)
+    geometry_samples: list[FaceGeometrySample] = Field(
+        min_length=1,
+        max_length=32,
+    )
 
     @model_validator(mode="after")
     def validate_track(self) -> FaceTrack:
@@ -63,6 +89,21 @@ class FaceTrack(SchemaModel):
             raise ValueError("face_track_id must use face_N")
         if not self.end_time > self.start_time:
             raise ValueError("face track end_time must exceed start_time")
+        if self.sample_count < len(self.geometry_samples):
+            raise ValueError("face sample_count cannot be below sampled geometry count")
+        if any(
+            sample.timestamp < self.start_time or sample.timestamp > self.end_time
+            for sample in self.geometry_samples
+        ):
+            raise ValueError("face geometry timestamp must be within track extent")
+        sample_order = [
+            (sample.timestamp, sample.frame_index) for sample in self.geometry_samples
+        ]
+        if sample_order != sorted(sample_order):
+            raise ValueError("face geometry samples must be chronologically ordered")
+        frame_indices = [sample.frame_index for sample in self.geometry_samples]
+        if len(frame_indices) != len(set(frame_indices)):
+            raise ValueError("face geometry samples must use unique frame indices")
         return self
 
 
@@ -94,7 +135,9 @@ class ActiveSpeakerInterval(SchemaModel):
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
     speech_present: bool
+    visible_face_track_ids: list[str] = Field(default_factory=list)
     face_speaking_probabilities: dict[str, float] = Field(default_factory=dict)
+    asd_coverage_ratio: float = Field(ge=0, le=1)
     audio_quality_usable: bool
     synchronization_plausible: bool
 
@@ -102,16 +145,34 @@ class ActiveSpeakerInterval(SchemaModel):
     def validate_interval(self) -> ActiveSpeakerInterval:
         if not self.end_time > self.start_time:
             raise ValueError("active-speaker end_time must exceed start_time")
+        if len(self.visible_face_track_ids) != len(set(self.visible_face_track_ids)):
+            raise ValueError("visible face track IDs must be unique")
+        if any(
+            _FACE_TRACK_ID.fullmatch(face_track_id) is None
+            for face_track_id in self.visible_face_track_ids
+        ):
+            raise ValueError("visible face track IDs must use face_N")
         for face_track_id, probability in self.face_speaking_probabilities.items():
             if _FACE_TRACK_ID.fullmatch(face_track_id) is None:
                 raise ValueError("ASD probability keys must use face_N")
             if not math.isfinite(probability) or not 0 <= probability <= 1:
                 raise ValueError("ASD probabilities must be finite and in [0, 1]")
+        visible = set(self.visible_face_track_ids)
+        scored = set(self.face_speaking_probabilities)
+        if scored - visible:
+            raise ValueError("ASD scores must refer to visible face tracks")
+        expected_coverage = len(scored) / len(visible) if visible else 1.0
+        if not math.isclose(
+            self.asd_coverage_ratio,
+            expected_coverage,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("ASD coverage ratio must match scored visible faces")
         return self
 
 
 class VoiceReferenceCandidate(SchemaModel):
-    entity_id: str
     path: str
     source_start: float = Field(ge=0)
     source_end: float = Field(gt=0)
@@ -120,8 +181,6 @@ class VoiceReferenceCandidate(SchemaModel):
 
     @model_validator(mode="after")
     def validate_candidate(self) -> VoiceReferenceCandidate:
-        if _ENTITY_ID.fullmatch(self.entity_id) is None:
-            raise ValueError("voice reference entity_id must use eN")
         if not self.path.strip():
             raise ValueError("voice reference path must not be empty")
         if not self.source_end > self.source_start:
@@ -134,12 +193,7 @@ class AudioBindingEvidence(SchemaModel):
     audio: AudioTrackMetadata
     face_tracks: list[FaceTrack] = Field(default_factory=list)
     associations: list[EntityFaceAssociation] = Field(default_factory=list)
-    active_speaker_intervals: list[ActiveSpeakerInterval] = Field(
-        default_factory=list
-    )
-    voice_reference_candidates: list[VoiceReferenceCandidate] = Field(
-        default_factory=list
-    )
+    active_speaker_intervals: list[ActiveSpeakerInterval] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_evidence(self) -> AudioBindingEvidence:
@@ -155,6 +209,10 @@ class AudioBindingEvidence(SchemaModel):
         if set(association_tracks) - known_tracks:
             raise ValueError("entity association references an unknown face track")
         for interval in self.active_speaker_intervals:
+            if set(interval.visible_face_track_ids) - known_tracks:
+                raise ValueError(
+                    "ASD interval references an unknown visible face track"
+                )
             if set(interval.face_speaking_probabilities) - known_tracks:
                 raise ValueError("ASD interval references an unknown face track")
         ordered = sorted(
@@ -173,10 +231,6 @@ class AudioBindingEvidence(SchemaModel):
             end_times = [
                 *(track.end_time for track in self.face_tracks),
                 *(interval.end_time for interval in self.active_speaker_intervals),
-                *(
-                    candidate.source_end
-                    for candidate in self.voice_reference_candidates
-                ),
             ]
             if any(value > self.audio.duration_seconds for value in end_times):
                 raise ValueError("audio evidence exceeds the source audio duration")
@@ -224,6 +278,7 @@ class AudioEntityBinding(SchemaModel):
 
 
 class VoiceReference(SchemaModel):
+    voice_reference_id: str
     entity_id: str
     path: str
     source_start: float = Field(ge=0)
@@ -235,10 +290,20 @@ class VoiceReference(SchemaModel):
 
     @model_validator(mode="after")
     def validate_intervals(self) -> VoiceReference:
+        if _VOICE_REFERENCE_ID.fullmatch(self.voice_reference_id) is None:
+            raise ValueError("voice_reference_id must use voice_reference_N")
+        if _ENTITY_ID.fullmatch(self.entity_id) is None:
+            raise ValueError("voice reference entity_id must use eN")
+        if not self.path.strip():
+            raise ValueError("voice reference path must not be empty")
         if not self.source_end > self.source_start:
             raise ValueError("voice reference source interval is invalid")
         if not self.binding_end > self.binding_start:
             raise ValueError("voice reference binding interval is invalid")
+        if self.source_start < self.binding_start or self.source_end > self.binding_end:
+            raise ValueError(
+                "voice reference must be contained in its binding interval"
+            )
         return self
 
 
@@ -280,7 +345,8 @@ class SemanticSubject(SchemaModel):
 
 class H3AudioAsset(SchemaModel):
     audio_id: str
-    role: Literal["voice_reference", "full_audio_reference"]
+    role: Literal["voice_reference", "full_audio"]
+    voice_reference_id: Optional[str] = None
     entity_id: Optional[str] = None
     path: str
     source_start: Optional[float] = Field(default=None, ge=0)
@@ -294,14 +360,17 @@ class H3AudioAsset(SchemaModel):
             raise ValueError("audio asset path must not be empty")
         if self.role == "voice_reference":
             if (
-                self.entity_id is None
+                self.voice_reference_id is None
+                or _VOICE_REFERENCE_ID.fullmatch(self.voice_reference_id) is None
+                or self.entity_id is None
                 or self.source_start is None
                 or self.source_end is None
                 or not self.source_end > self.source_start
             ):
                 raise ValueError("voice-reference audio requires entity and interval")
         elif (
-            self.entity_id is not None
+            self.voice_reference_id is not None
+            or self.entity_id is not None
             or self.source_start is not None
             or self.source_end is not None
         ):
@@ -309,10 +378,34 @@ class H3AudioAsset(SchemaModel):
         return self
 
 
+H3TaskComponent = Literal[
+    "reference_generation",
+    "audio_reference",
+    "audio_reuse",
+]
+
+
+class H3TaskSpecification(SchemaModel):
+    components: list[H3TaskComponent] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_components(self) -> H3TaskSpecification:
+        if len(self.components) != len(set(self.components)):
+            raise ValueError("H3 task components must be unique")
+        expected = [
+            component
+            for component in _H3_TASK_COMPONENT_ORDER
+            if component in self.components
+        ]
+        if self.components != expected:
+            raise ValueError("H3 task components must use deterministic order")
+        return self
+
+
 class H3AudioBindingIR(SchemaModel):
-    schema_version: Literal["r2v.h3.audio_ir.1"] = H3_AUDIO_IR_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.audio_ir.2"] = H3_AUDIO_IR_SCHEMA_VERSION
     clip_uid: str
-    task_type: Literal["reference_generation", "reference_generation_with_audio"]
+    task: H3TaskSpecification
     picture_assets: list[PictureAsset]
     subjects: list[SemanticSubject]
     audio_assets: list[H3AudioAsset]
@@ -333,32 +426,52 @@ class H3AudioBindingIR(SchemaModel):
         if subject_ids != expected_subjects:
             raise ValueError("subjects must be contiguous and ordered")
         audio_ids = [item.audio_id for item in self.audio_assets]
-        expected_audio = [
-            f"audio_{index}" for index in range(1, len(audio_ids) + 1)
-        ]
+        expected_audio = [f"audio_{index}" for index in range(1, len(audio_ids) + 1)]
         if audio_ids != expected_audio:
             raise ValueError("audio assets must be contiguous and ordered")
         if len(self.picture_assets) != len(self.subjects):
             raise ValueError("each H3 subject requires one picture asset in V1")
         for picture, subject in zip(self.picture_assets, self.subjects, strict=True):
-            if (
-                picture.entity_id != subject.entity_id
-                or subject.source_assets != [picture.picture_id]
-            ):
+            if picture.entity_id != subject.entity_id or subject.source_assets != [
+                picture.picture_id
+            ]:
                 raise ValueError("subject and picture ordering must match")
-        has_voice = any(item.role == "voice_reference" for item in self.audio_assets)
-        expected_task = (
-            "reference_generation_with_audio" if has_voice else "reference_generation"
-        )
-        if self.task_type != expected_task:
-            raise ValueError("H3 task_type must be derived from voice assets")
+        subject_by_entity = {subject.entity_id: subject for subject in self.subjects}
+        if len(subject_by_entity) != len(self.subjects):
+            raise ValueError("H3 subjects must use unique entity IDs")
+        voice_assets = [
+            item for item in self.audio_assets if item.role == "voice_reference"
+        ]
+        full_audio_assets = [
+            item for item in self.audio_assets if item.role == "full_audio"
+        ]
+        voice_entities = [item.entity_id for item in voice_assets]
+        if len(voice_entities) != len(set(voice_entities)):
+            raise ValueError("V1 allows at most one voice reference per entity")
+        voice_reference_ids = [item.voice_reference_id for item in voice_assets]
+        if len(voice_reference_ids) != len(set(voice_reference_ids)):
+            raise ValueError("H3 voice-reference IDs must be unique")
+        for asset in voice_assets:
+            assert asset.entity_id is not None
+            subject = subject_by_entity.get(asset.entity_id)
+            if subject is None:
+                raise ValueError("voice-reference entity must exist in H3 subjects")
+            if subject.reference_type != "subject":
+                raise ValueError("V1 voice references only support subject entities")
+        if len(full_audio_assets) > 1:
+            raise ValueError("H3 IR allows at most one full-audio asset")
+        components = set(self.task.components)
+        if ("audio_reference" in components) != bool(voice_assets):
+            raise ValueError(
+                "audio_reference task component must match voice-reference assets"
+            )
+        if ("audio_reuse" in components) != bool(full_audio_assets):
+            raise ValueError("audio_reuse task component must match full-audio asset")
         return self
 
 
 class AudioBindingSidecar(SchemaModel):
-    schema_version: Literal["r2v.h3.audio_binding.1"] = (
-        H3_AUDIO_BINDING_SCHEMA_VERSION
-    )
+    schema_version: Literal["r2v.h3.audio_binding.2"] = H3_AUDIO_BINDING_SCHEMA_VERSION
     clip_uid: str
     source_run_root: str
     source_video_path: str
@@ -376,24 +489,79 @@ class AudioBindingSidecar(SchemaModel):
                 raise ValueError("ready sidecar requires evidence and H3 IR")
         elif self.reason is None or not self.reason.strip():
             raise ValueError("non-ready sidecar requires a reason")
+        reference_ids = [
+            reference.voice_reference_id for reference in self.voice_references
+        ]
+        expected_ids = [
+            f"voice_reference_{index}" for index in range(1, len(reference_ids) + 1)
+        ]
+        if reference_ids != expected_ids:
+            raise ValueError("voice references must be contiguous and ordered")
+        reference_entities = [
+            reference.entity_id for reference in self.voice_references
+        ]
+        if len(reference_entities) != len(set(reference_entities)):
+            raise ValueError("V1 allows at most one voice reference per entity")
+        if self.h3_ir is not None:
+            asset_references = [
+                (
+                    asset.voice_reference_id,
+                    asset.entity_id,
+                    asset.path,
+                    asset.source_start,
+                    asset.source_end,
+                )
+                for asset in self.h3_ir.audio_assets
+                if asset.role == "voice_reference"
+            ]
+            sidecar_references = [
+                (
+                    reference.voice_reference_id,
+                    reference.entity_id,
+                    reference.path,
+                    reference.source_start,
+                    reference.source_end,
+                )
+                for reference in self.voice_references
+            ]
+            if asset_references != sidecar_references:
+                raise ValueError("H3 voice assets must match sidecar voice references")
+        elif self.voice_references:
+            raise ValueError("voice references require an H3 IR")
+        return self
+
+
+class PrecomputedClipEvidence(SchemaModel):
+    evidence: AudioBindingEvidence
+    voice_reference_candidates: list[VoiceReferenceCandidate] = Field(
+        default_factory=list
+    )
+
+    @model_validator(mode="after")
+    def validate_candidate_intervals(self) -> PrecomputedClipEvidence:
+        if self.evidence.audio.status == "ready":
+            assert self.evidence.audio.duration_seconds is not None
+            if any(
+                candidate.source_end > self.evidence.audio.duration_seconds
+                for candidate in self.voice_reference_candidates
+            ):
+                raise ValueError("voice candidate exceeds source audio duration")
         return self
 
 
 class PrecomputedEvidenceFile(SchemaModel):
-    clips: list[AudioBindingEvidence]
+    clips: list[PrecomputedClipEvidence]
 
     @model_validator(mode="after")
     def validate_clip_ids(self) -> PrecomputedEvidenceFile:
-        clip_ids = [item.clip_uid for item in self.clips]
+        clip_ids = [item.evidence.clip_uid for item in self.clips]
         if len(clip_ids) != len(set(clip_ids)):
             raise ValueError("precomputed evidence clip_uid values must be unique")
         return self
 
 
 class AudioBindingRunSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.audio_binding.1"] = (
-        H3_AUDIO_BINDING_SCHEMA_VERSION
-    )
+    schema_version: Literal["r2v.h3.audio_binding.2"] = H3_AUDIO_BINDING_SCHEMA_VERSION
     source_run_root: str
     clip_count: int = Field(ge=0)
     ready_count: int = Field(ge=0)
@@ -408,6 +576,9 @@ class AudioBindingRunSummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> AudioBindingRunSummary:
-        if self.clip_count != self.ready_count + self.ineligible_count + self.failed_count:
+        if (
+            self.clip_count
+            != self.ready_count + self.ineligible_count + self.failed_count
+        ):
             raise ValueError("audio binding clip counts must reconcile")
         return self

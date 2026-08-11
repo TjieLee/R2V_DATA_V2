@@ -35,13 +35,14 @@ These rules apply only to the new audio-binding sidecar dataset.
 completed V3 run + source video
   |-- existing annotation, pairing, references, and entity IDs
   |-- AudioPreprocessorBackend -> bounded audio metadata
-  |-- FaceTrackingBackend -> bounded face-track summaries
-  |-- EntityFaceAssociationBackend -> face_track_id to entity_id evidence
+  |-- FaceTrackingBackend -> bounded sampled face geometry
+  |-- EntityFaceAssociationBackend -> compare face geometry with V3/SAM3 masks
   `-- ActiveSpeakerBackend -> interval-level face speaking probabilities
           |
           `-- deterministic fusion -> AudioEntityBinding
                   |
-                  `-- deterministic H3 IR and rendering
+                  |-- clean bound intervals -> VoiceReferenceBackend
+                  `-- explicit task variant -> deterministic H3 IR and rendering
 ```
 
 No multimodal LLM owns binding, eligibility, task type, asset numbering, or H3
@@ -49,16 +50,21 @@ rendering. Real model adapters remain outside deterministic business logic.
 
 ## Pretrained ASD Candidates
 
-No backend is selected or installed in this pass. Initial adapter evaluation may
-compare these separately maintained research implementations:
+No backend is installed in this pass. The primary candidate for the first
+read-only server evaluation is
+[LR-ASD](https://github.com/Junhua-Liao/LR-ASD). It is evaluated as an adapter
+candidate, not accepted as production behavior by this document.
 
-- [TalkNet](https://github.com/TaoRuijie/TalkNet_ASD), an audio-visual ASD model
-  with released code;
+Baseline comparisons remain:
+
 - [Light-ASD](https://github.com/Junhua-Liao/Light-ASD), a lightweight ASD model
   with released code and pretrained weights;
-- [TS-TalkNet](https://github.com/Jiang-Yidi/TS-TalkNet), a later extension that
-  also consumes a pre-enrolled speaker reference and is therefore more relevant
-  to a future identity-aware pass than the initial V1 bootstrap.
+- [TalkNet](https://github.com/TaoRuijie/TalkNet_ASD), an audio-visual ASD model
+  with released code.
+
+TS-TalkNet remains a possible future identity-aware experiment because it uses
+a pre-enrolled speaker reference, but it is not a V1 baseline or implementation
+dependency.
 
 Before choosing one, audit its license, checkpoint provenance, face-crop and
 audio preprocessing contract, output timing, offline loading, server dependency
@@ -77,21 +83,31 @@ The source run is read-only. A sidecar output uses an independent root:
 ```
 
 Publication is atomic. Output must not be inside the source run. V1 stores
-interval summaries, not frame-by-frame ASD timelines. Audio paths are provenance
-pointers; the scaffold does not extract or copy media.
+interval summaries and at most 32 ordered geometry samples per face track, not
+unbounded frame-by-frame timelines. The H3 sidecar does not add fields to
+`clip.json`.
+
+`AudioTrackMetadata.full_audio_path` is source evidence only. Merely observing a
+full-audio path never publishes an H3 conditioning asset. A full-audio asset is
+created only for an explicitly requested `audio_reuse` variant.
 
 ## Schema Decisions
 
 `AudioTrackMetadata` records source/full-audio paths, health, duration, channel
 layout, sample rate, and bounded quality evidence.
 
-`FaceTrack` stores a stable ID, temporal extent, sample count, and aggregate
-detection confidence. `EntityFaceAssociation` links one face track to one
-existing V3 entity with method and confidence.
+`FaceTrack` stores a stable ID, temporal extent, total detection count, aggregate
+detection confidence, and a bounded set of samples containing `frame_index`,
+`timestamp`, `bbox_xyxy`, and detection confidence. The association backend also
+receives the read-only source run root and `masks.rle.json` path, so a future
+adapter can compare sampled face boxes with existing V3/SAM3 entity masks.
+`EntityFaceAssociation` records the resulting method and confidence.
 
-`ActiveSpeakerInterval` stores a non-overlapping speech interval, bounded
-speaking probabilities by face track, synchronization plausibility, and audio
-usability. It does not assign an entity.
+`ActiveSpeakerInterval` stores a non-overlapping speech interval, the visible
+face-track IDs, bounded speaking probabilities, exact ASD coverage ratio,
+synchronization plausibility, and audio usability. It does not assign an entity.
+Every scored face must be visible, and the ratio must equal scored-visible faces
+divided by all visible faces.
 
 `AudioEntityBinding` stores deterministic status:
 
@@ -101,9 +117,21 @@ usability. It does not assign an entity.
 - `ambiguous`: evidence is meaningful but not decisive or association is absent;
 - `no_speech`: the interval contains no speech.
 
-`VoiceReference` is published only from a clean bound interval for the same
-entity. `H3AudioBindingIR` separates picture assets, semantic subjects, audio
-assets, and interval bindings.
+`VoiceReferenceCandidate` has no `entity_id`. The deterministic binding is
+established first; only then may `VoiceReferenceBackend` extract candidates from
+clean bound intervals. Code assigns a candidate to the containing bound interval
+and publishes at most one `VoiceReference` per eligible subject entity.
+
+`H3AudioBindingIR.task.components` is a canonical ordered list drawn from:
+
+- `reference_generation`;
+- `audio_reference`;
+- `audio_reuse`.
+
+This replaces the coarse task-type flag. A component must agree exactly with its
+assets. A voice-reference entity must exist in `subjects`, V1 voice references
+are limited to `reference_type=subject`, and at most one full-audio asset is
+allowed.
 
 ## Deterministic V1 Fusion
 
@@ -116,20 +144,25 @@ The scaffold policy exposes explicit thresholds. A bound result requires:
 5. one association for that face track above the association threshold;
 6. usable audio and plausible synchronization.
 
-Two or more active faces produce `overlap`. No meaningful visible-face score
-produces `offscreen`. Intermediate scores, close scores, missing association, or
-failed quality/synchronization evidence produce `ambiguous`. The system never
+Two or more active faces produce `overlap`. `offscreen` requires sufficient ASD
+coverage and explicit low visible-speaker evidence. If any visible face is
+unscored, the interval is `ambiguous`, even when every available score is low.
+Intermediate scores, close scores, missing association, or failed
+quality/synchronization evidence also produce `ambiguous`. The system never
 forces every speech interval onto an entity.
 
-Thresholds in the scaffold are interface defaults for deterministic tests, not
-validated production values. Server evidence must justify any frozen values.
+All thresholds in the scaffold are unvalidated interface defaults for
+deterministic tests. They are not production values. LR-ASD and baseline server
+evidence must justify ASD coverage, active-speaker, association, duration, sync,
+and voice-quality thresholds before any adapter or policy is frozen.
 
 ## H3-Compatible IR and Rendering
 
 Picture assets follow V3 pairing order: `picture_1`, `picture_2`, and so on.
 Semantic subjects use the same order: `subject_1`, `subject_2`, and so on. Voice
-references are numbered by subject order, followed by the preserved full-audio
-asset. Task type is selected programmatically.
+references are numbered by eligible subject order. A separate audio-reuse
+variant publishes one full-audio asset. The two asset types are combined only
+when all corresponding task components were explicitly requested.
 
 The renderer derives text from the structured IR, for example:
 
@@ -156,9 +189,27 @@ python tools/build_v3_h3_audio_binding_sidecar.py \
   --output-root /path/outside/source-run
 ```
 
-The evidence file is a strict list of per-clip `AudioBindingEvidence` records.
-Missing evidence or backend exceptions become per-clip failed sidecars while
-neighboring clips continue.
+The default creates a `reference_generation + audio_reference` variant. A
+separate audio-reuse output is explicitly requested and written to a different
+sidecar root:
+
+```bash
+python tools/build_v3_h3_audio_binding_sidecar.py \
+  --run-root /path/to/completed-v3-run \
+  --evidence-json /path/to/precomputed-evidence.json \
+  --output-root /path/to/audio-reuse-sidecar \
+  --task-component reference_generation \
+  --task-component audio_reuse
+```
+
+Task components must be supplied in canonical order. Adding both
+`audio_reference` and `audio_reuse` intentionally requests a combined variant;
+it never happens because `full_audio_path` exists.
+
+The evidence file contains one strict `PrecomputedClipEvidence` per clip:
+pre-fusion `AudioBindingEvidence` plus separate post-fusion voice extraction
+candidates. Missing evidence or backend exceptions become per-clip failed
+sidecars while neighboring clips continue.
 
 ## Extension Boundaries
 
