@@ -42,9 +42,16 @@ cross-clip speaker identity, and production-stage integration are out of scope.
 
 ## Current Pass
 
-The architectural scaffold pass is implemented on this branch:
+The architectural scaffold review-fix pass is implemented on this branch:
 
-- strict audio evidence, binding, voice-reference, and H3 IR schemas;
+- source full-audio provenance is separate from explicitly requested H3 assets;
+- canonical task components distinguish reference generation, audio reference,
+  audio reuse, and intentional combinations;
+- face tracks retain at most 32 sampled geometry observations for mask
+  association without extending V3 `clip.json`;
+- ASD visible-face coverage is explicit and incomplete coverage is ambiguous;
+- deterministic fusion precedes voice-reference extraction and entity binding;
+- strict voice-reference, subject, and full-audio asset invariants;
 - pluggable audio, face-track, association, ASD, and evidence interfaces;
 - deterministic high-precision fusion;
 - deterministic H3 asset numbering and rendering;
@@ -65,10 +72,10 @@ Completed local validation for this pass:
 
 ```bash
 python -m pytest tests/test_h3_audio_binding.py -q
-# 14 passed
+# 26 passed
 
 python -m pytest -q
-# 1500 passed, 1 existing Pillow deprecation warning
+# 1512 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -79,8 +86,9 @@ git diff --check
 
 ## Open Questions
 
-- Which pretrained active-speaker detector will be validated first on the
-  server?
+- How does LR-ASD behave on the project's visible-person, overlap, offscreen,
+  profile-face, small-face, and dubbed-audio cases relative to Light-ASD and
+  TalkNet?
 - Which face detector/tracker adapter best preserves stable association with
   existing SAM3 entity IDs?
 - What server-measured speech-duration, synchronization, and voice-quality
@@ -89,7 +97,8 @@ git diff --check
 
 ## Exact Next Task
 
-Review and approve the V1 schemas, deterministic fusion semantics, sidecar layout,
-and precomputed-evidence CLI. After approval, evaluate candidate pretrained ASD
-and face-tracking adapters on a small read-only sample without integrating them
-into the production V3 stage order.
+Review and approve the corrected V1 contracts. After approval, implement a
+read-only LR-ASD adapter evaluation on a small isolated sample, with Light-ASD
+and TalkNet as baselines. Do not integrate any model into the production V3
+stage order until server evidence validates the currently provisional
+thresholds.

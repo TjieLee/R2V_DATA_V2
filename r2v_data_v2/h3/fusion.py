@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
+from r2v_data_v2.h3.backends import VoiceReferenceBackend
 from r2v_data_v2.h3.schemas import (
     ActiveSpeakerInterval,
     AudioBindingEvidence,
@@ -11,9 +13,11 @@ from r2v_data_v2.h3.schemas import (
     BindingStatus,
     H3AudioAsset,
     H3AudioBindingIR,
+    H3TaskSpecification,
     PictureAsset,
     SemanticSubject,
     VoiceReference,
+    VoiceReferenceCandidate,
 )
 from r2v_data_v2.v3.schemas import ClipRecord
 
@@ -26,6 +30,7 @@ class AudioBindingPolicy:
     minimum_association_confidence: float = 0.80
     minimum_clean_speech_seconds: float = 0.50
     minimum_voice_reference_quality: float = 0.70
+    minimum_asd_coverage: float = 1.0
 
     def __post_init__(self) -> None:
         probabilities = (
@@ -34,6 +39,7 @@ class AudioBindingPolicy:
             self.minimum_top_score_margin,
             self.minimum_association_confidence,
             self.minimum_voice_reference_quality,
+            self.minimum_asd_coverage,
         )
         if any(not 0 <= value <= 1 for value in probabilities):
             raise ValueError("audio binding probability thresholds must be in [0, 1]")
@@ -89,11 +95,6 @@ def fuse_audio_entity_bindings(
         for item in evidence.associations
         if item.entity_id not in known_entity_ids
     }
-    unknown_entities.update(
-        item.entity_id
-        for item in evidence.voice_reference_candidates
-        if item.entity_id not in known_entity_ids
-    )
     if unknown_entities:
         raise ValueError(
             f"face associations reference unknown V3 entities: {sorted(unknown_entities)}"
@@ -112,6 +113,17 @@ def fuse_audio_entity_bindings(
                     confidence=1.0,
                     active_face_track_ids=[],
                     reason_codes=["no_speech_detected"],
+                )
+            )
+            continue
+        if interval.asd_coverage_ratio < active_policy.minimum_asd_coverage:
+            bindings.append(
+                _binding(
+                    interval,
+                    status="ambiguous",
+                    confidence=0.0,
+                    active_face_track_ids=[],
+                    reason_codes=["asd_visible_face_coverage_incomplete"],
                 )
             )
             continue
@@ -222,29 +234,27 @@ def fuse_audio_entity_bindings(
 
 
 def select_voice_references(
-    evidence: AudioBindingEvidence,
+    candidates: Sequence[VoiceReferenceCandidate],
     bindings: list[AudioEntityBinding],
     *,
     entity_order: list[str],
+    eligible_entity_ids: set[str],
     policy: AudioBindingPolicy | None = None,
 ) -> list[VoiceReference]:
     active_policy = policy or AudioBindingPolicy()
     clean_by_entity: dict[str, list[AudioEntityBinding]] = {}
     for binding in bindings:
-        if (
-            binding.entity_id is not None
-            and binding.evidence.clean_training_eligible
-        ):
+        if binding.entity_id is not None and binding.evidence.clean_training_eligible:
             clean_by_entity.setdefault(binding.entity_id, []).append(binding)
     selected: list[VoiceReference] = []
     for entity_id in entity_order:
+        if entity_id not in eligible_entity_ids:
+            continue
         clean_bindings = clean_by_entity.get(entity_id, [])
-        candidates = []
-        for candidate in evidence.voice_reference_candidates:
+        matches = []
+        for candidate in candidates:
             if (
-                candidate.entity_id != entity_id
-                or candidate.quality_score
-                < active_policy.minimum_voice_reference_quality
+                candidate.quality_score < active_policy.minimum_voice_reference_quality
                 or candidate.source_end - candidate.source_start
                 < active_policy.minimum_clean_speech_seconds
             ):
@@ -259,11 +269,11 @@ def select_voice_references(
                 None,
             )
             if matching is not None:
-                candidates.append((candidate, matching))
-        if not candidates:
+                matches.append((candidate, matching))
+        if not matches:
             continue
         candidate, matching = min(
-            candidates,
+            matches,
             key=lambda item: (
                 -item[0].quality_score,
                 -(item[0].source_end - item[0].source_start),
@@ -273,6 +283,7 @@ def select_voice_references(
         )
         selected.append(
             VoiceReference(
+                voice_reference_id=f"voice_reference_{len(selected) + 1}",
                 entity_id=entity_id,
                 path=candidate.path,
                 source_start=candidate.source_start,
@@ -291,6 +302,8 @@ def build_h3_audio_ir(
     evidence: AudioBindingEvidence,
     bindings: list[AudioEntityBinding],
     voice_references: list[VoiceReference],
+    *,
+    task: H3TaskSpecification,
 ) -> H3AudioBindingIR:
     if clip.annotation is None or clip.annotation.status != "ready":
         raise ValueError("H3 audio IR requires ready annotation")
@@ -327,32 +340,32 @@ def build_h3_audio_ir(
             )
         )
     audio_assets: list[H3AudioAsset] = []
-    for voice in voice_references:
-        audio_assets.append(
-            H3AudioAsset(
-                audio_id=f"audio_{len(audio_assets) + 1}",
-                role="voice_reference",
-                entity_id=voice.entity_id,
-                path=voice.path,
-                source_start=voice.source_start,
-                source_end=voice.source_end,
+    if "audio_reference" in task.components:
+        for voice in voice_references:
+            audio_assets.append(
+                H3AudioAsset(
+                    audio_id=f"audio_{len(audio_assets) + 1}",
+                    role="voice_reference",
+                    voice_reference_id=voice.voice_reference_id,
+                    entity_id=voice.entity_id,
+                    path=voice.path,
+                    source_start=voice.source_start,
+                    source_end=voice.source_end,
+                )
             )
-        )
-    if evidence.audio.status == "ready" and evidence.audio.full_audio_path is not None:
+    if "audio_reuse" in task.components:
+        if evidence.audio.full_audio_path is None:
+            raise ValueError("audio_reuse requires full-audio provenance")
         audio_assets.append(
             H3AudioAsset(
                 audio_id=f"audio_{len(audio_assets) + 1}",
-                role="full_audio_reference",
+                role="full_audio",
                 path=evidence.audio.full_audio_path,
             )
         )
     return H3AudioBindingIR(
         clip_uid=clip.clip_uid,
-        task_type=(
-            "reference_generation_with_audio"
-            if voice_references
-            else "reference_generation"
-        ),
+        task=task,
         picture_assets=pictures,
         subjects=subjects,
         audio_assets=audio_assets,
@@ -366,7 +379,8 @@ def render_h3_audio_instruction(value: H3AudioBindingIR) -> str:
         for index, subject in enumerate(value.subjects, start=1)
     ]
     subject_index = {
-        subject.entity_id: index for index, subject in enumerate(value.subjects, start=1)
+        subject.entity_id: index
+        for index, subject in enumerate(value.subjects, start=1)
     }
     for index, audio in enumerate(value.audio_assets, start=1):
         if audio.role == "voice_reference":
@@ -378,10 +392,8 @@ def render_h3_audio_instruction(value: H3AudioBindingIR) -> str:
             )
         else:
             lines.append(f"<Audio {index}> preserves the full source audio.")
-    mode = (
-        "reference generation + audio reference"
-        if value.task_type == "reference_generation_with_audio"
-        else "reference generation"
+    mode = " + ".join(
+        component.replace("_", " ") for component in value.task.components
     )
     lines.extend(("", "summary:", f"[{mode}] deterministic H3 audio binding"))
     return "\n".join(lines)
@@ -392,6 +404,8 @@ def build_audio_binding_sidecar(
     evidence: AudioBindingEvidence,
     *,
     source_run_root: str,
+    voice_reference_backend: VoiceReferenceBackend | None = None,
+    task: H3TaskSpecification | None = None,
     policy: AudioBindingPolicy | None = None,
 ) -> AudioBindingSidecar:
     if evidence.clip_uid != clip.clip_uid:
@@ -423,36 +437,80 @@ def build_audio_binding_sidecar(
         )
     known_entities = {entity.entity_id for entity in clip.annotation.entities}
     active_policy = policy or AudioBindingPolicy()
+    active_task = task or H3TaskSpecification(
+        components=["reference_generation", "audio_reference"]
+    )
     bindings = fuse_audio_entity_bindings(
         evidence,
         known_entity_ids=known_entities,
         policy=active_policy,
     )
-    voice_references = select_voice_references(
+    voice_references: list[VoiceReference] = []
+    if "audio_reference" in active_task.components:
+        eligible_voice_entities = {
+            entity.entity_id
+            for entity in clip.annotation.entities
+            if entity.reference_type == "subject"
+        }
+        clean_bindings = [
+            binding
+            for binding in bindings
+            if binding.entity_id in eligible_voice_entities
+            and binding.evidence.clean_training_eligible
+        ]
+        if not clean_bindings:
+            return AudioBindingSidecar(
+                clip_uid=clip.clip_uid,
+                source_run_root=source_run_root,
+                source_video_path=clip.source.video_path,
+                status="ineligible",
+                reason="no_clean_entity_bound_audio",
+                evidence=evidence,
+                bindings=bindings,
+            )
+        if voice_reference_backend is None:
+            raise ValueError("audio_reference task requires a voice reference backend")
+        candidates = voice_reference_backend.extract(
+            clip_uid=clip.clip_uid,
+            audio=evidence.audio,
+            clean_bindings=clean_bindings,
+        )
+        assert evidence.audio.duration_seconds is not None
+        if any(
+            candidate.source_end > evidence.audio.duration_seconds
+            for candidate in candidates
+        ):
+            raise ValueError("voice candidate exceeds source audio duration")
+        voice_references = select_voice_references(
+            candidates,
+            bindings,
+            entity_order=clip.pairing.retained_entity_ids,
+            eligible_entity_ids=eligible_voice_entities,
+            policy=active_policy,
+        )
+        if not voice_references:
+            return AudioBindingSidecar(
+                clip_uid=clip.clip_uid,
+                source_run_root=source_run_root,
+                source_video_path=clip.source.video_path,
+                status="ineligible",
+                reason="no_usable_voice_reference",
+                evidence=evidence,
+                bindings=bindings,
+            )
+    h3_ir = build_h3_audio_ir(
+        clip,
         evidence,
         bindings,
-        entity_order=clip.pairing.retained_entity_ids,
-        policy=active_policy,
+        voice_references,
+        task=active_task,
     )
-    h3_ir = build_h3_audio_ir(clip, evidence, bindings, voice_references)
-    clean_bound = any(
-        binding.evidence.clean_training_eligible for binding in bindings
-    )
-    if not clean_bound:
-        status = "ineligible"
-        reason = "no_clean_entity_bound_audio"
-    elif not voice_references:
-        status = "ineligible"
-        reason = "no_usable_voice_reference"
-    else:
-        status = "ready"
-        reason = None
     return AudioBindingSidecar(
         clip_uid=clip.clip_uid,
         source_run_root=source_run_root,
         source_video_path=clip.source.video_path,
-        status=status,
-        reason=reason,
+        status="ready",
+        reason=None,
         evidence=evidence,
         bindings=bindings,
         voice_references=voice_references,

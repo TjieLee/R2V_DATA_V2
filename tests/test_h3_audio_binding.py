@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from r2v_data_v2.h3.backends import PrecomputedEvidenceBackend
+from r2v_data_v2.h3.backends import (
+    EntityFaceAssociationBackend,
+    PrecomputedEvidenceBackend,
+)
 from r2v_data_v2.h3.fusion import (
     build_audio_binding_sidecar,
     fuse_audio_entity_bindings,
@@ -15,10 +21,16 @@ from r2v_data_v2.h3.fusion import (
 from r2v_data_v2.h3.schemas import (
     ActiveSpeakerInterval,
     AudioBindingEvidence,
+    AudioEntityBinding,
     AudioTrackMetadata,
     EntityFaceAssociation,
+    FaceGeometrySample,
     FaceTrack,
+    H3AudioBindingIR,
+    H3TaskSpecification,
+    PrecomputedClipEvidence,
     PrecomputedEvidenceFile,
+    VoiceReference,
     VoiceReferenceCandidate,
 )
 from r2v_data_v2.h3.sidecar import build_audio_binding_sidecar_run
@@ -49,11 +61,16 @@ def _visibility() -> EntityVisibilitySummary:
     )
 
 
-def _clip(entity_count: int = 2) -> ClipRecord:
+def _clip(
+    entity_count: int = 2,
+    *,
+    reference_types: list[str] | None = None,
+) -> ClipRecord:
+    active_types = reference_types or ["subject"] * entity_count
     entities = [
         AnnotationEntity(
             entity_id=f"e{index}",
-            reference_type="subject",
+            reference_type=active_types[index - 1],
             phrase=f"person {index}",
             grounding_prompt=f"person {index}",
         )
@@ -79,6 +96,13 @@ def _clip(entity_count: int = 2) -> ClipRecord:
         for index, entity in enumerate(entities)
     ]
     retained = [entity.entity_id for entity in entities]
+    token_counters = {"subject": 0, "object": 0, "group": 0}
+    tokens: dict[str, str] = {}
+    for entity in entities:
+        token_counters[entity.reference_type] += 1
+        tokens[entity.entity_id] = (
+            f"<ref_{entity.reference_type}_{token_counters[entity.reference_type]}>"
+        )
     return ClipRecord(
         clip_uid="clip-1",
         source=ClipSource(
@@ -100,16 +124,15 @@ def _clip(entity_count: int = 2) -> ClipRecord:
             passed=True,
             qualifying_entity_ids=retained,
             required_visible_frames=7,
-            entity_visibility_summary={entity_id: _visibility() for entity_id in retained},
+            entity_visibility_summary={
+                entity_id: _visibility() for entity_id in retained
+            },
         ),
         references=ReferencesState(entities=references),
         pairing=PairingState(
             status="ready",
             retained_entity_ids=retained,
-            tokens={
-                entity_id: f"<ref_subject_{index}>"
-                for index, entity_id in enumerate(retained, start=1)
-            },
+            tokens=tokens,
         ),
     )
 
@@ -139,6 +162,20 @@ def _track(index: int) -> FaceTrack:
         end_time=10.0,
         sample_count=20,
         mean_detection_confidence=0.95,
+        geometry_samples=[
+            FaceGeometrySample(
+                frame_index=0,
+                timestamp=0.0,
+                bbox_xyxy=(10.0, 20.0, 30.0, 50.0),
+                confidence=0.96,
+            ),
+            FaceGeometrySample(
+                frame_index=9,
+                timestamp=9.0,
+                bbox_xyxy=(12.0, 20.0, 32.0, 50.0),
+                confidence=0.94,
+            ),
+        ],
     )
 
 
@@ -157,12 +194,20 @@ def _interval(
     probabilities: dict[str, float],
     *,
     speech: bool = True,
+    visible_face_track_ids: list[str] | None = None,
 ) -> ActiveSpeakerInterval:
+    visible = (
+        list(probabilities)
+        if visible_face_track_ids is None
+        else visible_face_track_ids
+    )
     return ActiveSpeakerInterval(
         start_time=start,
         end_time=end,
         speech_present=speech,
+        visible_face_track_ids=visible,
         face_speaking_probabilities=probabilities,
+        asd_coverage_ratio=len(probabilities) / len(visible) if visible else 1.0,
         audio_quality_usable=True,
         synchronization_plausible=True,
     )
@@ -173,31 +218,47 @@ def _evidence(
     *,
     associations: list[EntityFaceAssociation] | None = None,
     audio_status: str = "ready",
-    voice_candidates: list[VoiceReferenceCandidate] | None = None,
 ) -> AudioBindingEvidence:
     return AudioBindingEvidence(
         clip_uid="clip-1",
         audio=_audio(audio_status),
         face_tracks=[_track(1), _track(2)],
         associations=(
-            [_association(1), _association(2)]
-            if associations is None
-            else associations
+            [_association(1), _association(2)] if associations is None else associations
         ),
         active_speaker_intervals=intervals,
-        voice_reference_candidates=voice_candidates or [],
     )
 
 
-def _voice(entity_id: str, start: float, end: float) -> VoiceReferenceCandidate:
+def _voice(
+    start: float, end: float, *, path: str = "audio/voice.wav"
+) -> VoiceReferenceCandidate:
     return VoiceReferenceCandidate(
-        entity_id=entity_id,
-        path=f"audio/{entity_id}.wav",
+        path=path,
         source_start=start,
         source_end=end,
         quality_score=0.9,
         quality_metadata={"snr_db": 24.0},
     )
+
+
+class _FakeVoiceReferenceBackend:
+    def __init__(self, candidates: Sequence[VoiceReferenceCandidate]) -> None:
+        self.candidates = list(candidates)
+        self.calls: list[list[tuple[str | None, str]]] = []
+
+    def extract(
+        self,
+        *,
+        clip_uid: str,
+        audio: AudioTrackMetadata,
+        clean_bindings: Sequence[AudioEntityBinding],
+    ) -> Sequence[VoiceReferenceCandidate]:
+        assert clip_uid == "clip-1"
+        assert audio.status == "ready"
+        summarized = [(binding.entity_id, binding.status) for binding in clean_bindings]
+        self.calls.append(summarized)
+        return self.candidates
 
 
 def _fuse(evidence: AudioBindingEvidence):
@@ -215,9 +276,9 @@ def test_one_visible_person_speaking_binds_to_entity() -> None:
 
 
 def test_two_visible_people_only_e1_speaks() -> None:
-    binding = _fuse(
-        _evidence([_interval(1.0, 2.0, {"face_1": 0.96, "face_2": 0.03})])
-    )[0]
+    binding = _fuse(_evidence([_interval(1.0, 2.0, {"face_1": 0.96, "face_2": 0.03})]))[
+        0
+    ]
 
     assert binding.status == "bound"
     assert binding.entity_id == "e1"
@@ -239,9 +300,9 @@ def test_alternating_visible_speakers_bind_in_time_order() -> None:
 
 
 def test_simultaneous_speakers_are_overlap_not_clean_bound() -> None:
-    binding = _fuse(
-        _evidence([_interval(1.0, 2.0, {"face_1": 0.93, "face_2": 0.91})])
-    )[0]
+    binding = _fuse(_evidence([_interval(1.0, 2.0, {"face_1": 0.93, "face_2": 0.91})]))[
+        0
+    ]
 
     assert binding.status == "overlap"
     assert binding.entity_id is None
@@ -249,18 +310,36 @@ def test_simultaneous_speakers_are_overlap_not_clean_bound() -> None:
 
 
 def test_visible_silent_person_with_speech_is_offscreen() -> None:
-    binding = _fuse(
-        _evidence([_interval(1.0, 2.0, {"face_1": 0.04, "face_2": 0.02})])
-    )[0]
+    binding = _fuse(_evidence([_interval(1.0, 2.0, {"face_1": 0.04, "face_2": 0.02})]))[
+        0
+    ]
 
     assert binding.status == "offscreen"
     assert binding.entity_id is None
 
 
-def test_ambiguous_asd_scores_are_not_force_bound() -> None:
+def test_incomplete_asd_visible_face_coverage_is_ambiguous() -> None:
     binding = _fuse(
-        _evidence([_interval(1.0, 2.0, {"face_1": 0.75, "face_2": 0.70})])
+        _evidence(
+            [
+                _interval(
+                    1.0,
+                    2.0,
+                    {"face_1": 0.02},
+                    visible_face_track_ids=["face_1", "face_2"],
+                )
+            ]
+        )
     )[0]
+
+    assert binding.status == "ambiguous"
+    assert binding.evidence.reason_codes == ["asd_visible_face_coverage_incomplete"]
+
+
+def test_ambiguous_asd_scores_are_not_force_bound() -> None:
+    binding = _fuse(_evidence([_interval(1.0, 2.0, {"face_1": 0.75, "face_2": 0.70})]))[
+        0
+    ]
 
     assert binding.status == "ambiguous"
     assert binding.entity_id is None
@@ -275,16 +354,12 @@ def test_missing_face_track_association_is_ambiguous() -> None:
     )[0]
 
     assert binding.status == "ambiguous"
-    assert binding.evidence.reason_codes == [
-        "face_track_entity_association_missing"
-    ]
+    assert binding.evidence.reason_codes == ["face_track_entity_association_missing"]
 
 
 def test_no_speech_interval_remains_explicit() -> None:
     binding = _fuse(
-        _evidence(
-            [_interval(1.0, 2.0, {"face_1": 0.0, "face_2": 0.0}, speech=False)]
-        )
+        _evidence([_interval(1.0, 2.0, {"face_1": 0.0, "face_2": 0.0}, speech=False)])
     )[0]
 
     assert binding.status == "no_speech"
@@ -310,14 +385,25 @@ def test_h3_asset_numbering_and_rendering_are_deterministic() -> None:
             _interval(1.0, 2.0, {"face_1": 0.96, "face_2": 0.02}),
             _interval(3.0, 4.0, {"face_1": 0.03, "face_2": 0.94}),
         ],
-        voice_candidates=[_voice("e2", 3.1, 3.9), _voice("e1", 1.1, 1.9)],
+    )
+    voice_backend = _FakeVoiceReferenceBackend(
+        [
+            _voice(3.1, 3.9, path="audio/e2.wav"),
+            _voice(1.1, 1.9, path="audio/e1.wav"),
+        ]
     )
 
     first = build_audio_binding_sidecar(
-        _clip(), evidence, source_run_root="/run"
+        _clip(),
+        evidence,
+        source_run_root="/run",
+        voice_reference_backend=voice_backend,
     )
     second = build_audio_binding_sidecar(
-        _clip(), evidence, source_run_root="/run"
+        _clip(),
+        evidence,
+        source_run_root="/run",
+        voice_reference_backend=voice_backend,
     )
 
     assert first == second
@@ -334,15 +420,209 @@ def test_h3_asset_numbering_and_rendering_are_deterministic() -> None:
     assert [item.audio_id for item in first.h3_ir.audio_assets] == [
         "audio_1",
         "audio_2",
-        "audio_3",
     ]
-    assert [item.entity_id for item in first.h3_ir.audio_assets[:2]] == ["e1", "e2"]
-    assert first.h3_ir.audio_assets[2].role == "full_audio_reference"
+    assert [item.entity_id for item in first.h3_ir.audio_assets] == ["e1", "e2"]
+    assert all(item.role == "voice_reference" for item in first.h3_ir.audio_assets)
+    assert first.h3_ir.task.components == [
+        "reference_generation",
+        "audio_reference",
+    ]
+    assert all(
+        item.path != evidence.audio.full_audio_path for item in first.h3_ir.audio_assets
+    )
+    assert voice_backend.calls == [
+        [("e1", "bound"), ("e2", "bound")],
+        [("e1", "bound"), ("e2", "bound")],
+    ]
     rendered = render_h3_audio_instruction(first.h3_ir)
     assert "<Subject 1>" in rendered
     assert "<Picture 1>" in rendered
     assert "<Audio 1>" in rendered
     assert "[reference generation + audio reference]" in rendered
+
+
+def test_full_audio_provenance_is_only_published_for_explicit_audio_reuse() -> None:
+    evidence = _evidence([_interval(1.0, 2.0, {"face_1": 0.95})])
+
+    reference_only = build_audio_binding_sidecar(
+        _clip(),
+        evidence,
+        source_run_root="/run",
+        task=H3TaskSpecification(components=["reference_generation"]),
+    )
+    audio_reuse = build_audio_binding_sidecar(
+        _clip(),
+        evidence,
+        source_run_root="/run",
+        task=H3TaskSpecification(components=["reference_generation", "audio_reuse"]),
+    )
+
+    assert reference_only.status == "ready"
+    assert reference_only.h3_ir is not None
+    assert reference_only.h3_ir.audio_assets == []
+    assert audio_reuse.status == "ready"
+    assert audio_reuse.h3_ir is not None
+    assert audio_reuse.h3_ir.task.components == [
+        "reference_generation",
+        "audio_reuse",
+    ]
+    assert [(item.role, item.path) for item in audio_reuse.h3_ir.audio_assets] == [
+        ("full_audio", "audio/full.wav")
+    ]
+
+
+def test_combined_audio_tasks_require_an_explicit_combination() -> None:
+    evidence = _evidence([_interval(1.0, 2.0, {"face_1": 0.95})])
+    backend = _FakeVoiceReferenceBackend([_voice(1.1, 1.9)])
+    combined = build_audio_binding_sidecar(
+        _clip(),
+        evidence,
+        source_run_root="/run",
+        voice_reference_backend=backend,
+        task=H3TaskSpecification(
+            components=[
+                "reference_generation",
+                "audio_reference",
+                "audio_reuse",
+            ]
+        ),
+    )
+
+    assert combined.status == "ready"
+    assert combined.h3_ir is not None
+    assert [item.role for item in combined.h3_ir.audio_assets] == [
+        "voice_reference",
+        "full_audio",
+    ]
+
+
+def test_h3_task_components_require_canonical_order() -> None:
+    with pytest.raises(ValidationError, match="deterministic order"):
+        H3TaskSpecification(components=["audio_reuse", "reference_generation"])
+
+
+def test_voice_extractor_receives_fused_clean_entity_bindings() -> None:
+    backend = _FakeVoiceReferenceBackend([_voice(1.1, 1.9)])
+
+    sidecar = build_audio_binding_sidecar(
+        _clip(),
+        _evidence([_interval(1.0, 2.0, {"face_1": 0.95})]),
+        source_run_root="/run",
+        voice_reference_backend=backend,
+    )
+
+    assert sidecar.status == "ready"
+    assert backend.calls == [[("e1", "bound")]]
+    assert sidecar.voice_references[0].entity_id == "e1"
+    assert "entity_id" not in _voice(1.1, 1.9).model_dump()
+
+
+@pytest.mark.parametrize("reference_type", ["object", "group"])
+def test_v1_does_not_publish_object_or_group_voice_references(
+    reference_type: str,
+) -> None:
+    backend = _FakeVoiceReferenceBackend([_voice(1.1, 1.9)])
+
+    sidecar = build_audio_binding_sidecar(
+        _clip(entity_count=1, reference_types=[reference_type]),
+        _evidence(
+            [_interval(1.0, 2.0, {"face_1": 0.95})],
+            associations=[_association(1)],
+        ),
+        source_run_root="/run",
+        voice_reference_backend=backend,
+    )
+
+    assert sidecar.status == "ineligible"
+    assert sidecar.reason == "no_clean_entity_bound_audio"
+    assert sidecar.voice_references == []
+    assert backend.calls == []
+
+
+@pytest.mark.parametrize(
+    ("voice_reference_id", "path"),
+    [("voice_1", "audio/voice.wav"), ("voice_reference_1", " ")],
+)
+def test_voice_reference_validates_id_and_path(
+    voice_reference_id: str,
+    path: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        VoiceReference(
+            voice_reference_id=voice_reference_id,
+            entity_id="e1",
+            path=path,
+            source_start=1.1,
+            source_end=1.9,
+            quality_score=0.9,
+            binding_start=1.0,
+            binding_end=2.0,
+        )
+
+
+def test_h3_ir_rejects_unknown_or_duplicate_voice_entities() -> None:
+    sidecar = build_audio_binding_sidecar(
+        _clip(),
+        _evidence([_interval(1.0, 2.0, {"face_1": 0.95})]),
+        source_run_root="/run",
+        voice_reference_backend=_FakeVoiceReferenceBackend([_voice(1.1, 1.9)]),
+    )
+    assert sidecar.h3_ir is not None
+    unknown = sidecar.h3_ir.model_dump(mode="json")
+    unknown["audio_assets"][0]["entity_id"] = "e9"
+    with pytest.raises(ValidationError, match="entity must exist"):
+        H3AudioBindingIR.model_validate(unknown)
+
+    duplicate = sidecar.h3_ir.model_dump(mode="json")
+    second_asset = dict(duplicate["audio_assets"][0])
+    second_asset["audio_id"] = "audio_2"
+    second_asset["voice_reference_id"] = "voice_reference_2"
+    duplicate["audio_assets"].append(second_asset)
+    with pytest.raises(ValidationError, match="at most one voice reference"):
+        H3AudioBindingIR.model_validate(duplicate)
+
+
+def test_h3_ir_rejects_multiple_full_audio_assets() -> None:
+    sidecar = build_audio_binding_sidecar(
+        _clip(),
+        _evidence([]),
+        source_run_root="/run",
+        task=H3TaskSpecification(components=["reference_generation", "audio_reuse"]),
+    )
+    assert sidecar.h3_ir is not None
+    invalid = sidecar.h3_ir.model_dump(mode="json")
+    second_asset = dict(invalid["audio_assets"][0])
+    second_asset["audio_id"] = "audio_2"
+    invalid["audio_assets"].append(second_asset)
+
+    with pytest.raises(ValidationError, match="at most one full-audio"):
+        H3AudioBindingIR.model_validate(invalid)
+
+
+def test_face_track_geometry_is_bounded_and_association_has_mask_context() -> None:
+    geometry = [
+        FaceGeometrySample(
+            frame_index=index,
+            timestamp=index / 10,
+            bbox_xyxy=(1.0, 2.0, 3.0, 4.0),
+            confidence=0.9,
+        )
+        for index in range(33)
+    ]
+    with pytest.raises(ValidationError):
+        FaceTrack(
+            face_track_id="face_1",
+            start_time=0.0,
+            end_time=10.0,
+            sample_count=33,
+            mean_detection_confidence=0.9,
+            geometry_samples=geometry,
+        )
+
+    parameters = inspect.signature(EntityFaceAssociationBackend.associate).parameters
+    assert {"clip", "source_run_root", "tracked_masks_path", "face_tracks"} <= set(
+        parameters
+    )
 
 
 def _tree_hashes(root: Path) -> dict[str, str]:
@@ -372,10 +652,16 @@ def test_precomputed_sidecar_cli_is_read_only_and_preserves_v3_contract(
     evidence = _evidence(
         [_interval(1.0, 2.0, {"face_1": 0.95})],
         associations=[_association(1)],
-        voice_candidates=[_voice("e1", 1.1, 1.9)],
     )
     _write_run(run_root, clip)
-    evidence_file = PrecomputedEvidenceFile(clips=[evidence])
+    evidence_file = PrecomputedEvidenceFile(
+        clips=[
+            PrecomputedClipEvidence(
+                evidence=evidence,
+                voice_reference_candidates=[_voice(1.1, 1.9, path="audio/e1.wav")],
+            )
+        ]
+    )
     evidence_path.write_text(evidence_file.model_dump_json(indent=2), encoding="utf-8")
     before = _tree_hashes(run_root)
 
@@ -396,9 +682,12 @@ def test_precomputed_sidecar_cli_is_read_only_and_preserves_v3_contract(
     assert (output_root / "summary.json").is_file()
     assert (output_root / "audio_bindings.jsonl").is_file()
     assert (output_root / "clips" / "clip-1" / "audio_binding.json").is_file()
-    assert ClipRecord.model_validate_json(
-        (run_root / "clips" / "clip-1" / "clip.json").read_text("utf-8")
-    ) == clip
+    assert (
+        ClipRecord.model_validate_json(
+            (run_root / "clips" / "clip-1" / "clip.json").read_text("utf-8")
+        )
+        == clip
+    )
     assert "audio_binding" not in STAGE_ORDER
 
 

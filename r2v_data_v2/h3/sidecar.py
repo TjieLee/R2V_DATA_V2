@@ -6,11 +6,15 @@ import shutil
 import uuid
 from pathlib import Path
 
-from r2v_data_v2.h3.backends import AudioBindingEvidenceBackend
+from r2v_data_v2.h3.backends import (
+    AudioBindingEvidenceBackend,
+    VoiceReferenceBackend,
+)
 from r2v_data_v2.h3.fusion import AudioBindingPolicy, build_audio_binding_sidecar
 from r2v_data_v2.h3.schemas import (
     AudioBindingRunSummary,
     AudioBindingSidecar,
+    H3TaskSpecification,
 )
 from r2v_data_v2.v3.schemas import ClipRecord
 
@@ -104,6 +108,8 @@ def build_audio_binding_sidecar_run(
     run_root: Path,
     output_root: Path,
     backend: AudioBindingEvidenceBackend,
+    voice_reference_backend: VoiceReferenceBackend | None = None,
+    task: H3TaskSpecification | None = None,
     policy: AudioBindingPolicy | None = None,
     overwrite: bool = False,
 ) -> AudioBindingRunSummary:
@@ -129,6 +135,8 @@ def build_audio_binding_sidecar_run(
                     clip,
                     evidence,
                     source_run_root=str(source),
+                    voice_reference_backend=voice_reference_backend,
+                    task=task,
                     policy=policy,
                 )
             except Exception as exc:  # noqa: BLE001 - preserve neighboring cases
@@ -138,7 +146,9 @@ def build_audio_binding_sidecar_run(
                     reason=f"evidence_or_fusion_failed:{type(exc).__name__}:{exc}",
                 )
             records.append(record)
-            destination_path = temporary / "clips" / clip.clip_uid / "audio_binding.json"
+            destination_path = (
+                temporary / "clips" / clip.clip_uid / "audio_binding.json"
+            )
             destination_path.parent.mkdir(parents=True, exist_ok=True)
             destination_path.write_text(_model_json(record) + "\n", encoding="utf-8")
         jsonl = temporary / "audio_bindings.jsonl"

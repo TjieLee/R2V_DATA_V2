@@ -7,13 +7,14 @@ from typing import Protocol
 from r2v_data_v2.h3.schemas import (
     ActiveSpeakerInterval,
     AudioBindingEvidence,
+    AudioEntityBinding,
     AudioTrackMetadata,
     EntityFaceAssociation,
     FaceTrack,
     PrecomputedEvidenceFile,
     VoiceReferenceCandidate,
 )
-from r2v_data_v2.v3.schemas import AnnotationEntity, ClipRecord
+from r2v_data_v2.v3.schemas import ClipRecord
 
 
 class AudioPreprocessorBackend(Protocol):
@@ -33,8 +34,9 @@ class EntityFaceAssociationBackend(Protocol):
     def associate(
         self,
         *,
-        clip_uid: str,
-        entities: Sequence[AnnotationEntity],
+        clip: ClipRecord,
+        source_run_root: Path,
+        tracked_masks_path: Path,
         face_tracks: Sequence[FaceTrack],
     ) -> Sequence[EntityFaceAssociation]: ...
 
@@ -51,12 +53,12 @@ class ActiveSpeakerBackend(Protocol):
 
 
 class VoiceReferenceBackend(Protocol):
-    def propose(
+    def extract(
         self,
         *,
         clip_uid: str,
         audio: AudioTrackMetadata,
-        intervals: Sequence[ActiveSpeakerInterval],
+        clean_bindings: Sequence[AudioEntityBinding],
     ) -> Sequence[VoiceReferenceCandidate]: ...
 
 
@@ -68,7 +70,7 @@ class PrecomputedEvidenceBackend:
     """Strict GPU-free evidence provider for tests and sidecar replay."""
 
     def __init__(self, evidence: PrecomputedEvidenceFile) -> None:
-        self._by_clip = {item.clip_uid: item for item in evidence.clips}
+        self._by_clip = {item.evidence.clip_uid: item for item in evidence.clips}
 
     @classmethod
     def from_path(cls, path: Path) -> PrecomputedEvidenceBackend:
@@ -76,6 +78,28 @@ class PrecomputedEvidenceBackend:
 
     def collect(self, clip: ClipRecord) -> AudioBindingEvidence:
         try:
-            return self._by_clip[clip.clip_uid]
+            return self._by_clip[clip.clip_uid].evidence
         except KeyError as exc:
             raise KeyError(f"missing audio evidence for clip {clip.clip_uid}") from exc
+
+    def extract(
+        self,
+        *,
+        clip_uid: str,
+        audio: AudioTrackMetadata,
+        clean_bindings: Sequence[AudioEntityBinding],
+    ) -> Sequence[VoiceReferenceCandidate]:
+        try:
+            record = self._by_clip[clip_uid]
+        except KeyError as exc:
+            raise KeyError(f"missing voice evidence for clip {clip_uid}") from exc
+        if record.evidence.audio != audio:
+            raise ValueError(
+                "voice extraction audio does not match precomputed evidence"
+            )
+        if any(
+            binding.status != "bound" or not binding.evidence.clean_training_eligible
+            for binding in clean_bindings
+        ):
+            raise ValueError("voice extraction requires clean bound intervals")
+        return record.voice_reference_candidates
