@@ -19,6 +19,7 @@ from r2v_data_v2.v3.annotation import (
     AnnotationStats,
     QwenAnnotationClient,
     annotate_clips,
+    annotation_system_prompt,
     sanitize_annotation_payload,
     sanitize_background,
     sanitize_entity_candidates,
@@ -95,14 +96,10 @@ def _config(
             candidate_judge=QwenServiceConfig(model=str(annotation_model)),
             background_remove_judge=QwenServiceConfig(model=str(annotation_model)),
         ),
-        sam3=Sam3Config(
-            model_path=user_models / "sam3" / "checkpoint.pt"
-        ),
+        sam3=Sam3Config(model_path=user_models / "sam3" / "checkpoint.pt"),
         remove=RemoveConfig(
             base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
-            adapter_path=(
-                user_models / "Qwen-Image-Edit-2511-Object-Remover"
-            ),
+            adapter_path=(user_models / "Qwen-Image-Edit-2511-Object-Remover"),
         ),
         debug=DebugConfig(save_diagnostics=debug),
     )
@@ -113,9 +110,7 @@ def _config(
 def _config_path(config: V3Config, tmp_path: Path) -> Path:
     path = tmp_path / "v3-annotation.yaml"
     source_limit = (
-        ""
-        if config.source.limit is None
-        else f"  limit: {config.source.limit}\n"
+        "" if config.source.limit is None else f"  limit: {config.source.limit}\n"
     )
     path.write_text(
         f"dataset_json: {config.dataset_json}\n"
@@ -168,9 +163,7 @@ def _entity(
         "reference_type": reference_type,
         "phrase": phrase,
         "grounding_prompt": (
-            phrase.casefold()
-            if grounding_prompt is None
-            else grounding_prompt
+            phrase.casefold() if grounding_prompt is None else grounding_prompt
         ),
     }
 
@@ -216,9 +209,7 @@ def _payload(
             for index in range(1, len(entities) + 1)
         ]
         if background is not None:
-            marker_sentences.append(
-                "The environment remains {{background}}."
-            )
+            marker_sentences.append("The environment remains {{background}}.")
         if marker_sentences:
             template = f"{template} {' '.join(marker_sentences)}"
     return {
@@ -294,12 +285,10 @@ def _seed_ready_downstream(storage: RunStorage, clip_uid: str) -> None:
             coverage_ratio=visible_frame_count / 10,
             qualifies=index == 0,
             per_frame_area_ratio=(
-                [0.1] * visible_frame_count
-                + [0.0] * (10 - visible_frame_count)
+                [0.1] * visible_frame_count + [0.0] * (10 - visible_frame_count)
             ),
             per_frame_confidence=(
-                [0.9] * visible_frame_count
-                + [None] * (10 - visible_frame_count)
+                [0.9] * visible_frame_count + [None] * (10 - visible_frame_count)
             ),
         )
     storage.write_coverage(
@@ -392,8 +381,7 @@ def test_manifest_selection_limit_and_rerun_are_deterministic(
 ) -> None:
     config = _config(tmp_path, monkeypatch, source_limit=5)
     records = [
-        {"file_path": str(_video(config, f"scene_{index}_0.mp4"))}
-        for index in range(8)
+        {"file_path": str(_video(config, f"scene_{index}_0.mp4"))} for index in range(8)
     ]
     _write_source(config, records)
     storage = RunStorage(config)
@@ -557,7 +545,9 @@ def test_entity_sanitizer_deduplicates_truncates_and_assigns_ids() -> None:
     assert "truncated_entity_candidates:5" in warnings
 
 
-def test_annotation_state_accepts_schema_capacity_of_eight_contiguous_entities() -> None:
+def test_annotation_state_accepts_schema_capacity_of_eight_contiguous_entities() -> (
+    None
+):
     entities = [
         AnnotationEntity(
             entity_id=f"e{index}",
@@ -682,9 +672,7 @@ def test_invalid_entity_candidate_is_dropped_locally(
 
 
 def test_zero_valid_entities_still_produces_ready_annotation() -> None:
-    annotation, issues, _ = sanitize_annotation_payload(
-        _payload(entities=[])
-    )
+    annotation, issues, _ = sanitize_annotation_payload(_payload(entities=[]))
 
     assert issues == []
     assert annotation is not None
@@ -783,11 +771,14 @@ def test_phrase_and_grounding_prompt_need_not_appear_in_template() -> None:
     assert annotation is not None
     assert annotation.entities[0].phrase == "a red-haired woman"
     assert annotation.entities[0].grounding_prompt.endswith("green coat")
-    assert render_annotation_plain_text(
-        annotation.instruction_template,
-        annotation.entities,
-        annotation.background,
-    ) == "a red-haired woman crosses a courtyard."
+    assert (
+        render_annotation_plain_text(
+            annotation.instruction_template,
+            annotation.entities,
+            annotation.background,
+        )
+        == "a red-haired woman crosses a courtyard."
+    )
 
 
 def test_placeholder_represents_the_complete_entity_mention() -> None:
@@ -801,19 +792,20 @@ def test_placeholder_represents_the_complete_entity_mention() -> None:
 
     assert issues == []
     assert annotation is not None
-    assert render_annotation_plain_text(
-        annotation.instruction_template,
-        annotation.entities,
-        annotation.background,
-    ) == "a bald monk in a robe kneels."
+    assert (
+        render_annotation_plain_text(
+            annotation.instruction_template,
+            annotation.entities,
+            annotation.background,
+        )
+        == "a bald monk in a robe kneels."
+    )
 
 
 def test_three_entity_markers_are_valid_once_each() -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
-            template=(
-                "{{entity_1}} stands beside {{entity_2}} near {{entity_3}}."
-            ),
+            template=("{{entity_1}} stands beside {{entity_2}} near {{entity_3}}."),
             entities=[
                 _entity("woman"),
                 _entity("boat", reference_type="object"),
@@ -888,9 +880,7 @@ def test_unsafe_internal_marker_structures_are_rejected(
 def test_missing_entity_marker_drops_only_that_proposal_and_renumbers() -> None:
     annotation, issues, warnings = sanitize_annotation_payload(
         _payload(
-            template=(
-                "{{entity_1}} stands beside a dog while {{entity_3}} passes."
-            ),
+            template=("{{entity_1}} stands beside a dog while {{entity_3}} passes."),
             entities=[
                 _entity("woman"),
                 _entity("dog"),
@@ -913,9 +903,7 @@ def test_missing_entity_marker_drops_only_that_proposal_and_renumbers() -> None:
 def test_duplicate_entity_placeholder_keeps_first_and_expands_later() -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
-            template=(
-                "{{entity_1}} walks. Later {{entity_1}} stops."
-            ),
+            template=("{{entity_1}} walks. Later {{entity_1}} stops."),
             entities=[_entity("a man in blue")],
             background=None,
         )
@@ -934,8 +922,7 @@ def test_three_entity_placeholder_occurrences_keep_only_first() -> None:
     annotation, issues, _ = sanitize_annotation_payload(
         _payload(
             template=(
-                "{{entity_1}} walks. {{entity_1}} stops. "
-                "{{entity_1}} looks left."
+                "{{entity_1}} walks. {{entity_1}} stops. {{entity_1}} looks left."
             ),
             entities=[_entity("a man in blue")],
             background=None,
@@ -971,8 +958,7 @@ def test_two_duplicate_entity_placeholders_are_canonicalized_independently() -> 
         "a white boat",
     ]
     assert annotation.instruction_template == (
-        "{{entity_1}} greets {{entity_2}}. Later a man in blue follows "
-        "a white boat."
+        "{{entity_1}} greets {{entity_2}}. Later a man in blue follows a white boat."
     )
 
 
@@ -1022,9 +1008,7 @@ def test_unexpected_entity_marker_is_removed_without_extra_entity() -> None:
 def test_invalid_entity_candidate_removes_its_marker_and_renumbers() -> None:
     annotation, issues, warnings = sanitize_annotation_payload(
         _payload(
-            template=(
-                "{{entity_1}} stands beside {{entity_2}} and {{entity_3}}."
-            ),
+            template=("{{entity_1}} stands beside {{entity_2}} and {{entity_3}}."),
             entities=[
                 _entity("woman"),
                 _entity("region", reference_type="scene"),
@@ -1081,14 +1065,14 @@ def test_missing_and_duplicate_entities_leave_contiguous_placeholders() -> None:
     assert "dropped_entity_missing_marker:2" in warnings
 
 
-def test_duplicate_placeholder_then_grounding_failure_expands_every_occurrence() -> None:
+def test_duplicate_placeholder_then_grounding_failure_expands_every_occurrence() -> (
+    None
+):
     grounding = " ".join(f"feature{index}" for index in range(25))
     annotation, issues, warnings = sanitize_annotation_payload(
         _payload(
             template="{{entity_1}} walks. Later {{entity_1}} stops.",
-            entities=[
-                _entity("a man in blue", grounding_prompt=grounding)
-            ],
+            entities=[_entity("a man in blue", grounding_prompt=grounding)],
             background=None,
         )
     )
@@ -1146,9 +1130,7 @@ def test_annotation_word_count_uses_substituted_entity_phrase() -> None:
     )
 
     assert annotation is None
-    assert {issue.code for issue in issues} == {
-        "instruction_template_too_long"
-    }
+    assert {issue.code for issue in issues} == {"instruction_template_too_long"}
 
 
 def test_background_marker_matches_background_presence() -> None:
@@ -1212,8 +1194,7 @@ def test_duplicate_background_placeholder_keeps_first_and_expands_later() -> Non
     assert annotation is not None
     assert annotation.background is not None
     assert annotation.instruction_template == (
-        "{{entity_1}} crosses {{background}} before a sunlit plaza appears "
-        "again."
+        "{{entity_1}} crosses {{background}} before a sunlit plaza appears again."
     )
     assert annotation.instruction_template.count("{{background}}") == 1
 
@@ -1250,15 +1231,16 @@ def test_invalid_background_grounding_preserves_safe_phrase_in_text() -> None:
     assert issues == []
     assert annotation is not None
     assert annotation.background is None
-    assert annotation.instruction_template == (
-        "{{entity_1}} crosses a sunlit plaza."
-    )
+    assert annotation.instruction_template == ("{{entity_1}} crosses a sunlit plaza.")
     assert "dropped_background_grounding_prompt_too_long" in warnings
-    assert render_annotation_plain_text(
-        annotation.instruction_template,
-        annotation.entities,
-        annotation.background,
-    ) == "a woman crosses a sunlit plaza."
+    assert (
+        render_annotation_plain_text(
+            annotation.instruction_template,
+            annotation.entities,
+            annotation.background,
+        )
+        == "a woman crosses a sunlit plaza."
+    )
 
 
 def test_missing_marker_is_sanitized_without_repair_lifecycle(
@@ -1301,9 +1283,7 @@ def test_missing_marker_is_sanitized_without_repair_lifecycle(
     ],
 )
 def test_directly_visible_caption_language_is_allowed(caption: str) -> None:
-    annotation, issues, _ = sanitize_annotation_payload(
-        _payload(caption=caption)
-    )
+    annotation, issues, _ = sanitize_annotation_payload(_payload(caption=caption))
 
     assert issues == []
     assert annotation is not None
@@ -1322,21 +1302,13 @@ def test_instruction_template_warning_boundaries(
     assert issues == []
     assert annotation is not None
     if word_count > 180:
-        assert (
-            f"instruction_template_over_target_length:{word_count}"
-            in warnings
-        )
+        assert f"instruction_template_over_target_length:{word_count}" in warnings
         assert not any(
-            warning.startswith(
-                "instruction_template_over_preferred_length:"
-            )
+            warning.startswith("instruction_template_over_preferred_length:")
             for warning in warnings
         )
     elif word_count > 120:
-        assert (
-            f"instruction_template_over_preferred_length:{word_count}"
-            in warnings
-        )
+        assert f"instruction_template_over_preferred_length:{word_count}" in warnings
     else:
         assert not any(
             warning.startswith("instruction_template_over_preferred_length:")
@@ -1346,14 +1318,10 @@ def test_instruction_template_warning_boundaries(
 
 def test_instruction_template_over_220_words_enters_repair_validation() -> None:
     caption = " ".join(f"visible{index}" for index in range(221))
-    annotation, issues, _ = sanitize_annotation_payload(
-        _payload(caption=caption)
-    )
+    annotation, issues, _ = sanitize_annotation_payload(_payload(caption=caption))
 
     assert annotation is None
-    assert {issue.code for issue in issues} == {
-        "instruction_template_too_long"
-    }
+    assert {issue.code for issue in issues} == {"instruction_template_too_long"}
 
 
 @pytest.mark.parametrize("word_count", [12, 13, 14, 18])
@@ -1404,9 +1372,7 @@ def test_soft_entity_phrase_length_does_not_request_qwen_repair(
         [
             _payload(
                 template="{{entity_1}} remains visible.",
-                entities=[
-                    _entity(phrase, grounding_prompt="stable visible object")
-                ],
+                entities=[_entity(phrase, grounding_prompt="stable visible object")],
                 background=None,
             )
         ],
@@ -1447,9 +1413,7 @@ def test_grounding_prompt_fail_soft_does_not_request_qwen_repair(
         [
             _payload(
                 template="{{entity_1}} remains visible.",
-                entities=[
-                    _entity("a stable object", grounding_prompt=grounding)
-                ],
+                entities=[_entity("a stable object", grounding_prompt=grounding)],
                 background=None,
             )
         ],
@@ -1462,9 +1426,7 @@ def test_grounding_prompt_fail_soft_does_not_request_qwen_repair(
     assert clip.annotation is not None
     assert clip.annotation.status == "ready"
     assert clip.annotation.entities == []
-    assert clip.annotation.instruction_template == (
-        "a stable object remains visible."
-    )
+    assert clip.annotation.instruction_template == ("a stable object remains visible.")
 
 
 @pytest.mark.parametrize(
@@ -1487,7 +1449,7 @@ def test_transient_action_in_grounding_prompt_drops_only_entity(
                     "a visible person",
                     grounding_prompt=grounding_prompt,
                 )
-            ]
+            ],
         )
     )
 
@@ -1514,7 +1476,7 @@ def test_stable_short_grounding_prompt_is_allowed(grounding_prompt: str) -> None
                     "a stable foreground reference",
                     grounding_prompt=grounding_prompt,
                 )
-            ]
+            ],
         )
     )
 
@@ -1533,14 +1495,10 @@ def test_stable_short_grounding_prompt_is_allowed(grounding_prompt: str) -> None
     ],
 )
 def test_unsupported_caption_inference_is_rejected(caption: str) -> None:
-    annotation, issues, _ = sanitize_annotation_payload(
-        _payload(caption=caption)
-    )
+    annotation, issues, _ = sanitize_annotation_payload(_payload(caption=caption))
 
     assert annotation is None
-    assert [issue.code for issue in issues] == [
-        "unsupported_caption_inference"
-    ]
+    assert [issue.code for issue in issues] == ["unsupported_caption_inference"]
 
 
 def test_caption_semantic_issue_can_be_repaired(
@@ -1551,12 +1509,8 @@ def test_caption_semantic_issue_can_be_repaired(
         tmp_path,
         monkeypatch,
         [
-            _payload(
-                caption="Wind causes the branches to sway beside the road."
-            ),
-            _payload(
-                caption="Thin branches sway slightly beside the road."
-            ),
+            _payload(caption="Wind causes the branches to sway beside the road."),
+            _payload(caption="Thin branches sway slightly beside the road."),
         ],
         repair_retries=1,
     )
@@ -1606,6 +1560,81 @@ def test_annotation_prompt_defines_concise_text_limits() -> None:
         "after every placeholder is replaced by its phrase",
     ):
         assert phrase in lowered
+
+
+def test_dense_prompt_preserves_recall_with_semantic_type_boundaries() -> None:
+    prompt = annotation_system_prompt(
+        QwenAnnotationConfig(entity_selection_mode="reference_dense_v1")
+    ).lower()
+    for contract in (
+        "animals are subjects, never objects",
+        "body parts are not independent objects",
+        "amorphous materials, liquids, sauces, smoke, shadows, lighting",
+        "buildings, room architecture, bridges, trees, landscape elements",
+        "screen, painting, photograph, poster",
+        "worn or attached objects may be selected",
+        "plate of meatballs",
+        "loaf of bread",
+    ):
+        assert contract in prompt
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "object",
+        "a large black object with cutouts",
+        "small dark floating object",
+        "an unidentified item beside the chair",
+        "a strange thing with holes",
+    ),
+)
+def test_dense_generic_object_pattern_drops_modified_vague_heads(
+    phrase: str,
+) -> None:
+    entities, warnings = sanitize_entity_candidates(
+        [
+            {
+                "reference_type": "object",
+                "phrase": phrase,
+                "grounding_prompt": "stable visible foreground shape near center",
+            }
+        ],
+        max_entities=8,
+        reject_generic_object_phrases=True,
+    )
+
+    assert entities == []
+    assert warnings == ("dropped_generic_object_phrase:0",)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "a red shoulder bag",
+        "a silver SUV",
+        "a steel cutting tool",
+        "a plate of meatballs",
+        "an ocean-patterned dress",
+    ),
+)
+def test_dense_generic_object_pattern_preserves_concrete_objects(
+    phrase: str,
+) -> None:
+    entities, warnings = sanitize_entity_candidates(
+        [
+            {
+                "reference_type": "object",
+                "phrase": phrase,
+                "grounding_prompt": "stable visible foreground object near center",
+            }
+        ],
+        max_entities=8,
+        reject_generic_object_phrases=True,
+    )
+
+    assert len(entities) == 1
+    assert "dropped_generic_object_phrase:0" not in warnings
 
 
 def test_empty_caption_is_repaired(
@@ -1873,9 +1902,7 @@ class _CompletionsStub:
     def create(self, **kwargs: object) -> object:
         self.calls.append(dict(kwargs))
         return SimpleNamespace(
-            choices=[
-                SimpleNamespace(message=SimpleNamespace(content=self.raw))
-            ]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.raw))]
         )
 
 
@@ -1895,9 +1922,7 @@ class _StrictFallbackCompletionsStub(_CompletionsStub):
                 body={},
             )
         return SimpleNamespace(
-            choices=[
-                SimpleNamespace(message=SimpleNamespace(content=self.raw))
-            ]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.raw))]
         )
 
 
@@ -1910,9 +1935,7 @@ class _SequencedCompletionsStub:
         self.calls.append(dict(kwargs))
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=next(self.responses))
-                )
+                SimpleNamespace(message=SimpleNamespace(content=next(self.responses)))
             ]
         )
 
@@ -1926,9 +1949,7 @@ def test_qwen_request_uses_full_video_minimal_schema_and_no_resampling(
     completions = _CompletionsStub(json.dumps(_payload()))
     client = QwenAnnotationClient(
         config.qwen.annotation,
-        client=SimpleNamespace(
-            chat=SimpleNamespace(completions=completions)
-        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
     result = client.annotate(
@@ -1953,9 +1974,7 @@ def test_qwen_request_uses_full_video_minimal_schema_and_no_resampling(
         "instruction_template",
     ]
     messages = request["messages"]
-    assert messages[-1]["content"][0]["video_url"]["url"] == (
-        video.resolve().as_uri()
-    )
+    assert messages[-1]["content"][0]["video_url"]["url"] == (video.resolve().as_uri())
 
 
 def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
@@ -1967,9 +1986,7 @@ def test_qwen_falls_back_to_json_object_when_strict_schema_is_unsupported(
     completions = _StrictFallbackCompletionsStub(json.dumps(_payload()))
     client = QwenAnnotationClient(
         config.qwen.annotation,
-        client=SimpleNamespace(
-            chat=SimpleNamespace(completions=completions)
-        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
     result = client.annotate(
@@ -1990,14 +2007,10 @@ def test_annotation_repair_profiles_each_real_http_call(
 ) -> None:
     config = _config(tmp_path, monkeypatch, repair_retries=1)
     video = _video(config)
-    completions = _SequencedCompletionsStub(
-        ["{}", json.dumps(_payload())]
-    )
+    completions = _SequencedCompletionsStub(["{}", json.dumps(_payload())])
     client = QwenAnnotationClient(
         config.qwen.annotation,
-        client=SimpleNamespace(
-            chat=SimpleNamespace(completions=completions)
-        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
     profiler = V3Profiler(tmp_path / "profile", git_commit="abc123")
 
@@ -2063,9 +2076,7 @@ def test_system_prompt_plans_references_before_writing_template() -> None:
     )
     assert "never repeat the same entity placeholder" in normalized
     assert "first natural environment mention" in normalized
-    assert "duplicate entity or background placeholders are forbidden" in (
-        normalized
-    )
+    assert "duplicate entity or background placeholders are forbidden" in (normalized)
 
 
 def test_system_prompt_rejects_inferred_causes_and_multiscene_backgrounds() -> None:

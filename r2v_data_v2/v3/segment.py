@@ -49,6 +49,11 @@ class SegmentStats:
     cross_type_collision_retry_attempted: int = 0
     cross_type_collision_retry_ready: int = 0
     cross_type_collision_unresolved: int = 0
+    anchor_fast_path_hits: int = 0
+    anchor_fallback_attempted: int = 0
+    anchor_fallback_hits: int = 0
+    anchor_all_frames_not_found: int = 0
+    anchor_probe_calls: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -166,9 +171,7 @@ def _track_quality(
 ) -> tuple[int, float, int]:
     frames = _valid_track_frames(track)
     confidences = [
-        float(frame.confidence)
-        for frame in frames
-        if frame.confidence is not None
+        float(frame.confidence) for frame in frames if frame.confidence is not None
     ]
     median_confidence = float(np.median(confidences)) if confidences else -math.inf
     return len(frames), median_confidence, -annotation_index
@@ -365,9 +368,7 @@ def _entity_masks_from_result(
             height=height,
             width=width,
         )
-        observations_by_slot[observation.slot].append(
-            (observation, mask)
-        )
+        observations_by_slot[observation.slot].append((observation, mask))
         all_object_ids.add(observation.object_id)
 
     if entity.reference_type != "group" and len(all_object_ids) > 1:
@@ -376,8 +377,7 @@ def _entity_masks_from_result(
             height=height,
             width=width,
             reason=(
-                "multiple backend identities cannot be unioned for a "
-                "subject or object"
+                "multiple backend identities cannot be unioned for a subject or object"
             ),
         )
     if entity.reference_type == "group" and len(all_object_ids) > 1:
@@ -408,9 +408,7 @@ def _entity_masks_from_result(
                 )
             )
             continue
-        nonempty = [
-            (item, mask) for item, mask in observed if mask.any()
-        ]
+        nonempty = [(item, mask) for item, mask in observed if mask.any()]
         if not nonempty:
             frames.append(_empty_frame(slot, height, width))
             continue
@@ -419,9 +417,7 @@ def _entity_masks_from_result(
                 entity,
                 height=height,
                 width=width,
-                reason=(
-                    "multiple masks cannot be unioned for a subject or object"
-                ),
+                reason=("multiple masks cannot be unioned for a subject or object"),
             )
         ordered = sorted(nonempty, key=lambda value: value[0].object_id)
         combined = np.logical_or.reduce([mask for _, mask in ordered])
@@ -627,9 +623,7 @@ def _validate_existing_masks(
             masks.reference_type != entity.reference_type
             or masks.grounding_prompt != entity.grounding_prompt
         ):
-            raise ValueError(
-                "mask artifact entity semantics do not match annotation"
-            )
+            raise ValueError("mask artifact entity semantics do not match annotation")
     return artifact
 
 
@@ -638,9 +632,7 @@ def _overlay_text(
     grounding_prompt: str,
     frame: TrackedMaskFrame,
 ) -> str:
-    confidence = (
-        "none" if frame.confidence is None else f"{frame.confidence:.4f}"
-    )
+    confidence = "none" if frame.confidence is None else f"{frame.confidence:.4f}"
     object_ids = ",".join(frame.backend_object_ids) or "none"
     return (
         f"{entity_id} | slot={frame.slot:02d} | present={frame.present} | "
@@ -842,16 +834,12 @@ def _segment_clips_with_backend(
                 ):
                     phrase_retried.add(entity.entity_id)
                     clip_rescue_counters["object_rescue_attempted"] += 1
-                    clip_rescue_counters[
-                        "object_not_found_retry_attempted"
-                    ] += 1
+                    clip_rescue_counters["object_not_found_retry_attempted"] += 1
                     original = entity_masks
                     retry = retry_object(entity, "object_not_found_retry")
                     if retry.status == "ready":
                         entity_masks = retry
-                        clip_rescue_counters[
-                            "object_not_found_retry_ready"
-                        ] += 1
+                        clip_rescue_counters["object_not_found_retry_ready"] += 1
                     clip_diagnostics.append(
                         {
                             "kind": "object_not_found",
@@ -899,10 +887,7 @@ def _segment_clips_with_backend(
                 width=frames.width,
                 entities=tracked_entities,
             )
-            if (
-                config.debug.save_diagnostics
-                or config.sam3.save_debug_overlays
-            ):
+            if config.debug.save_diagnostics or config.sam3.save_debug_overlays:
                 _write_debug_overlays(
                     storage,
                     clip_uid=clip.clip_uid,
@@ -939,6 +924,8 @@ def _segment_clips_with_backend(
             storage.root / "diagnostics" / "object_rescue.jsonl",
             diagnostic_root.glob("*.json"),
         )
+    anchor_counter_reader = getattr(backend, "anchor_search_counters", None)
+    anchor_counters = anchor_counter_reader() if callable(anchor_counter_reader) else {}
     stats = SegmentStats(
         processed=processed,
         skipped_existing=skipped_existing,
@@ -948,6 +935,7 @@ def _segment_clips_with_backend(
         entities_not_found=not_found_count,
         entities_failed=entity_failed_count,
         **rescue_counters,
+        **anchor_counters,
     )
     storage.update_stage_counts("segment", stats.to_dict())
     return stats
@@ -969,9 +957,7 @@ def segment_clips(
         )
 
     if config.sam3.model_path is None:
-        raise ValueError(
-            "sam3.model_path must be configured before segment runs"
-        )
+        raise ValueError("sam3.model_path must be configured before segment runs")
     owned_backend = Sam3SegmentationBackend(config.sam3)
     try:
         return _segment_clips_with_backend(

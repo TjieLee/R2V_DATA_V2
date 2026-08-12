@@ -145,9 +145,7 @@ def _sam_outputs(
             [0.95 - (index * 0.05) for index in range(len(masks))],
             dtype=np.float32,
         ),
-        "out_obj_ids": np.asarray(
-            [f"object-{index}" for index in range(len(masks))]
-        ),
+        "out_obj_ids": np.asarray([f"object-{index}" for index in range(len(masks))]),
     }
 
 
@@ -222,18 +220,13 @@ def _config(
         ),
         sam3=Sam3Config(
             model_path=(
-                user_models / "sam3" / "checkpoint.pt"
-                if with_sam3_model
-                else None
+                user_models / "sam3" / "checkpoint.pt" if with_sam3_model else None
             ),
             save_debug_overlays=debug_overlays,
         ),
         remove=RemoveConfig(
-            base_model_path=pretrained
-            / "Qwen"
-            / "Qwen-Image-Edit-2511",
-            adapter_path=user_models
-            / "Qwen-Image-Edit-2511-Object-Remover",
+            base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
+            adapter_path=user_models / "Qwen-Image-Edit-2511-Object-Remover",
         ),
     )
     config.validate()
@@ -675,6 +668,133 @@ def test_sam3_anchor_probe_order_uses_only_configured_slots(
     assert predictor.prompt_slots == [5, 2, 7, 0, 9]
 
 
+@pytest.mark.parametrize("fallback_slot", [4, 6, 1])
+def test_sam3_progressive_anchor_finds_remaining_slots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_slot: int,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    predictor = FakeSam3Predictor({fallback_slot: _sam_outputs(_mask())})
+    backend = Sam3SegmentationBackend(
+        Sam3Config(anchor_search_mode="progressive_v1"),
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "ready"
+    assert predictor.prompt_slots[:5] == [5, 2, 7, 0, 9]
+    assert fallback_slot in predictor.prompt_slots
+    counters = backend.anchor_search_counters()
+    assert counters["anchor_fallback_attempted"] == 1
+    assert counters["anchor_fallback_hits"] == 1
+    assert (
+        counters["anchor_probe_calls"]
+        == predictor.prompt_slots.index(fallback_slot) + 1
+    )
+
+
+def test_sam3_progressive_anchor_uses_unique_after_ambiguous_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    predictor = FakeSam3Predictor(
+        {
+            5: _sam_outputs(_mask(), _mask(x1=9, x2=12)),
+            4: _sam_outputs(_mask()),
+        }
+    )
+    backend = Sam3SegmentationBackend(
+        Sam3Config(anchor_search_mode="progressive_v1"),
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "ready"
+    assert 4 in predictor.prompt_slots
+
+
+def test_sam3_progressive_anchor_all_absent_reports_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    predictor = FakeSam3Predictor({})
+    backend = Sam3SegmentationBackend(
+        Sam3Config(anchor_search_mode="progressive_v1"),
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "not_found"
+    assert predictor.prompt_slots == [5, 2, 7, 0, 9, 4, 6, 3, 8, 1]
+    assert backend.anchor_search_counters() == {
+        "anchor_fast_path_hits": 0,
+        "anchor_fallback_attempted": 1,
+        "anchor_fallback_hits": 0,
+        "anchor_all_frames_not_found": 1,
+        "anchor_probe_calls": 10,
+    }
+
+
+def test_sam3_progressive_anchor_all_ambiguous_preserves_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    ambiguous = _sam_outputs(_mask(), _mask(x1=9, x2=12))
+    predictor = FakeSam3Predictor({slot: ambiguous for slot in range(10)})
+    backend = Sam3SegmentationBackend(
+        Sam3Config(anchor_search_mode="progressive_v1"),
+        predictor=predictor,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "failed"
+    assert "multiple ambiguous instances" in str(result.reason)
+
+
 def test_sam3_multi_object_group_fails_without_propagation_or_union(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -684,9 +804,7 @@ def test_sam3_multi_object_group_fails_without_propagation_or_union(
         monkeypatch,
         entities=[_entity("e1", reference_type="group")],
     )
-    predictor = FakeSam3Predictor(
-        {5: _sam_outputs(_mask(), _mask(x1=9, x2=12))}
-    )
+    predictor = FakeSam3Predictor({5: _sam_outputs(_mask(), _mask(x1=9, x2=12))})
     backend = Sam3SegmentationBackend(
         storage.config.sam3,
         predictor=predictor,
@@ -745,12 +863,8 @@ def test_sam3_collects_forward_and_backward_tracks_for_coverage(
     predictor = FakeSam3Predictor(
         {5: _sam_output(mask)},
         propagation_by_direction={
-            "forward": [
-                _stream_response(slot, mask) for slot in range(6, 10)
-            ],
-            "backward": [
-                _stream_response(slot, mask) for slot in range(4, -1, -1)
-            ],
+            "forward": [_stream_response(slot, mask) for slot in range(6, 10)],
+            "backward": [_stream_response(slot, mask) for slot in range(4, -1, -1)],
         },
     )
     backend = Sam3SegmentationBackend(
@@ -789,9 +903,7 @@ def test_sam3_collects_forward_and_backward_tracks_for_coverage(
             entities={entity.entity_id: tracked},
         ),
         entities=[entity],
-        required_visible_frames=(
-            storage.config.coverage.required_visible_frames
-        ),
+        required_visible_frames=(storage.config.coverage.required_visible_frames),
     )
 
     assert coverage.required_visible_frames == 7
@@ -802,10 +914,13 @@ def test_mask_iou_rejects_shape_mismatch_and_empty_union() -> None:
     mask = _mask()
 
     assert mask_iou(mask, mask.copy()) == pytest.approx(1.0)
-    assert mask_iou(
-        np.zeros_like(mask),
-        np.zeros_like(mask),
-    ) == 0.0
+    assert (
+        mask_iou(
+            np.zeros_like(mask),
+            np.zeros_like(mask),
+        )
+        == 0.0
+    )
     with pytest.raises(ValueError, match="equal mask shapes"):
         mask_iou(mask, np.zeros((8, 8), dtype=bool))
 
@@ -827,12 +942,8 @@ def test_sam3_session_local_object_ids_are_canonicalized(
             "session-3": _sam_output(mask, object_id="backward-7"),
         },
         propagation_by_direction={
-            "forward": [
-                _stream_response(6, mask, object_id="forward-0")
-            ],
-            "backward": [
-                _stream_response(4, mask, object_id="backward-7")
-            ],
+            "forward": [_stream_response(6, mask, object_id="forward-0")],
+            "backward": [_stream_response(4, mask, object_id="backward-7")],
         },
     )
     backend = Sam3SegmentationBackend(
@@ -884,9 +995,7 @@ def test_sam3_anchor_identity_mismatch_between_sessions_fails(
 
     assert result.status == "failed"
     assert result.reason == "anchor_identity_mismatch_between_directions"
-    assert set(predictor.propagation_session_ids).issubset(
-        predictor.closed_session_ids
-    )
+    assert set(predictor.propagation_session_ids).issubset(predictor.closed_session_ids)
 
 
 @pytest.mark.parametrize(
@@ -909,12 +1018,8 @@ def test_sam3_empty_direction_preserves_other_direction(
     )
     mask = _mask()
     streams = {
-        "forward": [
-            _stream_response(slot, mask) for slot in range(6, 10)
-        ],
-        "backward": [
-            _stream_response(slot, mask) for slot in range(4, -1, -1)
-        ],
+        "forward": [_stream_response(slot, mask) for slot in range(6, 10)],
+        "backward": [_stream_response(slot, mask) for slot in range(4, -1, -1)],
     }
     streams[empty_direction] = []
     predictor = FakeSam3Predictor(
@@ -959,17 +1064,11 @@ def test_sam3_propagation_anchor_duplicates_are_ignored(
         propagation_by_direction={
             "forward": [
                 _stream_response(5, forward_anchor_copy),
-                *[
-                    _stream_response(slot, anchor_mask)
-                    for slot in range(6, 10)
-                ],
+                *[_stream_response(slot, anchor_mask) for slot in range(6, 10)],
             ],
             "backward": [
                 _stream_response(5, backward_anchor_copy),
-                *[
-                    _stream_response(slot, anchor_mask)
-                    for slot in range(4, -1, -1)
-                ],
+                *[_stream_response(slot, anchor_mask) for slot in range(4, -1, -1)],
             ],
         },
     )
@@ -1123,9 +1222,7 @@ def test_sam3_object_id_change_in_either_direction_fails(
 
     assert result.status == "failed"
     assert result.reason == expected_reason
-    assert set(predictor.propagation_session_ids).issubset(
-        predictor.closed_session_ids
-    )
+    assert set(predictor.propagation_session_ids).issubset(predictor.closed_session_ids)
 
 
 def test_segment_closes_only_its_owned_backend(
@@ -1154,9 +1251,7 @@ def test_segment_closes_only_its_owned_backend(
             reference_type: str,
             grounding_prompt: str,
         ) -> EntityTrackResult:
-            return _ready(
-                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
-            )
+            return _ready([BackendMaskObservation(1, _mask(), 0.9, "track-1")])
 
         def close(self) -> None:
             self.closed = True
@@ -1183,11 +1278,7 @@ def test_segment_does_not_close_injected_backend(
         entities=[_entity("e1")],
     )
     backend = FakeSegmentationBackend(
-        {
-            "e1": _ready(
-                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
-            )
-        }
+        {"e1": _ready([BackendMaskObservation(1, _mask(), 0.9, "track-1")])}
     )
 
     segment_clips(storage.config, storage, backend=backend)
@@ -1224,11 +1315,7 @@ def test_segment_fake_backend_allows_missing_model_path(
         with_sam3_model=False,
     )
     backend = FakeSegmentationBackend(
-        {
-            "e1": _ready(
-                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
-            )
-        }
+        {"e1": _ready([BackendMaskObservation(1, _mask(), 0.9, "track-1")])}
     )
 
     stats = segment_clips(storage.config, storage, backend=backend)
@@ -1252,11 +1339,7 @@ def test_segment_debug_overlays_follow_configuration(
     )
     frame_bytes = {path.name: path.read_bytes() for path in frame_paths}
     backend = FakeSegmentationBackend(
-        {
-            "e1": _ready(
-                [BackendMaskObservation(1, _mask(), 0.9, "track-1")]
-            )
-        }
+        {"e1": _ready([BackendMaskObservation(1, _mask(), 0.9, "track-1")])}
     )
 
     segment_clips(storage.config, storage, backend=backend)
@@ -1369,10 +1452,7 @@ def test_cross_entity_duplicate_requires_median_iou_threshold() -> None:
 
 
 def test_cross_entity_duplicate_requires_high_overlap_frame_fraction() -> None:
-    pairs = [
-        _overlap_mask_pair(intersection)
-        for intersection in (100, 98, 95, 88, 88)
-    ]
+    pairs = [_overlap_mask_pair(intersection) for intersection in (100, 98, 95, 88, 88)]
     decision = v3_segment_module.compare_cross_entity_tracks(
         "e1",
         _published_track("e1", {slot: pair[0] for slot, pair in enumerate(pairs)}),

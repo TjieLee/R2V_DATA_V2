@@ -80,17 +80,12 @@ _ENTITY_COUNT_WORDS = (
     "eight",
 )
 _ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[DEFAULT_MAX_ANNOTATION_ENTITIES]
-_DENSE_GENERIC_OBJECT_PHRASES = frozenset(
-    {
-        "object",
-        "thing",
-        "item",
-        "unknown object",
-        "awkward object",
-        "unidentified object",
-        "large black object",
-        "a large black awkward object",
-    }
+_DENSE_GENERIC_OBJECT_HEAD = re.compile(
+    r"^(?:(?:a|an|the)\s+)?"
+    r"(?:(?:unknown|unidentified|floating|black|dark|large|small|strange|awkward)\s+)*"
+    r"(?:object|thing|item)s?"
+    r"(?:\s+(?:with|without|near|beside|in|on|at|of)\b.*)?$",
+    flags=re.IGNORECASE,
 )
 _PREFERRED_ENTITY_PHRASE_WORD_LIMIT = 12
 _HARD_ENTITY_PHRASE_WORD_LIMIT = 18
@@ -234,6 +229,17 @@ entity, inspect the video once for additional clearly visible, stable, trackable
 entities with independent control value. A larger or more salient person does
 not automatically exclude smaller useful objects.
 
+Use subject for exactly one person, animal, or character. Animals are subjects,
+never objects. Body parts are not independent objects. Use object only for one
+concrete, discrete, physical foreground object with independent reference or
+control value. Amorphous materials, liquids, sauces, smoke, shadows, lighting,
+and similar non-discrete content are not objects. Static environmental structure
+such as buildings, room architecture, bridges, trees, landscape elements, and
+similar scene structure should normally remain in the scene or background
+description. Content inside a screen, painting, photograph, poster,
+visualization, diagram, animation, or other depicted representation must not
+become a physical object reference merely because it is visually distinct.
+
 Worn or attached objects may be selected when they are visually distinct,
 stable across the clip, specifically nameable, and independently useful. These
 may include a hat, glasses, bag, jacket, shirt, distinctive footwear, tool,
@@ -242,6 +248,11 @@ never invent entities, and return fewer entities when evidence is weak. Do not
 split a subject into arbitrary tiny details such as buttons, shoelaces, fingers,
 ears, tiny decorations, indistinct fragments, or anything that cannot be
 reliably localized.
+
+Discrete foods and food containers may remain valid objects when they have a
+recognizable bounded form, such as a lobster, fish, bowl, frying pan, plate of
+meatballs, loaf of bread, or pot of food. Do not promote amorphous sauce, steam,
+oil puddles, or similar substances into object references.
 
 An object phrase must name a concrete recognizable physical entity. Do not use
 generic phrases such as object, thing, item, unknown object, awkward object,
@@ -661,7 +672,7 @@ def _sanitize_entity_candidates_with_indices(
         if (
             reject_generic_object_phrases
             and normalized_type == "object"
-            and phrase_key in _DENSE_GENERIC_OBJECT_PHRASES
+            and _DENSE_GENERIC_OBJECT_HEAD.fullmatch(phrase_key) is not None
         ):
             warnings.append(f"dropped_generic_object_phrase:{index}")
             continue

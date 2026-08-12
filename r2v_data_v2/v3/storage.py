@@ -33,6 +33,7 @@ from r2v_data_v2.v3.schemas import (
     InstructionState,
     PairingState,
     ReferenceEditState,
+    ReferenceIntegrityState,
     ReferencesState,
     RunRecord,
     SampledFramesArtifact,
@@ -49,6 +50,7 @@ _SECTION_INVALIDATIONS = {
         "references",
         "pairing",
         "reference_edit",
+        "reference_integrity",
         "instruction",
         "export",
     ),
@@ -57,6 +59,7 @@ _SECTION_INVALIDATIONS = {
         "references",
         "pairing",
         "reference_edit",
+        "reference_integrity",
         "instruction",
         "export",
     ),
@@ -65,6 +68,7 @@ _SECTION_INVALIDATIONS = {
         "references",
         "pairing",
         "reference_edit",
+        "reference_integrity",
         "instruction",
         "export",
     ),
@@ -72,12 +76,20 @@ _SECTION_INVALIDATIONS = {
         "references",
         "pairing",
         "reference_edit",
+        "reference_integrity",
         "instruction",
         "export",
     ),
-    "references": ("pairing", "reference_edit", "instruction", "export"),
-    "pairing": ("reference_edit", "instruction", "export"),
-    "reference_edit": ("instruction", "export"),
+    "references": (
+        "pairing",
+        "reference_edit",
+        "reference_integrity",
+        "instruction",
+        "export",
+    ),
+    "pairing": ("reference_edit", "reference_integrity", "instruction", "export"),
+    "reference_edit": ("reference_integrity", "instruction", "export"),
+    "reference_integrity": ("instruction", "export"),
     "instruction": ("export",),
 }
 
@@ -90,6 +102,7 @@ def evaluate_export_state(
     clip: ClipRecord,
     *,
     require_reference_edit: bool = False,
+    require_reference_integrity: bool = False,
 ) -> ExportState:
     if clip.annotation is None or clip.annotation.status != "ready":
         return ExportState(accepted=False, reason="annotation_not_ready")
@@ -101,6 +114,10 @@ def evaluate_export_state(
         clip.reference_edit is None or clip.reference_edit.status != "ready"
     ):
         return ExportState(accepted=False, reason="reference_edit_not_ready")
+    if require_reference_integrity and (
+        clip.reference_integrity is None or clip.reference_integrity.status != "ready"
+    ):
+        return ExportState(accepted=False, reason="reference_integrity_not_ready")
     if clip.instruction is None or clip.instruction.status != "ready":
         return ExportState(accepted=False, reason="instruction_not_ready")
     retained = set(clip.pairing.retained_entity_ids)
@@ -405,6 +422,7 @@ class RunStorage:
                 "references": validated_references,
                 "pairing": validated_pairing,
                 "reference_edit": None,
+                "reference_integrity": None,
                 "instruction": None,
                 "export": ExportState(),
             }
@@ -444,6 +462,7 @@ class RunStorage:
                 "references": validated_references,
                 "pairing": validated_pairing,
                 "reference_edit": validated_reference_edit,
+                "reference_integrity": None,
                 "instruction": None,
                 "export": ExportState(),
             }
@@ -462,6 +481,43 @@ class RunStorage:
             clip_uid,
             "reference_edit",
             ReferenceEditState(status="failed", reason=reason),
+        )
+
+    def write_reference_integrity_result(
+        self,
+        clip_uid: str,
+        references: ReferencesState,
+        pairing: PairingState,
+        reference_integrity: ReferenceIntegrityState,
+    ) -> ClipRecord:
+        current = self.read_clip(clip_uid)
+        values = {
+            "references": ReferencesState.model_validate(
+                references.model_dump(mode="json")
+            ),
+            "pairing": PairingState.model_validate(pairing.model_dump(mode="json")),
+            "reference_integrity": ReferenceIntegrityState.model_validate(
+                reference_integrity.model_dump(mode="json")
+            ),
+            "instruction": None,
+            "export": ExportState(),
+        }
+        if all(getattr(current, name) == value for name, value in values.items()):
+            return current
+        updated = current.model_copy(update=values)
+        validated = ClipRecord.model_validate(updated.model_dump(mode="json"))
+        write_json_atomic(self.clip_path(clip_uid), _model_dict(validated))
+        return validated
+
+    def write_reference_integrity_failure(
+        self,
+        clip_uid: str,
+        reason: str,
+    ) -> ClipRecord:
+        return self._replace_section(
+            clip_uid,
+            "reference_integrity",
+            ReferenceIntegrityState(status="failed", reason=reason),
         )
 
     def write_instruction(
@@ -798,6 +854,9 @@ class DatasetExporter:
                 evaluate_export_state(
                     clip,
                     require_reference_edit=self.config.reference_edit.enabled,
+                    require_reference_integrity=(
+                        self.config.reference_integrity.enabled
+                    ),
                 ),
             )
             for clip in self.storage.iter_clips()

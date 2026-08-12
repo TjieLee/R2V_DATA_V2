@@ -124,6 +124,72 @@ def _write_contact_sheet(
     sheet.save(destination, format="JPEG", quality=92)
 
 
+def _write_integrity_sheet(
+    run_root: Path,
+    output_root: Path,
+    clip: ClipRecord,
+    *,
+    category: str,
+    entity_id: str,
+) -> None:
+    if clip.reference_integrity is None:
+        return
+    state = next(
+        (item for item in clip.reference_integrity.entities if item.entity_id == entity_id),
+        None,
+    )
+    if state is None or state.source_context_path is None:
+        return
+    entity = next(
+        (
+            item
+            for item in (clip.annotation.entities if clip.annotation is not None else [])
+            if item.entity_id == entity_id
+        ),
+        None,
+    )
+    if entity is None:
+        return
+    source_path = _resolved_reference_path(run_root, state.source_context_path)
+    final_path = _resolved_reference_path(run_root, state.final_reference_path)
+    with Image.open(source_path) as opened:
+        source = opened.convert("RGB")
+    with Image.open(final_path) as opened:
+        final = opened.convert("RGB")
+    panel_width, panel_height, title_height = 420, 420, 86
+    sheet = Image.new("RGB", (panel_width * 2, panel_height + title_height), "white")
+    draw = ImageDraw.Draw(sheet)
+    label = " | ".join(
+        (
+            clip.clip_uid,
+            entity_id,
+            entity.reference_type,
+            entity.phrase,
+            state.input_reference.reference_scope,
+            "synthetic" if state.input_reference.synthetic else "real",
+            state.status,
+            state.reason,
+        )
+    )
+    draw.text((8, 8), label, fill="black")
+    for index, (heading, image) in enumerate(
+        (("SOURCE CONTEXT", source), ("FINAL REFERENCE", final))
+    ):
+        image.thumbnail((panel_width - 20, panel_height - 30), Image.Resampling.LANCZOS)
+        x = index * panel_width + (panel_width - image.width) // 2
+        y = title_height + (panel_height - image.height) // 2
+        sheet.paste(image, (x, y))
+        draw.text((index * panel_width + 8, title_height + 4), heading, fill="black")
+    destination = (
+        output_root
+        / "contact_sheets"
+        / category
+        / f"{clip.clip_uid}_{entity_id}.jpg"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(destination, format="JPEG", quality=92)
+
+
 def _count_distribution(
     values: list[int], *, maximum: int | None = None
 ) -> dict[str, object]:
@@ -159,6 +225,9 @@ def audit_entity_composition(
             "segment_failed",
             "coverage_qualified",
             "pair_retained",
+            "reference_edit_ready",
+            "reference_integrity_ready",
+            "export_ready",
             "final_ready",
         )
     }
@@ -169,6 +238,13 @@ def audit_entity_composition(
     annotation_entity_counts: Counter[str] = Counter()
     annotation_density: list[int] = []
     final_density: list[int] = []
+    stage_density: dict[str, list[int]] = {
+        "post_pair": [],
+        "post_reference_edit": [],
+        "post_reference_integrity": [],
+        "final_export": final_density,
+    }
+    integrity_rejection_reasons: Counter[str] = Counter()
     final_synthetic_counts: Counter[str] = Counter()
     final_scope_counts: Counter[str] = Counter()
     background_reference_count = 0
@@ -198,11 +274,68 @@ def audit_entity_composition(
                 if entity is not None:
                     funnel["coverage_qualified"][entity.reference_type] += 1
 
-        if clip.pairing is not None and clip.pairing.status == "ready":
-            for entity_id in clip.pairing.retained_entity_ids:
+        post_integrity_ids = (
+            list(clip.pairing.retained_entity_ids)
+            if clip.pairing is not None and clip.pairing.status == "ready"
+            else []
+        )
+        post_reference_edit_ids = post_integrity_ids
+        post_pair_ids = post_reference_edit_ids
+        has_pair_evidence = clip.pairing is not None
+        if (
+            clip.reference_integrity is not None
+            and clip.reference_integrity.status == "ready"
+        ):
+            post_reference_edit_ids = [
+                item.entity_id for item in clip.reference_integrity.entities
+            ]
+            post_pair_ids = post_reference_edit_ids
+            has_pair_evidence = True
+        if clip.reference_edit is not None and clip.reference_edit.status == "ready":
+            post_pair_ids = [item.entity_id for item in clip.reference_edit.entities]
+            has_pair_evidence = True
+        if has_pair_evidence:
+            for entity_id in post_pair_ids:
                 entity = entities_by_id.get(entity_id)
                 if entity is not None:
                     funnel["pair_retained"][entity.reference_type] += 1
+            for entity_id in post_reference_edit_ids:
+                entity = entities_by_id.get(entity_id)
+                if entity is not None:
+                    funnel["reference_edit_ready"][entity.reference_type] += 1
+            for entity_id in post_integrity_ids:
+                entity = entities_by_id.get(entity_id)
+                if entity is not None:
+                    funnel["reference_integrity_ready"][entity.reference_type] += 1
+                    funnel["final_ready"][entity.reference_type] += 1
+            stage_density["post_pair"].append(len(post_pair_ids))
+            stage_density["post_reference_edit"].append(len(post_reference_edit_ids))
+            stage_density["post_reference_integrity"].append(len(post_integrity_ids))
+
+        if (
+            clip.reference_integrity is not None
+            and clip.reference_integrity.status == "ready"
+        ):
+            for item in clip.reference_integrity.entities:
+                if item.status == "rejected":
+                    integrity_rejection_reasons[item.reason] += 1
+                    if contact_sheets:
+                        _write_integrity_sheet(
+                            source_root,
+                            destination,
+                            clip,
+                            category="integrity_rejected",
+                            entity_id=item.entity_id,
+                        )
+                elif item.diagnostics.suspicious and item.status == "accepted":
+                    if contact_sheets:
+                        _write_integrity_sheet(
+                            source_root,
+                            destination,
+                            clip,
+                            category="integrity_suspicious_accepted",
+                            entity_id=item.entity_id,
+                        )
 
         if (
             not clip.export.accepted
@@ -226,7 +359,7 @@ def audit_entity_composition(
         for entity_id in retained:
             reference_type = entities_by_id[entity_id].reference_type
             final_entity_counts[reference_type] += 1
-            funnel["final_ready"][reference_type] += 1
+            funnel["export_ready"][reference_type] += 1
             reference = next(
                 item for item in clip.references.entities if item.entity_id == entity_id
             )
@@ -298,6 +431,14 @@ def audit_entity_composition(
             final_density,
             maximum=8,
         ),
+        "reference_density_by_stage": {
+            stage: _count_distribution(values, maximum=8)
+            for stage, values in stage_density.items()
+        },
+        "integrity_rejections": {
+            "count": sum(integrity_rejection_reasons.values()),
+            "reasons": dict(sorted(integrity_rejection_reasons.items())),
+        },
         "background_reference_count": background_reference_count,
         "final_entity_references_by_source": {
             "real": final_synthetic_counts["real"],

@@ -41,9 +41,7 @@ _PLAIN_ENGLISH_IMAGE_INDEX = re.compile(
     r"(?<!<)\bImage\s+([1-9]\d*)\b(?!>)",
     flags=re.IGNORECASE,
 )
-_ANNOTATION_ENTITY_MARKER_WITH_SPACE = re.compile(
-    r" \{\{entity_[1-9]\d*\}\}"
-)
+_ANNOTATION_ENTITY_MARKER_WITH_SPACE = re.compile(r" \{\{entity_[1-9]\d*\}\}")
 _ANNOTATION_BACKGROUND_MARKER_WITH_SPACE = re.compile(r" \{\{background\}\}")
 _ANNOTATION_ENTITY_PLACEHOLDER = re.compile(r"\{\{entity_[1-9]\d*\}\}")
 _ANNOTATION_BACKGROUND_PLACEHOLDER = re.compile(r"\{\{background\}\}")
@@ -135,9 +133,7 @@ class AnnotationState(SchemaModel):
         if _ANY_REF_TOKEN.search(self.t2v_caption):
             raise ValueError("t2v_caption must not contain reference tokens")
         if _ANY_REF_TOKEN.search(self.instruction_template):
-            raise ValueError(
-                "instruction_template must not contain reference tokens"
-            )
+            raise ValueError("instruction_template must not contain reference tokens")
         if self.status == "ready":
             has_template = bool(self.instruction_template.strip())
             has_legacy_caption = bool(self.t2v_caption.strip())
@@ -400,9 +396,7 @@ class RawEntityReferenceDecision(SchemaModel):
         if self.image_quality == "poor" and self.reference_scope != "reject":
             raise ValueError("poor image quality must reject the reference")
         if not self.independent_reference_value and self.reference_scope != "reject":
-            raise ValueError(
-                "a reference without independent value must be rejected"
-            )
+            raise ValueError("a reference without independent value must be rejected")
         if self.requires_substantial_invention and self.reference_scope != "reject":
             raise ValueError(
                 "a reference requiring substantial invention must be rejected"
@@ -517,17 +511,13 @@ class EntityReferenceState(SchemaModel):
                     "ready entity reference requires visible major structure"
                 )
             if self.truncation_severity == "major":
-                raise ValueError(
-                    "ready entity reference cannot have major truncation"
-                )
+                raise ValueError("ready entity reference cannot have major truncation")
             if self.discrete_foreground_instance is False:
                 raise ValueError(
                     "ready entity reference requires a discrete foreground instance"
                 )
             if self.mask_matches_target is False:
-                raise ValueError(
-                    "ready entity reference mask must match its target"
-                )
+                raise ValueError("ready entity reference mask must match its target")
             if self.reference_scope == "full":
                 if (
                     self.visible_region != "whole"
@@ -1086,15 +1076,21 @@ class ReferenceEditEntityState(SchemaModel):
             if self.fallback_policy != "not_used" or self.reason is not None:
                 raise ValueError("accepted reference edit cannot use fallback")
             if self.background_fallback != "none":
-                raise ValueError("accepted reference edit cannot mark background fallback")
+                raise ValueError(
+                    "accepted reference edit cannot mark background fallback"
+                )
         elif self.status == "fallback":
             if self.reason is None or not self.reason.strip():
                 raise ValueError("reference edit fallback requires a reason")
             if self.fallback_policy == "keep_source":
                 if self.output_image_path != self.source_image_path:
-                    raise ValueError("keep-source fallback must publish the source image")
+                    raise ValueError(
+                        "keep-source fallback must publish the source image"
+                    )
                 if self.background_fallback != "none":
-                    raise ValueError("keep-source fallback cannot mark background fallback")
+                    raise ValueError(
+                        "keep-source fallback cannot mark background fallback"
+                    )
             elif self.fallback_policy == "completion_candidate":
                 if (
                     self.route != "repairable"
@@ -1135,7 +1131,9 @@ class ReferenceEditEntityState(SchemaModel):
             if self.fallback_policy != "reject_entity":
                 raise ValueError("rejected reference edit must reject the entity")
             if self.background_fallback != "none":
-                raise ValueError("rejected reference edit cannot mark background fallback")
+                raise ValueError(
+                    "rejected reference edit cannot mark background fallback"
+                )
             if self.reason is None or not self.reason.strip():
                 raise ValueError("rejected reference edit requires a reason")
         return self
@@ -1158,6 +1156,127 @@ class ReferenceEditState(SchemaModel):
                 raise ValueError("failed reference edit must clear entity results")
         elif self.reason is not None:
             raise ValueError("ready reference edit cannot have a failure reason")
+        return self
+
+
+class ReferenceTopologyDiagnostics(SchemaModel):
+    alpha_available: StrictBool
+    significant_component_count: int = Field(ge=0)
+    largest_component_ratio: float = Field(ge=0, le=1)
+    second_component_ratio: float = Field(ge=0, le=1)
+    bbox_fill_ratio: float = Field(ge=0, le=1)
+    border_contact: StrictBool
+    enclosed_transparent_hole_count: int = Field(ge=0)
+    largest_enclosed_hole_area: int = Field(ge=0)
+    enclosed_hole_bbox_ratio: float = Field(ge=0, le=1)
+    suspicious: StrictBool
+    suspicion_reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_diagnostics(self) -> ReferenceTopologyDiagnostics:
+        ratios = (
+            self.largest_component_ratio,
+            self.second_component_ratio,
+            self.bbox_fill_ratio,
+            self.enclosed_hole_bbox_ratio,
+        )
+        if not all(math.isfinite(value) for value in ratios):
+            raise ValueError("reference topology ratios must be finite")
+        if len(self.suspicion_reasons) != len(set(self.suspicion_reasons)):
+            raise ValueError("reference topology suspicion reasons must be unique")
+        if self.suspicious != bool(self.suspicion_reasons):
+            raise ValueError("reference topology suspicion flag must match reasons")
+        return self
+
+
+class ReferenceIntegrityReview(SchemaModel):
+    matches_target: StrictBool
+    recognizable_as_named_entity: StrictBool
+    structurally_complete_for_scope: StrictBool
+    no_major_missing_regions: StrictBool
+    no_unnatural_holes_or_surface_loss: StrictBool
+    no_unrelated_entity_dominance: StrictBool
+    usable_as_independent_reference: StrictBool
+    verdict: Literal["accept", "reject"]
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_review(self) -> ReferenceIntegrityReview:
+        if not self.reason.strip():
+            raise ValueError("reference integrity review reason must not be empty")
+        passed = all(
+            (
+                self.matches_target,
+                self.recognizable_as_named_entity,
+                self.structurally_complete_for_scope,
+                self.no_major_missing_regions,
+                self.no_unnatural_holes_or_surface_loss,
+                self.no_unrelated_entity_dominance,
+                self.usable_as_independent_reference,
+            )
+        )
+        if self.verdict != ("accept" if passed else "reject"):
+            raise ValueError(
+                "reference integrity verdict must match all integrity checks"
+            )
+        return self
+
+
+class ReferenceIntegrityEntityState(SchemaModel):
+    entity_id: str
+    status: Literal["accepted", "rejected", "skipped"]
+    input_reference: EntityReferenceState
+    final_reference_path: str
+    source_context_path: Optional[str] = None
+    diagnostics: ReferenceTopologyDiagnostics
+    reviewed: StrictBool
+    review: Optional[ReferenceIntegrityReview] = None
+    judge_failed: StrictBool = False
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_entity_state(self) -> ReferenceIntegrityEntityState:
+        if (
+            self.input_reference.entity_id != self.entity_id
+            or self.input_reference.status != "ready"
+            or self.input_reference.image_path != self.final_reference_path
+        ):
+            raise ValueError("integrity input must be the ready published reference")
+        if not self.reason.strip():
+            raise ValueError("reference integrity entity reason must not be empty")
+        if self.status == "skipped":
+            if self.reviewed or self.review is not None or self.judge_failed:
+                raise ValueError("skipped integrity result cannot contain a review")
+        else:
+            if not self.reviewed:
+                raise ValueError("reviewed integrity result must mark reviewed=true")
+            if self.judge_failed:
+                if self.status != "rejected" or self.review is not None:
+                    raise ValueError("integrity judge failure must fail closed")
+            elif self.review is None:
+                raise ValueError("reviewed integrity result requires a review")
+            elif (self.status == "accepted") != (self.review.verdict == "accept"):
+                raise ValueError("integrity entity status must match review verdict")
+        return self
+
+
+class ReferenceIntegrityState(SchemaModel):
+    status: Literal["ready", "failed"]
+    entities: list[ReferenceIntegrityEntityState] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> ReferenceIntegrityState:
+        entity_ids = [item.entity_id for item in self.entities]
+        if len(entity_ids) != len(set(entity_ids)):
+            raise ValueError("reference integrity entity IDs must be unique")
+        if self.status == "failed":
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("failed reference integrity requires a reason")
+            if self.entities:
+                raise ValueError("failed reference integrity must clear entity results")
+        elif self.reason is not None:
+            raise ValueError("ready reference integrity cannot have a failure reason")
         return self
 
 
@@ -1387,6 +1506,7 @@ class ClipRecord(SchemaModel):
     references: ReferencesState = Field(default_factory=ReferencesState)
     pairing: Optional[PairingState] = None
     reference_edit: Optional[ReferenceEditState] = None
+    reference_integrity: Optional[ReferenceIntegrityState] = None
     instruction: Optional[InstructionState] = None
     export: ExportState = Field(default_factory=ExportState)
 
@@ -1398,6 +1518,16 @@ class ClipRecord(SchemaModel):
         annotation_order = [entity.entity_id for entity in annotation_entities]
         annotation_by_id = {entity.entity_id: entity for entity in annotation_entities}
         annotation_ids = set(annotation_order)
+        integrity_rejected_ids = {
+            item.entity_id
+            for item in (
+                self.reference_integrity.entities
+                if self.reference_integrity is not None
+                and self.reference_integrity.status == "ready"
+                else []
+            )
+            if item.status == "rejected"
+        }
         if self.coverage is not None:
             unknown_qualifying = (
                 set(self.coverage.qualifying_entity_ids) - annotation_ids
@@ -1509,6 +1639,8 @@ class ClipRecord(SchemaModel):
                         )
                     continue
                 if reference is None or reference.status != "ready":
+                    if entity_id in integrity_rejected_ids:
+                        continue
                     raise ValueError(
                         "published reference edit requires a ready entity reference"
                     )
@@ -1520,6 +1652,36 @@ class ClipRecord(SchemaModel):
                     raise ValueError(
                         "accepted reference edit must publish a synthetic reference"
                     )
+        if (
+            self.reference_integrity is not None
+            and self.reference_integrity.status == "ready"
+        ):
+            integrity_order = [
+                item.entity_id for item in self.reference_integrity.entities
+            ]
+            expected_integrity_order = [
+                entity_id
+                for entity_id in annotation_order
+                if entity_id in set(integrity_order)
+            ]
+            if integrity_order != expected_integrity_order:
+                raise ValueError(
+                    "reference integrity entities must follow annotation order"
+                )
+            references_by_id = {
+                reference.entity_id: reference for reference in self.references.entities
+            }
+            for item in self.reference_integrity.entities:
+                published = references_by_id.get(item.entity_id)
+                if item.status == "rejected":
+                    if published is None or published.status != "rejected":
+                        raise ValueError(
+                            "rejected integrity result must reject its reference"
+                        )
+                elif published is None or published.status != "ready":
+                    raise ValueError(
+                        "accepted integrity result requires a ready reference"
+                    )
         if self.instruction is not None and self.instruction.status == "ready":
             if self.pairing is None or self.pairing.status != "ready":
                 raise ValueError("ready instruction requires ready pairing")
@@ -1528,6 +1690,11 @@ class ClipRecord(SchemaModel):
                 and self.reference_edit.status != "ready"
             ):
                 raise ValueError("ready instruction requires ready reference edit")
+            if (
+                self.reference_integrity is not None
+                and self.reference_integrity.status != "ready"
+            ):
+                raise ValueError("ready instruction requires ready reference integrity")
             binding_count = len(self.pairing.retained_entity_ids)
             if self.pairing.background_token is not None:
                 binding_count += 1
@@ -1555,6 +1722,11 @@ class ClipRecord(SchemaModel):
                 and self.reference_edit.status != "ready"
             ):
                 raise ValueError("accepted export requires ready reference edit")
+            if (
+                self.reference_integrity is not None
+                and self.reference_integrity.status != "ready"
+            ):
+                raise ValueError("accepted export requires ready reference integrity")
         return self
 
 

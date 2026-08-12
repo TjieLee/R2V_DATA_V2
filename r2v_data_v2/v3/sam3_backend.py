@@ -13,7 +13,8 @@ from r2v_data_v2.v3.config import Sam3Config
 
 TrackStatus = Literal["ready", "not_found", "failed"]
 PropagationDirection = Literal["forward", "backward"]
-_ANCHOR_PROBE_ORDER = (5, 2, 7, 0, 9)
+_ANCHOR_FAST_PROBE_ORDER = (5, 2, 7, 0, 9)
+_ANCHOR_FALLBACK_PROBE_ORDER = (4, 6, 3, 8, 1)
 _MINIMUM_MATCHING_MASK_IOU = 0.95
 
 
@@ -99,9 +100,7 @@ def _validate_anchor_consistency(
         or not backward.anchor.mask.any()
         or not _masks_match(forward.anchor.mask, backward.anchor.mask)
     ):
-        raise _TrackValidationError(
-            "anchor_identity_mismatch_between_directions"
-        )
+        raise _TrackValidationError("anchor_identity_mismatch_between_directions")
 
 
 def _remap_direction_object_id(
@@ -125,9 +124,7 @@ def _merge_directional_tracks(
         *backward.observations,
         *backward.non_owned_observations,
     )
-    propagation_by_key: dict[
-        tuple[int, str], BackendMaskObservation
-    ] = {}
+    propagation_by_key: dict[tuple[int, str], BackendMaskObservation] = {}
     for observation in _remap_direction_object_id(
         propagation_observations,
         canonical_object_id,
@@ -160,9 +157,7 @@ def _merge_directional_tracks(
                 merged[key] = observation
                 continue
             if not _masks_match(existing.mask, observation.mask):
-                raise _TrackValidationError(
-                    "conflicting_bidirectional_mask"
-                )
+                raise _TrackValidationError("conflicting_bidirectional_mask")
     return tuple(merged[key] for key in sorted(merged))
 
 
@@ -190,14 +185,22 @@ class Sam3SegmentationBackend:
         self.config = config
         self._predictor = predictor
         self._builder = builder
+        self._anchor_counters = {
+            "anchor_fast_path_hits": 0,
+            "anchor_fallback_attempted": 0,
+            "anchor_fallback_hits": 0,
+            "anchor_all_frames_not_found": 0,
+            "anchor_probe_calls": 0,
+        }
+
+    def anchor_search_counters(self) -> dict[str, int]:
+        return dict(self._anchor_counters)
 
     def _load_predictor(self) -> object:
         if self._predictor is not None:
             return self._predictor
         if self.config.model_path is None:
-            raise ValueError(
-                "sam3.model_path must be configured before segment runs"
-            )
+            raise ValueError("sam3.model_path must be configured before segment runs")
         model_path = self.config.model_path.expanduser().resolve()
         if not model_path.is_file():
             raise FileNotFoundError(
@@ -322,25 +325,52 @@ class Sam3SegmentationBackend:
         grounding_prompt: str,
     ) -> tuple[int | None, str | None]:
         ambiguous_instance = False
-        for slot in _ANCHOR_PROBE_ORDER:
-            if slot >= frame_count:
-                continue
-            observations = self._prompt_frame(
-                predictor,
-                frames_dir=frames_dir,
-                slot=slot,
-                grounding_prompt=grounding_prompt,
-            )
-            if len(observations) > 1:
-                if reference_type == "group":
-                    return None, "unverified_multi_object_group"
-                ambiguous_instance = True
-                continue
-            if not observations:
-                continue
-            return slot, None
+
+        def probe(order: tuple[int, ...]) -> int | None:
+            nonlocal ambiguous_instance
+            for slot in order:
+                if slot >= frame_count:
+                    continue
+                self._anchor_counters["anchor_probe_calls"] += 1
+                observations = self._prompt_frame(
+                    predictor,
+                    frames_dir=frames_dir,
+                    slot=slot,
+                    grounding_prompt=grounding_prompt,
+                )
+                if len(observations) > 1:
+                    if reference_type == "group":
+                        raise _TrackValidationError("unverified_multi_object_group")
+                    ambiguous_instance = True
+                    continue
+                if observations:
+                    return slot
+            return None
+
+        try:
+            anchor = probe(_ANCHOR_FAST_PROBE_ORDER)
+        except _TrackValidationError as exc:
+            return None, str(exc)
+        if anchor is not None:
+            self._anchor_counters["anchor_fast_path_hits"] += 1
+            return anchor, None
+        if self.config.anchor_search_mode == "progressive_v1":
+            self._anchor_counters["anchor_fallback_attempted"] += 1
+            try:
+                anchor = probe(_ANCHOR_FALLBACK_PROBE_ORDER)
+            except _TrackValidationError as exc:
+                return None, str(exc)
+            if anchor is not None:
+                self._anchor_counters["anchor_fallback_hits"] += 1
+                return anchor, None
         if ambiguous_instance:
-            return None, "ambiguous_multi_object_instance"
+            return None, (
+                "unverified_multi_object_group"
+                if reference_type == "group"
+                else "ambiguous_multi_object_instance"
+            )
+        if self.config.anchor_search_mode == "progressive_v1":
+            self._anchor_counters["anchor_all_frames_not_found"] += 1
         return None, None
 
     def _run_direction(
@@ -369,13 +399,10 @@ class Sam3SegmentationBackend:
                 prompted["outputs"],
             )
             if reference_type == "group" and len(anchored) > 1:
-                raise _TrackValidationError(
-                    "unverified_multi_object_group"
-                )
+                raise _TrackValidationError("unverified_multi_object_group")
             if len(anchored) != 1:
                 raise _TrackValidationError(
-                    "SAM3 did not resolve one stable tracked identity for "
-                    "the entity"
+                    "SAM3 did not resolve one stable tracked identity for the entity"
                 )
             anchor = anchored[0]
             observations: list[BackendMaskObservation] = []
@@ -396,25 +423,17 @@ class Sam3SegmentationBackend:
                     continue
                 current = self._observations(slot, response["outputs"])
                 if any(
-                    observation.object_id != anchor.object_id
-                    for observation in current
+                    observation.object_id != anchor.object_id for observation in current
                 ):
                     raise _TrackValidationError(
-                        "sam3_object_identity_changed_during_"
-                        f"{direction}_propagation"
+                        f"sam3_object_identity_changed_during_{direction}_propagation"
                     )
-                owns_slot = (
-                    direction == "forward" and slot > anchor_slot
-                ) or (
+                owns_slot = (direction == "forward" and slot > anchor_slot) or (
                     direction == "backward" and slot < anchor_slot
                 )
                 # Retain anomalous cross-direction responses only to validate
                 # duplicate masks; they are never published by the track.
-                destination = (
-                    observations
-                    if owns_slot
-                    else non_owned_observations
-                )
+                destination = observations if owns_slot else non_owned_observations
                 destination.extend(current)
             return DirectionalTrackResult(
                 direction=direction,

@@ -80,6 +80,7 @@ class QwenServicesConfig:
     background_final_judge: QwenServiceConfig | None = None
     cross_pair_judge: QwenServiceConfig | None = None
     reference_edit_judge: QwenServiceConfig | None = None
+    reference_integrity_judge: QwenServiceConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ class Sam3Config:
     device: str = "cuda"
     save_debug_overlays: bool = False
     object_rescue_mode: str = "off"
+    anchor_search_mode: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -188,6 +190,12 @@ class ReferenceEditConfig:
 
 
 @dataclass(frozen=True)
+class ReferenceIntegrityConfig:
+    enabled: bool = False
+    mode: str = "targeted_qwen_v1"
+
+
+@dataclass(frozen=True)
 class InstructionConfig:
     enabled: bool = True
     repair_retries: int = 1
@@ -213,6 +221,9 @@ class V3Config:
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
     remove: RemoveConfig = field(default_factory=RemoveConfig)
     reference_edit: ReferenceEditConfig = field(default_factory=ReferenceEditConfig)
+    reference_integrity: ReferenceIntegrityConfig = field(
+        default_factory=ReferenceIntegrityConfig
+    )
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
@@ -267,9 +278,8 @@ class V3Config:
         ):
             raise ValueError("source.max_clips_per_parent must be a positive integer")
         if self.source.selection_mode == "parent_stratified_random_v1":
-            if (
-                not isinstance(self.source.random_seed, int)
-                or isinstance(self.source.random_seed, bool)
+            if not isinstance(self.source.random_seed, int) or isinstance(
+                self.source.random_seed, bool
             ):
                 raise ValueError(
                     "source.random_seed must be an integer for "
@@ -346,9 +356,9 @@ class V3Config:
         if not isinstance(self.sam3.save_debug_overlays, bool):
             raise TypeError("sam3.save_debug_overlays must be a boolean")
         if self.sam3.object_rescue_mode not in {"off", "phrase_retry_v1"}:
-            raise ValueError(
-                "sam3.object_rescue_mode must be off or phrase_retry_v1"
-            )
+            raise ValueError("sam3.object_rescue_mode must be off or phrase_retry_v1")
+        if self.sam3.anchor_search_mode not in {"legacy", "progressive_v1"}:
+            raise ValueError("sam3.anchor_search_mode must be legacy or progressive_v1")
         if self.sam3.model_path is not None:
             sam3_model = self.sam3.model_path.expanduser().resolve(strict=False)
             if not (
@@ -401,9 +411,7 @@ class V3Config:
                 "pair.reference_prefilter_mode must be off or conservative_v1"
             )
         if self.pair.background_final_guard_mode not in {"off", "qwen_v1"}:
-            raise ValueError(
-                "pair.background_final_guard_mode must be off or qwen_v1"
-            )
+            raise ValueError("pair.background_final_guard_mode must be off or qwen_v1")
         if (
             self.pair.background_final_guard_mode == "qwen_v1"
             and self.qwen.background_final_judge is None
@@ -560,6 +568,18 @@ class V3Config:
                 "qwen.reference_edit_judge is required when "
                 "reference_edit.enabled is true"
             )
+        if not isinstance(self.reference_integrity.enabled, bool):
+            raise TypeError("reference_integrity.enabled must be a boolean")
+        if self.reference_integrity.mode != "targeted_qwen_v1":
+            raise ValueError("reference_integrity.mode must be targeted_qwen_v1")
+        if (
+            self.reference_integrity.enabled
+            and self.qwen.reference_integrity_judge is None
+        ):
+            raise ValueError(
+                "qwen.reference_integrity_judge is required when "
+                "reference_integrity.enabled is true"
+            )
         if self.reference_edit.enabled:
             for name, path in (
                 ("python_executable", self.reference_edit.python_executable),
@@ -598,9 +618,7 @@ class V3Config:
                 "reference_edit.timeout_seconds must be a positive integer"
             )
         if self.reference_edit.add_background_to_complete is not True:
-            raise ValueError(
-                "reference_edit.add_background_to_complete must be true"
-            )
+            raise ValueError("reference_edit.add_background_to_complete must be true")
         if self.reference_edit.fallback_policy not in {
             "keep_source",
             "reject_entity",
@@ -651,9 +669,7 @@ class V3Config:
             ),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(
-                    f"reference_edit.{name} must be a positive integer"
-                )
+                raise ValueError(f"reference_edit.{name} must be a positive integer")
         minimum_scale = self.reference_edit.min_candidate_scale_ratio
         if (
             not isinstance(minimum_scale, float)
@@ -686,6 +702,7 @@ class V3Config:
             "background_final_judge",
             "cross_pair_judge",
             "reference_edit_judge",
+            "reference_integrity_judge",
         ):
             service = getattr(self.qwen, name)
             if service is not None:
@@ -726,6 +743,8 @@ class V3Config:
                 str(self.sam3.model_path) if self.sam3.model_path is not None else None
             ),
             "sam3.device": self.sam3.device,
+            "sam3.anchor_search_mode": self.sam3.anchor_search_mode,
+            "reference_integrity.mode": self.reference_integrity.mode,
         }
 
     def fingerprint(self) -> str:
@@ -821,6 +840,7 @@ def load_config(path: str | Path) -> V3Config:
         "background",
         "remove",
         "reference_edit",
+        "reference_integrity",
         "instruction",
         "debug",
     }
@@ -844,6 +864,7 @@ def load_config(path: str | Path) -> V3Config:
             "background_final_judge",
             "cross_pair_judge",
             "reference_edit_judge",
+            "reference_integrity_judge",
         }
     )
     if qwen_unknown:
@@ -877,6 +898,10 @@ def load_config(path: str | Path) -> V3Config:
         reference_edit_judge=_parse_optional_service(
             qwen_values.get("reference_edit_judge"),
             field_name="qwen.reference_edit_judge",
+        ),
+        reference_integrity_judge=_parse_optional_service(
+            qwen_values.get("reference_integrity_judge"),
+            field_name="qwen.reference_integrity_judge",
         ),
     )
     remove_values = _mapping(raw.get("remove"), "remove")
@@ -960,6 +985,11 @@ def load_config(path: str | Path) -> V3Config:
             ReferenceEditConfig,
             reference_edit_values,
             "reference_edit",
+        ),
+        reference_integrity=_build(
+            ReferenceIntegrityConfig,
+            _mapping(raw.get("reference_integrity"), "reference_integrity"),
+            "reference_integrity",
         ),
         instruction=_build(
             InstructionConfig,

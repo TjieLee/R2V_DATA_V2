@@ -28,6 +28,10 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguReferenceEditJudge,
     BooguSamReviewer,
 )
+from r2v_data_v2.v3.reference_integrity import (
+    ReferenceIntegrityJudge,
+    reference_integrity_clips,
+)
 from r2v_data_v2.v3.reference_judge import EntityReferenceJudge
 from r2v_data_v2.v3.removal_judge import BackgroundRemovalJudge
 from r2v_data_v2.v3.remove import remove_backgrounds
@@ -45,6 +49,7 @@ STAGE_ORDER = (
     "remove",
     "pair",
     "reference_edit",
+    "reference_integrity",
     "instruct",
     "export",
 )
@@ -58,6 +63,7 @@ _IMPLEMENTED_STAGES = frozenset(
         "background",
         "pair",
         "reference_edit",
+        "reference_integrity",
         "instruct",
         "remove",
         "export",
@@ -100,6 +106,7 @@ def run_pipeline_v3(
     reference_edit_backend: BooguReferenceEditBackend | None = None,
     reference_edit_judge: BooguReferenceEditJudge | None = None,
     reference_edit_sam_reviewer: BooguSamReviewer | None = None,
+    reference_integrity_judge: ReferenceIntegrityJudge | None = None,
     profile: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
@@ -118,9 +125,7 @@ def run_pipeline_v3(
     config = load_config(config_path)
     storage = RunStorage(config)
     run = storage.initialize(git_commit=git_commit or _git_commit())
-    profiler = (
-        V3Profiler(storage.root, git_commit=run.git_commit) if profile else None
-    )
+    profiler = V3Profiler(storage.root, git_commit=run.git_commit) if profile else None
     results: dict[str, object] = {
         "run": {
             "run_id": run.run_id,
@@ -198,6 +203,13 @@ def run_pipeline_v3(
                             judge=reference_edit_judge,
                             sam_reviewer=reference_edit_sam_reviewer,
                         ).to_dict()
+                    elif stage == "reference_integrity":
+                        results[stage] = reference_integrity_clips(
+                            config,
+                            storage,
+                            overwrite=overwrite,
+                            judge=reference_integrity_judge,
+                        ).to_dict()
                     elif stage == "instruct":
                         results[stage] = instruct_clips(
                             config,
@@ -237,6 +249,7 @@ def main() -> None:
         help=(
             "comma-separated V3 stages; manifest, annotate, frames, segment, "
             "rank, background, remove, pair, reference_edit, instruct, and "
+            "reference_integrity, "
             "export are currently implemented"
         ),
     )
