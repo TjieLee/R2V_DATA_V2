@@ -89,6 +89,7 @@ class SourceConfig:
     limit: int | None = None
     allow_full_run: bool = False
     selection_mode: str = "sequential"
+    selection_manifest: Path | None = None
     random_seed: int | None = None
     max_clips_per_parent: int = 1
 
@@ -296,17 +297,45 @@ class V3Config:
             raise ValueError("source.limit must be a positive integer")
         if not isinstance(self.source.allow_full_run, bool):
             raise TypeError("source.allow_full_run must be a boolean")
-        if self.source.limit is None and not self.source.allow_full_run:
+        if (
+            self.source.selection_mode != "fixed_selection_v1"
+            and self.source.limit is None
+            and not self.source.allow_full_run
+        ):
             raise ValueError(
                 "source.limit is required unless source.allow_full_run is true"
             )
         if self.source.selection_mode not in {
             "sequential",
             "parent_stratified_random_v1",
+            "fixed_selection_v1",
         }:
             raise ValueError(
-                "source.selection_mode must be sequential or "
-                "parent_stratified_random_v1"
+                "source.selection_mode must be sequential, "
+                "parent_stratified_random_v1, or fixed_selection_v1"
+            )
+        selection_manifest = self.source.selection_manifest
+        if self.source.selection_mode == "fixed_selection_v1":
+            if selection_manifest is None:
+                raise ValueError(
+                    "source.selection_manifest is required for fixed_selection_v1"
+                )
+            if not isinstance(selection_manifest, Path):
+                raise TypeError("source.selection_manifest must be a path")
+            if self.source.start_index != 0:
+                raise ValueError(
+                    "source.start_index must be 0 for fixed_selection_v1"
+                )
+            resolved_selection = selection_manifest.expanduser().resolve(strict=False)
+            if resolved_selection.suffix.lower() not in {".json", ".jsonl"}:
+                raise ValueError(
+                    "source.selection_manifest must use .json or .jsonl"
+                )
+            if not resolved_selection.is_file():
+                raise ValueError("source.selection_manifest must be an existing file")
+        elif selection_manifest is not None:
+            raise ValueError(
+                "source.selection_manifest is only valid for fixed_selection_v1"
             )
         if (
             not isinstance(self.source.max_clips_per_parent, int)
@@ -852,6 +881,9 @@ class V3Config:
 
     def fingerprint(self) -> str:
         value = _json_compatible(asdict(self))
+        source = value.get("source")
+        if isinstance(source, dict) and source.get("selection_manifest") is None:
+            source.pop("selection_manifest", None)
         qwen = value.get("qwen")
         if isinstance(qwen, dict):
             for service in qwen.values():
@@ -1013,6 +1045,14 @@ def load_config(path: str | Path) -> V3Config:
         raw.get("reference_edit"),
         "reference_edit",
     )
+    source_values = _mapping(raw.get("source"), "source")
+    if "selection_manifest" in source_values:
+        selection_manifest = source_values["selection_manifest"]
+        source_values["selection_manifest"] = (
+            None
+            if selection_manifest in (None, "")
+            else Path(str(selection_manifest)).expanduser()
+        )
     runtime_values = dict(_mapping(raw.get("runtime"), "runtime"))
     runtime_stage_workers = _build(
         RuntimeStageWorkersConfig,
@@ -1061,7 +1101,7 @@ def load_config(path: str | Path) -> V3Config:
         export_root=Path(str(raw["export_root"])).expanduser(),
         source=_build(
             SourceConfig,
-            _mapping(raw.get("source"), "source"),
+            source_values,
             "source",
         ),
         qwen=qwen,
