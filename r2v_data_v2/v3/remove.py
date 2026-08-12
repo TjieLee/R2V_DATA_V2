@@ -797,6 +797,11 @@ def remove_backgrounds(
                     continue
 
                 candidate, candidate_bytes, candidate_sha, seed = accepted
+                prior_attempts = (
+                    state.removal_attempts
+                    if state.status == "pending_remove"
+                    else []
+                )
                 _publish_ready(
                     config,
                     storage,
@@ -807,7 +812,7 @@ def remove_backgrounds(
                     candidate_bytes=candidate_bytes,
                     candidate_sha256=candidate_sha,
                     seed=seed,
-                    attempts=[*state.removal_attempts, *attempts],
+                    attempts=[*prior_attempts, *attempts],
                 )
                 counters["processed"] += 1
                 counters["ready_removed"] += 1

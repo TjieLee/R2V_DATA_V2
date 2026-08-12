@@ -41,6 +41,7 @@ from r2v_data_v2.structured_output import (
     parse_qwen_json_issues,
 )
 from r2v_data_v2.v3.config import QwenServiceConfig
+from r2v_data_v2.v3.profiling import profiled_openai_call
 from r2v_data_v2.v3.sam3_backend import (
     EntityTrackResult,
     SegmentationBackend,
@@ -1160,6 +1161,8 @@ class QwenCompletionPublicationJudge:
         self,
         messages: list[dict[str, object]],
         model: type[BaseModel],
+        *,
+        retry_index: int,
     ) -> str:
         parameters: dict[str, Any] = {
             "model": self.config.model,
@@ -1171,21 +1174,37 @@ class QwenCompletionPublicationJudge:
         }
         schema_name = f"v3_completion_publication_{self.kind}_review"
         try:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": True,
-                        "schema": model.model_json_schema(),
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "strict": True,
+                            "schema": model.model_json_schema(),
+                        },
                     },
-                },
+                ),
+                component=f"qwen_completion_publication_{self.kind}",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={"review_kind": self.kind, "response_format": "json_schema"},
             )
         except BadRequestError:
-            response = self.client.chat.completions.create(
-                **parameters,
-                response_format={"type": "json_object"},
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component=f"qwen_completion_publication_{self.kind}",
+                operation="initial" if retry_index == 0 else "repair",
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={"review_kind": self.kind, "response_format": "json_object"},
             )
         content = response.choices[0].message.content
         if not content:
@@ -1242,6 +1261,7 @@ class QwenCompletionPublicationJudge:
                         request_text=request_text,
                     ),
                     model,
+                    retry_index=attempt,
                 )
             except Exception as exc:
                 raise PublicationJudgeFailure(

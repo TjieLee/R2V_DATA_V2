@@ -380,6 +380,7 @@ def reference_edit_clips(
     judge: BooguReferenceEditJudge | None = None,
     sam_reviewer: BooguSamReviewer | None = None,
     scale_collapse_judge: ScaleCollapseFallbackJudge | None = None,
+    manage_backend_lifecycle: bool = True,
 ) -> ReferenceEditStats:
     config.validate()
     if storage.root != config.resolved_run_root:
@@ -472,7 +473,7 @@ def reference_edit_clips(
                 ),
             )
         starter = getattr(active_backend, "start", None)
-        if callable(starter):
+        if manage_backend_lifecycle and callable(starter):
             starter(stderr_log_path=storage.reference_edit_worker_log_path())
             started_backend = active_backend
             counters["worker_starts"] += 1

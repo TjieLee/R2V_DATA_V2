@@ -4625,9 +4625,10 @@ def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
 
 def test_reference_edit_stage_is_between_pair_and_instruct() -> None:
     pair_index = STAGE_ORDER.index("pair")
-    assert STAGE_ORDER[pair_index : pair_index + 3] == (
+    assert STAGE_ORDER[pair_index : pair_index + 4] == (
         "pair",
         "reference_edit",
+        "reference_integrity",
         "instruct",
     )
 

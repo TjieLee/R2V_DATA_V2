@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as datetime_module
+import fcntl
 import json
 import os
 import re
@@ -165,12 +166,17 @@ def _model_dict(value: object) -> dict[str, object]:
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
-        )
-        handle.flush()
-        os.fsync(handle.fileno())
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0, os.SEEK_END)
+            handle.write(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _write_jsonl_atomic(path: Path, records: list[dict[str, object]]) -> None:

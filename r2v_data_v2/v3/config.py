@@ -197,6 +197,41 @@ class ReferenceIntegrityConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeStageWorkersConfig:
+    annotate: int = 2
+    frames: int = 4
+    segment: int = 1
+    rank: int = 4
+    background: int = 4
+    remove: int = 1
+    pair: int = 2
+    reference_edit: int = 1
+    reference_integrity: int = 2
+    instruct: int = 2
+
+
+@dataclass(frozen=True)
+class RuntimeGpuWorkersConfig:
+    segment: str | None = None
+    remove: str | None = None
+    reference_edit: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    mode: str = "staged_legacy"
+    qwen_max_inflight: int = 2
+    cpu_workers: int = 8
+    worker_timeout_seconds: int = 3600
+    stage_workers: RuntimeStageWorkersConfig = field(
+        default_factory=RuntimeStageWorkersConfig
+    )
+    gpu_workers: RuntimeGpuWorkersConfig = field(
+        default_factory=RuntimeGpuWorkersConfig
+    )
+
+
+@dataclass(frozen=True)
 class InstructionConfig:
     enabled: bool = True
     repair_retries: int = 1
@@ -225,6 +260,7 @@ class V3Config:
     reference_integrity: ReferenceIntegrityConfig = field(
         default_factory=ReferenceIntegrityConfig
     )
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
@@ -601,6 +637,43 @@ class V3Config:
                 "qwen.reference_integrity_judge is required when "
                 "reference_integrity.enabled is true"
             )
+        if self.runtime.mode not in {"staged_legacy", "streaming_v1"}:
+            raise ValueError("runtime.mode must be staged_legacy or streaming_v1")
+        for name, value in (
+            ("qwen_max_inflight", self.runtime.qwen_max_inflight),
+            ("cpu_workers", self.runtime.cpu_workers),
+            ("worker_timeout_seconds", self.runtime.worker_timeout_seconds),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"runtime.{name} must be a positive integer")
+        for name, value in asdict(self.runtime.stage_workers).items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(
+                    f"runtime.stage_workers.{name} must be a positive integer"
+                )
+        for stage in ("segment", "remove", "reference_edit"):
+            if getattr(self.runtime.stage_workers, stage) != 1:
+                raise ValueError(
+                    f"runtime.stage_workers.{stage} must be 1 to avoid duplicate "
+                    "GPU model copies"
+                )
+        for stage, visible in asdict(self.runtime.gpu_workers).items():
+            if visible is not None and (
+                not isinstance(visible, str)
+                or not visible.isdigit()
+                or int(visible) < 0
+            ):
+                raise ValueError(
+                    f"runtime.gpu_workers.{stage} must be one physical CUDA index"
+                )
+        if (
+            self.runtime.mode == "streaming_v1"
+            and self.pair.same_parent_fallback_enabled
+        ):
+            raise ValueError(
+                "runtime.mode=streaming_v1 does not support "
+                "pair.same_parent_fallback_enabled=true"
+            )
         if self.reference_edit.enabled:
             for name, path in (
                 ("python_executable", self.reference_edit.python_executable),
@@ -767,6 +840,14 @@ class V3Config:
             "sam3.device": self.sam3.device,
             "sam3.anchor_search_mode": self.sam3.anchor_search_mode,
             "reference_integrity.mode": self.reference_integrity.mode,
+            "runtime.mode": self.runtime.mode,
+            "runtime.qwen_max_inflight": str(self.runtime.qwen_max_inflight),
+            "runtime.stage_workers": json.dumps(
+                asdict(self.runtime.stage_workers), sort_keys=True
+            ),
+            "runtime.gpu_workers": json.dumps(
+                asdict(self.runtime.gpu_workers), sort_keys=True
+            ),
         }
 
     def fingerprint(self) -> str:
@@ -863,6 +944,7 @@ def load_config(path: str | Path) -> V3Config:
         "remove",
         "reference_edit",
         "reference_integrity",
+        "runtime",
         "instruction",
         "debug",
     }
@@ -930,6 +1012,17 @@ def load_config(path: str | Path) -> V3Config:
     reference_edit_values = _mapping(
         raw.get("reference_edit"),
         "reference_edit",
+    )
+    runtime_values = dict(_mapping(raw.get("runtime"), "runtime"))
+    runtime_stage_workers = _build(
+        RuntimeStageWorkersConfig,
+        _mapping(runtime_values.pop("stage_workers", None), "runtime.stage_workers"),
+        "runtime.stage_workers",
+    )
+    runtime_gpu_workers = _build(
+        RuntimeGpuWorkersConfig,
+        _mapping(runtime_values.pop("gpu_workers", None), "runtime.gpu_workers"),
+        "runtime.gpu_workers",
     )
     pair_values = _mapping(raw.get("pair"), "pair")
     if pair_values.get("reference_prefilter_mode") is False:
@@ -1012,6 +1105,15 @@ def load_config(path: str | Path) -> V3Config:
             ReferenceIntegrityConfig,
             _mapping(raw.get("reference_integrity"), "reference_integrity"),
             "reference_integrity",
+        ),
+        runtime=_build(
+            RuntimeConfig,
+            {
+                **runtime_values,
+                "stage_workers": runtime_stage_workers,
+                "gpu_workers": runtime_gpu_workers,
+            },
+            "runtime",
         ),
         instruction=_build(
             InstructionConfig,

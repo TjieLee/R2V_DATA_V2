@@ -229,8 +229,9 @@ entity, inspect the video once for additional clearly visible, stable, trackable
 entities with independent control value. A larger or more salient person does
 not automatically exclude smaller useful objects.
 
-Use subject for exactly one person, animal, or character. Animals are subjects,
-never objects. Body parts are not independent objects. Use object only for one
+Use subject for exactly one person, animal, or character.
+Animals are subjects, never objects. Body parts are not independent objects.
+Use object only for one
 concrete, discrete, physical foreground object with independent reference or
 control value. Amorphous materials, liquids, sauces, smoke, shadows, lighting,
 and similar non-discrete content are not objects. Static environmental structure
@@ -250,9 +251,10 @@ ears, tiny decorations, indistinct fragments, or anything that cannot be
 reliably localized.
 
 Discrete foods and food containers may remain valid objects when they have a
-recognizable bounded form, such as a lobster, fish, bowl, frying pan, plate of
-meatballs, loaf of bread, or pot of food. Do not promote amorphous sauce, steam,
-oil puddles, or similar substances into object references.
+recognizable bounded form, such as a lobster, fish, bowl, or frying pan.
+A plate of meatballs, loaf of bread, or pot of food can also remain valid.
+Do not promote amorphous sauce, steam, oil puddles, or similar substances into
+object references.
 
 An object phrase must name a concrete recognizable physical entity. Do not use
 generic phrases such as object, thing, item, unknown object, awkward object,
