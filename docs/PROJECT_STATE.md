@@ -42,7 +42,7 @@ cross-clip speaker identity, and production-stage integration are out of scope.
 
 ## Current Pass
 
-The architectural scaffold review-fix pass is implemented on this branch:
+The bounded LR-ASD pilot infrastructure is implemented on this branch:
 
 - source full-audio provenance is separate from explicitly requested H3 assets;
 - canonical task components distinguish reference generation, audio reference,
@@ -52,30 +52,36 @@ The architectural scaffold review-fix pass is implemented on this branch:
 - ASD visible-face coverage is explicit and incomplete coverage is ambiguous;
 - deterministic fusion precedes voice-reference extraction and entity binding;
 - strict voice-reference, subject, and full-audio asset invariants;
-- pluggable audio, face-track, association, ASD, and evidence interfaces;
-- deterministic high-precision fusion;
-- deterministic H3 asset numbering and rendering;
-- read-only completed-run sidecar CLI using precomputed/fake evidence;
-- GPU-free unit tests and V3 compatibility checks.
+- isolated external LR-ASD subprocess runtime with the official 25 FPS, 16 kHz
+  mono, S3FD, shot-aware tracking, crop, and inference path;
+- strict LR-ASD-native JSON preserving raw class-1 logits, native `score >= 0`
+  decisions, and checkpoint provenance without probability claims;
+- independent local Silero VAD subprocess bridge without diarization;
+- deterministic 25-FPS-to-V3 timestamp alignment and face-box/entity-mask
+  association diagnostics;
+- `reference_generation`-only fusion and a self-contained manual review bundle;
+- bounded, read-only pilot selection with per-clip failure isolation;
+- GPU-free fake-evidence tests and V3 compatibility checks.
 
-New implementation is isolated under `r2v_data_v2/h3/` with one CLI,
-`tools/build_v3_h3_audio_binding_sidecar.py`. It is not present in
-`run_pipeline_v3.STAGE_ORDER`, does not extend `ClipRecord`, and writes only to a
-separate atomically published sidecar root.
+The implementation remains isolated under `r2v_data_v2/h3/`. The precomputed
+sidecar CLI remains available, and the real pilot entry point is
+`tools/eval_h3_audio_binding_lr_asd.py`. Neither is present in
+`run_pipeline_v3.STAGE_ORDER`; neither extends `ClipRecord`; both write only to
+separate output roots.
 
 No existing V3 quality gate, config schema, pipeline stage, `ClipRecord`, export,
 or production artifact may change in this pass.
 
 ## Tested Commands
 
-Completed local validation for this pass:
+Completed GPU-free validation for this pass:
 
 ```bash
 python -m pytest tests/test_h3_audio_binding.py -q
-# 26 passed
+# 37 passed
 
 python -m pytest -q
-# 1512 passed, 1 existing Pillow deprecation warning
+# 1523 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -97,8 +103,8 @@ git diff --check
 
 ## Exact Next Task
 
-Review and approve the corrected V1 contracts. After approval, implement a
-read-only LR-ASD adapter evaluation on a small isolated sample, with Light-ASD
-and TalkNet as baselines. Do not integrate any model into the production V3
-stage order until server evidence validates the currently provisional
-thresholds.
+Review this bounded infrastructure, then configure isolated LR-ASD and Silero
+environments on the server and run a small explicit-clip pilot outside every V3
+run root. Inspect the review bundles before comparing Light-ASD or TalkNet.
+Do not add audio binding to the production V3 stage order until real evidence
+validates the provisional association and fusion policies.

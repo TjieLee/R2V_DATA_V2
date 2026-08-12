@@ -6,9 +6,15 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from r2v_data_v2.h3.association import (
+    FaceEntityAssociationPolicy,
+    associate_face_tracks_to_entities,
+    nearest_track_sample,
+)
 from r2v_data_v2.h3.backends import (
     EntityFaceAssociationBackend,
     PrecomputedEvidenceBackend,
@@ -18,8 +24,24 @@ from r2v_data_v2.h3.fusion import (
     fuse_audio_entity_bindings,
     render_h3_audio_instruction,
 )
+from r2v_data_v2.h3.lr_asd import (
+    LRASDRuntimeError,
+    PrecomputedLRASDBackend,
+    PrecomputedSpeechActivityBackend,
+    normalize_lr_asd_evidence,
+)
+from r2v_data_v2.h3.pilot import run_h3_audio_binding_pilot
+from r2v_data_v2.h3.pilot_schemas import (
+    LRASDNativeArtifact,
+    LRASDNativeSample,
+    LRASDNativeTrack,
+    SpeechActivityArtifact,
+    SpeechActivityInterval,
+)
+from r2v_data_v2.h3.review import build_review_timeline
 from r2v_data_v2.h3.schemas import (
     ActiveSpeakerInterval,
+    ASDModelProvenance,
     AudioBindingEvidence,
     AudioEntityBinding,
     AudioTrackMetadata,
@@ -34,6 +56,7 @@ from r2v_data_v2.h3.schemas import (
     VoiceReferenceCandidate,
 )
 from r2v_data_v2.h3.sidecar import build_audio_binding_sidecar_run
+from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
@@ -44,6 +67,11 @@ from r2v_data_v2.v3.schemas import (
     EntityVisibilitySummary,
     PairingState,
     ReferencesState,
+    SampledFrame,
+    SampledFramesArtifact,
+    TrackedEntityMasks,
+    TrackedMaskFrame,
+    TrackedMasksArtifact,
 )
 from run_pipeline_v3 import STAGE_ORDER
 from tools.build_v3_h3_audio_binding_sidecar import main as sidecar_main
@@ -726,3 +754,634 @@ def test_sidecar_output_inside_source_run_is_rejected(tmp_path: Path) -> None:
         )
 
     assert _tree_hashes(run_root) == before
+
+
+def _pilot_clip(clip_uid: str, source_video: Path, *, entity_count: int = 1) -> ClipRecord:
+    payload = _clip(entity_count=entity_count).model_dump(mode="json")
+    payload["clip_uid"] = clip_uid
+    payload["source"]["video_path"] = str(source_video)
+    for reference in payload["references"]["entities"]:
+        reference["source_clip_uid"] = clip_uid
+        reference["image_path"] = (
+            f"clips/{clip_uid}/selected/{reference['entity_id']}.png"
+        )
+    return ClipRecord.model_validate(payload)
+
+
+def _tracked_mask_frame(slot: int, mask: np.ndarray, entity_id: str) -> TrackedMaskFrame:
+    rows, columns = np.nonzero(mask)
+    return TrackedMaskFrame(
+        slot=slot,
+        present=True,
+        confidence=0.95,
+        backend_confidences=[0.95],
+        backend_object_ids=[f"object-{entity_id}"],
+        area_pixels=int(mask.sum()),
+        area_ratio=float(mask.mean()),
+        bbox_xyxy=(
+            int(columns.min()),
+            int(rows.min()),
+            int(columns.max()) + 1,
+            int(rows.max()) + 1,
+        ),
+        rle=encode_binary_mask(mask),
+    )
+
+
+def _visual_artifacts(
+    clip_uid: str,
+    masks_by_entity: dict[str, np.ndarray],
+) -> tuple[SampledFramesArtifact, TrackedMasksArtifact]:
+    height, width = next(iter(masks_by_entity.values())).shape
+    frames = SampledFramesArtifact(
+        clip_uid=clip_uid,
+        width=width,
+        height=height,
+        frames=[
+            SampledFrame(
+                slot=slot,
+                source_frame_index=slot,
+                timestamp_seconds=slot / 25,
+                image_path=f"frames/{slot:02d}.jpg",
+                sha256="0" * 64,
+            )
+            for slot in range(10)
+        ],
+    )
+    masks = TrackedMasksArtifact(
+        clip_uid=clip_uid,
+        width=width,
+        height=height,
+        entities={
+            entity_id: TrackedEntityMasks(
+                status="ready",
+                reference_type="subject",
+                grounding_prompt=f"person {entity_id}",
+                backend_object_ids=[f"object-{entity_id}"],
+                frames=[
+                    _tracked_mask_frame(slot, mask, entity_id)
+                    for slot in range(10)
+                ],
+            )
+            for entity_id, mask in masks_by_entity.items()
+        },
+    )
+    return frames, masks
+
+
+def _native_artifact(
+    *,
+    clip_uid: str,
+    source_video: Path,
+    audio_path: Path,
+    logits_by_track: list[list[float]],
+    bboxes: list[tuple[float, float, float, float]] | None = None,
+) -> LRASDNativeArtifact:
+    active_bboxes = bboxes or [(2.0, 2.0, 8.0, 8.0)] * len(logits_by_track)
+    return LRASDNativeArtifact(
+        clip_uid=clip_uid,
+        source_video_path=str(source_video),
+        model_video_path=str(source_video.parent / f"{clip_uid}.model.avi"),
+        audio_path=str(audio_path),
+        model_provenance=ASDModelProvenance(
+            backend="lr_asd",
+            model_identifier="Junhua-Liao/LR-ASD",
+            checkpoint_path="/models/lr_asd.model",
+            checkpoint_sha256="a" * 64,
+        ),
+        width=20,
+        height=20,
+        duration_seconds=0.4,
+        tracks=[
+            LRASDNativeTrack(
+                face_track_id=f"face_{track_index}",
+                samples=[
+                    LRASDNativeSample(
+                        frame_index=frame_index,
+                        timestamp_seconds=frame_index / 25,
+                        bbox_xyxy=active_bboxes[track_index - 1],
+                        detection_confidence=0.95,
+                        raw_class1_logit=logit,
+                        backend_native_active=logit >= 0,
+                    )
+                    for frame_index, logit in enumerate(logits)
+                ],
+            )
+            for track_index, logits in enumerate(logits_by_track, start=1)
+        ],
+    )
+
+
+def _speech_artifact(
+    clip_uid: str,
+    audio_path: Path,
+    *,
+    speech: bool,
+) -> SpeechActivityArtifact:
+    return SpeechActivityArtifact(
+        clip_uid=clip_uid,
+        backend="silero_vad",
+        model_identifier="silero_vad.jit",
+        source_audio_path=str(audio_path),
+        duration_seconds=0.4,
+        intervals=(
+            [SpeechActivityInterval(start_time=0.0, end_time=0.4)]
+            if speech
+            else []
+        ),
+    )
+
+
+def _full_entity_mask() -> np.ndarray:
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[1:18, 1:12] = 1
+    return mask
+
+
+def test_lr_asd_native_scores_preserve_logit_decision_and_provenance(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.7] * 10],
+    )
+    native = LRASDNativeArtifact.model_validate_json(native.model_dump_json())
+    associations = [_association(1)]
+    evidence = normalize_lr_asd_evidence(
+        native,
+        _speech_artifact("clip-1", audio, speech=True),
+        associations,
+    )
+
+    score = evidence.active_speaker_intervals[0].face_scores[0]
+    assert score.raw_backend_score == pytest.approx(0.7)
+    assert score.backend_native_active is True
+    assert score.score_semantics == "lr_asd_native_class_1_logit"
+    assert score.normalized_score is None
+    assert evidence.active_speaker_intervals[0].model_provenance == (
+        native.model_provenance
+    )
+    payload = native.model_dump(mode="json")
+    payload["tracks"][0]["samples"][0]["backend_native_active"] = False
+    with pytest.raises(ValidationError, match="score >= 0"):
+        LRASDNativeArtifact.model_validate(payload)
+    timestamp_payload = native.model_dump(mode="json")
+    timestamp_payload["tracks"][0]["samples"][1]["timestamp_seconds"] = 0.05
+    with pytest.raises(ValidationError, match="25-FPS"):
+        LRASDNativeArtifact.model_validate(timestamp_payload)
+
+
+def test_lr_asd_25fps_nearest_timestamp_mapping_is_bounded(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.1] * 10],
+    )
+
+    matched = nearest_track_sample(
+        native.tracks[0],
+        timestamp_seconds=0.081,
+        maximum_delta_seconds=0.01,
+    )
+    assert matched is not None
+    assert matched[0].frame_index == 2
+    assert matched[0].timestamp_seconds == pytest.approx(2 / 25)
+    assert matched[1] == pytest.approx(0.001)
+    assert (
+        nearest_track_sample(
+            native.tracks[0],
+            timestamp_seconds=0.081,
+            maximum_delta_seconds=0.0005,
+        )
+        is None
+    )
+
+
+def test_face_track_associates_with_covering_entity_mask(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    frames, masks = _visual_artifacts("clip-1", {"e1": _full_entity_mask()})
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.5] * 10],
+    )
+
+    association = associate_face_tracks_to_entities(
+        frames=frames,
+        masks=masks,
+        tracks=native.tracks,
+    )[0]
+
+    assert association.status == "matched"
+    assert association.entity_id == "e1"
+    assert association.candidates[0].matched_sampled_slots == 10
+    assert association.candidates[0].mean_face_bbox_coverage == 1.0
+    assert association.candidates[0].face_center_inside_count == 10
+    diagnostics = association.evidence["slot_diagnostics"]
+    assert {item["timestamp_delta_seconds"] for item in diagnostics} == {0.0}
+
+
+def test_conflicting_entity_masks_make_face_association_ambiguous(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    mask = _full_entity_mask()
+    frames, masks = _visual_artifacts("clip-1", {"e1": mask, "e2": mask})
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.5] * 10],
+    )
+
+    association = associate_face_tracks_to_entities(
+        frames=frames,
+        masks=masks,
+        tracks=native.tracks,
+    )[0]
+
+    assert association.status == "ambiguous"
+    assert association.entity_id is None
+    assert association.reason == "conflicting_entity_masks"
+    assert association.top1_top2_margin == 0.0
+
+
+def test_insufficient_aligned_slots_make_association_ambiguous(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    frames, masks = _visual_artifacts("clip-1", {"e1": _full_entity_mask()})
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.5]],
+    )
+
+    association = associate_face_tracks_to_entities(
+        frames=frames,
+        masks=masks,
+        tracks=native.tracks,
+        policy=FaceEntityAssociationPolicy(
+            maximum_timestamp_delta_seconds=0.01,
+            minimum_matched_sampled_slots=2,
+        ),
+    )[0]
+
+    assert association.status == "ambiguous"
+    assert association.reason == "insufficient_aligned_sampled_slots"
+    assert association.evidence["aligned_sampled_slots"] == 1
+
+
+@pytest.mark.parametrize(
+    ("speech", "logits_by_track", "expected_status"),
+    [
+        (True, [[-0.3] * 10], "offscreen"),
+        (False, [[0.8] * 10], "no_speech"),
+        (True, [[0.8] * 10, [0.2] * 10], "overlap"),
+    ],
+)
+def test_native_asd_and_vad_produce_explicit_binding_states(
+    tmp_path: Path,
+    speech: bool,
+    logits_by_track: list[list[float]],
+    expected_status: str,
+) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=logits_by_track,
+    )
+    associations = [_association(index) for index in range(1, len(logits_by_track) + 1)]
+    evidence = normalize_lr_asd_evidence(
+        native,
+        _speech_artifact("clip-1", audio, speech=speech),
+        associations,
+    )
+
+    binding = fuse_audio_entity_bindings(
+        evidence,
+        known_entity_ids={f"e{index}" for index in range(1, len(logits_by_track) + 1)},
+    )[0]
+
+    assert binding.status == expected_status
+    if expected_status == "offscreen":
+        assert "lr_asd_native_decision_unvalidated" in binding.evidence.reason_codes
+
+
+class _FakeReviewMediaBackend:
+    def render_visualization(
+        self,
+        *,
+        source_video_path: Path,
+        timeline_path: Path,
+        destination_path: Path,
+    ) -> None:
+        assert source_video_path.read_bytes() == b"video"
+        assert json.loads(timeline_path.read_text(encoding="utf-8"))["samples"]
+        destination_path.write_bytes(b"visualization")
+
+    def extract_audio(
+        self,
+        *,
+        source_audio_path: Path,
+        start_time: float,
+        end_time: float,
+        destination_path: Path,
+    ) -> None:
+        assert source_audio_path.read_bytes() == b"audio"
+        destination_path.write_bytes(f"{start_time:.3f}-{end_time:.3f}".encode())
+
+
+class _CountingLRASDBackend(PrecomputedLRASDBackend):
+    def __init__(
+        self,
+        artifacts: dict[str, LRASDNativeArtifact],
+        *,
+        fail_clip_uid: str | None = None,
+    ) -> None:
+        super().__init__(artifacts)
+        self.fail_clip_uid = fail_clip_uid
+        self.calls: list[str] = []
+
+    def analyze(
+        self,
+        *,
+        clip_uid: str,
+        source_video_path: Path,
+        work_dir: Path,
+    ) -> LRASDNativeArtifact:
+        self.calls.append(clip_uid)
+        if clip_uid == self.fail_clip_uid:
+            raise LRASDRuntimeError("fake isolated runtime failure")
+        return super().analyze(
+            clip_uid=clip_uid,
+            source_video_path=source_video_path,
+            work_dir=work_dir,
+        )
+
+
+class _OutputLocalLRASDBackend:
+    def analyze(
+        self,
+        *,
+        clip_uid: str,
+        source_video_path: Path,
+        work_dir: Path,
+    ) -> LRASDNativeArtifact:
+        work_dir.mkdir(parents=True)
+        audio_path = work_dir / "audio.wav"
+        model_video_path = work_dir / "model.avi"
+        visualization_path = work_dir / "official.avi"
+        audio_path.write_bytes(b"audio")
+        model_video_path.write_bytes(b"model")
+        visualization_path.write_bytes(b"visualization")
+        native = _native_artifact(
+            clip_uid=clip_uid,
+            source_video=source_video_path,
+            audio_path=audio_path,
+            logits_by_track=[[0.7] * 10],
+        )
+        payload = native.model_dump(mode="json")
+        payload["model_video_path"] = str(model_video_path)
+        payload["official_visualization_path"] = str(visualization_path)
+        return LRASDNativeArtifact.model_validate(payload)
+
+
+class _DynamicSpeechActivityBackend:
+    def detect(
+        self,
+        *,
+        clip_uid: str,
+        audio_path: Path,
+        duration_seconds: float,
+        work_dir: Path,
+    ) -> SpeechActivityArtifact:
+        del work_dir
+        assert duration_seconds == 0.4
+        return _speech_artifact(clip_uid, audio_path, speech=True)
+
+
+def _write_pilot_clip(
+    run_root: Path,
+    clip: ClipRecord,
+    *,
+    masks_by_entity: dict[str, np.ndarray],
+) -> None:
+    _write_run(run_root, clip)
+    clip_dir = run_root / "clips" / clip.clip_uid
+    frames, masks = _visual_artifacts(clip.clip_uid, masks_by_entity)
+    (clip_dir / "frames").mkdir()
+    (clip_dir / "frames" / "frames.json").write_text(
+        frames.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (clip_dir / "masks.rle.json").write_text(
+        masks.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_pilot_isolates_lr_asd_failure_and_runs_backend_once_per_clip(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source_1 = tmp_path / "clip-1.mp4"
+    source_2 = tmp_path / "clip-2.mp4"
+    audio_1 = tmp_path / "clip-1.wav"
+    audio_2 = tmp_path / "clip-2.wav"
+    for path, content in (
+        (source_1, b"video"),
+        (source_2, b"video"),
+        (audio_1, b"audio"),
+        (audio_2, b"audio"),
+    ):
+        path.write_bytes(content)
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source_1),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-2", source_2),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    native_1 = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source_1,
+        audio_path=audio_1,
+        logits_by_track=[[0.7] * 10],
+    )
+    native_2 = _native_artifact(
+        clip_uid="clip-2",
+        source_video=source_2,
+        audio_path=audio_2,
+        logits_by_track=[[0.7] * 10],
+    )
+    backend = _CountingLRASDBackend(
+        {"clip-1": native_1, "clip-2": native_2},
+        fail_clip_uid="clip-1",
+    )
+    before = _tree_hashes(run_root)
+
+    summary = run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=tmp_path / "pilot",
+        lr_asd_backend=backend,
+        speech_backend=PrecomputedSpeechActivityBackend(
+            {
+                "clip-2": _speech_artifact("clip-2", audio_2, speech=True),
+            }
+        ),
+        review_media_backend=_FakeReviewMediaBackend(),
+        limit=2,
+    )
+
+    assert backend.calls == ["clip-1", "clip-2"]
+    assert summary.clips_attempted == 2
+    assert summary.clips_succeeded == 1
+    assert summary.clips_failed == 1
+    assert summary.asd_runtime_failures == 1
+    assert (tmp_path / "pilot" / "review" / "clip-2" / "timeline.json").is_file()
+    failures = [
+        json.loads(line)
+        for line in (tmp_path / "pilot" / "failures.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert failures == [
+        {
+            "clip_uid": "clip-1",
+            "error_type": "LRASDRuntimeError",
+            "reason": "fake isolated runtime failure",
+            "stage": "lr_asd",
+        }
+    ]
+    assert _tree_hashes(run_root) == before
+
+
+def test_review_bundle_metadata_is_deterministic_and_keeps_native_evidence(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    run_root = tmp_path / "run"
+    clip = _pilot_clip("clip-1", source)
+    _write_pilot_clip(
+        run_root,
+        clip,
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.7] * 10],
+    )
+
+    for output_name in ("pilot-a", "pilot-b"):
+        run_h3_audio_binding_pilot(
+            run_root=run_root,
+            output_root=tmp_path / output_name,
+            lr_asd_backend=PrecomputedLRASDBackend({"clip-1": native}),
+            speech_backend=PrecomputedSpeechActivityBackend(
+                {"clip-1": _speech_artifact("clip-1", audio, speech=True)}
+            ),
+            review_media_backend=_FakeReviewMediaBackend(),
+            clip_ids=["clip-1"],
+        )
+
+    first = tmp_path / "pilot-a" / "review" / "clip-1"
+    second = tmp_path / "pilot-b" / "review" / "clip-1"
+    for name in (
+        "timeline.json",
+        "audio_binding.json",
+        "lr_asd_native.json",
+        "face_entity_association.json",
+    ):
+        assert (first / name).read_bytes() == (second / name).read_bytes()
+    timeline = json.loads((first / "timeline.json").read_text(encoding="utf-8"))
+    assert timeline == build_review_timeline(
+        native=native,
+        associations=associate_face_tracks_to_entities(
+            frames=_visual_artifacts("clip-1", {"e1": _full_entity_mask()})[0],
+            masks=_visual_artifacts("clip-1", {"e1": _full_entity_mask()})[1],
+            tracks=native.tracks,
+        ),
+        bindings=[
+            AudioEntityBinding.model_validate(item) for item in timeline["bindings"]
+        ],
+    )
+    assert (first / "source.mp4").read_bytes() == b"video"
+    assert (first / "visualization.mp4").read_bytes() == b"visualization"
+    assert list((first / "bound_audio").glob("e1_*.wav"))
+
+
+def test_pilot_rebases_internal_runtime_paths_before_atomic_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    run_root = tmp_path / "run"
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    output_root = tmp_path / "pilot"
+
+    run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=output_root,
+        lr_asd_backend=_OutputLocalLRASDBackend(),
+        speech_backend=_DynamicSpeechActivityBackend(),
+        review_media_backend=_FakeReviewMediaBackend(),
+        clip_ids=["clip-1"],
+    )
+
+    native = json.loads(
+        (output_root / "review" / "clip-1" / "lr_asd_native.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    audio_path = Path(native["audio_path"])
+    model_video_path = Path(native["model_video_path"])
+    official_visualization_path = Path(native["official_visualization_path"])
+    assert output_root in audio_path.parents
+    assert audio_path.read_bytes() == b"audio"
+    assert model_video_path.read_bytes() == b"model"
+    assert official_visualization_path.read_bytes() == b"visualization"
+    assert ".tmp-" not in native["audio_path"]
+    sidecar = json.loads(
+        (output_root / "review" / "clip-1" / "audio_binding.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sidecar["evidence"]["audio"]["full_audio_path"] == str(audio_path)
