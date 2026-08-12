@@ -557,7 +557,7 @@ def test_entity_sanitizer_deduplicates_truncates_and_assigns_ids() -> None:
     assert "truncated_entity_candidates:5" in warnings
 
 
-def test_annotation_state_accepts_five_contiguous_entities() -> None:
+def test_annotation_state_accepts_schema_capacity_of_eight_contiguous_entities() -> None:
     entities = [
         AnnotationEntity(
             entity_id=f"e{index}",
@@ -572,7 +572,7 @@ def test_annotation_state_accepts_five_contiguous_entities() -> None:
         status="ready",
         instruction_template=" ".join(
             f"Object {index} {{{{entity_{index}}}}} remains visible."
-            for index in range(1, 6)
+            for index in range(1, MAX_ANNOTATION_ENTITIES + 1)
         ),
         entities=entities,
     )
@@ -583,6 +583,9 @@ def test_annotation_state_accepts_five_contiguous_entities() -> None:
         "e3",
         "e4",
         "e5",
+        "e6",
+        "e7",
+        "e8",
     ]
 
 
@@ -619,7 +622,7 @@ def test_failed_annotation_cannot_publish_instruction_template() -> None:
         )
 
 
-def test_annotation_state_rejects_six_entities() -> None:
+def test_annotation_state_rejects_more_than_eight_entities() -> None:
     entities = [
         AnnotationEntity(
             entity_id=f"e{index}",
@@ -630,7 +633,7 @@ def test_annotation_state_rejects_six_entities() -> None:
         for index in range(1, MAX_ANNOTATION_ENTITIES + 2)
     ]
 
-    with pytest.raises(ValidationError, match="at most 5 entities"):
+    with pytest.raises(ValidationError, match="at most 8 entities"):
         AnnotationState(
             status="ready",
             instruction_template="Six objects remain visible.",

@@ -14,7 +14,11 @@ from PIL import Image
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
-from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.config import (
+    DEFAULT_MAX_ANNOTATION_ENTITIES,
+    DENSE_MAX_ANNOTATION_ENTITIES,
+    V3Config,
+)
 from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundReferenceState,
@@ -339,6 +343,16 @@ class RunStorage:
         clip_uid: str,
         value: AnnotationState,
     ) -> ClipRecord:
+        maximum = (
+            DENSE_MAX_ANNOTATION_ENTITIES
+            if self.config.qwen.annotation.entity_selection_mode == "reference_dense_v1"
+            else DEFAULT_MAX_ANNOTATION_ENTITIES
+        )
+        if len(value.entities) > maximum:
+            raise ValueError(
+                "annotation entity count exceeds the configured selection-mode limit: "
+                f"{len(value.entities)} > {maximum}"
+            )
         return self._replace_section(clip_uid, "annotation", value)
 
     def write_coverage(self, clip_uid: str, value: CoverageState) -> ClipRecord:

@@ -33,9 +33,22 @@ class SelectedSource:
     metadata: dict[str, object]
 
 
-def _parse_selected_source(source_index: int, raw: dict[str, object]) -> SelectedSource:
+@dataclass(frozen=True)
+class SelectionDiagnostics:
+    source_records_scanned: int = 0
+    parents_discovered: int = 0
+    filesystem_checks: int = 0
+    missing_selected_candidates: int = 0
+
+
+def _parse_selected_source(
+    source_index: int,
+    raw: dict[str, object],
+    *,
+    check_video_exists: bool = True,
+) -> SelectedSource:
     parsed = parse_source_record(raw)
-    if not parsed.video_path.is_file():
+    if check_video_exists and not _source_video_is_file(parsed.video_path):
         raise FileNotFoundError(f"source video does not exist: {parsed.video_path}")
     identity = parse_clip_identity(parsed.video_path)
     return SelectedSource(
@@ -49,18 +62,28 @@ def _parse_selected_source(source_index: int, raw: dict[str, object]) -> Selecte
     )
 
 
+def _source_video_is_file(video_path: Path) -> bool:
+    return video_path.is_file()
+
+
 def _random_selected_sources(
     config: V3Config,
     storage: RunStorage,
-) -> tuple[list[SelectedSource], int]:
+) -> tuple[list[SelectedSource], int, SelectionDiagnostics]:
     by_parent: dict[str, list[SelectedSource]] = {}
     failed = 0
+    source_records_scanned = 0
     seen_clip_uids: set[str] = set()
     for source_index, raw in enumerate(iter_source_records(config.dataset_json)):
         if source_index < config.source.start_index:
             continue
+        source_records_scanned += 1
         try:
-            selected = _parse_selected_source(source_index, raw)
+            selected = _parse_selected_source(
+                source_index,
+                raw,
+                check_video_exists=False,
+            )
             if selected.clip_uid in seen_clip_uids:
                 raise ValueError(
                     f"duplicate clip identity in source dataset: {selected.clip_uid}"
@@ -95,19 +118,52 @@ def _random_selected_sources(
         )
 
     chosen: list[SelectedSource] = []
+    filesystem_checks = 0
+    missing_selected_candidates = 0
     for parent_id in parent_ids:
-        chosen.extend(
-            by_parent[parent_id][: config.source.max_clips_per_parent]
-        )
+        accepted_for_parent = 0
+        for candidate in by_parent[parent_id]:
+            if accepted_for_parent >= config.source.max_clips_per_parent:
+                break
+            filesystem_checks += 1
+            if not _source_video_is_file(candidate.video_path):
+                missing_selected_candidates += 1
+                failed += 1
+                storage.append_failure(
+                    clip_uid=candidate.clip_uid,
+                    stage="manifest",
+                    reason=f"source video does not exist: {candidate.video_path}",
+                    details={
+                        "source_index": candidate.source_index,
+                        "video_path": str(candidate.video_path),
+                    },
+                )
+                continue
+            chosen.append(candidate)
+            accepted_for_parent += 1
+            if len(chosen) >= config.source.limit:
+                break
         if len(chosen) >= config.source.limit:
             break
-    return chosen[: config.source.limit], failed
+    if len(chosen) < config.source.limit:
+        raise ValueError(
+            "source.limit cannot be satisfied after validating selected source "
+            f"videos: requested {config.source.limit}, available {len(chosen)}"
+        )
+    diagnostics = SelectionDiagnostics(
+        source_records_scanned=source_records_scanned,
+        parents_discovered=len(parent_ids),
+        filesystem_checks=filesystem_checks,
+        missing_selected_candidates=missing_selected_candidates,
+    )
+    return chosen, failed, diagnostics
 
 
 def _write_selection_provenance(
     config: V3Config,
     storage: RunStorage,
     selected: list[SelectedSource],
+    diagnostics: SelectionDiagnostics,
 ) -> None:
     write_json_atomic(
         storage.root / "source_selection.json",
@@ -117,6 +173,7 @@ def _write_selection_provenance(
             "max_clips_per_parent": config.source.max_clips_per_parent,
             "requested_limit": config.source.limit,
             "selected_count": len(selected),
+            **asdict(diagnostics),
             "selected": [
                 {
                     "source_index": item.source_index,
@@ -150,8 +207,16 @@ def build_manifest(
     storage: RunStorage,
 ) -> ManifestStats:
     if config.source.selection_mode == "parent_stratified_random_v1":
-        selected_sources, failed = _random_selected_sources(config, storage)
-        _write_selection_provenance(config, storage, selected_sources)
+        selected_sources, failed, diagnostics = _random_selected_sources(
+            config,
+            storage,
+        )
+        _write_selection_provenance(
+            config,
+            storage,
+            selected_sources,
+            diagnostics,
+        )
         processed = skipped_existing = 0
         for selected in selected_sources:
             try:

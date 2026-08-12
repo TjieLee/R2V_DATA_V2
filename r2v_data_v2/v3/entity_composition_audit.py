@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from collections import Counter
 from pathlib import Path
+from statistics import mean, median
 
 from PIL import Image, ImageDraw
 
@@ -63,7 +64,8 @@ def _write_contact_sheet(
     run_root: Path,
     output_root: Path,
     clip: ClipRecord,
-    composition: str,
+    category: str,
+    entity_ids: list[str],
 ) -> None:
     assert clip.pairing is not None
     references = {
@@ -72,34 +74,67 @@ def _write_contact_sheet(
         if item.status == "ready" and item.image_path is not None
     }
     source_images: list[tuple[str, Image.Image]] = []
-    for entity_id in clip.pairing.retained_entity_ids:
+    entities_by_id = {
+        item.entity_id: item
+        for item in (clip.annotation.entities if clip.annotation is not None else [])
+    }
+    for entity_id in entity_ids:
         reference = references.get(entity_id)
         if reference is None or reference.image_path is None:
             continue
         path = _resolved_reference_path(run_root, reference.image_path)
         with Image.open(path) as opened:
-            source_images.append((entity_id, opened.convert("RGB")))
+            entity = entities_by_id.get(entity_id)
+            if entity is None:
+                continue
+            label = " | ".join(
+                (
+                    entity_id,
+                    entity.reference_type,
+                    reference.reference_scope,
+                    "synthetic" if reference.synthetic else "real",
+                    entity.phrase,
+                )
+            )
+            source_images.append((label, opened.convert("RGB")))
     if not source_images:
         return
 
-    tile_width, tile_height, title_height = 320, 320, 44
+    tile_width, tile_height, title_height = 360, 340, 44
     sheet = Image.new(
         "RGB",
         (tile_width * len(source_images), tile_height + title_height),
         "white",
     )
     draw = ImageDraw.Draw(sheet)
-    draw.text((8, 8), f"{clip.clip_uid} | {composition}", fill="black")
-    for index, (entity_id, source) in enumerate(source_images):
+    draw.text((8, 8), f"{clip.clip_uid} | {category}", fill="black")
+    for index, (label, source) in enumerate(source_images):
         image = source.copy()
         image.thumbnail((tile_width, tile_height - 24), Image.Resampling.LANCZOS)
         x = index * tile_width + (tile_width - image.width) // 2
         y = title_height + (tile_height - image.height) // 2
         sheet.paste(image, (x, y))
-        draw.text((index * tile_width + 8, title_height + 6), entity_id, fill="black")
-    destination = output_root / "contact_sheets" / composition / f"{clip.clip_uid}.jpg"
+        draw.text(
+            (index * tile_width + 8, title_height + 6),
+            label,
+            fill="black",
+        )
+    destination = output_root / "contact_sheets" / category / f"{clip.clip_uid}.jpg"
     destination.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(destination, format="JPEG", quality=92)
+
+
+def _count_distribution(
+    values: list[int], *, maximum: int | None = None
+) -> dict[str, object]:
+    counts = Counter(values)
+    if maximum is None:
+        maximum = max(values, default=0)
+    return {
+        "mean": mean(values) if values else 0.0,
+        "median": median(values) if values else 0.0,
+        "histogram": {str(value): counts[value] for value in range(maximum + 1)},
+    }
 
 
 def audit_entity_composition(
@@ -130,14 +165,24 @@ def audit_entity_composition(
     mixed_cases: list[dict[str, object]] = []
     sample_count = samples_with_subject = samples_with_object = 0
     samples_with_both = 0
+    annotation_ready_clip_count = 0
+    annotation_entity_counts: Counter[str] = Counter()
+    annotation_density: list[int] = []
+    final_density: list[int] = []
+    final_synthetic_counts: Counter[str] = Counter()
+    final_scope_counts: Counter[str] = Counter()
+    background_reference_count = 0
 
     for clip in _iter_clips(source_root):
         annotation = clip.annotation
         if annotation is None or annotation.status != "ready":
             continue
+        annotation_ready_clip_count += 1
+        annotation_density.append(len(annotation.entities))
         entities_by_id = {entity.entity_id: entity for entity in annotation.entities}
         for entity in annotation.entities:
             funnel["annotated"][entity.reference_type] += 1
+            annotation_entity_counts[entity.reference_type] += 1
 
         masks = _read_masks(source_root, clip.clip_uid)
         if masks is not None:
@@ -174,6 +219,7 @@ def audit_entity_composition(
         category = _composition(types)
         composition_counts[category] += 1
         sample_count += 1
+        final_density.append(len(retained))
         samples_with_subject += int("subject" in types)
         samples_with_object += int("object" in types)
         samples_with_both += int({"subject", "object"}.issubset(types))
@@ -181,6 +227,17 @@ def audit_entity_composition(
             reference_type = entities_by_id[entity_id].reference_type
             final_entity_counts[reference_type] += 1
             funnel["final_ready"][reference_type] += 1
+            reference = next(
+                item for item in clip.references.entities if item.entity_id == entity_id
+            )
+            final_synthetic_counts["synthetic" if reference.synthetic else "real"] += 1
+            final_scope_counts[reference.reference_scope] += 1
+        if (
+            clip.pairing.background_token is not None
+            and clip.references.background is not None
+            and clip.references.background.status in {"clean_raw", "ready_removed"}
+        ):
+            background_reference_count += 1
         if {"subject", "object"}.issubset(types):
             mixed_cases.append(
                 {
@@ -193,18 +250,65 @@ def audit_entity_composition(
                     ],
                 }
             )
-        if contact_sheets and category in {
-            "subject_only",
-            "object_only",
-            "subject_object",
-        }:
-            _write_contact_sheet(source_root, destination, clip, category)
+        if contact_sheets:
+            subject_ids = [
+                entity_id
+                for entity_id in retained
+                if entities_by_id[entity_id].reference_type == "subject"
+            ]
+            object_ids = [
+                entity_id
+                for entity_id in retained
+                if entities_by_id[entity_id].reference_type == "object"
+            ]
+            for sheet_category, entity_ids in (
+                ("subjects", subject_ids),
+                ("objects", object_ids),
+                ("all_entities", retained),
+                (
+                    "multi_entity_samples",
+                    retained if len(retained) > 1 else [],
+                ),
+            ):
+                if entity_ids:
+                    _write_contact_sheet(
+                        source_root,
+                        destination,
+                        clip,
+                        sheet_category,
+                        entity_ids,
+                    )
 
     summary: dict[str, object] = {
-        "sample_count": sample_count,
-        "compositions": {
-            key: composition_counts[key] for key in _COMPOSITION_KEYS
+        "annotation_ready_clip_count": annotation_ready_clip_count,
+        "annotation_entity_count": {
+            entity_type: annotation_entity_counts[entity_type]
+            for entity_type in _ENTITY_TYPES
         },
+        "annotation_entities_per_ready_clip": _count_distribution(
+            annotation_density,
+            maximum=8,
+        ),
+        "final_accepted_sample_count": sample_count,
+        "final_entity_reference_count": {
+            entity_type: final_entity_counts[entity_type]
+            for entity_type in _ENTITY_TYPES
+        },
+        "final_entity_references_per_accepted_sample": _count_distribution(
+            final_density,
+            maximum=8,
+        ),
+        "background_reference_count": background_reference_count,
+        "final_entity_references_by_source": {
+            "real": final_synthetic_counts["real"],
+            "synthetic": final_synthetic_counts["synthetic"],
+        },
+        "final_entity_references_by_scope": {
+            "full": final_scope_counts["full"],
+            "local": final_scope_counts["local"],
+        },
+        "sample_count": sample_count,
+        "compositions": {key: composition_counts[key] for key in _COMPOSITION_KEYS},
         "samples_with_subject": samples_with_subject,
         "samples_with_object": samples_with_object,
         "samples_with_subject_and_object": samples_with_both,
@@ -213,10 +317,7 @@ def audit_entity_composition(
             for entity_type in _ENTITY_TYPES
         },
         "funnel_by_type": {
-            stage: {
-                entity_type: counts[entity_type]
-                for entity_type in _ENTITY_TYPES
-            }
+            stage: {entity_type: counts[entity_type] for entity_type in _ENTITY_TYPES}
             for stage, counts in funnel.items()
         },
         "mixed_subject_object_clip_count": len(mixed_cases),

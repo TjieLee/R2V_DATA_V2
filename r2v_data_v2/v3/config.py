@@ -20,6 +20,8 @@ REMOVE_ADAPTER_NAME = "Qwen-Image-Edit-2511-Object-Remover"
 REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
 REFERENCE_EDIT_BACKEND = "boogu_image_0_1_edit_turbo"
 REFERENCE_EDIT_MODEL_REVISION = "hotfix-1k-20260708"
+DEFAULT_MAX_ANNOTATION_ENTITIES = 5
+DENSE_MAX_ANNOTATION_ENTITIES = 8
 
 _T = TypeVar("_T")
 
@@ -119,6 +121,7 @@ class ReferenceScopeConfig:
 @dataclass(frozen=True)
 class PairConfig:
     enabled: bool = True
+    entity_geometry_mode: str = "legacy"
     reference_prefilter_mode: str = "off"
     background_final_guard_mode: str = "off"
     max_candidates_per_entity: int = 3
@@ -328,10 +331,11 @@ class V3Config:
         if self.qwen.annotation.entity_selection_mode not in {
             "default",
             "composition_balanced_v1",
+            "reference_dense_v1",
         }:
             raise ValueError(
-                "qwen.annotation.entity_selection_mode must be default or "
-                "composition_balanced_v1"
+                "qwen.annotation.entity_selection_mode must be default, "
+                "composition_balanced_v1, or reference_dense_v1"
             )
         if self.frames.count != 10:
             raise ValueError("V3 requires exactly 10 sampled frames")
@@ -387,6 +391,10 @@ class V3Config:
         if self.pair.enabled and self.qwen.candidate_judge is None:
             raise ValueError(
                 "qwen.candidate_judge is required when pair.enabled is true"
+            )
+        if self.pair.entity_geometry_mode not in {"legacy", "type_aware_v1"}:
+            raise ValueError(
+                "pair.entity_geometry_mode must be legacy or type_aware_v1"
             )
         if self.pair.reference_prefilter_mode not in {"off", "conservative_v1"}:
             raise ValueError(

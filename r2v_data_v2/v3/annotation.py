@@ -13,7 +13,12 @@ from r2v_data_v2.structured_output import (
     StructuredOutputFailure,
     ValidationIssue,
 )
-from r2v_data_v2.v3.config import QwenAnnotationConfig, V3Config
+from r2v_data_v2.v3.config import (
+    DEFAULT_MAX_ANNOTATION_ENTITIES,
+    DENSE_MAX_ANNOTATION_ENTITIES,
+    QwenAnnotationConfig,
+    V3Config,
+)
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
     model_profile_context,
@@ -63,8 +68,30 @@ _ENTITY_FIELDS = frozenset(
 )
 _BACKGROUND_FIELDS = frozenset({"phrase", "grounding_prompt"})
 _REFERENCE_TYPES = frozenset({"subject", "object", "group"})
-_ENTITY_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five")
-_ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[MAX_ANNOTATION_ENTITIES]
+_ENTITY_COUNT_WORDS = (
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+)
+_ENTITY_LIMIT_WORD = _ENTITY_COUNT_WORDS[DEFAULT_MAX_ANNOTATION_ENTITIES]
+_DENSE_GENERIC_OBJECT_PHRASES = frozenset(
+    {
+        "object",
+        "thing",
+        "item",
+        "unknown object",
+        "awkward object",
+        "unidentified object",
+        "large black object",
+        "a large black awkward object",
+    }
+)
 _PREFERRED_ENTITY_PHRASE_WORD_LIMIT = 12
 _HARD_ENTITY_PHRASE_WORD_LIMIT = 18
 _PREFERRED_INSTRUCTION_WORD_LIMIT = 120
@@ -186,12 +213,73 @@ device, food item, or other stable physical object with independent reference
 value. Never classify a person, animal, body part, depicted person, photograph,
 poster, screen content, or a whole person-plus-object composite as an object."""
 
+_DEFAULT_STEP_1_SELECTION = f"""STEP 1: Select the reference entity proposals.
+Return at most {_ENTITY_LIMIT_WORD} entities. Select only stable, discrete
+foreground reference candidates that SAM3 can localize and track and that could
+be reused as an independent reference image. Fewer than {_ENTITY_LIMIT_WORD} is
+preferred when evidence is weak. Do not select environmental regions such as
+sky, ocean, water surface,
+ground, roads, or room space; distributed or transient content such as clouds,
+smoke, flame, lighting, shadows, reflections, or weather; content depicted in a
+screen, photo, poster, painting, sculpture, or animation; small attached
+accessories without independent reference value; or tiny, brief, blurred, or
+untrackable objects. These examples guide selection only and are not an object
+name ontology."""
+
+REFERENCE_DENSE_STEP_1_SELECTION_PROMPT = """STEP 1: Select the reference entity proposals.
+Return at most eight stable, visually distinct foreground entities that SAM3 can
+localize and track and that can be independently useful as reference images.
+Do not stop after finding one strong primary entity. After selecting the clearest
+entity, inspect the video once for additional clearly visible, stable, trackable
+entities with independent control value. A larger or more salient person does
+not automatically exclude smaller useful objects.
+
+Worn or attached objects may be selected when they are visually distinct,
+stable across the clip, specifically nameable, and independently useful. These
+may include a hat, glasses, bag, jacket, shirt, distinctive footwear, tool,
+weapon, handheld device, or similar stable physical object. This is not a quota:
+never invent entities, and return fewer entities when evidence is weak. Do not
+split a subject into arbitrary tiny details such as buttons, shoelaces, fingers,
+ears, tiny decorations, indistinct fragments, or anything that cannot be
+reliably localized.
+
+An object phrase must name a concrete recognizable physical entity. Do not use
+generic phrases such as object, thing, item, unknown object, awkward object,
+unidentified object, large black object, or a large black awkward object. Do not
+select environmental regions, distributed or transient effects, depicted
+content, brief or blurred content, or untrackable entities. These examples guide
+selection only and are not an object ontology."""
+
+_DEFAULT_PLACEHOLDER_LIMIT = """and so on through at most
+{{entity_5}}."""
+_DENSE_PLACEHOLDER_LIMIT = """and so on through at most
+{{entity_8}}."""
+
+
+def _reference_dense_system_prompt() -> str:
+    if SYSTEM_PROMPT.count(_DEFAULT_STEP_1_SELECTION) != 1:
+        raise RuntimeError("default annotation STEP 1 prompt boundary changed")
+    prompt = SYSTEM_PROMPT.replace(
+        _DEFAULT_STEP_1_SELECTION,
+        REFERENCE_DENSE_STEP_1_SELECTION_PROMPT,
+        1,
+    )
+    if prompt.count(_DEFAULT_PLACEHOLDER_LIMIT) != 1:
+        raise RuntimeError("default annotation placeholder limit changed")
+    return prompt.replace(
+        _DEFAULT_PLACEHOLDER_LIMIT,
+        _DENSE_PLACEHOLDER_LIMIT,
+        1,
+    )
+
 
 def annotation_system_prompt(config: QwenAnnotationConfig) -> str:
     if config.entity_selection_mode == "default":
         return SYSTEM_PROMPT
     if config.entity_selection_mode == "composition_balanced_v1":
         return f"{SYSTEM_PROMPT}\n\n{COMPOSITION_BALANCED_ENTITY_SELECTION_PROMPT}"
+    if config.entity_selection_mode == "reference_dense_v1":
+        return _reference_dense_system_prompt()
     raise ValueError(
         f"unsupported annotation entity selection mode: "
         f"{config.entity_selection_mode}"
@@ -512,7 +600,12 @@ def _inspect_recognizable_markers(
 
 def _sanitize_entity_candidates_with_indices(
     raw_entities: object,
+    *,
+    max_entities: int = DEFAULT_MAX_ANNOTATION_ENTITIES,
+    reject_generic_object_phrases: bool = False,
 ) -> tuple[list[AnnotationEntity], tuple[str, ...], tuple[int, ...]]:
+    if not 1 <= max_entities <= MAX_ANNOTATION_ENTITIES:
+        raise ValueError("max_entities is outside the annotation schema capacity")
     if not isinstance(raw_entities, list):
         return [], ("dropped_invalid_entities_collection",), ()
 
@@ -565,6 +658,13 @@ def _sanitize_entity_candidates_with_indices(
         if phrase_key in seen_phrases:
             warnings.append(f"dropped_duplicate_entity_phrase:{index}")
             continue
+        if (
+            reject_generic_object_phrases
+            and normalized_type == "object"
+            and phrase_key in _DENSE_GENERIC_OBJECT_PHRASES
+        ):
+            warnings.append(f"dropped_generic_object_phrase:{index}")
+            continue
         phrase_word_count = _english_word_count(phrase)
         if phrase_word_count > _PREFERRED_ENTITY_PHRASE_WORD_LIMIT:
             warnings.append(
@@ -572,9 +672,9 @@ def _sanitize_entity_candidates_with_indices(
                 f"{source_index}:{phrase_word_count}"
             )
         seen_phrases.add(phrase_key)
-        if len(accepted) == MAX_ANNOTATION_ENTITIES:
+        if len(accepted) == max_entities:
             warnings.append(
-                f"truncated_entity_candidates:{MAX_ANNOTATION_ENTITIES}"
+                f"truncated_entity_candidates:{max_entities}"
             )
             break
         accepted.append((index + 1, normalized_type, phrase, grounding_prompt))
@@ -605,9 +705,14 @@ def _sanitize_entity_candidates_with_indices(
 
 def sanitize_entity_candidates(
     raw_entities: object,
+    *,
+    max_entities: int = DEFAULT_MAX_ANNOTATION_ENTITIES,
+    reject_generic_object_phrases: bool = False,
 ) -> tuple[list[AnnotationEntity], tuple[str, ...]]:
     entities, warnings, _ = _sanitize_entity_candidates_with_indices(
-        raw_entities
+        raw_entities,
+        max_entities=max_entities,
+        reject_generic_object_phrases=reject_generic_object_phrases,
     )
     return entities, warnings
 
@@ -701,6 +806,9 @@ def sanitize_background(
 
 def sanitize_annotation_payload(
     raw_payload: dict[str, object],
+    *,
+    max_entities: int = DEFAULT_MAX_ANNOTATION_ENTITIES,
+    reject_generic_object_phrases: bool = False,
 ) -> tuple[AnnotationState | None, list[ValidationIssue], tuple[str, ...]]:
     template = _clean_instruction_template(
         raw_payload.get("instruction_template")
@@ -735,7 +843,9 @@ def sanitize_annotation_payload(
     )
     entities, entity_warnings, accepted_source_indexes = (
         _sanitize_entity_candidates_with_indices(
-        raw_payload.get("entities", [])
+            raw_payload.get("entities", []),
+            max_entities=max_entities,
+            reject_generic_object_phrases=reject_generic_object_phrases,
         )
     )
     marker_eligible_indexes = set(marker_eligibility.entity_source_indexes)
@@ -1008,7 +1118,16 @@ class QwenAnnotationClient:
             raw_payload, issues = _parse_raw_payload(raw)
             if raw_payload is None:
                 continue
-            annotation, issues, warnings = sanitize_annotation_payload(raw_payload)
+            dense_mode = self.config.entity_selection_mode == "reference_dense_v1"
+            annotation, issues, warnings = sanitize_annotation_payload(
+                raw_payload,
+                max_entities=(
+                    DENSE_MAX_ANNOTATION_ENTITIES
+                    if dense_mode
+                    else DEFAULT_MAX_ANNOTATION_ENTITIES
+                ),
+                reject_generic_object_phrases=dense_mode,
+            )
             if annotation is not None and not issues:
                 return AnnotationAttempt(
                     annotation=annotation,

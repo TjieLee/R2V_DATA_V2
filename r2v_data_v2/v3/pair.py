@@ -62,6 +62,7 @@ from r2v_data_v2.v3.schemas import (
     PairingState,
     RawEntityReferenceDecision,
     ReferencesState,
+    ReferenceType,
     SampledFrame,
     SampledFramesArtifact,
     TrackedEntityMasks,
@@ -699,6 +700,21 @@ def _eroded_sharpness_mask(mask: np.ndarray) -> np.ndarray:
     )
 
 
+def entity_candidate_geometry_thresholds(
+    config: V3Config,
+    reference_type: ReferenceType,
+) -> tuple[int, int]:
+    if (
+        config.pair.entity_geometry_mode == "type_aware_v1"
+        and reference_type == "object"
+    ):
+        return 64 * 64, 96
+    return (
+        config.reference_edit.min_source_content_area_pixels,
+        config.reference_edit.min_source_content_long_side_pixels,
+    )
+
+
 def _build_entity_reference_candidates(
     config: V3Config,
     storage: RunStorage,
@@ -742,17 +758,16 @@ def _build_entity_reference_candidates(
                 frames=frames,
             )
         )
+    minimum_area_pixels, minimum_long_side_pixels = (
+        entity_candidate_geometry_thresholds(config, entity.reference_type)
+    )
     non_tiny_candidates = [
         candidate
         for candidate in candidates
         if tiny_content_reason(
             content_geometry_from_mask(candidate.mask),
-            minimum_area_pixels=(
-                config.reference_edit.min_source_content_area_pixels
-            ),
-            minimum_long_side_pixels=(
-                config.reference_edit.min_source_content_long_side_pixels
-            ),
+            minimum_area_pixels=minimum_area_pixels,
+            minimum_long_side_pixels=minimum_long_side_pixels,
         )
         is None
     ]

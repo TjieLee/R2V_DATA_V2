@@ -19,7 +19,7 @@ MASK_SCHEMA_VERSION = "r2v.v3.masks.1"
 RUN_SCHEMA_VERSION = "r2v.v3.run.1"
 DATASET_SCHEMA_VERSION = "r2v.v3.dataset.1"
 SAMPLE_SCHEMA_VERSION = "r2v.v3.sample.1"
-MAX_ANNOTATION_ENTITIES = 5
+MAX_ANNOTATION_ENTITIES = 8
 
 _REF_TOKEN = re.compile(r"<ref_(?:subject|object|group|bg)_\d+>")
 _ANY_REF_TOKEN = re.compile(r"<ref_[^>]+>")
