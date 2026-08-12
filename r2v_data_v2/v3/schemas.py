@@ -861,7 +861,7 @@ class BackgroundReferenceState(SchemaModel):
         if self.removal_backend is not None and not self.removal_backend.strip():
             raise ValueError("removal_backend must not be empty")
 
-        if self.status in {"none", "clean_raw", "pending_remove"}:  # noqa: SIM102
+        if self.status in {"none", "clean_raw"}:  # noqa: SIM102
             if (
                 self.removal_backend is not None
                 or self.removal_seed is not None
@@ -871,6 +871,40 @@ class BackgroundReferenceState(SchemaModel):
             ):
                 raise ValueError(
                     f"{self.status} background cannot publish removal metadata"
+                )
+
+        if self.status == "pending_remove":
+            has_attempts = bool(self.removal_attempts)
+            if has_attempts:
+                if self.removal_backend is None:
+                    raise ValueError(
+                        "retryable pending_remove requires removal_backend"
+                    )
+                if self.reason is None or not self.reason.strip():
+                    raise ValueError("retryable pending_remove requires a reason")
+                if any(
+                    attempt.status == "accepted" for attempt in self.removal_attempts
+                ):
+                    raise ValueError(
+                        "retryable pending_remove cannot contain an accepted attempt"
+                    )
+                if not any(
+                    attempt.status == "failed" for attempt in self.removal_attempts
+                ):
+                    raise ValueError(
+                        "retryable pending_remove requires a failed attempt"
+                    )
+            elif self.removal_backend is not None or self.reason is not None:
+                raise ValueError(
+                    "fresh pending_remove cannot publish removal diagnostics"
+                )
+            if (
+                self.removal_seed is not None
+                or any(value is not None for value in generation_diagnostics)
+                or self.output_sha256 is not None
+            ):
+                raise ValueError(
+                    "pending_remove cannot publish generated output metadata"
                 )
 
         if self.status == "ready_removed":

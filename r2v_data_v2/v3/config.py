@@ -144,6 +144,7 @@ class BackgroundConfig:
 class RemoveConfig:
     enabled: bool = True
     backend: str = REMOVE_BACKEND
+    inference_profile: str = "object_remover_4step_v1"
     base_model_path: Path = field(default_factory=_default_remove_model)
     adapter_path: Path | None = field(default_factory=_default_remove_adapter)
     candidate_seeds: tuple[int, ...] = (0, 17)
@@ -151,7 +152,7 @@ class RemoveConfig:
     preserve_unmasked_pixels: bool = True
     device: str = "cuda"
     dtype: str = "bfloat16"
-    num_inference_steps: int = 40
+    num_inference_steps: int = 4
     true_cfg_scale: float = 4.0
     guidance_scale: float = 1.0
     negative_prompt: str = " "
@@ -503,12 +504,32 @@ class V3Config:
             raise ValueError("remove.device must be a non-empty string")
         if self.remove.dtype not in {"bfloat16", "float16", "float32"}:
             raise ValueError("remove.dtype must be bfloat16, float16, or float32")
+        if self.remove.inference_profile not in {
+            "object_remover_4step_v1",
+            "experimental_override",
+        }:
+            raise ValueError(
+                "remove.inference_profile must be object_remover_4step_v1 or "
+                "experimental_override"
+            )
         if (
             not isinstance(self.remove.num_inference_steps, int)
             or isinstance(self.remove.num_inference_steps, bool)
             or self.remove.num_inference_steps < 1
         ):
             raise ValueError("remove.num_inference_steps must be a positive integer")
+        if (
+            self.remove.inference_profile == "object_remover_4step_v1"
+            and self.remove.num_inference_steps != 4
+        ):
+            raise ValueError(
+                "remove.inference_profile=object_remover_4step_v1 requires "
+                "num_inference_steps=4"
+            )
+        if self.remove.enabled and self.remove.adapter_path is None:
+            raise ValueError(
+                "remove.adapter_path is required when the Object-Remover stage is enabled"
+            )
         for name, value in (
             ("true_cfg_scale", self.remove.true_cfg_scale),
             ("guidance_scale", self.remove.guidance_scale),
@@ -713,6 +734,7 @@ class V3Config:
         return {
             **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
             "remove.backend": self.remove.backend,
+            "remove.inference_profile": self.remove.inference_profile,
             "remove.base_model": str(self.remove.base_model_path),
             "remove.adapter": (
                 str(self.remove.adapter_path)

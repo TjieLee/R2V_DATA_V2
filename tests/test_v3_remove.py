@@ -522,6 +522,7 @@ def test_removal_attempt_schema_rejects_invalid_states(
         ({"max_generation_mask_area_ratio": 0.0}, "greater than 0"),
         ({"max_generation_mask_area_ratio": 1}, "finite float"),
         ({"adapter_weight_name": ""}, "non-empty string"),
+        ({"inference_profile": "fast"}, "inference_profile"),
         ({"save_rejected_candidates": 1}, "boolean"),
     ],
 )
@@ -544,10 +545,18 @@ def test_config_fingerprint_and_identifiers_cover_new_parameters(
     config = _config(tmp_path, monkeypatch)
     changed = replace(
         config,
-        remove=replace(config.remove, num_inference_steps=41),
+        remove=replace(
+            config.remove,
+            inference_profile="experimental_override",
+            num_inference_steps=41,
+        ),
     )
     assert changed.fingerprint() != config.fingerprint()
-    assert config.model_identifiers()["remove.num_inference_steps"] == "40"
+    assert config.model_identifiers()["remove.num_inference_steps"] == "4"
+    assert (
+        config.model_identifiers()["remove.inference_profile"]
+        == "object_remover_4step_v1"
+    )
     assert changed.model_identifiers()["remove.num_inference_steps"] == "41"
 
 
@@ -576,6 +585,7 @@ def test_remove_yaml_parser_loads_new_fields(
                 "  adapter_weight_name: object.safetensors",
                 "  candidate_seeds: [5]",
                 "  dtype: float16",
+                "  inference_profile: experimental_override",
                 "  num_inference_steps: 33",
                 "  generation_mask_dilation_pixels: 4",
                 "  max_generation_mask_area_ratio: 0.7",
@@ -588,6 +598,7 @@ def test_remove_yaml_parser_loads_new_fields(
     assert loaded.remove.adapter_weight_name == "object.safetensors"
     assert loaded.remove.candidate_seeds == (5,)
     assert loaded.remove.dtype == "float16"
+    assert loaded.remove.inference_profile == "experimental_override"
     assert loaded.remove.num_inference_steps == 33
     assert loaded.remove.generation_mask_dilation_pixels == 4
     assert loaded.remove.max_generation_mask_area_ratio == 0.7
@@ -689,49 +700,23 @@ def test_first_failure_second_accepts(
     assert stats.candidates_failed == 1
 
 
-@pytest.mark.parametrize(
-    ("judge_responses", "backend_responses", "expected_reason"),
-    [
-        (
-            [_reject("one"), _reject("two")],
-            None,
-            "all_removal_candidates_rejected",
-        ),
-        (
-            None,
-            [RuntimeError("one"), RuntimeError("two")],
-            "all_removal_candidates_failed",
-        ),
-        (
-            [_reject("one")],
-            [
-                Image.new("RGB", (WIDTH, HEIGHT), (200, 1, 1)),
-                RuntimeError("two"),
-            ],
-            "no_acceptable_removal_candidate",
-        ),
-    ],
-)
-def test_no_accepted_candidate_is_controlled_rejection(
+def test_all_quality_rejected_candidates_are_permanent_rejection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    judge_responses: list[BackgroundRemovalReview] | None,
-    backend_responses: list[Image.Image | Exception] | None,
-    expected_reason: str,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
     storage = _pending_storage(config)
     stats = remove_backgrounds(
         config,
         storage,
-        backend=_Backend(backend_responses),
-        judge=_Judge(judge_responses),
+        backend=_Backend(),
+        judge=_Judge([_reject("one"), _reject("two")]),
     )
     state = _background(storage)
     assert stats.processed == stats.rejected == 1
     assert stats.failed == 0
     assert state.status == "rejected"
-    assert state.reason == expected_reason
+    assert state.reason == "all_removal_candidates_rejected"
     assert state.output_image_path is None
     assert state.generation_mask_path is None
     assert state.output_sha256 is None
@@ -740,6 +725,104 @@ def test_no_accepted_candidate_is_controlled_rejection(
         for attempt in state.removal_attempts
     )
     assert storage.read_clip("clip-1").references.entities[0].entity_id == "e1"
+
+
+@pytest.mark.parametrize(
+    ("judge_responses", "backend_responses"),
+    [
+        (None, [RuntimeError("one"), RuntimeError("two")]),
+        (
+            [_reject("one")],
+            [
+                Image.new("RGB", (WIDTH, HEIGHT), (200, 1, 1)),
+                RuntimeError("two"),
+            ],
+        ),
+    ],
+)
+def test_backend_failure_keeps_background_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    judge_responses: list[BackgroundRemovalReview] | None,
+    backend_responses: list[Image.Image | Exception],
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+
+    stats = remove_backgrounds(
+        config,
+        storage,
+        backend=_Backend(backend_responses),
+        judge=_Judge(judge_responses),
+    )
+
+    state = _background(storage)
+    assert stats.processed == 1
+    assert stats.retryable_pending == 1
+    assert stats.rejected == 0
+    assert state.status == "pending_remove"
+    assert state.reason == "removal_infrastructure_failure"
+    assert any(attempt.status == "failed" for attempt in state.removal_attempts)
+
+
+def test_retryable_pending_can_be_retried_without_background_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = _pending_storage(config)
+    remove_backgrounds(
+        config,
+        storage,
+        backend=_Backend([RuntimeError("cuda failed"), RuntimeError("cuda failed")]),
+        judge=_Judge(),
+    )
+
+    stats = remove_backgrounds(
+        config,
+        storage,
+        backend=_Backend(),
+        judge=_Judge([_accept()]),
+    )
+
+    assert stats.ready_removed == 1
+    assert _background(storage).status == "ready_removed"
+
+
+def test_default_remove_profile_is_validated_four_step_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+
+    assert config.remove.inference_profile == "object_remover_4step_v1"
+    assert config.remove.num_inference_steps == 4
+    with pytest.raises(ValueError, match="requires num_inference_steps=4"):
+        replace(
+            config,
+            remove=replace(config.remove, num_inference_steps=40),
+        ).validate()
+    replace(
+        config,
+        remove=replace(
+            config.remove,
+            inference_profile="experimental_override",
+            num_inference_steps=40,
+        ),
+    ).validate()
+
+
+def test_enabled_remove_requires_object_remover_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="adapter_path is required"):
+        replace(
+            config,
+            remove=replace(config.remove, adapter_path=None),
+        ).validate()
 
 
 def test_generation_mask_too_large_rejects_before_backend_load(

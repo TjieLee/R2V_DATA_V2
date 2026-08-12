@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import inspect
+import json
+import re
+import sys
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -11,6 +14,7 @@ from r2v_data_v2.v3.config import RemoveConfig
 
 _OBJECT_REMOVER_ADAPTER = "object_remover"
 _SUPPORTED_WEIGHT_SUFFIXES = {".safetensors", ".bin"}
+_CUDA_DEVICE = re.compile(r"^cuda(?::(\d+))?$")
 
 
 class BackgroundRemovalBackend(Protocol):
@@ -132,6 +136,7 @@ class QwenImageEditRemovalBackend:
         self._load_error: BaseException | None = None
         self._adapter_weight_name = config.adapter_weight_name
         self._active_adapter_name: str | None = None
+        self._startup_diagnostics: dict[str, object] | None = None
 
     @property
     def base_model_path(self) -> Path:
@@ -148,6 +153,33 @@ class QwenImageEditRemovalBackend:
     @property
     def active_adapter_name(self) -> str | None:
         return self._active_adapter_name
+
+    @property
+    def startup_diagnostics(self) -> dict[str, object] | None:
+        return (
+            dict(self._startup_diagnostics)
+            if self._startup_diagnostics is not None
+            else None
+        )
+
+    def _validate_device(self, torch: Any) -> int:
+        match = _CUDA_DEVICE.fullmatch(self.config.device)
+        if match is None:
+            return int(torch.cuda.device_count()) if hasattr(torch, "cuda") else 0
+        visible_count = int(torch.cuda.device_count())
+        if not torch.cuda.is_available() or visible_count < 1:
+            raise RuntimeError(
+                f"remove.device={self.config.device} requires visible CUDA devices"
+            )
+        ordinal = int(match.group(1) or 0)
+        if ordinal >= visible_count:
+            raise ValueError(
+                "remove CUDA device ordinal is outside the visible device set: "
+                f"configured={self.config.device}, visible_cuda_device_count="
+                f"{visible_count}. When CUDA_VISIBLE_DEVICES remaps one physical GPU, "
+                "use device=cuda or cuda:0 inside that process."
+            )
+        return visible_count
 
     def _resolve_adapter_weight(self, adapter_path: Path) -> tuple[Path, str]:
         if adapter_path.is_file():
@@ -266,6 +298,8 @@ class QwenImageEditRemovalBackend:
         import torch
         from diffusers.utils import USE_PEFT_BACKEND
 
+        visible_cuda_device_count = self._validate_device(torch)
+
         if not USE_PEFT_BACKEND:
             raise RuntimeError(
                 "PEFT backend is required for the Object-Remover LoRA"
@@ -351,6 +385,26 @@ class QwenImageEditRemovalBackend:
         self._torch = torch
         self._adapter_weight_name = weight_name
         self._active_adapter_name = _OBJECT_REMOVER_ADAPTER
+        self._startup_diagnostics = {
+            "backend": self.config.backend,
+            "base_model": str(base_path),
+            "adapter_path": str(resolved_adapter),
+            "adapter_weight_file": str(adapter_directory / weight_name),
+            "active_adapter": self._active_adapter_name,
+            "num_inference_steps": self.config.num_inference_steps,
+            "dtype": self.config.dtype,
+            "configured_device": self.config.device,
+            "visible_cuda_device_count": visible_cuda_device_count,
+        }
+        print(
+            json.dumps(
+                {"v3_remove_startup": self._startup_diagnostics},
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _ensure_loaded(self) -> None:
         if self._pipeline is not None:
@@ -448,6 +502,7 @@ class QwenImageEditRemovalBackend:
         pipeline = self._pipeline
         self._pipeline = None
         self._active_adapter_name = None
+        self._startup_diagnostics = None
         if pipeline is not None:
             del pipeline
         torch = self._torch

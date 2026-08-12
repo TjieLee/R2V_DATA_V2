@@ -37,6 +37,7 @@ def _install_fake_runtime(
     output: object | None = None,
     pipeline_vae_scale_factor: int = 8,
     use_peft_backend: bool = True,
+    visible_cuda_device_count: int = 8,
 ) -> type:
     torch = types.ModuleType("torch")
     torch.bfloat16 = object()
@@ -45,6 +46,7 @@ def _install_fake_runtime(
     torch.Generator = _Generator
     torch.cuda = SimpleNamespace(
         is_available=lambda: True,
+        device_count=lambda: visible_cuda_device_count,
         empty_cache=lambda: events.append("empty_cache"),
     )
 
@@ -562,6 +564,59 @@ def test_load_activate_and_inference_order_and_parameters(
     assert inference[5].device == "cuda:1"
     assert inference[5].seed == 17
     assert inference[6:] == (4.5, "none", 23, 1.25, 1)
+    assert backend.startup_diagnostics == {
+        "backend": config.backend,
+        "base_model": str(config.base_model_path.resolve()),
+        "adapter_path": str(config.adapter_path.resolve()),
+        "adapter_weight_file": str(config.adapter_path.resolve()),
+        "active_adapter": "object_remover",
+        "num_inference_steps": 23,
+        "dtype": config.dtype,
+        "configured_device": "cuda:1",
+        "visible_cuda_device_count": 8,
+    }
+
+
+def test_invalid_visible_cuda_ordinal_fails_before_model_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    _install_fake_runtime(
+        monkeypatch,
+        events,
+        visible_cuda_device_count=1,
+    )
+    backend = QwenImageEditRemovalBackend(
+        replace(_config(tmp_path), device="cuda:4")
+    )
+
+    with pytest.raises(ValueError, match="outside the visible device set"):
+        _remove(backend)
+
+    assert not any(
+        isinstance(event, tuple) and event[0] == "from_pretrained"
+        for event in events
+    )
+
+
+def test_unqualified_cuda_uses_first_visible_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    _install_fake_runtime(
+        monkeypatch,
+        events,
+        visible_cuda_device_count=1,
+    )
+    backend = QwenImageEditRemovalBackend(
+        replace(_config(tmp_path), device="cuda")
+    )
+
+    _remove(backend)
+
+    assert ("to", "cuda") in events
 
 
 def test_backend_passes_padded_image_and_explicit_dimensions(

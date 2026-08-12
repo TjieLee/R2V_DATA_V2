@@ -48,6 +48,7 @@ class RemoveStats:
     failed: int = 0
     ready_removed: int = 0
     rejected: int = 0
+    retryable_pending: int = 0
     candidates_generated: int = 0
     candidates_rejected: int = 0
     candidates_failed: int = 0
@@ -397,6 +398,39 @@ def _publish_rejected(
     storage.cleanup_remove_artifacts(clip_uid)
 
 
+def _publish_retryable(
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    original: BackgroundReferenceState,
+    attempts: list[BackgroundRemovalAttempt],
+    reason: str,
+    removal_backend: str,
+) -> None:
+    state = BackgroundReferenceState(
+        status="pending_remove",
+        source_image_path=original.source_image_path,
+        source_frame_slot=original.source_frame_slot,
+        source_frame_index=original.source_frame_index,
+        source_mask_path=original.source_mask_path,
+        source_foreground_area_pixels=original.source_foreground_area_pixels,
+        source_foreground_area_ratio=original.source_foreground_area_ratio,
+        removal_backend=removal_backend,
+        removal_attempts=attempts,
+        reason=reason,
+    )
+    clip = storage.read_clip(clip_uid)
+    storage.write_references(
+        clip_uid,
+        ReferencesState(
+            entities=list(clip.references.entities),
+            background=state,
+        ),
+    )
+    storage.selected_background_output_path(clip_uid).unlink(missing_ok=True)
+    storage.cleanup_remove_artifacts(clip_uid)
+
+
 def _validate_output_png(
     path: Path,
     *,
@@ -551,6 +585,7 @@ def remove_backgrounds(
         "failed": 0,
         "ready_removed": 0,
         "rejected": 0,
+        "retryable_pending": 0,
         "candidates_generated": 0,
         "candidates_rejected": 0,
         "candidates_failed": 0,
@@ -730,20 +765,35 @@ def remove_backgrounds(
                     statuses = {attempt.status for attempt in attempts}
                     if statuses == {"rejected"}:
                         reason = "all_removal_candidates_rejected"
-                    elif statuses == {"failed"}:
-                        reason = "all_removal_candidates_failed"
+                        _publish_rejected(
+                            storage,
+                            clip_uid=clip_uid,
+                            original=state,
+                            reason=reason,
+                            removal_backend=config.remove.backend,
+                            attempts=attempts,
+                        )
+                        counters["rejected"] += 1
                     else:
-                        reason = "no_acceptable_removal_candidate"
-                    _publish_rejected(
-                        storage,
-                        clip_uid=clip_uid,
-                        original=state,
-                        reason=reason,
-                        removal_backend=config.remove.backend,
-                        attempts=attempts,
-                    )
+                        reason = "removal_infrastructure_failure"
+                        if state.status == "pending_remove":
+                            _publish_retryable(
+                                storage,
+                                clip_uid=clip_uid,
+                                original=state,
+                                attempts=[*state.removal_attempts, *attempts],
+                                reason=reason,
+                                removal_backend=config.remove.backend,
+                            )
+                            counters["retryable_pending"] += 1
+                        else:
+                            storage.append_failure(
+                                clip_uid=clip_uid,
+                                stage="remove",
+                                reason=reason,
+                            )
+                            counters["failed"] += 1
                     counters["processed"] += 1
-                    counters["rejected"] += 1
                     continue
 
                 candidate, candidate_bytes, candidate_sha, seed = accepted
@@ -757,7 +807,7 @@ def remove_backgrounds(
                     candidate_bytes=candidate_bytes,
                     candidate_sha256=candidate_sha,
                     seed=seed,
-                    attempts=attempts,
+                    attempts=[*state.removal_attempts, *attempts],
                 )
                 counters["processed"] += 1
                 counters["ready_removed"] += 1
