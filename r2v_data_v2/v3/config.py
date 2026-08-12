@@ -65,6 +65,7 @@ class QwenServiceConfig:
 class QwenAnnotationConfig(QwenServiceConfig):
     max_tokens: int = 4096
     repair_retries: int = 1
+    entity_selection_mode: str = "default"
     video: QwenVideoConfig = field(default_factory=QwenVideoConfig)
 
 
@@ -84,6 +85,9 @@ class SourceConfig:
     start_index: int = 0
     limit: int | None = None
     allow_full_run: bool = False
+    selection_mode: str = "sequential"
+    random_seed: int | None = None
+    max_clips_per_parent: int = 1
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,7 @@ class Sam3Config:
     model_path: Path | None = None
     device: str = "cuda"
     save_debug_overlays: bool = False
+    object_rescue_mode: str = "off"
 
 
 @dataclass(frozen=True)
@@ -244,6 +249,33 @@ class V3Config:
             raise ValueError(
                 "source.limit is required unless source.allow_full_run is true"
             )
+        if self.source.selection_mode not in {
+            "sequential",
+            "parent_stratified_random_v1",
+        }:
+            raise ValueError(
+                "source.selection_mode must be sequential or "
+                "parent_stratified_random_v1"
+            )
+        if (
+            not isinstance(self.source.max_clips_per_parent, int)
+            or isinstance(self.source.max_clips_per_parent, bool)
+            or self.source.max_clips_per_parent < 1
+        ):
+            raise ValueError("source.max_clips_per_parent must be a positive integer")
+        if self.source.selection_mode == "parent_stratified_random_v1":
+            if (
+                not isinstance(self.source.random_seed, int)
+                or isinstance(self.source.random_seed, bool)
+            ):
+                raise ValueError(
+                    "source.random_seed must be an integer for "
+                    "parent_stratified_random_v1"
+                )
+            if self.source.limit is None:
+                raise ValueError(
+                    "source.limit is required for parent_stratified_random_v1"
+                )
         for field_name, path in (
             ("run_root", run_root),
             ("export_root", export_root),
@@ -293,6 +325,14 @@ class V3Config:
             raise ValueError(
                 "qwen.annotation.repair_retries must be a non-negative integer"
             )
+        if self.qwen.annotation.entity_selection_mode not in {
+            "default",
+            "composition_balanced_v1",
+        }:
+            raise ValueError(
+                "qwen.annotation.entity_selection_mode must be default or "
+                "composition_balanced_v1"
+            )
         if self.frames.count != 10:
             raise ValueError("V3 requires exactly 10 sampled frames")
         if self.sam3.backend != "sam3":
@@ -301,6 +341,10 @@ class V3Config:
             raise ValueError("sam3.device must be a non-empty string")
         if not isinstance(self.sam3.save_debug_overlays, bool):
             raise TypeError("sam3.save_debug_overlays must be a boolean")
+        if self.sam3.object_rescue_mode not in {"off", "phrase_retry_v1"}:
+            raise ValueError(
+                "sam3.object_rescue_mode must be off or phrase_retry_v1"
+            )
         if self.sam3.model_path is not None:
             sam3_model = self.sam3.model_path.expanduser().resolve(strict=False)
             if not (

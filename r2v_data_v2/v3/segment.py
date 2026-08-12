@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 import shutil
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
 
+from r2v_data_v2.reconciliation import rebuild_jsonl, write_json_atomic
 from r2v_data_v2.v3.config import V3Config
 from r2v_data_v2.v3.frames import validate_sampled_frames
 from r2v_data_v2.v3.mask_codec import (
@@ -40,6 +42,13 @@ class SegmentStats:
     entities_ready: int = 0
     entities_not_found: int = 0
     entities_failed: int = 0
+    object_rescue_attempted: int = 0
+    object_not_found_retry_attempted: int = 0
+    object_not_found_retry_ready: int = 0
+    cross_type_collision_detected: int = 0
+    cross_type_collision_retry_attempted: int = 0
+    cross_type_collision_retry_ready: int = 0
+    cross_type_collision_unresolved: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -56,6 +65,35 @@ class CrossEntityDuplicateDecision:
     is_duplicate: bool
     winner_entity_id: str | None = None
     loser_entity_id: str | None = None
+
+
+_RESCUE_COUNTER_NAMES = (
+    "object_rescue_attempted",
+    "object_not_found_retry_attempted",
+    "object_not_found_retry_ready",
+    "cross_type_collision_detected",
+    "cross_type_collision_retry_attempted",
+    "cross_type_collision_retry_ready",
+    "cross_type_collision_unresolved",
+)
+
+
+def _empty_rescue_counters() -> dict[str, int]:
+    return {name: 0 for name in _RESCUE_COUNTER_NAMES}
+
+
+def _rescue_diagnostic_path(storage: RunStorage, clip_uid: str) -> Path:
+    return storage.root / "diagnostics" / "object_rescue" / f"{clip_uid}.json"
+
+
+def _track_summary(track: TrackedEntityMasks) -> dict[str, str | None]:
+    return {"status": track.status, "reason": track.reason}
+
+
+def _duplicate_metrics(
+    decision: CrossEntityDuplicateDecision | None,
+) -> dict[str, object] | None:
+    return None if decision is None else asdict(decision)
 
 
 def _empty_rle(height: int, width: int) -> MaskRle:
@@ -430,6 +468,145 @@ def _entity_masks_from_result(
     )
 
 
+def _track_with_prompt(
+    backend: SegmentationBackend,
+    entity: AnnotationEntity,
+    *,
+    frame_paths: list[Path],
+    grounding_prompt: str,
+    height: int,
+    width: int,
+    retry_index: int,
+    operation: str,
+    clip_uid: str,
+) -> TrackedEntityMasks:
+    with profile_model_call(
+        component="sam3_segment_track",
+        operation=operation,
+        retry_index=retry_index,
+        model=type(backend).__name__,
+        metadata={
+            "clip_uid": clip_uid,
+            "entity_id": entity.entity_id,
+            "reference_type": entity.reference_type,
+        },
+    ):
+        result = backend.track(
+            frame_paths=frame_paths,
+            entity_id=entity.entity_id,
+            reference_type=entity.reference_type,
+            grounding_prompt=grounding_prompt,
+        )
+    return _entity_masks_from_result(
+        entity,
+        result,
+        height=height,
+        width=width,
+    )
+
+
+def _rescue_subject_object_collisions(
+    entities: list[AnnotationEntity],
+    tracks: dict[str, TrackedEntityMasks],
+    *,
+    height: int,
+    width: int,
+    retry_object: Callable[[AnnotationEntity, str], TrackedEntityMasks],
+    phrase_retried: set[str],
+    counters: dict[str, int],
+    diagnostics: list[dict[str, object]],
+) -> dict[str, TrackedEntityMasks]:
+    rescued = dict(tracks)
+    annotation_index = {
+        entity.entity_id: index for index, entity in enumerate(entities)
+    }
+    subjects = [entity for entity in entities if entity.reference_type == "subject"]
+    objects = [entity for entity in entities if entity.reference_type == "object"]
+    for subject in subjects:
+        if rescued[subject.entity_id].status != "ready":
+            continue
+        for object_entity in objects:
+            if rescued[object_entity.entity_id].status != "ready":
+                continue
+            before = compare_cross_entity_tracks(
+                subject.entity_id,
+                rescued[subject.entity_id],
+                object_entity.entity_id,
+                rescued[object_entity.entity_id],
+                first_annotation_index=annotation_index[subject.entity_id],
+                second_annotation_index=annotation_index[object_entity.entity_id],
+            )
+            if not before.is_duplicate:
+                continue
+
+            counters["cross_type_collision_detected"] += 1
+            original = rescued[object_entity.entity_id]
+            retry: TrackedEntityMasks | None = None
+            after: CrossEntityDuplicateDecision | None = None
+            if object_entity.entity_id not in phrase_retried:
+                phrase_retried.add(object_entity.entity_id)
+                counters["object_rescue_attempted"] += 1
+                counters["cross_type_collision_retry_attempted"] += 1
+                retry = retry_object(object_entity, "cross_type_collision")
+                if retry.status == "ready":
+                    after = compare_cross_entity_tracks(
+                        subject.entity_id,
+                        rescued[subject.entity_id],
+                        object_entity.entity_id,
+                        retry,
+                        first_annotation_index=annotation_index[subject.entity_id],
+                        second_annotation_index=annotation_index[
+                            object_entity.entity_id
+                        ],
+                    )
+                    if not after.is_duplicate:
+                        rescued[object_entity.entity_id] = retry
+                        counters["cross_type_collision_retry_ready"] += 1
+            else:
+                # The current track is already the sole allowed phrase retry.
+                after = before
+
+            unresolved = (
+                retry is None
+                or retry.status != "ready"
+                or after is None
+                or after.is_duplicate
+            )
+            diagnostics.append(
+                {
+                    "kind": "cross_type_collision",
+                    "entity_id": object_entity.entity_id,
+                    "reference_type": object_entity.reference_type,
+                    "original_grounding_prompt": object_entity.grounding_prompt,
+                    "retry_phrase": object_entity.phrase,
+                    "original": _track_summary(original),
+                    "retry": (
+                        _track_summary(retry)
+                        if retry is not None
+                        else {
+                            "status": "not_attempted",
+                            "reason": "phrase_retry_already_used",
+                        }
+                    ),
+                    "subject_collision_entity_id": subject.entity_id,
+                    "duplicate_metrics_before_retry": _duplicate_metrics(before),
+                    "duplicate_metrics_after_retry": _duplicate_metrics(after),
+                }
+            )
+            if unresolved:
+                counters["cross_type_collision_unresolved"] += 1
+                rescued[object_entity.entity_id] = _failed_entity(
+                    object_entity,
+                    height=height,
+                    width=width,
+                    reason=(
+                        "cross_type_subject_object_collision_unresolved:"
+                        f"{subject.entity_id}"
+                    ),
+                )
+    return rescued
+
+
 def _validate_existing_masks(
     storage: RunStorage,
     *,
@@ -562,6 +739,8 @@ def _segment_clips_with_backend(
 ) -> SegmentStats:
     processed = skipped_existing = skipped_not_ready = failed = 0
     ready_count = not_found_count = entity_failed_count = 0
+    rescue_counters = _empty_rescue_counters()
+    rescue_enabled = config.sam3.object_rescue_mode == "phrase_retry_v1"
     for clip in storage.iter_clips():
         annotation = clip.annotation
         if annotation is None or annotation.status != "ready":
@@ -586,6 +765,9 @@ def _segment_clips_with_backend(
                 skipped_existing += 1
             continue
 
+        rescue_path = _rescue_diagnostic_path(storage, clip.clip_uid)
+        if rescue_enabled:
+            rescue_path.unlink(missing_ok=True)
         try:
             frames = validate_sampled_frames(storage, clip.clip_uid)
             frame_paths = [
@@ -594,30 +776,51 @@ def _segment_clips_with_backend(
             ]
             storage.prepare_masks_publication(clip.clip_uid)
             tracked_entities: dict[str, TrackedEntityMasks] = {}
+            clip_rescue_counters = _empty_rescue_counters()
+            clip_diagnostics: list[dict[str, object]] = []
+            phrase_retried: set[str] = set()
+
+            def retry_object(
+                retry_entity: AnnotationEntity,
+                operation: str,
+                *,
+                _frame_paths: list[Path] = frame_paths,
+                _height: int = frames.height,
+                _width: int = frames.width,
+                _clip_uid: str = clip.clip_uid,
+            ) -> TrackedEntityMasks:
+                try:
+                    return _track_with_prompt(
+                        backend,
+                        retry_entity,
+                        frame_paths=_frame_paths,
+                        grounding_prompt=retry_entity.phrase,
+                        height=_height,
+                        width=_width,
+                        retry_index=1,
+                        operation=operation,
+                        clip_uid=_clip_uid,
+                    )
+                except Exception as exc:  # noqa: BLE001 - rescue fails closed
+                    return _failed_entity(
+                        retry_entity,
+                        height=_height,
+                        width=_width,
+                        reason=str(exc),
+                    )
+
             for entity in annotation.entities:
                 try:
-                    with profile_model_call(
-                        component="sam3_segment_track",
-                        operation="track",
-                        retry_index=0,
-                        model=type(backend).__name__,
-                        metadata={
-                            "clip_uid": clip.clip_uid,
-                            "entity_id": entity.entity_id,
-                            "reference_type": entity.reference_type,
-                        },
-                    ):
-                        result = backend.track(
-                            frame_paths=frame_paths,
-                            entity_id=entity.entity_id,
-                            reference_type=entity.reference_type,
-                            grounding_prompt=entity.grounding_prompt,
-                        )
-                    entity_masks = _entity_masks_from_result(
+                    entity_masks = _track_with_prompt(
+                        backend,
                         entity,
-                        result,
+                        frame_paths=frame_paths,
+                        grounding_prompt=entity.grounding_prompt,
                         height=frames.height,
                         width=frames.width,
+                        retry_index=0,
+                        operation="track",
+                        clip_uid=clip.clip_uid,
                     )
                 except Exception as exc:  # noqa: BLE001 - isolate entity tracking
                     entity_masks = _failed_entity(
@@ -632,8 +835,50 @@ def _segment_clips_with_backend(
                         reason=str(exc),
                         details={"entity_id": entity.entity_id},
                     )
+                if (
+                    rescue_enabled
+                    and entity.reference_type == "object"
+                    and entity_masks.status == "not_found"
+                ):
+                    phrase_retried.add(entity.entity_id)
+                    clip_rescue_counters["object_rescue_attempted"] += 1
+                    clip_rescue_counters[
+                        "object_not_found_retry_attempted"
+                    ] += 1
+                    original = entity_masks
+                    retry = retry_object(entity, "object_not_found_retry")
+                    if retry.status == "ready":
+                        entity_masks = retry
+                        clip_rescue_counters[
+                            "object_not_found_retry_ready"
+                        ] += 1
+                    clip_diagnostics.append(
+                        {
+                            "kind": "object_not_found",
+                            "entity_id": entity.entity_id,
+                            "reference_type": entity.reference_type,
+                            "original_grounding_prompt": entity.grounding_prompt,
+                            "retry_phrase": entity.phrase,
+                            "original": _track_summary(original),
+                            "retry": _track_summary(retry),
+                            "subject_collision_entity_id": None,
+                            "duplicate_metrics_before_retry": None,
+                            "duplicate_metrics_after_retry": None,
+                        }
+                    )
                 tracked_entities[entity.entity_id] = entity_masks
 
+            if rescue_enabled:
+                tracked_entities = _rescue_subject_object_collisions(
+                    annotation.entities,
+                    tracked_entities,
+                    height=frames.height,
+                    width=frames.width,
+                    retry_object=retry_object,
+                    phrase_retried=phrase_retried,
+                    counters=clip_rescue_counters,
+                    diagnostics=clip_diagnostics,
+                )
             tracked_entities = _deduplicate_cross_entity_tracks(
                 annotation.entities,
                 tracked_entities,
@@ -665,6 +910,21 @@ def _segment_clips_with_backend(
                     artifact=artifact,
                 )
             storage.write_masks(clip.clip_uid, artifact)
+            if rescue_enabled:
+                write_json_atomic(
+                    rescue_path,
+                    {
+                        "schema_version": "r2v.v3.object_rescue_diagnostic.1",
+                        "clip_uid": clip.clip_uid,
+                        "counters": clip_rescue_counters,
+                        "attempts": [
+                            {"clip_uid": clip.clip_uid, **diagnostic}
+                            for diagnostic in clip_diagnostics
+                        ],
+                    },
+                )
+                for name in _RESCUE_COUNTER_NAMES:
+                    rescue_counters[name] += clip_rescue_counters[name]
             processed += 1
         except Exception as exc:  # noqa: BLE001 - isolate per-clip stage failures
             storage.append_failure(
@@ -673,6 +933,12 @@ def _segment_clips_with_backend(
                 reason=str(exc),
             )
             failed += 1
+    if rescue_enabled:
+        diagnostic_root = storage.root / "diagnostics" / "object_rescue"
+        rebuild_jsonl(
+            storage.root / "diagnostics" / "object_rescue.jsonl",
+            diagnostic_root.glob("*.json"),
+        )
     stats = SegmentStats(
         processed=processed,
         skipped_existing=skipped_existing,
@@ -681,6 +947,7 @@ def _segment_clips_with_backend(
         entities_ready=ready_count,
         entities_not_found=not_found_count,
         entities_failed=entity_failed_count,
+        **rescue_counters,
     )
     storage.update_stage_counts("segment", stats.to_dict())
     return stats

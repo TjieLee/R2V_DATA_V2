@@ -175,6 +175,28 @@ is non-null,
 background phrase in the same way. When background is null, do not include that
 placeholder. Return JSON only."""
 
+COMPOSITION_BALANCED_ENTITY_SELECTION_PROMPT = """After selecting the clearest
+primary reference candidate, perform one brief complementary scan. When both a
+stable independently referenceable subject and a stable independently
+referenceable non-human object are clearly visible and trackable, prefer at
+least one candidate of each type before extra candidates of the same type. This
+is a preference, not a quota; never invent a candidate to satisfy it. A useful
+object may be a distinct garment, tool, container, vehicle, piece of furniture,
+device, food item, or other stable physical object with independent reference
+value. Never classify a person, animal, body part, depicted person, photograph,
+poster, screen content, or a whole person-plus-object composite as an object."""
+
+
+def annotation_system_prompt(config: QwenAnnotationConfig) -> str:
+    if config.entity_selection_mode == "default":
+        return SYSTEM_PROMPT
+    if config.entity_selection_mode == "composition_balanced_v1":
+        return f"{SYSTEM_PROMPT}\n\n{COMPOSITION_BALANCED_ENTITY_SELECTION_PROMPT}"
+    raise ValueError(
+        f"unsupported annotation entity selection mode: "
+        f"{config.entity_selection_mode}"
+    )
+
 
 @dataclass(frozen=True)
 class AnnotationAttempt:
@@ -874,7 +896,7 @@ class QwenAnnotationClient:
         request_text: str,
     ) -> list[dict[str, object]]:
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": annotation_system_prompt(self.config)},
             {
                 "role": "user",
                 "content": [
