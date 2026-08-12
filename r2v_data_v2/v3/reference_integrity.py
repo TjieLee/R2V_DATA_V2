@@ -28,6 +28,17 @@ from r2v_data_v2.v3.storage import RunStorage
 
 SYSTEM_PROMPT = """You are the final integrity reviewer for one entity reference.
 Compare the highlighted target in the source context with the final reference.
+The final reference must denote the same complete entity as the annotation
+phrase. Do not reinterpret the target as a convenient sub-entity. When a
+container-and-contents relationship is part of the annotated entity identity,
+the reference must preserve that defining relationship; recognizable contents
+alone are insufficient. Identity-defining nouns and structure must remain,
+although modifiers describing only a transient state need not all remain
+visually obvious. For example, "a clay pot of stew" must reject when only stew
+remains, and "a bowl of noodles" must reject when only noodles remain. For the
+object "a camera", the camera itself must remain. For the subject "a man in a
+white t-shirt", an unrelated held bowl or chopsticks may disappear if the
+stable subject identity remains.
 For a subject, require enough stable identity-bearing appearance for the stated
 scope, but do not require a visible face in every valid back view, masked person,
 character, or animal. Reject a torso, arms, or clothing fragment when the source

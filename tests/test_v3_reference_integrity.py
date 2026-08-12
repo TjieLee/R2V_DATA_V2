@@ -22,6 +22,7 @@ from r2v_data_v2.v3.config import (
 from r2v_data_v2.v3.entity_composition_audit import audit_entity_composition
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.reference_integrity import (
+    SYSTEM_PROMPT,
     ReferenceIntegrityJudgeFailure,
     ReferenceIntegrityReviewAttempt,
     reference_integrity_clips,
@@ -50,9 +51,16 @@ from r2v_data_v2.v3.schemas import (
 from r2v_data_v2.v3.storage import RunStorage
 
 
-def _review(*, accept: bool, reason: str = "reviewed") -> ReferenceIntegrityReview:
+def _review(
+    *,
+    accept: bool,
+    reason: str = "reviewed",
+    preserves_semantics: bool | None = None,
+) -> ReferenceIntegrityReview:
+    semantic_fidelity = accept if preserves_semantics is None else preserves_semantics
     return ReferenceIntegrityReview(
         matches_target=accept,
+        preserves_annotated_entity_semantics=semantic_fidelity,
         recognizable_as_named_entity=accept,
         structurally_complete_for_scope=accept,
         no_major_missing_regions=accept,
@@ -61,6 +69,21 @@ def _review(*, accept: bool, reason: str = "reviewed") -> ReferenceIntegrityRevi
         usable_as_independent_reference=accept,
         verdict="accept" if accept else "reject",
         reason=reason,
+    )
+
+
+def _semantic_reinterpretation_review() -> ReferenceIntegrityReview:
+    return ReferenceIntegrityReview(
+        matches_target=True,
+        preserves_annotated_entity_semantics=False,
+        recognizable_as_named_entity=True,
+        structurally_complete_for_scope=True,
+        no_major_missing_regions=True,
+        no_unnatural_holes_or_surface_loss=True,
+        no_unrelated_entity_dominance=True,
+        usable_as_independent_reference=True,
+        verdict="reject",
+        reason="only the stew remains; the annotated clay pot is missing",
     )
 
 
@@ -166,6 +189,7 @@ def _storage_with_ready_pair(
     second_scope: str = "local",
     second_synthetic: bool = False,
     second_hole: bool = False,
+    second_phrase: str = "a metal bracket",
 ) -> RunStorage:
     storage = RunStorage(_config(tmp_path, monkeypatch))
     storage.initialize(git_commit="integrity-test")
@@ -192,8 +216,8 @@ def _storage_with_ready_pair(
         AnnotationEntity(
             entity_id="e2",
             reference_type="object",
-            phrase="a metal bracket",
-            grounding_prompt="metal bracket beside the person",
+            phrase=second_phrase,
+            grounding_prompt=f"{second_phrase} beside the person",
         ),
     ]
     storage.write_annotation(
@@ -317,6 +341,45 @@ def _storage_with_ready_pair(
     return storage
 
 
+def test_integrity_schema_requires_semantic_fidelity_for_acceptance() -> None:
+    accepted = _review(accept=True).model_dump(mode="json")
+
+    missing = dict(accepted)
+    missing.pop("preserves_annotated_entity_semantics")
+    with pytest.raises(ValueError):
+        ReferenceIntegrityReview.model_validate(missing)
+
+    non_boolean = {
+        **accepted,
+        "preserves_annotated_entity_semantics": 1,
+    }
+    with pytest.raises(ValueError):
+        ReferenceIntegrityReview.model_validate(non_boolean)
+
+    contradicted = {
+        **accepted,
+        "preserves_annotated_entity_semantics": False,
+    }
+    with pytest.raises(ValueError, match="must match all integrity checks"):
+        ReferenceIntegrityReview.model_validate(contradicted)
+
+
+def test_integrity_prompt_forbids_sub_entity_reinterpretation() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.lower().split())
+
+    for contract in (
+        "same complete entity as the annotation phrase",
+        "do not reinterpret the target as a convenient sub-entity",
+        "recognizable contents alone are insufficient",
+        '"a clay pot of stew" must reject when only stew remains',
+        '"a bowl of noodles" must reject when only noodles remain',
+        'for the object "a camera", the camera itself must remain',
+        'for the subject "a man in a white t-shirt"',
+        "an unrelated held bowl or chopsticks may disappear",
+    ):
+        assert contract in prompt
+
+
 def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:
     rgba = np.zeros((80, 80, 4), dtype=np.uint8)
     rgba[8:72, 8:72, :3] = 80
@@ -347,6 +410,30 @@ def test_integrity_rejects_entity_and_invalidates_instruction_export(
     assert clip.references.entities[1].status == "rejected"
     assert clip.instruction is None
     assert clip.export == ExportState()
+
+
+def test_integrity_rejects_reference_reinterpreted_as_contained_food(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_phrase="a steaming clay pot of stew",
+    )
+    judge = FakeIntegrityJudge([_semantic_reinterpretation_review()])
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    clip = storage.read_clip("clip-1")
+    assert judge.calls[0]["phrase"] == "a steaming clay pot of stew"
+    assert stats.entities_rejected == 1
+    assert clip.references.entities[1].status == "rejected"
+    assert clip.reference_integrity is not None
+    result = clip.reference_integrity.entities[1]
+    assert result.review is not None
+    assert result.review.preserves_annotated_entity_semantics is False
+    assert result.status == "rejected"
 
 
 @pytest.mark.parametrize(
