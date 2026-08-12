@@ -115,19 +115,125 @@ AssociationMethod = Literal[
 ]
 
 
+class EntityAssociationCandidateEvidence(SchemaModel):
+    entity_id: str
+    aligned_sampled_slots: int = Field(ge=0, le=10)
+    matched_sampled_slots: int = Field(ge=0, le=10)
+    mean_face_bbox_coverage: float = Field(ge=0, le=1)
+    face_center_inside_count: int = Field(ge=0, le=10)
+    temporal_consistency: float = Field(ge=0, le=1)
+    association_score: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_candidate(self) -> EntityAssociationCandidateEvidence:
+        if _ENTITY_ID.fullmatch(self.entity_id) is None:
+            raise ValueError("association candidate entity_id must use eN")
+        if self.matched_sampled_slots > self.aligned_sampled_slots:
+            raise ValueError("matched association slots cannot exceed aligned slots")
+        if self.face_center_inside_count > self.matched_sampled_slots:
+            raise ValueError("face center matches cannot exceed matched slots")
+        expected_consistency = (
+            self.matched_sampled_slots / self.aligned_sampled_slots
+            if self.aligned_sampled_slots
+            else 0.0
+        )
+        if not math.isclose(
+            self.temporal_consistency,
+            expected_consistency,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("association temporal consistency is inconsistent")
+        return self
+
+
 class EntityFaceAssociation(SchemaModel):
     face_track_id: str
-    entity_id: str
+    status: Literal["matched", "ambiguous", "unmatched"] = "matched"
+    entity_id: Optional[str] = None
     confidence: float = Field(ge=0, le=1)
     method: AssociationMethod
+    candidates: list[EntityAssociationCandidateEvidence] = Field(default_factory=list)
+    top1_top2_margin: Optional[float] = Field(default=None, ge=0, le=1)
+    reason: Optional[str] = None
     evidence: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_ids(self) -> EntityFaceAssociation:
         if _FACE_TRACK_ID.fullmatch(self.face_track_id) is None:
             raise ValueError("association face_track_id must use face_N")
-        if _ENTITY_ID.fullmatch(self.entity_id) is None:
-            raise ValueError("association entity_id must use eN")
+        if self.status == "matched":
+            if self.entity_id is None or _ENTITY_ID.fullmatch(self.entity_id) is None:
+                raise ValueError("matched association entity_id must use eN")
+            if self.reason is not None:
+                raise ValueError("matched association cannot have a failure reason")
+        else:
+            if self.entity_id is not None:
+                raise ValueError("non-matched association cannot claim an entity")
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("non-matched association requires a reason")
+        candidate_ids = [candidate.entity_id for candidate in self.candidates]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("association candidate entity IDs must be unique")
+        if self.candidates != sorted(
+            self.candidates,
+            key=lambda item: (-item.association_score, item.entity_id),
+        ):
+            raise ValueError("association candidates must use deterministic order")
+        if (
+            self.status == "matched"
+            and self.candidates
+            and self.candidates[0].entity_id != self.entity_id
+        ):
+            raise ValueError("matched entity must be the top association candidate")
+        return self
+
+
+class ASDModelProvenance(SchemaModel):
+    backend: str
+    model_identifier: str
+    checkpoint_path: str
+    checkpoint_sha256: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> ASDModelProvenance:
+        if not self.backend.strip() or not self.model_identifier.strip():
+            raise ValueError("ASD backend and model identifier must not be empty")
+        if not self.checkpoint_path.strip():
+            raise ValueError("ASD checkpoint path must not be empty")
+        if self.checkpoint_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.checkpoint_sha256
+        ):
+            raise ValueError("ASD checkpoint SHA-256 must be lowercase hexadecimal")
+        return self
+
+
+class ActiveSpeakerFaceScore(SchemaModel):
+    face_track_id: str
+    raw_backend_score: float
+    backend_native_active: bool
+    score_semantics: Literal[
+        "lr_asd_native_class_1_logit",
+        "derived_normalized_score",
+    ]
+    normalized_score: Optional[float] = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_score(self) -> ActiveSpeakerFaceScore:
+        if _FACE_TRACK_ID.fullmatch(self.face_track_id) is None:
+            raise ValueError("ASD face score ID must use face_N")
+        if not math.isfinite(self.raw_backend_score):
+            raise ValueError("ASD raw backend score must be finite")
+        if (
+            self.score_semantics == "lr_asd_native_class_1_logit"
+            and self.backend_native_active != (self.raw_backend_score >= 0)
+        ):
+            raise ValueError("LR-ASD active decision must preserve score >= 0")
+        if (
+            self.score_semantics == "derived_normalized_score"
+            and self.normalized_score is None
+        ):
+            raise ValueError("derived normalized score requires normalized_score")
         return self
 
 
@@ -136,8 +242,10 @@ class ActiveSpeakerInterval(SchemaModel):
     end_time: float = Field(gt=0)
     speech_present: bool
     visible_face_track_ids: list[str] = Field(default_factory=list)
+    face_scores: list[ActiveSpeakerFaceScore] = Field(default_factory=list)
     face_speaking_probabilities: dict[str, float] = Field(default_factory=dict)
     asd_coverage_ratio: float = Field(ge=0, le=1)
+    model_provenance: Optional[ASDModelProvenance] = None
     audio_quality_usable: bool
     synchronization_plausible: bool
 
@@ -158,9 +266,18 @@ class ActiveSpeakerInterval(SchemaModel):
             if not math.isfinite(probability) or not 0 <= probability <= 1:
                 raise ValueError("ASD probabilities must be finite and in [0, 1]")
         visible = set(self.visible_face_track_ids)
-        scored = set(self.face_speaking_probabilities)
+        score_ids = [score.face_track_id for score in self.face_scores]
+        if len(score_ids) != len(set(score_ids)):
+            raise ValueError("ASD native face scores must use unique track IDs")
+        native_scored = set(score_ids)
+        normalized_scored = set(self.face_speaking_probabilities)
+        if native_scored and normalized_scored - native_scored:
+            raise ValueError("normalized ASD scores require native face evidence")
+        scored = native_scored or normalized_scored
         if scored - visible:
             raise ValueError("ASD scores must refer to visible face tracks")
+        if self.face_scores and self.model_provenance is None:
+            raise ValueError("native ASD scores require model provenance")
         expected_coverage = len(scored) / len(visible) if visible else 1.0
         if not math.isclose(
             self.asd_coverage_ratio,

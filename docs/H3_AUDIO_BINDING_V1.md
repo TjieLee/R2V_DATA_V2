@@ -33,27 +33,39 @@ These rules apply only to the new audio-binding sidecar dataset.
 
 ```text
 completed V3 run + source video
-  |-- existing annotation, pairing, references, and entity IDs
-  |-- AudioPreprocessorBackend -> bounded audio metadata
-  |-- FaceTrackingBackend -> bounded sampled face geometry
-  |-- EntityFaceAssociationBackend -> compare face geometry with V3/SAM3 masks
-  `-- ActiveSpeakerBackend -> interval-level face speaking probabilities
+  |-- existing annotation, pairing, references, frames, and entity masks
+  |-- isolated LR-ASD raw-video run -> face tracks + native ASD logits
+  |-- independent Silero VAD -> speech/no-speech intervals
+  `-- timestamp-aligned face-box/entity-mask association evidence
           |
           `-- deterministic fusion -> AudioEntityBinding
                   |
-                  |-- clean bound intervals -> VoiceReferenceBackend
-                  `-- explicit task variant -> deterministic H3 IR and rendering
+                  |-- pilot-only review audio and visualization
+                  `-- reference_generation-only H3 IR
 ```
 
 No multimodal LLM owns binding, eligibility, task type, asset numbering, or H3
-rendering. Real model adapters remain outside deterministic business logic.
+rendering. No voice-reference asset is published by the pilot.
 
 ## Pretrained ASD Candidates
 
-No backend is installed in this pass. The primary candidate for the first
-read-only server evaluation is
-[LR-ASD](https://github.com/Junhua-Liao/LR-ASD). It is evaluated as an adapter
-candidate, not accepted as production behavior by this document.
+[LR-ASD](https://github.com/Junhua-Liao/LR-ASD) is the first real read-only pilot
+backend. Its environment stays isolated from the R2V environment and is invoked
+by subprocess. The pilot runs the official raw-video path once per clip:
+
+- convert the model video to 25 FPS;
+- extract 16 kHz mono audio;
+- detect faces with S3FD;
+- run shot-aware IoU face tracking;
+- use the official face-crop preprocessing;
+- run official LR-ASD inference.
+
+The unmodified vendor output is converted to strict JSON before R2V business
+logic reads it. The vendor model returns a native class-1 logit when labels are
+absent, and its demo uses `score >= 0` as the active decision. The pilot stores
+that raw score and native decision explicitly. It does not describe the score as
+a calibrated probability. Independent speech activity uses a local Silero VAD
+JIT model on CPU; V1 does not perform speaker diarization.
 
 Baseline comparisons remain:
 
@@ -66,10 +78,10 @@ TS-TalkNet remains a possible future identity-aware experiment because it uses
 a pre-enrolled speaker reference, but it is not a V1 baseline or implementation
 dependency.
 
-Before choosing one, audit its license, checkpoint provenance, face-crop and
-audio preprocessing contract, output timing, offline loading, server dependency
-isolation, and behavior on dubbed, offscreen, overlapping, profile-face, and
-small-face clips. The business layer consumes only normalized interval scores.
+Before production use, audit license and checkpoint provenance, output timing,
+offline loading, server dependency isolation, and behavior on dubbed, offscreen,
+overlapping, profile-face, and small-face clips. Oxford `ca-subtitle` and
+`av-diarization` remain reference architectures, not dependencies in this pass.
 
 ## Durable Sidecar Contract
 
@@ -104,10 +116,13 @@ adapter can compare sampled face boxes with existing V3/SAM3 entity masks.
 `EntityFaceAssociation` records the resulting method and confidence.
 
 `ActiveSpeakerInterval` stores a non-overlapping speech interval, the visible
-face-track IDs, bounded speaking probabilities, exact ASD coverage ratio,
+face-track IDs, native per-face score evidence, exact ASD coverage ratio,
 synchronization plausibility, and audio usability. It does not assign an entity.
 Every scored face must be visible, and the ratio must equal scored-visible faces
-divided by all visible faces.
+divided by all visible faces. Both the strict LR-ASD-native artifact and the
+normalized H3 evidence preserve the 25-FPS frame-level native logits. Review
+audio extraction may merge adjacent deterministic bound states without changing
+the machine-readable evidence.
 
 `AudioEntityBinding` stores deterministic status:
 
@@ -135,12 +150,19 @@ allowed.
 
 ## Deterministic V1 Fusion
 
-The scaffold policy exposes explicit thresholds. A bound result requires:
+The pilot policy exposes explicit, configurable thresholds. Face tracks are
+aligned independently to each V3 sampled-frame timestamp by nearest timestamp
+within the configured tolerance. Association records timestamp delta, face-box
+coverage by each entity mask, face-center containment, matched sampled slots,
+temporal consistency, and the top-1/top-2 entity margin. Face-box/mask IoU alone
+does not decide association.
+
+A bound result requires:
 
 1. audio status `ready`;
 2. speech present and interval duration above the configured minimum;
-3. exactly one face probability at or above the active threshold;
-4. sufficient margin over the second score;
+3. exactly one face with a backend-native active decision;
+4. complete ASD coverage for visible faces;
 5. one association for that face track above the association threshold;
 6. usable audio and plausible synchronization.
 
@@ -151,10 +173,51 @@ Intermediate scores, close scores, missing association, or failed
 quality/synchronization evidence also produce `ambiguous`. The system never
 forces every speech interval onto an entity.
 
-All thresholds in the scaffold are unvalidated interface defaults for
-deterministic tests. They are not production values. LR-ASD and baseline server
-evidence must justify ASD coverage, active-speaker, association, duration, sync,
-and voice-quality thresholds before any adapter or policy is frozen.
+All thresholds in the scaffold and pilot remain unvalidated defaults. They are
+not production values. Server evidence must justify timestamp tolerance,
+face-mask coverage, matched-slot count, temporal consistency, association
+margin/confidence, speech duration, synchronization, and voice-quality policies
+before any adapter or threshold is frozen.
+
+## LR-ASD Pilot CLI
+
+The independent pilot accepts explicit clip IDs and/or a bounded limit. It does
+not appear in `run_pipeline_v3.STAGE_ORDER`, and its output must be outside the
+source run:
+
+```bash
+export LR_ASD_CODE_ROOT=/path/to/Junhua-Liao/LR-ASD
+export LR_ASD_PYTHON=/path/to/lr-asd-venv/bin/python
+export LR_ASD_MODEL_PATH=/path/to/pretrain_AVA.model
+export SILERO_VAD_PYTHON=/path/to/vad-venv/bin/python
+export SILERO_VAD_MODEL_PATH=/path/to/silero_vad.jit
+
+python tools/eval_h3_audio_binding_lr_asd.py \
+  --run-root /path/to/completed-v3-run \
+  --output-root /path/outside/source-run/h3-lr-asd-pilot \
+  --clip-id <clip_uid>
+```
+
+The LR-ASD environment is responsible for its official dependencies and
+`ffmpeg`. The Silero environment must contain its local package and JIT model;
+the bridge never downloads a model. Per-clip failures are written to
+`failures.jsonl` and do not stop neighboring clips.
+
+Each successful case produces:
+
+```text
+review/<clip_uid>/
+  source.mp4
+  visualization.mp4
+  timeline.json
+  audio_binding.json
+  lr_asd_native.json
+  face_entity_association.json
+  bound_audio/*.wav
+```
+
+`bound_audio` files are human-review artifacts only. They are not
+`VoiceReference` or H3 audio-conditioning assets.
 
 ## H3-Compatible IR and Rendering
 
@@ -213,8 +276,8 @@ sidecars while neighboring clips continue.
 
 ## Extension Boundaries
 
-Future adapters may add a real audio preprocessor, face detector/tracker,
-face-to-SAM entity associator, ASD model, and voice-reference extractor. Later
+Future passes may evaluate the pilot evidence, compare the baseline ASD models,
+and add voice-reference extraction only after deterministic fusion. Later
 versions may add diarization, speaker embeddings, offscreen propagation,
 cross-clip identity, pose/expression control, or shot-aware H3 tasks without
 changing the V1 evidence and binding separation.

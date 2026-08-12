@@ -93,7 +93,9 @@ def fuse_audio_entity_bindings(
     unknown_entities = {
         item.entity_id
         for item in evidence.associations
-        if item.entity_id not in known_entity_ids
+        if item.status == "matched"
+        and item.entity_id is not None
+        and item.entity_id not in known_entity_ids
     }
     if unknown_entities:
         raise ValueError(
@@ -127,28 +129,81 @@ def fuse_audio_entity_bindings(
                 )
             )
             continue
-        active = [
-            face_track_id
-            for face_track_id, score in probabilities
-            if score >= active_policy.active_speaker_probability
-        ]
+        native_scores = {
+            score.face_track_id: score for score in interval.face_scores
+        }
+        uses_native_decision = bool(native_scores)
+        if uses_native_decision:
+            active = sorted(
+                face_track_id
+                for face_track_id, score in native_scores.items()
+                if score.backend_native_active
+            )
+        else:
+            active = [
+                face_track_id
+                for face_track_id, score in probabilities
+                if score >= active_policy.active_speaker_probability
+            ]
         if len(active) >= 2:
+            if uses_native_decision:
+                normalized_scores = [
+                    native_scores[face_track_id].normalized_score
+                    for face_track_id in active
+                ]
+                confidence = (
+                    min(score for score in normalized_scores if score is not None)
+                    if all(score is not None for score in normalized_scores)
+                    else 0.0
+                )
+            else:
+                confidence = min(
+                    interval.face_speaking_probabilities[face_track_id]
+                    for face_track_id in active
+                )
             bindings.append(
                 _binding(
                     interval,
                     status="overlap",
-                    confidence=min(
-                        interval.face_speaking_probabilities[face_track_id]
-                        for face_track_id in active
-                    ),
+                    confidence=confidence,
                     active_face_track_ids=active,
-                    reason_codes=["multiple_visible_speakers_active"],
+                    reason_codes=[
+                        "multiple_visible_speakers_active",
+                        *(
+                            ["lr_asd_native_decision_unvalidated"]
+                            if uses_native_decision
+                            else []
+                        ),
+                    ],
                 )
             )
             continue
-        top_face, top_score = probabilities[0] if probabilities else (None, 0.0)
-        second_score = probabilities[1][1] if len(probabilities) > 1 else 0.0
-        if top_score <= active_policy.offscreen_probability_ceiling:
+        if uses_native_decision and not active:
+            bindings.append(
+                _binding(
+                    interval,
+                    status="offscreen",
+                    confidence=0.0,
+                    active_face_track_ids=[],
+                    reason_codes=[
+                        "speech_without_visible_active_speaker",
+                        "lr_asd_native_decision_unvalidated",
+                    ],
+                )
+            )
+            continue
+        if uses_native_decision:
+            top_face = active[0]
+            normalized_score = native_scores[top_face].normalized_score
+            top_score = normalized_score if normalized_score is not None else 0.0
+            second_score = 0.0
+        else:
+            top_face, top_score = probabilities[0] if probabilities else (None, 0.0)
+            second_score = probabilities[1][1] if len(probabilities) > 1 else 0.0
+        if (
+            not uses_native_decision
+            and top_score <= active_policy.offscreen_probability_ceiling
+        ):
             bindings.append(
                 _binding(
                     interval,
@@ -159,7 +214,7 @@ def fuse_audio_entity_bindings(
                 )
             )
             continue
-        if (
+        if not uses_native_decision and (
             top_face is None
             or top_score < active_policy.active_speaker_probability
             or top_score - second_score < active_policy.minimum_top_score_margin
@@ -183,6 +238,21 @@ def fuse_audio_entity_bindings(
                     confidence=top_score,
                     active_face_track_ids=[top_face],
                     reason_codes=["face_track_entity_association_missing"],
+                )
+            )
+            continue
+        if association.status != "matched" or association.entity_id is None:
+            bindings.append(
+                _binding(
+                    interval,
+                    status="ambiguous",
+                    confidence=top_score,
+                    active_face_track_ids=[top_face],
+                    reason_codes=[
+                        "face_track_entity_association_ambiguous"
+                        if association.status == "ambiguous"
+                        else "face_track_entity_association_unmatched"
+                    ],
                 )
             )
             continue
@@ -217,14 +287,26 @@ def fuse_audio_entity_bindings(
             continue
         duration = interval.end_time - interval.start_time
         clean = duration >= active_policy.minimum_clean_speech_seconds
+        binding_confidence = (
+            association.confidence
+            if uses_native_decision
+            else min(top_score, association.confidence)
+        )
         bindings.append(
             _binding(
                 interval,
                 status="bound",
-                confidence=min(top_score, association.confidence),
+                confidence=binding_confidence,
                 active_face_track_ids=[top_face],
                 association_confidence=association.confidence,
-                reason_codes=[] if clean else ["speech_interval_too_short"],
+                reason_codes=[
+                    *([] if clean else ["speech_interval_too_short"]),
+                    *(
+                        ["lr_asd_native_decision_unvalidated"]
+                        if uses_native_decision
+                        else []
+                    ),
+                ],
                 entity_id=association.entity_id,
                 face_track_id=top_face,
                 clean_training_eligible=clean,
