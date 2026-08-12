@@ -231,6 +231,9 @@ not automatically exclude smaller useful objects.
 
 Use subject for exactly one person, animal, or character.
 Animals are subjects, never objects. Body parts are not independent objects.
+Any living animal or animal depicted as a creature is always a subject. Fish,
+lobster, crab, spider, turtle, clam, and other creatures must not become
+objects merely because they have a bounded shape.
 Use object only for one
 concrete, discrete, physical foreground object with independent reference or
 control value. Amorphous materials, liquids, sauces, smoke, shadows, lighting,
@@ -250,9 +253,11 @@ split a subject into arbitrary tiny details such as buttons, shoelaces, fingers,
 ears, tiny decorations, indistinct fragments, or anything that cannot be
 reliably localized.
 
-Discrete foods and food containers may remain valid objects when they have a
-recognizable bounded form, such as a lobster, fish, bowl, or frying pan.
-A plate of meatballs, loaf of bread, or pot of food can also remain valid.
+Clearly prepared or cooked food may be an object when its visible semantics are
+culinary rather than those of a living creature, such as a cooked whole fish in
+a wok or a cooked lobster dish. Other discrete foods and food containers may
+remain valid objects, including a loaf of bread, a plate of meatballs,
+dumplings, a bowl, a frying pan, or a pot of cooked food.
 Do not promote amorphous sauce, steam, oil puddles, or similar substances into
 object references.
 

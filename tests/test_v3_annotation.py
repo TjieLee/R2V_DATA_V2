@@ -1566,17 +1566,42 @@ def test_dense_prompt_preserves_recall_with_semantic_type_boundaries() -> None:
     prompt = annotation_system_prompt(
         QwenAnnotationConfig(entity_selection_mode="reference_dense_v1")
     ).lower()
+    normalized = " ".join(prompt.split())
     for contract in (
         "animals are subjects, never objects",
+        "living animal or animal depicted as a creature is always a subject",
+        "must not become objects merely because they have a bounded shape",
         "body parts are not independent objects",
         "amorphous materials, liquids, sauces, smoke, shadows, lighting",
         "buildings, room architecture, bridges, trees, landscape elements",
         "screen, painting, photograph, poster",
         "worn or attached objects may be selected",
+        "cooked whole fish in a wok",
+        "cooked lobster dish",
         "plate of meatballs",
         "loaf of bread",
+        "dumplings",
+        "a bowl",
+        "a frying pan",
+        "a pot of cooked food",
     ):
-        assert contract in prompt
+        assert contract in normalized
+
+
+def test_dense_prompt_does_not_offer_bare_animals_as_object_examples() -> None:
+    prompt = " ".join(
+        annotation_system_prompt(
+            QwenAnnotationConfig(entity_selection_mode="reference_dense_v1")
+        )
+        .lower()
+        .split()
+    )
+
+    assert "such as a lobster, fish" not in prompt
+    assert "such as a lobster" not in prompt
+    assert "such as fish" not in prompt
+    for animal in ("fish", "lobster", "crab", "spider", "turtle", "clam"):
+        assert animal in prompt
 
 
 @pytest.mark.parametrize(
