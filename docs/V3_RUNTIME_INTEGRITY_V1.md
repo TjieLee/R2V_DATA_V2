@@ -1,204 +1,496 @@
 # V3 Runtime and Reference Integrity V1
 
-## Scope
+Last updated: 2026-08-13
 
-This design is based on parent commit
-`098a02f3b79625d7cb15accd6dcd4ba949280388` and is developed on
-`feature/v3-runtime-integrity-v1`. It keeps the established V3 coverage,
-candidate ranking, fragmentation, background guard, Boogu, and cross-pair
-quality policies unchanged.
+This document is the operational/design specification for
+`feature/v3-runtime-integrity-v1`. It records the current visual V3 contracts
+and the commands needed to create, resume, or replay a server run. Current
+experiment state and freeze evidence are in `V3_RUNTIME_INTEGRITY_STATE.md`.
+Machine paths, services, and GPU rules are in `SERVER_ENVIRONMENT_RUNBOOK.md`.
 
-No completed run or export tree is migrated by this change. Existing configs
-remain on `runtime.mode: staged_legacy` unless streaming is explicitly enabled.
-
-## Density Evidence
-
-The `density120` review contained 117 ready annotations, 145 annotation
-entities, 51 accepted samples, and 63 final entity references. Its final
-density was 1.235 entity references per sample: 40 samples had one reference,
-10 had two, and one had three. The object funnel retained 35 of 38
-coverage-qualified objects; the subject funnel retained 28 of 30
-coverage-qualified subjects.
-
-This evidence supports retaining `reference_dense_v1`, `phrase_retry_v1`, and
-`type_aware_v1`. The new work removes semantic pollution and structurally
-unusable final references instead of loosening downstream gates.
-
-## Semantic Cleanup
-
-Dense annotation defines a subject as one visible person, animal, or character.
-An object is one concrete, discrete physical foreground object with independent
-conditioning value. Animals are never objects. Body parts, amorphous materials,
-liquids, sauces, smoke, shadows, lighting, scene structure, vegetation, and
-depicted or screen content are not promoted to physical object references.
-
-Discrete food, vehicles, tools, bags, clothing, and other worn or attached
-controllable objects remain eligible. A conservative syntax check drops vague
-object heads such as `object`, `thing`, and `item`, including modified phrases
-such as `a large black object with cutouts`. It does not guess a replacement
-category and does not contain an animal or product ontology.
-
-## Progressive SAM3 Anchors
-
-`sam3.anchor_search_mode: progressive_v1` probes the existing fast order
-`5, 2, 7, 0, 9`, stopping at the first unique usable target. Only when that
-order yields no unique target does it probe `4, 6, 3, 8, 1`. An ambiguous early
-probe does not prevent a later unique subject or object anchor. A multi-object
-group remains `unverified_multi_object_group`; group masks are not unioned.
-
-The segment summary records fast hits, fallback attempts, fallback hits,
-all-frame misses, and total probe calls. `legacy` remains the default.
-
-## Reference Integrity Stage
-
-The opt-in stage order is:
+## 1. Current Code Baseline
 
 ```text
-pair -> reference_edit -> reference_integrity -> instruct -> export
+branch: feature/v3-runtime-integrity-v1
+validated code baseline: 32a9e0e17598b6bd2d7912b6fafdb08d81187285
 ```
 
-`targeted_qwen_v1` calculates alpha topology evidence including component
-ratios, bbox fill, border contact, and enclosed transparent holes. Topology is
-only a suspicion signal. Legitimate handles, brackets, wheels, scissors,
-frames, and other source-matching cutouts are never rejected by topology alone.
+Recent final-integrity lineage:
 
-Qwen review is required for every synthetic reference, every local reference,
-and every topology-suspicious reference. It receives the final reference plus
-the sampled source frame with the source target highlighted. A clean, real,
-full, non-suspicious reference skips the extra call.
+```text
+42769a31 Harden final V3 reference integrity
+  -> e575af6 Retry malformed V3 integrity reviews
+  -> b30942e Add conservative V3 source bbox fallback
+  -> 32a9e0e Enforce deterministic V3 reference semantics
+```
 
-The review checks target identity, recognizability for the declared scope,
-major structure, missing surfaces, unnatural holes, unrelated dominance, and
-independent reference usability. Subject review does not require a face, but it
-rejects a crop that loses essentially all identity-bearing evidence present in
-the source. Judge failure rejects that entity fail-closed.
+A later documentation-only commit may move HEAD without changing the validated
+code baseline. Always record both values in a production/freeze note.
 
-An integrity rejection removes only that entity, rebuilds tokens from the
-remaining ready references, and invalidates instruction/export. A clip becomes
-non-exportable only when no qualifying entity reference remains.
+## 2. Frozen Stage Order
 
-## Object-Remover Contract
+```text
+manifest
+-> annotate
+-> frames
+-> segment
+-> rank
+-> background
+-> remove
+-> pair
+-> reference_edit
+-> reference_integrity
+-> instruct
+-> export
+```
 
-The production profile is:
+`rank.py` is temporal coverage, not candidate Top3 ranking. Candidate extraction
+and Top3 ordering after SAM masks live in `pair.py`.
+
+Do not loosen coverage or candidate thresholds as part of integrity work.
+
+## 3. Source Selection
+
+The validated fixed-selection mode is:
+
+```yaml
+source:
+  selection_mode: fixed_selection_v1
+```
+
+The 120-case development selection used for the current rescue/integrity work is:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_selections/density120-fixed.json
+```
+
+Fixed selection is loaded in O(K), validates identity/path/duplicates, and
+preserves manifest order. Do not replace it with `start_index/limit` when an
+exact A/B population is required.
+
+## 4. Annotation Semantics
+
+`reference_dense_v1` may emit up to eight stable foreground references.
+
+Subject:
+
+- one visible person, animal, or character;
+- animals and other living creatures belong here, not under `object`.
+
+Object:
+
+- one concrete, discrete physical foreground object with independent reference
+  value;
+- cooked/prepared culinary food may be a valid object;
+- body parts, amorphous sauces/liquids/smoke/light, scene structure, vegetation,
+  and represented/screen content are not ordinary physical object references.
+
+Annotation semantics are intentionally conservative. Final integrity now has an
+additional deterministic hard gate for high-confidence violations; it does not
+replace annotation cleanup.
+
+## 5. SAM3 Rescue
+
+Frozen modes:
+
+```yaml
+sam3:
+  anchor_search_mode: progressive_v1
+  object_rescue_mode: phrase_retry_v1
+  not_found_rescue_mode: entity_phrase_retry_v1
+  multi_instance_rescue_mode: qwen_anchor_select_v1
+```
+
+The flow is:
+
+1. probe the progressive anchor slots;
+2. use the grounding prompt first;
+3. on object not-found, retry the entity phrase where configured;
+4. for ambiguous multi-instance anchors, show numbered candidates to Qwen and
+   allow only a strict selected target;
+5. keep existing track/coverage thresholds unchanged.
+
+The current 120 A/B improved ready clips from 87 to 122 with zero old-ready to
+new-non-ready regressions. This rescue path is frozen unless a final audit shows
+new concrete regressions.
+
+## 6. Coverage and Candidate Top3
+
+Coverage remains 7/10.
+
+After SAM, `pair.py` builds entity reference candidates only from frames that
+are present, track-valid, non-empty, and geometrically sane. Severe tiny or
+fragmented candidates are removed before sorting.
+
+Current Top3 sort priority is:
+
+```python
+(
+    candidate.border_contact_count,
+    -candidate.area_ratio,
+    -candidate.sharpness_score,
+    candidate.normalized_center_distance,
+    _SLOT_PRIORITY_INDEX[candidate.frame_slot],
+)
+```
+
+with slot priority:
+
+```text
+5, 4, 6, 3, 7, 2, 8, 1, 9, 0
+```
+
+and current limit:
+
+```yaml
+pair:
+  max_candidates_per_entity: 3
+  crop_padding_ratio: 0.08
+  reference_prefilter_mode: conservative_v1
+```
+
+Do not move this logic into `rank.py`.
+
+## 7. Background Removal and Reference Edit
+
+Production remover profile:
 
 ```yaml
 remove:
   inference_profile: object_remover_4step_v1
   num_inference_steps: 4
+  device: cuda:4
 ```
 
-It requires the existing Qwen-Image-Edit-2511 Object-Remover LoRA. Base-only
-generation is not allowed. The backend verifies the active adapter and emits
-startup diagnostics for model, adapter, weight file, steps, dtype, configured
-device, and visible CUDA count before first inference.
+The Qwen-Image-Edit-2511 Object-Remover LoRA is mandatory. Do not use old
+40-step settings, base-only generation, Lightning/Rapid substitute weights, or
+historical experimental defaults as production guidance.
 
-Historical production configs, including `prod5000`, stored the unintended
-40-step value. Historical runtime comparisons must therefore not be treated as
-4-step performance. Forty steps remain possible only under
-`inference_profile: experimental_override`.
+Reference editing uses the validated Boogu runtime. The current completion and
+background prompts are already frozen; integrity work must not broaden them.
 
-A candidate round containing any backend, CUDA, or runtime failure remains
-`pending_remove` with diagnostic attempts and can be retried by running only
-the remove stage. Permanent rejection occurs only when every candidate in the
-completed round was generated and quality-rejected. Overwrite of an existing
-ready removal preserves the previous publication when a new attempt has an
-infrastructure failure.
+## 8. Final Reference Integrity
 
-## Streaming Runtime
+### 8.1 Deterministic semantic hard gate
 
-`runtime.mode: streaming_v1` executes a bounded per-clip DAG. Each clip owns one
-writer, while different clips may occupy different stages. CPU stage executors
-are constrained by both their stage worker count and `runtime.cpu_workers`.
-Global export begins only after all clip tasks finish.
+Commit `32a9e0e` adds a high-precision policy classifier before Qwen review.
+Only `reference_type == object` is eligible for deterministic semantic reject.
+The classifier uses the entity phrase head and does not use broad grounding
+context as the rejection trigger.
 
-All Qwen calls share one budget, including calls made by isolated workers. A
-process-local semaphore and run-local file slots enforce
-`runtime.qwen_max_inflight` across threads and worker processes.
+Current policy reasons:
 
-SAM3, remove, and reference-edit each have one long-lived JSONL worker process.
-The process sets `CUDA_VISIBLE_DEVICES` before model imports and uses local
-`cuda` or `cuda:0`, avoiding physical-versus-visible ordinal ambiguity. One
-request failure returns a failed response without terminating neighboring
-requests. Invalid JSON, timeout, process exit, and request-ID mismatch fail
-closed.
-
-Recommended server mapping:
-
-```yaml
-runtime:
-  mode: streaming_v1
-  qwen_max_inflight: 2
-  cpu_workers: 8
-  gpu_workers:
-    remove: "4"
-    segment: "5"
-    reference_edit: "6"
+```text
+semantic_policy:amorphous_object
+semantic_policy:scene_structure_object
+semantic_policy:living_creature_object
 ```
 
-The Qwen service remains on physical GPUs 0-3. Server `max-num-seqs` must be a
-deployment variable and must not be raised without a GPU-memory pilot.
+Examples expected to hard reject:
 
-Streaming fails configuration validation when same-parent fallback is enabled,
-because donor availability would otherwise depend on task completion order.
+```text
+a thick golden-brown sauce
+a large domed cathedral
+a light-colored dog with long fur   # if typed object
+a giant clam with a blue-spotted mantle  # if typed object
+```
 
-## Profiling
+Examples deliberately not hard rejected solely by this classifier:
 
-Streaming events record queue wait, service time, stage inflight count, clip
-end-to-end time, per-stage throughput, Qwen inflight observations, and GPU
-worker busy/idle estimates. Existing model-call retry data, SAM anchor counters,
-and integrity counters remain available. Summary identifies the lowest measured
-stage throughput as the current bottleneck.
+```text
+a cooked red lobster on a wooden cutting board
+a cooked whole fish in a wok
+a bottle of water
+an oil bottle
+a green laser pointer emitting bright green light
+a dog toy
+a clam shell
+a cathedral model
+a tree branch
+```
 
-## Known Limitations
+Represented content remains a semantic-risk route to Qwen because a physical
+carrier such as a screen, framed painting, or poster requires visual context.
 
-- The first streaming release supports independent clips only; same-parent
-  fallback requires staged execution.
-- Heavy model worker counts are fixed at one. Throughput comes from cross-stage
-  overlap, not duplicate model copies.
-- GPU/model compatibility and throughput still require server smoke tests.
-- Existing runs whose config hash predates the new schema are not rewritten.
+A deterministic policy reject:
 
-## Server Smoke Commands
+- does not call the Qwen integrity judge;
+- does not call the source-bbox fallback judge;
+- publishes an explicit `semantic_policy_reason`;
+- removes the entity using the same downstream pairing/reference invalidation
+  semantics as other integrity rejection;
+- remains valid under normal `ClipRecord` validation.
 
-These commands are documentation only and were not run by Codex. Use a fresh
-20-clip run root in
-`/mnt/workspace/litengjie/data/R2V_DATA_V2/configs/runtime-integrity-20.local.yaml`.
-That local file must set `source.limit: 20`, progressive anchors, the 4-step
-remover profile, integrity enabled, streaming enabled, and GPU mappings 4/5/6.
+### 8.2 Qwen integrity review
+
+Review evidence is the final reference plus highlighted source context.
+Synthetic, local, topology-suspicious, source-bbox, represented-content-risk,
+and other risk-routed references require review. Clean real full references may
+skip it when no risk applies.
+
+The hard review booleans include:
+
+```text
+matches_target
+reference_entity_semantically_valid
+preserves_annotated_entity_semantics
+preserves_primary_identity_region
+recognizable_as_named_entity
+structurally_complete_for_scope
+no_major_missing_regions
+no_unnatural_holes_or_surface_loss
+no_unrelated_entity_dominance
+no_severe_reference_artifact
+usable_as_independent_reference
+```
+
+The verdict must match all booleans.
+
+### 8.3 Structured-output repair
+
+`QwenReferenceIntegrityJudge` performs one normal request. If JSON is truncated,
+invalid, or schema-invalid, it performs exactly one repair request using the
+same image evidence/context plus the invalid response and validation error.
+
+Profiling distinguishes:
+
+```text
+operation=initial retry_index=0
+operation=repair  retry_index=1
+```
+
+A valid first response adds no extra call. Both raw responses and finish reasons
+are retained on repair/final failure. Do not globally increase Qwen max tokens
+as a substitute for this bounded repair.
+
+### 8.4 Source bbox fallback
+
+`source_bbox_fallback_v1` is a narrow recall rescue for artifact-only failures.
+It is not a generic second reference selector.
+
+Eligibility requires semantic, target, identity, and major structure checks to
+pass. The failed reference must primarily have a localized edit/cutout artifact,
+for example an unnatural erased-object-shaped cavity.
+
+Never use bbox fallback for:
+
+- deterministic semantic-policy rejection;
+- Qwen integrity judge failure;
+- wrong target;
+- semantic mismatch;
+- lost primary identity region;
+- major structural loss;
+- severe fragmentation;
+- cross-pair in V1.
+
+The proposed fallback uses the exact selected source frame and target tracked
+mask bbox with the normal crop padding, then crops raw RGB only. It does not
+apply the mask, erase an occluder, inpaint, or generate pixels.
+
+A dedicated three-image Qwen review compares highlighted source context, the
+failed reference, and the proposed raw bbox crop. All strict fallback booleans
+must pass. On acceptance the final reference is real source pixels with:
+
+```text
+source_bbox_fallback=true
+synthetic=false
+```
+
+and explicit source clip/entity/frame/bbox/hash metadata. If a prior Boogu edit
+was the published reference, the edit state is atomically transitioned to the
+source-bbox fallback policy while the original generated evidence remains for
+diagnostics.
+
+## 9. Server Environment
+
+Canonical paths:
+
+```text
+repo:          /mnt/workspace/litengjie/data/R2V_DATA_V2
+python:        /mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
+SAM3 code:     /mnt/workspace/litengjie/data/vendor/sam3
+SAM3 ckpt:     /mnt/workspace/public/pretrained/facebook/sam3/sam3.pt
+Qwen model:    /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+Qwen endpoint: http://127.0.0.1:8000/v1
+Boogu code:    /mnt/workspace/litengjie/data/vendor/Boogu-Image
+Boogu python:  /mnt/workspace/litengjie/data/venvs/boogu-image/bin/python
+Boogu model:   /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708
+Remover LoRA:  /mnt/workspace/litengjie/data/models/Qwen-Image-Edit-2511-Object-Remover/Qwen-Image-Edit-2511-Object-Remover.safetensors
+```
+
+Preferred physical GPU allocation:
+
+```text
+GPU 0-3: Qwen3-VL vLLM TP4
+GPU 4:   Object remover
+GPU 5:   SAM3
+GPU 6:   Boogu
+GPU 7:   spare
+```
+
+Do not globally export `CUDA_VISIBLE_DEVICES` in a general production shell.
+For an isolated staged SAM3-only invocation, exposing physical GPU 5 and using
+worker-local `cuda` is valid. Do not wrap the full pipeline or the remove stage
+with `CUDA_VISIBLE_DEVICES=4`; staged removal uses the configured physical
+`cuda:4` device.
+
+See `SERVER_ENVIRONMENT_RUNBOOK.md` for exact Qwen startup, shell initialization,
+preflight, monitoring, and process-safety rules.
+
+## 10. Fresh Server Preflight
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
 source .venv/bin/activate
+
+set +e
+set +u
+set +o pipefail
+
+export MAIN_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
+export SAM3_CODE_ROOT=/mnt/workspace/litengjie/data/vendor/sam3
+export QWEN_BASE_URL=http://127.0.0.1:8000/v1
+export PYTHONPATH="$SAM3_CODE_ROOT:/mnt/workspace/litengjie/data/R2V_DATA_V2${PYTHONPATH:+:$PYTHONPATH}"
+
 export HF_HOME=/mnt/workspace/litengjie/data/cache/huggingface
 export TORCH_HOME=/mnt/workspace/litengjie/data/cache/torch
 export XDG_CACHE_HOME=/mnt/workspace/litengjie/data/cache/xdg
 export TMPDIR=/mnt/workspace/litengjie/data/tmp
-export PYTHONPATH=/mnt/workspace/litengjie/data/vendor/sam3${PYTHONPATH:+:$PYTHONPATH}
-CONFIG=/mnt/workspace/litengjie/data/R2V_DATA_V2/configs/runtime-integrity-20.local.yaml
+
+git fetch origin
+git switch feature/v3-runtime-integrity-v1
+git pull --ff-only
+
+git rev-parse HEAD
+git status --short
+curl -fsS --noproxy '*' "$QWEN_BASE_URL/models" | head
 ```
 
-Progressive SAM3 smoke on the fresh run:
+Before a code-sensitive replay, compare HEAD with the recorded validated code
+baseline. A docs-only HEAD after that baseline is allowed when the code tree is
+unchanged.
+
+## 11. Fresh Full Pipeline Run
+
+Use a fresh timestamped run root and exact config. Never reuse a non-empty run
+root with a different `run.json` identity.
 
 ```bash
-python run_pipeline_v3.py --config "$CONFIG" --stages manifest,annotate,frames,segment --profile
+CONFIG=/mnt/workspace/litengjie/data/r2v_v3_configs/<exact-config>.yaml
+LOG=/mnt/workspace/litengjie/data/r2v_v3_logs/<exact-run>.log
+
+mkdir -p /mnt/workspace/litengjie/data/r2v_v3_logs
+
+nohup "$MAIN_PYTHON" run_pipeline_v3.py \
+  --config "$CONFIG" \
+  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,export \
+  --profile \
+  > "$LOG" 2>&1 &
+
+echo $!
 ```
 
-Four-step remover smoke after rank/background evidence exists:
+Do not omit `reference_integrity` from the final production/freeze stage list.
+
+## 12. Stage-Only Replay Rules
+
+Run only the stage that needs new evidence. Do not rerun expensive upstream work
+merely to satisfy a downstream code change.
+
+Typical commands:
 
 ```bash
-python run_pipeline_v3.py --config "$CONFIG" --stages rank,background,remove --profile
+# SAM3 rescue A/B after annotation/frames are already materialized
+"$MAIN_PYTHON" run_pipeline_v3.py \
+  --config "$CONFIG" \
+  --stages segment,rank \
+  --profile
+
+# Final-integrity-only replay after references/reference_edit are prepared
+"$MAIN_PYTHON" run_pipeline_v3.py \
+  --config "$CONFIG" \
+  --stages reference_integrity \
+  --profile
 ```
 
-Integrity smoke after pairing/reference edit:
+If the run uses old `ClipRecord` JSON that predates newly required integrity
+fields, do not blindly parse the whole historical clip under the newest schema
+while extracting evidence. For read-only extraction, parse raw JSON and validate
+only stable sections such as `AnnotationState`, `SampledFramesArtifact`, and
+`TrackedMasksArtifact`.
+
+For an actual replay run, create a fresh run root with a matching current
+`run.json`. Preserve previous integrity rejects monotonically when appropriate,
+remove stale reference-edit entries that point at no-longer-ready references,
+clear only downstream states that are being recomputed, and require
+`ClipRecord.model_validate()` before model calls. Never delete `run.json` from a
+non-empty run root to bypass identity checks.
+
+## 13. Current Five-Case Semantic Replay
+
+Before the final 120 replay, validate only these existing cases against code
+baseline `32a9e0e`:
+
+```text
+0f32c6b7fa9934c159a03ff7  sauce       -> deterministic reject
+34da1ad5a39a0389de87568b  cathedral   -> deterministic reject
+4e892f7740e1557b495a64da  dog object  -> deterministic reject
+b527c92f98b7f27f1d301f7c giant clam  -> deterministic reject
+82f312a07328785e228802d3  cooked lobster -> no deterministic reject
+```
+
+Expected counters for the four negative cases:
+
+```text
+semantic_policy_rejected = 4
+Qwen integrity calls      = 0
+source bbox calls         = 0
+```
+
+The cooked lobster must continue onto the normal integrity path.
+
+Use a fresh targeted replay root derived from already-materialized source
+artifacts; do not rerun annotation, SAM3, removal, pair, or Boogu for this check.
+
+## 14. Monitoring
 
 ```bash
-python run_pipeline_v3.py --config "$CONFIG" --stages pair,reference_edit,reference_integrity --profile
+pgrep -af 'run_pipeline_v3.py'
+nvitop
+nvidia-smi
+
+tail -n 100 "$LOG"
+tail -f "$LOG"
 ```
 
-Full streaming 20-clip pilot with a separate fresh run root:
+For a selected run root:
 
 ```bash
-python run_pipeline_v3.py --config "$CONFIG" --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,export --profile
+RUN=/mnt/workspace/litengjie/data/r2v_v3_runs/<exact-run>
+
+find "$RUN/clips" -name masks.rle.json | wc -l
+find "$RUN/clips" -name clip.json | wc -l
+
+test -f "$RUN/profiling/events.jsonl" && \
+  tail -n 20 "$RUN/profiling/events.jsonl"
 ```
 
-Do not run these commands against a completed production or pilot run root.
+SAM3 can run in the main pipeline process; absence of a separately named SAM3
+process is not itself a failure.
+
+## 15. Freeze Procedure
+
+The visual V3 path is ready to freeze when all of the following are true:
+
+1. five-case semantic replay matches all expected hard-gate outcomes;
+2. no semantic policy reject calls Qwen or bbox fallback;
+3. final 120 integrity replay has no infrastructure failure requiring a code
+   change;
+4. source bbox rescue remains narrow and does not revive semantic/identity
+   failures;
+5. contact-sheet/audit review finds no systematic regression;
+6. exact freeze code commit, docs commit, config hash, fixed selection, run root,
+   and export/audit paths are recorded in `V3_RUNTIME_INTEGRITY_STATE.md`.
+
+After freeze, do not continue tuning visual V3 from isolated anecdotes. Resume
+the H3/audio branch as a separate workstream.
