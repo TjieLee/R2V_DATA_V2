@@ -32,6 +32,7 @@ from r2v_data_v2.v3.reference_integrity import (
     SourceBboxFallbackJudgeFailure,
     SourceBboxFallbackReviewAttempt,
     reference_integrity_clips,
+    reference_semantic_hard_reject_reason,
     reference_semantic_risk_reason,
     reference_topology_diagnostics,
 )
@@ -49,6 +50,7 @@ from r2v_data_v2.v3.schemas import (
     PairingState,
     ReferenceEditEntityState,
     ReferenceEditState,
+    ReferenceIntegrityEntityState,
     ReferenceIntegrityReview,
     ReferencesState,
     SampledFrame,
@@ -817,19 +819,25 @@ def test_valid_cooked_lobster_and_normal_object_are_not_semantic_risk() -> None:
 
 
 @pytest.mark.parametrize(
-    "phrase",
+    ("phrase", "expected_reason"),
     (
-        "a brown dog",
-        "a living clam",
-        "thick red sauce",
-        "a stone cathedral",
-        "a person on a screen",
+        ("a thick golden-brown sauce", "semantic_policy:amorphous_object"),
+        (
+            "a large domed cathedral with multiple smaller domes and arched windows",
+            "semantic_policy:scene_structure_object",
+        ),
+        ("a light-colored dog with long fur", "semantic_policy:living_creature_object"),
+        (
+            "a giant clam with a textured shell and blue-spotted mantle",
+            "semantic_policy:living_creature_object",
+        ),
     ),
 )
-def test_semantically_invalid_clean_full_object_is_rejected(
+def test_semantic_policy_rejects_without_qwen_or_bbox_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     phrase: str,
+    expected_reason: str,
 ) -> None:
     storage = _storage_with_ready_pair(
         tmp_path,
@@ -837,9 +845,7 @@ def test_semantically_invalid_clean_full_object_is_rejected(
         second_scope="full",
         second_phrase=phrase,
     )
-    judge = FakeIntegrityJudge(
-        [_invalid_reference_semantics_review(f"{phrase} violates V3 semantics")]
-    )
+    judge = FakeIntegrityJudge([])
     bbox_judge = FakeSourceBboxFallbackJudge([])
 
     stats = reference_integrity_clips(
@@ -850,21 +856,117 @@ def test_semantically_invalid_clean_full_object_is_rejected(
     )
 
     clip = storage.read_clip("clip-1")
-    assert len(judge.calls) == 1
-    assert judge.calls[0]["phrase"] == phrase
-    assert stats.entities_reviewed == 1
+    assert judge.calls == []
+    assert bbox_judge.calls == []
+    assert stats.entities_reviewed == 0
     assert stats.entities_rejected == 1
+    assert stats.semantic_policy_rejected == 1
     assert clip.references.entities[1].status == "rejected"
     assert clip.reference_integrity is not None
-    review = clip.reference_integrity.entities[1].review
-    assert review is not None
-    assert review.reference_entity_semantically_valid is False
-    assert bbox_judge.calls == []
+    result = clip.reference_integrity.entities[1]
+    assert result.status == "rejected"
+    assert result.reviewed is False
+    assert result.review is None
+    assert result.semantic_policy_reason == expected_reason
+    assert result.reason == expected_reason
+    assert result.final_reference_path == result.input_reference.image_path
+    assert result.source_bbox_fallback_review is None
+    assert clip.pairing is not None
+    assert clip.pairing.retained_entity_ids == ["e1"]
+    assert ClipRecord.model_validate(clip.model_dump(mode="json")) == clip
 
 
 @pytest.mark.parametrize(
     "phrase",
-    ("a cooked lobster dish", "a black camera"),
+    (
+        "a cooked red lobster on a wooden cutting board",
+        "a cooked whole fish in a wok",
+        "a bottle of water",
+        "an oil bottle",
+        "a green laser pointer emitting bright green light",
+        "a dog toy",
+        "a clam shell",
+        "a cathedral model",
+        "a model cathedral",
+        "a tree branch",
+    ),
+)
+def test_semantic_policy_hard_reject_avoids_ambiguous_false_positives(
+    phrase: str,
+) -> None:
+    assert (
+        reference_semantic_hard_reject_reason(
+            reference_type="object",
+            phrase=phrase,
+        )
+        is None
+    )
+
+
+def test_represented_content_remains_qwen_review_risk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phrase = "a person on a screen"
+    assert (
+        reference_semantic_hard_reject_reason(
+            reference_type="object",
+            phrase=phrase,
+        )
+        is None
+    )
+    assert reference_semantic_risk_reason(
+        reference_type="object",
+        phrase=phrase,
+        grounding_prompt=phrase,
+    ) == "represented_content_semantic_risk"
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_phrase=phrase,
+    )
+    judge = FakeIntegrityJudge(
+        [_invalid_reference_semantics_review("represented content is not physical")]
+    )
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    result = storage.read_clip("clip-1").reference_integrity
+    assert result is not None
+    assert len(judge.calls) == 1
+    assert stats.semantic_policy_rejected == 0
+    assert result.entities[1].reviewed is True
+    assert result.entities[1].review is not None
+    assert result.entities[1].semantic_policy_reason is None
+
+
+def test_reference_integrity_entity_state_accepts_legacy_json_without_policy_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([]),
+    )
+    integrity = storage.read_clip("clip-1").reference_integrity
+    assert integrity is not None
+    state = integrity.entities[0]
+    payload = state.model_dump(mode="json")
+    assert payload.pop("semantic_policy_reason") is None
+
+    assert ReferenceIntegrityEntityState.model_validate(payload) == state
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "a cooked lobster dish",
+        "a cooked whole fish in a wok",
+        "a black camera",
+    ),
 )
 def test_clean_full_valid_object_behavior_is_unchanged(
     tmp_path: Path,

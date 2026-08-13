@@ -189,6 +189,49 @@ _REPRESENTED_CONTENT_TERMS = (
     "video display",
     "visualization",
 )
+_SEMANTIC_HEAD_BOUNDARIES = frozenset(
+    {
+        "against",
+        "at",
+        "behind",
+        "beside",
+        "by",
+        "carrying",
+        "containing",
+        "emitting",
+        "filled",
+        "from",
+        "holding",
+        "in",
+        "inside",
+        "lying",
+        "near",
+        "of",
+        "on",
+        "outside",
+        "over",
+        "running",
+        "sitting",
+        "standing",
+        "under",
+        "walking",
+        "wearing",
+        "with",
+        "without",
+    }
+)
+_PHYSICAL_REPLICA_TERMS = (
+    "figurine",
+    "miniature",
+    "model",
+    "plush",
+    "plushie",
+    "replica",
+    "sculpture",
+    "statue",
+    "stuffed",
+    "toy",
+)
 
 
 def _contains_integrity_term(text: str, term: str) -> bool:
@@ -219,6 +262,70 @@ def reference_semantic_risk_reason(
         _contains_integrity_term(text, term) for term in _REPRESENTED_CONTENT_TERMS
     ):
         return "represented_content_semantic_risk"
+    return None
+
+
+def _semantic_entity_head(phrase: str) -> str | None:
+    tokens = re.findall(r"[a-z]+(?:-[a-z]+)*", phrase.casefold())
+    head_tokens: list[str] = []
+    for token in tokens:
+        if token in _SEMANTIC_HEAD_BOUNDARIES:
+            break
+        head_tokens.append(token)
+    return head_tokens[-1] if head_tokens else None
+
+
+def _semantic_head_matches(head: str, terms: tuple[str, ...]) -> bool:
+    if head in terms:
+        return True
+    singular_candidates = []
+    if head.endswith("s"):
+        singular_candidates.append(head[:-1])
+    if head.endswith("es"):
+        singular_candidates.append(head[:-2])
+    if head.endswith("ies"):
+        singular_candidates.append(f"{head[:-3]}y")
+    return any(candidate in terms for candidate in singular_candidates)
+
+
+def reference_semantic_hard_reject_reason(
+    *,
+    reference_type: str,
+    phrase: str,
+) -> str | None:
+    """Return only high-confidence object taxonomy violations.
+
+    The broad semantic-risk router intentionally considers grounding context.
+    This hard gate instead uses the entity phrase's leading noun phrase so that
+    context such as "of water" or "emitting light" cannot cause rejection.
+    """
+
+    if reference_type != "object":
+        return None
+    text = " ".join(phrase.casefold().split())
+    head = _semantic_entity_head(text)
+    if head is None:
+        return None
+    culinary = any(_contains_integrity_term(text, term) for term in _CULINARY_TERMS)
+    physical_replica = any(
+        _contains_integrity_term(text, term) for term in _PHYSICAL_REPLICA_TERMS
+    )
+    if (
+        _semantic_head_matches(head, _OBJECT_CREATURE_TERMS)
+        and not culinary
+        and not physical_replica
+    ):
+        return "semantic_policy:living_creature_object"
+    if (
+        _semantic_head_matches(head, _AMORPHOUS_OBJECT_TERMS)
+        and not physical_replica
+    ):
+        return "semantic_policy:amorphous_object"
+    if (
+        _semantic_head_matches(head, _SCENE_STRUCTURE_OBJECT_TERMS)
+        and not physical_replica
+    ):
+        return "semantic_policy:scene_structure_object"
     return None
 
 
@@ -973,6 +1080,7 @@ class ReferenceIntegrityStats:
     entities_skipped_review: int = 0
     entities_accepted: int = 0
     entities_rejected: int = 0
+    semantic_policy_rejected: int = 0
     judge_failed: int = 0
     topology_suspicious: int = 0
     source_bbox_fallback_attempted: int = 0
@@ -1055,6 +1163,27 @@ def reference_integrity_clips(
                         phrase=entity.phrase,
                         grounding_prompt=entity.grounding_prompt,
                     )
+                    semantic_policy_reason = reference_semantic_hard_reject_reason(
+                        reference_type=entity.reference_type,
+                        phrase=entity.phrase,
+                    )
+                    if semantic_policy_reason is not None:
+                        rejected_ids.add(entity_id)
+                        counters["entities_rejected"] += 1
+                        counters["semantic_policy_rejected"] += 1
+                        results.append(
+                            ReferenceIntegrityEntityState(
+                                entity_id=entity_id,
+                                status="rejected",
+                                input_reference=reference,
+                                final_reference_path=reference.image_path,
+                                diagnostics=diagnostics,
+                                reviewed=False,
+                                semantic_policy_reason=semantic_policy_reason,
+                                reason=semantic_policy_reason,
+                            )
+                        )
+                        continue
                     requires_review = (
                         reference.synthetic
                         or reference.reference_scope == "local"

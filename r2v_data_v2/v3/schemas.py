@@ -1395,6 +1395,13 @@ class ReferenceIntegrityEntityState(SchemaModel):
     source_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
     source_bbox_fallback_review: Optional[SourceBboxFallbackReview] = None
     judge_failed: StrictBool = False
+    semantic_policy_reason: Optional[
+        Literal[
+            "semantic_policy:amorphous_object",
+            "semantic_policy:scene_structure_object",
+            "semantic_policy:living_creature_object",
+        ]
+    ] = None
     reason: str
 
     @model_validator(mode="after")
@@ -1433,6 +1440,21 @@ class ReferenceIntegrityEntityState(SchemaModel):
             )
         if not self.reason.strip():
             raise ValueError("reference integrity entity reason must not be empty")
+        if self.semantic_policy_reason is not None:
+            if (
+                self.status != "rejected"
+                or self.reviewed
+                or self.review is not None
+                or self.judge_failed
+                or self.source_context_path is not None
+                or fallback_attempted
+                or self.final_reference_path != self.input_reference.image_path
+                or self.reason != self.semantic_policy_reason
+            ):
+                raise ValueError(
+                    "semantic policy rejection requires unreviewed original reference"
+                )
+            return self
         if self.status == "skipped":
             if self.reviewed or self.review is not None or self.judge_failed:
                 raise ValueError("skipped integrity result cannot contain a review")
