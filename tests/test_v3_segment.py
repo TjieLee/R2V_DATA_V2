@@ -32,6 +32,7 @@ from r2v_data_v2.v3.rank import build_coverage_state
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
+    MultiInstanceAnchorDecision,
     Sam3SegmentationBackend,
     mask_iou,
 )
@@ -130,6 +131,18 @@ class FakeSam3Predictor:
         self.propagation_directions.append(direction)
         self.propagation_session_ids.append(str(request["session_id"]))
         return self.propagation_by_direction.get(direction, [])
+
+
+@dataclass
+class FakeAnchorSelector:
+    result: MultiInstanceAnchorDecision | Exception
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def select(self, **kwargs: object) -> MultiInstanceAnchorDecision:
+        self.calls.append(kwargs)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
 
 
 def _sam_outputs(
@@ -795,6 +808,195 @@ def test_sam3_progressive_anchor_all_ambiguous_preserves_failure(
     assert "multiple ambiguous instances" in str(result.reason)
 
 
+def test_sam3_unique_anchor_fast_path_makes_no_qwen_selection_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    selector = FakeAnchorSelector(
+        MultiInstanceAnchorDecision("select", 1, "unused")
+    )
+    predictor = FakeSam3Predictor({5: _sam_outputs(_mask())})
+    backend = Sam3SegmentationBackend(
+        Sam3Config(multi_instance_rescue_mode="qwen_anchor_select_v1"),
+        predictor=predictor,
+        anchor_selector=selector,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        entity_phrase="a woman in a red coat",
+        grounding_prompt="woman near center",
+    )
+
+    assert result.status == "ready"
+    assert selector.calls == []
+    assert backend.recall_rescue_counters()["multi_instance_rescue_attempted"] == 0
+
+
+def test_sam3_qwen_selects_one_of_two_subject_anchor_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    first = _mask(x1=1, x2=5)
+    second = _mask(x1=9, x2=13)
+    selector = FakeAnchorSelector(
+        MultiInstanceAnchorDecision("select", 2, "candidate 2 matches")
+    )
+    predictor = FakeSam3Predictor({5: _sam_outputs(first, second)})
+    backend = Sam3SegmentationBackend(
+        Sam3Config(multi_instance_rescue_mode="qwen_anchor_select_v1"),
+        predictor=predictor,
+        anchor_selector=selector,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        entity_phrase="the woman in the blue jacket",
+        grounding_prompt="woman standing on the right",
+    )
+
+    assert result.status == "ready"
+    assert len(selector.calls) == 1
+    assert selector.calls[0]["entity_phrase"] == "the woman in the blue jacket"
+    assert selector.calls[0]["grounding_prompt"] == "woman standing on the right"
+    assert np.array_equal(result.observations[0].mask, second)
+    assert backend.recall_rescue_counters() == {
+        "multi_instance_rescue_attempted": 1,
+        "multi_instance_rescue_selected": 1,
+        "multi_instance_rescue_rejected": 0,
+        "propagation_identity_switch_detected": 0,
+        "partial_track_salvage_attempted": 0,
+        "partial_track_salvage_ready": 0,
+        "partial_track_salvage_insufficient": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_reason"),
+    (
+        (
+            MultiInstanceAnchorDecision("uncertain", None, "both cars plausible"),
+            "multi_instance_anchor_uncertain",
+        ),
+        (
+            MultiInstanceAnchorDecision("select", 3, "invalid candidate"),
+            "multi_instance_anchor_invalid_candidate_id",
+        ),
+    ),
+)
+def test_sam3_multi_instance_uncertain_or_invalid_selection_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: MultiInstanceAnchorDecision,
+    expected_reason: str,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1", reference_type="object")],
+    )
+    predictor = FakeSam3Predictor(
+        {5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13))}
+    )
+    selector = FakeAnchorSelector(decision)
+    backend = Sam3SegmentationBackend(
+        Sam3Config(multi_instance_rescue_mode="qwen_anchor_select_v1"),
+        predictor=predictor,
+        anchor_selector=selector,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="object",
+        entity_phrase="the parked blue car",
+        grounding_prompt="blue car near the curb",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == expected_reason
+    assert len(selector.calls) == 1
+
+
+def test_sam3_multi_instance_judge_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    predictor = FakeSam3Predictor(
+        {5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13))}
+    )
+    selector = FakeAnchorSelector(RuntimeError("Qwen unavailable"))
+    backend = Sam3SegmentationBackend(
+        Sam3Config(multi_instance_rescue_mode="qwen_anchor_select_v1"),
+        predictor=predictor,
+        anchor_selector=selector,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        entity_phrase="the woman in the blue jacket",
+        grounding_prompt="woman on the right",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "multi_instance_anchor_judge_failed"
+
+
+def test_sam3_multi_instance_group_never_calls_qwen_or_unions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1", reference_type="group")],
+    )
+    selector = FakeAnchorSelector(
+        MultiInstanceAnchorDecision("select", 1, "must remain unused")
+    )
+    predictor = FakeSam3Predictor(
+        {5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13))}
+    )
+    backend = Sam3SegmentationBackend(
+        Sam3Config(multi_instance_rescue_mode="qwen_anchor_select_v1"),
+        predictor=predictor,
+        anchor_selector=selector,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="group",
+        entity_phrase="two women",
+        grounding_prompt="two women near center",
+    )
+
+    assert result.status == "failed"
+    assert result.reason == "unverified_multi_object_group"
+    assert selector.calls == []
+
+
 def test_sam3_multi_object_group_fails_without_propagation_or_union(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1223,6 +1425,134 @@ def test_sam3_object_id_change_in_either_direction_fails(
     assert result.status == "failed"
     assert result.reason == expected_reason
     assert set(predictor.propagation_session_ids).issubset(predictor.closed_session_ids)
+
+
+def test_late_forward_identity_switch_salvages_verified_track_and_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1")
+    storage, _frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+    )
+    mask = _mask()
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(mask)},
+        propagation_by_direction={
+            "forward": [
+                _stream_response(6, mask),
+                _stream_response(7, mask),
+                _stream_response(8, mask, object_id="changed-object"),
+                _stream_response(9, mask),
+            ],
+            "backward": [_stream_response(slot, mask) for slot in range(4, -1, -1)],
+        },
+    )
+    backend = Sam3SegmentationBackend(storage.config.sam3, predictor=predictor)
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+    artifact = storage.read_masks("clip-1")
+    track = artifact.entities[entity.entity_id]
+    coverage = build_coverage_state(
+        artifact=artifact,
+        entities=[entity],
+        required_visible_frames=storage.config.coverage.required_visible_frames,
+    )
+
+    assert track.status == "ready"
+    assert [frame.slot for frame in track.frames if frame.present] == list(range(8))
+    assert track.frames[8].present is False
+    assert track.frames[8].track_valid is False
+    assert track.frames[9].present is False
+    assert track.frames[9].track_valid is False
+    assert "changed-object" not in track.backend_object_ids
+    assert all(
+        "changed-object" not in frame.backend_object_ids for frame in track.frames
+    )
+    assert coverage.passed is True
+    assert coverage.entity_visibility_summary["e1"].visible_frame_count == 8
+    assert stats.propagation_identity_switch_detected == 1
+    assert stats.partial_track_salvage_attempted == 1
+    assert stats.partial_track_salvage_ready == 1
+    assert stats.partial_track_salvage_insufficient == 0
+
+
+def test_partial_identity_switch_track_below_coverage_remains_non_qualifying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1")
+    storage, _frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+    )
+    mask = _mask()
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(mask)},
+        propagation_by_direction={
+            "forward": [
+                _stream_response(6, mask, object_id="changed-object"),
+                _stream_response(7, mask),
+            ],
+            "backward": [
+                _stream_response(4, mask),
+                _stream_response(3, mask),
+            ],
+        },
+    )
+    backend = Sam3SegmentationBackend(storage.config.sam3, predictor=predictor)
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+    artifact = storage.read_masks("clip-1")
+    coverage = build_coverage_state(
+        artifact=artifact,
+        entities=[entity],
+        required_visible_frames=storage.config.coverage.required_visible_frames,
+    )
+
+    assert artifact.entities["e1"].status == "ready"
+    assert [
+        frame.slot for frame in artifact.entities["e1"].frames if frame.present
+    ] == [3, 4, 5]
+    assert coverage.passed is False
+    assert coverage.entity_visibility_summary["e1"].visible_frame_count == 3
+    assert stats.partial_track_salvage_ready == 0
+    assert stats.partial_track_salvage_insufficient == 1
+
+
+def test_no_identity_switch_keeps_recall_counters_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    mask = _mask()
+    predictor = FakeSam3Predictor(
+        {5: _sam_output(mask)},
+        propagation_by_direction={
+            "forward": [_stream_response(6, mask)],
+            "backward": [_stream_response(4, mask)],
+        },
+    )
+    backend = Sam3SegmentationBackend(storage.config.sam3, predictor=predictor)
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="distinct subject",
+    )
+
+    assert result.status == "ready"
+    assert [observation.slot for observation in result.observations] == [4, 5, 6]
+    assert all(observation.valid for observation in result.observations)
+    assert all(value == 0 for value in backend.recall_rescue_counters().values())
 
 
 def test_segment_closes_only_its_owned_backend(

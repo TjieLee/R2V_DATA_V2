@@ -71,6 +71,7 @@ def _config(
     source: SourceConfig | None = None,
     annotation_mode: str = "default",
     rescue_mode: str = "off",
+    not_found_rescue_mode: str = "off",
 ) -> V3Config:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -100,6 +101,7 @@ def _config(
         sam3=Sam3Config(
             model_path=user_models / "sam3" / "checkpoint.pt",
             object_rescue_mode=rescue_mode,
+            not_found_rescue_mode=not_found_rescue_mode,
         ),
         remove=RemoveConfig(
             base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
@@ -177,12 +179,14 @@ def _storage_with_frames(
     entities: list[AnnotationEntity],
     rescue_mode: str,
     run_name: str,
+    not_found_rescue_mode: str = "off",
 ) -> RunStorage:
     config = _config(
         tmp_path,
         monkeypatch,
         run_name=run_name,
         rescue_mode=rescue_mode,
+        not_found_rescue_mode=not_found_rescue_mode,
     )
     storage = RunStorage(config)
     storage.initialize(git_commit="composition-test")
@@ -495,6 +499,25 @@ def test_invalid_annotation_and_rescue_modes_fail_config_validation(
         replace(
             config,
             sam3=replace(config.sam3, object_rescue_mode="all_entities"),
+        ).validate()
+    with pytest.raises(ValueError, match="not_found_rescue_mode"):
+        replace(
+            config,
+            sam3=replace(config.sam3, not_found_rescue_mode="retry_everything"),
+        ).validate()
+    with pytest.raises(ValueError, match="multi_instance_rescue_mode"):
+        replace(
+            config,
+            sam3=replace(config.sam3, multi_instance_rescue_mode="largest_mask"),
+        ).validate()
+    with pytest.raises(ValueError, match="qwen.candidate_judge"):
+        replace(
+            config,
+            qwen=replace(config.qwen, candidate_judge=None),
+            sam3=replace(
+                config.sam3,
+                multi_instance_rescue_mode="qwen_anchor_select_v1",
+            ),
         ).validate()
     assert replace(
         config,
@@ -924,6 +947,122 @@ def test_object_not_found_retries_phrase_once_and_publishes_rescue(
     assert stats.object_rescue_attempted == 1
     assert stats.object_not_found_retry_attempted == 1
     assert stats.object_not_found_retry_ready == 1
+
+
+def test_subject_not_found_retries_entity_phrase_once_and_publishes_rescue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1", "subject")
+    storage = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+        rescue_mode="off",
+        not_found_rescue_mode="entity_phrase_retry_v1",
+        run_name="subject-not-found-ready",
+    )
+    backend = PromptBackend(
+        {
+            (entity.entity_id, entity.grounding_prompt): [_not_found()],
+            (entity.entity_id, entity.phrase): [_ready(_mask(2, 7))],
+        }
+    )
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+
+    assert [call[2] for call in backend.calls] == [
+        entity.grounding_prompt,
+        entity.phrase,
+    ]
+    assert storage.read_masks("clip-1").entities["e1"].status == "ready"
+    assert stats.subject_not_found_retry_attempted == 1
+    assert stats.subject_not_found_retry_ready == 1
+
+
+def test_not_found_retry_skips_normalized_duplicate_phrase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1", "subject").model_copy(
+        update={"grounding_prompt": "  THE concise SUBJECT e1  "}
+    )
+    storage = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+        rescue_mode="off",
+        not_found_rescue_mode="entity_phrase_retry_v1",
+        run_name="subject-duplicate-prompt",
+    )
+    backend = PromptBackend(
+        {(entity.entity_id, entity.grounding_prompt): [_not_found()]}
+    )
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+
+    assert len(backend.calls) == 1
+    assert stats.subject_not_found_retry_attempted == 0
+    assert storage.read_masks("clip-1").entities["e1"].status == "not_found"
+
+
+def test_ambiguous_subject_phrase_retry_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1", "subject")
+    storage = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+        rescue_mode="off",
+        not_found_rescue_mode="entity_phrase_retry_v1",
+        run_name="subject-ambiguous-retry",
+    )
+    backend = PromptBackend(
+        {
+            (entity.entity_id, entity.grounding_prompt): [_not_found("initial")],
+            (entity.entity_id, entity.phrase): [
+                EntityTrackResult(
+                    status="failed",
+                    reason="multiple ambiguous instances",
+                )
+            ],
+        }
+    )
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+    track = storage.read_masks("clip-1").entities["e1"]
+
+    assert len(backend.calls) == 2
+    assert track.status == "not_found"
+    assert track.reason == "initial"
+    assert stats.subject_not_found_retry_attempted == 1
+    assert stats.subject_not_found_retry_ready == 0
+
+
+def test_general_not_found_retry_does_not_change_group_behavior(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity = _entity("e1", "group")
+    storage = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[entity],
+        rescue_mode="off",
+        not_found_rescue_mode="entity_phrase_retry_v1",
+        run_name="group-no-phrase-retry",
+    )
+    backend = PromptBackend(
+        {(entity.entity_id, entity.grounding_prompt): [_not_found()]}
+    )
+
+    stats = segment_clips(storage.config, storage, backend=backend)
+
+    assert len(backend.calls) == 1
+    assert stats.subject_not_found_retry_attempted == 0
+    assert stats.object_not_found_retry_attempted == 0
 
 
 @pytest.mark.parametrize("reference_type", ["subject", "group"])

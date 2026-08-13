@@ -106,6 +106,8 @@ class Sam3Config:
     device: str = "cuda"
     save_debug_overlays: bool = False
     object_rescue_mode: str = "off"
+    not_found_rescue_mode: str = "off"
+    multi_instance_rescue_mode: str = "off"
     anchor_search_mode: str = "legacy"
 
 
@@ -423,6 +425,30 @@ class V3Config:
             raise TypeError("sam3.save_debug_overlays must be a boolean")
         if self.sam3.object_rescue_mode not in {"off", "phrase_retry_v1"}:
             raise ValueError("sam3.object_rescue_mode must be off or phrase_retry_v1")
+        if self.sam3.not_found_rescue_mode not in {
+            "off",
+            "entity_phrase_retry_v1",
+        }:
+            raise ValueError(
+                "sam3.not_found_rescue_mode must be off or "
+                "entity_phrase_retry_v1"
+            )
+        if self.sam3.multi_instance_rescue_mode not in {
+            "off",
+            "qwen_anchor_select_v1",
+        }:
+            raise ValueError(
+                "sam3.multi_instance_rescue_mode must be off or "
+                "qwen_anchor_select_v1"
+            )
+        if (
+            self.sam3.multi_instance_rescue_mode == "qwen_anchor_select_v1"
+            and self.qwen.candidate_judge is None
+        ):
+            raise ValueError(
+                "qwen.candidate_judge is required when "
+                "sam3.multi_instance_rescue_mode is qwen_anchor_select_v1"
+            )
         if self.sam3.anchor_search_mode not in {"legacy", "progressive_v1"}:
             raise ValueError("sam3.anchor_search_mode must be legacy or progressive_v1")
         if self.sam3.model_path is not None:

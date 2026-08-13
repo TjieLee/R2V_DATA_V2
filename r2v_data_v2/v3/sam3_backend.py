@@ -44,6 +44,33 @@ class DirectionalTrackResult:
     anchor: BackendMaskObservation
     observations: tuple[BackendMaskObservation, ...]
     non_owned_observations: tuple[BackendMaskObservation, ...] = ()
+    identity_switch_detected: bool = False
+
+
+@dataclass(frozen=True)
+class MultiInstanceAnchorDecision:
+    verdict: Literal["select", "reject", "uncertain"]
+    candidate_id: int | None
+    reason: str
+
+
+class MultiInstanceAnchorSelector(Protocol):
+    def select(
+        self,
+        *,
+        frame_path: Path,
+        candidates: tuple[BackendMaskObservation, ...],
+        entity_phrase: str,
+        grounding_prompt: str,
+        reference_type: str,
+    ) -> MultiInstanceAnchorDecision: ...
+
+
+@dataclass(frozen=True)
+class _AnchorProbeSelection:
+    slot: int
+    observation: BackendMaskObservation
+    multi_instance_rescued: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +196,7 @@ class SegmentationBackend(Protocol):
         entity_id: str,
         reference_type: str,
         grounding_prompt: str,
+        entity_phrase: str | None = None,
     ) -> EntityTrackResult: ...
 
 
@@ -181,10 +209,12 @@ class Sam3SegmentationBackend:
         *,
         predictor: object | None = None,
         builder: Callable[..., object] | None = None,
+        anchor_selector: MultiInstanceAnchorSelector | None = None,
     ) -> None:
         self.config = config
         self._predictor = predictor
         self._builder = builder
+        self._anchor_selector = anchor_selector
         self._anchor_counters = {
             "anchor_fast_path_hits": 0,
             "anchor_fallback_attempted": 0,
@@ -192,9 +222,21 @@ class Sam3SegmentationBackend:
             "anchor_all_frames_not_found": 0,
             "anchor_probe_calls": 0,
         }
+        self._recall_rescue_counters = {
+            "multi_instance_rescue_attempted": 0,
+            "multi_instance_rescue_selected": 0,
+            "multi_instance_rescue_rejected": 0,
+            "propagation_identity_switch_detected": 0,
+            "partial_track_salvage_attempted": 0,
+            "partial_track_salvage_ready": 0,
+            "partial_track_salvage_insufficient": 0,
+        }
 
     def anchor_search_counters(self) -> dict[str, int]:
         return dict(self._anchor_counters)
+
+    def recall_rescue_counters(self) -> dict[str, int]:
+        return dict(self._recall_rescue_counters)
 
     def _load_predictor(self) -> object:
         if self._predictor is not None:
@@ -320,16 +362,17 @@ class Sam3SegmentationBackend:
         predictor: object,
         *,
         frames_dir: Path,
-        frame_count: int,
+        frame_paths: list[Path],
         reference_type: str,
+        entity_phrase: str,
         grounding_prompt: str,
-    ) -> tuple[int | None, str | None]:
+    ) -> tuple[_AnchorProbeSelection | None, str | None]:
         ambiguous_instance = False
 
-        def probe(order: tuple[int, ...]) -> int | None:
+        def probe(order: tuple[int, ...]) -> _AnchorProbeSelection | None:
             nonlocal ambiguous_instance
             for slot in order:
-                if slot >= frame_count:
+                if slot >= len(frame_paths):
                     continue
                 self._anchor_counters["anchor_probe_calls"] += 1
                 observations = self._prompt_frame(
@@ -342,9 +385,68 @@ class Sam3SegmentationBackend:
                     if reference_type == "group":
                         raise _TrackValidationError("unverified_multi_object_group")
                     ambiguous_instance = True
-                    continue
+                    if (
+                        self.config.multi_instance_rescue_mode
+                        != "qwen_anchor_select_v1"
+                    ):
+                        continue
+                    self._recall_rescue_counters[
+                        "multi_instance_rescue_attempted"
+                    ] += 1
+                    if self._anchor_selector is None:
+                        self._recall_rescue_counters[
+                            "multi_instance_rescue_rejected"
+                        ] += 1
+                        raise _TrackValidationError(
+                            "multi_instance_anchor_selector_not_configured"
+                        )
+                    try:
+                        decision = self._anchor_selector.select(
+                            frame_path=frame_paths[slot],
+                            candidates=tuple(observations),
+                            entity_phrase=entity_phrase,
+                            grounding_prompt=grounding_prompt,
+                            reference_type=reference_type,
+                        )
+                    except Exception as exc:
+                        self._recall_rescue_counters[
+                            "multi_instance_rescue_rejected"
+                        ] += 1
+                        raise _TrackValidationError(
+                            "multi_instance_anchor_judge_failed"
+                        ) from exc
+                    candidate_id = decision.candidate_id
+                    if decision.verdict != "select":
+                        self._recall_rescue_counters[
+                            "multi_instance_rescue_rejected"
+                        ] += 1
+                        raise _TrackValidationError(
+                            f"multi_instance_anchor_{decision.verdict}"
+                        )
+                    if (
+                        candidate_id is None
+                        or candidate_id < 1
+                        or candidate_id > len(observations)
+                    ):
+                        self._recall_rescue_counters[
+                            "multi_instance_rescue_rejected"
+                        ] += 1
+                        raise _TrackValidationError(
+                            "multi_instance_anchor_invalid_candidate_id"
+                        )
+                    self._recall_rescue_counters[
+                        "multi_instance_rescue_selected"
+                    ] += 1
+                    return _AnchorProbeSelection(
+                        slot=slot,
+                        observation=observations[candidate_id - 1],
+                        multi_instance_rescued=True,
+                    )
                 if observations:
-                    return slot
+                    return _AnchorProbeSelection(
+                        slot=slot,
+                        observation=observations[0],
+                    )
             return None
 
         try:
@@ -379,11 +481,12 @@ class Sam3SegmentationBackend:
         *,
         frames_dir: Path,
         frame_count: int,
-        anchor_slot: int,
+        anchor_selection: _AnchorProbeSelection,
         reference_type: str,
         grounding_prompt: str,
         direction: PropagationDirection,
     ) -> DirectionalTrackResult:
+        anchor_slot = anchor_selection.slot
         session_id = self._start_session(predictor, frames_dir)
         try:
             prompted = predictor.handle_request(  # type: ignore[attr-defined]
@@ -400,13 +503,35 @@ class Sam3SegmentationBackend:
             )
             if reference_type == "group" and len(anchored) > 1:
                 raise _TrackValidationError("unverified_multi_object_group")
-            if len(anchored) != 1:
-                raise _TrackValidationError(
-                    "SAM3 did not resolve one stable tracked identity for the entity"
-                )
-            anchor = anchored[0]
+            ignored_object_ids: set[str] = set()
+            if anchor_selection.multi_instance_rescued:
+                matching = [
+                    observation
+                    for observation in anchored
+                    if _masks_match(
+                        observation.mask,
+                        anchor_selection.observation.mask,
+                    )
+                ]
+                if len(matching) != 1:
+                    raise _TrackValidationError(
+                        "selected_anchor_identity_not_reidentified"
+                    )
+                anchor = matching[0]
+                ignored_object_ids = {
+                    observation.object_id
+                    for observation in anchored
+                    if observation.object_id != anchor.object_id
+                }
+            else:
+                if len(anchored) != 1:
+                    raise _TrackValidationError(
+                        "SAM3 did not resolve one stable tracked identity for the entity"
+                    )
+                anchor = anchored[0]
             observations: list[BackendMaskObservation] = []
             non_owned_observations: list[BackendMaskObservation] = []
+            identity_switch_detected = False
             for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
                 {
                     "type": "propagate_in_video",
@@ -422,12 +547,35 @@ class Sam3SegmentationBackend:
                 if slot == anchor_slot:
                     continue
                 current = self._observations(slot, response["outputs"])
-                if any(
-                    observation.object_id != anchor.object_id for observation in current
-                ):
-                    raise _TrackValidationError(
-                        f"sam3_object_identity_changed_during_{direction}_propagation"
+                unknown = [
+                    observation
+                    for observation in current
+                    if observation.object_id != anchor.object_id
+                    and observation.object_id not in ignored_object_ids
+                ]
+                if unknown:
+                    identity_switch_detected = True
+                    invalid_slots = (
+                        range(slot, frame_count)
+                        if direction == "forward"
+                        else range(slot + 1)
                     )
+                    observations.extend(
+                        BackendMaskObservation(
+                            slot=invalid_slot,
+                            mask=np.zeros_like(anchor.mask, dtype=bool),
+                            confidence=0.0,
+                            object_id=anchor.object_id,
+                            valid=False,
+                        )
+                        for invalid_slot in invalid_slots
+                    )
+                    break
+                current = [
+                    observation
+                    for observation in current
+                    if observation.object_id == anchor.object_id
+                ]
                 owns_slot = (direction == "forward" and slot > anchor_slot) or (
                     direction == "backward" and slot < anchor_slot
                 )
@@ -440,6 +588,7 @@ class Sam3SegmentationBackend:
                 anchor=anchor,
                 observations=tuple(observations),
                 non_owned_observations=tuple(non_owned_observations),
+                identity_switch_detected=identity_switch_detected,
             )
         finally:
             self._close_session(predictor, session_id)
@@ -451,6 +600,7 @@ class Sam3SegmentationBackend:
         entity_id: str,
         reference_type: str,
         grounding_prompt: str,
+        entity_phrase: str | None = None,
     ) -> EntityTrackResult:
         del entity_id
         if reference_type not in {"subject", "object", "group"}:
@@ -465,14 +615,15 @@ class Sam3SegmentationBackend:
             )
         frames_dir = self._frames_dir(frame_paths)
         predictor = self._load_predictor()
-        anchor_slot, anchor_failure = self._find_anchor(
+        anchor_selection, anchor_failure = self._find_anchor(
             predictor,
             frames_dir=frames_dir,
-            frame_count=len(frame_paths),
+            frame_paths=frame_paths,
             reference_type=reference_type,
+            entity_phrase=entity_phrase or grounding_prompt,
             grounding_prompt=grounding_prompt,
         )
-        if anchor_slot is None:
+        if anchor_selection is None:
             if anchor_failure == "unverified_multi_object_group":
                 return EntityTrackResult(
                     status="failed",
@@ -486,17 +637,20 @@ class Sam3SegmentationBackend:
                         "single-entity prompt"
                     ),
                 )
+            if anchor_failure is not None:
+                return EntityTrackResult(status="failed", reason=anchor_failure)
             return EntityTrackResult(
                 status="not_found",
                 reason="SAM3 did not find the prompted entity",
             )
 
+        switch_count = 0
         try:
             forward = self._run_direction(
                 predictor,
                 frames_dir=frames_dir,
                 frame_count=len(frame_paths),
-                anchor_slot=anchor_slot,
+                anchor_selection=anchor_selection,
                 reference_type=reference_type,
                 grounding_prompt=grounding_prompt,
                 direction="forward",
@@ -505,17 +659,60 @@ class Sam3SegmentationBackend:
                 predictor,
                 frames_dir=frames_dir,
                 frame_count=len(frame_paths),
-                anchor_slot=anchor_slot,
+                anchor_selection=anchor_selection,
                 reference_type=reference_type,
                 grounding_prompt=grounding_prompt,
                 direction="backward",
             )
+            switch_count = sum(
+                (
+                    forward.identity_switch_detected,
+                    backward.identity_switch_detected,
+                )
+            )
+            if switch_count:
+                self._recall_rescue_counters[
+                    "propagation_identity_switch_detected"
+                ] += switch_count
+                self._recall_rescue_counters[
+                    "partial_track_salvage_attempted"
+                ] += 1
             _validate_anchor_consistency(forward, backward)
             # SAM3 object IDs are session-local. The backward session ID is
             # remapped to the forward anchor ID after anchor-mask validation.
             observations = _merge_directional_tracks(forward, backward)
         except _TrackValidationError as exc:
+            if switch_count:
+                self._recall_rescue_counters[
+                    "partial_track_salvage_insufficient"
+                ] += 1
             return EntityTrackResult(status="failed", reason=str(exc))
+        valid_observations = [
+            observation
+            for observation in observations
+            if observation.valid and np.asarray(observation.mask, dtype=bool).any()
+        ]
+        if switch_count and len(valid_observations) <= 1:
+            self._recall_rescue_counters[
+                "partial_track_salvage_insufficient"
+            ] += 1
+            changed_directions = [
+                result.direction
+                for result in (forward, backward)
+                if result.identity_switch_detected
+            ]
+            changed_label = (
+                changed_directions[0]
+                if len(changed_directions) == 1
+                else "bidirectional"
+            )
+            return EntityTrackResult(
+                status="failed",
+                reason=(
+                    "sam3_object_identity_changed_during_"
+                    f"{changed_label}_propagation"
+                ),
+            )
         return EntityTrackResult(
             status="ready",
             observations=observations,
@@ -523,6 +720,9 @@ class Sam3SegmentationBackend:
         )
 
     def close(self) -> None:
+        selector_close = getattr(self._anchor_selector, "close", None)
+        if callable(selector_close):
+            selector_close()
         if self._predictor is None:
             return
         shutdown = getattr(self._predictor, "shutdown", None)

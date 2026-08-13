@@ -62,10 +62,12 @@ class _StageRuntime:
 
     def _initialize(self) -> Any:
         if self.stage == "segment":
-            from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
-            from r2v_data_v2.v3.segment import segment_clips
+            from r2v_data_v2.v3.segment import (
+                build_sam3_segment_backend,
+                segment_clips,
+            )
 
-            backend = Sam3SegmentationBackend(self.config.sam3)
+            backend = build_sam3_segment_backend(self.config)
             self._segment_backend = backend
             self._closers.append(backend)
             return lambda scoped: segment_clips(

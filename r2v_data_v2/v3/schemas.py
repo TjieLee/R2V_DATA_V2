@@ -9,6 +9,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictInt,
     field_validator,
     model_validator,
 )
@@ -1256,6 +1257,27 @@ class ReferenceIntegrityReview(SchemaModel):
         if self.verdict != ("accept" if passed else "reject"):
             raise ValueError(
                 "reference integrity verdict must match all integrity checks"
+            )
+        return self
+
+
+class Sam3AnchorSelectionReview(SchemaModel):
+    verdict: Literal["select", "reject", "uncertain"]
+    selected_candidate_id: Optional[StrictInt] = None
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_review(self) -> Sam3AnchorSelectionReview:
+        if not self.reason.strip():
+            raise ValueError("SAM3 anchor selection reason must not be empty")
+        if self.verdict == "select":
+            if self.selected_candidate_id is None or self.selected_candidate_id < 1:
+                raise ValueError(
+                    "selected SAM3 anchor requires a positive candidate ID"
+                )
+        elif self.selected_candidate_id is not None:
+            raise ValueError(
+                "rejected or uncertain SAM3 anchor cannot select a candidate"
             )
         return self
 

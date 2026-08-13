@@ -219,6 +219,28 @@ SAM3. Single-subject, single-object, and current first-pass group tracking
 retain exactly one identity rather than unioning unrelated detections.
 Multi-object groups remain unverified and are rejected.
 
+Conservative recall rescue is opt-in. With
+`sam3.not_found_rescue_mode: entity_phrase_retry_v1`, a not-found subject or
+object receives at most one retry using its annotation `phrase`; normalized
+duplicate prompts and groups do not trigger another inference. Existing
+`object_rescue_mode: phrase_retry_v1` remains compatible for object-only retry
+and collision handling. With
+`sam3.multi_instance_rescue_mode: qwen_anchor_select_v1`, the first ambiguous
+subject/object probe is rendered with numbered masks and sent to the configured
+candidate-judge VLM. Only one explicit valid candidate ID may become the anchor;
+reject, uncertainty, invalid output, or judge failure fails closed. Unique
+anchors make no VLM call, groups are never rescued, masks are never selected by
+SAM score alone, and candidates are never unioned.
+
+If one propagation session changes object ID, the mismatched observation and
+all later slots owned by that direction are invalidated. Earlier verified masks,
+the `add_prompt` anchor, and the independent opposite direction remain eligible
+for publication. The segment stage never remaps the changed ID or accepts later
+observations; the unchanged 7/10 coverage stage decides whether the resulting
+partial track is temporally sufficient. Segment counts record phrase retries,
+multi-instance selection, identity switches, and ready versus insufficient
+partial-track salvage.
+
 After all annotation entities have been tracked, non-group ready tracks are
 compared across entity IDs. A pair is a duplicate only with at least three
 common present-valid frames, median mask IoU at least `0.85`, and at least 75%
@@ -1255,6 +1277,10 @@ sam3:
   model_path: /mnt/workspace/litengjie/data/models/sam3/checkpoint.pt
   device: cuda
   save_debug_overlays: false
+  object_rescue_mode: off
+  not_found_rescue_mode: off
+  multi_instance_rescue_mode: off
+  anchor_search_mode: legacy
 
 coverage:
   required_visible_frames: 7
