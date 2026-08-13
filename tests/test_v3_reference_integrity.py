@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from r2v_data_v2.v3.config import (
 from r2v_data_v2.v3.entity_composition_audit import audit_entity_composition
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.reference_integrity import (
+    SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     QwenReferenceIntegrityJudge,
     QwenSourceBboxFallbackJudge,
@@ -322,6 +324,64 @@ def test_qwen_integrity_valid_first_response_uses_one_call(
     assert len(completions.calls) == 1
 
 
+def test_integrity_review_schema_terminates_with_reason_then_verdict() -> None:
+    schema = ReferenceIntegrityReview.model_json_schema()
+
+    assert list(schema["properties"])[-2:] == ["reason", "verdict"]
+    assert set(schema["required"]) == {
+        "matches_target",
+        "reference_entity_semantically_valid",
+        "preserves_annotated_entity_semantics",
+        "preserves_primary_identity_region",
+        "recognizable_as_named_entity",
+        "structurally_complete_for_scope",
+        "no_major_missing_regions",
+        "no_unnatural_holes_or_surface_loss",
+        "no_unrelated_entity_dominance",
+        "no_severe_reference_artifact",
+        "usable_as_independent_reference",
+        "reason",
+        "verdict",
+    }
+
+
+def test_source_bbox_review_schema_terminates_with_reason_then_verdict() -> None:
+    schema = SourceBboxFallbackReview.model_json_schema()
+
+    assert list(schema["properties"])[-2:] == ["reason", "verdict"]
+    assert set(schema["required"]) == {
+        "same_target_entity",
+        "target_remains_dominant",
+        "extra_non_target_content_is_minor",
+        "no_competing_salient_entity",
+        "no_severe_reference_artifact",
+        "bbox_is_preferable_to_failed_reference",
+        "usable_as_independent_reference",
+        "certain",
+        "reason",
+        "verdict",
+    }
+
+
+@pytest.mark.parametrize(
+    ("review_type", "review"),
+    (
+        (ReferenceIntegrityReview, _review(accept=True)),
+        (SourceBboxFallbackReview, _bbox_review(accept=True)),
+    ),
+)
+def test_review_schemas_accept_historical_verdict_before_reason_json(
+    review_type: type[ReferenceIntegrityReview | SourceBboxFallbackReview],
+    review: ReferenceIntegrityReview | SourceBboxFallbackReview,
+) -> None:
+    payload = review.model_dump(mode="json")
+    reason = payload.pop("reason")
+    verdict = payload.pop("verdict")
+    historical_payload = {**payload, "verdict": verdict, "reason": reason}
+
+    assert review_type.model_validate_json(json.dumps(historical_payload)) == review
+
+
 def test_qwen_integrity_repairs_truncated_response_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -362,6 +422,11 @@ def test_qwen_integrity_repairs_truncated_response_once(
     repair_text = str(repair_messages[-1]["content"])
     assert "Validation error:" in repair_text
     assert "Do not return markdown, explanation, chain-of-thought" in repair_text
+    assert "Follow the supplied schema key order" in repair_text
+    assert "Emit reason before verdict" in repair_text
+    assert "make verdict the final key" in repair_text
+    assert "close the JSON object immediately after verdict" in repair_text
+    assert "Do not emit trailing whitespace" in repair_text
 
 
 def test_qwen_integrity_repairs_schema_invalid_response(
@@ -781,6 +846,27 @@ def test_integrity_prompt_enforces_reference_semantics_and_severe_artifacts() ->
         "a severe blank patch or edit scar",
         "large white bottle-shaped hole",
         "the bottle need not remain for her identity",
+    ):
+        assert contract in prompt
+
+
+@pytest.mark.parametrize(
+    "system_prompt",
+    (SYSTEM_PROMPT, SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT),
+)
+def test_integrity_system_prompts_require_immediate_schema_ordered_termination(
+    system_prompt: str,
+) -> None:
+    prompt = " ".join(system_prompt.lower().split())
+
+    for contract in (
+        "return exactly one compact json object",
+        "follow the supplied schema key order",
+        "reason must be one concise sentence",
+        "emit reason before verdict",
+        "make verdict the final key",
+        "close the json object immediately after verdict",
+        "do not emit trailing whitespace, markdown, or explanation",
     ):
         assert contract in prompt
 

@@ -87,7 +87,11 @@ bottle-shaped hole through her reference. The bottle need not remain for her
 identity; the artificial cavity itself is the failure.
 Legitimate source-matching cutouts, handles, wheels, scissors, brackets, frames,
 and truss structures are not defects merely because they contain holes.
-Return JSON only and make verdict accept if and only if every boolean is true."""
+Make verdict accept if and only if every boolean is true. Return exactly one
+compact JSON object and follow the supplied schema key order. Reason must be one
+concise sentence. Emit reason before verdict, make verdict the final key, and
+close the JSON object immediately after verdict. Do not emit trailing whitespace,
+markdown, or explanation."""
 
 SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT = """You are reviewing a conservative raw-source
 bbox fallback for a failed entity reference. Image 1 is source context with the
@@ -100,8 +104,11 @@ Reject another person or major body from another person, another large animal,
 vehicle, or product, a large unrelated foreground object, dominating scene content
 or text, a target that is too small, any severe artifact, or any ambiguity about the
 target. Do not decide from an object-name blacklist alone; judge visual dominance
-and conditioning ambiguity. Return JSON only. Set verdict to accept if and only if
-every strict boolean is true."""
+and conditioning ambiguity. Set verdict to accept if and only if every strict
+boolean is true. Return exactly one compact JSON object and follow the supplied
+schema key order. Reason must be one concise sentence. Emit reason before verdict,
+make verdict the final key, and close the JSON object immediately after verdict.
+Do not emit trailing whitespace, markdown, or explanation."""
 
 _OBJECT_CREATURE_TERMS = (
     "animal",
@@ -519,8 +526,12 @@ class QwenReferenceIntegrityJudge:
                             "Repair the preceding invalid response. Return only one "
                             "compact strict JSON object matching the supplied "
                             "ReferenceIntegrityReview schema. Preserve the original "
-                            "semantic context and image evidence. Do not return "
-                            "markdown, explanation, chain-of-thought, or extra fields.\n"
+                            "semantic context and image evidence. Follow the supplied "
+                            "schema key order. Reason must be one concise sentence. "
+                            "Emit reason before verdict, make verdict the final key, "
+                            "and close the JSON object immediately after verdict. Do "
+                            "not emit trailing whitespace. Do not return markdown, "
+                            "explanation, chain-of-thought, or extra fields.\n"
                             f"Validation error: {validation_error}"
                         ),
                     },

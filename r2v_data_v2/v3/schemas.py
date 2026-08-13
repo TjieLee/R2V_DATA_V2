@@ -1296,8 +1296,8 @@ class ReferenceIntegrityReview(SchemaModel):
     no_unrelated_entity_dominance: StrictBool
     no_severe_reference_artifact: StrictBool
     usable_as_independent_reference: StrictBool
-    verdict: Literal["accept", "reject"]
     reason: str
+    verdict: Literal["accept", "reject"]
 
     @model_validator(mode="after")
     def validate_review(self) -> ReferenceIntegrityReview:
@@ -1334,8 +1334,8 @@ class SourceBboxFallbackReview(SchemaModel):
     bbox_is_preferable_to_failed_reference: StrictBool
     usable_as_independent_reference: StrictBool
     certain: StrictBool
-    verdict: Literal["accept", "reject"]
     reason: str
+    verdict: Literal["accept", "reject"]
 
     @model_validator(mode="after")
     def validate_review(self) -> SourceBboxFallbackReview:
