@@ -8,7 +8,7 @@ import re
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 from openai import BadRequestError, OpenAI
@@ -121,12 +121,12 @@ close the JSON object immediately after verdict. Do not emit trailing whitespace
 markdown, or explanation."""
 
 SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT = """You are reviewing a conservative raw-source
-bbox fallback for a failed entity reference. Image 1 is source context with the
-target highlighted. Image 2 is the current failed reference. Image 3 is a raw RGB
-bbox crop from the exact selected source frame and target-mask bbox. Decide whether
-Image 3 is a substantially better independent conditioning reference without
-changing the target identity. A small held bottle, cup, fruit, tool, hand, or limited
-local background may remain when the annotated target stays clearly dominant.
+bbox alternative for an entity reference. Image 1 is source context with the target
+highlighted. Image 2 is the current reference. Image 3 is a raw RGB bbox crop from
+the exact selected source frame and target-mask bbox. Decide whether Image 3 is a
+substantially better independent conditioning reference without changing the target
+identity. A small held bottle, cup, fruit, tool, hand, or limited local background
+may remain when the annotated target stays clearly dominant.
 Reject another person or major body from another person, another large animal,
 vehicle, or product, a large unrelated foreground object, dominating scene content
 or text, a target that is too small, any severe artifact, or any ambiguity about the
@@ -136,6 +136,11 @@ boolean is true. Return exactly one compact JSON object and follow the supplied
 schema key order. Reason must be one concise sentence. Emit reason before verdict,
 make verdict the final key, and close the JSON object immediately after verdict.
 Do not emit trailing whitespace, markdown, or explanation."""
+
+SourceBboxFallbackTrigger = Literal[
+    "artifact_review_reject",
+    "topology_alpha_hole_upgrade",
+]
 
 _OBJECT_CREATURE_TERMS = (
     "animal",
@@ -628,6 +633,7 @@ class SourceBboxFallbackJudge(Protocol):
         phrase: str,
         grounding_prompt: str,
         reference_scope: str,
+        trigger: SourceBboxFallbackTrigger = "artifact_review_reject",
     ) -> SourceBboxFallbackReviewAttempt: ...
 
 
@@ -655,7 +661,16 @@ class QwenSourceBboxFallbackJudge:
         phrase: str,
         grounding_prompt: str,
         reference_scope: str,
+        trigger: SourceBboxFallbackTrigger = "artifact_review_reject",
     ) -> SourceBboxFallbackReviewAttempt:
+        if trigger == "topology_alpha_hole_upgrade":
+            trigger_context = (
+                "Image 2 is the current Qwen-accepted reference, but deterministic "
+                "alpha topology found a meaningful enclosed transparent hole. "
+                "Accept Image 3 only if the raw source bbox is clearly preferable."
+            )
+        else:
+            trigger_context = "Image 2 is the current failed reference."
         messages: list[dict[str, object]] = [
             {"role": "system", "content": SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT},
             {
@@ -668,6 +683,8 @@ class QwenSourceBboxFallbackJudge:
                             f"Phrase: {phrase}\n"
                             f"Grounding prompt: {grounding_prompt}\n"
                             f"Scope: {reference_scope}\n"
+                            f"Trigger: {trigger}\n"
+                            f"{trigger_context}\n"
                             "Review Image 3 as the proposed source_bbox_fallback_v1."
                         ),
                     },
@@ -699,6 +716,7 @@ class QwenSourceBboxFallbackJudge:
             "reference_scope": reference_scope,
             "image_count": 3,
             "mode": "source_bbox_fallback_v1",
+            "trigger": trigger,
         }
         raw: str | None = None
         try:
@@ -1021,6 +1039,30 @@ def _artifact_only_bbox_eligible(review: ReferenceIntegrityReview) -> bool:
     )
 
 
+def _topology_bbox_upgrade_eligible(
+    *,
+    review: ReferenceIntegrityReview,
+    reference_type: str,
+    reference: EntityReferenceState,
+    clip_uid: str,
+    diagnostics: ReferenceTopologyDiagnostics,
+) -> bool:
+    return all(
+        (
+            review.verdict == "accept",
+            reference_type == "subject",
+            reference.reference_scope == "local",
+            not reference.synthetic,
+            _is_self_sourced_reference(clip_uid=clip_uid, reference=reference),
+            not reference.source_bbox_fallback,
+            diagnostics.alpha_available,
+            diagnostics.enclosed_transparent_hole_count >= 1,
+            diagnostics.largest_enclosed_hole_area >= 1024,
+            diagnostics.enclosed_hole_bbox_ratio >= 0.01,
+        )
+    )
+
+
 def _is_self_sourced_reference(
     *,
     clip_uid: str,
@@ -1094,6 +1136,139 @@ def _reference_edit_after_source_bbox(
     )
 
 
+@dataclass(frozen=True)
+class _SourceBboxEvaluation:
+    candidate_relative: str
+    metadata_relative: str
+    bbox_xyxy: tuple[int, int, int, int]
+    attempt: SourceBboxFallbackReviewAttempt | None = None
+    judge_failure: SourceBboxFallbackJudgeFailure | None = None
+
+
+def _evaluate_source_bbox(
+    *,
+    storage: RunStorage,
+    clip_uid: str,
+    entity_id: str,
+    source_evidence: _SourceEvidence,
+    source_context: Image.Image,
+    current_reference: Image.Image,
+    current_reference_path: Path,
+    reference: EntityReferenceState,
+    reference_type: str,
+    phrase: str,
+    grounding_prompt: str,
+    original_review: ReferenceIntegrityReview,
+    diagnostics: ReferenceTopologyDiagnostics,
+    crop_padding_ratio: float,
+    trigger: SourceBboxFallbackTrigger,
+    judge: SourceBboxFallbackJudge,
+) -> _SourceBboxEvaluation:
+    candidate, bbox_xyxy = _source_bbox_candidate(
+        source_evidence,
+        crop_padding_ratio=crop_padding_ratio,
+    )
+    candidate_path = storage.selected_path(
+        clip_uid,
+        f"source_bbox_fallback_{entity_id}.png",
+    )
+    metadata_path = storage.selected_path(
+        clip_uid,
+        f"source_bbox_fallback_{entity_id}.json",
+    )
+    _write_context_atomic(candidate_path, candidate)
+    candidate_relative = storage.relative_artifact_path(candidate_path)
+    metadata_relative = storage.relative_artifact_path(metadata_path)
+    current_reference_sha256 = hashlib.sha256(
+        current_reference_path.read_bytes()
+    ).hexdigest()
+    metadata: dict[str, object] = {
+        "mode": "source_bbox_fallback_v1",
+        "trigger": f"{trigger}_v1",
+        "synthetic": False,
+        "raw_source_pixels_only": True,
+        "clip_uid": clip_uid,
+        "entity_id": entity_id,
+        "source_clip_uid": source_evidence.source_clip_uid,
+        "source_entity_id": source_evidence.source_entity_id,
+        "source_frame_slot": source_evidence.frame_slot,
+        "source_frame_index": source_evidence.source_frame_index,
+        "source_frame_path": storage.relative_artifact_path(
+            source_evidence.frame_path
+        ),
+        "source_frame_sha256": hashlib.sha256(
+            source_evidence.frame_path.read_bytes()
+        ).hexdigest(),
+        "source_mask_sha256": hashlib.sha256(
+            np.ascontiguousarray(source_evidence.mask.astype(np.uint8)).tobytes()
+        ).hexdigest(),
+        "bbox_xyxy": list(bbox_xyxy),
+        "crop_padding_ratio": crop_padding_ratio,
+        "candidate_path": candidate_relative,
+        "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+        "original_reference_path": reference.image_path,
+        "original_reference_sha256": current_reference_sha256,
+        "original_integrity_review": original_review.model_dump(mode="json"),
+    }
+    if trigger == "artifact_review_reject":
+        metadata.update(
+            {
+                "failed_reference_path": reference.image_path,
+                "failed_reference_sha256": current_reference_sha256,
+            }
+        )
+    else:
+        metadata["topology_evidence"] = {
+            "alpha_available": diagnostics.alpha_available,
+            "enclosed_transparent_hole_count": (
+                diagnostics.enclosed_transparent_hole_count
+            ),
+            "largest_enclosed_hole_area": diagnostics.largest_enclosed_hole_area,
+            "enclosed_hole_bbox_ratio": diagnostics.enclosed_hole_bbox_ratio,
+        }
+    try:
+        attempt = judge.review(
+            source_context=source_context,
+            failed_reference=current_reference,
+            source_bbox_candidate=candidate,
+            reference_type=reference_type,
+            phrase=phrase,
+            grounding_prompt=grounding_prompt,
+            reference_scope=reference.reference_scope,
+            trigger=trigger,
+        )
+    except SourceBboxFallbackJudgeFailure as exc:
+        metadata.update(
+            {
+                "status": "judge_failed",
+                "reason": str(exc),
+                "raw_response": exc.raw_response,
+            }
+        )
+        write_json_atomic(metadata_path, metadata)
+        return _SourceBboxEvaluation(
+            candidate_relative=candidate_relative,
+            metadata_relative=metadata_relative,
+            bbox_xyxy=bbox_xyxy,
+            judge_failure=exc,
+        )
+    metadata.update(
+        {
+            "status": "accepted" if attempt.review.verdict == "accept" else "rejected",
+            "review": attempt.review.model_dump(mode="json"),
+            "raw_response": attempt.raw_response,
+            "finish_reason": attempt.finish_reason,
+        }
+    )
+    write_json_atomic(metadata_path, metadata)
+    return _SourceBboxEvaluation(
+        candidate_relative=candidate_relative,
+        metadata_relative=metadata_relative,
+        bbox_xyxy=bbox_xyxy,
+        attempt=attempt,
+    )
+
+
 def _tokens_for_retained(
     retained: list[str],
     reference_types: dict[str, str],
@@ -1125,6 +1300,10 @@ class ReferenceIntegrityStats:
     source_bbox_fallback_accepted: int = 0
     source_bbox_fallback_rejected: int = 0
     source_bbox_fallback_judge_failed: int = 0
+    source_bbox_topology_upgrade_attempted: int = 0
+    source_bbox_topology_upgrade_accepted: int = 0
+    source_bbox_topology_upgrade_kept_original: int = 0
+    source_bbox_topology_upgrade_judge_failed: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -1309,23 +1488,14 @@ def reference_integrity_clips(
                                 "finish_reasons": list(attempt.finish_reasons),
                             },
                         )
-                    if attempt.review.verdict == "accept":
-                        counters["entities_accepted"] += 1
-                        results.append(
-                            ReferenceIntegrityEntityState(
-                                entity_id=entity_id,
-                                status="accepted",
-                                input_reference=reference,
-                                final_reference_path=reference.image_path,
-                                source_context_path=context_relative,
-                                diagnostics=diagnostics,
-                                reviewed=True,
-                                review=attempt.review,
-                                reason=attempt.review.reason,
-                            )
-                        )
-                        continue
-                    fallback_eligible = (
+                    topology_upgrade_eligible = _topology_bbox_upgrade_eligible(
+                        review=attempt.review,
+                        reference_type=entity.reference_type,
+                        reference=reference,
+                        clip_uid=clip.clip_uid,
+                        diagnostics=diagnostics,
+                    )
+                    artifact_fallback_eligible = (
                         _artifact_only_bbox_eligible(attempt.review)
                         and not reference.source_bbox_fallback
                         and _is_self_sourced_reference(
@@ -1333,13 +1503,19 @@ def reference_integrity_clips(
                             reference=reference,
                         )
                     )
-                    if not fallback_eligible:
-                        rejected_ids.add(entity_id)
-                        counters["entities_rejected"] += 1
+                    if not (
+                        topology_upgrade_eligible or artifact_fallback_eligible
+                    ):
+                        accepted = attempt.review.verdict == "accept"
+                        if accepted:
+                            counters["entities_accepted"] += 1
+                        else:
+                            rejected_ids.add(entity_id)
+                            counters["entities_rejected"] += 1
                         results.append(
                             ReferenceIntegrityEntityState(
                                 entity_id=entity_id,
-                                status="rejected",
+                                status="accepted" if accepted else "rejected",
                                 input_reference=reference,
                                 final_reference_path=reference.image_path,
                                 source_context_path=context_relative,
@@ -1351,57 +1527,15 @@ def reference_integrity_clips(
                         )
                         continue
 
-                    counters["source_bbox_fallback_attempted"] += 1
-                    candidate, bbox_xyxy = _source_bbox_candidate(
-                        source_evidence,
-                        crop_padding_ratio=config.pair.crop_padding_ratio,
+                    trigger: SourceBboxFallbackTrigger = (
+                        "topology_alpha_hole_upgrade"
+                        if topology_upgrade_eligible
+                        else "artifact_review_reject"
                     )
-                    candidate_path = storage.selected_path(
-                        clip.clip_uid,
-                        f"source_bbox_fallback_{entity_id}.png",
-                    )
-                    metadata_path = storage.selected_path(
-                        clip.clip_uid,
-                        f"source_bbox_fallback_{entity_id}.json",
-                    )
-                    _write_context_atomic(candidate_path, candidate)
-                    candidate_relative = storage.relative_artifact_path(candidate_path)
-                    metadata_relative = storage.relative_artifact_path(metadata_path)
-                    metadata: dict[str, object] = {
-                        "mode": "source_bbox_fallback_v1",
-                        "synthetic": False,
-                        "raw_source_pixels_only": True,
-                        "clip_uid": clip.clip_uid,
-                        "entity_id": entity_id,
-                        "source_clip_uid": source_evidence.source_clip_uid,
-                        "source_entity_id": source_evidence.source_entity_id,
-                        "source_frame_slot": source_evidence.frame_slot,
-                        "source_frame_index": source_evidence.source_frame_index,
-                        "source_frame_path": storage.relative_artifact_path(
-                            source_evidence.frame_path
-                        ),
-                        "source_frame_sha256": hashlib.sha256(
-                            source_evidence.frame_path.read_bytes()
-                        ).hexdigest(),
-                        "source_mask_sha256": hashlib.sha256(
-                            np.ascontiguousarray(
-                                source_evidence.mask.astype(np.uint8)
-                            ).tobytes()
-                        ).hexdigest(),
-                        "bbox_xyxy": list(bbox_xyxy),
-                        "crop_padding_ratio": config.pair.crop_padding_ratio,
-                        "candidate_path": candidate_relative,
-                        "candidate_sha256": hashlib.sha256(
-                            candidate_path.read_bytes()
-                        ).hexdigest(),
-                        "failed_reference_path": reference.image_path,
-                        "failed_reference_sha256": hashlib.sha256(
-                            final_path.read_bytes()
-                        ).hexdigest(),
-                        "original_integrity_review": attempt.review.model_dump(
-                            mode="json"
-                        ),
-                    }
+                    if topology_upgrade_eligible:
+                        counters["source_bbox_topology_upgrade_attempted"] += 1
+                    else:
+                        counters["source_bbox_fallback_attempted"] += 1
                     if active_bbox_fallback_judge is None:
                         service = config.qwen.reference_integrity_judge
                         if service is None:
@@ -1412,25 +1546,60 @@ def reference_integrity_clips(
                             service
                         )
                         active_bbox_fallback_judge = owned_bbox_fallback_judge
-                    try:
-                        fallback_attempt = active_bbox_fallback_judge.review(
-                            source_context=context,
-                            failed_reference=final_image,
-                            source_bbox_candidate=candidate,
-                            reference_type=entity.reference_type,
-                            phrase=entity.phrase,
-                            grounding_prompt=entity.grounding_prompt,
-                            reference_scope=reference.reference_scope,
-                        )
-                    except SourceBboxFallbackJudgeFailure as exc:
-                        metadata.update(
-                            {
-                                "status": "judge_failed",
-                                "reason": str(exc),
-                                "raw_response": exc.raw_response,
-                            }
-                        )
-                        write_json_atomic(metadata_path, metadata)
+                    bbox_evaluation = _evaluate_source_bbox(
+                        storage=storage,
+                        clip_uid=clip.clip_uid,
+                        entity_id=entity_id,
+                        source_evidence=source_evidence,
+                        source_context=context,
+                        current_reference=final_image,
+                        current_reference_path=final_path,
+                        reference=reference,
+                        reference_type=entity.reference_type,
+                        phrase=entity.phrase,
+                        grounding_prompt=entity.grounding_prompt,
+                        original_review=attempt.review,
+                        diagnostics=diagnostics,
+                        crop_padding_ratio=config.pair.crop_padding_ratio,
+                        trigger=trigger,
+                        judge=active_bbox_fallback_judge,
+                    )
+                    if bbox_evaluation.judge_failure is not None:
+                        exc = bbox_evaluation.judge_failure
+                        if topology_upgrade_eligible:
+                            counters[
+                                "source_bbox_topology_upgrade_judge_failed"
+                            ] += 1
+                            counters[
+                                "source_bbox_topology_upgrade_kept_original"
+                            ] += 1
+                            counters["entities_accepted"] += 1
+                            results.append(
+                                ReferenceIntegrityEntityState(
+                                    entity_id=entity_id,
+                                    status="accepted",
+                                    input_reference=reference,
+                                    final_reference_path=reference.image_path,
+                                    source_context_path=context_relative,
+                                    diagnostics=diagnostics,
+                                    reviewed=True,
+                                    review=attempt.review,
+                                    source_bbox_fallback_trigger=trigger,
+                                    source_bbox_fallback_candidate_path=(
+                                        bbox_evaluation.candidate_relative
+                                    ),
+                                    source_bbox_fallback_metadata_path=(
+                                        bbox_evaluation.metadata_relative
+                                    ),
+                                    source_bbox_xyxy=bbox_evaluation.bbox_xyxy,
+                                    source_bbox_fallback_judge_failed=True,
+                                    reason=(
+                                        "topology_bbox_upgrade_judge_failed_"
+                                        f"kept_original:{exc}"
+                                    ),
+                                )
+                            )
+                            continue
                         counters["source_bbox_fallback_judge_failed"] += 1
                         counters["source_bbox_fallback_rejected"] += 1
                         counters["entities_rejected"] += 1
@@ -1449,34 +1618,31 @@ def reference_integrity_clips(
                             )
                         )
                         continue
+                    fallback_attempt = bbox_evaluation.attempt
+                    assert fallback_attempt is not None
                     fallback_accepted = fallback_attempt.review.verdict == "accept"
-                    metadata.update(
-                        {
-                            "status": (
-                                "accepted" if fallback_accepted else "rejected"
-                            ),
-                            "review": fallback_attempt.review.model_dump(mode="json"),
-                            "raw_response": fallback_attempt.raw_response,
-                            "finish_reason": fallback_attempt.finish_reason,
-                        }
-                    )
-                    write_json_atomic(metadata_path, metadata)
                     if fallback_accepted:
                         fallback_reference = _source_bbox_reference(
                             reference,
                             clip_uid=clip.clip_uid,
-                            image_path=candidate_relative,
-                            bbox_xyxy=bbox_xyxy,
-                            metadata_path=metadata_relative,
+                            image_path=bbox_evaluation.candidate_relative,
+                            bbox_xyxy=bbox_evaluation.bbox_xyxy,
+                            metadata_path=bbox_evaluation.metadata_relative,
                         )
                         fallback_references[entity_id] = fallback_reference
                         updated_reference_edit = _reference_edit_after_source_bbox(
                             updated_reference_edit,
                             entity_id=entity_id,
-                            output_image_path=candidate_relative,
-                            metadata_path=metadata_relative,
+                            output_image_path=bbox_evaluation.candidate_relative,
+                            metadata_path=bbox_evaluation.metadata_relative,
                         )
-                        counters["source_bbox_fallback_accepted"] += 1
+                        if topology_upgrade_eligible:
+                            counters["source_bbox_topology_upgrade_accepted"] += 1
+                        else:
+                            counters["source_bbox_fallback_accepted"] += 1
+                        counters["entities_accepted"] += 1
+                    elif topology_upgrade_eligible:
+                        counters["source_bbox_topology_upgrade_kept_original"] += 1
                         counters["entities_accepted"] += 1
                     else:
                         rejected_ids.add(entity_id)
@@ -1485,10 +1651,14 @@ def reference_integrity_clips(
                     results.append(
                         ReferenceIntegrityEntityState(
                             entity_id=entity_id,
-                            status="accepted" if fallback_accepted else "rejected",
+                            status=(
+                                "accepted"
+                                if fallback_accepted or topology_upgrade_eligible
+                                else "rejected"
+                            ),
                             input_reference=reference,
                             final_reference_path=(
-                                candidate_relative
+                                bbox_evaluation.candidate_relative
                                 if fallback_accepted
                                 else reference.image_path
                             ),
@@ -1496,9 +1666,14 @@ def reference_integrity_clips(
                             diagnostics=diagnostics,
                             reviewed=True,
                             review=attempt.review,
-                            source_bbox_fallback_candidate_path=candidate_relative,
-                            source_bbox_fallback_metadata_path=metadata_relative,
-                            source_bbox_xyxy=bbox_xyxy,
+                            source_bbox_fallback_trigger=trigger,
+                            source_bbox_fallback_candidate_path=(
+                                bbox_evaluation.candidate_relative
+                            ),
+                            source_bbox_fallback_metadata_path=(
+                                bbox_evaluation.metadata_relative
+                            ),
+                            source_bbox_xyxy=bbox_evaluation.bbox_xyxy,
                             source_bbox_fallback_review=fallback_attempt.review,
                             reason=fallback_attempt.review.reason,
                         )

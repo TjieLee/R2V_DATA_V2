@@ -55,6 +55,7 @@ from r2v_data_v2.v3.schemas import (
     ReferenceIntegrityEntityState,
     ReferenceIntegrityReview,
     ReferencesState,
+    ReferenceTopologyDiagnostics,
     SampledFrame,
     SampledFramesArtifact,
     SourceBboxFallbackReview,
@@ -1290,6 +1291,52 @@ def _make_human_reference_reviewable(storage: RunStorage) -> EntityReferenceStat
     return human
 
 
+def _make_human_topology_upgrade_candidate(
+    storage: RunStorage,
+) -> EntityReferenceState:
+    human = _make_human_reference_reviewable(storage)
+    assert human.image_path is not None
+    rgba = np.zeros((504, 439, 4), dtype=np.uint8)
+    rgba[..., :3] = (120, 30, 20)
+    rgba[10:494, 10:429, 3] = 255
+    rgba[210:256, 195:247, 3] = 0
+    Image.fromarray(rgba).save(storage.root / human.image_path)
+    diagnostics = reference_topology_diagnostics(Image.fromarray(rgba))
+    assert diagnostics.enclosed_transparent_hole_count == 1
+    assert diagnostics.largest_enclosed_hole_area == 2392
+    assert diagnostics.enclosed_hole_bbox_ratio >= 0.01
+    assert diagnostics.suspicious is False
+    return human
+
+
+def _write_not_required_reference_edit(storage: RunStorage) -> None:
+    clip = storage.read_clip("clip-1")
+    state = ReferenceEditState(
+        status="ready",
+        entities=[
+            ReferenceEditEntityState(
+                entity_id=reference.entity_id,
+                route=(
+                    "local_usable"
+                    if reference.reference_scope == "local"
+                    else "complete"
+                ),
+                status="not_required",
+                source_reference=reference,
+                source_image_path=reference.image_path,
+                output_image_path=reference.image_path,
+            )
+            for reference in clip.references.entities
+        ],
+    )
+    storage.write_reference_edit_result(
+        "clip-1",
+        clip.references,
+        clip.pairing,
+        state,
+    )
+
+
 def test_transient_removal_artifact_publishes_real_source_bbox_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1324,6 +1371,222 @@ def test_transient_removal_artifact_publishes_real_source_bbox_fallback(
     assert result.review.no_severe_reference_artifact is False
     assert result.source_bbox_fallback_review is not None
     assert result.source_bbox_fallback_review.verdict == "accept"
+    assert result.source_bbox_fallback_trigger == "artifact_review_reject"
+    legacy_state = result.model_dump(mode="json")
+    legacy_state.pop("source_bbox_fallback_trigger")
+    assert (
+        ReferenceIntegrityEntityState.model_validate(legacy_state)
+        .source_bbox_fallback_trigger
+        is None
+    )
+
+
+def test_topology_bbox_upgrade_eligibility_is_narrow_and_independent_of_suspicion(
+) -> None:
+    reference = _ready_reference(
+        "e1",
+        "clips/clip-1/selected/e1.png",
+        reference_scope="local",
+    )
+    review = _review(accept=True)
+    diagnostics = ReferenceTopologyDiagnostics(
+        alpha_available=True,
+        significant_component_count=1,
+        largest_component_ratio=1.0,
+        second_component_ratio=0.0,
+        bbox_fill_ratio=0.98,
+        border_contact=False,
+        enclosed_transparent_hole_count=1,
+        largest_enclosed_hole_area=2362,
+        enclosed_hole_bbox_ratio=0.0131,
+        suspicious=False,
+    )
+
+    def eligible(
+        *,
+        candidate: EntityReferenceState = reference,
+        candidate_type: str = "subject",
+        evidence: ReferenceTopologyDiagnostics = diagnostics,
+        result: ReferenceIntegrityReview = review,
+    ) -> bool:
+        return integrity_module._topology_bbox_upgrade_eligible(
+            review=result,
+            reference_type=candidate_type,
+            reference=candidate,
+            clip_uid="clip-1",
+            diagnostics=evidence,
+        )
+
+    assert eligible() is True
+    assert eligible(
+        evidence=diagnostics.model_copy(
+            update={"enclosed_hole_bbox_ratio": 0.0099}
+        )
+    ) is False
+    assert eligible(
+        evidence=diagnostics.model_copy(
+            update={"largest_enclosed_hole_area": 1023}
+        )
+    ) is False
+    assert eligible(candidate_type="object") is False
+    assert eligible(
+        candidate=reference.model_copy(update={"reference_scope": "full"})
+    ) is False
+    assert eligible(candidate=reference.model_copy(update={"synthetic": True})) is False
+    assert eligible(
+        candidate=reference.model_copy(update={"source_clip_uid": "donor"})
+    ) is False
+    assert eligible(
+        candidate=reference.model_copy(update={"source_bbox_fallback": True})
+    ) is False
+    assert eligible(result=_review(accept=False)) is False
+
+
+def test_topology_bbox_upgrade_accept_publishes_real_bbox_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    original = _make_human_topology_upgrade_candidate(storage)
+    _write_not_required_reference_edit(storage)
+    bbox_judge = FakeSourceBboxFallbackJudge([_bbox_review(accept=True)])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_review(accept=True)]),
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    published = updated.references.entities[0]
+    result = updated.reference_integrity.entities[0]
+    assert stats.entities_accepted == 2
+    assert stats.entities_rejected == 0
+    assert stats.source_bbox_topology_upgrade_attempted == 1
+    assert stats.source_bbox_topology_upgrade_accepted == 1
+    assert stats.source_bbox_topology_upgrade_kept_original == 0
+    assert stats.source_bbox_fallback_attempted == 0
+    assert len(bbox_judge.calls) == 1
+    assert bbox_judge.calls[0]["trigger"] == "topology_alpha_hole_upgrade"
+    assert result.status == "accepted"
+    assert result.review is not None and result.review.verdict == "accept"
+    assert result.source_bbox_fallback_trigger == "topology_alpha_hole_upgrade"
+    assert result.source_bbox_fallback_review is not None
+    assert result.source_bbox_fallback_review.verdict == "accept"
+    assert result.final_reference_path != original.image_path
+    assert published.image_path == result.final_reference_path
+    assert published.source_bbox_fallback is True
+    assert published.synthetic is False
+    assert published.source_bbox_metadata_path is not None
+    metadata = json.loads(
+        (storage.root / published.source_bbox_metadata_path).read_text(encoding="utf-8")
+    )
+    assert metadata["trigger"] == "topology_alpha_hole_upgrade_v1"
+    assert metadata["topology_evidence"] == {
+        "alpha_available": True,
+        "enclosed_transparent_hole_count": 1,
+        "largest_enclosed_hole_area": 2392,
+        "enclosed_hole_bbox_ratio": pytest.approx(
+            result.diagnostics.enclosed_hole_bbox_ratio
+        ),
+    }
+    assert metadata["source_frame_sha256"]
+    assert metadata["source_mask_sha256"]
+    assert metadata["candidate_sha256"]
+    assert metadata["original_reference_sha256"]
+    assert updated.reference_edit is not None
+    edit = updated.reference_edit.entities[0]
+    assert edit.status == "fallback"
+    assert edit.fallback_policy == "source_bbox_fallback"
+    assert edit.output_image_path == published.image_path
+    ClipRecord.model_validate(updated.model_dump(mode="json"))
+
+
+def test_topology_bbox_reject_keeps_qwen_accepted_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    original = _make_human_topology_upgrade_candidate(storage)
+    original_bytes = (storage.root / original.image_path).read_bytes()
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_review(accept=True)]),
+        bbox_fallback_judge=FakeSourceBboxFallbackJudge(
+            [_bbox_review(accept=False)]
+        ),
+    )
+
+    updated = storage.read_clip("clip-1")
+    published = updated.references.entities[0]
+    result = updated.reference_integrity.entities[0]
+    assert stats.entities_accepted == 2
+    assert stats.entities_rejected == 0
+    assert stats.source_bbox_topology_upgrade_attempted == 1
+    assert stats.source_bbox_topology_upgrade_accepted == 0
+    assert stats.source_bbox_topology_upgrade_kept_original == 1
+    assert published.image_path == original.image_path
+    assert published.source_bbox_fallback is False
+    assert (storage.root / original.image_path).read_bytes() == original_bytes
+    assert result.status == "accepted"
+    assert result.final_reference_path == original.image_path
+    assert result.source_bbox_fallback_trigger == "topology_alpha_hole_upgrade"
+    assert result.source_bbox_fallback_review is not None
+    assert result.source_bbox_fallback_review.verdict == "reject"
+    assert result.source_bbox_fallback_metadata_path is not None
+    metadata = json.loads(
+        (storage.root / result.source_bbox_fallback_metadata_path).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["status"] == "rejected"
+    assert metadata["trigger"] == "topology_alpha_hole_upgrade_v1"
+    ClipRecord.model_validate(updated.model_dump(mode="json"))
+
+
+def test_topology_bbox_judge_failure_keeps_original_and_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    original = _make_human_topology_upgrade_candidate(storage)
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_review(accept=True)]),
+        bbox_fallback_judge=FakeSourceBboxFallbackJudge(
+            [SourceBboxFallbackJudgeFailure("malformed topology comparison")]
+        ),
+    )
+
+    updated = storage.read_clip("clip-1")
+    published = updated.references.entities[0]
+    result = updated.reference_integrity.entities[0]
+    assert stats.entities_accepted == 2
+    assert stats.entities_rejected == 0
+    assert stats.source_bbox_topology_upgrade_attempted == 1
+    assert stats.source_bbox_topology_upgrade_judge_failed == 1
+    assert stats.source_bbox_topology_upgrade_kept_original == 1
+    assert stats.source_bbox_fallback_judge_failed == 0
+    assert published.image_path == original.image_path
+    assert published.status == "ready"
+    assert result.status == "accepted"
+    assert result.source_bbox_fallback_trigger == "topology_alpha_hole_upgrade"
+    assert result.source_bbox_fallback_judge_failed is True
+    assert result.source_bbox_fallback_review is None
+    assert result.source_bbox_fallback_metadata_path is not None
+    metadata = json.loads(
+        (storage.root / result.source_bbox_fallback_metadata_path).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["status"] == "judge_failed"
+    assert metadata["topology_evidence"]["largest_enclosed_hole_area"] == 2392
+    ClipRecord.model_validate(updated.model_dump(mode="json"))
 
 
 def test_transient_removal_artifact_stays_rejected_when_bbox_has_competing_content(
@@ -1620,6 +1883,45 @@ def test_qwen_source_bbox_reviewer_uses_three_images_and_strict_schema(
     ) == 3
 
 
+def test_qwen_source_bbox_reviewer_describes_topology_upgrade_honestly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _bbox_review(accept=False)
+    completions = FakeIntegrityCompletions(
+        [(expected.model_dump_json(), "stop")]
+    )
+    service = _config(tmp_path, monkeypatch).qwen.reference_integrity_judge
+    assert service is not None
+    judge = QwenSourceBboxFallbackJudge(
+        service,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+        ),
+    )
+
+    judge.review(
+        source_context=Image.new("RGB", (12, 10)),
+        failed_reference=Image.new("RGB", (8, 8)),
+        source_bbox_candidate=Image.new("RGB", (9, 7)),
+        reference_type="subject",
+        phrase="a man in a red robe",
+        grounding_prompt="man in a red robe near center",
+        reference_scope="local",
+        trigger="topology_alpha_hole_upgrade",
+    )
+
+    call = completions.calls[0]
+    messages = call["messages"]
+    assert isinstance(messages, list)
+    user_content = messages[1]["content"]
+    assert isinstance(user_content, list)
+    text = str(user_content[0]["text"])
+    assert "current Qwen-accepted reference" in text
+    assert "deterministic alpha topology" in text
+    assert "current failed reference" not in text
+
+
 def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:
     rgba = np.zeros((80, 80, 4), dtype=np.uint8)
     rgba[8:72, 8:72, :3] = 80
@@ -1631,6 +1933,21 @@ def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:
     assert diagnostics.suspicious is True
     assert diagnostics.enclosed_transparent_hole_count == 1
     assert "large_enclosed_alpha_hole" in diagnostics.suspicion_reasons
+
+
+def test_broad_topology_hole_threshold_remains_five_percent() -> None:
+    rgba = np.zeros((220, 220, 4), dtype=np.uint8)
+    rgba[20:200, 20:200, :3] = 80
+    rgba[20:200, 20:200, 3] = 255
+    rgba[90:130, 90:130, 3] = 0
+
+    diagnostics = reference_topology_diagnostics(Image.fromarray(rgba))
+
+    assert diagnostics.largest_enclosed_hole_area == 1600
+    assert diagnostics.enclosed_hole_bbox_ratio == pytest.approx(1600 / (180 * 180))
+    assert diagnostics.enclosed_hole_bbox_ratio < 0.05
+    assert "large_enclosed_alpha_hole" not in diagnostics.suspicion_reasons
+    assert diagnostics.suspicious is False
 
 
 def test_integrity_rejects_entity_and_invalidates_instruction_export(

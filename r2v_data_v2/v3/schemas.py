@@ -1390,10 +1390,17 @@ class ReferenceIntegrityEntityState(SchemaModel):
     diagnostics: ReferenceTopologyDiagnostics
     reviewed: StrictBool
     review: Optional[ReferenceIntegrityReview] = None
+    source_bbox_fallback_trigger: Optional[
+        Literal[
+            "artifact_review_reject",
+            "topology_alpha_hole_upgrade",
+        ]
+    ] = None
     source_bbox_fallback_candidate_path: Optional[str] = None
     source_bbox_fallback_metadata_path: Optional[str] = None
     source_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
     source_bbox_fallback_review: Optional[SourceBboxFallbackReview] = None
+    source_bbox_fallback_judge_failed: StrictBool = False
     judge_failed: StrictBool = False
     semantic_policy_reason: Optional[
         Literal[
@@ -1410,33 +1417,77 @@ class ReferenceIntegrityEntityState(SchemaModel):
             self.input_reference.status != "ready"
         ):
             raise ValueError("integrity input must be the ready published reference")
-        fallback_fields = (
+        fallback_provenance = (
             self.source_bbox_fallback_candidate_path,
             self.source_bbox_fallback_metadata_path,
             self.source_bbox_xyxy,
-            self.source_bbox_fallback_review,
         )
-        fallback_attempted = any(value is not None for value in fallback_fields)
-        if fallback_attempted and any(value is None for value in fallback_fields):
+        fallback_attempted = any(value is not None for value in fallback_provenance)
+        if fallback_attempted and any(
+            value is None for value in fallback_provenance
+        ):
             raise ValueError("source bbox fallback integrity provenance is incomplete")
+        if self.source_bbox_fallback_review is not None and not fallback_attempted:
+            raise ValueError("source bbox fallback review requires provenance")
+        if self.source_bbox_fallback_trigger is not None and not fallback_attempted:
+            raise ValueError("source bbox fallback trigger requires provenance")
+        if self.source_bbox_fallback_judge_failed:
+            if (
+                self.source_bbox_fallback_trigger
+                != "topology_alpha_hole_upgrade"
+                or not fallback_attempted
+                or self.source_bbox_fallback_review is not None
+                or self.review is None
+                or self.review.verdict != "accept"
+                or self.status != "accepted"
+                or self.final_reference_path != self.input_reference.image_path
+            ):
+                raise ValueError(
+                    "topology bbox judge failure must keep an accepted original"
+                )
+        elif fallback_attempted and self.source_bbox_fallback_review is None:
+            raise ValueError("source bbox fallback attempt requires a review")
         fallback_accepted = bool(
             self.source_bbox_fallback_review is not None
             and self.source_bbox_fallback_review.verdict == "accept"
         )
         if fallback_accepted:
+            expected_original_verdict = (
+                "accept"
+                if self.source_bbox_fallback_trigger
+                == "topology_alpha_hole_upgrade"
+                else "reject"
+            )
             if (
                 self.status != "accepted"
                 or self.judge_failed
                 or self.review is None
-                or self.review.verdict != "reject"
+                or self.review.verdict != expected_original_verdict
                 or self.final_reference_path
                 != self.source_bbox_fallback_candidate_path
                 or self.final_reference_path == self.input_reference.image_path
             ):
-                raise ValueError("accepted bbox fallback requires a rejected original")
+                raise ValueError(
+                    "accepted bbox fallback does not match its explicit trigger"
+                )
         elif self.final_reference_path != self.input_reference.image_path:
             raise ValueError(
                 "integrity output may differ from its input only for accepted bbox fallback"
+            )
+        if self.source_bbox_fallback_trigger == "topology_alpha_hole_upgrade":
+            if (
+                self.review is None
+                or self.review.verdict != "accept"
+                or self.status != "accepted"
+            ):
+                raise ValueError(
+                    "topology bbox upgrade requires an accepted original review"
+                )
+        elif self.source_bbox_fallback_trigger == "artifact_review_reject" and (
+            self.review is None or self.review.verdict != "reject"
+        ):
+            raise ValueError(
+                "artifact bbox fallback requires a rejected original review"
             )
         if not self.reason.strip():
             raise ValueError("reference integrity entity reason must not be empty")
@@ -1448,6 +1499,8 @@ class ReferenceIntegrityEntityState(SchemaModel):
                 or self.judge_failed
                 or self.source_context_path is not None
                 or fallback_attempted
+                or self.source_bbox_fallback_trigger is not None
+                or self.source_bbox_fallback_judge_failed
                 or self.final_reference_path != self.input_reference.image_path
                 or self.reason != self.semantic_policy_reason
             ):
