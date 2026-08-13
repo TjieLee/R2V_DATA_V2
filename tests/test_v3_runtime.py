@@ -36,6 +36,7 @@ from r2v_data_v2.v3.runtime import (
     streaming_model_stage_enabled,
 )
 from r2v_data_v2.v3.storage import _append_jsonl
+from tools.run_v3_streaming_stage_worker import _StageRuntime
 
 
 def _config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> V3Config:
@@ -400,6 +401,79 @@ for line in sys.stdin:
 
     assert first == second == {"processed": 1}
     assert worker.starts == 1
+
+
+def test_persistent_segment_worker_reports_recall_counter_deltas_per_clip() -> None:
+    class CumulativeBackend:
+        def __init__(self) -> None:
+            self.anchor = {"anchor_probe_calls": 0}
+            self.recall = {
+                "multi_instance_rescue_attempted": 0,
+                "multi_instance_rescue_selected": 0,
+                "partial_track_salvage_ready": 0,
+                "partial_track_salvage_insufficient": 0,
+            }
+
+        def anchor_search_counters(self) -> dict[str, int]:
+            return dict(self.anchor)
+
+        def recall_rescue_counters(self) -> dict[str, int]:
+            return dict(self.recall)
+
+    class Counts:
+        def __init__(self, values: dict[str, int]) -> None:
+            self.values = values
+
+        def to_dict(self) -> dict[str, int]:
+            return dict(self.values)
+
+    backend = CumulativeBackend()
+    call_index = 0
+
+    def handler(_scoped: object) -> Counts:
+        nonlocal call_index
+        call_index += 1
+        backend.anchor["anchor_probe_calls"] += 2
+        backend.recall["multi_instance_rescue_attempted"] += 1
+        backend.recall["multi_instance_rescue_selected"] += 1
+        values = {
+            "processed": 1,
+            "anchor_probe_calls": backend.anchor["anchor_probe_calls"],
+            "multi_instance_rescue_attempted": backend.recall[
+                "multi_instance_rescue_attempted"
+            ],
+            "multi_instance_rescue_selected": backend.recall[
+                "multi_instance_rescue_selected"
+            ],
+            "partial_track_salvage_ready": int(call_index == 1),
+            "partial_track_salvage_insufficient": int(call_index == 2),
+        }
+        return Counts(values)
+
+    runtime = object.__new__(_StageRuntime)
+    runtime.storage = object()
+    runtime.stage = "segment"
+    runtime._shared_lock = threading.Lock()
+    runtime._segment_backend = backend
+    runtime._handler = handler
+    runtime._first_reference_edit_request = False
+
+    first = runtime.run_clip("clip-a")
+    second = runtime.run_clip("clip-b")
+
+    assert first["anchor_probe_calls"] == 2
+    assert second["anchor_probe_calls"] == 2
+    assert first["multi_instance_rescue_attempted"] == 1
+    assert second["multi_instance_rescue_attempted"] == 1
+    assert first["multi_instance_rescue_selected"] == 1
+    assert second["multi_instance_rescue_selected"] == 1
+    assert first["partial_track_salvage_ready"] == 1
+    assert first["partial_track_salvage_insufficient"] == 0
+    assert second["partial_track_salvage_ready"] == 0
+    assert second["partial_track_salvage_insufficient"] == 1
+    assert sum(
+        counts["multi_instance_rescue_attempted"] for counts in (first, second)
+    ) == 2
 
 
 def test_single_worker_request_error_does_not_kill_persistent_process(

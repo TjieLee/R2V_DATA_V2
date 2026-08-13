@@ -225,12 +225,15 @@ object receives at most one retry using its annotation `phrase`; normalized
 duplicate prompts and groups do not trigger another inference. Existing
 `object_rescue_mode: phrase_retry_v1` remains compatible for object-only retry
 and collision handling. With
-`sam3.multi_instance_rescue_mode: qwen_anchor_select_v1`, the first ambiguous
+`sam3.multi_instance_rescue_mode: qwen_anchor_select_v1`, each ambiguous
 subject/object probe is rendered with numbered masks and sent to the configured
 candidate-judge VLM. Only one explicit valid candidate ID may become the anchor;
-reject, uncertainty, invalid output, or judge failure fails closed. Unique
-anchors make no VLM call, groups are never rescued, masks are never selected by
-SAM score alone, and candidates are never unioned.
+reject, uncertainty, an invalid candidate ID, or judge failure makes only that
+ambiguous probe unusable and anchor probing continues. If all configured probes
+are exhausted after any ambiguity without a usable anchor, the entity fails
+closed as `ambiguous_multi_object_instance`. Unique anchors make no VLM call,
+groups are never rescued, masks are never selected by SAM score alone, and
+candidates are never unioned.
 
 If one propagation session changes object ID, the mismatched observation and
 all later slots owned by that direction are invalidated. Earlier verified masks,

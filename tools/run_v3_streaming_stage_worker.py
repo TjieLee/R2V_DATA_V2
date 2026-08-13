@@ -173,11 +173,23 @@ class _StageRuntime:
             if self._segment_backend is not None
             else None
         )
+        before_recall = (
+            self._segment_backend.recall_rescue_counters()
+            if self._segment_backend is not None
+            else None
+        )
         counts = self._handler(scoped).to_dict()
         if before_anchor is not None:
             after_anchor = self._segment_backend.anchor_search_counters()
             for name, value in after_anchor.items():
                 counts[name] = value - before_anchor.get(name, 0)
+        if before_recall is not None:
+            after_recall = self._segment_backend.recall_rescue_counters()
+            for name, value in after_recall.items():
+                counts[name] = int(counts.get(name, value)) - before_recall.get(
+                    name,
+                    0,
+                )
         if self.stage == "reference_edit" and self._first_reference_edit_request:
             counts["worker_starts"] = 1
             self._first_reference_edit_request = False

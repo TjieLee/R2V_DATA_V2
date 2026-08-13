@@ -886,31 +886,28 @@ def test_sam3_qwen_selects_one_of_two_subject_anchor_candidates(
 
 
 @pytest.mark.parametrize(
-    ("decision", "expected_reason"),
+    "decision",
     (
-        (
-            MultiInstanceAnchorDecision("uncertain", None, "both cars plausible"),
-            "multi_instance_anchor_uncertain",
-        ),
-        (
-            MultiInstanceAnchorDecision("select", 3, "invalid candidate"),
-            "multi_instance_anchor_invalid_candidate_id",
-        ),
+        MultiInstanceAnchorDecision("uncertain", None, "both cars plausible"),
+        MultiInstanceAnchorDecision("select", 3, "invalid candidate"),
     ),
 )
-def test_sam3_multi_instance_uncertain_or_invalid_selection_fails_closed(
+def test_sam3_unusable_ambiguous_probe_continues_to_later_unique_anchor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     decision: MultiInstanceAnchorDecision,
-    expected_reason: str,
 ) -> None:
     _storage, frame_paths = _storage_with_frames(
         tmp_path,
         monkeypatch,
         entities=[_entity("e1", reference_type="object")],
     )
+    unique = _mask(x1=6, x2=11)
     predictor = FakeSam3Predictor(
-        {5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13))}
+        {
+            5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13)),
+            2: _sam_outputs(unique),
+        }
     )
     selector = FakeAnchorSelector(decision)
     backend = Sam3SegmentationBackend(
@@ -927,12 +924,14 @@ def test_sam3_multi_instance_uncertain_or_invalid_selection_fails_closed(
         grounding_prompt="blue car near the curb",
     )
 
-    assert result.status == "failed"
-    assert result.reason == expected_reason
+    assert result.status == "ready"
+    assert predictor.prompt_slots[:2] == [5, 2]
+    assert result.observations[0].slot == 2
+    assert np.array_equal(result.observations[0].mask, unique)
     assert len(selector.calls) == 1
 
 
-def test_sam3_multi_instance_judge_failure_fails_closed(
+def test_sam3_multi_instance_judge_failure_continues_to_unique_anchor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -941,8 +940,12 @@ def test_sam3_multi_instance_judge_failure_fails_closed(
         monkeypatch,
         entities=[_entity("e1")],
     )
+    unique = _mask(x1=6, x2=11)
     predictor = FakeSam3Predictor(
-        {5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13))}
+        {
+            5: _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13)),
+            2: _sam_outputs(unique),
+        }
     )
     selector = FakeAnchorSelector(RuntimeError("Qwen unavailable"))
     backend = Sam3SegmentationBackend(
@@ -959,8 +962,49 @@ def test_sam3_multi_instance_judge_failure_fails_closed(
         grounding_prompt="woman on the right",
     )
 
+    assert result.status == "ready"
+    assert predictor.prompt_slots[:2] == [5, 2]
+    assert np.array_equal(result.observations[0].mask, unique)
+
+
+def test_sam3_all_ambiguous_uncertain_probes_preserve_ambiguous_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage, frame_paths = _storage_with_frames(
+        tmp_path,
+        monkeypatch,
+        entities=[_entity("e1")],
+    )
+    ambiguous = _sam_outputs(_mask(x1=1, x2=5), _mask(x1=9, x2=13))
+    predictor = FakeSam3Predictor({slot: ambiguous for slot in range(10)})
+    selector = FakeAnchorSelector(
+        MultiInstanceAnchorDecision("uncertain", None, "both remain plausible")
+    )
+    backend = Sam3SegmentationBackend(
+        Sam3Config(
+            anchor_search_mode="progressive_v1",
+            multi_instance_rescue_mode="qwen_anchor_select_v1",
+        ),
+        predictor=predictor,
+        anchor_selector=selector,
+    )
+
+    result = backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        entity_phrase="the woman in the blue jacket",
+        grounding_prompt="woman near center",
+    )
+
     assert result.status == "failed"
-    assert result.reason == "multi_instance_anchor_judge_failed"
+    assert "multiple ambiguous instances" in str(result.reason)
+    assert predictor.prompt_slots == [5, 2, 7, 0, 9, 4, 6, 3, 8, 1]
+    assert len(selector.calls) == 10
+    counters = backend.recall_rescue_counters()
+    assert counters["multi_instance_rescue_attempted"] == 10
+    assert counters["multi_instance_rescue_rejected"] == 10
 
 
 def test_sam3_multi_instance_group_never_calls_qwen_or_unions(

@@ -397,9 +397,7 @@ class Sam3SegmentationBackend:
                         self._recall_rescue_counters[
                             "multi_instance_rescue_rejected"
                         ] += 1
-                        raise _TrackValidationError(
-                            "multi_instance_anchor_selector_not_configured"
-                        )
+                        continue
                     try:
                         decision = self._anchor_selector.select(
                             frame_path=frame_paths[slot],
@@ -408,21 +406,17 @@ class Sam3SegmentationBackend:
                             grounding_prompt=grounding_prompt,
                             reference_type=reference_type,
                         )
-                    except Exception as exc:
+                    except Exception:  # noqa: BLE001 - judge failure skips this probe
                         self._recall_rescue_counters[
                             "multi_instance_rescue_rejected"
                         ] += 1
-                        raise _TrackValidationError(
-                            "multi_instance_anchor_judge_failed"
-                        ) from exc
+                        continue
                     candidate_id = decision.candidate_id
                     if decision.verdict != "select":
                         self._recall_rescue_counters[
                             "multi_instance_rescue_rejected"
                         ] += 1
-                        raise _TrackValidationError(
-                            f"multi_instance_anchor_{decision.verdict}"
-                        )
+                        continue
                     if (
                         candidate_id is None
                         or candidate_id < 1
@@ -431,9 +425,7 @@ class Sam3SegmentationBackend:
                         self._recall_rescue_counters[
                             "multi_instance_rescue_rejected"
                         ] += 1
-                        raise _TrackValidationError(
-                            "multi_instance_anchor_invalid_candidate_id"
-                        )
+                        continue
                     self._recall_rescue_counters[
                         "multi_instance_rescue_selected"
                     ] += 1
