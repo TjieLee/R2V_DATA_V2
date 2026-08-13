@@ -11,16 +11,17 @@ state from chat history.
 
 ```text
 branch: feature/v3-runtime-integrity-v1
-current validated code baseline: 32a9e0e17598b6bd2d7912b6fafdb08d81187285
+current validated code baseline: 7752dca272388a61d7619ea5ef69a2618ba7a446
 ```
 
-Recent integrity lineage:
+Recent final-integrity lineage:
 
 ```text
 42769a31 Harden final V3 reference integrity
   -> e575af6 Retry malformed V3 integrity reviews
   -> b30942e Add conservative V3 source bbox fallback
   -> 32a9e0e Enforce deterministic V3 reference semantics
+  -> 7752dca Prevent V3 integrity schema whitespace stalls
 ```
 
 Documentation-only commits may move repository HEAD after the code baseline.
@@ -101,7 +102,7 @@ zero-candidate grounding miss is intentionally not being tuned further.
 
 ## Reference Integrity Contracts
 
-Final integrity has three independent mechanisms.
+Final integrity has four relevant contracts.
 
 ### 1. Deterministic semantic policy
 
@@ -122,7 +123,7 @@ physical carriers/replicas such as toys, models, figurines, bottles, shells, or
 replicas remain eligible. Represented/screen/painting content remains on the
 Qwen semantic-risk review path.
 
-### 2. Qwen final integrity review
+### 2. Qwen final integrity review and bounded repair
 
 Synthetic, local, topology-suspicious, represented-content-risk, and otherwise
 routed references are checked against highlighted source evidence. A clean real
@@ -134,7 +135,17 @@ repair call with the same image evidence and context. Fail closed occurs only
 after both structured responses fail. Raw responses and finish reasons are
 retained for diagnostics.
 
-### 3. Conservative source bbox fallback
+### 3. Structured-output termination order
+
+Commit `7752dca` fixes a real vLLM/Qwen `json_schema` whitespace stall. The two
+review schemas now put `reason` before `verdict`, with `verdict` as the final
+schema property. Prompts require a short reason, verdict last, immediate object
+closure, and no trailing whitespace.
+
+Production `reference_integrity_judge.max_tokens` remains `1024`. Raising it to
+2048 was diagnostic only and did not solve the stall.
+
+### 4. Conservative source bbox fallback
 
 Commit `b30942e` adds `source_bbox_fallback_v1` only for artifact-local integrity
 failures where semantic, target identity, primary identity region, and major
@@ -181,25 +192,13 @@ source_bbox_fallback_judge_failed: 0
 
 Important real cases:
 
-- `e9f509acaea60f5699d91287 e2`, woman in a red top with glasses:
-  the generated/cutout reference was rejected for a severe white bottle-shaped
-  artifact; the raw source bbox was accepted and published as real pixels with
-  `synthetic=false`.
-- `f71655c87e485f9f5998b1f2 e2`, green laser pointer:
-  the previous malformed-JSON failure did not recur as a `judge_failed` result;
-  the normal integrity path completed successfully and bbox fallback was not
-  invoked.
-- robe-person examples were accepted by normal integrity and therefore did not
-  trigger bbox fallback. Do not widen fallback merely to force those cases onto
-  the bbox path.
-
-The same replay demonstrated why a deterministic semantic hard gate was needed:
-Qwen still accepted sauce, cathedral, dog-as-object, and giant-clam-as-object
-despite semantic-risk routing.
+- `e9f509acaea60f5699d91287 e2`, woman in a red top with glasses: the edited
+  reference was rejected for a severe white bottle-shaped artifact; the raw
+  source bbox was accepted and published as real pixels with `synthetic=false`.
+- `f71655c87e485f9f5998b1f2 e2`, green laser pointer: normal integrity completed
+  successfully and bbox fallback was not invoked.
 
 ### Deterministic semantic final-5 replay — PASS
-
-Real server replay after commit `32a9e0e`:
 
 ```text
 run_id: semantic-final5-20260813-182752
@@ -207,102 +206,149 @@ run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/semantic-final5-20260813-182
 config_hash: 717840669bb12167214350c71a4eaf22d74edd929ae0502b739bde872c5dd512
 ```
 
-Observed stage summary:
+Observed summary:
 
 ```text
 processed: 5
-skipped_disabled: 0
-skipped_existing: 0
-skipped_not_ready: 0
 failed: 0
 entities_reviewed: 3
-entities_skipped_review: 0
 entities_accepted: 3
 entities_rejected: 4
 semantic_policy_rejected: 4
 judge_failed: 0
-topology_suspicious: 0
 source_bbox_fallback_attempted: 0
-source_bbox_fallback_accepted: 0
-source_bbox_fallback_rejected: 0
-source_bbox_fallback_judge_failed: 0
 ```
 
-All five freeze-gate cases matched expectations:
+All four negative examples were deterministic rejects with no Qwen or bbox call:
 
 ```text
-0f32c6b7fa9934c159a03ff7 e2  thick golden-brown sauce
-  rejected, reviewed=false
-  semantic_policy:amorphous_object
-  no source context, Qwen review, or bbox fallback
-
-34da1ad5a39a0389de87568b e1  large domed cathedral
-  rejected, reviewed=false
-  semantic_policy:scene_structure_object
-  no source context, Qwen review, or bbox fallback
-
-4e892f7740e1557b495a64da e3  light-colored dog typed object
-  rejected, reviewed=false
-  semantic_policy:living_creature_object
-  no source context, Qwen review, or bbox fallback
-
-b527c92f98b7f27f1d301f7c e1  giant clam typed object
-  rejected, reviewed=false
-  semantic_policy:living_creature_object
-  no source context, Qwen review, or bbox fallback
-
-82f312a07328785e228802d3 e1  cooked red lobster
-  not semantic-policy rejected
-  normal Qwen integrity review accepted
-  reference_entity_semantically_valid=true
+0f32c6b7fa9934c159a03ff7 e2 -> semantic_policy:amorphous_object
+34da1ad5a39a0389de87568b e1 -> semantic_policy:scene_structure_object
+4e892f7740e1557b495a64da e3 -> semantic_policy:living_creature_object
+b527c92f98b7f27f1d301f7c e1 -> semantic_policy:living_creature_object
 ```
 
-This closes the deterministic semantic policy validation. Do not tune the hard
-gate further without new concrete false-positive or false-negative evidence.
+`82f312a07328785e228802d3 e1`, cooked red lobster, remained eligible and was
+accepted by normal integrity review.
+
+### Schema-order two-case probe — PASS
+
+Real server probe after `7752dca`:
+
+```text
+run_id: integrity-schema-order2-20260813-201628
+run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/integrity-schema-order2-20260813-201628
+config_hash: 6430982581c1771181ec736f498c9d7326a020e9845958684be27f38ff2ebd33
+reference_integrity_judge.max_tokens: 1024
+```
+
+The two historical whitespace-stall subjects were:
+
+```text
+0395f7806515a3efb1c9c6c4 e3  a young man with dark hair in a blue suit jacket
+3588dd1d1b1c3dd21788b423 e2  a boy in a red sweater with a necklace
+```
+
+After the schema-order fix both were accepted on the first request:
+
+```text
+finish_reason:       stop
+raw_response_count:  1
+trailing_whitespace: 0
+judge_failed:        false
+```
+
+Observed Qwen integrity call times across the two clips were approximately
+`8.641s`, `7.898s`, `7.875s`, and `7.468s`. The previous pathological cases had
+consumed roughly 85 seconds per 2048-token attempt and still ended in `length`.
+This validates the ordering/termination fix rather than a larger token budget.
+
+## Final 120 Integrity Freeze Replay — INFRA PASS
+
+Final real server replay:
+
+```text
+run_id: integrity-final-freeze120-20260813-202412
+run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/integrity-final-freeze120-20260813-202412
+config_hash: 810fdb46cc7b03deaf411d84a13c2c285abde2f584dc42de4d05174505242c47
+code baseline: 7752dca272388a61d7619ea5ef69a2618ba7a446
+```
+
+Observed stage summary:
+
+```text
+processed: 63
+skipped_not_ready: 57
+failed: 0
+entities_reviewed: 72
+entities_skipped_review: 10
+entities_accepted: 82
+entities_rejected: 4
+semantic_policy_rejected: 4
+judge_failed: 0
+topology_suspicious: 2
+source_bbox_fallback_attempted: 1
+source_bbox_fallback_accepted: 1
+source_bbox_fallback_rejected: 0
+source_bbox_fallback_judge_failed: 0
+runtime: about 10m11s
+```
+
+Structured-output audit:
+
+```text
+repair_count: 0
+length_count: 0
+judge_failed_count: 0
+```
+
+The four final rejects are exactly the intended deterministic semantic rejects:
+
+```text
+0f32c6b7fa9934c159a03ff7 e2 -> semantic_policy:amorphous_object
+34da1ad5a39a0389de87568b e1 -> semantic_policy:scene_structure_object
+4e892f7740e1557b495a64da e3 -> semantic_policy:living_creature_object
+b527c92f98b7f27f1d301f7c e1 -> semantic_policy:living_creature_object
+```
+
+The only bbox fallback is the intended red-top-woman artifact case:
+
+```text
+e9f509acaea60f5699d91287 e2
+  source_bbox_fallback verdict: accept
+  final representation: real source RGB bbox
+```
+
+This closes the final integrity infrastructure gate. Do not rerun Qwen, SAM3,
+Boogu, removal, pair, or annotation for freeze validation unless a visual audit
+shows a concrete new problem.
 
 ## Local Validation for Current Code Baseline
 
-Reported validation for `32a9e0e17598b6bd2d7912b6fafdb08d81187285`:
+Reported local validation for `7752dca272388a61d7619ea5ef69a2618ba7a446`:
 
 ```text
-reference-integrity targeted tests: 66 passed
+reference-integrity targeted tests: 72 passed
 storage/schema tests:              63 passed, 1 warning
-full pytest:                       1651 passed, 1 warning
+full pytest:                       1657 passed, 1 warning
 Ruff:                              PASS
 git diff --check:                  PASS
 working tree:                      clean
 ```
 
-No real Qwen, SAM3, Boogu, CUDA, GPU, or server data job was run by the local
-implementation task. Real server evidence is recorded separately above.
-
 ## Remaining Freeze Check
 
-The five-case semantic replay has passed. The only remaining visual-V3 freeze
-step is one final 120-clip `reference_integrity` replay on the fixed development
-population, followed by a contact-sheet/audit review.
+Only a read-only retained-reference/contact-sheet review remains.
 
-For this final replay:
+Do not run additional model inference. Review the final published ready
+references from `integrity-final-freeze120-20260813-202412`, including the
+single source-bbox fallback and representative real/synthetic references.
 
-- reuse already-materialized annotation, frames, SAM3 masks, coverage, pair,
-  removal, and reference-edit evidence;
-- do not rerun SAM3, annotation, remover, pair, or Boogu;
-- create a fresh run root with a current matching `run.json`;
-- preserve old integrity rejects monotonically when preparing replay artifacts;
-- clear only `reference_integrity`, instruction, and export states that need to
-  be recomputed;
-- require `ClipRecord.model_validate()` before model calls;
-- keep `debug.save_diagnostics=true`;
-- run only `--stages reference_integrity --profile`;
-- review counters, all rejects, all bbox fallbacks, all judge repairs/failures,
-  and a final contact sheet before freezing.
-
-Freeze requires no new infrastructure failure or broad regression. A small
-number of intended semantic/artifact rejects is expected and is not itself a
-failure.
-
-After the final 120 replay and contact-sheet review pass, freeze the visual V3
-code/config and return to the audio/H3 branch.
+If the contact-sheet review finds no broad quality regression or new systematic
+failure, freeze visual V3 at code baseline `7752dca272388a61d7619ea5ef69a2618ba7a446`
+with final integrity config hash
+`810fdb46cc7b03deaf411d84a13c2c285abde2f584dc42de4d05174505242c47`, then
+return to the audio/H3 branch.
 
 ## Historical Runtime Note
 
