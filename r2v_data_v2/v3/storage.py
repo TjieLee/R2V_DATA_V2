@@ -495,8 +495,15 @@ class RunStorage:
         references: ReferencesState,
         pairing: PairingState,
         reference_integrity: ReferenceIntegrityState,
+        *,
+        reference_edit: ReferenceEditState | None = None,
     ) -> ClipRecord:
         current = self.read_clip(clip_uid)
+        validated_reference_edit = (
+            current.reference_edit
+            if reference_edit is None
+            else ReferenceEditState.model_validate(reference_edit.model_dump(mode="json"))
+        )
         values = {
             "references": ReferencesState.model_validate(
                 references.model_dump(mode="json")
@@ -505,6 +512,7 @@ class RunStorage:
             "reference_integrity": ReferenceIntegrityState.model_validate(
                 reference_integrity.model_dump(mode="json")
             ),
+            "reference_edit": validated_reference_edit,
             "instruction": None,
             "export": ExportState(),
         }

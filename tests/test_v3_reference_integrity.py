@@ -26,8 +26,11 @@ from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.reference_integrity import (
     SYSTEM_PROMPT,
     QwenReferenceIntegrityJudge,
+    QwenSourceBboxFallbackJudge,
     ReferenceIntegrityJudgeFailure,
     ReferenceIntegrityReviewAttempt,
+    SourceBboxFallbackJudgeFailure,
+    SourceBboxFallbackReviewAttempt,
     reference_integrity_clips,
     reference_semantic_risk_reason,
     reference_topology_diagnostics,
@@ -35,6 +38,7 @@ from r2v_data_v2.v3.reference_integrity import (
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
+    ClipRecord,
     ClipSource,
     CoverageState,
     EntityReferenceState,
@@ -43,16 +47,19 @@ from r2v_data_v2.v3.schemas import (
     InstructionLegendEntry,
     InstructionState,
     PairingState,
+    ReferenceEditEntityState,
+    ReferenceEditState,
     ReferenceIntegrityReview,
     ReferencesState,
     SampledFrame,
     SampledFramesArtifact,
+    SourceBboxFallbackReview,
     TrackedEntityMasks,
     TrackedMaskFrame,
     TrackedMasksArtifact,
     render_inline_instruction_text,
 )
-from r2v_data_v2.v3.storage import RunStorage
+from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
 
 
 def _review(
@@ -159,6 +166,25 @@ def _severe_reference_artifact_review() -> ReferenceIntegrityReview:
     )
 
 
+def _bbox_review(*, accept: bool) -> SourceBboxFallbackReview:
+    return SourceBboxFallbackReview(
+        same_target_entity=True,
+        target_remains_dominant=True,
+        extra_non_target_content_is_minor=True,
+        no_competing_salient_entity=accept,
+        no_severe_reference_artifact=True,
+        bbox_is_preferable_to_failed_reference=True,
+        usable_as_independent_reference=True,
+        certain=True,
+        verdict="accept" if accept else "reject",
+        reason=(
+            "raw source bbox is a clear artifact-free target reference"
+            if accept
+            else "a competing salient person dominates the raw bbox"
+        ),
+    )
+
+
 @dataclass
 class FakeIntegrityJudge:
     results: list[ReferenceIntegrityReview | Exception]
@@ -172,6 +198,23 @@ class FakeIntegrityJudge:
         return ReferenceIntegrityReviewAttempt(
             review=result,
             raw_response=result.model_dump_json(),
+        )
+
+
+@dataclass
+class FakeSourceBboxFallbackJudge:
+    results: list[SourceBboxFallbackReview | Exception]
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def review(self, **kwargs: object) -> SourceBboxFallbackReviewAttempt:
+        self.calls.append(kwargs)
+        result = self.results[len(self.calls) - 1]
+        if isinstance(result, Exception):
+            raise result
+        return SourceBboxFallbackReviewAttempt(
+            review=result,
+            raw_response=result.model_dump_json(),
+            finish_reason="stop",
         )
 
 
@@ -797,8 +840,14 @@ def test_semantically_invalid_clean_full_object_is_rejected(
     judge = FakeIntegrityJudge(
         [_invalid_reference_semantics_review(f"{phrase} violates V3 semantics")]
     )
+    bbox_judge = FakeSourceBboxFallbackJudge([])
 
-    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
 
     clip = storage.read_clip("clip-1")
     assert len(judge.calls) == 1
@@ -810,6 +859,7 @@ def test_semantically_invalid_clean_full_object_is_rejected(
     review = clip.reference_integrity.entities[1].review
     assert review is not None
     assert review.reference_entity_semantically_valid is False
+    assert bbox_judge.calls == []
 
 
 @pytest.mark.parametrize(
@@ -828,10 +878,17 @@ def test_clean_full_valid_object_behavior_is_unchanged(
         second_phrase=phrase,
     )
     judge = FakeIntegrityJudge([])
+    bbox_judge = FakeSourceBboxFallbackJudge([])
 
-    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
 
     assert judge.calls == []
+    assert bbox_judge.calls == []
     assert stats.entities_skipped_review == 2
     assert stats.entities_rejected == 0
     assert all(
@@ -890,8 +947,14 @@ def test_bottle_shaped_white_cavity_rejects_human_reference(
     draw.rectangle((31, 16, 35, 23), fill=(255, 255, 255, 255))
     damaged.save(image_path)
     judge = FakeIntegrityJudge([_severe_reference_artifact_review()])
+    bbox_judge = FakeSourceBboxFallbackJudge([_bbox_review(accept=False)])
 
-    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
 
     updated = storage.read_clip("clip-1")
     assert stats.entities_rejected == 1
@@ -903,6 +966,319 @@ def test_bottle_shaped_white_cavity_rejects_human_reference(
     assert review.preserves_primary_identity_region is True
     assert review.no_severe_reference_artifact is False
     assert review.verdict == "reject"
+    assert len(bbox_judge.calls) == 1
+
+
+def test_artifact_only_human_publishes_real_source_bbox_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+    )
+    clip = storage.read_clip("clip-1")
+    original = clip.references.entities[0].model_copy(
+        update={
+            "reference_scope": "local",
+            "visible_region": "upper_body",
+            "whole_entity_recognizable": False,
+        }
+    )
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=[original, clip.references.entities[1]]),
+        clip.pairing,
+    )
+    bbox_judge = FakeSourceBboxFallbackJudge([_bbox_review(accept=True)])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_severe_reference_artifact_review()]),
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    published = updated.references.entities[0]
+    assert stats.source_bbox_fallback_attempted == 1
+    assert stats.source_bbox_fallback_accepted == 1
+    assert stats.entities_rejected == 0
+    assert published.status == "ready"
+    assert published.synthetic is False
+    assert published.source_bbox_fallback is True
+    assert published.source_clip_uid == "clip-1"
+    assert published.source_entity_id == "e1"
+    assert published.source_frame_index == 0
+    assert published.source_bbox_xyxy == (4, 2, 28, 22)
+    assert published.image_path is not None
+    assert published.source_bbox_metadata_path is not None
+    candidate_path = storage.root / published.image_path
+    with Image.open(storage.frame_path("clip-1", 0)) as source_frame:
+        expected_pixels = np.asarray(source_frame.convert("RGB"))[2:22, 4:28]
+    with Image.open(candidate_path) as candidate:
+        assert candidate.mode == "RGB"
+        assert candidate.size == (24, 20)
+        assert np.array_equal(np.asarray(candidate), expected_pixels)
+    metadata_path = storage.root / published.source_bbox_metadata_path
+    assert metadata_path.is_file()
+    assert updated.pairing is not None
+    assert updated.pairing.retained_entity_ids == ["e1", "e2"]
+    assert updated.reference_integrity is not None
+    result = updated.reference_integrity.entities[0]
+    assert result.status == "accepted"
+    assert result.review is not None and result.review.verdict == "reject"
+    assert result.source_bbox_fallback_review is not None
+    assert result.source_bbox_fallback_review.verdict == "accept"
+    assert result.final_reference_path == published.image_path
+    assert updated.instruction is None
+    assert updated.export == ExportState()
+    body = "{{image_1}} holds {{image_2}}."
+    storage.write_instruction(
+        "clip-1",
+        InstructionState(
+            status="ready",
+            instruction_body_template=body,
+            reference_legend=[
+                InstructionLegendEntry(image_id="image_1", description="person"),
+                InstructionLegendEntry(image_id="image_2", description="bracket"),
+            ],
+            r2v_instruction=render_inline_instruction_text(body),
+        ),
+    )
+    dataset = DatasetExporter(storage.config, storage).export()
+    assert dataset.sample_count == 1
+    exported = storage.config.resolved_export_root / "references/clip-1/subject_1.png"
+    with Image.open(exported) as exported_image:
+        assert np.array_equal(np.asarray(exported_image), expected_pixels)
+
+
+def test_cross_pair_artifact_failure_never_uses_source_bbox_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    cross_reference = clip.references.entities[1].model_copy(
+        update={"source_clip_uid": "donor", "source_entity_id": "e2"}
+    )
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=[clip.references.entities[0], cross_reference]),
+        clip.pairing,
+    )
+    original_loader = integrity_module._source_evidence
+
+    def load_local_source(storage_arg, *, clip_uid, reference):
+        local_reference = reference.model_copy(
+            update={"source_clip_uid": None, "source_entity_id": None}
+        )
+        return original_loader(
+            storage_arg,
+            clip_uid=clip_uid,
+            reference=local_reference,
+        )
+
+    monkeypatch.setattr(integrity_module, "_source_evidence", load_local_source)
+    bbox_judge = FakeSourceBboxFallbackJudge([])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_severe_reference_artifact_review()]),
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    assert stats.source_bbox_fallback_attempted == 0
+    assert bbox_judge.calls == []
+    assert storage.read_clip("clip-1").references.entities[1].status == "rejected"
+
+
+def test_source_bbox_judge_failure_preserves_original_fail_closed_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch)
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_severe_reference_artifact_review()]),
+        bbox_fallback_judge=FakeSourceBboxFallbackJudge(
+            [SourceBboxFallbackJudgeFailure("malformed bbox review")]
+        ),
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert stats.source_bbox_fallback_attempted == 1
+    assert stats.source_bbox_fallback_judge_failed == 1
+    assert stats.source_bbox_fallback_rejected == 1
+    assert updated.references.entities[1].status == "rejected"
+    assert updated.reference_integrity is not None
+    assert updated.reference_integrity.entities[1].status == "rejected"
+
+
+def test_source_bbox_fallback_updates_reference_edit_provenance_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_synthetic=True,
+    )
+    clip = storage.read_clip("clip-1")
+    first = clip.references.entities[0]
+    generated = clip.references.entities[1]
+    assert generated.image_path is not None
+    raw_path = storage.selected_path("clip-1", "e2_source.png")
+    raw_path.write_bytes((storage.root / generated.image_path).read_bytes())
+    raw_relative = storage.relative_artifact_path(raw_path)
+    source_reference = generated.model_copy(
+        update={
+            "image_path": raw_relative,
+            "synthetic": False,
+            "generation_metadata_path": None,
+            "generation_source_sha256": None,
+            "generation_output_sha256": None,
+        }
+    )
+    original_generation_metadata = generated.generation_metadata_path
+    assert original_generation_metadata is not None
+    reference_edit = ReferenceEditState(
+        status="ready",
+        entities=[
+            ReferenceEditEntityState(
+                entity_id="e1",
+                route="complete",
+                status="not_required",
+                source_reference=first,
+                source_image_path=first.image_path,
+                output_image_path=first.image_path,
+            ),
+            ReferenceEditEntityState(
+                entity_id="e2",
+                route="complete",
+                status="accepted",
+                source_reference=source_reference,
+                source_image_path=raw_relative,
+                output_image_path=generated.image_path,
+                operation="add_entity_background",
+                operations=["add_entity_background"],
+                metadata_path=original_generation_metadata,
+            ),
+        ],
+    )
+    storage.write_reference_edit_result(
+        "clip-1",
+        clip.references,
+        clip.pairing,
+        reference_edit,
+    )
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_severe_reference_artifact_review()]),
+        bbox_fallback_judge=FakeSourceBboxFallbackJudge(
+            [_bbox_review(accept=True)]
+        ),
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert stats.source_bbox_fallback_accepted == 1
+    final_reference = updated.references.entities[1]
+    assert final_reference.source_bbox_fallback is True
+    assert final_reference.synthetic is False
+    assert updated.reference_edit is not None
+    final_edit = updated.reference_edit.entities[1]
+    assert final_edit.status == "fallback"
+    assert final_edit.fallback_policy == "source_bbox_fallback"
+    assert final_edit.output_image_path == final_reference.image_path
+    assert (
+        final_edit.source_bbox_fallback_metadata_path
+        == final_reference.source_bbox_metadata_path
+    )
+    assert final_edit.metadata_path == original_generation_metadata
+    assert final_edit.operations == ["add_entity_background"]
+    ClipRecord.model_validate(updated.model_dump(mode="json"))
+
+
+def test_source_bbox_fields_are_backward_compatible_for_existing_clip_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch)
+    payload = storage.read_clip("clip-1").model_dump(mode="json")
+    for reference in payload["references"]["entities"]:
+        reference.pop("source_bbox_fallback")
+        reference.pop("source_bbox_xyxy")
+        reference.pop("source_bbox_metadata_path")
+
+    restored = ClipRecord.model_validate(payload)
+
+    assert all(
+        reference.source_bbox_fallback is False
+        for reference in restored.references.entities
+    )
+
+
+def test_source_bbox_fallback_review_requires_every_strict_boolean() -> None:
+    accepted = _bbox_review(accept=True).model_dump(mode="json")
+
+    with pytest.raises(ValueError):
+        SourceBboxFallbackReview.model_validate(
+            {**accepted, "target_remains_dominant": 1}
+        )
+    with pytest.raises(ValueError, match="must match all strict checks"):
+        SourceBboxFallbackReview.model_validate(
+            {**accepted, "target_remains_dominant": False}
+        )
+
+
+def test_qwen_source_bbox_reviewer_uses_three_images_and_strict_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _bbox_review(accept=True)
+    completions = FakeIntegrityCompletions(
+        [(expected.model_dump_json(), "stop")]
+    )
+    service = _config(tmp_path, monkeypatch).qwen.reference_integrity_judge
+    assert service is not None
+    judge = QwenSourceBboxFallbackJudge(
+        service,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+        ),
+    )
+
+    attempt = judge.review(
+        source_context=Image.new("RGB", (12, 10)),
+        failed_reference=Image.new("RGB", (8, 8)),
+        source_bbox_candidate=Image.new("RGB", (9, 7)),
+        reference_type="subject",
+        phrase="a woman in a red top",
+        grounding_prompt="woman in red top near center",
+        reference_scope="local",
+    )
+
+    assert attempt.review == expected
+    call = completions.calls[0]
+    response_format = call["response_format"]
+    assert isinstance(response_format, dict)
+    assert response_format["type"] == "json_schema"
+    messages = call["messages"]
+    assert isinstance(messages, list)
+    assert sum(
+        item.get("type") == "image_url"
+        for message in messages
+        if isinstance(message, dict) and isinstance(message.get("content"), list)
+        for item in message["content"]
+        if isinstance(item, dict)
+    ) == 3
 
 
 def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:
@@ -984,8 +1360,14 @@ def test_integrity_rejects_headless_human_subject_from_final_pairing(
         clip.pairing,
     )
     judge = FakeIntegrityJudge([_primary_identity_loss_review()])
+    bbox_judge = FakeSourceBboxFallbackJudge([])
 
-    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
 
     updated = storage.read_clip("clip-1")
     assert stats.entities_rejected == 1
@@ -996,6 +1378,7 @@ def test_integrity_rejects_headless_human_subject_from_final_pairing(
     assert result is not None
     assert result.entities[0].review is not None
     assert result.entities[0].review.preserves_primary_identity_region is False
+    assert bbox_judge.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1033,13 +1416,20 @@ def test_integrity_semantic_failures_reject_only_the_reviewed_entity(
             clip.pairing,
         )
     judge = FakeIntegrityJudge([_review(accept=False, reason=reason)])
+    bbox_judge = FakeSourceBboxFallbackJudge([])
 
-    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
 
     updated = storage.read_clip("clip-1")
     rejected = next(item for item in updated.references.entities if item.entity_id == entity_id)
     assert rejected.status == "rejected"
     assert stats.entities_rejected == 1
+    assert bbox_judge.calls == []
 
 
 def test_legitimate_bracket_cutout_is_reviewed_and_may_be_accepted(
@@ -1096,8 +1486,14 @@ def test_integrity_judge_failure_fails_closed_for_entity(
     judge = FakeIntegrityJudge(
         [ReferenceIntegrityJudgeFailure("structured output invalid")]
     )
+    bbox_judge = FakeSourceBboxFallbackJudge([])
 
-    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
 
     clip = storage.read_clip("clip-1")
     assert stats.judge_failed == 1
@@ -1105,6 +1501,32 @@ def test_integrity_judge_failure_fails_closed_for_entity(
     state = clip.reference_integrity.entities[1]
     assert state.judge_failed is True
     assert state.status == "rejected"
+    assert bbox_judge.calls == []
+
+
+def test_malformed_integrity_repair_failure_never_uses_bbox_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch)
+    judge, completions = _qwen_integrity_judge(
+        storage.config,
+        [("{", "length"), ("{}", "stop")],
+    )
+    bbox_judge = FakeSourceBboxFallbackJudge([])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    assert len(completions.calls) == 2
+    assert stats.judge_failed == 1
+    assert stats.source_bbox_fallback_attempted == 0
+    assert bbox_judge.calls == []
+    assert storage.read_clip("clip-1").references.entities[1].status == "rejected"
 
 
 def test_audit_reports_stage_density_before_export(

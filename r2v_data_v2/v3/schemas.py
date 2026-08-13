@@ -478,6 +478,9 @@ class EntityReferenceState(SchemaModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    source_bbox_fallback: StrictBool = False
+    source_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    source_bbox_metadata_path: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_reference_state(self) -> EntityReferenceState:
@@ -493,6 +496,29 @@ class EntityReferenceState(SchemaModel):
         if (self.image_quality is None) != (self.completeness is None):
             raise ValueError(
                 "entity reference quality and completeness must be set together"
+            )
+        bbox_fields = (self.source_bbox_xyxy, self.source_bbox_metadata_path)
+        if self.source_bbox_fallback:
+            if self.synthetic:
+                raise ValueError("source bbox fallback must contain only real pixels")
+            if (
+                self.source_clip_uid is None
+                or self.source_entity_id != self.entity_id
+                or any(value is None for value in bbox_fields)
+            ):
+                raise ValueError(
+                    "source bbox fallback requires complete self-source provenance"
+                )
+            assert self.source_bbox_xyxy is not None
+            x1, y1, x2, y2 = self.source_bbox_xyxy
+            if min(x1, y1) < 0 or x2 <= x1 or y2 <= y1:
+                raise ValueError("source bbox fallback coordinates are invalid")
+            assert self.source_bbox_metadata_path is not None
+            if not self.source_bbox_metadata_path.strip():
+                raise ValueError("source bbox fallback metadata path must not be empty")
+        elif any(value is not None for value in bbox_fields):
+            raise ValueError(
+                "non-bbox entity reference cannot publish bbox fallback provenance"
             )
         if self.status == "ready":
             if self.independent_reference_value is False:
@@ -582,6 +608,9 @@ class EntityReferenceState(SchemaModel):
                 or self.generation_metadata_path is not None
                 or self.generation_source_sha256 is not None
                 or self.generation_output_sha256 is not None
+                or self.source_bbox_fallback
+                or self.source_bbox_xyxy is not None
+                or self.source_bbox_metadata_path is not None
             ):
                 raise ValueError(
                     "rejected entity reference cannot publish image or generation provenance"
@@ -1035,6 +1064,7 @@ ReferenceEditFallbackPolicy = Literal[
     "not_used",
     "keep_source",
     "completion_candidate",
+    "source_bbox_fallback",
     "reject_entity",
 ]
 
@@ -1053,6 +1083,7 @@ class ReferenceEditEntityState(SchemaModel):
     background_metadata_path: Optional[str] = None
     background_fallback: Literal["none", "completion_candidate"] = "none"
     fallback_policy: ReferenceEditFallbackPolicy = "not_used"
+    source_bbox_fallback_metadata_path: Optional[str] = None
     reason: Optional[str] = None
 
     @model_validator(mode="after")
@@ -1114,6 +1145,10 @@ class ReferenceEditEntityState(SchemaModel):
                 raise ValueError(
                     "accepted reference edit cannot mark background fallback"
                 )
+            if self.source_bbox_fallback_metadata_path is not None:
+                raise ValueError(
+                    "accepted reference edit cannot publish bbox fallback metadata"
+                )
         elif self.status == "fallback":
             if self.reason is None or not self.reason.strip():
                 raise ValueError("reference edit fallback requires a reason")
@@ -1125,6 +1160,10 @@ class ReferenceEditEntityState(SchemaModel):
                 if self.background_fallback != "none":
                     raise ValueError(
                         "keep-source fallback cannot mark background fallback"
+                    )
+                if self.source_bbox_fallback_metadata_path is not None:
+                    raise ValueError(
+                        "keep-source fallback cannot publish bbox fallback metadata"
                     )
             elif self.fallback_policy == "completion_candidate":
                 if (
@@ -1141,6 +1180,22 @@ class ReferenceEditEntityState(SchemaModel):
                     raise ValueError(
                         "completion fallback requires both operations and final output"
                     )
+                if self.source_bbox_fallback_metadata_path is not None:
+                    raise ValueError(
+                        "completion fallback cannot publish bbox fallback metadata"
+                    )
+            elif self.fallback_policy == "source_bbox_fallback":
+                if (
+                    self.output_image_path is None
+                    or not self.output_image_path.strip()
+                    or self.output_image_path == self.source_image_path
+                    or self.source_bbox_fallback_metadata_path is None
+                    or not self.source_bbox_fallback_metadata_path.strip()
+                    or self.background_fallback != "none"
+                ):
+                    raise ValueError(
+                        "source bbox fallback requires a distinct real output and metadata"
+                    )
             else:
                 raise ValueError(
                     "reference edit fallback must keep source or completion candidate"
@@ -1152,6 +1207,7 @@ class ReferenceEditEntityState(SchemaModel):
                 or self.operations
                 or self.completion_metadata_path is not None
                 or self.background_metadata_path is not None
+                or self.source_bbox_fallback_metadata_path is not None
                 or self.background_fallback != "none"
                 or self.fallback_policy != "not_used"
             ):
@@ -1171,6 +1227,10 @@ class ReferenceEditEntityState(SchemaModel):
                 )
             if self.reason is None or not self.reason.strip():
                 raise ValueError("rejected reference edit requires a reason")
+            if self.source_bbox_fallback_metadata_path is not None:
+                raise ValueError(
+                    "rejected reference edit cannot publish bbox fallback metadata"
+                )
         return self
 
 
@@ -1265,6 +1325,41 @@ class ReferenceIntegrityReview(SchemaModel):
         return self
 
 
+class SourceBboxFallbackReview(SchemaModel):
+    same_target_entity: StrictBool
+    target_remains_dominant: StrictBool
+    extra_non_target_content_is_minor: StrictBool
+    no_competing_salient_entity: StrictBool
+    no_severe_reference_artifact: StrictBool
+    bbox_is_preferable_to_failed_reference: StrictBool
+    usable_as_independent_reference: StrictBool
+    certain: StrictBool
+    verdict: Literal["accept", "reject"]
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_review(self) -> SourceBboxFallbackReview:
+        if not self.reason.strip():
+            raise ValueError("source bbox fallback review reason must not be empty")
+        passed = all(
+            (
+                self.same_target_entity,
+                self.target_remains_dominant,
+                self.extra_non_target_content_is_minor,
+                self.no_competing_salient_entity,
+                self.no_severe_reference_artifact,
+                self.bbox_is_preferable_to_failed_reference,
+                self.usable_as_independent_reference,
+                self.certain,
+            )
+        )
+        if self.verdict != ("accept" if passed else "reject"):
+            raise ValueError(
+                "source bbox fallback verdict must match all strict checks"
+            )
+        return self
+
+
 class Sam3AnchorSelectionReview(SchemaModel):
     verdict: Literal["select", "reject", "uncertain"]
     selected_candidate_id: Optional[StrictInt] = None
@@ -1295,17 +1390,47 @@ class ReferenceIntegrityEntityState(SchemaModel):
     diagnostics: ReferenceTopologyDiagnostics
     reviewed: StrictBool
     review: Optional[ReferenceIntegrityReview] = None
+    source_bbox_fallback_candidate_path: Optional[str] = None
+    source_bbox_fallback_metadata_path: Optional[str] = None
+    source_bbox_xyxy: Optional[tuple[int, int, int, int]] = None
+    source_bbox_fallback_review: Optional[SourceBboxFallbackReview] = None
     judge_failed: StrictBool = False
     reason: str
 
     @model_validator(mode="after")
     def validate_entity_state(self) -> ReferenceIntegrityEntityState:
-        if (
-            self.input_reference.entity_id != self.entity_id
-            or self.input_reference.status != "ready"
-            or self.input_reference.image_path != self.final_reference_path
+        if self.input_reference.entity_id != self.entity_id or (
+            self.input_reference.status != "ready"
         ):
             raise ValueError("integrity input must be the ready published reference")
+        fallback_fields = (
+            self.source_bbox_fallback_candidate_path,
+            self.source_bbox_fallback_metadata_path,
+            self.source_bbox_xyxy,
+            self.source_bbox_fallback_review,
+        )
+        fallback_attempted = any(value is not None for value in fallback_fields)
+        if fallback_attempted and any(value is None for value in fallback_fields):
+            raise ValueError("source bbox fallback integrity provenance is incomplete")
+        fallback_accepted = bool(
+            self.source_bbox_fallback_review is not None
+            and self.source_bbox_fallback_review.verdict == "accept"
+        )
+        if fallback_accepted:
+            if (
+                self.status != "accepted"
+                or self.judge_failed
+                or self.review is None
+                or self.review.verdict != "reject"
+                or self.final_reference_path
+                != self.source_bbox_fallback_candidate_path
+                or self.final_reference_path == self.input_reference.image_path
+            ):
+                raise ValueError("accepted bbox fallback requires a rejected original")
+        elif self.final_reference_path != self.input_reference.image_path:
+            raise ValueError(
+                "integrity output may differ from its input only for accepted bbox fallback"
+            )
         if not self.reason.strip():
             raise ValueError("reference integrity entity reason must not be empty")
         if self.status == "skipped":
@@ -1319,7 +1444,9 @@ class ReferenceIntegrityEntityState(SchemaModel):
                     raise ValueError("integrity judge failure must fail closed")
             elif self.review is None:
                 raise ValueError("reviewed integrity result requires a review")
-            elif (self.status == "accepted") != (self.review.verdict == "accept"):
+            elif not fallback_accepted and (
+                (self.status == "accepted") != (self.review.verdict == "accept")
+            ):
                 raise ValueError("integrity entity status must match review verdict")
         return self
 
@@ -1620,6 +1747,13 @@ class ClipRecord(SchemaModel):
                 raise ValueError(
                     "generated fallback must preserve self clip provenance"
                 )
+            if reference.source_bbox_fallback and (
+                reference.source_clip_uid != self.clip_uid
+                or reference.source_entity_id != reference.entity_id
+            ):
+                raise ValueError(
+                    "source bbox fallback must preserve self clip/entity provenance"
+                )
         if self.pairing is not None and self.pairing.status == "ready":
             retained = self.pairing.retained_entity_ids
             retained_ids = set(retained)
@@ -1716,6 +1850,21 @@ class ClipRecord(SchemaModel):
                     raise ValueError(
                         "accepted reference edit must publish a synthetic reference"
                     )
+                if item.fallback_policy == "source_bbox_fallback" and (
+                    not reference.source_bbox_fallback
+                    or reference.synthetic
+                    or item.source_bbox_fallback_metadata_path
+                    != reference.source_bbox_metadata_path
+                ):
+                    raise ValueError(
+                        "reference edit bbox fallback must publish matching real provenance"
+                    )
+                if reference.source_bbox_fallback and (
+                    item.fallback_policy != "source_bbox_fallback"
+                ):
+                    raise ValueError(
+                        "published bbox fallback requires matching reference edit policy"
+                    )
         if (
             self.reference_integrity is not None
             and self.reference_integrity.status == "ready"
@@ -1746,6 +1895,21 @@ class ClipRecord(SchemaModel):
                     raise ValueError(
                         "accepted integrity result requires a ready reference"
                     )
+                if item.source_bbox_fallback_review is not None:
+                    fallback_accepted = (
+                        item.source_bbox_fallback_review.verdict == "accept"
+                    )
+                    if fallback_accepted and (
+                        not published.source_bbox_fallback
+                        or published.image_path != item.final_reference_path
+                        or published.source_bbox_xyxy != item.source_bbox_xyxy
+                        or published.source_bbox_metadata_path
+                        != item.source_bbox_fallback_metadata_path
+                        or published.synthetic
+                    ):
+                        raise ValueError(
+                            "accepted integrity bbox fallback must match published reference"
+                        )
         if self.instruction is not None and self.instruction.status == "ready":
             if self.pairing is None or self.pairing.status != "ready":
                 raise ValueError("ready instruction requires ready pairing")
