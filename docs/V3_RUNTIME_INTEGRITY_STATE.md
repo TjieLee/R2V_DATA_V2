@@ -159,9 +159,10 @@ Production `reference_integrity_judge.max_tokens` remains `1024`. Raising it to
 
 ### 4. Conservative source bbox fallback
 
-Commit `b30942e` adds `source_bbox_fallback_v1` only for artifact-local integrity
+Commit `b30942e` adds `source_bbox_fallback_v1` for artifact-local integrity
 failures where semantic, target identity, primary identity region, and major
-structure all passed.
+structure all passed. Code baseline `3cfb11f` adds a separate optional
+`topology_alpha_hole_upgrade` trigger for a Qwen-accepted reference.
 
 The fallback:
 
@@ -174,6 +175,14 @@ The fallback:
 - requires a separate strict Qwen bbox review before publication;
 - publishes `source_bbox_fallback=true` and `synthetic=false` with explicit
   source/bbox provenance.
+
+The topology trigger is limited to a normal-Qwen-accepted `subject` with
+`reference_scope=local`, `synthetic=false`, self-sourced provenance, no prior
+bbox fallback, alpha available, at least one enclosed transparent hole, largest
+hole area at least `1024`, and enclosed-hole bbox ratio at least `0.01`. It does
+not alter the broad `0.05` topology suspicion threshold. Bbox accept publishes
+the real source bbox; bbox reject or judge failure keeps the original accepted
+reference. The artifact-review-reject path remains fail-closed.
 
 ## Real Targeted Integrity Evidence
 
@@ -335,32 +344,36 @@ This closes the final integrity infrastructure gate. Do not rerun Qwen, SAM3,
 Boogu, removal, pair, or annotation for freeze validation unless a visual audit
 shows a concrete new problem.
 
-### Contact-sheet visual review — NOT PASS
+### Population-aware visual review — ONE TARGET REMAINS
 
-The final120 infrastructure run above passed, but its contact-sheet visual freeze
-did not. Three subject references retained obvious residue from transient-object
-removal:
+The final120 infrastructure run passed. The initial contact sheet overstated the
+final-population problem because it included every raw
+`references.entities.status=ready` entry, including references from pair-rejected
+clips. Final contact sheets must instead use retained and published final
+references.
 
-- contact-sheet label `7d3c89d8bb... e2`, young boy in an orange shirt: an
-  irregular white blob remained near the mouth/spoon/food region;
-- `eace10dad52d7534c50dae01 e1`, man in a red robe: removing the held orange left
-  a white circular silhouette in the hand;
-- `eace10dad52d7534c50dae01 e2`, man in a white silk robe: the held item became an
-  unnatural white sphere/placeholder.
+- contact-sheet label `7d3c89d8bb... e2`, the young-boy white-blob case, was
+  pair-rejected and is not part of the final integrity or training population;
+- `eace10dad52d7534c50dae01 e2`, the man in a white silk robe, now correctly
+  follows normal artifact reject -> bbox accept and publishes real source pixels
+  with `synthetic=false`;
+- `eace10dad52d7534c50dae01 e1`, the man in a red robe, is the only remaining
+  final visual-freeze issue. Normal Qwen accepted it, while alpha diagnostics
+  show one enclosed transparent hole of about `2362` pixels with ratio about
+  `0.0131`.
 
-The held items are not required identity content. The artificial residue is the
-failure. The next server validation is only a targeted replay of these three
-references after `b7e46fc`; do not run another full 120 replay for this prompt
-change.
+Code baseline `3cfb11f` makes that last class eligible for an optional strict bbox
+comparison without lowering the broad topology threshold or converting topology
+into an automatic reject.
 
 ## Local Validation for Current Code Baseline
 
-Reported local validation for `b7e46fc748bbedb245d883c0fdf055b5aa90a988`:
+Reported local validation for `3cfb11f`:
 
 ```text
-reference-integrity targeted tests: 76 passed
+reference-integrity targeted tests: 82 passed
 storage/schema tests:              63 passed, 1 warning
-full pytest:                       1661 passed, 1 warning
+full pytest:                       1667 passed, 1 warning
 Ruff:                              PASS
 git diff --check:                  PASS
 working tree:                      clean
@@ -368,15 +381,14 @@ working tree:                      clean
 
 ## Remaining Freeze Check
 
-The semantic five-case replay and final120 infrastructure checks have passed,
-but the final120 contact-sheet visual review exposed the three transient-removal
-artifacts recorded above. The only remaining visual-V3 check is a targeted
-three-reference integrity replay after `b7e46fc`, using already-materialized
-evidence and rerunning no upstream stage. Review the normal integrity verdict,
-any bbox fallback decision, and the three final reference images. Do not rerun
-the full 120 population unless that targeted replay reveals a broader regression.
+The semantic five-case replay and final120 infrastructure checks have passed.
+After correcting the contact-sheet population, the only remaining visual-V3
+check is one targeted integrity replay for `eace10dad52d7534c50dae01 e1` on code
+baseline `3cfb11f`, using already-materialized evidence and rerunning no upstream
+stage. Review the normal integrity verdict, topology trigger, strict bbox
+decision, and final published reference. Do not rerun the full 120 population.
 
-If all three targeted outcomes are visually correct with no infrastructure
+If this one targeted outcome is visually correct with no infrastructure
 failure, record the replay evidence and freeze the visual V3 code/config before
 returning to the audio/H3 branch.
 

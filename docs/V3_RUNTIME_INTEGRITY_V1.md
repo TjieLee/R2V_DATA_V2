@@ -282,8 +282,9 @@ as a substitute for this bounded repair.
 
 ### 8.4 Source bbox fallback
 
-`source_bbox_fallback_v1` is a narrow recall rescue for artifact-only failures.
-It is not a generic second reference selector.
+`source_bbox_fallback_v1` is a narrow recall rescue for artifact-only failures
+and, as of code baseline `3cfb11f`, one optional topology-assisted quality
+upgrade. It is not a generic second reference selector.
 
 Eligibility requires semantic, target, identity, and major structure checks to
 pass. The failed reference must primarily have a localized edit/cutout artifact,
@@ -317,6 +318,20 @@ and explicit source clip/entity/frame/bbox/hash metadata. If a prior Boogu edit
 was the published reference, the edit state is atomically transitioned to the
 source-bbox fallback policy while the original generated evidence remains for
 diagnostics.
+
+The optional `topology_alpha_hole_upgrade` path runs only after normal integrity
+accepted a real, self-sourced, local subject cutout. It requires alpha, at least
+one enclosed transparent hole, largest enclosed-hole area at least `1024`
+pixels, and enclosed-hole-to-foreground-bbox ratio at least `0.01`. It does not
+use or alter the broad topology suspicion flag; in particular,
+`large_enclosed_alpha_hole` remains `hole_ratio >= 0.05`.
+
+This topology path is a comparison, not an automatic rejection. The same strict
+three-image bbox judge must find the raw source bbox clearly preferable. Bbox
+accept publishes the real source bbox. Bbox reject or bbox-judge failure keeps
+the original Qwen-accepted reference and records the attempted upgrade. The
+existing artifact-review-reject path remains fail-closed after bbox rejection
+or bbox-judge failure.
 
 ## 9. Server Environment
 
@@ -493,15 +508,23 @@ length_count: 0
 ```
 
 Infrastructure therefore passed, including the structured-output termination
-fix. The contact-sheet visual freeze did not pass: the young-boy reference with
-contact-sheet label `7d3c89d8bb... e2` retained an irregular white mouth-region
-blob, while `eace10dad52d7534c50dae01 e1` and `e2` retained white circular or
-spherical placeholders after held-item removal.
+fix. Later population-aware review corrected the initial contact-sheet reading:
 
-After the prompt hardening in `b7e46fc`, run only a targeted replay of those
-three references. Reuse existing evidence and do not rerun annotation, SAM3,
-coverage, pair, remover, or Boogu. Another full 120 replay is not the current
-next step.
+- the young-boy white-blob reference with contact-sheet label
+  `7d3c89d8bb... e2` was pair-rejected and was not part of the final integrity or
+  training population; the earlier contact sheet over-included raw ready
+  references;
+- `eace10dad52d7534c50dae01 e2`, the man in a white robe, now follows normal
+  artifact reject -> bbox accept -> real publication with `synthetic=false`;
+- `eace10dad52d7534c50dae01 e1`, the man in a red robe, is the only remaining
+  final visual-freeze issue: normal Qwen accepted the local RGBA even though it
+  has one enclosed transparent hole of about `2362` pixels and ratio `0.0131`.
+
+After code baseline `3cfb11f`, run only one targeted real replay for red-robed
+`e1`. Reuse existing evidence and do not rerun the 120 population, annotation,
+SAM3, coverage, pair, remover, or Boogu. Final contact sheets must be generated
+from actually retained and published final references, not every raw
+`references.entities.status=ready` entry from pair-rejected clips.
 
 ## 14. Monitoring
 
