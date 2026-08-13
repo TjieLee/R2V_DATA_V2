@@ -56,7 +56,34 @@ visually obvious. For example, "a clay pot of stew" must reject when only stew
 remains, and "a bowl of noodles" must reject when only noodles remain. For the
 object "a camera", the camera itself must remain. For the subject "a man in a
 white t-shirt", an unrelated held bowl or chopsticks may disappear if the
-stable subject identity remains.
+stable subject identity remains. A held or transient non-target object may
+disappear only when its removal leaves a visually plausible target/reference
+surface. The fact that the removed item is transient, non-identity-defining, or
+unrelated to the target does not excuse an artificial removal artifact. Reject a
+white or transparent circular silhouette in a hand; a bottle-, cup-, fruit-,
+spoon-, or tool-shaped blank cavity; an irregular white blob near a hand or
+mouth; a solid-color placeholder where the source contained another object; a
+conspicuous erased-object outline; a blank patch cutting through clothing,
+skin, body surface, or another identity/reference-bearing region; or any
+obviously artificial missing or reconstructed surface caused by deleting the
+non-target item. Set no_severe_reference_artifact to false for these artifacts.
+Also set no_unnatural_holes_or_surface_loss to false when the blank region is an
+unnatural missing or replaced surface. The semantic and identity fields should
+still describe the otherwise-correct target accurately.
+REJECT an orange removed from a person's hand leaving a white circular
+silhouette; a spoon or food removed near a child's mouth leaving an irregular
+white blob; a bottle removed from a person's torso or hand leaving a
+bottle-shaped white cavity; or a held item replaced by an unnatural white sphere
+or placeholder. The orange, bottle, spoon, food, or other held item itself does
+not have to remain; the failure is the artificial residue left by its removal.
+Do not reject merely because a transient item disappeared. Clean removal may be
+accepted when the hand, clothing, body, and background surfaces are visually
+plausible and the target remains structurally and semantically correct. This
+includes a cleanly removed bowl, disappearing chopsticks with no hole or
+placeholder, or an unrelated nearby object that disappears cleanly. Naturally
+white clothing or objects, white backgrounds, highlights, teeth, sclera, and
+paper are not artifacts merely because they are white. Judge unnatural
+source-to-reference alteration, not raw white-pixel presence.
 For a subject, require enough stable identity-bearing appearance for the stated
 scope, but do not require a visible face in every valid back view, masked person,
 character, or animal. For a human subject, when the highlighted source context

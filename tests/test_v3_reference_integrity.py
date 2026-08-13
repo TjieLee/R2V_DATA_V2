@@ -170,6 +170,21 @@ def _severe_reference_artifact_review() -> ReferenceIntegrityReview:
     )
 
 
+def _transient_removal_artifact_review() -> ReferenceIntegrityReview:
+    accepted = _review(accept=True).model_dump(mode="json")
+    return ReferenceIntegrityReview.model_validate(
+        {
+            **accepted,
+            "no_unnatural_holes_or_surface_loss": False,
+            "no_severe_reference_artifact": False,
+            "reason": (
+                "removed held fruit left a white circular artificial residue"
+            ),
+            "verdict": "reject",
+        }
+    )
+
+
 def _bbox_review(*, accept: bool) -> SourceBboxFallbackReview:
     return SourceBboxFallbackReview(
         same_target_entity=True,
@@ -850,6 +865,22 @@ def test_integrity_prompt_enforces_reference_semantics_and_severe_artifacts() ->
         assert contract in prompt
 
 
+def test_integrity_prompt_distinguishes_clean_transient_removal_from_artifact() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.lower().split())
+
+    for contract in (
+        "transient, non-identity-defining, or unrelated to the target does not excuse",
+        "orange removed from a person's hand leaving a white circular silhouette",
+        "spoon or food removed near a child's mouth leaving an irregular white blob",
+        "held item itself does not have to remain",
+        "clean removal may be accepted",
+        "set no_severe_reference_artifact to false",
+        "set no_unnatural_holes_or_surface_loss to false",
+        "judge unnatural source-to-reference alteration, not raw white-pixel presence",
+    ):
+        assert contract in prompt
+
+
 @pytest.mark.parametrize(
     "system_prompt",
     (SYSTEM_PROMPT, SOURCE_BBOX_FALLBACK_SYSTEM_PROMPT),
@@ -1240,6 +1271,126 @@ def test_artifact_only_human_publishes_real_source_bbox_fallback(
     exported = storage.config.resolved_export_root / "references/clip-1/subject_1.png"
     with Image.open(exported) as exported_image:
         assert np.array_equal(np.asarray(exported_image), expected_pixels)
+
+
+def _make_human_reference_reviewable(storage: RunStorage) -> EntityReferenceState:
+    clip = storage.read_clip("clip-1")
+    human = clip.references.entities[0].model_copy(
+        update={
+            "reference_scope": "local",
+            "visible_region": "upper_body",
+            "whole_entity_recognizable": False,
+        }
+    )
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=[human, clip.references.entities[1]]),
+        clip.pairing,
+    )
+    return human
+
+
+def test_transient_removal_artifact_publishes_real_source_bbox_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    _make_human_reference_reviewable(storage)
+    bbox_judge = FakeSourceBboxFallbackJudge([_bbox_review(accept=True)])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_transient_removal_artifact_review()]),
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    published = updated.references.entities[0]
+    assert stats.source_bbox_fallback_attempted == 1
+    assert stats.source_bbox_fallback_accepted == 1
+    assert stats.entities_rejected == 0
+    assert len(bbox_judge.calls) == 1
+    assert published.status == "ready"
+    assert published.synthetic is False
+    assert published.source_bbox_fallback is True
+    assert updated.reference_integrity is not None
+    result = updated.reference_integrity.entities[0]
+    assert result.review is not None
+    assert result.review.matches_target is True
+    assert result.review.preserves_annotated_entity_semantics is True
+    assert result.review.structurally_complete_for_scope is True
+    assert result.review.no_unnatural_holes_or_surface_loss is False
+    assert result.review.no_severe_reference_artifact is False
+    assert result.source_bbox_fallback_review is not None
+    assert result.source_bbox_fallback_review.verdict == "accept"
+
+
+def test_transient_removal_artifact_stays_rejected_when_bbox_has_competing_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    original = _make_human_reference_reviewable(storage)
+    bbox_judge = FakeSourceBboxFallbackJudge([_bbox_review(accept=False)])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge([_transient_removal_artifact_review()]),
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    rejected = updated.references.entities[0]
+    assert stats.source_bbox_fallback_attempted == 1
+    assert stats.source_bbox_fallback_rejected == 1
+    assert stats.entities_rejected == 1
+    assert len(bbox_judge.calls) == 1
+    assert rejected.status == "rejected"
+    assert rejected.image_path is None
+    assert updated.reference_integrity is not None
+    result = updated.reference_integrity.entities[0]
+    assert result.status == "rejected"
+    assert result.final_reference_path == original.image_path
+    assert result.source_bbox_fallback_review is not None
+    assert result.source_bbox_fallback_review.verdict == "reject"
+
+
+def test_clean_transient_object_removal_is_accepted_without_bbox_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(tmp_path, monkeypatch, second_scope="full")
+    _make_human_reference_reviewable(storage)
+    bbox_judge = FakeSourceBboxFallbackJudge([])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=FakeIntegrityJudge(
+            [
+                _review(
+                    accept=True,
+                    reason="held bowl is cleanly absent with plausible surfaces",
+                )
+            ]
+        ),
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert stats.entities_reviewed == 1
+    assert stats.entities_rejected == 0
+    assert stats.source_bbox_fallback_attempted == 0
+    assert bbox_judge.calls == []
+    assert updated.references.entities[0].status == "ready"
+    assert updated.reference_integrity is not None
+    result = updated.reference_integrity.entities[0]
+    assert result.status == "accepted"
+    assert result.review is not None
+    assert result.review.no_unnatural_holes_or_surface_loss is True
+    assert result.review.no_severe_reference_artifact is True
 
 
 def test_cross_pair_artifact_failure_never_uses_source_bbox_fallback(
