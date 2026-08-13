@@ -101,7 +101,7 @@ zero-candidate grounding miss is intentionally not being tuned further.
 
 ## Reference Integrity Contracts
 
-Final integrity now has three independent mechanisms.
+Final integrity has three independent mechanisms.
 
 ### 1. Deterministic semantic policy
 
@@ -143,7 +143,7 @@ structure all passed.
 The fallback:
 
 - uses the exact already-selected source frame;
-- crops raw RGB using the tracked target mask bbox plus the normal crop padding;
+- crops raw RGB using the tracked target mask bbox plus normal crop padding;
 - does not apply the mask;
 - does not inpaint or generate pixels;
 - is disabled for cross-pair, semantic failures, identity failures, wrong target,
@@ -154,7 +154,7 @@ The fallback:
 
 ## Real Targeted Integrity Evidence
 
-Latest real targeted run:
+### Bbox / structured-output targeted replay
 
 ```text
 run_id: integrity-bbox-targeted-20260813-174737
@@ -193,10 +193,72 @@ Important real cases:
   trigger bbox fallback. Do not widen fallback merely to force those cases onto
   the bbox path.
 
-The same targeted run demonstrated why a deterministic semantic hard gate was
-needed: Qwen still accepted sauce, cathedral, dog-as-object, and giant-clam-as-
-object despite semantic-risk routing. Commit `32a9e0e` addresses exactly that
-failure mode.
+The same replay demonstrated why a deterministic semantic hard gate was needed:
+Qwen still accepted sauce, cathedral, dog-as-object, and giant-clam-as-object
+despite semantic-risk routing.
+
+### Deterministic semantic final-5 replay — PASS
+
+Real server replay after commit `32a9e0e`:
+
+```text
+run_id: semantic-final5-20260813-182752
+run_root: /mnt/workspace/litengjie/data/r2v_v3_runs/semantic-final5-20260813-182752
+config_hash: 717840669bb12167214350c71a4eaf22d74edd929ae0502b739bde872c5dd512
+```
+
+Observed stage summary:
+
+```text
+processed: 5
+skipped_disabled: 0
+skipped_existing: 0
+skipped_not_ready: 0
+failed: 0
+entities_reviewed: 3
+entities_skipped_review: 0
+entities_accepted: 3
+entities_rejected: 4
+semantic_policy_rejected: 4
+judge_failed: 0
+topology_suspicious: 0
+source_bbox_fallback_attempted: 0
+source_bbox_fallback_accepted: 0
+source_bbox_fallback_rejected: 0
+source_bbox_fallback_judge_failed: 0
+```
+
+All five freeze-gate cases matched expectations:
+
+```text
+0f32c6b7fa9934c159a03ff7 e2  thick golden-brown sauce
+  rejected, reviewed=false
+  semantic_policy:amorphous_object
+  no source context, Qwen review, or bbox fallback
+
+34da1ad5a39a0389de87568b e1  large domed cathedral
+  rejected, reviewed=false
+  semantic_policy:scene_structure_object
+  no source context, Qwen review, or bbox fallback
+
+4e892f7740e1557b495a64da e3  light-colored dog typed object
+  rejected, reviewed=false
+  semantic_policy:living_creature_object
+  no source context, Qwen review, or bbox fallback
+
+b527c92f98b7f27f1d301f7c e1  giant clam typed object
+  rejected, reviewed=false
+  semantic_policy:living_creature_object
+  no source context, Qwen review, or bbox fallback
+
+82f312a07328785e228802d3 e1  cooked red lobster
+  not semantic-policy rejected
+  normal Qwen integrity review accepted
+  reference_entity_semantically_valid=true
+```
+
+This closes the deterministic semantic policy validation. Do not tune the hard
+gate further without new concrete false-positive or false-negative evidence.
 
 ## Local Validation for Current Code Baseline
 
@@ -212,47 +274,35 @@ working tree:                      clean
 ```
 
 No real Qwen, SAM3, Boogu, CUDA, GPU, or server data job was run by the local
-implementation task.
+implementation task. Real server evidence is recorded separately above.
 
 ## Remaining Freeze Check
 
-Do not run another 120-clip job yet. First replay only these semantic policy
-cases on the server against code baseline `32a9e0e`:
+The five-case semantic replay has passed. The only remaining visual-V3 freeze
+step is one final 120-clip `reference_integrity` replay on the fixed development
+population, followed by a contact-sheet/audit review.
 
-```text
-0f32c6b7fa9934c159a03ff7  a thick golden-brown sauce
-  expected: reject, semantic_policy:amorphous_object
+For this final replay:
 
-34da1ad5a39a0389de87568b  large domed cathedral
-  expected: reject, semantic_policy:scene_structure_object
+- reuse already-materialized annotation, frames, SAM3 masks, coverage, pair,
+  removal, and reference-edit evidence;
+- do not rerun SAM3, annotation, remover, pair, or Boogu;
+- create a fresh run root with a current matching `run.json`;
+- preserve old integrity rejects monotonically when preparing replay artifacts;
+- clear only `reference_integrity`, instruction, and export states that need to
+  be recomputed;
+- require `ClipRecord.model_validate()` before model calls;
+- keep `debug.save_diagnostics=true`;
+- run only `--stages reference_integrity --profile`;
+- review counters, all rejects, all bbox fallbacks, all judge repairs/failures,
+  and a final contact sheet before freezing.
 
-4e892f7740e1557b495a64da  light-colored dog with long fur typed object
-  expected: reject, semantic_policy:living_creature_object
+Freeze requires no new infrastructure failure or broad regression. A small
+number of intended semantic/artifact rejects is expected and is not itself a
+failure.
 
-b527c92f98b7f27f1d301f7c giant clam typed object
-  expected: reject, semantic_policy:living_creature_object
-
-82f312a07328785e228802d3  cooked red lobster on a cutting board
-  expected: not hard-rejected; normal integrity path may accept
-```
-
-Required server assertions:
-
-```text
-semantic_policy_rejected = 4 for the four negative examples
-Qwen integrity calls      = 0 for those four policy rejects
-bbox fallback calls       = 0 for those four policy rejects
-cooked lobster            = not semantic-policy rejected
-failed                     = 0
-```
-
-If the five-case replay matches the expectations, perform one final 120-clip
-reference-integrity replay plus contact-sheet/audit review. Do not rerun SAM3,
-Boogu, removal, or annotation unless the final audit provides specific evidence
-that one of those stages is invalid.
-
-After that final replay passes, freeze the visual V3 code/config and return to
-the audio/H3 branch.
+After the final 120 replay and contact-sheet review pass, freeze the visual V3
+code/config and return to the audio/H3 branch.
 
 ## Historical Runtime Note
 
