@@ -1226,6 +1226,7 @@ class ReferenceTopologyDiagnostics(SchemaModel):
 
 class ReferenceIntegrityReview(SchemaModel):
     matches_target: StrictBool
+    reference_entity_semantically_valid: StrictBool
     preserves_annotated_entity_semantics: StrictBool
     preserves_primary_identity_region: StrictBool
     recognizable_as_named_entity: StrictBool
@@ -1233,6 +1234,7 @@ class ReferenceIntegrityReview(SchemaModel):
     no_major_missing_regions: StrictBool
     no_unnatural_holes_or_surface_loss: StrictBool
     no_unrelated_entity_dominance: StrictBool
+    no_severe_reference_artifact: StrictBool
     usable_as_independent_reference: StrictBool
     verdict: Literal["accept", "reject"]
     reason: str
@@ -1244,6 +1246,7 @@ class ReferenceIntegrityReview(SchemaModel):
         passed = all(
             (
                 self.matches_target,
+                self.reference_entity_semantically_valid,
                 self.preserves_annotated_entity_semantics,
                 self.preserves_primary_identity_region,
                 self.recognizable_as_named_entity,
@@ -1251,6 +1254,7 @@ class ReferenceIntegrityReview(SchemaModel):
                 self.no_major_missing_regions,
                 self.no_unnatural_holes_or_surface_loss,
                 self.no_unrelated_entity_dominance,
+                self.no_severe_reference_artifact,
                 self.usable_as_independent_reference,
             )
         )

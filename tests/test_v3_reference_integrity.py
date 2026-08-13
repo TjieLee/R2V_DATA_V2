@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import r2v_data_v2.v3.config as config_module
 from r2v_data_v2.reconciliation import write_json_atomic
@@ -26,6 +26,7 @@ from r2v_data_v2.v3.reference_integrity import (
     ReferenceIntegrityJudgeFailure,
     ReferenceIntegrityReviewAttempt,
     reference_integrity_clips,
+    reference_semantic_risk_reason,
     reference_topology_diagnostics,
 )
 from r2v_data_v2.v3.schemas import (
@@ -57,6 +58,8 @@ def _review(
     reason: str = "reviewed",
     preserves_semantics: bool | None = None,
     preserves_primary_identity_region: bool | None = None,
+    reference_entity_semantically_valid: bool | None = None,
+    no_severe_reference_artifact: bool | None = None,
 ) -> ReferenceIntegrityReview:
     semantic_fidelity = accept if preserves_semantics is None else preserves_semantics
     identity_region = (
@@ -64,8 +67,19 @@ def _review(
         if preserves_primary_identity_region is None
         else preserves_primary_identity_region
     )
+    semantic_validity = (
+        accept
+        if reference_entity_semantically_valid is None
+        else reference_entity_semantically_valid
+    )
+    artifact_free = (
+        accept
+        if no_severe_reference_artifact is None
+        else no_severe_reference_artifact
+    )
     return ReferenceIntegrityReview(
         matches_target=accept,
+        reference_entity_semantically_valid=semantic_validity,
         preserves_annotated_entity_semantics=semantic_fidelity,
         preserves_primary_identity_region=identity_region,
         recognizable_as_named_entity=accept,
@@ -73,6 +87,7 @@ def _review(
         no_major_missing_regions=accept,
         no_unnatural_holes_or_surface_loss=accept,
         no_unrelated_entity_dominance=accept,
+        no_severe_reference_artifact=artifact_free,
         usable_as_independent_reference=accept,
         verdict="accept" if accept else "reject",
         reason=reason,
@@ -82,6 +97,7 @@ def _review(
 def _semantic_reinterpretation_review() -> ReferenceIntegrityReview:
     return ReferenceIntegrityReview(
         matches_target=True,
+        reference_entity_semantically_valid=True,
         preserves_annotated_entity_semantics=False,
         preserves_primary_identity_region=True,
         recognizable_as_named_entity=True,
@@ -89,6 +105,7 @@ def _semantic_reinterpretation_review() -> ReferenceIntegrityReview:
         no_major_missing_regions=True,
         no_unnatural_holes_or_surface_loss=True,
         no_unrelated_entity_dominance=True,
+        no_severe_reference_artifact=True,
         usable_as_independent_reference=True,
         verdict="reject",
         reason="only the stew remains; the annotated clay pot is missing",
@@ -98,6 +115,7 @@ def _semantic_reinterpretation_review() -> ReferenceIntegrityReview:
 def _primary_identity_loss_review() -> ReferenceIntegrityReview:
     return ReferenceIntegrityReview(
         matches_target=True,
+        reference_entity_semantically_valid=True,
         preserves_annotated_entity_semantics=True,
         preserves_primary_identity_region=False,
         recognizable_as_named_entity=True,
@@ -105,9 +123,36 @@ def _primary_identity_loss_review() -> ReferenceIntegrityReview:
         no_major_missing_regions=True,
         no_unnatural_holes_or_surface_loss=True,
         no_unrelated_entity_dominance=True,
+        no_severe_reference_artifact=True,
         usable_as_independent_reference=True,
         verdict="reject",
         reason="the source shows the head but the final subject is cropped below it",
+    )
+
+
+def _invalid_reference_semantics_review(reason: str) -> ReferenceIntegrityReview:
+    accepted = _review(accept=True).model_dump(mode="json")
+    return ReferenceIntegrityReview.model_validate(
+        {
+            **accepted,
+            "reference_entity_semantically_valid": False,
+            "verdict": "reject",
+            "reason": reason,
+        }
+    )
+
+
+def _severe_reference_artifact_review() -> ReferenceIntegrityReview:
+    accepted = _review(accept=True).model_dump(mode="json")
+    return ReferenceIntegrityReview.model_validate(
+        {
+            **accepted,
+            "no_severe_reference_artifact": False,
+            "verdict": "reject",
+            "reason": (
+                "a large white bottle-shaped edit cavity cuts through the woman"
+            ),
+        }
     )
 
 
@@ -412,6 +457,32 @@ def test_integrity_schema_requires_primary_identity_region_for_acceptance() -> N
 
 
 @pytest.mark.parametrize(
+    "field_name",
+    (
+        "reference_entity_semantically_valid",
+        "no_severe_reference_artifact",
+    ),
+)
+def test_integrity_schema_requires_final_semantic_and_artifact_gates(
+    field_name: str,
+) -> None:
+    accepted = _review(accept=True).model_dump(mode="json")
+
+    missing = dict(accepted)
+    missing.pop(field_name)
+    with pytest.raises(ValueError):
+        ReferenceIntegrityReview.model_validate(missing)
+
+    with pytest.raises(ValueError):
+        ReferenceIntegrityReview.model_validate({**accepted, field_name: 1})
+
+    with pytest.raises(ValueError, match="must match all integrity checks"):
+        ReferenceIntegrityReview.model_validate(
+            {**accepted, field_name: False}
+        )
+
+
+@pytest.mark.parametrize(
     "description",
     (
         "person viewed from behind with the head present",
@@ -487,6 +558,190 @@ def test_integrity_prompt_requires_human_head_region_without_requiring_face() ->
         "apply this human head-region rule only to human subjects",
     ):
         assert contract in prompt
+
+
+def test_integrity_prompt_enforces_reference_semantics_and_severe_artifacts() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.lower().split())
+
+    for contract in (
+        "set reference_entity_semantically_valid to false",
+        "a living animal or creature is labeled as an object",
+        "clearly cooked or prepared culinary food may remain a valid object",
+        "amorphous sauce, liquid, smoke, steam, fog, light",
+        "a static scene structure such as a cathedral, building, bridge, or tree",
+        "represented content",
+        "set no_severe_reference_artifact to false",
+        "large white or transparent erased-object-shaped cavity",
+        "a severe blank patch or edit scar",
+        "large white bottle-shaped hole",
+        "the bottle need not remain for her identity",
+    ):
+        assert contract in prompt
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_reason"),
+    (
+        ("a brown dog", "object_creature_semantic_risk"),
+        ("a living clam", "object_creature_semantic_risk"),
+        ("thick red sauce", "amorphous_object_semantic_risk"),
+        ("a stone cathedral", "scene_structure_object_semantic_risk"),
+        ("a person on a screen", "represented_content_semantic_risk"),
+    ),
+)
+def test_clean_full_semantic_risk_objects_are_routed_to_integrity_review(
+    phrase: str,
+    expected_reason: str,
+) -> None:
+    assert reference_semantic_risk_reason(
+        reference_type="object",
+        phrase=phrase,
+        grounding_prompt=phrase,
+    ) == expected_reason
+
+
+def test_valid_cooked_lobster_and_normal_object_are_not_semantic_risk() -> None:
+    for phrase in ("a cooked lobster dish", "a black camera"):
+        assert (
+            reference_semantic_risk_reason(
+                reference_type="object",
+                phrase=phrase,
+                grounding_prompt=phrase,
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    (
+        "a brown dog",
+        "a living clam",
+        "thick red sauce",
+        "a stone cathedral",
+        "a person on a screen",
+    ),
+)
+def test_semantically_invalid_clean_full_object_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phrase: str,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_phrase=phrase,
+    )
+    judge = FakeIntegrityJudge(
+        [_invalid_reference_semantics_review(f"{phrase} violates V3 semantics")]
+    )
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    clip = storage.read_clip("clip-1")
+    assert len(judge.calls) == 1
+    assert judge.calls[0]["phrase"] == phrase
+    assert stats.entities_reviewed == 1
+    assert stats.entities_rejected == 1
+    assert clip.references.entities[1].status == "rejected"
+    assert clip.reference_integrity is not None
+    review = clip.reference_integrity.entities[1].review
+    assert review is not None
+    assert review.reference_entity_semantically_valid is False
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ("a cooked lobster dish", "a black camera"),
+)
+def test_clean_full_valid_object_behavior_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phrase: str,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_phrase=phrase,
+    )
+    judge = FakeIntegrityJudge([])
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    assert judge.calls == []
+    assert stats.entities_skipped_review == 2
+    assert stats.entities_rejected == 0
+    assert all(
+        reference.status == "ready"
+        for reference in storage.read_clip("clip-1").references.entities
+    )
+
+
+def test_clean_full_human_reference_behavior_is_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+    )
+    judge = FakeIntegrityJudge([])
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    assert judge.calls == []
+    assert stats.entities_skipped_review == 2
+    assert storage.read_clip("clip-1").references.entities[0].status == "ready"
+
+
+def test_bottle_shaped_white_cavity_rejects_human_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+    )
+    clip = storage.read_clip("clip-1")
+    human = clip.references.entities[0].model_copy(
+        update={
+            "reference_scope": "local",
+            "visible_region": "upper_body",
+            "whole_entity_recognizable": False,
+        }
+    )
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=[human, clip.references.entities[1]]),
+        clip.pairing,
+    )
+    assert human.image_path is not None
+    image_path = storage.root / human.image_path
+    with Image.open(image_path) as opened:
+        damaged = opened.convert("RGBA")
+        damaged.load()
+    draw = ImageDraw.Draw(damaged)
+    draw.rectangle((27, 23, 39, 51), fill=(255, 255, 255, 255))
+    draw.rectangle((31, 16, 35, 23), fill=(255, 255, 255, 255))
+    damaged.save(image_path)
+    judge = FakeIntegrityJudge([_severe_reference_artifact_review()])
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    updated = storage.read_clip("clip-1")
+    assert stats.entities_rejected == 1
+    assert updated.references.entities[0].status == "rejected"
+    assert updated.reference_integrity is not None
+    review = updated.reference_integrity.entities[0].review
+    assert review is not None
+    assert review.preserves_annotated_entity_semantics is True
+    assert review.preserves_primary_identity_region is True
+    assert review.no_severe_reference_artifact is False
+    assert review.verdict == "reject"
 
 
 def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:

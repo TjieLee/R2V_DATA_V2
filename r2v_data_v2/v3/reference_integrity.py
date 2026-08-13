@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,6 +29,19 @@ from r2v_data_v2.v3.storage import RunStorage
 
 SYSTEM_PROMPT = """You are the final integrity reviewer for one entity reference.
 Compare the highlighted target in the source context with the final reference.
+First judge whether the annotated entity itself obeys V3 reference semantics.
+Set reference_entity_semantically_valid to false when a living animal or
+creature is labeled as an object, including a dog, a living clam, or a fish,
+crab, lobster, spider, or turtle depicted as a creature. Clearly cooked or
+prepared culinary food may remain a valid object, such as a cooked whole fish
+in a wok or a cooked lobster dish; do not reject it solely because its noun
+originates from an animal. Amorphous sauce, liquid, smoke, steam, fog, light, or
+similar unbounded material is not an object by itself. A static scene structure
+such as a cathedral, building, bridge, or tree is not an object reference.
+Depicted, screen, painting, poster, photograph, animation, or visualization
+content is not a physical reference entity when the annotation denotes only the
+represented content. A physical carrier such as the actual screen, framed
+painting, or poster may still be a valid object when that carrier is the entity.
 The final reference must denote the same complete entity as the annotation
 phrase. Do not reinterpret the target as a convenient sub-entity. When a
 container-and-contents relationship is part of the annotated entity identity,
@@ -59,9 +73,135 @@ requirement or new rejection behavior for non-human subjects or objects. For an
 object, require its recognizable structural core. Reject major missing surfaces,
 large unnatural holes, disconnected remnants, identity-changing completion
 artifacts, severe destructive truncation, or an unrelated dominant entity.
+Set no_severe_reference_artifact to false for a conspicuous artificial defect
+that makes the reference unusable even if identity remains recognizable. This
+includes a large white or transparent erased-object-shaped cavity through the
+entity, a severe blank patch or edit scar, a large unnatural missing surface,
+or an obvious generation artifact that would teach incorrect appearance. For
+example, reject a red-top woman whose removed held bottle leaves a large white
+bottle-shaped hole through her reference. The bottle need not remain for her
+identity; the artificial cavity itself is the failure.
 Legitimate source-matching cutouts, handles, wheels, scissors, brackets, frames,
 and truss structures are not defects merely because they contain holes.
 Return JSON only and make verdict accept if and only if every boolean is true."""
+
+_OBJECT_CREATURE_TERMS = (
+    "animal",
+    "bear",
+    "bird",
+    "cat",
+    "clam",
+    "cow",
+    "crab",
+    "creature",
+    "deer",
+    "dog",
+    "dolphin",
+    "elephant",
+    "fish",
+    "frog",
+    "horse",
+    "insect",
+    "lion",
+    "lizard",
+    "lobster",
+    "monkey",
+    "octopus",
+    "rabbit",
+    "seal",
+    "shark",
+    "snake",
+    "spider",
+    "squid",
+    "tiger",
+    "turtle",
+    "whale",
+)
+_CULINARY_TERMS = (
+    "baked",
+    "boiled",
+    "cooked",
+    "dish",
+    "food",
+    "fried",
+    "grilled",
+    "meal",
+    "prepared",
+    "roasted",
+    "stewed",
+)
+_AMORPHOUS_OBJECT_TERMS = (
+    "fire",
+    "flame",
+    "fog",
+    "light",
+    "liquid",
+    "mist",
+    "oil",
+    "sauce",
+    "shadow",
+    "smoke",
+    "steam",
+    "water",
+)
+_SCENE_STRUCTURE_OBJECT_TERMS = (
+    "building",
+    "bridge",
+    "cathedral",
+    "church",
+    "forest",
+    "house",
+    "mountain",
+    "tree",
+)
+_REPRESENTED_CONTENT_TERMS = (
+    "animated",
+    "animation",
+    "depiction",
+    "depicted",
+    "diagram",
+    "illustration",
+    "mural",
+    "painting",
+    "photo",
+    "photograph",
+    "poster",
+    "screen",
+    "screen image",
+    "video display",
+    "visualization",
+)
+
+
+def _contains_integrity_term(text: str, term: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) is not None
+
+
+def reference_semantic_risk_reason(
+    *,
+    reference_type: str,
+    phrase: str,
+    grounding_prompt: str,
+) -> str | None:
+    if reference_type != "object":
+        return None
+    text = " ".join(f"{phrase} {grounding_prompt}".casefold().split())
+    creature = any(_contains_integrity_term(text, term) for term in _OBJECT_CREATURE_TERMS)
+    culinary = any(_contains_integrity_term(text, term) for term in _CULINARY_TERMS)
+    if creature and not culinary:
+        return "object_creature_semantic_risk"
+    if any(_contains_integrity_term(text, term) for term in _AMORPHOUS_OBJECT_TERMS):
+        return "amorphous_object_semantic_risk"
+    if any(
+        _contains_integrity_term(text, term)
+        for term in _SCENE_STRUCTURE_OBJECT_TERMS
+    ):
+        return "scene_structure_object_semantic_risk"
+    if any(
+        _contains_integrity_term(text, term) for term in _REPRESENTED_CONTENT_TERMS
+    ):
+        return "represented_content_semantic_risk"
+    return None
 
 
 @dataclass(frozen=True)
@@ -508,10 +648,16 @@ def reference_integrity_clips(
                         final_image.load()
                     diagnostics = reference_topology_diagnostics(final_image)
                     counters["topology_suspicious"] += int(diagnostics.suspicious)
+                    semantic_risk = reference_semantic_risk_reason(
+                        reference_type=entity.reference_type,
+                        phrase=entity.phrase,
+                        grounding_prompt=entity.grounding_prompt,
+                    )
                     requires_review = (
                         reference.synthetic
                         or reference.reference_scope == "local"
                         or diagnostics.suspicious
+                        or semantic_risk is not None
                     )
                     if not requires_review:
                         results.append(
