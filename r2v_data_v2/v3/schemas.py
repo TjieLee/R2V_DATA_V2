@@ -1226,6 +1226,7 @@ class ReferenceTopologyDiagnostics(SchemaModel):
 class ReferenceIntegrityReview(SchemaModel):
     matches_target: StrictBool
     preserves_annotated_entity_semantics: StrictBool
+    preserves_primary_identity_region: StrictBool
     recognizable_as_named_entity: StrictBool
     structurally_complete_for_scope: StrictBool
     no_major_missing_regions: StrictBool
@@ -1243,6 +1244,7 @@ class ReferenceIntegrityReview(SchemaModel):
             (
                 self.matches_target,
                 self.preserves_annotated_entity_semantics,
+                self.preserves_primary_identity_region,
                 self.recognizable_as_named_entity,
                 self.structurally_complete_for_scope,
                 self.no_major_missing_regions,

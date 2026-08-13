@@ -41,13 +41,26 @@ white t-shirt", an unrelated held bowl or chopsticks may disappear if the
 stable subject identity remains.
 For a subject, require enough stable identity-bearing appearance for the stated
 scope, but do not require a visible face in every valid back view, masked person,
-character, or animal. Reject a torso, arms, or clothing fragment when the source
-contains substantially more useful identity evidence and the final image loses
-it. For an object, require its recognizable structural core. Reject major
-missing surfaces, large unnatural holes, disconnected remnants, identity-changing
-completion artifacts, severe destructive truncation, or an unrelated dominant
-entity. Legitimate source-matching cutouts, handles, wheels, scissors, brackets,
-frames, and truss structures are not defects merely because they contain holes.
+character, or animal. For a human subject, when the highlighted source context
+visibly contains the person's head or head region, the final reference must
+preserve a recognizable head region together with stable person appearance. A
+visible face is not required. Accept a person viewed from behind with the head
+present, a helmeted or masked person with the head present, and a side-profile
+person with the head and upper body present. Reject a chef reference containing
+only coat and arms when the source shows the head, a person reference cropped
+completely below the neck, or a clothing-only fragment labeled as a subject.
+Set preserves_primary_identity_region to false for these human head-region
+failures. For a non-human subject or object, evaluate that field using its
+existing identity-bearing region without imposing human anatomy.
+Reject a torso, arms, legs, or clothing fragment when the source contains
+substantially more useful identity evidence and the final image loses it. Apply
+this human head-region rule only to human subjects; do not introduce a face
+requirement or new rejection behavior for non-human subjects or objects. For an
+object, require its recognizable structural core. Reject major missing surfaces,
+large unnatural holes, disconnected remnants, identity-changing completion
+artifacts, severe destructive truncation, or an unrelated dominant entity.
+Legitimate source-matching cutouts, handles, wheels, scissors, brackets, frames,
+and truss structures are not defects merely because they contain holes.
 Return JSON only and make verdict accept if and only if every boolean is true."""
 
 

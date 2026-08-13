@@ -56,11 +56,18 @@ def _review(
     accept: bool,
     reason: str = "reviewed",
     preserves_semantics: bool | None = None,
+    preserves_primary_identity_region: bool | None = None,
 ) -> ReferenceIntegrityReview:
     semantic_fidelity = accept if preserves_semantics is None else preserves_semantics
+    identity_region = (
+        accept
+        if preserves_primary_identity_region is None
+        else preserves_primary_identity_region
+    )
     return ReferenceIntegrityReview(
         matches_target=accept,
         preserves_annotated_entity_semantics=semantic_fidelity,
+        preserves_primary_identity_region=identity_region,
         recognizable_as_named_entity=accept,
         structurally_complete_for_scope=accept,
         no_major_missing_regions=accept,
@@ -76,6 +83,7 @@ def _semantic_reinterpretation_review() -> ReferenceIntegrityReview:
     return ReferenceIntegrityReview(
         matches_target=True,
         preserves_annotated_entity_semantics=False,
+        preserves_primary_identity_region=True,
         recognizable_as_named_entity=True,
         structurally_complete_for_scope=True,
         no_major_missing_regions=True,
@@ -84,6 +92,22 @@ def _semantic_reinterpretation_review() -> ReferenceIntegrityReview:
         usable_as_independent_reference=True,
         verdict="reject",
         reason="only the stew remains; the annotated clay pot is missing",
+    )
+
+
+def _primary_identity_loss_review() -> ReferenceIntegrityReview:
+    return ReferenceIntegrityReview(
+        matches_target=True,
+        preserves_annotated_entity_semantics=True,
+        preserves_primary_identity_region=False,
+        recognizable_as_named_entity=True,
+        structurally_complete_for_scope=True,
+        no_major_missing_regions=True,
+        no_unnatural_holes_or_surface_loss=True,
+        no_unrelated_entity_dominance=True,
+        usable_as_independent_reference=True,
+        verdict="reject",
+        reason="the source shows the head but the final subject is cropped below it",
     )
 
 
@@ -364,6 +388,72 @@ def test_integrity_schema_requires_semantic_fidelity_for_acceptance() -> None:
         ReferenceIntegrityReview.model_validate(contradicted)
 
 
+def test_integrity_schema_requires_primary_identity_region_for_acceptance() -> None:
+    accepted = _review(accept=True).model_dump(mode="json")
+
+    missing = dict(accepted)
+    missing.pop("preserves_primary_identity_region")
+    with pytest.raises(ValueError):
+        ReferenceIntegrityReview.model_validate(missing)
+
+    non_boolean = {
+        **accepted,
+        "preserves_primary_identity_region": 1,
+    }
+    with pytest.raises(ValueError):
+        ReferenceIntegrityReview.model_validate(non_boolean)
+
+    contradicted = {
+        **accepted,
+        "preserves_primary_identity_region": False,
+    }
+    with pytest.raises(ValueError, match="must match all integrity checks"):
+        ReferenceIntegrityReview.model_validate(contradicted)
+
+
+@pytest.mark.parametrize(
+    "description",
+    (
+        "person viewed from behind with the head present",
+        "helmeted or masked person with the head present",
+        "side-profile person with the head and upper body present",
+        "normal portrait with a recognizable head region",
+    ),
+)
+def test_human_subject_with_recognizable_head_region_can_pass(
+    description: str,
+) -> None:
+    review = _review(accept=True, reason=description)
+
+    assert review.preserves_primary_identity_region is True
+    assert review.verdict == "accept"
+
+
+def test_headless_human_subject_cannot_pass_integrity_schema() -> None:
+    accepted = _review(accept=True).model_dump(mode="json")
+    headless = {
+        **accepted,
+        "preserves_primary_identity_region": False,
+        "verdict": "reject",
+        "reason": "the source shows the head but the final reference is headless",
+    }
+
+    review = ReferenceIntegrityReview.model_validate(headless)
+
+    assert review.preserves_primary_identity_region is False
+    assert review.verdict == "reject"
+
+
+def test_object_integrity_behavior_is_unchanged() -> None:
+    review = _review(
+        accept=True,
+        reason="the camera preserves its recognizable structural core",
+    )
+
+    assert review.preserves_primary_identity_region is True
+    assert review.verdict == "accept"
+
+
 def test_integrity_prompt_forbids_sub_entity_reinterpretation() -> None:
     prompt = " ".join(SYSTEM_PROMPT.lower().split())
 
@@ -376,6 +466,25 @@ def test_integrity_prompt_forbids_sub_entity_reinterpretation() -> None:
         'for the object "a camera", the camera itself must remain',
         'for the subject "a man in a white t-shirt"',
         "an unrelated held bowl or chopsticks may disappear",
+    ):
+        assert contract in prompt
+
+
+def test_integrity_prompt_requires_human_head_region_without_requiring_face() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.lower().split())
+
+    for contract in (
+        "the final reference must preserve a recognizable head region",
+        "a visible face is not required",
+        "person viewed from behind with the head present",
+        "helmeted or masked person with the head present",
+        "side-profile person with the head and upper body present",
+        "chef reference containing only coat and arms",
+        "person reference cropped completely below the neck",
+        "clothing-only fragment labeled as a subject",
+        "set preserves_primary_identity_region to false",
+        "without imposing human anatomy",
+        "apply this human head-region rule only to human subjects",
     ):
         assert contract in prompt
 
@@ -434,6 +543,43 @@ def test_integrity_rejects_reference_reinterpreted_as_contained_food(
     assert result.review is not None
     assert result.review.preserves_annotated_entity_semantics is False
     assert result.status == "rejected"
+
+
+def test_integrity_rejects_headless_human_subject_from_final_pairing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+    )
+    clip = storage.read_clip("clip-1")
+    human = clip.references.entities[0].model_copy(
+        update={
+            "reference_scope": "local",
+            "visible_region": "upper_body",
+            "whole_entity_recognizable": False,
+        }
+    )
+    storage.write_references_and_pairing(
+        "clip-1",
+        ReferencesState(entities=[human, clip.references.entities[1]]),
+        clip.pairing,
+    )
+    judge = FakeIntegrityJudge([_primary_identity_loss_review()])
+
+    stats = reference_integrity_clips(storage.config, storage, judge=judge)
+
+    updated = storage.read_clip("clip-1")
+    assert stats.entities_rejected == 1
+    assert updated.references.entities[0].status == "rejected"
+    assert updated.pairing is not None
+    assert updated.pairing.retained_entity_ids == ["e2"]
+    result = updated.reference_integrity
+    assert result is not None
+    assert result.entities[0].review is not None
+    assert result.entities[0].review.preserves_primary_identity_region is False
 
 
 @pytest.mark.parametrize(
