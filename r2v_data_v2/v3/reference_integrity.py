@@ -208,12 +208,29 @@ def reference_semantic_risk_reason(
 class ReferenceIntegrityReviewAttempt:
     review: ReferenceIntegrityReview
     raw_response: str
+    raw_responses: tuple[str, ...] = ()
+    finish_reasons: tuple[str | None, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.raw_responses:
+            object.__setattr__(self, "raw_responses", (self.raw_response,))
 
 
 class ReferenceIntegrityJudgeFailure(RuntimeError):
-    def __init__(self, message: str, *, raw_response: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_response: str | None = None,
+        raw_responses: tuple[str, ...] = (),
+        finish_reasons: tuple[str | None, ...] = (),
+    ) -> None:
         super().__init__(message)
-        self.raw_response = raw_response
+        self.raw_responses = raw_responses or (
+            (raw_response,) if raw_response is not None else ()
+        )
+        self.raw_response = self.raw_responses[-1] if self.raw_responses else None
+        self.finish_reasons = finish_reasons
 
 
 class ReferenceIntegrityJudge(Protocol):
@@ -250,6 +267,68 @@ class QwenReferenceIntegrityJudge:
             base_url=config.base_url,
             api_key=config.api_key,
             timeout=config.timeout_seconds,
+        )
+
+    def _request(
+        self,
+        *,
+        messages: list[dict[str, object]],
+        metadata: dict[str, object],
+        operation: str,
+        retry_index: int,
+    ) -> object:
+        parameters: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "max_tokens": self.config.max_tokens,
+        }
+        try:
+            return profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_reference_integrity_review",
+                            "strict": True,
+                            "schema": ReferenceIntegrityReview.model_json_schema(),
+                        },
+                    },
+                ),
+                component="qwen_reference_integrity",
+                operation=operation,
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={**metadata, "response_format": "json_schema"},
+            )
+        except BadRequestError:
+            return profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={"type": "json_object"},
+                ),
+                component="qwen_reference_integrity",
+                operation=operation,
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={**metadata, "response_format": "json_object"},
+            )
+
+    @staticmethod
+    def _response_content(response: object) -> tuple[str, str | None]:
+        try:
+            choice = response.choices[0]  # type: ignore[attr-defined]
+            content = choice.message.content
+        except (AttributeError, IndexError, KeyError, TypeError) as exc:
+            raise ValueError("Qwen integrity response has no message content") from exc
+        finish_reason = getattr(choice, "finish_reason", None)
+        return (str(content) if content is not None else ""), (
+            str(finish_reason) if finish_reason is not None else None
         )
 
     def review(
@@ -291,15 +370,6 @@ class QwenReferenceIntegrityJudge:
                 ],
             },
         ]
-        parameters: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": messages,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "presence_penalty": 0.0,
-            "max_tokens": self.config.max_tokens,
-        }
-        raw: str | None = None
         metadata = {
             "reference_type": reference_type,
             "reference_scope": reference_scope,
@@ -307,48 +377,63 @@ class QwenReferenceIntegrityJudge:
             "image_count": 2,
             "mode": "targeted_qwen_v1",
         }
-        try:
+        raw_responses: list[str] = []
+        finish_reasons: list[str | None] = []
+        validation_error: Exception | None = None
+        active_messages = messages
+        review: ReferenceIntegrityReview | None = None
+        for retry_index, operation in ((0, "initial"), (1, "repair")):
+            if retry_index:
+                assert validation_error is not None
+                active_messages = [
+                    *messages,
+                    {"role": "assistant", "content": raw_responses[-1]},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair the preceding invalid response. Return only one "
+                            "compact strict JSON object matching the supplied "
+                            "ReferenceIntegrityReview schema. Preserve the original "
+                            "semantic context and image evidence. Do not return "
+                            "markdown, explanation, chain-of-thought, or extra fields.\n"
+                            f"Validation error: {validation_error}"
+                        ),
+                    },
+                ]
             try:
-                response = profiled_openai_call(
-                    lambda: self.client.chat.completions.create(
-                        **parameters,
-                        response_format={
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": "v3_reference_integrity_review",
-                                "strict": True,
-                                "schema": ReferenceIntegrityReview.model_json_schema(),
-                            },
-                        },
-                    ),
-                    component="qwen_reference_integrity",
-                    operation="initial",
-                    retry_index=0,
-                    model=self.config.model,
-                    messages=messages,
-                    metadata={**metadata, "response_format": "json_schema"},
+                response = self._request(
+                    messages=active_messages,
+                    metadata=metadata,
+                    operation=operation,
+                    retry_index=retry_index,
                 )
-            except BadRequestError:
-                response = profiled_openai_call(
-                    lambda: self.client.chat.completions.create(
-                        **parameters,
-                        response_format={"type": "json_object"},
-                    ),
-                    component="qwen_reference_integrity",
-                    operation="initial",
-                    retry_index=0,
-                    model=self.config.model,
-                    messages=messages,
-                    metadata={**metadata, "response_format": "json_object"},
-                )
-            content = response.choices[0].message.content
-            if not content:
-                raise ValueError("Qwen returned an empty integrity review")
-            raw = str(content)
-            review = ReferenceIntegrityReview.model_validate_json(raw)
-        except Exception as exc:
-            raise ReferenceIntegrityJudgeFailure(str(exc), raw_response=raw) from exc
-        return ReferenceIntegrityReviewAttempt(review=review, raw_response=raw)
+                raw, finish_reason = self._response_content(response)
+            except Exception as exc:
+                raise ReferenceIntegrityJudgeFailure(
+                    str(exc),
+                    raw_responses=tuple(raw_responses),
+                    finish_reasons=tuple(finish_reasons),
+                ) from exc
+            raw_responses.append(raw)
+            finish_reasons.append(finish_reason)
+            try:
+                review = ReferenceIntegrityReview.model_validate_json(raw)
+                break
+            except ValueError as exc:
+                validation_error = exc
+        if review is None:
+            assert validation_error is not None
+            raise ReferenceIntegrityJudgeFailure(
+                str(validation_error),
+                raw_responses=tuple(raw_responses),
+                finish_reasons=tuple(finish_reasons),
+            ) from validation_error
+        return ReferenceIntegrityReviewAttempt(
+            review=review,
+            raw_response=raw_responses[-1],
+            raw_responses=tuple(raw_responses),
+            finish_reasons=tuple(finish_reasons),
+        )
 
     def close(self) -> None:
         close = getattr(self.client, "close", None)
@@ -694,6 +779,20 @@ def reference_integrity_clips(
                             synthetic=reference.synthetic,
                         )
                     except ReferenceIntegrityJudgeFailure as exc:
+                        if config.debug.save_diagnostics:
+                            debug_path = storage.debug_path(
+                                clip.clip_uid,
+                                f"reference_integrity_{entity_id}.json",
+                            )
+                            write_json_atomic(
+                                debug_path,
+                                {
+                                    "judge_failed": True,
+                                    "raw_responses": list(exc.raw_responses),
+                                    "finish_reasons": list(exc.finish_reasons),
+                                    "reason": str(exc),
+                                },
+                            )
                         rejected_ids.add(entity_id)
                         counters["judge_failed"] += 1
                         counters["entities_rejected"] += 1
@@ -720,6 +819,8 @@ def reference_integrity_clips(
                             {
                                 "review": attempt.review.model_dump(mode="json"),
                                 "raw_response": attempt.raw_response,
+                                "raw_responses": list(attempt.raw_responses),
+                                "finish_reasons": list(attempt.finish_reasons),
                             },
                         )
                     accepted = attempt.review.verdict == "accept"

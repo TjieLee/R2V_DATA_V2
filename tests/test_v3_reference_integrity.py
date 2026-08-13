@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
 import r2v_data_v2.v3.config as config_module
+import r2v_data_v2.v3.reference_integrity as integrity_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.config import (
     QwenAnnotationConfig,
@@ -23,6 +25,7 @@ from r2v_data_v2.v3.entity_composition_audit import audit_entity_composition
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.reference_integrity import (
     SYSTEM_PROMPT,
+    QwenReferenceIntegrityJudge,
     ReferenceIntegrityJudgeFailure,
     ReferenceIntegrityReviewAttempt,
     reference_integrity_clips,
@@ -172,6 +175,54 @@ class FakeIntegrityJudge:
         )
 
 
+@dataclass
+class FakeIntegrityCompletions:
+    responses: list[tuple[str, str | None]]
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        content, finish_reason = self.responses.pop(0)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+
+
+def _qwen_integrity_judge(
+    config: V3Config,
+    responses: list[tuple[str, str | None]],
+) -> tuple[QwenReferenceIntegrityJudge, FakeIntegrityCompletions]:
+    completions = FakeIntegrityCompletions(responses)
+    service = config.qwen.reference_integrity_judge
+    assert service is not None
+    judge = QwenReferenceIntegrityJudge(
+        service,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+        ),
+    )
+    return judge, completions
+
+
+def _run_qwen_integrity_review(
+    judge: QwenReferenceIntegrityJudge,
+) -> ReferenceIntegrityReviewAttempt:
+    return judge.review(
+        source_context=Image.new("RGB", (12, 10), (20, 40, 60)),
+        final_reference=Image.new("RGB", (8, 8), (80, 100, 120)),
+        reference_type="object",
+        phrase="a green laser pointer",
+        grounding_prompt="green laser pointer near center",
+        reference_scope="full",
+        synthetic=False,
+    )
+
+
 def _config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> V3Config:
     writable = (tmp_path / "workspace" / "data").resolve()
     dataset_root = (tmp_path / "public" / "dataset").resolve()
@@ -206,6 +257,116 @@ def _config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> V3Config:
     )
     config.validate()
     return config
+
+
+def test_qwen_integrity_valid_first_response_uses_one_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _review(accept=True)
+    judge, completions = _qwen_integrity_judge(
+        _config(tmp_path, monkeypatch),
+        [(expected.model_dump_json(), "stop")],
+    )
+
+    attempt = _run_qwen_integrity_review(judge)
+
+    assert attempt.review == expected
+    assert attempt.raw_responses == (expected.model_dump_json(),)
+    assert attempt.finish_reasons == ("stop",)
+    assert len(completions.calls) == 1
+
+
+def test_qwen_integrity_repairs_truncated_response_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _review(accept=True)
+    profiled: list[tuple[str, int]] = []
+
+    def profile(request, *, operation, retry_index, **_kwargs):
+        profiled.append((operation, retry_index))
+        return request()
+
+    monkeypatch.setattr(integrity_module, "profiled_openai_call", profile)
+    judge, completions = _qwen_integrity_judge(
+        _config(tmp_path, monkeypatch),
+        [(' {"matches_target": true', "length"), (expected.model_dump_json(), "stop")],
+    )
+
+    attempt = _run_qwen_integrity_review(judge)
+
+    assert attempt.review == expected
+    assert attempt.raw_responses == (
+        ' {"matches_target": true',
+        expected.model_dump_json(),
+    )
+    assert attempt.finish_reasons == ("length", "stop")
+    assert profiled == [("initial", 0), ("repair", 1)]
+    assert len(completions.calls) == 2
+    repair_messages = completions.calls[1]["messages"]
+    assert isinstance(repair_messages, list)
+    image_items = [
+        item
+        for message in repair_messages
+        if isinstance(message, dict) and isinstance(message.get("content"), list)
+        for item in message["content"]
+        if isinstance(item, dict) and item.get("type") == "image_url"
+    ]
+    assert len(image_items) == 2
+    repair_text = str(repair_messages[-1]["content"])
+    assert "Validation error:" in repair_text
+    assert "Do not return markdown, explanation, chain-of-thought" in repair_text
+
+
+def test_qwen_integrity_repairs_schema_invalid_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _review(accept=True)
+    judge, completions = _qwen_integrity_judge(
+        _config(tmp_path, monkeypatch),
+        [("{}", "stop"), (expected.model_dump_json(), "stop")],
+    )
+
+    attempt = _run_qwen_integrity_review(judge)
+
+    assert attempt.review == expected
+    assert len(completions.calls) == 2
+
+
+def test_qwen_integrity_fails_closed_with_both_invalid_raw_responses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge, completions = _qwen_integrity_judge(
+        _config(tmp_path, monkeypatch),
+        [("{", "length"), ("{}", "stop")],
+    )
+
+    with pytest.raises(ReferenceIntegrityJudgeFailure) as raised:
+        _run_qwen_integrity_review(judge)
+
+    assert raised.value.raw_responses == ("{", "{}")
+    assert raised.value.raw_response == "{}"
+    assert raised.value.finish_reasons == ("length", "stop")
+    assert len(completions.calls) == 2
+
+
+def test_qwen_integrity_repaired_output_still_enforces_hard_booleans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _severe_reference_artifact_review()
+    judge, _ = _qwen_integrity_judge(
+        _config(tmp_path, monkeypatch),
+        [("{}", "stop"), (expected.model_dump_json(), "stop")],
+    )
+
+    attempt = _run_qwen_integrity_review(judge)
+
+    assert attempt.review.verdict == "reject"
+    assert attempt.review.no_severe_reference_artifact is False
 
 
 def _visibility() -> EntityVisibilitySummary:
