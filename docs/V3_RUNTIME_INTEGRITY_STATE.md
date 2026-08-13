@@ -11,7 +11,7 @@ state from chat history.
 
 ```text
 branch: feature/v3-runtime-integrity-v1
-current validated code baseline: 7752dca272388a61d7619ea5ef69a2618ba7a446
+current validated code baseline: b7e46fc748bbedb245d883c0fdf055b5aa90a988
 ```
 
 Recent final-integrity lineage:
@@ -22,6 +22,7 @@ Recent final-integrity lineage:
   -> b30942e Add conservative V3 source bbox fallback
   -> 32a9e0e Enforce deterministic V3 reference semantics
   -> 7752dca Prevent V3 integrity schema whitespace stalls
+  -> b7e46fc Tighten V3 transient removal artifact review
 ```
 
 Documentation-only commits may move repository HEAD after the code baseline.
@@ -128,6 +129,17 @@ Qwen semantic-risk review path.
 Synthetic, local, topology-suspicious, represented-content-risk, and otherwise
 routed references are checked against highlighted source evidence. A clean real
 full reference may skip the Qwen call when no risk route applies.
+
+Transient held objects are not identity requirements by themselves, but their
+removal must leave a visually plausible target/reference surface. A white or
+transparent silhouette, blank cavity, irregular blob, solid-color placeholder,
+or erased-object outline left by removing a held fruit, spoon, cup, bottle, tool,
+or other occluder is an artifact failure even when the target identity remains
+correct. Such artifact-only failures set the artifact/surface-loss booleans false
+while preserving truthful semantic and identity fields, which allows the existing
+source-bbox eligibility policy to operate without any routing change. Clean
+transient-object removal remains acceptable; naturally white content is not an
+artifact merely because it is white.
 
 Commit `e575af6` adds exactly one structured-output repair retry. A valid first
 response makes one call. A malformed/truncated/schema-invalid response gets one
@@ -323,14 +335,32 @@ This closes the final integrity infrastructure gate. Do not rerun Qwen, SAM3,
 Boogu, removal, pair, or annotation for freeze validation unless a visual audit
 shows a concrete new problem.
 
+### Contact-sheet visual review — NOT PASS
+
+The final120 infrastructure run above passed, but its contact-sheet visual freeze
+did not. Three subject references retained obvious residue from transient-object
+removal:
+
+- contact-sheet label `7d3c89d8bb... e2`, young boy in an orange shirt: an
+  irregular white blob remained near the mouth/spoon/food region;
+- `eace10dad52d7534c50dae01 e1`, man in a red robe: removing the held orange left
+  a white circular silhouette in the hand;
+- `eace10dad52d7534c50dae01 e2`, man in a white silk robe: the held item became an
+  unnatural white sphere/placeholder.
+
+The held items are not required identity content. The artificial residue is the
+failure. The next server validation is only a targeted replay of these three
+references after `b7e46fc`; do not run another full 120 replay for this prompt
+change.
+
 ## Local Validation for Current Code Baseline
 
-Reported local validation for `7752dca272388a61d7619ea5ef69a2618ba7a446`:
+Reported local validation for `b7e46fc748bbedb245d883c0fdf055b5aa90a988`:
 
 ```text
-reference-integrity targeted tests: 72 passed
+reference-integrity targeted tests: 76 passed
 storage/schema tests:              63 passed, 1 warning
-full pytest:                       1657 passed, 1 warning
+full pytest:                       1661 passed, 1 warning
 Ruff:                              PASS
 git diff --check:                  PASS
 working tree:                      clean
@@ -338,17 +368,17 @@ working tree:                      clean
 
 ## Remaining Freeze Check
 
-Only a read-only retained-reference/contact-sheet review remains.
+The semantic five-case replay and final120 infrastructure checks have passed,
+but the final120 contact-sheet visual review exposed the three transient-removal
+artifacts recorded above. The only remaining visual-V3 check is a targeted
+three-reference integrity replay after `b7e46fc`, using already-materialized
+evidence and rerunning no upstream stage. Review the normal integrity verdict,
+any bbox fallback decision, and the three final reference images. Do not rerun
+the full 120 population unless that targeted replay reveals a broader regression.
 
-Do not run additional model inference. Review the final published ready
-references from `integrity-final-freeze120-20260813-202412`, including the
-single source-bbox fallback and representative real/synthetic references.
-
-If the contact-sheet review finds no broad quality regression or new systematic
-failure, freeze visual V3 at code baseline `7752dca272388a61d7619ea5ef69a2618ba7a446`
-with final integrity config hash
-`810fdb46cc7b03deaf411d84a13c2c285abde2f584dc42de4d05174505242c47`, then
-return to the audio/H3 branch.
+If all three targeted outcomes are visually correct with no infrastructure
+failure, record the replay evidence and freeze the visual V3 code/config before
+returning to the audio/H3 branch.
 
 ## Historical Runtime Note
 

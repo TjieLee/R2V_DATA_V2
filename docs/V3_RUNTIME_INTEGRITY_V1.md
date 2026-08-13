@@ -12,7 +12,7 @@ Machine paths, services, and GPU rules are in `SERVER_ENVIRONMENT_RUNBOOK.md`.
 
 ```text
 branch: feature/v3-runtime-integrity-v1
-validated code baseline: 32a9e0e17598b6bd2d7912b6fafdb08d81187285
+validated code baseline: b7e46fc748bbedb245d883c0fdf055b5aa90a988
 ```
 
 Recent final-integrity lineage:
@@ -22,6 +22,8 @@ Recent final-integrity lineage:
   -> e575af6 Retry malformed V3 integrity reviews
   -> b30942e Add conservative V3 source bbox fallback
   -> 32a9e0e Enforce deterministic V3 reference semantics
+  -> 7752dca Prevent V3 integrity schema whitespace stalls
+  -> b7e46fc Tighten V3 transient removal artifact review
 ```
 
 A later documentation-only commit may move HEAD without changing the validated
@@ -246,6 +248,21 @@ usable_as_independent_reference
 
 The verdict must match all booleans.
 
+A transient held or occluding item is not automatically part of target identity,
+but its removal must leave a plausible target/reference surface. Reject an
+otherwise-correct person reference when removal leaves a white/transparent
+silhouette, object-shaped cavity, irregular mouth/hand blob, solid-color
+placeholder, erased outline, or artificial missing/reconstructed surface. Set
+`no_severe_reference_artifact=false` and also set
+`no_unnatural_holes_or_surface_loss=false` when the residue is an unnatural
+missing or replaced surface. Keep the semantic/identity booleans truthful so an
+artifact-only rejection can enter the existing bbox fallback policy naturally.
+
+Do not require a transient bowl, orange, bottle, spoon, food item, tool, or
+chopsticks to remain when removal is visually clean. Do not infer artifacts from
+white pixels alone: naturally white clothing/objects/background, highlights,
+teeth, sclera, and paper remain valid source-matching content.
+
 ### 8.3 Structured-output repair
 
 `QwenReferenceIntegrityJudge` performs one normal request. If JSON is truncated,
@@ -451,6 +468,40 @@ The cooked lobster must continue onto the normal integrity path.
 
 Use a fresh targeted replay root derived from already-materialized source
 artifacts; do not rerun annotation, SAM3, removal, pair, or Boogu for this check.
+
+### 13.1 Final120 infrastructure and contact-sheet result
+
+The final fixed-population integrity replay completed without infrastructure
+failure:
+
+```text
+run_id: integrity-final-freeze120-20260813-202412
+config_hash: 810fdb46cc7b03deaf411d84a13c2c285abde2f584dc42de4d05174505242c47
+
+processed: 63
+failed: 0
+entities_reviewed: 72
+entities_skipped_review: 10
+entities_accepted: 82
+entities_rejected: 4
+semantic_policy_rejected: 4
+judge_failed: 0
+source_bbox_fallback_attempted: 1
+source_bbox_fallback_accepted: 1
+repair_count: 0
+length_count: 0
+```
+
+Infrastructure therefore passed, including the structured-output termination
+fix. The contact-sheet visual freeze did not pass: the young-boy reference with
+contact-sheet label `7d3c89d8bb... e2` retained an irregular white mouth-region
+blob, while `eace10dad52d7534c50dae01 e1` and `e2` retained white circular or
+spherical placeholders after held-item removal.
+
+After the prompt hardening in `b7e46fc`, run only a targeted replay of those
+three references. Reuse existing evidence and do not rerun annotation, SAM3,
+coverage, pair, remover, or Boogu. Another full 120 replay is not the current
+next step.
 
 ## 14. Monitoring
 
