@@ -595,11 +595,14 @@ def build_audio_pair_samples(
         cross_targets = speaking
         selected_edges: list[PairEvidence] = []
         reference_occurrences: list[EntityOccurrence] = []
+        used_reference_ids: set[str] = set()
         complete = True
         for target_occurrence in cross_targets:
             candidates = []
             for edge in edge_by_target.get(target_occurrence.entity_occurrence_id, []):
                 reference = occurrence_by_id[edge.reference_entity_occurrence_id]
+                if reference.entity_occurrence_id in used_reference_ids:
+                    continue
                 reference_clip = binding_by_clip[
                     reference.entity_occurrence_id.split("/", 1)[0]
                 ]
@@ -634,6 +637,7 @@ def build_audio_pair_samples(
             )
             selected_edges.append(edge)
             reference_occurrences.append(reference)
+            used_reference_ids.add(reference.entity_occurrence_id)
         if not complete:
             incomplete_cross.append(
                 {

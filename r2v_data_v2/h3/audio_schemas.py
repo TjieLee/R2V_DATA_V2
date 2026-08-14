@@ -465,11 +465,31 @@ class AudioPairSample(SchemaModel):
             or len(self.source_clip_binding_ids) != len(set(self.source_clip_binding_ids))
         ):
             raise ValueError("pair sample requires ID and subjects")
+        if self.source_clip_binding_ids[0] != self.target.clip_binding_id:
+            raise ValueError("pair source provenance must begin with target clip")
         subject_ids = [item.subject_id for item in self.subjects]
         if subject_ids != [
             f"subject_{index}" for index in range(1, len(subject_ids) + 1)
         ]:
             raise ValueError("pair subjects must be contiguous and ordered")
+        target_occurrences = [
+            item.target_entity_occurrence_id for item in self.subjects
+        ]
+        picture_occurrences = [
+            item.picture_entity_occurrence_id for item in self.subjects
+        ]
+        voice_subject_occurrences = [
+            item.voice_entity_occurrence_id for item in self.subjects
+        ]
+        if any(
+            len(values) != len(set(values))
+            for values in (
+                target_occurrences,
+                picture_occurrences,
+                voice_subject_occurrences,
+            )
+        ):
+            raise ValueError("pair occurrence mappings must be one-to-one")
         if len(self.voice_references) != len(self.subjects):
             raise ValueError("strict pair requires one voice reference per subject")
         if len(self.subject_audio_bindings) != len(self.subjects):
@@ -477,6 +497,8 @@ class AudioPairSample(SchemaModel):
         voice_occurrences = {
             voice.entity_occurrence_id for voice in self.voice_references
         }
+        if len(voice_occurrences) != len(self.voice_references):
+            raise ValueError("pair voice references must use unique occurrences")
         if voice_occurrences != {
             subject.voice_entity_occurrence_id for subject in self.subjects
         }:
@@ -514,6 +536,12 @@ class AudioPairSample(SchemaModel):
         ):
             raise ValueError("pair speech turns must come from target clip")
         if self.pair_kind == "in_pair":
+            if (
+                self.pair_id != f"in_pair/{self.target.clip_uid}"
+                or self.source_clip_binding_ids != [self.target.clip_binding_id]
+                or self.pair_evidence
+            ):
+                raise ValueError("in-pair ID/evidence/source provenance is invalid")
             if any(
                 subject.target_entity_occurrence_id
                 != subject.voice_entity_occurrence_id
@@ -521,6 +549,10 @@ class AudioPairSample(SchemaModel):
             ):
                 raise ValueError("in-pair voice must come from target occurrence")
         else:
+            if not self.pair_id.startswith(
+                f"cross_pair/{self.target.clip_uid}/"
+            ) or len(self.source_clip_binding_ids) < 2:
+                raise ValueError("cross-pair ID/source provenance is invalid")
             if any(
                 subject.target_entity_occurrence_id
                 == subject.voice_entity_occurrence_id

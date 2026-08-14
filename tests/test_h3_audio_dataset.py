@@ -805,6 +805,18 @@ def test_missing_one_subject_reference_blocks_cross_but_not_in_pair(
     ]
 
 
+def test_pair_schema_rejects_reusing_one_voice_occurrence_for_two_subjects(
+    tmp_path: Path,
+) -> None:
+    target = _two_subject_binding(tmp_path, "clip-a")
+    samples, _, _ = build_audio_pair_samples([target], audio_root=tmp_path)
+    payload = samples[0].model_dump(mode="python")
+    payload["subjects"][1]["voice_entity_occurrence_id"] = "clip-a/e1"
+
+    with pytest.raises(ValidationError, match="one-to-one"):
+        type(samples[0]).model_validate(payload)
+
+
 def test_zero_cross_variant_policy_keeps_only_in_pair(tmp_path: Path) -> None:
     bindings = [
         _canonical_binding(
