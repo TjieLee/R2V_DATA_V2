@@ -1,13 +1,15 @@
 # R2V_DATA_V2 Project State
 
-Last updated: 2026-08-11
+Last updated: 2026-08-14
 
 ## Repository
 
 - Repository: `TjieLee/R2V_DATA_V2`
-- Active development branch: `feature/h3-audio-binding-v1`
-- Parent branch: `feature/v3-boogu-reference-edit`
-- Production code baseline: `f4cdec251095ba3fd70c57f0a4082c58e5a67101`
+- Active development branch: `feature/audio-entity-pairing-h3-v1`
+- Visual parent branch: `feature/v3-runtime-integrity-v1`
+- Visual baseline at integration: `87bd4e06107d7f56df550979b0e96515cb70f911`
+- Audio source branch: `feature/h3-audio-binding-v1`
+- Audio source HEAD at integration: `3c4d28018e41461bd296f6e40d985e35a04c6ab5`
 - Branch point: `60aaa3877f8e928e5d7eb309950a406d070d4344`
 - Current scaffold HEAD: the Git commit containing this document; verify with
   `git rev-parse HEAD`.
@@ -35,12 +37,35 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Build a MiniMax-H3-compatible audio-to-visual-entity binding sidecar. V1 is
-audio-only and prioritizes high-precision, visible, single-speaker evidence.
-Pose, expression, camera control, model training, offscreen identity propagation,
-cross-clip speaker identity, and production-stage integration are out of scope.
+Build producer-only MiniMax-H3-compatible audio-to-visual entity binding,
+strict pairwise in-pair/cross-pair construction, and a self-contained H3 dataset
+export. Pose, expression, camera control, model training, offscreen identity
+propagation, global transitive identity clustering, and production-stage
+integration remain out of scope.
 
 ## Current Pass
+
+The Audio/H3 V1 integration branch is based on the latest Visual integrity
+branch and retains the earlier audio scaffold as isolated commits. It adds:
+
+- `r2v.audio.clip_binding.1` with deterministic merged speech turns, one final
+  Visual reference per occurrence, one primary voice reference per bound
+  subject, and normalized face/voice/text embedding asset provenance;
+- blockwise NumPy and optional FAISS top-K candidate retrieval;
+- strict pairwise same-person and same-voice evidence without transitive
+  clustering;
+- deterministic in-pair and all-speaking-subject cross-pair construction;
+- `r2v.audio.pair_sample.1` and export-relative `r2v.h3.sample.1` contracts;
+- draft-only H3 rendering with configurable speech delimiters;
+- atomic separate-root publication and a unified `tools/audio_data.py` CLI;
+- precomputed, FFmpeg, and external-subprocess adapter boundaries with no base
+  model dependency.
+
+The face, speaker, ASR, and pair thresholds remain unvalidated. No real model,
+GPU, server run, or production data has been exercised in this Mac pass. See
+`docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for the canonical contract.
+
+### Earlier audio scaffold
 
 The bounded LR-ASD pilot infrastructure is implemented on this branch:
 
