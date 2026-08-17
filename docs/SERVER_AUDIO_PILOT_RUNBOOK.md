@@ -165,53 +165,47 @@ cat "$SMOKE_OUT/runtime/$SMOKE_CLIP/lr_asd/lr_asd.stderr.log" 2>/dev/null || tru
 
 ## 20-clip validation
 
-Use one stable output root as well:
+Use one stable output root:
 
 ```bash
 export PILOT20_OUT=$AUDIO_RUN_ROOT/pilot20
-rm -rf "$PILOT20_OUT"
-
-cd "$REPO"
-"$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
-  --run-root "$V3_RUN" \
-  --output-root "$PILOT20_OUT" \
-  --limit 20 \
-  --workers 1
 ```
 
-The verified pilot20 reported `clips_attempted=20`, `clips_succeeded=20`,
-`clips_failed=0`, and `asd_runtime_failures=0`. Manual review of the generated
-binding videos found no persistent speaker/entity misbinding. Keep
-`$AUDIO_RUN_ROOT/smoke` and `$AUDIO_RUN_ROOT/pilot20` as the fixed reusable
-smoke and validation directories.
+For validation and worker benchmarks, use an explicit fixed `--clip-id` set.
+Do not use `--limit 20` when comparing runs, because that can select a different
+raw clip set than the manually reviewed Visual-eligible pilot set.
 
-Before production, benchmark the same bounded clip set with 1, 2, 4, and 6
-clip-level worker processes. Use separate disposable outputs so the summaries
-and deterministic JSONL files can be compared:
-
-```bash
-for workers in 1 2 4 6; do
-  output="$AUDIO_RUN_ROOT/worker-benchmark-$workers"
-  rm -rf "$output"
-  time "$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
-    --run-root "$V3_RUN" \
-    --output-root "$output" \
-    --limit 20 \
-    --workers "$workers"
-done
-```
-
-The verified worker benchmark completed with semantically matching outputs:
+The verified pilot20 reported:
 
 ```text
-workers=1  399s
-workers=2  223s
-workers=4  155s
-workers=6  146s
+clips_attempted=20
+clips_succeeded=20
+clips_failed=0
+asd_runtime_failures=0
 ```
 
-Use `--workers 4` as the current production starting point. The CLI default
-remains `--workers 1` for conservative compatibility.
+Manual review of the generated binding videos found no persistent
+speaker/entity misbinding. Keep association thresholds conservative; the pilot
+summary field `face_entity_association_failures` counts non-matched face-track
+associations, not failed clips.
+
+## Verified worker benchmark
+
+On the same fixed 20-clip set and the same H200 node, all worker counts produced
+matching binding semantics and deterministic outputs.
+
+```text
+workers  wall_seconds  speedup_vs_w1
+1        399           1.00x
+2        223           1.79x
+4        155           2.57x
+6        146           2.73x
+```
+
+Use `--workers 4` as the current production default. Six workers saved only
+9 seconds versus four workers (about 5.8% wall-clock reduction) while increasing
+CPU, filesystem, and GPU concurrency. Re-benchmark only if the node type,
+storage, LR-ASD implementation, or workload distribution changes materially.
 
 ## Voice-reference quality diagnostics
 
@@ -237,15 +231,12 @@ These measurements use coalesced bound speech turns and the existing LR-ASD
 `thresholds_calibrated=false`. Do not use them as a production
 voice-reference gate until the real pilot distributions have been reviewed.
 
-Only preserve/archive a run when it is actually useful for comparison or an
-accepted production checkpoint. Routine failed smoke attempts are disposable.
+Routine benchmark outputs are disposable after the results are recorded.
 
 Verified server note: official LR-ASD track boxes may extend slightly outside
 the model-video bounds because the vendor crop pads the frame. The R2V bridge
 clips only the published artifact coordinates to the model-video bounds; it
 continues to use the raw vendor box for detection-confidence matching.
-`face_entity_association_failures` in the pilot summary counts unmatched
-face-track associations, not failed clips.
 
 ## Cleanup of old timestamped smoke attempts
 
