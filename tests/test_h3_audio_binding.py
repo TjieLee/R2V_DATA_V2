@@ -8,6 +8,7 @@ import wave
 from array import array
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -71,6 +72,10 @@ from r2v_data_v2.h3.schemas import (
     VoiceReferenceCandidate,
 )
 from r2v_data_v2.h3.sidecar import build_audio_binding_sidecar_run
+from r2v_data_v2.h3.voice_quality import (
+    _local_noise_metrics,
+    recompute_voice_reference_quality_artifacts,
+)
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -91,6 +96,7 @@ from r2v_data_v2.v3.schemas import (
 from run_pipeline_v3 import STAGE_ORDER
 from tools.build_v3_h3_audio_binding_sidecar import main as sidecar_main
 from tools.eval_h3_audio_binding_lr_asd import _parser as lr_asd_pilot_parser
+from tools.recompute_h3_voice_quality import main as recompute_voice_quality_main
 
 
 def _visibility() -> EntityVisibilitySummary:
@@ -919,6 +925,86 @@ def _write_pcm16_wav(path: Path, samples: list[int]) -> None:
         destination.writeframes(payload.tobytes())
 
 
+def test_local_noise_uses_only_no_speech_and_robust_window_median() -> None:
+    sample_rate = 16000
+    samples = [0] * (3 * sample_rate)
+    samples[: 400 * 16] = [1000] * (400 * 16)
+    samples[: 20 * 16] = [30000] * (20 * 16)
+    samples[400 * 16 : 800 * 16] = [25000] * (400 * 16)
+    samples[2000 * 16 : 2400 * 16] = [1000] * (400 * 16)
+    bindings = _fuse(
+        _evidence(
+            [
+                _interval(0.0, 0.4, {}, speech=False, visible_face_track_ids=[]),
+                _interval(0.4, 0.8, {"face_1": 0.01}),
+                _interval(2.0, 2.4, {}, speech=False, visible_face_track_ids=[]),
+            ]
+        )
+    )
+
+    metrics = _local_noise_metrics(
+        audio_samples=samples,
+        sidecar=SimpleNamespace(bindings=bindings),
+        turn_start_time=1.0,
+        turn_end_time=2.0,
+        sample_rate_hz=sample_rate,
+    )
+
+    assert [binding.status for binding in bindings] == [
+        "no_speech",
+        "offscreen",
+        "no_speech",
+    ]
+    assert metrics["local_noise_context_available"] is True
+    assert metrics["local_noise_sample_count"] == 12800
+    assert metrics["local_noise_duration_seconds"] == pytest.approx(0.8)
+    assert metrics["local_noise_rms_amplitude"] == pytest.approx(1000 / 32768)
+    assert metrics["local_noise_rms_dbfs"] == pytest.approx(
+        20 * math.log10(1000 / 32768)
+    )
+
+
+@pytest.mark.parametrize(
+    ("duration", "expected_available"),
+    [(0.199, False), (0.200, True)],
+)
+def test_local_noise_requires_at_least_point_two_seconds(
+    duration: float,
+    expected_available: bool,
+) -> None:
+    sample_rate = 16000
+    bindings = _fuse(
+        _evidence(
+            [
+                _interval(
+                    0.0,
+                    duration,
+                    {},
+                    speech=False,
+                    visible_face_track_ids=[],
+                )
+            ]
+        )
+    )
+
+    metrics = _local_noise_metrics(
+        audio_samples=[1000] * (3 * sample_rate),
+        sidecar=SimpleNamespace(bindings=bindings),
+        turn_start_time=1.0,
+        turn_end_time=2.0,
+        sample_rate_hz=sample_rate,
+    )
+
+    assert metrics["local_noise_context_available"] is expected_available
+    assert metrics["local_noise_sample_count"] == round(duration * sample_rate)
+    if expected_available:
+        assert metrics["local_noise_rms_amplitude"] == pytest.approx(1000 / 32768)
+    else:
+        assert metrics["local_noise_rms_amplitude"] is None
+        assert metrics["local_noise_rms_dbfs"] is None
+        assert metrics["estimated_snr_db"] is None
+
+
 def _full_entity_mask() -> np.ndarray:
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[1:18, 1:12] = 1
@@ -1438,6 +1524,12 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
     assert quality["association_confidence"] == pytest.approx(
         {"mean": 1.0, "min": 1.0}
     )
+    assert quality["local_noise_context_available"] is False
+    assert quality["local_noise_sample_count"] == 0
+    assert quality["local_noise_duration_seconds"] == 0.0
+    assert quality["local_noise_rms_amplitude"] is None
+    assert quality["local_noise_rms_dbfs"] is None
+    assert quality["estimated_snr_db"] is None
     quality_summary = json.loads(
         (parallel_root / "voice_reference_quality_summary.json").read_text(
             encoding="utf-8"
@@ -1446,6 +1538,9 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
     assert quality_summary["thresholds_calibrated"] is False
     assert quality_summary["candidate_turn_count"] == 2
     assert quality_summary["diagnostics_failed_clip_count"] == 0
+    assert quality_summary["noise_context_available_count"] == 0
+    assert quality_summary["noise_context_unavailable_count"] == 2
+    assert quality_summary["noise_context_availability_rate"] == 0.0
     for clip_uid in ("clip-1", "clip-3"):
         assert (
             parallel_root / "clips" / clip_uid / "audio_binding.json"
@@ -1474,6 +1569,123 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
             / clip_uid
             / "face_entity_association.json"
         ).read_bytes()
+
+
+def test_voice_quality_noise_metrics_and_postprocess_are_deterministic(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run_root = tmp_path / "run"
+    source = tmp_path / "clip-1.mp4"
+    audio = tmp_path / "clip-1.wav"
+    source.write_bytes(b"video")
+    samples = [1000] * 32000
+    samples[:320] = [30000] * 320
+    samples[6400:25600] = [10000] * 19200
+    _write_pcm16_wav(audio, samples)
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.7] * 50],
+        duration_seconds=2.0,
+    )
+    lr_backend = _CountingLRASDBackend({"clip-1": native})
+    pilot_root = tmp_path / "voice-quality-pilot20"
+    run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=pilot_root,
+        lr_asd_backend=lr_backend,
+        speech_backend=PrecomputedSpeechActivityBackend(
+            {
+                "clip-1": SpeechActivityArtifact(
+                    clip_uid="clip-1",
+                    backend="silero_vad",
+                    model_identifier="silero_vad.jit",
+                    source_audio_path=str(audio),
+                    duration_seconds=2.0,
+                    intervals=[
+                        SpeechActivityInterval(start_time=0.4, end_time=1.6)
+                    ],
+                )
+            }
+        ),
+        review_media_backend=_FakeReviewMediaBackend(),
+        clip_ids=["clip-1"],
+    )
+
+    quality_path = (
+        pilot_root / "clips" / "clip-1" / "voice_reference_quality.json"
+    )
+    quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    assert quality["schema_version"] == "r2v.h3.voice_reference_quality.2"
+    assert len(quality["candidate_turns"]) == 1
+    turn = quality["candidate_turns"][0]
+    assert turn["start_time"] == pytest.approx(0.4)
+    assert turn["end_time"] == pytest.approx(1.6)
+    assert turn["local_noise_context_available"] is True
+    assert turn["local_noise_sample_count"] == 12800
+    assert turn["local_noise_duration_seconds"] == pytest.approx(0.8)
+    assert turn["local_noise_rms_amplitude"] == pytest.approx(1000 / 32768)
+    assert turn["local_noise_rms_dbfs"] == pytest.approx(
+        20 * math.log10(1000 / 32768)
+    )
+    assert turn["estimated_snr_db"] == pytest.approx(20.0)
+    summary_path = pilot_root / "voice_reference_quality_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["noise_context_available_count"] == 1
+    assert summary["noise_context_unavailable_count"] == 0
+    assert summary["noise_context_availability_rate"] == 1.0
+    assert summary["metric_distributions"]["estimated_snr_db"]["mean"] == (
+        pytest.approx(20.0)
+    )
+
+    non_diagnostic_before = {
+        name: digest
+        for name, digest in _tree_hashes(pilot_root).items()
+        if "voice_reference_quality" not in name
+    }
+    for path in pilot_root.rglob("*voice_reference_quality*"):
+        if path.is_file():
+            path.write_text("{}\n", encoding="utf-8")
+
+    recomputed = recompute_voice_reference_quality_artifacts(
+        pilot_root=pilot_root,
+    )
+
+    assert recomputed.candidate_turn_count == 1
+    assert lr_backend.calls == ["clip-1"]
+    assert {
+        name: digest
+        for name, digest in _tree_hashes(pilot_root).items()
+        if "voice_reference_quality" not in name
+    } == non_diagnostic_before
+    assert quality_path.read_bytes() == (
+        pilot_root / "review" / "clip-1" / "voice_reference_quality.json"
+    ).read_bytes()
+    first_diagnostic_hashes = {
+        name: digest
+        for name, digest in _tree_hashes(pilot_root).items()
+        if "voice_reference_quality" in name
+    }
+
+    cli_result = recompute_voice_quality_main(
+        ["--pilot-root", str(pilot_root)]
+    )
+
+    assert cli_result["thresholds_calibrated"] is False
+    assert json.loads(capsys.readouterr().out)["candidate_turn_count"] == 1
+    assert {
+        name: digest
+        for name, digest in _tree_hashes(pilot_root).items()
+        if "voice_reference_quality" in name
+    } == first_diagnostic_hashes
+    assert not list(pilot_root.rglob("*.tmp-*"))
 
 
 def test_voice_quality_failure_does_not_change_binding_result(tmp_path: Path) -> None:

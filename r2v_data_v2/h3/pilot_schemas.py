@@ -203,6 +203,12 @@ class VoiceReferenceTurnDiagnostics(SchemaModel):
     peak_amplitude: float = Field(ge=0, le=1)
     peak_dbfs: float | None = None
     clipping_ratio: float = Field(ge=0, le=1)
+    local_noise_context_available: bool
+    local_noise_sample_count: int = Field(ge=0)
+    local_noise_duration_seconds: float = Field(ge=0)
+    local_noise_rms_amplitude: float | None = Field(default=None, ge=0, le=1)
+    local_noise_rms_dbfs: float | None = None
+    estimated_snr_db: float | None = None
     lr_asd_raw_native_score: LRASDScoreDiagnostics
     association_confidence: AssociationConfidenceDiagnostics
     voice_reference_eligible: Literal[True] = True
@@ -230,17 +236,69 @@ class VoiceReferenceTurnDiagnostics(SchemaModel):
             self.association_confidence.mean,
             self.association_confidence.min,
         )
-        optional = (self.rms_dbfs, self.peak_dbfs)
+        optional = (
+            self.rms_dbfs,
+            self.peak_dbfs,
+            self.local_noise_rms_amplitude,
+            self.local_noise_rms_dbfs,
+            self.estimated_snr_db,
+        )
         if not all(math.isfinite(value) for value in numeric) or any(
             value is not None and not math.isfinite(value) for value in optional
         ):
             raise ValueError("voice-quality metrics must be finite")
+        if not math.isclose(
+            self.local_noise_duration_seconds,
+            self.local_noise_sample_count / 16000,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("local-noise duration must match its sample count")
+        if self.local_noise_context_available:
+            if (
+                self.local_noise_sample_count < 3200
+                or self.local_noise_rms_amplitude is None
+            ):
+                raise ValueError("available local-noise context requires 0.20 seconds")
+        elif (
+            self.local_noise_sample_count >= 3200
+            or self.local_noise_rms_amplitude is not None
+            or self.local_noise_rms_dbfs is not None
+            or self.estimated_snr_db is not None
+        ):
+            raise ValueError("unavailable local-noise context cannot publish estimates")
+        expected_noise_dbfs = (
+            20 * math.log10(self.local_noise_rms_amplitude)
+            if self.local_noise_rms_amplitude is not None
+            and self.local_noise_rms_amplitude > 0
+            else None
+        )
+        if expected_noise_dbfs is None:
+            if self.local_noise_rms_dbfs is not None or self.estimated_snr_db is not None:
+                raise ValueError("silent local-noise context has no finite dBFS or SNR")
+        elif self.local_noise_rms_dbfs is None or not math.isclose(
+            self.local_noise_rms_dbfs,
+            expected_noise_dbfs,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("local-noise dBFS must match robust RMS amplitude")
+        if self.rms_dbfs is not None and self.local_noise_rms_dbfs is not None:
+            if self.estimated_snr_db is None or not math.isclose(
+                self.estimated_snr_db,
+                self.rms_dbfs - self.local_noise_rms_dbfs,
+                rel_tol=0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError("estimated SNR must match turn and local-noise dBFS")
+        elif self.estimated_snr_db is not None:
+            raise ValueError("estimated SNR requires finite turn and local-noise dBFS")
         return self
 
 
 class VoiceReferenceClipDiagnostics(SchemaModel):
-    schema_version: Literal["r2v.h3.voice_reference_quality.1"] = (
-        "r2v.h3.voice_reference_quality.1"
+    schema_version: Literal["r2v.h3.voice_reference_quality.2"] = (
+        "r2v.h3.voice_reference_quality.2"
     )
     clip_uid: str
     source_audio_path: str
@@ -281,8 +339,8 @@ class VoiceQualityMetricDistribution(SchemaModel):
 
 
 class VoiceReferenceQualityPilotReport(SchemaModel):
-    schema_version: Literal["r2v.h3.voice_reference_quality_report.1"] = (
-        "r2v.h3.voice_reference_quality_report.1"
+    schema_version: Literal["r2v.h3.voice_reference_quality_report.2"] = (
+        "r2v.h3.voice_reference_quality_report.2"
     )
     thresholds_calibrated: Literal[False] = False
     clip_report_count: int = Field(ge=0)
@@ -290,6 +348,9 @@ class VoiceReferenceQualityPilotReport(SchemaModel):
     diagnostics_failed_clip_count: int = Field(ge=0)
     clips_with_candidate_turns: int = Field(ge=0)
     candidate_turn_count: int = Field(ge=0)
+    noise_context_available_count: int = Field(ge=0)
+    noise_context_unavailable_count: int = Field(ge=0)
+    noise_context_availability_rate: float = Field(ge=0, le=1)
     metric_distributions: dict[str, VoiceQualityMetricDistribution]
 
     @model_validator(mode="after")
@@ -298,4 +359,21 @@ class VoiceReferenceQualityPilotReport(SchemaModel):
             self.diagnostics_ready_clip_count + self.diagnostics_failed_clip_count
         ):
             raise ValueError("voice-quality clip counts must reconcile")
+        if self.candidate_turn_count != (
+            self.noise_context_available_count
+            + self.noise_context_unavailable_count
+        ):
+            raise ValueError("voice-quality noise-context counts must reconcile")
+        expected_rate = (
+            self.noise_context_available_count / self.candidate_turn_count
+            if self.candidate_turn_count
+            else 0.0
+        )
+        if not math.isclose(
+            self.noise_context_availability_rate,
+            expected_rate,
+            rel_tol=0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("voice-quality noise-context rate must match counts")
         return self

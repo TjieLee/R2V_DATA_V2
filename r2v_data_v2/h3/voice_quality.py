@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import math
 import sys
+import uuid
 import wave
 from array import array
 from collections.abc import Sequence
@@ -21,6 +23,10 @@ from r2v_data_v2.h3.pilot_schemas import (
     VoiceReferenceTurnDiagnostics,
 )
 from r2v_data_v2.h3.schemas import AudioBindingSidecar
+
+_LOCAL_NOISE_CONTEXT_SECONDS = 2.0
+_MINIMUM_LOCAL_NOISE_SECONDS = 0.20
+_LOCAL_NOISE_WINDOW_SECONDS = 0.020
 
 
 def _percentile(values: Sequence[float], quantile: float) -> float:
@@ -73,6 +79,72 @@ def _audio_metrics(samples: Sequence[int]) -> dict[str, float | int | None]:
         "peak_amplitude": peak_amplitude,
         "peak_dbfs": _dbfs(peak_amplitude),
         "clipping_ratio": clipping_ratio,
+    }
+
+
+def _local_noise_metrics(
+    *,
+    audio_samples: Sequence[int],
+    sidecar: AudioBindingSidecar,
+    turn_start_time: float,
+    turn_end_time: float,
+    sample_rate_hz: int,
+) -> dict[str, bool | float | int | None]:
+    search_ranges = (
+        (max(0.0, turn_start_time - _LOCAL_NOISE_CONTEXT_SECONDS), turn_start_time),
+        (turn_end_time, turn_end_time + _LOCAL_NOISE_CONTEXT_SECONDS),
+    )
+    sample_spans: list[tuple[int, int]] = []
+    for binding in sidecar.bindings:
+        if binding.status != "no_speech":
+            continue
+        for search_start, search_end in search_ranges:
+            overlap_start = max(binding.start_time, search_start)
+            overlap_end = min(binding.end_time, search_end)
+            if overlap_end <= overlap_start:
+                continue
+            start_sample = max(0, round(overlap_start * sample_rate_hz))
+            end_sample = min(
+                len(audio_samples),
+                round(overlap_end * sample_rate_hz),
+            )
+            if end_sample > start_sample:
+                sample_spans.append((start_sample, end_sample))
+
+    sample_count = sum(end - start for start, end in sample_spans)
+    duration_seconds = sample_count / sample_rate_hz
+    minimum_sample_count = math.ceil(
+        _MINIMUM_LOCAL_NOISE_SECONDS * sample_rate_hz
+    )
+    if sample_count < minimum_sample_count:
+        return {
+            "local_noise_context_available": False,
+            "local_noise_sample_count": sample_count,
+            "local_noise_duration_seconds": duration_seconds,
+            "local_noise_rms_amplitude": None,
+            "local_noise_rms_dbfs": None,
+            "estimated_snr_db": None,
+        }
+
+    window_sample_count = max(
+        1,
+        round(_LOCAL_NOISE_WINDOW_SECONDS * sample_rate_hz),
+    )
+    window_rms_values = []
+    for span_start, span_end in sample_spans:
+        for window_start in range(span_start, span_end, window_sample_count):
+            window_end = min(span_end, window_start + window_sample_count)
+            window_metrics = _audio_metrics(audio_samples[window_start:window_end])
+            window_rms_values.append(float(window_metrics["rms_amplitude"]))
+    robust_rms = _percentile(window_rms_values, 0.50)
+    robust_dbfs = _dbfs(robust_rms)
+    return {
+        "local_noise_context_available": True,
+        "local_noise_sample_count": sample_count,
+        "local_noise_duration_seconds": duration_seconds,
+        "local_noise_rms_amplitude": robust_rms,
+        "local_noise_rms_dbfs": robust_dbfs,
+        "estimated_snr_db": None,
     }
 
 
@@ -138,6 +210,17 @@ def build_voice_reference_quality_diagnostics(
         metrics = _audio_metrics(
             audio_samples[turn.start_sample : turn.end_sample]
         )
+        local_noise = _local_noise_metrics(
+            audio_samples=audio_samples,
+            sidecar=sidecar,
+            turn_start_time=turn.start_time,
+            turn_end_time=turn.end_time,
+            sample_rate_hz=native.audio_sample_rate_hz,
+        )
+        if metrics["rms_dbfs"] is not None and local_noise["local_noise_rms_dbfs"] is not None:
+            local_noise["estimated_snr_db"] = float(metrics["rms_dbfs"]) - float(
+                local_noise["local_noise_rms_dbfs"]
+            )
         diagnostics.append(
             VoiceReferenceTurnDiagnostics(
                 clip_uid=native.clip_uid,
@@ -161,6 +244,30 @@ def build_voice_reference_quality_diagnostics(
                     else float(metrics["peak_dbfs"])
                 ),
                 clipping_ratio=float(metrics["clipping_ratio"]),
+                local_noise_context_available=bool(
+                    local_noise["local_noise_context_available"]
+                ),
+                local_noise_sample_count=int(
+                    local_noise["local_noise_sample_count"]
+                ),
+                local_noise_duration_seconds=float(
+                    local_noise["local_noise_duration_seconds"]
+                ),
+                local_noise_rms_amplitude=(
+                    None
+                    if local_noise["local_noise_rms_amplitude"] is None
+                    else float(local_noise["local_noise_rms_amplitude"])
+                ),
+                local_noise_rms_dbfs=(
+                    None
+                    if local_noise["local_noise_rms_dbfs"] is None
+                    else float(local_noise["local_noise_rms_dbfs"])
+                ),
+                estimated_snr_db=(
+                    None
+                    if local_noise["estimated_snr_db"] is None
+                    else float(local_noise["estimated_snr_db"])
+                ),
                 lr_asd_raw_native_score=LRASDScoreDiagnostics(
                     mean=math.fsum(scores) / len(scores),
                     min=min(scores),
@@ -188,6 +295,11 @@ _DISTRIBUTION_FIELDS = (
     "peak_amplitude",
     "peak_dbfs",
     "clipping_ratio",
+    "local_noise_sample_count",
+    "local_noise_duration_seconds",
+    "local_noise_rms_amplitude",
+    "local_noise_rms_dbfs",
+    "estimated_snr_db",
     "lr_asd_raw_native_score_mean",
     "lr_asd_raw_native_score_min",
     "lr_asd_raw_native_score_p10",
@@ -256,5 +368,112 @@ def build_voice_reference_quality_report(
         ),
         clips_with_candidate_turns=sum(bool(report.candidate_turns) for report in ordered),
         candidate_turn_count=len(turns),
+        noise_context_available_count=sum(
+            turn.local_noise_context_available for turn in turns
+        ),
+        noise_context_unavailable_count=sum(
+            not turn.local_noise_context_available for turn in turns
+        ),
+        noise_context_availability_rate=(
+            sum(turn.local_noise_context_available for turn in turns) / len(turns)
+            if turns
+            else 0.0
+        ),
         metric_distributions=distributions,
     )
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _json_document(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _json_lines(values: Sequence[dict[str, object]]) -> str:
+    return "".join(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+        for value in values
+    )
+
+
+def recompute_voice_reference_quality_artifacts(
+    *,
+    pilot_root: Path,
+) -> VoiceReferenceQualityPilotReport:
+    root = pilot_root.expanduser().resolve(strict=True)
+    if not (root / "summary.json").is_file():
+        raise ValueError("voice-quality postprocess requires a pilot summary.json")
+    clip_paths = sorted((root / "clips").glob("*/audio_binding.json"))
+    if not clip_paths:
+        raise ValueError("voice-quality postprocess found no audio binding artifacts")
+
+    reports: list[VoiceReferenceClipDiagnostics] = []
+    for sidecar_path in clip_paths:
+        clip_uid = sidecar_path.parent.name
+        native_path = root / "runtime" / clip_uid / "lr_asd" / "lr_asd_native.json"
+        review_dir = root / "review" / clip_uid
+        if not native_path.is_file() or not review_dir.is_dir():
+            raise ValueError(
+                f"voice-quality postprocess artifacts are incomplete for {clip_uid}"
+            )
+        sidecar = AudioBindingSidecar.model_validate_json(
+            sidecar_path.read_text(encoding="utf-8")
+        )
+        native = LRASDNativeArtifact.model_validate_json(
+            native_path.read_text(encoding="utf-8")
+        )
+        if sidecar.clip_uid != clip_uid or native.clip_uid != clip_uid:
+            raise ValueError("voice-quality postprocess clip identities do not match")
+        source_audio_path = Path(native.audio_path).expanduser()
+        if not source_audio_path.is_absolute():
+            source_audio_path = root / source_audio_path
+        try:
+            report = build_voice_reference_quality_diagnostics(
+                native=native,
+                sidecar=sidecar,
+                source_audio_path=source_audio_path.resolve(strict=True),
+                published_audio_path=native.audio_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics remain non-gating
+            report = VoiceReferenceClipDiagnostics(
+                clip_uid=clip_uid,
+                source_audio_path=native.audio_path,
+                status="failed",
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        reports.append(report)
+
+    summary = build_voice_reference_quality_report(reports)
+    turn_payloads = [
+        turn.model_dump(mode="json")
+        for report in reports
+        for turn in report.candidate_turns
+    ]
+    for report in reports:
+        payload = _json_document(report.model_dump(mode="json"))
+        _atomic_write(
+            root / "clips" / report.clip_uid / "voice_reference_quality.json",
+            payload,
+        )
+        _atomic_write(
+            root / "review" / report.clip_uid / "voice_reference_quality.json",
+            payload,
+        )
+    _atomic_write(
+        root / "voice_reference_quality.jsonl",
+        _json_lines(turn_payloads),
+    )
+    _atomic_write(
+        root / "voice_reference_quality_summary.json",
+        _json_document(summary.model_dump(mode="json")),
+    )
+    return summary

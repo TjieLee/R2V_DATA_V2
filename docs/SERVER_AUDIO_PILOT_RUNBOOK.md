@@ -231,6 +231,30 @@ These measurements use coalesced bound speech turns and the existing LR-ASD
 `thresholds_calibrated=false`. Do not use them as a production
 voice-reference gate until the real pilot distributions have been reviewed.
 
+Local background diagnostics use only `no_speech` bindings within two seconds
+before or after each candidate turn. They exclude `offscreen`, `ambiguous`, and
+`overlap` intervals. The reported local noise level is the median RMS of 20 ms
+windows, and remains unavailable unless at least 0.20 seconds of explicit
+`no_speech` context exists.
+
+Recompute these diagnostics from an existing pilot without running LR-ASD,
+S3FD, Silero, or review rendering:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/recompute_h3_voice_quality.py \
+  --pilot-root "$PILOT20_OUT"
+
+cat "$PILOT20_OUT/voice_reference_quality_summary.json"
+```
+
+The current V1 calibration candidates are duration at least 1.0 seconds,
+minimum association confidence at least 0.85, mean LR-ASD score at least 0.50,
+LR-ASD p10 at least 0.20, RMS dBFS at least -40, and clipping ratio at most
+0.0001. These values are not enabled gates. In particular, local noise and SNR
+must be reviewed on real pilot distributions before any production threshold is
+introduced.
+
 Routine benchmark outputs are disposable after the results are recorded.
 
 Verified server note: official LR-ASD track boxes may extend slightly outside
