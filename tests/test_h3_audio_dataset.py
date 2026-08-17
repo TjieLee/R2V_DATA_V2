@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from r2v_data_v2.h3 import audio_backends as audio_backends_module
 from r2v_data_v2.h3 import audio_export as audio_export_module
+from r2v_data_v2.h3 import audio_pairing as audio_pairing_module
 from r2v_data_v2.h3.audio_backends import (
     ExternalSubprocessEmbeddingBackend,
     PrecomputedAudioMediaBackend,
@@ -20,6 +21,7 @@ from r2v_data_v2.h3.audio_backends import (
 )
 from r2v_data_v2.h3.audio_binding import (
     AudioBindingProductionConfig,
+    TranscriptSegment,
     build_audio_clip_binding_dataset,
     coalesce_audio_bindings,
     load_clip_bindings,
@@ -43,7 +45,10 @@ from r2v_data_v2.h3.audio_schemas import (
     FileAsset,
     FullAudioArtifact,
     LocalBindingSummary,
+    PairEvidence,
     ProducerProvenance,
+    SamePersonEvidence,
+    SameVoiceEvidence,
     SourceVideoProvenance,
     SpeechTurn,
     TranscriptProvenance,
@@ -114,6 +119,8 @@ def _frame_binding(
     face_track_id: str | None = "face_1",
     confidence: float = 0.9,
     clean: bool = True,
+    audio_quality_usable: bool = True,
+    synchronization_plausible: bool = True,
 ) -> AudioEntityBinding:
     if status != "bound":
         entity_id = None
@@ -127,8 +134,8 @@ def _frame_binding(
         status=status,
         confidence=confidence,
         evidence=BindingEvidence(
-            audio_quality_usable=True,
-            synchronization_plausible=True,
+            audio_quality_usable=audio_quality_usable,
+            synchronization_plausible=synchronization_plausible,
             clean_training_eligible=clean,
         ),
     )
@@ -527,6 +534,90 @@ def test_coalescing_preserves_sources_and_applies_duration_after_merge() -> None
     assert turns[0].voice_reference_eligible is True
 
 
+def test_25fps_bindings_become_voice_eligible_only_after_merge() -> None:
+    bindings = [
+        _frame_binding(index / 25, (index + 1) / 25, clean=False)
+        for index in range(20)
+    ]
+
+    turns = coalesce_audio_bindings(
+        bindings,
+        clip_uid="clip-a",
+        sample_rate_hz=16000,
+        maximum_gap_seconds=0.08,
+        minimum_voice_reference_duration_seconds=0.5,
+    )
+    selected = select_primary_voice_turns(
+        turns,
+        entity_order=["e1"],
+        minimum_binding_confidence=0.8,
+    )
+
+    assert len(turns) == 1
+    assert turns[0].end_time - turns[0].start_time == pytest.approx(0.8)
+    assert turns[0].voice_reference_eligible is True
+    assert selected == {"e1": turns[0]}
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    ["audio_quality_usable", "synchronization_plausible"],
+)
+def test_bad_frame_evidence_makes_merged_voice_turn_ineligible(
+    invalid_evidence: str,
+) -> None:
+    bindings = []
+    for index in range(20):
+        options = {
+            "clean": False,
+            "audio_quality_usable": True,
+            "synchronization_plausible": True,
+        }
+        if index == 10:
+            options[invalid_evidence] = False
+        bindings.append(
+            _frame_binding(index / 25, (index + 1) / 25, **options)
+        )
+
+    turns = coalesce_audio_bindings(
+        bindings,
+        clip_uid="clip-a",
+        sample_rate_hz=16000,
+        maximum_gap_seconds=0.08,
+        minimum_voice_reference_duration_seconds=0.5,
+    )
+
+    assert len(turns) == 1
+    assert turns[0].voice_reference_eligible is False
+
+
+def test_transcript_segment_is_assigned_to_only_the_largest_overlap_turn() -> None:
+    turns = coalesce_audio_bindings(
+        [
+            _frame_binding(0.0, 0.6),
+            _frame_binding(0.6, 1.2, entity_id="e2", face_track_id="face_2"),
+        ],
+        clip_uid="clip-a",
+        sample_rate_hz=16000,
+        maximum_gap_seconds=0.08,
+        minimum_voice_reference_duration_seconds=0.5,
+        transcript_segments=[
+            TranscriptSegment(
+                start_time=0.45,
+                end_time=1.05,
+                text="second speaker words",
+            ),
+            TranscriptSegment(
+                start_time=0.3,
+                end_time=0.9,
+                text="ambiguous boundary words",
+            ),
+        ],
+    )
+
+    assert [turn.text for turn in turns] == [None, "second speaker words"]
+
+
 @pytest.mark.parametrize("status", ["overlap", "offscreen", "ambiguous", "no_speech"])
 def test_non_bound_status_breaks_speech_turn_coalescing(status: str) -> None:
     turns = coalesce_audio_bindings(
@@ -654,6 +745,80 @@ def test_strict_cross_pair_requires_face_and_voice_and_preserves_target_text(
         "clip_binding/clip-a",
         "clip_binding/clip-b",
     ]
+    assert "<Audio 1> is the target full audio." in cross_a.annotation_draft.text
+    assert "<Subject 1> uses <Picture 1>." in cross_a.annotation_draft.text
+    assert (
+        "<Audio 2> is the voice reference for <Subject 1>."
+        in cross_a.annotation_draft.text
+    )
+    assert "<Subject 1> says <d>target words</d>" in cross_a.annotation_draft.text
+
+
+def _accepted_pair_edge(target: str, reference: str, score: float) -> PairEvidence:
+    return PairEvidence(
+        target_entity_occurrence_id=target,
+        reference_entity_occurrence_id=reference,
+        same_person=SamePersonEvidence(
+            status="accepted",
+            face_similarity=score,
+            face_margin=0.1,
+            policy_version="test",
+            reason_codes=[],
+        ),
+        same_voice=SameVoiceEvidence(
+            status="accepted",
+            voice_similarity=score,
+            voice_margin=0.1,
+            policy_version="test",
+            reason_codes=[],
+        ),
+        combined_score=score,
+    )
+
+
+def test_cross_pair_uses_optimal_complete_one_to_one_matching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _two_subject_binding(tmp_path, "clip-a")
+    donor_a = _canonical_binding(
+        tmp_path,
+        "clip-b",
+        face=[1.0, 0.0],
+        voice=[1.0, 0.0],
+    )
+    donor_b = _canonical_binding(
+        tmp_path,
+        "clip-c",
+        face=[1.0, 0.0],
+        voice=[1.0, 0.0],
+    )
+    edges = [
+        _accepted_pair_edge("clip-a/e1", "clip-b/e1", 0.95),
+        _accepted_pair_edge("clip-a/e1", "clip-c/e1", 0.90),
+        _accepted_pair_edge("clip-a/e2", "clip-b/e1", 0.93),
+    ]
+    monkeypatch.setattr(
+        audio_pairing_module,
+        "build_pairwise_evidence",
+        lambda *args, **kwargs: edges,
+    )
+
+    samples, _, _ = build_audio_pair_samples(
+        [target, donor_a, donor_b],
+        audio_root=tmp_path,
+    )
+    cross = next(
+        sample
+        for sample in samples
+        if sample.pair_kind == "cross_pair" and sample.target.clip_uid == "clip-a"
+    )
+
+    assert [item.voice_entity_occurrence_id for item in cross.subjects] == [
+        "clip-c/e1",
+        "clip-b/e1",
+    ]
+    assert sum(item.combined_score for item in cross.pair_evidence) == pytest.approx(1.83)
 
 
 def test_no_face_keeps_in_pair_but_blocks_strict_cross_pair(tmp_path: Path) -> None:
@@ -844,6 +1009,9 @@ def test_zero_cross_variant_policy_keeps_only_in_pair(tmp_path: Path) -> None:
         "in_pair/clip-b",
     ]
 
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        AudioPairingConfig(max_cross_pair_variants_per_target=2)
+
 
 def test_near_duplicate_source_video_is_not_cross_paired(tmp_path: Path) -> None:
     duplicate = b"same-source-video"
@@ -881,6 +1049,8 @@ def test_missing_transcript_does_not_render_empty_dialogue(tmp_path: Path) -> No
 
     assert len(samples) == 1
     assert "<d></d>" not in samples[0].annotation_draft.text
+    assert " says <d>" not in samples[0].annotation_draft.text
+    assert "<Audio 1> is the target full audio." in samples[0].annotation_draft.text
     assert samples[0].annotation_draft.annotation_status == "draft"
     assert samples[0].annotation_draft.is_final_annotation is False
 
@@ -1251,6 +1421,83 @@ def test_clip_failure_is_isolated_and_recorded(tmp_path: Path) -> None:
     failure = json.loads((output_root / "failures.jsonl").read_text(encoding="utf-8"))
     assert failure["clip_uid"] == "clip-b"
     assert failure["failure_type"] == "KeyError"
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason="the frozen Visual/H3 baseline requires Python 3.10+ strict zip",
+)
+@pytest.mark.parametrize("mismatch", ["clip_uid", "source_video"])
+def test_sidecar_identity_mismatch_fails_only_that_clip(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    run_root, visual_root, sidecar_root, _, _ = _visual_and_sidecar_fixture(tmp_path)
+    sidecar_path = sidecar_root / "clips" / "clip-a" / "audio_binding.json"
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    if mismatch == "clip_uid":
+        payload["clip_uid"] = "clip-other"
+    else:
+        other_video = tmp_path / "public" / "other.mp4"
+        other_video.write_bytes(b"other-video")
+        payload["source_video_path"] = str(other_video)
+    sidecar_path.write_text(json.dumps(payload), encoding="utf-8")
+    output_root = tmp_path / "audio-output"
+
+    outputs = build_audio_clip_binding_dataset(
+        run_root=run_root,
+        visual_export_root=visual_root,
+        sidecar_root=sidecar_root,
+        output_root=output_root,
+        audio_backend=object(),
+        face_backend=object(),
+        speaker_backend=object(),
+    )
+
+    assert outputs == []
+    failure = json.loads((output_root / "failures.jsonl").read_text(encoding="utf-8"))
+    assert failure["clip_uid"] == "clip-a"
+    assert failure["status"] == "failed"
+    assert "does not match" in failure["reason"]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason="the frozen Visual/H3 baseline requires Python 3.10+ strict zip",
+)
+def test_non_ready_sidecar_is_accounted_in_binding_report(tmp_path: Path) -> None:
+    run_root, visual_root, sidecar_root, _, _ = _visual_and_sidecar_fixture(tmp_path)
+    sidecar_path = sidecar_root / "clips" / "clip-a" / "audio_binding.json"
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    payload.update({"status": "ineligible", "reason": "no clean visible speech"})
+    sidecar_path.write_text(json.dumps(payload), encoding="utf-8")
+    output_root = tmp_path / "audio-output"
+
+    outputs = build_audio_clip_binding_dataset(
+        run_root=run_root,
+        visual_export_root=visual_root,
+        sidecar_root=sidecar_root,
+        output_root=output_root,
+        audio_backend=object(),
+        face_backend=object(),
+        speaker_backend=object(),
+    )
+
+    assert outputs == []
+    report = json.loads((output_root / "pair_report.json").read_text(encoding="utf-8"))
+    assert report == {
+        "clip_binding_count": 0,
+        "failed_clip_count": 0,
+        "ineligible_clip_count": 1,
+        "pair_sample_count": 0,
+        "selected_clip_count": 1,
+    }
+    failure = json.loads((output_root / "failures.jsonl").read_text(encoding="utf-8"))
+    assert failure == {
+        "clip_uid": "clip-a",
+        "reason": "no clean visible speech",
+        "status": "ineligible",
+    }
 
 
 def test_clip_binding_jsonl_order_is_deterministic(tmp_path: Path) -> None:

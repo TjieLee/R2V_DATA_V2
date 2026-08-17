@@ -23,10 +23,12 @@ not been calibrated for production.
 2. Materialize one full-audio target from the explicitly selected source audio
    stream. Preserve stream index, codec, sample rate, channels, duration, and
    time base as provenance.
-3. Coalesce adjacent 25 FPS frame bindings only when their status, entity ID,
-   face-track ID, and clean-evidence state match and their gap is within policy.
-   Overlap, offscreen, ambiguous, no-speech, and entity changes are hard turn
-   boundaries.
+3. Coalesce adjacent bound 25 FPS frame bindings when their entity ID and
+   face-track ID match and their gap is within policy. Overlap, offscreen,
+   ambiguous, no-speech, and identity changes are hard turn boundaries. Voice
+   eligibility is recomputed after merge from the full turn duration plus every
+   frame's audio-quality and synchronization evidence; a 40 ms frame is not
+   required to be independently voice-reference eligible.
 4. Select at most one primary voice-reference turn per bound subject using
    confidence descending, duration descending, start time ascending, and turn
    ID ascending.
@@ -75,14 +77,16 @@ voice-only matches, and candidate-grade edges are rejected.
 
 For a multi-speaker target, every speaking subject must have face evidence and a
 strict legal cross reference. Missing any subject blocks the cross-pair but does
-not remove the in-pair. V1 publishes at most the configured number of cross
-variants, defaulting to one, and does not enumerate a Cartesian product.
+not remove the in-pair. A bounded deterministic search chooses the complete
+one-to-one donor assignment with maximum combined score. V1 allows zero or one
+cross variant; it does not enumerate a Cartesian product.
 
 ## Draft H3 Rendering
 
 `r2v.audio.pair_sample.1` records explicit subject-to-picture and
 subject-to-voice bindings. The deterministic renderer begins with existing
-Visual V3 text and appends only transcript text from bound target speech turns.
+Visual V3 text, explicitly states the `<Subject N>` / `<Picture N>` / `<Audio N>`
+mapping, and appends only transcript text from bound target speech turns.
 Its default speech delimiters are configurable `<d>` and `</d>`. Tags must be
 paired and may not enclose empty invented dialogue.
 
@@ -159,7 +163,7 @@ python tools/audio_data.py pair \
   --top-k 20 \
   --face-threshold 0.70 --face-margin 0.04 \
   --voice-threshold 0.75 --voice-margin 0.04 \
-  --max-cross-pair-variants 1 --seed 0
+  --max-cross-pair-variants 1
 
 python tools/audio_data.py export-h3 \
   --audio-root /path/to/audio-pairs \
@@ -173,6 +177,13 @@ voice duration, dry run, and explicit overwrite. Its precomputed manifest maps
 clip/occurrence IDs to full audio, voice audio, face/speaker/text `.npy`
 fixtures, optional transcript segments, and exact audio-stream provenance.
 `pair --report-only` performs no publication.
+
+The LR-ASD pilot publishes each successful sidecar both in its diagnostic
+`review/<clip_uid>/audio_binding.json` bundle and at canonical
+`clips/<clip_uid>/audio_binding.json`, with a root `audio_bindings.jsonl`. The
+canonical tree can therefore be passed directly to `audio_data.py bind`.
+Non-ready sidecars and binding failures remain per-clip records, while
+`pair_report.json` accounts for selected, ready, ineligible, and failed clips.
 
 ## Server Adapter Boundary
 

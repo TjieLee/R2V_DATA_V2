@@ -1,6 +1,6 @@
 # R2V_DATA_V2 Project State
 
-Last updated: 2026-08-14
+Last updated: 2026-08-17
 
 ## Repository
 
@@ -60,6 +60,11 @@ branch and retains the earlier audio scaffold as isolated commits. It adds:
 - atomic separate-root publication and a unified `tools/audio_data.py` CLI;
 - precomputed, FFmpeg, and external-subprocess adapter boundaries with no base
   model dependency.
+- canonical LR-ASD pilot sidecars that feed the binding producer without manual
+  directory copying, plus explicit selected/ready/ineligible/failed accounting;
+- post-merge voice eligibility for continuous 25 FPS LR-ASD evidence, unique
+  transcript-segment assignment, and optimal one-to-one multi-subject donors;
+- explicit draft `<Subject N>` / `<Picture N>` / `<Audio N>` bindings.
 
 The face, speaker, ASR, and pair thresholds remain unvalidated. No real model,
 GPU, server run, or production data has been exercised in this Mac pass. See
@@ -99,21 +104,30 @@ or production artifact may change in this pass.
 
 ## Tested Commands
 
-Completed GPU-free validation for this pass:
+Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
-python -m pytest tests/test_h3_audio_binding.py -q
-# 37 passed
+python -m pytest tests/test_h3_audio_dataset.py \
+  tests/test_h3_audio_binding.py -q
+# 74 passed
 
 python -m pytest -q
-# 1523 passed, 1 existing Pillow deprecation warning
+# 1741 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
 
+python -m compileall r2v_data_v2 tools tests
+# passed
+
 git diff --check
 # passed
 ```
+
+The repository-local `.venv` uses Python 3.9.6. Its compatible Audio/H3 dataset
+subset passed `31 passed, 5 skipped`; the skips and the legacy binding-test
+collection limit are caused by frozen Visual/H3 Python 3.10+ syntax and were not
+worked around by changing Visual code.
 
 ## Open Questions
 

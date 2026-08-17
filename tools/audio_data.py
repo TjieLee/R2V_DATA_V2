@@ -57,7 +57,6 @@ def _parser() -> argparse.ArgumentParser:
     pair.add_argument("--voice-margin", type=float, default=0.04)
     pair.add_argument("--text-threshold", type=float, default=0.30)
     pair.add_argument("--max-cross-pair-variants", type=int, default=1)
-    pair.add_argument("--seed", type=int, default=0)
     pair.add_argument("--speech-open-tag", default="<d>")
     pair.add_argument("--speech-close-tag", default="</d>")
     pair.add_argument("--renderer-profile", default="h3_v1")
@@ -183,7 +182,6 @@ def _pair(arguments: argparse.Namespace) -> dict[str, object]:
         voice_margin_threshold=arguments.voice_margin,
         text_threshold=arguments.text_threshold,
         max_cross_pair_variants_per_target=arguments.max_cross_pair_variants,
-        deterministic_seed=arguments.seed,
         speech_open_tag=arguments.speech_open_tag,
         speech_close_tag=arguments.speech_close_tag,
         renderer_profile=arguments.renderer_profile,

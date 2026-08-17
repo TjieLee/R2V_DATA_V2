@@ -35,7 +35,6 @@ class AudioPairingConfig:
     text_threshold: float = 0.30
     minimum_local_binding_confidence: float = 0.80
     max_cross_pair_variants_per_target: int = 1
-    deterministic_seed: int = 0
     renderer_profile: str = "h3_v1"
     speech_open_tag: str = "<d>"
     speech_close_tag: str = "</d>"
@@ -56,10 +55,8 @@ class AudioPairingConfig:
             raise ValueError("pair thresholds must be finite cosine/probability values")
         if self.face_without_text_strict_threshold < self.face_strict_threshold:
             raise ValueError("missing-text face threshold must not be weaker")
-        if self.max_cross_pair_variants_per_target < 0:
-            raise ValueError("max cross-pair variants must be non-negative")
-        if self.deterministic_seed < 0:
-            raise ValueError("deterministic seed must be non-negative")
+        if self.max_cross_pair_variants_per_target not in {0, 1}:
+            raise ValueError("max cross-pair variants must be 0 or 1 in V1")
         if (
             not self.renderer_profile.strip()
             or not self.speech_open_tag
@@ -247,6 +244,14 @@ def _draft_annotation(
         occurrence.entity_id: index
         for index, occurrence in enumerate(subject_occurrences, start=1)
     }
+    mapping_lines = ["<Audio 1> is the target full audio."]
+    for index in range(1, len(subject_occurrences) + 1):
+        mapping_lines.extend(
+            [
+                f"<Subject {index}> uses <Picture {index}>.",
+                f"<Audio {index + 1}> is the voice reference for <Subject {index}>.",
+            ]
+        )
     speech_lines: list[str] = []
     for turn in speech_turns:
         if turn.text is None:
@@ -254,16 +259,13 @@ def _draft_annotation(
         if turn.entity_id not in subject_index:
             raise ValueError("published transcript has an unknown subject")
         speech_lines.append(
-            f"subject_{subject_index[turn.entity_id]} says "
+            f"<Subject {subject_index[turn.entity_id]}> says "
             f"{config.speech_open_tag}{turn.text}{config.speech_close_tag}"
         )
-    text = binding.visual_r2v_instruction.strip()
-    if speech_lines:
-        text = f"{text}\n" + "\n".join(speech_lines)
-    if not text:
-        text = binding.visual_t2v_caption.strip()
-    if not text:
+    visual_text = binding.visual_r2v_instruction.strip() or binding.visual_t2v_caption.strip()
+    if not visual_text:
         raise ValueError("draft annotation requires existing visual text")
+    text = "\n".join([visual_text, *mapping_lines, *speech_lines])
     if text.count(config.speech_open_tag) != text.count(config.speech_close_tag):
         raise ValueError("speech delimiter tags must be paired")
     if f"{config.speech_open_tag}{config.speech_close_tag}" in text:
@@ -497,6 +499,44 @@ def _published_speech_turns(
     ]
 
 
+def _best_complete_matching(
+    candidate_sets: list[list[tuple[PairEvidence, EntityOccurrence]]],
+) -> list[tuple[PairEvidence, EntityOccurrence]] | None:
+    best: list[tuple[PairEvidence, EntityOccurrence]] | None = None
+    best_key: tuple[float, tuple[str, ...]] | None = None
+
+    def search(
+        target_index: int,
+        selected: list[tuple[PairEvidence, EntityOccurrence]],
+        used_reference_ids: set[str],
+        score: float,
+    ) -> None:
+        nonlocal best, best_key
+        if target_index == len(candidate_sets):
+            reference_ids = tuple(item[1].entity_occurrence_id for item in selected)
+            key = (-score, reference_ids)
+            if best_key is None or key < best_key:
+                best = list(selected)
+                best_key = key
+            return
+        for edge, reference in candidate_sets[target_index]:
+            if reference.entity_occurrence_id in used_reference_ids:
+                continue
+            selected.append((edge, reference))
+            used_reference_ids.add(reference.entity_occurrence_id)
+            search(
+                target_index + 1,
+                selected,
+                used_reference_ids,
+                score + edge.combined_score,
+            )
+            used_reference_ids.remove(reference.entity_occurrence_id)
+            selected.pop()
+
+    search(0, [], set(), 0.0)
+    return best
+
+
 def build_audio_pair_samples(
     bindings: list[AudioClipBinding],
     *,
@@ -593,16 +633,11 @@ def build_audio_pair_samples(
             )
             continue
         cross_targets = speaking
-        selected_edges: list[PairEvidence] = []
-        reference_occurrences: list[EntityOccurrence] = []
-        used_reference_ids: set[str] = set()
-        complete = True
+        candidate_sets: list[list[tuple[PairEvidence, EntityOccurrence]]] = []
         for target_occurrence in cross_targets:
-            candidates = []
+            candidates: list[tuple[PairEvidence, EntityOccurrence]] = []
             for edge in edge_by_target.get(target_occurrence.entity_occurrence_id, []):
                 reference = occurrence_by_id[edge.reference_entity_occurrence_id]
-                if reference.entity_occurrence_id in used_reference_ids:
-                    continue
                 reference_clip = binding_by_clip[
                     reference.entity_occurrence_id.split("/", 1)[0]
                 ]
@@ -625,20 +660,11 @@ def build_audio_pair_samples(
                 ):
                     continue
                 candidates.append((edge, reference))
-            if not candidates:
-                complete = False
-                break
-            edge, reference = min(
-                candidates,
-                key=lambda item: (
-                    -item[0].combined_score,
-                    item[1].entity_occurrence_id,
-                ),
+            candidate_sets.append(
+                sorted(candidates, key=lambda item: item[1].entity_occurrence_id)
             )
-            selected_edges.append(edge)
-            reference_occurrences.append(reference)
-            used_reference_ids.add(reference.entity_occurrence_id)
-        if not complete:
+        matching = _best_complete_matching(candidate_sets)
+        if matching is None:
             incomplete_cross.append(
                 {
                     "clip_uid": binding.clip_uid,
@@ -646,6 +672,8 @@ def build_audio_pair_samples(
                 }
             )
             continue
+        selected_edges = [item[0] for item in matching]
+        reference_occurrences = [item[1] for item in matching]
         subject_bindings = [
             PairSubjectBinding(
                 subject_id=f"subject_{index}",

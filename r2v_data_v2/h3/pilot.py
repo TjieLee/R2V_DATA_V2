@@ -208,6 +208,7 @@ def run_h3_audio_binding_pilot(
         "asd_runtime_failures": 0,
     }
     failures: list[dict[str, object]] = []
+    canonical_sidecars: list[dict[str, object]] = []
     try:
         temporary.mkdir()
         for clip_path in clip_paths:
@@ -284,6 +285,12 @@ def run_h3_audio_binding_pilot(
                     media_backend=review_media_backend,
                     source_audio_path=Path(runtime_native.audio_path),
                 )
+                sidecar_payload = sidecar.model_dump(mode="json")
+                _write_json(
+                    temporary / "clips" / clip_uid / "audio_binding.json",
+                    sidecar_payload,
+                )
+                canonical_sidecars.append(sidecar_payload)
                 counters["clips_succeeded"] += 1
                 counters["clips_with_speech"] += int(bool(speech.intervals))
                 counters["face_entity_association_failures"] += sum(
@@ -320,6 +327,7 @@ def run_h3_audio_binding_pilot(
         )
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
         _write_jsonl(temporary / "failures.jsonl", failures)
+        _write_jsonl(temporary / "audio_bindings.jsonl", canonical_sidecars)
         temporary.replace(destination)
         return summary
     except Exception:

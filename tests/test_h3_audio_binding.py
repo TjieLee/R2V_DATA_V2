@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
 from r2v_data_v2.h3.association import (
@@ -15,6 +16,12 @@ from r2v_data_v2.h3.association import (
     associate_face_tracks_to_entities,
     nearest_track_sample,
 )
+from r2v_data_v2.h3.audio_backends import (
+    PrecomputedAudioMediaBackend,
+    PrecomputedEmbeddingBackend,
+)
+from r2v_data_v2.h3.audio_binding import build_audio_clip_binding_dataset
+from r2v_data_v2.h3.audio_schemas import AudioStreamProvenance
 from r2v_data_v2.h3.backends import (
     EntityFaceAssociationBackend,
     PrecomputedEvidenceBackend,
@@ -1268,6 +1275,17 @@ def test_pilot_isolates_lr_asd_failure_and_runs_backend_once_per_clip(
     assert summary.clips_failed == 1
     assert summary.asd_runtime_failures == 1
     assert (tmp_path / "pilot" / "review" / "clip-2" / "timeline.json").is_file()
+    assert (
+        tmp_path / "pilot" / "clips" / "clip-2" / "audio_binding.json"
+    ).is_file()
+    canonical_records = [
+        json.loads(line)
+        for line in (tmp_path / "pilot" / "audio_bindings.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line
+    ]
+    assert [item["clip_uid"] for item in canonical_records] == ["clip-2"]
     failures = [
         json.loads(line)
         for line in (tmp_path / "pilot" / "failures.jsonl")
@@ -1385,3 +1403,106 @@ def test_pilot_rebases_internal_runtime_paths_before_atomic_publication(
         )
     )
     assert sidecar["evidence"]["audio"]["full_audio_path"] == str(audio_path)
+
+
+def test_pilot_canonical_sidecar_is_directly_consumed_by_bind_dataset(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.mp4"
+    audio = tmp_path / "audio.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    run_root = tmp_path / "run"
+    clip = _pilot_clip("clip-1", source)
+    _write_pilot_clip(
+        run_root,
+        clip,
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    pilot_root = tmp_path / "pilot"
+    run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=pilot_root,
+        lr_asd_backend=PrecomputedLRASDBackend(
+            {
+                "clip-1": _native_artifact(
+                    clip_uid="clip-1",
+                    source_video=source,
+                    audio_path=audio,
+                    logits_by_track=[[0.7] * 10],
+                )
+            }
+        ),
+        speech_backend=PrecomputedSpeechActivityBackend(
+            {"clip-1": _speech_artifact("clip-1", audio, speech=True)}
+        ),
+        review_media_backend=_FakeReviewMediaBackend(),
+        clip_ids=["clip-1"],
+    )
+    review_sidecar = pilot_root / "review" / "clip-1" / "audio_binding.json"
+    canonical_sidecar = pilot_root / "clips" / "clip-1" / "audio_binding.json"
+    assert canonical_sidecar.read_bytes() == review_sidecar.read_bytes()
+
+    visual_root = tmp_path / "visual-export"
+    reference_path = visual_root / "references" / "clip-1" / "subject_1.png"
+    reference_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "navy").save(reference_path)
+    (visual_root / "samples.jsonl").write_text(
+        json.dumps(
+            {
+                "sample_id": "clip-1",
+                "target_video": str(source),
+                "t2v_caption": "A person speaks.",
+                "r2v_instruction": "Use the person reference.",
+                "references": [
+                    {
+                        "type": "entity",
+                        "entity_id": "e1",
+                        "image_path": "references/clip-1/subject_1.png",
+                        "token": "<ref_subject_1>",
+                        "scope": "full",
+                        "visible_region": "whole",
+                        "source_frame_index": 5,
+                        "source_clip_uid": "clip-1",
+                        "source_entity_id": "e1",
+                        "synthetic": False,
+                    }
+                ],
+                "source": {"parent_video_id": "parent", "clip_suffix": "1"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    full_audio = tmp_path / "full.flac"
+    full_audio.write_bytes(b"full-audio")
+    outputs = build_audio_clip_binding_dataset(
+        run_root=run_root,
+        visual_export_root=visual_root,
+        sidecar_root=pilot_root,
+        output_root=tmp_path / "audio-bindings",
+        audio_backend=PrecomputedAudioMediaBackend(
+            {"clip-1": full_audio},
+            {},
+            {
+                "clip-1": AudioStreamProvenance(
+                    stream_index=0,
+                    codec_name="aac",
+                    original_sample_rate_hz=16000,
+                    original_channels=1,
+                    duration_seconds=0.4,
+                    time_base="1/16000",
+                )
+            },
+        ),
+        face_backend=PrecomputedEmbeddingBackend(
+            {"clip-1/e1": np.asarray([1.0, 0.0], dtype=np.float32)},
+            model_identifier="fake-face",
+        ),
+        speaker_backend=PrecomputedEmbeddingBackend(
+            {},
+            model_identifier="fake-speaker",
+        ),
+    )
+
+    assert [item.clip_uid for item in outputs] == ["clip-1"]

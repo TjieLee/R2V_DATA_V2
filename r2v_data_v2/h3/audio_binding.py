@@ -187,23 +187,45 @@ def _frame_range(binding: AudioEntityBinding, frame_rate: float) -> tuple[int, i
     )
 
 
-def _turn_text(
-    start_time: float,
-    end_time: float,
+def _turn_texts(
+    groups: Sequence[Sequence[tuple[int, AudioEntityBinding]]],
     transcript_segments: Sequence[TranscriptSegment],
-) -> tuple[str | None, str]:
-    matches = [
-        item
-        for item in transcript_segments
-        if item.start_time < end_time and item.end_time > start_time
-    ]
-    if not matches:
-        return None, "missing"
-    text = " ".join(item.text.strip() for item in matches if item.text.strip()).strip()
-    if not text:
-        return None, "missing"
-    status = "reviewed" if all(item.status == "reviewed" for item in matches) else "auto"
-    return text, status
+) -> list[tuple[str | None, str]]:
+    assigned: list[list[TranscriptSegment]] = [[] for _ in groups]
+    for segment in sorted(
+        transcript_segments,
+        key=lambda item: (item.start_time, item.end_time, item.text),
+    ):
+        overlaps = [
+            max(
+                0.0,
+                min(segment.end_time, group[-1][1].end_time)
+                - max(segment.start_time, group[0][1].start_time),
+            )
+            if group[0][1].status == "bound"
+            else 0.0
+            for group in groups
+        ]
+        maximum = max(overlaps, default=0.0)
+        if maximum <= 0:
+            continue
+        winners = [
+            index
+            for index, overlap in enumerate(overlaps)
+            if abs(overlap - maximum) <= 1e-6
+        ]
+        if len(winners) == 1:
+            assigned[winners[0]].append(segment)
+
+    results: list[tuple[str | None, str]] = []
+    for matches in assigned:
+        if not matches:
+            results.append((None, "missing"))
+            continue
+        text = " ".join(item.text.strip() for item in matches).strip()
+        status = "reviewed" if all(item.status == "reviewed" for item in matches) else "auto"
+        results.append((text, status))
+    return results
 
 
 def coalesce_audio_bindings(
@@ -240,8 +262,6 @@ def coalesce_audio_bindings(
             and previous.status == "bound"
             and binding.entity_id == previous.entity_id
             and binding.face_track_id == previous.face_track_id
-            and binding.evidence.clean_training_eligible
-            == previous.evidence.clean_training_eligible
             and binding.start_time - previous.end_time <= maximum_gap_seconds
         )
         if mergeable:
@@ -249,20 +269,20 @@ def coalesce_audio_bindings(
         else:
             groups.append([(index, binding)])
 
+    turn_texts = _turn_texts(groups, transcript_segments)
     turns: list[SpeechTurn] = []
     for turn_index, group in enumerate(groups, start=1):
         first = group[0][1]
         last = group[-1][1]
         frame_ranges = [_frame_range(binding, frame_rate) for _, binding in group]
-        text, text_status = _turn_text(
-            first.start_time,
-            last.end_time,
-            transcript_segments,
-        )
+        text, text_status = turn_texts[turn_index - 1]
         duration = last.end_time - first.start_time
         voice_eligible = (
-            first.status == "bound"
-            and all(binding.evidence.clean_training_eligible for _, binding in group)
+            all(binding.status == "bound" for _, binding in group)
+            and all(binding.entity_id == first.entity_id for _, binding in group)
+            and all(binding.face_track_id == first.face_track_id for _, binding in group)
+            and all(binding.evidence.audio_quality_usable for _, binding in group)
+            and all(binding.evidence.synchronization_plausible for _, binding in group)
             and duration >= minimum_voice_reference_duration_seconds
         )
         turns.append(
@@ -406,6 +426,30 @@ def _copy_visual_reference(
     temporary.replace(destination)
 
 
+def _validate_sidecar_identity(
+    sidecar: AudioBindingSidecar,
+    visual: VisualClipInput,
+) -> None:
+    if sidecar.clip_uid != visual.clip_uid:
+        raise ValueError("audio sidecar clip_uid does not match visual clip")
+    visual_video = visual.source_video_path.expanduser().resolve(strict=True)
+    sidecar_video = Path(sidecar.source_video_path).expanduser().resolve(strict=True)
+    if sidecar_video != visual_video:
+        raise ValueError("audio sidecar source video does not match visual source")
+    if sidecar.evidence is not None:
+        if sidecar.evidence.clip_uid != visual.clip_uid:
+            raise ValueError("audio evidence clip_uid does not match visual clip")
+        evidence_video = (
+            Path(sidecar.evidence.audio.source_video_path)
+            .expanduser()
+            .resolve(strict=True)
+        )
+        if evidence_video != visual_video:
+            raise ValueError("audio evidence source video does not match visual source")
+    if sidecar.h3_ir is not None and sidecar.h3_ir.clip_uid != visual.clip_uid:
+        raise ValueError("audio H3 IR clip_uid does not match visual clip")
+
+
 def _write_jsonl(path: Path, values: Sequence[object]) -> None:
     path.write_text(
         "".join(
@@ -496,8 +540,11 @@ def _build_audio_clip_binding_batch(
             sidecar_record = AudioBindingSidecar.model_validate_json(
                 sidecar_path.read_text(encoding="utf-8")
             )
+            _validate_sidecar_identity(sidecar_record, visual)
             if sidecar_record.status != "ready" or sidecar_record.evidence is None:
-                continue
+                raise ValueError(
+                    f"audio sidecar is {sidecar_record.status}: {sidecar_record.reason}"
+                )
             full_path = temporary / "full_audio" / (
                 f"{visual.clip_uid}.{active.full_audio_format}"
             )
@@ -846,12 +893,32 @@ def build_audio_clip_binding_dataset(
     )
     outputs: list[AudioClipBinding] = []
     failures: list[dict[str, object]] = []
+    ineligible_clip_count = 0
+    failed_clip_count = 0
     successful_roots: list[Path] = []
     try:
         staging.mkdir(parents=True)
         for visual in visual_inputs:
             clip_root = staging / visual.clip_uid
             try:
+                sidecar_path = sidecar / "clips" / visual.clip_uid / "audio_binding.json"
+                sidecar_record = AudioBindingSidecar.model_validate_json(
+                    sidecar_path.read_text(encoding="utf-8")
+                )
+                _validate_sidecar_identity(sidecar_record, visual)
+                if sidecar_record.status != "ready":
+                    if sidecar_record.status == "ineligible":
+                        ineligible_clip_count += 1
+                    else:
+                        failed_clip_count += 1
+                    failures.append(
+                        {
+                            "clip_uid": visual.clip_uid,
+                            "status": sidecar_record.status,
+                            "reason": sidecar_record.reason,
+                        }
+                    )
+                    continue
                 clip_outputs = _build_audio_clip_binding_batch(
                     run_root=source_run,
                     visual_export_root=visual_export,
@@ -867,9 +934,11 @@ def build_audio_clip_binding_dataset(
                     visual_inputs=[visual],
                 )
             except Exception as exc:  # noqa: BLE001 - isolate one source clip
+                failed_clip_count += 1
                 failures.append(
                     {
                         "clip_uid": visual.clip_uid,
+                        "status": "failed",
                         "failure_type": type(exc).__name__,
                         "reason": str(exc),
                     }
@@ -898,8 +967,17 @@ def build_audio_clip_binding_dataset(
         outputs.sort(key=lambda item: item.clip_uid)
         _write_jsonl(temporary / "clip_bindings.jsonl", outputs)
         (temporary / "pair_samples.jsonl").write_text("", encoding="utf-8")
+        binding_report = {
+            "selected_clip_count": len(visual_inputs),
+            "clip_binding_count": len(outputs),
+            "ineligible_clip_count": ineligible_clip_count,
+            "failed_clip_count": failed_clip_count,
+            "pair_sample_count": 0,
+        }
+        if len(visual_inputs) != len(outputs) + ineligible_clip_count + failed_clip_count:
+            raise RuntimeError("audio clip binding accounting is inconsistent")
         (temporary / "pair_report.json").write_text(
-            json.dumps({"pair_sample_count": 0}, sort_keys=True) + "\n",
+            json.dumps(binding_report, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         (temporary / "failures.jsonl").write_text(
@@ -912,7 +990,7 @@ def build_audio_clip_binding_dataset(
         (temporary / "dataset.json").write_text(
             AudioDatasetManifest(
                 clip_binding_count=len(outputs),
-                failed_clip_count=len(failures),
+                failed_clip_count=failed_clip_count,
                 pair_sample_count=0,
                 producer_provenance=producer,
             ).model_dump_json(indent=2)
