@@ -1,0 +1,1774 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import math
+import os
+import re
+import time
+from collections import Counter
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+import numpy as np
+from openai import OpenAI
+from PIL import Image
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+
+import r2v_data_v2.v3.config as v3_config_module
+from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.config import QwenServiceConfig, V3Config
+from r2v_data_v2.v3.mask_codec import decode_binary_mask
+from r2v_data_v2.v3.pair import (
+    EntityReferenceCandidate,
+    build_candidate_context_image,
+    build_entity_reference_candidates,
+    build_reference_crop,
+    mask_component_diagnostics,
+)
+from r2v_data_v2.v3.profiling import profiled_openai_call
+from r2v_data_v2.v3.sam3_backend import (
+    EntityTrackResult,
+    Sam3SegmentationBackend,
+    SegmentationBackend,
+)
+from r2v_data_v2.v3.schemas import (
+    AnnotationEntity,
+    ClipRecord,
+    EntityReferenceState,
+    SampledFramesArtifact,
+    TrackedMasksArtifact,
+    render_annotation_plain_text,
+)
+from r2v_data_v2.v3.storage import RunStorage
+
+ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION = "r2v.v3.subject_attributes.1"
+ATTRIBUTE_OWNER_SCHEMA_VERSION = "r2v.v3.subject_attribute_owner.1"
+ENRICHED_SAMPLE_SCHEMA_VERSION = "r2v.v3.enriched_sample.1"
+MAX_ATTRIBUTES_PER_OWNER = 3
+MIN_ATTRIBUTE_AREA_PIXELS = 16
+MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 4
+MAX_ATTRIBUTE_TO_OWNER_AREA_RATIO = 0.85
+WRONG_OWNER_MINIMUM_OVERLAP_RATIO = 0.50
+
+_IMAGE_PLACEHOLDER = re.compile(r"\{\{image_([1-9]\d*)\}\}")
+_ANGLE_IMAGE_LABEL = re.compile(r"<Image ([1-9]\d*)>")
+_ANY_REF_TOKEN = re.compile(r"<ref_[^>]+>")
+
+
+AttributeType = Literal[
+    "face",
+    "hair",
+    "headwear",
+    "glasses",
+    "upper_clothing",
+    "lower_clothing",
+    "dress_or_skirt",
+    "shoes",
+    "bag",
+    "accessory",
+]
+
+
+class _SchemaModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DiscoveredSubjectAttribute(_SchemaModel):
+    attribute_type: AttributeType
+    phrase: str
+    grounding_prompt: str
+
+    @model_validator(mode="after")
+    def validate_text(self) -> DiscoveredSubjectAttribute:
+        if not self.phrase.strip() or not self.grounding_prompt.strip():
+            raise ValueError("discovered attribute text must not be empty")
+        if _ANY_REF_TOKEN.search(self.phrase) or _ANY_REF_TOKEN.search(
+            self.grounding_prompt
+        ):
+            raise ValueError("discovered attribute text must not contain ref tokens")
+        return self
+
+
+class SubjectAttributeDiscovery(_SchemaModel):
+    owner_entity_id: str = Field(pattern=r"^e[1-9]\d*$")
+    owner_is_human: StrictBool
+    attributes: list[DiscoveredSubjectAttribute] = Field(
+        default_factory=list,
+        max_length=MAX_ATTRIBUTES_PER_OWNER,
+    )
+
+    @model_validator(mode="after")
+    def validate_attributes(self) -> SubjectAttributeDiscovery:
+        if not self.owner_is_human and self.attributes:
+            raise ValueError("non-human subjects must not publish attributes")
+        kinds = [attribute.attribute_type for attribute in self.attributes]
+        if len(kinds) != len(set(kinds)):
+            raise ValueError("discovery must not repeat an attribute type")
+        return self
+
+
+class SubjectAttributeReview(_SchemaModel):
+    attribute_id: str = Field(pattern=r"^a[1-9]\d*$")
+    matches_attribute: StrictBool
+    owner_binding_correct: StrictBool
+    recognizable: StrictBool
+    characteristic_appearance_visible: StrictBool
+    usable_as_attribute_condition: StrictBool
+    reason: str
+
+    @property
+    def accepted(self) -> bool:
+        return all(
+            (
+                self.matches_attribute,
+                self.owner_binding_correct,
+                self.recognizable,
+                self.characteristic_appearance_visible,
+                self.usable_as_attribute_condition,
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> SubjectAttributeReview:
+        if not self.reason.strip():
+            raise ValueError("attribute review reason must not be empty")
+        return self
+
+
+class SubjectAttributeReviewBatch(_SchemaModel):
+    owner_entity_id: str = Field(pattern=r"^e[1-9]\d*$")
+    reviews: list[SubjectAttributeReview]
+
+    @model_validator(mode="after")
+    def validate_unique_ids(self) -> SubjectAttributeReviewBatch:
+        ids = [review.attribute_id for review in self.reviews]
+        if len(ids) != len(set(ids)):
+            raise ValueError("attribute review IDs must be unique")
+        return self
+
+
+class OwnershipGeometry(_SchemaModel):
+    passed: bool
+    reason: str
+    owner_overlap_ratio: float = Field(ge=0, le=1)
+    maximum_other_owner_overlap_ratio: float = Field(ge=0, le=1)
+    attribute_to_owner_area_ratio: float = Field(ge=0)
+    near_owner_region: bool
+    attribute_area_pixels: int = Field(ge=0)
+    attribute_long_side_pixels: int = Field(ge=0)
+    significant_component_count: int = Field(ge=0)
+    largest_component_ratio: float = Field(ge=0, le=1)
+    second_largest_component_ratio: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_reason(self) -> OwnershipGeometry:
+        if not self.reason.strip():
+            raise ValueError("ownership geometry reason must not be empty")
+        return self
+
+
+class SubjectAttributeRecord(_SchemaModel):
+    attribute_id: str = Field(pattern=r"^a[1-9]\d*$")
+    owner_entity_id: str = Field(pattern=r"^e[1-9]\d*$")
+    attribute_type: AttributeType
+    phrase: str
+    grounding_prompt: str
+    status: Literal["accepted", "rejected"]
+    image_path: str | None = None
+    source_frame_index: int | None = Field(default=None, ge=0)
+    source_frame_slot: int | None = Field(default=None, ge=0, lt=10)
+    owner_candidate_id: str | None = None
+    same_frame_as_owner_reference: bool | None = None
+    sam3_prompt: str
+    ownership_geometry: OwnershipGeometry | None = None
+    review: SubjectAttributeReview | None = None
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_record(self) -> SubjectAttributeRecord:
+        if not self.phrase.strip() or not self.grounding_prompt.strip():
+            raise ValueError("attribute record text must not be empty")
+        if not self.sam3_prompt.strip() or not self.reason.strip():
+            raise ValueError("attribute record provenance must not be empty")
+        provenance = (
+            self.image_path,
+            self.source_frame_index,
+            self.source_frame_slot,
+            self.owner_candidate_id,
+            self.same_frame_as_owner_reference,
+        )
+        if self.status == "accepted":
+            if any(value is None for value in provenance):
+                raise ValueError("accepted attribute requires complete image provenance")
+            if self.ownership_geometry is None or not self.ownership_geometry.passed:
+                raise ValueError("accepted attribute requires passed ownership geometry")
+            if self.review is None or not self.review.accepted:
+                raise ValueError("accepted attribute requires an accepted review")
+            if self.review.attribute_id != self.attribute_id:
+                raise ValueError("attribute record review ID must match")
+        elif self.image_path is not None:
+            raise ValueError("rejected attribute must not publish an image")
+        return self
+
+
+class OwnerEnrichmentMetrics(_SchemaModel):
+    discovery_calls: int = Field(default=0, ge=0, le=1)
+    review_calls: int = Field(default=0, ge=0, le=1)
+    sam3_attempts: int = Field(default=0, ge=0, le=MAX_ATTRIBUTES_PER_OWNER)
+    discovered_by_type: dict[str, int] = Field(default_factory=dict)
+    deterministic_ownership_rejects: int = Field(default=0, ge=0)
+    recognizability_rejects: int = Field(default=0, ge=0)
+    accepted_attributes: int = Field(default=0, ge=0)
+    same_frame_accepted: int = Field(default=0, ge=0)
+    different_frame_accepted: int = Field(default=0, ge=0)
+    qwen_model_call_time_seconds: float = Field(default=0.0, ge=0)
+    sam3_model_call_time_seconds: float = Field(default=0.0, ge=0)
+    failures: int = Field(default=0, ge=0)
+
+
+class OwnerEnrichmentArtifact(_SchemaModel):
+    schema_version: Literal[
+        "r2v.v3.subject_attribute_owner.1"
+    ] = ATTRIBUTE_OWNER_SCHEMA_VERSION
+    sample_id: str
+    owner_entity_id: str = Field(pattern=r"^e[1-9]\d*$")
+    owner_is_human: bool | None
+    attribute_id_start: int = Field(ge=1)
+    owner_phrase: str
+    owner_grounding_prompt: str
+    records: list[SubjectAttributeRecord]
+    metrics: OwnerEnrichmentMetrics
+    failure_reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_ids(self) -> OwnerEnrichmentArtifact:
+        expected = [
+            f"a{index}"
+            for index in range(
+                self.attribute_id_start,
+                self.attribute_id_start + len(self.records),
+            )
+        ]
+        actual = [record.attribute_id for record in self.records]
+        if actual != expected:
+            raise ValueError("owner attribute IDs must be contiguous and ordered")
+        if any(record.owner_entity_id != self.owner_entity_id for record in self.records):
+            raise ValueError("owner artifact records must use one owner_entity_id")
+        if self.owner_is_human is not True and self.records:
+            raise ValueError("only a confirmed human owner may publish attributes")
+        if self.metrics.discovery_calls != 1:
+            raise ValueError("eligible owner artifact requires one discovery call")
+        if self.metrics.accepted_attributes != sum(
+            record.status == "accepted" for record in self.records
+        ):
+            raise ValueError("owner accepted count must match records")
+        return self
+
+
+class EnrichedReference(_SchemaModel):
+    image_id: str = Field(pattern=r"^image_[1-9]\d*$")
+    image_index: int = Field(ge=1)
+    kind: Literal["subject", "object", "group", "background", "attribute"]
+    origin: Literal["visual_run", "attribute_enrichment"]
+    entity_id: str | None = None
+    attribute_id: str | None = None
+    owner_entity_id: str | None = None
+    image_path: str
+    source_frame_index: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> EnrichedReference:
+        if self.image_id != f"image_{self.image_index}":
+            raise ValueError("enriched reference image_id must match image_index")
+        if self.kind == "attribute":
+            if (
+                self.origin != "attribute_enrichment"
+                or self.attribute_id is None
+                or self.owner_entity_id is None
+                or self.entity_id is not None
+            ):
+                raise ValueError("attribute reference requires owner-bound provenance")
+        elif self.attribute_id is not None or self.owner_entity_id is not None:
+            raise ValueError("visual references cannot publish attribute provenance")
+        elif self.kind == "background":
+            if self.entity_id is not None:
+                raise ValueError("background reference entity_id must be null")
+        elif self.entity_id is None:
+            raise ValueError("entity reference requires entity_id")
+        return self
+
+
+class EnrichedSample(_SchemaModel):
+    schema_version: Literal[
+        "r2v.v3.enriched_sample.1"
+    ] = ENRICHED_SAMPLE_SCHEMA_VERSION
+    sample_id: str
+    clip_uid: str
+    source_run_root: str
+    original_visual: dict[str, object]
+    original_instruction: str
+    enriched_instruction: str
+    references: list[EnrichedReference]
+    accepted_attributes: list[SubjectAttributeRecord]
+
+    @model_validator(mode="after")
+    def validate_sample(self) -> EnrichedSample:
+        indexes = [reference.image_index for reference in self.references]
+        if indexes != list(range(1, len(indexes) + 1)):
+            raise ValueError("enriched reference indexes must be contiguous")
+        expected_labels = {str(index) for index in indexes}
+        if set(_ANGLE_IMAGE_LABEL.findall(self.enriched_instruction)) != expected_labels:
+            raise ValueError("enriched instruction labels must match references")
+        accepted_ids = [record.attribute_id for record in self.accepted_attributes]
+        reference_ids = [
+            reference.attribute_id
+            for reference in self.references
+            if reference.kind == "attribute"
+        ]
+        if reference_ids != accepted_ids:
+            raise ValueError("enriched attribute references must match accepted records")
+        if any(record.status != "accepted" for record in self.accepted_attributes):
+            raise ValueError("enriched sample may contain only accepted attributes")
+        return self
+
+
+@dataclass(frozen=True)
+class OwnerEligibility:
+    eligible: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class PendingAttributeCandidate:
+    discovered: DiscoveredSubjectAttribute
+    attribute_id: str
+    owner_entity_id: str
+    owner_candidate: EntityReferenceCandidate
+    attribute_mask: np.ndarray
+    source_image: Image.Image
+    crop: Image.Image
+    geometry: OwnershipGeometry
+
+
+@dataclass
+class EnrichmentTotals:
+    eligible_human_owners: int = 0
+    screened_nonhuman_subjects: int = 0
+    skipped_existing_owners: int = 0
+    discovery_calls: int = 0
+    review_calls: int = 0
+    sam3_attempts: int = 0
+    discovered_by_type: Counter[str] = field(default_factory=Counter)
+    deterministic_ownership_rejects: int = 0
+    recognizability_rejects: int = 0
+    accepted_attributes: int = 0
+    same_frame_accepted: int = 0
+    different_frame_accepted: int = 0
+    qwen_model_call_time_seconds: float = 0.0
+    sam3_model_call_time_seconds: float = 0.0
+    failures: int = 0
+    failure_reasons: Counter[str] = field(default_factory=Counter)
+
+    def add_owner_metrics(self, metrics: OwnerEnrichmentMetrics) -> None:
+        self.discovery_calls += metrics.discovery_calls
+        self.review_calls += metrics.review_calls
+        self.sam3_attempts += metrics.sam3_attempts
+        self.discovered_by_type.update(metrics.discovered_by_type)
+        self.deterministic_ownership_rejects += (
+            metrics.deterministic_ownership_rejects
+        )
+        self.recognizability_rejects += metrics.recognizability_rejects
+        self.accepted_attributes += metrics.accepted_attributes
+        self.same_frame_accepted += metrics.same_frame_accepted
+        self.different_frame_accepted += metrics.different_frame_accepted
+        self.qwen_model_call_time_seconds += metrics.qwen_model_call_time_seconds
+        self.sam3_model_call_time_seconds += metrics.sam3_model_call_time_seconds
+        self.failures += metrics.failures
+
+
+class SubjectAttributeDiscoveryClient(Protocol):
+    def discover(
+        self,
+        *,
+        owner: AnnotationEntity,
+        owner_candidates: list[EntityReferenceCandidate],
+        source_images: dict[str, Image.Image],
+    ) -> SubjectAttributeDiscovery: ...
+
+
+class SubjectAttributeReviewClient(Protocol):
+    def review(
+        self,
+        *,
+        owner: AnnotationEntity,
+        candidates: list[PendingAttributeCandidate],
+    ) -> SubjectAttributeReviewBatch: ...
+
+
+DISCOVERY_SYSTEM_PROMPT = """Inspect one explicitly identified V3 subject in
+up to three existing strong Visual V3 candidate frames. Return at most three
+clearly visible, visually distinctive, segmentable attributes that are
+unambiguously owned by that subject. Omit uncertain, tiny, generic, hidden, or
+weak items; zero attributes is valid. Prefer useful face or hair, distinctive
+clothing, headwear or glasses, then shoes, bag, or another clear wearable
+accessory. Do not enumerate every small item. grounding_prompt must include the
+owner relation, for example 'the red jacket worn by the woman'. Return one JSON
+object with owner_entity_id and attributes. Each attribute has exactly
+attribute_type, phrase, and grounding_prompt. Allowed types are face, hair,
+headwear, glasses, upper_clothing, lower_clothing, dress_or_skirt, shoes, bag,
+and accessory. Also return owner_is_human. If the subject is an animal,
+non-human creature, or non-human character, set owner_is_human=false and return
+an empty attributes list. Return JSON only."""
+
+
+REVIEW_SYSTEM_PROMPT = """Review all proposed subject-bound attribute crops for
+one known owner together. For every supplied attribute_id, judge only visible
+evidence. matches_attribute means the mask crop depicts the named component,
+owner_binding_correct means it belongs to the intended person, recognizable
+means it is not a sleeve fragment, shoe tip, tiny edge, stray hair, or other
+unidentifiable fragment, characteristic_appearance_visible means useful shape,
+color, texture, or structure remains, and usable_as_attribute_condition means
+the raw transparent crop is independently useful for conditioning. Do not apply
+whole-object completeness semantics to face, hair, clothing, or wearables.
+Return exactly one review per supplied attribute in the same order, with all
+five booleans and one concise reason. Return JSON only."""
+
+
+def _png_data_url(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+class QwenSubjectAttributeClient:
+    def __init__(
+        self,
+        config: QwenServiceConfig,
+        *,
+        client: Any | None = None,
+    ) -> None:
+        self.config = config
+        self.client = client or OpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout_seconds,
+        )
+
+    def _request(
+        self,
+        *,
+        component: str,
+        system_prompt: str,
+        content: list[dict[str, object]],
+    ) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+        response = profiled_openai_call(
+            lambda: self.client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                response_format={"type": "json_object"},
+            ),
+            component=component,
+            operation="batch",
+            retry_index=0,
+            model=self.config.model,
+            messages=messages,
+            metadata={"response_format": "json_object"},
+        )
+        raw = response.choices[0].message.content
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"{component} returned empty content")
+        return raw
+
+    def discover(
+        self,
+        *,
+        owner: AnnotationEntity,
+        owner_candidates: list[EntityReferenceCandidate],
+        source_images: dict[str, Image.Image],
+    ) -> SubjectAttributeDiscovery:
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "owner_entity_id": owner.entity_id,
+                        "owner_phrase": owner.phrase,
+                        "owner_grounding_prompt": owner.grounding_prompt,
+                        "candidate_count": len(owner_candidates),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+        for candidate in owner_candidates[:MAX_ATTRIBUTES_PER_OWNER]:
+            source = source_images[candidate.image_path]
+            context = build_candidate_context_image(source, candidate.mask)
+            content.extend(
+                (
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Owner {owner.entity_id} strong candidate "
+                            f"{candidate.candidate_id}, source frame "
+                            f"{candidate.source_frame_index}"
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _png_data_url(context)},
+                    },
+                )
+            )
+        payload = SubjectAttributeDiscovery.model_validate_json(
+            self._request(
+                component="qwen_subject_attribute_discovery",
+                system_prompt=DISCOVERY_SYSTEM_PROMPT,
+                content=content,
+            )
+        )
+        if payload.owner_entity_id != owner.entity_id:
+            raise ValueError("attribute discovery returned the wrong owner_entity_id")
+        return payload
+
+    def review(
+        self,
+        *,
+        owner: AnnotationEntity,
+        candidates: list[PendingAttributeCandidate],
+    ) -> SubjectAttributeReviewBatch:
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "owner_entity_id": owner.entity_id,
+                        "owner_phrase": owner.phrase,
+                        "attributes": [
+                            {
+                                "attribute_id": candidate.attribute_id,
+                                "attribute_type": candidate.discovered.attribute_type,
+                                "phrase": candidate.discovered.phrase,
+                                "grounding_prompt": (
+                                    candidate.discovered.grounding_prompt
+                                ),
+                            }
+                            for candidate in candidates
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        ]
+        for candidate in candidates:
+            owner_context = build_candidate_context_image(
+                candidate.source_image,
+                candidate.owner_candidate.mask,
+            )
+            content.extend(
+                (
+                    {
+                        "type": "text",
+                        "text": f"{candidate.attribute_id} owner context",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": _png_data_url(owner_context)},
+                    },
+                    {
+                        "type": "text",
+                        "text": f"{candidate.attribute_id} isolated attribute crop",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _png_data_url(candidate.crop.convert("RGBA"))
+                        },
+                    },
+                )
+            )
+        payload = SubjectAttributeReviewBatch.model_validate_json(
+            self._request(
+                component="qwen_subject_attribute_review",
+                system_prompt=REVIEW_SYSTEM_PROMPT,
+                content=content,
+            )
+        )
+        expected_ids = [candidate.attribute_id for candidate in candidates]
+        if payload.owner_entity_id != owner.entity_id:
+            raise ValueError("attribute review returned the wrong owner_entity_id")
+        if [review.attribute_id for review in payload.reviews] != expected_ids:
+            raise ValueError("attribute review IDs must match proposed attributes")
+        return payload
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
+
+def evaluate_owner_eligibility(
+    clip: ClipRecord,
+    *,
+    entity_id: str,
+    has_usable_candidate_evidence: bool,
+) -> OwnerEligibility:
+    if clip.annotation is None or clip.annotation.status != "ready":
+        return OwnerEligibility(False, "annotation_not_ready")
+    if not clip.export.accepted:
+        return OwnerEligibility(False, "visual_export_not_accepted")
+    if clip.pairing is None or clip.pairing.status != "ready":
+        return OwnerEligibility(False, "pairing_not_ready")
+    entities = {entity.entity_id: entity for entity in clip.annotation.entities}
+    entity = entities.get(entity_id)
+    if entity is None:
+        return OwnerEligibility(False, "annotation_entity_missing")
+    if entity.reference_type != "subject":
+        return OwnerEligibility(False, "owner_is_not_subject")
+    if entity_id not in clip.pairing.retained_entity_ids:
+        return OwnerEligibility(False, "subject_not_retained")
+    references = {
+        reference.entity_id: reference for reference in clip.references.entities
+    }
+    reference = references.get(entity_id)
+    if reference is None or reference.status != "ready":
+        return OwnerEligibility(False, "published_subject_reference_not_ready")
+    integrity = clip.reference_integrity
+    if integrity is not None:
+        if integrity.status != "ready":
+            return OwnerEligibility(False, "reference_integrity_not_ready")
+        result = next(
+            (item for item in integrity.entities if item.entity_id == entity_id),
+            None,
+        )
+        if result is not None and result.status == "rejected":
+            return OwnerEligibility(False, "reference_integrity_rejected")
+    if not has_usable_candidate_evidence:
+        return OwnerEligibility(False, "usable_owner_candidate_evidence_missing")
+    return OwnerEligibility(True, "eligible")
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    rows, columns = np.nonzero(mask)
+    if not rows.size:
+        raise ValueError("mask must not be empty")
+    return (
+        int(columns.min()),
+        int(rows.min()),
+        int(columns.max()) + 1,
+        int(rows.max()) + 1,
+    )
+
+
+def _bboxes_intersect(
+    first: tuple[int, int, int, int],
+    second: tuple[int, int, int, int],
+) -> bool:
+    return not (
+        first[2] <= second[0]
+        or second[2] <= first[0]
+        or first[3] <= second[1]
+        or second[3] <= first[1]
+    )
+
+
+def evaluate_ownership_geometry(
+    attribute_mask: np.ndarray,
+    owner_mask: np.ndarray,
+    other_owner_masks: dict[str, np.ndarray],
+    *,
+    owner_padding_ratio: float,
+) -> OwnershipGeometry:
+    attribute = np.asarray(attribute_mask, dtype=bool)
+    owner = np.asarray(owner_mask, dtype=bool)
+    if attribute.ndim != 2 or owner.shape != attribute.shape:
+        raise ValueError("attribute and owner masks must be equal two-dimensional masks")
+    if (
+        not isinstance(owner_padding_ratio, float)
+        or not math.isfinite(owner_padding_ratio)
+        or not 0 <= owner_padding_ratio <= 0.5
+    ):
+        raise ValueError("owner_padding_ratio must be a finite float in [0, 0.5]")
+    attribute_area = int(attribute.sum())
+    owner_area = int(owner.sum())
+    if owner_area == 0:
+        raise ValueError("owner mask must not be empty")
+    if attribute_area == 0:
+        return OwnershipGeometry(
+            passed=False,
+            reason="empty_attribute_mask",
+            owner_overlap_ratio=0.0,
+            maximum_other_owner_overlap_ratio=0.0,
+            attribute_to_owner_area_ratio=0.0,
+            near_owner_region=False,
+            attribute_area_pixels=0,
+            attribute_long_side_pixels=0,
+            significant_component_count=0,
+            largest_component_ratio=0.0,
+            second_largest_component_ratio=0.0,
+        )
+    attribute_bbox = _bbox(attribute)
+    owner_bbox = _bbox(owner)
+    width = attribute_bbox[2] - attribute_bbox[0]
+    height = attribute_bbox[3] - attribute_bbox[1]
+    long_side = max(width, height)
+    diagnostics = mask_component_diagnostics(attribute)
+    owner_overlap = float(np.logical_and(attribute, owner).sum() / attribute_area)
+    other_overlaps: list[float] = []
+    for other_mask in other_owner_masks.values():
+        other = np.asarray(other_mask, dtype=bool)
+        if other.shape != attribute.shape:
+            raise ValueError("other owner mask dimensions must match attribute mask")
+        other_overlaps.append(
+            float(np.logical_and(attribute, other).sum() / attribute_area)
+        )
+    maximum_other_overlap = max(other_overlaps, default=0.0)
+    owner_long_side = max(
+        owner_bbox[2] - owner_bbox[0],
+        owner_bbox[3] - owner_bbox[1],
+    )
+    padding = math.ceil(owner_long_side * owner_padding_ratio)
+    expanded_owner_bbox = (
+        max(0, owner_bbox[0] - padding),
+        max(0, owner_bbox[1] - padding),
+        min(attribute.shape[1], owner_bbox[2] + padding),
+        min(attribute.shape[0], owner_bbox[3] + padding),
+    )
+    near_owner = _bboxes_intersect(attribute_bbox, expanded_owner_bbox)
+    attribute_to_owner_ratio = attribute_area / owner_area
+    reason = "passed"
+    if attribute_area < MIN_ATTRIBUTE_AREA_PIXELS:
+        reason = "tiny_attribute_area"
+    elif long_side < MIN_ATTRIBUTE_LONG_SIDE_PIXELS:
+        reason = "tiny_attribute_long_side"
+    elif diagnostics.severely_fragmented:
+        reason = "severely_fragmented_attribute_mask"
+    elif attribute_to_owner_ratio >= MAX_ATTRIBUTE_TO_OWNER_AREA_RATIO:
+        reason = "attribute_mask_primarily_contains_owner"
+    elif (
+        maximum_other_overlap >= WRONG_OWNER_MINIMUM_OVERLAP_RATIO
+        and maximum_other_overlap > owner_overlap
+    ):
+        reason = "attribute_primarily_belongs_to_other_subject"
+    elif owner_overlap == 0.0 and not near_owner:
+        reason = "attribute_not_near_intended_owner"
+    return OwnershipGeometry(
+        passed=reason == "passed",
+        reason=reason,
+        owner_overlap_ratio=owner_overlap,
+        maximum_other_owner_overlap_ratio=maximum_other_overlap,
+        attribute_to_owner_area_ratio=attribute_to_owner_ratio,
+        near_owner_region=near_owner,
+        attribute_area_pixels=attribute_area,
+        attribute_long_side_pixels=long_side,
+        significant_component_count=diagnostics.significant_component_count,
+        largest_component_ratio=diagnostics.largest_component_ratio,
+        second_largest_component_ratio=diagnostics.second_largest_component_ratio,
+    )
+
+
+def prefer_attribute_candidate_frames(
+    candidates: list[EntityReferenceCandidate],
+    *,
+    owner_reference_source_frame_index: int,
+) -> list[EntityReferenceCandidate]:
+    rank = {candidate.candidate_id: index for index, candidate in enumerate(candidates)}
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.source_frame_index == owner_reference_source_frame_index,
+            rank[candidate.candidate_id],
+        ),
+    )
+
+
+def _decode_owner_mask(
+    masks: TrackedMasksArtifact,
+    *,
+    entity_id: str,
+    slot: int,
+) -> np.ndarray | None:
+    tracked = masks.entities.get(entity_id)
+    if tracked is None or tracked.status != "ready":
+        return None
+    frame = tracked.frames[slot]
+    if not frame.present or not frame.track_valid or frame.area_pixels <= 0:
+        return None
+    decoded = np.asarray(decode_binary_mask(frame.rle), dtype=bool)
+    if decoded.shape != (masks.height, masks.width):
+        raise ValueError("decoded owner mask dimensions are invalid")
+    return decoded
+
+
+def _source_image(
+    storage: RunStorage,
+    candidate: EntityReferenceCandidate,
+) -> Image.Image:
+    path = (storage.root / candidate.image_path).resolve(strict=False)
+    path.relative_to(storage.root.resolve(strict=False))
+    with Image.open(path) as opened:
+        opened.load()
+        return opened.convert("RGB")
+
+
+def _published_reference(clip: ClipRecord, entity_id: str) -> EntityReferenceState:
+    reference = next(
+        (
+            item
+            for item in clip.references.entities
+            if item.entity_id == entity_id and item.status == "ready"
+        ),
+        None,
+    )
+    if reference is None:
+        raise ValueError("eligible owner is missing its ready published reference")
+    return reference
+
+
+def _rejected_record(
+    discovered: DiscoveredSubjectAttribute,
+    *,
+    attribute_id: str,
+    owner_entity_id: str,
+    reason: str,
+    geometry: OwnershipGeometry | None = None,
+    source_frame_index: int | None = None,
+    source_frame_slot: int | None = None,
+    owner_candidate_id: str | None = None,
+    same_frame: bool | None = None,
+    review: SubjectAttributeReview | None = None,
+) -> SubjectAttributeRecord:
+    return SubjectAttributeRecord(
+        attribute_id=attribute_id,
+        owner_entity_id=owner_entity_id,
+        attribute_type=discovered.attribute_type,
+        phrase=discovered.phrase,
+        grounding_prompt=discovered.grounding_prompt,
+        status="rejected",
+        image_path=None,
+        source_frame_index=source_frame_index,
+        source_frame_slot=source_frame_slot,
+        owner_candidate_id=owner_candidate_id,
+        same_frame_as_owner_reference=same_frame,
+        sam3_prompt=discovered.grounding_prompt,
+        ownership_geometry=geometry,
+        review=review,
+        reason=reason,
+    )
+
+
+def _select_attribute_candidate(
+    *,
+    discovered: DiscoveredSubjectAttribute,
+    attribute_id: str,
+    clip_uid: str,
+    owner: AnnotationEntity,
+    owner_candidates: list[EntityReferenceCandidate],
+    owner_reference: EntityReferenceState,
+    masks: TrackedMasksArtifact,
+    track: EntityTrackResult,
+    storage: RunStorage,
+    other_subject_ids: list[str],
+    crop_padding_ratio: float,
+) -> PendingAttributeCandidate | SubjectAttributeRecord:
+    if track.status != "ready":
+        reason = f"sam3_{track.status}"
+        if track.reason:
+            reason = f"{reason}:{track.reason}"
+        return _rejected_record(
+            discovered,
+            attribute_id=attribute_id,
+            owner_entity_id=owner.entity_id,
+            reason=reason,
+        )
+    observations = {observation.slot: observation for observation in track.observations}
+    owner_reference_is_local = owner_reference.source_clip_uid in {None, clip_uid}
+    ordered = prefer_attribute_candidate_frames(
+        owner_candidates,
+        owner_reference_source_frame_index=(
+            owner_reference.source_frame_index if owner_reference_is_local else -1
+        ),
+    )
+    geometry_rejections: list[
+        tuple[EntityReferenceCandidate, OwnershipGeometry]
+    ] = []
+    for owner_candidate in ordered:
+        observation = observations.get(owner_candidate.frame_slot)
+        if observation is None:
+            continue
+        attribute_mask = np.asarray(observation.mask, dtype=bool)
+        owner_mask = owner_candidate.mask
+        other_masks = {
+            entity_id: decoded
+            for entity_id in other_subject_ids
+            if (
+                decoded := _decode_owner_mask(
+                    masks,
+                    entity_id=entity_id,
+                    slot=owner_candidate.frame_slot,
+                )
+            )
+            is not None
+        }
+        geometry = evaluate_ownership_geometry(
+            attribute_mask,
+            owner_mask,
+            other_masks,
+            owner_padding_ratio=crop_padding_ratio,
+        )
+        if not geometry.passed:
+            geometry_rejections.append((owner_candidate, geometry))
+            continue
+        source = _source_image(storage, owner_candidate)
+        crop, _ = build_reference_crop(
+            source,
+            attribute_mask,
+            crop_padding_ratio=crop_padding_ratio,
+        )
+        return PendingAttributeCandidate(
+            discovered=discovered,
+            attribute_id=attribute_id,
+            owner_entity_id=owner.entity_id,
+            owner_candidate=owner_candidate,
+            attribute_mask=attribute_mask,
+            source_image=source,
+            crop=crop,
+            geometry=geometry,
+        )
+    if geometry_rejections:
+        owner_candidate, geometry = geometry_rejections[0]
+        return _rejected_record(
+            discovered,
+            attribute_id=attribute_id,
+            owner_entity_id=owner.entity_id,
+            reason=f"ownership_geometry:{geometry.reason}",
+            geometry=geometry,
+            source_frame_index=owner_candidate.source_frame_index,
+            source_frame_slot=owner_candidate.frame_slot,
+            owner_candidate_id=owner_candidate.candidate_id,
+            same_frame=(
+                owner_reference_is_local
+                and owner_candidate.source_frame_index
+                == owner_reference.source_frame_index
+            ),
+        )
+    return _rejected_record(
+        discovered,
+        attribute_id=attribute_id,
+        owner_entity_id=owner.entity_id,
+        reason="sam3_no_owner_candidate_frame_mask",
+    )
+
+
+def _save_attribute_crop(
+    output_root: Path,
+    *,
+    sample_id: str,
+    attribute_id: str,
+    crop: Image.Image,
+) -> str:
+    destination = output_root / "references" / sample_id / f"{attribute_id}.png"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        crop.save(temporary, format="PNG")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination.relative_to(output_root).as_posix()
+
+
+def _validate_attribute_png(output_root: Path, relative_path: str) -> None:
+    path = (output_root / relative_path).resolve(strict=False)
+    path.relative_to(output_root.resolve(strict=False))
+    with Image.open(path) as opened:
+        opened.load()
+        if opened.format != "PNG" or opened.mode != "RGBA":
+            raise ValueError("accepted attribute artifact must be RGBA PNG")
+        pixels = np.asarray(opened)
+    alpha = pixels[..., 3]
+    if not np.any(alpha == 255) or not np.isin(alpha, (0, 255)).all():
+        raise ValueError("accepted attribute alpha must be non-empty and binary")
+    if np.any(pixels[..., :3][alpha == 0] != 255):
+        raise ValueError("transparent attribute RGB pixels must be white")
+
+
+def _load_cached_owner_artifact(
+    path: Path,
+    *,
+    output_root: Path,
+    sample_id: str,
+    owner_entity_id: str,
+    attribute_id_start: int,
+) -> OwnerEnrichmentArtifact | None:
+    if not path.is_file():
+        return None
+    try:
+        artifact = OwnerEnrichmentArtifact.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+        if (
+            artifact.sample_id != sample_id
+            or artifact.owner_entity_id != owner_entity_id
+            or artifact.attribute_id_start != attribute_id_start
+        ):
+            return None
+        for record in artifact.records:
+            if record.status == "accepted":
+                assert record.image_path is not None
+                _validate_attribute_png(output_root, record.image_path)
+        return artifact
+    except (OSError, ValueError):
+        return None
+
+
+def _owner_artifact_path(
+    output_root: Path,
+    *,
+    sample_id: str,
+    owner_entity_id: str,
+) -> Path:
+    return output_root / "owners" / sample_id / f"{owner_entity_id}.json"
+
+
+def _process_owner(
+    *,
+    config: V3Config,
+    storage: RunStorage,
+    output_root: Path,
+    clip: ClipRecord,
+    owner: AnnotationEntity,
+    owner_candidates: list[EntityReferenceCandidate],
+    frames: SampledFramesArtifact,
+    masks: TrackedMasksArtifact,
+    attribute_id_start: int,
+    discovery_client: SubjectAttributeDiscoveryClient,
+    review_client: SubjectAttributeReviewClient,
+    segmentation_backend: SegmentationBackend,
+) -> OwnerEnrichmentArtifact:
+    metrics = OwnerEnrichmentMetrics(discovery_calls=1)
+    owner_reference = _published_reference(clip, owner.entity_id)
+    source_images = {
+        candidate.image_path: _source_image(storage, candidate)
+        for candidate in owner_candidates
+    }
+    discovery_started = time.perf_counter()
+    try:
+        discovery = discovery_client.discover(
+            owner=owner,
+            owner_candidates=owner_candidates,
+            source_images=source_images,
+        )
+    except Exception as exc:  # noqa: BLE001 - isolate one eligible owner
+        elapsed = time.perf_counter() - discovery_started
+        return OwnerEnrichmentArtifact(
+            sample_id=clip.clip_uid,
+            owner_entity_id=owner.entity_id,
+            owner_is_human=None,
+            attribute_id_start=attribute_id_start,
+            owner_phrase=owner.phrase,
+            owner_grounding_prompt=owner.grounding_prompt,
+            records=[],
+            metrics=metrics.model_copy(
+                update={
+                    "qwen_model_call_time_seconds": elapsed,
+                    "failures": 1,
+                }
+            ),
+            failure_reason=f"discovery_failed:{type(exc).__name__}:{exc}",
+        )
+    qwen_seconds = time.perf_counter() - discovery_started
+    if not discovery.owner_is_human:
+        return OwnerEnrichmentArtifact(
+            sample_id=clip.clip_uid,
+            owner_entity_id=owner.entity_id,
+            owner_is_human=False,
+            attribute_id_start=attribute_id_start,
+            owner_phrase=owner.phrase,
+            owner_grounding_prompt=owner.grounding_prompt,
+            records=[],
+            metrics=metrics.model_copy(
+                update={"qwen_model_call_time_seconds": qwen_seconds}
+            ),
+        )
+    discovered_by_type = Counter(
+        attribute.attribute_type for attribute in discovery.attributes
+    )
+    frame_paths = [storage.frame_path(clip.clip_uid, frame.slot) for frame in frames.frames]
+    retained_subject_ids = [
+        entity.entity_id
+        for entity in clip.annotation.entities
+        if (
+            entity.reference_type == "subject"
+            and clip.pairing is not None
+            and entity.entity_id in clip.pairing.retained_entity_ids
+            and entity.entity_id != owner.entity_id
+        )
+    ]
+    pending: list[PendingAttributeCandidate] = []
+    records_by_id: dict[str, SubjectAttributeRecord] = {}
+    sam_seconds = 0.0
+    processing_failures = 0
+    for offset, discovered in enumerate(discovery.attributes):
+        attribute_id = f"a{attribute_id_start + offset}"
+        sam_started = time.perf_counter()
+        try:
+            track = segmentation_backend.track(
+                frame_paths=frame_paths,
+                entity_id=f"{owner.entity_id}-{attribute_id}",
+                reference_type="object",
+                grounding_prompt=discovered.grounding_prompt,
+                entity_phrase=discovered.phrase,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate one SAM3 attribute attempt
+            track = EntityTrackResult(
+                status="failed",
+                reason=f"{type(exc).__name__}:{exc}",
+            )
+        sam_seconds += time.perf_counter() - sam_started
+        try:
+            selected = _select_attribute_candidate(
+                discovered=discovered,
+                attribute_id=attribute_id,
+                clip_uid=clip.clip_uid,
+                owner=owner,
+                owner_candidates=owner_candidates,
+                owner_reference=owner_reference,
+                masks=masks,
+                track=track,
+                storage=storage,
+                other_subject_ids=retained_subject_ids,
+                crop_padding_ratio=config.pair.crop_padding_ratio,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate one attribute
+            processing_failures += 1
+            selected = _rejected_record(
+                discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=f"attribute_processing_failed:{type(exc).__name__}:{exc}",
+            )
+        if isinstance(selected, SubjectAttributeRecord):
+            records_by_id[attribute_id] = selected
+        else:
+            pending.append(selected)
+
+    review_calls = 0
+    review_failure: str | None = None
+    reviews: dict[str, SubjectAttributeReview] = {}
+    if pending:
+        review_calls = 1
+        review_started = time.perf_counter()
+        try:
+            batch = review_client.review(owner=owner, candidates=pending)
+            reviews = {review.attribute_id: review for review in batch.reviews}
+        except Exception as exc:  # noqa: BLE001 - fail closed for this owner batch
+            review_failure = f"review_failed:{type(exc).__name__}:{exc}"
+        qwen_seconds += time.perf_counter() - review_started
+
+    for candidate in pending:
+        review = reviews.get(candidate.attribute_id)
+        same_frame = (
+            owner_reference.source_clip_uid in {None, clip.clip_uid}
+            and candidate.owner_candidate.source_frame_index
+            == owner_reference.source_frame_index
+        )
+        if review is None:
+            records_by_id[candidate.attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=candidate.attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=review_failure or "recognizability_review_missing",
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=same_frame,
+            )
+            continue
+        if not review.accepted:
+            records_by_id[candidate.attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=candidate.attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=f"recognizability:{review.reason}",
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=same_frame,
+                review=review,
+            )
+            continue
+        relative_path = _save_attribute_crop(
+            output_root,
+            sample_id=clip.clip_uid,
+            attribute_id=candidate.attribute_id,
+            crop=candidate.crop,
+        )
+        records_by_id[candidate.attribute_id] = SubjectAttributeRecord(
+            attribute_id=candidate.attribute_id,
+            owner_entity_id=owner.entity_id,
+            attribute_type=candidate.discovered.attribute_type,
+            phrase=candidate.discovered.phrase,
+            grounding_prompt=candidate.discovered.grounding_prompt,
+            status="accepted",
+            image_path=relative_path,
+            source_frame_index=candidate.owner_candidate.source_frame_index,
+            source_frame_slot=candidate.owner_candidate.frame_slot,
+            owner_candidate_id=candidate.owner_candidate.candidate_id,
+            same_frame_as_owner_reference=same_frame,
+            sam3_prompt=candidate.discovered.grounding_prompt,
+            ownership_geometry=candidate.geometry,
+            review=review,
+            reason="accepted",
+        )
+
+    ordered_records = [
+        records_by_id[f"a{attribute_id_start + offset}"]
+        for offset in range(len(discovery.attributes))
+    ]
+    deterministic_rejects = sum(
+        record.reason.startswith("ownership_geometry:")
+        for record in ordered_records
+    )
+    recognizability_rejects = sum(
+        record.status == "rejected"
+        and (
+            record.reason.startswith("recognizability:")
+            or record.reason.startswith("review_failed:")
+            or record.reason == "recognizability_review_missing"
+        )
+        for record in ordered_records
+    )
+    accepted = [record for record in ordered_records if record.status == "accepted"]
+    failures = int(review_failure is not None) + processing_failures
+    return OwnerEnrichmentArtifact(
+        sample_id=clip.clip_uid,
+        owner_entity_id=owner.entity_id,
+        owner_is_human=True,
+        attribute_id_start=attribute_id_start,
+        owner_phrase=owner.phrase,
+        owner_grounding_prompt=owner.grounding_prompt,
+        records=ordered_records,
+        metrics=OwnerEnrichmentMetrics(
+            discovery_calls=1,
+            review_calls=review_calls,
+            sam3_attempts=len(discovery.attributes),
+            discovered_by_type=dict(sorted(discovered_by_type.items())),
+            deterministic_ownership_rejects=deterministic_rejects,
+            recognizability_rejects=recognizability_rejects,
+            accepted_attributes=len(accepted),
+            same_frame_accepted=sum(
+                record.same_frame_as_owner_reference is True for record in accepted
+            ),
+            different_frame_accepted=sum(
+                record.same_frame_as_owner_reference is False for record in accepted
+            ),
+            qwen_model_call_time_seconds=qwen_seconds,
+            sam3_model_call_time_seconds=sam_seconds,
+            failures=failures,
+        ),
+        failure_reason=review_failure,
+    )
+
+
+_RELATION_PHRASE: dict[AttributeType, str] = {
+    "face": "with the facial appearance shown in {image}",
+    "hair": "with the hairstyle shown in {image}",
+    "headwear": "wearing the headwear shown in {image}",
+    "glasses": "wearing the glasses shown in {image}",
+    "upper_clothing": "wearing the clothing shown in {image}",
+    "lower_clothing": "wearing the clothing shown in {image}",
+    "dress_or_skirt": "wearing the dress or skirt shown in {image}",
+    "shoes": "wearing the shoes shown in {image}",
+    "bag": "carrying or wearing the bag shown in {image}",
+    "accessory": "with the accessory shown in {image}",
+}
+
+
+def _render_enriched_instruction(
+    clip: ClipRecord,
+    accepted_attributes: list[SubjectAttributeRecord],
+) -> tuple[str, list[EnrichedReference]]:
+    if (
+        clip.annotation is None
+        or clip.pairing is None
+        or clip.instruction is None
+        or clip.instruction.status != "ready"
+    ):
+        raise ValueError("enriched instruction requires ready Visual state")
+    annotations = {entity.entity_id: entity for entity in clip.annotation.entities}
+    references = {
+        reference.entity_id: reference
+        for reference in clip.references.entities
+        if reference.status == "ready"
+    }
+    attributes_by_owner: dict[str, list[SubjectAttributeRecord]] = {}
+    for record in accepted_attributes:
+        attributes_by_owner.setdefault(record.owner_entity_id, []).append(record)
+
+    enriched_references: list[EnrichedReference] = []
+    old_to_new: dict[int, int] = {}
+    attribute_image_indexes: dict[str, int] = {}
+    old_index = 0
+    for entity_id in clip.pairing.retained_entity_ids:
+        old_index += 1
+        annotation = annotations[entity_id]
+        reference = references[entity_id]
+        new_index = len(enriched_references) + 1
+        old_to_new[old_index] = new_index
+        enriched_references.append(
+            EnrichedReference(
+                image_id=f"image_{new_index}",
+                image_index=new_index,
+                kind=annotation.reference_type,
+                origin="visual_run",
+                entity_id=entity_id,
+                image_path=reference.image_path or "",
+                source_frame_index=reference.source_frame_index,
+            )
+        )
+        for attribute in attributes_by_owner.get(entity_id, []):
+            assert attribute.image_path is not None
+            new_index = len(enriched_references) + 1
+            attribute_image_indexes[attribute.attribute_id] = new_index
+            enriched_references.append(
+                EnrichedReference(
+                    image_id=f"image_{new_index}",
+                    image_index=new_index,
+                    kind="attribute",
+                    origin="attribute_enrichment",
+                    attribute_id=attribute.attribute_id,
+                    owner_entity_id=entity_id,
+                    image_path=attribute.image_path,
+                    source_frame_index=attribute.source_frame_index,
+                )
+            )
+    if clip.pairing.background_token is not None:
+        old_index += 1
+        background = clip.references.background
+        if background is None or background.output_image_path is None:
+            raise ValueError("ready Visual background is missing its image path")
+        new_index = len(enriched_references) + 1
+        old_to_new[old_index] = new_index
+        enriched_references.append(
+            EnrichedReference(
+                image_id=f"image_{new_index}",
+                image_index=new_index,
+                kind="background",
+                origin="visual_run",
+                image_path=background.output_image_path,
+                source_frame_index=background.source_frame_index,
+            )
+        )
+
+    def remap(match: re.Match[str]) -> str:
+        old = int(match.group(1))
+        if old not in old_to_new:
+            raise ValueError("original instruction contains an unknown image placeholder")
+        return f"{{{{image_{old_to_new[old]}}}}}"
+
+    body = _IMAGE_PLACEHOLDER.sub(remap, clip.instruction.instruction_body_template)
+    for entity_id in clip.pairing.retained_entity_ids:
+        owner_attributes = attributes_by_owner.get(entity_id, [])
+        if not owner_attributes:
+            continue
+        old_entity_index = clip.pairing.retained_entity_ids.index(entity_id) + 1
+        owner_marker = f"{{{{image_{old_to_new[old_entity_index]}}}}}"
+        relations = [
+            _RELATION_PHRASE[attribute.attribute_type].format(
+                image=f"{{{{image_{attribute_image_indexes[attribute.attribute_id]}}}}}"
+            )
+            for attribute in owner_attributes
+        ]
+        body = body.replace(
+            owner_marker,
+            owner_marker + ", " + " and ".join(relations),
+            1,
+        )
+    enriched_instruction = _IMAGE_PLACEHOLDER.sub(
+        lambda match: f"<Image {match.group(1)}>",
+        body.strip(),
+    )
+    return enriched_instruction, enriched_references
+
+
+def _build_enriched_sample(
+    *,
+    storage: RunStorage,
+    clip: ClipRecord,
+    records: list[SubjectAttributeRecord],
+) -> EnrichedSample:
+    if clip.annotation is None or clip.instruction is None:
+        raise ValueError("enriched sample requires annotation and instruction")
+    accepted = [record for record in records if record.status == "accepted"]
+    enriched_instruction, references = _render_enriched_instruction(clip, accepted)
+    return EnrichedSample(
+        sample_id=clip.clip_uid,
+        clip_uid=clip.clip_uid,
+        source_run_root=str(storage.root),
+        original_visual={
+            "clip_record_path": (
+                storage.clip_path(clip.clip_uid).relative_to(storage.root).as_posix()
+            ),
+            "target_video": clip.source.video_path,
+            "t2v_caption": (
+                render_annotation_plain_text(
+                    clip.annotation.instruction_template,
+                    clip.annotation.entities,
+                    clip.annotation.background,
+                )
+                if clip.annotation.instruction_template
+                else clip.annotation.t2v_caption
+            ),
+            "source": {
+                "parent_video_id": clip.source.parent_video_id,
+                "clip_suffix": clip.source.clip_suffix,
+            },
+        },
+        original_instruction=clip.instruction.r2v_instruction,
+        enriched_instruction=enriched_instruction,
+        references=references,
+        accepted_attributes=accepted,
+    )
+
+
+def _write_jsonl_atomic(path: Path, records: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_output_root(
+    run_root: Path,
+    export_root: Path,
+    output_root: Path,
+) -> None:
+    writable_root = v3_config_module.ALLOWED_WRITABLE_ROOT.resolve(strict=False)
+    resolved_run = run_root.resolve(strict=False)
+    resolved_export = export_root.resolve(strict=False)
+    resolved_output = output_root.resolve(strict=False)
+    if writable_root not in resolved_output.parents:
+        raise ValueError(
+            "attribute output_root must be inside /mnt/workspace/litengjie/data"
+        )
+    if (
+        resolved_output == resolved_run
+        or resolved_output in resolved_run.parents
+        or resolved_run in resolved_output.parents
+    ):
+        raise ValueError("attribute output_root must be separate from source run_root")
+    if (
+        resolved_output == resolved_export
+        or resolved_output in resolved_export.parents
+        or resolved_export in resolved_output.parents
+    ):
+        raise ValueError(
+            "attribute output_root must not overlap the Visual export_root"
+        )
+
+
+def _clear_enrichment_artifacts(output_root: Path) -> None:
+    for directory, pattern in (
+        (output_root / "references", "*.png"),
+        (output_root / "owners", "*.json"),
+    ):
+        if directory.is_dir():
+            for path in directory.rglob(pattern):
+                path.unlink()
+
+
+def _gpu_peak_bytes() -> int | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.max_memory_allocated())
+    except (ImportError, RuntimeError):
+        return None
+
+
+def run_subject_attribute_enrichment(
+    config: V3Config,
+    *,
+    run_root: Path,
+    output_root: Path,
+    max_owners: int = 50,
+    overwrite: bool = False,
+    discovery_client: SubjectAttributeDiscoveryClient | None = None,
+    review_client: SubjectAttributeReviewClient | None = None,
+    segmentation_backend: SegmentationBackend | None = None,
+) -> dict[str, object]:
+    if isinstance(max_owners, bool) or not isinstance(max_owners, int) or max_owners < 1:
+        raise ValueError("max_owners must be a positive integer")
+    effective_config = replace(config, run_root=Path(run_root))
+    effective_config.validate()
+    storage = RunStorage(effective_config)
+    run = storage.read_run()
+    output_root = Path(output_root).expanduser().resolve(strict=False)
+    _validate_output_root(
+        storage.root,
+        effective_config.resolved_export_root,
+        output_root,
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        _clear_enrichment_artifacts(output_root)
+
+    service = effective_config.qwen.candidate_judge
+    owned_qwen: QwenSubjectAttributeClient | None = None
+    if discovery_client is None or review_client is None:
+        if service is None:
+            raise ValueError(
+                "qwen.candidate_judge is required for subject attribute enrichment"
+            )
+        owned_qwen = QwenSubjectAttributeClient(service)
+        discovery_client = discovery_client or owned_qwen
+        review_client = review_client or owned_qwen
+    owned_segmenter: Sam3SegmentationBackend | None = None
+    if segmentation_backend is None:
+        if effective_config.sam3.model_path is None:
+            raise ValueError("sam3.model_path is required for attribute enrichment")
+        owned_segmenter = Sam3SegmentationBackend(effective_config.sam3)
+        segmentation_backend = owned_segmenter
+    assert discovery_client is not None
+    assert review_client is not None
+    assert segmentation_backend is not None
+
+    started = time.perf_counter()
+    gpu_before = _gpu_peak_bytes()
+    totals = EnrichmentTotals()
+    all_records: list[SubjectAttributeRecord] = []
+    sample_records: list[EnrichedSample] = []
+    reached_limit = False
+    try:
+        for clip in storage.iter_clips():
+            if reached_limit:
+                break
+            if (
+                not clip.export.accepted
+                or clip.annotation is None
+                or clip.annotation.status != "ready"
+                or clip.pairing is None
+                or clip.pairing.status != "ready"
+            ):
+                continue
+            try:
+                frames = storage.read_frames(clip.clip_uid)
+                masks = storage.read_masks(clip.clip_uid)
+            except (OSError, ValueError):
+                continue
+            sample_attribute_start = 1
+            clip_records: list[SubjectAttributeRecord] = []
+            processed_owner = False
+            for owner in clip.annotation.entities:
+                if owner.reference_type != "subject":
+                    continue
+                try:
+                    candidates = build_entity_reference_candidates(
+                        effective_config,
+                        storage,
+                        clip_uid=clip.clip_uid,
+                        entity=owner,
+                        frames=frames,
+                        masks=masks,
+                    )[:MAX_ATTRIBUTES_PER_OWNER]
+                except (OSError, ValueError):
+                    candidates = []
+                eligibility = evaluate_owner_eligibility(
+                    clip,
+                    entity_id=owner.entity_id,
+                    has_usable_candidate_evidence=bool(candidates),
+                )
+                if not eligibility.eligible:
+                    continue
+                if totals.eligible_human_owners >= max_owners:
+                    reached_limit = True
+                    break
+                artifact_path = _owner_artifact_path(
+                    output_root,
+                    sample_id=clip.clip_uid,
+                    owner_entity_id=owner.entity_id,
+                )
+                cached = None
+                if not overwrite:
+                    cached = _load_cached_owner_artifact(
+                        artifact_path,
+                        output_root=output_root,
+                        sample_id=clip.clip_uid,
+                        owner_entity_id=owner.entity_id,
+                        attribute_id_start=sample_attribute_start,
+                    )
+                if cached is not None:
+                    artifact = cached
+                    totals.skipped_existing_owners += 1
+                else:
+                    try:
+                        artifact = _process_owner(
+                            config=effective_config,
+                            storage=storage,
+                            output_root=output_root,
+                            clip=clip,
+                            owner=owner,
+                            owner_candidates=candidates,
+                            frames=frames,
+                            masks=masks,
+                            attribute_id_start=sample_attribute_start,
+                            discovery_client=discovery_client,
+                            review_client=review_client,
+                            segmentation_backend=segmentation_backend,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - isolate one owner
+                        totals.failures += 1
+                        totals.failure_reasons[
+                            f"owner_processing_failed:{type(exc).__name__}"
+                        ] += 1
+                        continue
+                    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(
+                        artifact_path,
+                        artifact.model_dump(mode="json"),
+                    )
+                if artifact.failure_reason:
+                    totals.failure_reasons[artifact.failure_reason.split(":", 1)[0]] += 1
+                totals.add_owner_metrics(artifact.metrics)
+                if artifact.owner_is_human is True:
+                    totals.eligible_human_owners += 1
+                    processed_owner = True
+                elif artifact.owner_is_human is False:
+                    totals.screened_nonhuman_subjects += 1
+                clip_records.extend(artifact.records)
+                all_records.extend(artifact.records)
+                sample_attribute_start += len(artifact.records)
+            if processed_owner:
+                sample_records.append(
+                    _build_enriched_sample(
+                        storage=storage,
+                        clip=clip,
+                        records=clip_records,
+                    )
+                )
+    finally:
+        if owned_segmenter is not None:
+            owned_segmenter.close()
+        if owned_qwen is not None:
+            owned_qwen.close()
+
+    invocation_wall_time = time.perf_counter() - started
+    gpu_after = _gpu_peak_bytes()
+    owner_count = totals.eligible_human_owners
+    qwen_calls = totals.discovery_calls + totals.review_calls
+    single_subject_example = next(
+        (
+            sample.sample_id
+            for sample in sample_records
+            if sample.accepted_attributes
+            and sum(reference.kind == "subject" for reference in sample.references) == 1
+        ),
+        None,
+    )
+    multi_subject_example = next(
+        (
+            sample.sample_id
+            for sample in sample_records
+            if sample.accepted_attributes
+            and sum(reference.kind == "subject" for reference in sample.references) >= 2
+        ),
+        None,
+    )
+    summary: dict[str, object] = {
+        "schema_version": ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION,
+        "source_run_root": str(storage.root),
+        "source_run_git_commit": run.git_commit,
+        "output_root": str(output_root),
+        "owner_limit": max_owners,
+        "eligible_human_owner_count": owner_count,
+        "screened_nonhuman_subject_count": totals.screened_nonhuman_subjects,
+        "skipped_existing_owner_count": totals.skipped_existing_owners,
+        "qwen_discovery_calls": totals.discovery_calls,
+        "qwen_recognizability_calls": totals.review_calls,
+        "qwen_calls_total": qwen_calls,
+        "attributes_discovered_by_type": dict(sorted(totals.discovered_by_type.items())),
+        "sam3_attempts": totals.sam3_attempts,
+        "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
+        "recognizability_rejects": totals.recognizability_rejects,
+        "accepted_attribute_references": totals.accepted_attributes,
+        "accepted_attributes_per_human_owner": (
+            totals.accepted_attributes / owner_count if owner_count else 0.0
+        ),
+        "average_extra_qwen_calls_per_human_owner": (
+            qwen_calls / owner_count if owner_count else 0.0
+        ),
+        "average_sam3_attempts_per_human_owner": (
+            totals.sam3_attempts / owner_count if owner_count else 0.0
+        ),
+        "same_frame_accepted": totals.same_frame_accepted,
+        "different_frame_accepted": totals.different_frame_accepted,
+        "invocation_wall_time_seconds": invocation_wall_time,
+        "qwen_model_call_time_seconds": totals.qwen_model_call_time_seconds,
+        "sam3_model_call_time_seconds": totals.sam3_model_call_time_seconds,
+        "model_call_time_seconds": (
+            totals.qwen_model_call_time_seconds
+            + totals.sam3_model_call_time_seconds
+        ),
+        "gpu_peak_memory_bytes_before": gpu_before,
+        "gpu_peak_memory_bytes_after": gpu_after,
+        "failures": totals.failures,
+        "failure_reasons": dict(sorted(totals.failure_reasons.items())),
+        "enriched_sample_count": len(sample_records),
+        "attribute_record_count": len(all_records),
+        "example_enriched_samples": {
+            "single_subject": single_subject_example,
+            "multi_subject": multi_subject_example,
+        },
+    }
+    _write_jsonl_atomic(
+        output_root / "attributes.jsonl",
+        [record.model_dump(mode="json") for record in all_records],
+    )
+    _write_jsonl_atomic(
+        output_root / "enriched_samples.jsonl",
+        [sample.model_dump(mode="json") for sample in sample_records],
+    )
+    write_json_atomic(output_root / "summary.json", summary)
+    return summary
+
+
+__all__ = [
+    "DiscoveredSubjectAttribute",
+    "EnrichedSample",
+    "OwnerEligibility",
+    "OwnershipGeometry",
+    "PendingAttributeCandidate",
+    "QwenSubjectAttributeClient",
+    "SubjectAttributeDiscovery",
+    "SubjectAttributeRecord",
+    "SubjectAttributeReview",
+    "SubjectAttributeReviewBatch",
+    "evaluate_owner_eligibility",
+    "evaluate_ownership_geometry",
+    "prefer_attribute_candidate_frames",
+    "run_subject_attribute_enrichment",
+]
