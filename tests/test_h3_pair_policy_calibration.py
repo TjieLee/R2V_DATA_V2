@@ -322,6 +322,17 @@ def test_report_uses_human_different_and_excludes_uncertain_from_statistics(
     uncertain = _label_from_candidate(
         by_pair[("clip-b/e1", "clip-d/e1")], "uncertain"
     )
+    with confirmed.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "left_occurrence_id": "clip-d/e1",
+                    "right_occurrence_id": "clip-e/e1",
+                    "same_person_label": "same",
+                }
+            )
+            + "\n"
+        )
     labels = tmp_path / "pair_policy_review_labels.jsonl"
     labels.write_text(
         different.model_dump_json() + "\n" + uncertain.model_dump_json() + "\n"
@@ -337,9 +348,19 @@ def test_report_uses_human_different_and_excludes_uncertain_from_statistics(
     )
 
     assert report.confirmed_same_pair_count == 2
+    assert report.input_confirmed_same_pair_count == 3
+    assert report.available_confirmed_same_pair_count == 2
+    assert report.unavailable_confirmed_same_pair_count == 1
+    assert report.available_confirmed_same_pairs == [
+        ("clip-a/e1", "clip-b/e1"),
+        ("clip-b/e1", "clip-c/e1"),
+    ]
+    assert report.unavailable_confirmed_same_pairs == [
+        ("clip-d/e1", "clip-e/e1")
+    ]
     assert report.confirmed_different_pair_count == 1
     assert report.uncertain_pair_count == 1
-    assert report.directly_human_labeled_same_pair_count == 2
+    assert report.directly_human_labeled_same_pair_count == 3
     assert report.component_implied_same_pair_count == 1
     assert report.component_implied_same_pairs == [
         ("clip-a/e1", "clip-c/e1")
@@ -402,3 +423,31 @@ def test_calibration_closure_is_not_imported_by_production_pairing() -> None:
     assert "pair_policy_calibration" not in source
     assert "_same_closure" not in source
     assert "max_clips_per_parent" not in source
+
+
+def test_report_still_rejects_malformed_confirmed_occurrence_ids(
+    tmp_path: Path,
+) -> None:
+    embedding, mining, _, _ = _fixture(tmp_path)
+    malformed = tmp_path / "malformed_confirmed.jsonl"
+    malformed.write_text(
+        json.dumps(
+            {
+                "left_occurrence_id": "clip-a/not-an-entity-id",
+                "right_occurrence_id": "clip-b/e1",
+                "same_person_label": "same",
+            }
+        )
+        + "\n"
+    )
+    labels = tmp_path / "empty_labels.jsonl"
+    labels.write_text("")
+
+    with pytest.raises(ValueError, match="clip_uid/eN"):
+        report_pair_policy_calibration(
+            embedding_root=embedding,
+            confirmed_face_pairs=malformed,
+            hard_negative_labels=labels,
+            output_root=tmp_path / "report",
+            face_mining_root=mining,
+        )

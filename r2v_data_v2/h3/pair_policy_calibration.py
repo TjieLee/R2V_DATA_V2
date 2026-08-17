@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import uuid
 from collections import Counter, defaultdict
@@ -21,7 +22,7 @@ from r2v_data_v2.h3.face_identity_mining import FaceMiningOccurrence
 from r2v_data_v2.h3.schemas import SchemaModel
 
 PAIR_POLICY_REVIEW_SCHEMA_VERSION = "r2v.h3.pair_policy_review.1"
-PAIR_POLICY_REPORT_SCHEMA_VERSION = "r2v.h3.pair_policy_calibration_report.1"
+PAIR_POLICY_REPORT_SCHEMA_VERSION = "r2v.h3.pair_policy_calibration_report.2"
 
 
 class PairPolicyEvidence(SchemaModel):
@@ -182,12 +183,17 @@ class ThresholdSimulationResult(SchemaModel):
 
 
 class PairPolicyCalibrationReport(SchemaModel):
-    schema_version: Literal["r2v.h3.pair_policy_calibration_report.1"] = (
+    schema_version: Literal["r2v.h3.pair_policy_calibration_report.2"] = (
         PAIR_POLICY_REPORT_SCHEMA_VERSION
     )
     embedding_root: str
     confirmed_face_pairs_path: str
     hard_negative_labels_path: str
+    input_confirmed_same_pair_count: int = Field(ge=0)
+    available_confirmed_same_pair_count: int = Field(ge=0)
+    unavailable_confirmed_same_pair_count: int = Field(ge=0)
+    available_confirmed_same_pairs: list[tuple[str, str]]
+    unavailable_confirmed_same_pairs: list[tuple[str, str]]
     confirmed_same_pair_count: int = Field(ge=0)
     confirmed_different_pair_count: int = Field(ge=0)
     uncertain_pair_count: int = Field(ge=0)
@@ -208,6 +214,23 @@ class PairPolicyCalibrationReport(SchemaModel):
     threshold_simulation: ThresholdSimulationResult | None = None
     thresholds_calibrated: Literal[False] = False
     production_policy_selected: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_confirmed_counts(self) -> PairPolicyCalibrationReport:
+        if self.input_confirmed_same_pair_count != (
+            self.available_confirmed_same_pair_count
+            + self.unavailable_confirmed_same_pair_count
+        ):
+            raise ValueError("input confirmed SAME count split is inconsistent")
+        if self.available_confirmed_same_pair_count != len(
+            self.available_confirmed_same_pairs
+        ):
+            raise ValueError("available confirmed SAME count is inconsistent")
+        if self.unavailable_confirmed_same_pair_count != len(
+            self.unavailable_confirmed_same_pairs
+        ):
+            raise ValueError("unavailable confirmed SAME count is inconsistent")
+        return self
 
 
 @dataclass(frozen=True)
@@ -455,7 +478,18 @@ def build_pair_policy_evidence(
 
 
 def _canonical_pair(left: str, right: str) -> tuple[str, str]:
-    if not left or not right or left == right:
+    for value in (left, right):
+        parts = value.split("/")
+        if (
+            len(parts) != 2
+            or not parts[0]
+            or "/" in parts[0]
+            or re.fullmatch(r"e[1-9]\d*", parts[1]) is None
+        ):
+            raise ValueError(
+                "pair label occurrence IDs must use clip_uid/eN"
+            )
+    if left == right:
         raise ValueError("pair label endpoints must be distinct and non-empty")
     return tuple(sorted((left, right)))
 
@@ -947,14 +981,14 @@ def report_pair_policy_calibration(
         if pair not in by_pair:
             raise ValueError("hard-negative label references unavailable evidence")
         _verify_review_label(label, by_pair[pair])
-    if any(pair not in by_pair for pair in confirmed):
-        raise ValueError("confirmed SAME pair references unavailable evidence")
-
-    positive_pairs = confirmed + [
+    available_confirmed = [pair for pair in confirmed if pair in by_pair]
+    unavailable_confirmed = [pair for pair in confirmed if pair not in by_pair]
+    review_same_pairs = [
         pair
         for pair, label in zip(review_pairs, labels, strict=True)
         if label.same_person_label == "same"
     ]
+    positive_pairs = available_confirmed + review_same_pairs
     negative_pairs = [
         pair
         for pair, label in zip(review_pairs, labels, strict=True)
@@ -967,16 +1001,22 @@ def report_pair_policy_calibration(
     ]
     positive_rows = [by_pair[pair] for pair in positive_pairs]
     negative_rows = [by_pair[pair] for pair in negative_pairs]
-    _, implied = _same_closure(positive_pairs, set(by_pair))
+    all_human_same_pairs = confirmed + review_same_pairs
+    _, implied = _same_closure(all_human_same_pairs, set(by_pair))
     boundary_count = 5
     report = PairPolicyCalibrationReport(
         embedding_root=str(root),
         confirmed_face_pairs_path=str(confirmed_path),
         hard_negative_labels_path=str(review_path),
+        input_confirmed_same_pair_count=len(confirmed),
+        available_confirmed_same_pair_count=len(available_confirmed),
+        unavailable_confirmed_same_pair_count=len(unavailable_confirmed),
+        available_confirmed_same_pairs=available_confirmed,
+        unavailable_confirmed_same_pairs=unavailable_confirmed,
         confirmed_same_pair_count=len(positive_rows),
         confirmed_different_pair_count=len(negative_rows),
         uncertain_pair_count=len(uncertain_pairs),
-        directly_human_labeled_same_pair_count=len(positive_rows),
+        directly_human_labeled_same_pair_count=len(all_human_same_pairs),
         component_implied_same_pair_count=len(implied),
         component_implied_same_pairs=sorted(implied),
         face_positive_distribution=_distribution(
