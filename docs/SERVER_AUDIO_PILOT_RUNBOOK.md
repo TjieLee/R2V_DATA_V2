@@ -70,9 +70,12 @@ git checkout 1b6dcd2d8fc2895683de6508ec6294ec47d388ca
 mkdir -p model/faceDetector/s3fd
 
 "$AUDIO_ENV/bin/python" -m gdown \
-  --id 1KafnHz7ccT-3IyddBsL5yi2xGtxAKypt \
+  1KafnHz7ccT-3IyddBsL5yi2xGtxAKypt \
   -O model/faceDetector/s3fd/sfd_face.pth
 ```
+
+Recent `gdown` versions take the Google Drive ID as the positional `url_or_id`
+argument; do not use the removed `--id` flag.
 
 The LR-ASD repository already contains:
 
