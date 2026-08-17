@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -154,19 +155,34 @@ def _write_primary_voice(
 
 def _write_audio(root: Path, inventory: H3ProductionInventory) -> None:
     root.mkdir(parents=True)
-    for item in inventory.occurrences:
-        source = root.parent / "source" / f"{item.clip_uid}.mp4"
+    for clip_uid in inventory.eligible_clip_uids:
+        source = root.parent / "source" / f"{clip_uid}.mp4"
         source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_bytes(f"source:{item.clip_uid}".encode())
-        sidecar = root / "clips" / item.clip_uid / "audio_binding.json"
+        source.write_bytes(f"source:{clip_uid}".encode())
+        full_audio = root / "full_audio" / f"{clip_uid}.flac"
+        full_audio.parent.mkdir(parents=True, exist_ok=True)
+        full_audio.write_bytes(f"full-audio:{clip_uid}".encode())
+        sidecar = root / "clips" / clip_uid / "audio_binding.json"
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(
             json.dumps(
                 {
-                    "clip_uid": item.clip_uid,
+                    "clip_uid": clip_uid,
                     "source_run_root": inventory.source_run_root,
                     "source_video_path": str(source),
                     "status": "ready",
+                    "evidence": {
+                        "audio": {
+                            "status": "ready",
+                            "source_video_path": str(source),
+                            "full_audio_path": str(full_audio),
+                            "duration_seconds": 3.0,
+                            "sample_rate_hz": 16000,
+                            "channels": 1,
+                            "quality_score": 1.0,
+                            "reason": None,
+                        }
+                    },
                 },
                 sort_keys=True,
             )
@@ -294,7 +310,7 @@ def test_production_embedding_retains_all_and_gates_only_speaker_on_voice(
     assert rows[2]["primary_voice_unavailable_reasons"]
 
 
-def test_production_pairs_are_exact_deterministic_and_preserve_every_in_pair(
+def test_production_pairs_are_clip_level_exact_and_media_roles_are_canonical(
     tmp_path: Path,
 ) -> None:
     ids = ["clip-a/e1", "clip-b/e1", "clip-c/e1", "clip-d/e1", "clip-e/e1"]
@@ -343,18 +359,74 @@ def test_production_pairs_are_exact_deterministic_and_preserve_every_in_pair(
     cross_pairs = _read_jsonl(output / "cross_pairs.jsonl")
     evidence = _read_jsonl(output / "pair_evidence.jsonl")
     assert len(in_pairs) == 4
-    assert {item["target_occurrence_id"] for item in in_pairs} == set(ids[:4])
-    assert summary.complete_eligible_occurrence_count == 5
-    assert summary.in_pair_count == 4
-    assert summary.cross_pair_eligible_target_count == 3
-    assert summary.cross_pair_count == 3
+    assert {item["target_clip_uid"] for item in in_pairs} == {
+        item.split("/")[0] for item in ids[:4]
+    }
+    assert len({item["target_clip_uid"] for item in in_pairs}) == len(in_pairs)
+    assert all(len(item["subjects"]) == 1 for item in in_pairs)
+
+    target_in = next(item for item in in_pairs if item["target_clip_uid"] == "clip-a")
+    donor_in = next(item for item in in_pairs if item["target_clip_uid"] == "clip-b")
+    first = next(item for item in cross_pairs if item["target_clip_uid"] == "clip-a")
+    mapping = first["mappings"][0]
+    assert mapping["donor_occurrence_id"] == "clip-b/e1"
+    assert (
+        mapping["target_visual_reference_path"]
+        == target_in["subjects"][0]["target_visual_reference_path"]
+    )
+    assert (
+        mapping["donor_primary_voice_reference_path"]
+        == donor_in["subjects"][0]["target_primary_voice_reference_path"]
+    )
+    assert (
+        mapping["target_primary_voice_reference_path"]
+        == target_in["subjects"][0]["target_primary_voice_reference_path"]
+    )
+    assert (
+        mapping["donor_visual_reference_path"]
+        == donor_in["subjects"][0]["target_visual_reference_path"]
+    )
+    assert first["target_video_path"] == target_in["target_video_path"]
+    assert first["target_full_audio_path"] == target_in["target_full_audio_path"]
+    assert Path(first["target_full_audio_path"]).is_file()
+    assert len({item["target_clip_uid"] for item in cross_pairs}) == len(cross_pairs)
+
+    selected_evidence = [item for item in evidence if item["selected"]]
+    selected_mappings = [item for pair in cross_pairs for item in pair["mappings"]]
     assert len(evidence) == 3 * 2
-    first = next(item for item in cross_pairs if item["target_occurrence_id"] == "clip-a/e1")
-    assert first["donor_occurrence_id"] == "clip-b/e1"
-    assert len({item["target_occurrence_id"] for item in cross_pairs}) == len(cross_pairs)
+    assert len(selected_evidence) == len(selected_mappings) == 3
+    assert {
+        (item["target_occurrence_id"], item["donor_occurrence_id"])
+        for item in selected_evidence
+    } == {
+        (item["target_occurrence_id"], item["donor_occurrence_id"])
+        for item in selected_mappings
+    }
+
+    html = (output / "review.html").read_text(encoding="utf-8")
+    assert "Is this donor the same physical person as the target" in html
+    assert all(item["mapping_id"] in html for item in selected_mappings)
+    assert "1 CORRECT" in html
+    assert "2 WRONG" in html
+    assert "3 UNCERTAIN" in html
+    assert "Export JSONL" in html
+    assert len(list((output / "review_media" / "faces").iterdir())) == 3
+    assert len(list((output / "review_media" / "voices").iterdir())) == 3
+
+    assert summary.complete_visual_eligible_occurrence_count == 5
+    assert summary.in_pair_clip_sample_count == 4
+    assert summary.cross_pair_candidate_clip_count == 3
+    assert summary.cross_pair_clip_sample_count == 3
+    assert summary.selected_target_donor_subject_mapping_count == 3
+    assert summary.clips_without_complete_cross_pair_mapping == 1
+    assert summary.incomplete_cross_pair_reason_counts == {
+        "target_missing_required_embedding": 1
+    }
     assert summary.parent_quota_applied is False
     assert summary.transitive_clustering_performed is False
     assert summary.human_calibration_labels_used_as_identity_truth is False
+    assert summary.exact_candidate_evaluation is True
+    assert summary.thresholds_calibrated is True
     assert summary.face_threshold == 0.72
     assert summary.voice_threshold == 0.20
     assert summary.rank_gate_enabled is False
@@ -362,6 +434,134 @@ def test_production_pairs_are_exact_deterministic_and_preserve_every_in_pair(
     assert summary.text_gate_enabled is False
     assert AudioPairingConfig().face_threshold == 0.72
     assert AudioPairingConfig().voice_threshold == 0.20
+
+
+def test_multi_speaker_cross_uses_maximum_total_face_assignment(
+    tmp_path: Path,
+) -> None:
+    ids = ["clip-a/e1", "clip-a/e2", "clip-b/e1", "clip-c/e1"]
+    inventory = _inventory(tmp_path, ids)
+    primary = tmp_path / "primary"
+    _write_primary_voice(primary, inventory)
+
+    def unit(degrees: float) -> np.ndarray:
+        radians = math.radians(degrees)
+        return np.array([math.cos(radians), math.sin(radians)], dtype=np.float32)
+
+    face_vectors = {
+        "clip-a/e1": unit(0.0),
+        "clip-a/e2": unit(10.0),
+        "clip-b/e1": unit(2.0),
+        "clip-c/e1": unit(-10.0),
+    }
+    low_voice = np.array([0.2, math.sqrt(0.96)], dtype=np.float32)
+    voice_vectors = {
+        "clip-a/e1": unit(0.0),
+        "clip-a/e2": unit(0.0),
+        "clip-b/e1": unit(0.0),
+        "clip-c/e1": low_voice,
+    }
+    embedding = tmp_path / "embedding"
+    run_production_embedding_stage(
+        inventory=inventory,
+        primary_voice_root=primary,
+        output_root=embedding,
+        face_backend=PrecomputedEmbeddingBackend(
+            face_vectors,
+            model_identifier="test/face",
+        ),
+        speaker_backend=PrecomputedEmbeddingBackend(
+            voice_vectors,
+            model_identifier="test/voice",
+        ),
+    )
+    audio = tmp_path / "audio"
+    _write_audio(audio, inventory)
+    output = tmp_path / "pairs"
+
+    summary = build_h3_production_pairs(
+        inventory=inventory,
+        audio_root=audio,
+        primary_voice_root=primary,
+        embedding_root=embedding,
+        output_root=output,
+    )
+
+    in_pairs = _read_jsonl(output / "in_pairs.jsonl")
+    cross_pairs = _read_jsonl(output / "cross_pairs.jsonl")
+    target_in = next(item for item in in_pairs if item["target_clip_uid"] == "clip-a")
+    target_cross = next(
+        item for item in cross_pairs if item["target_clip_uid"] == "clip-a"
+    )
+    assert len(target_in["subjects"]) == 2
+    assert [item["target_occurrence_id"] for item in target_cross["mappings"]] == [
+        "clip-a/e1",
+        "clip-a/e2",
+    ]
+    assert [item["donor_occurrence_id"] for item in target_cross["mappings"]] == [
+        "clip-c/e1",
+        "clip-b/e1",
+    ]
+    assert len({item["donor_occurrence_id"] for item in target_cross["mappings"]}) == 2
+    assert target_cross["mappings"][0]["voice_similarity"] == pytest.approx(0.2)
+    assert target_cross["mappings"][1]["voice_similarity"] == pytest.approx(1.0)
+    selected_face_total = sum(
+        item["face_similarity"] for item in target_cross["mappings"]
+    )
+    greedy_face_total = float(
+        np.dot(face_vectors["clip-a/e1"], face_vectors["clip-b/e1"])
+        + np.dot(face_vectors["clip-a/e2"], face_vectors["clip-c/e1"])
+    )
+    assert selected_face_total > greedy_face_total
+    assert len({item["target_clip_uid"] for item in in_pairs}) == len(in_pairs)
+    assert len({item["target_clip_uid"] for item in cross_pairs}) == len(cross_pairs)
+    assert summary.selected_target_donor_subject_mapping_count == sum(
+        len(item["mappings"]) for item in cross_pairs
+    )
+
+
+def test_incomplete_multi_speaker_mapping_preserves_clip_in_pair(
+    tmp_path: Path,
+) -> None:
+    ids = ["clip-a/e1", "clip-a/e2", "clip-b/e1"]
+    inventory = _inventory(tmp_path, ids)
+    primary = tmp_path / "primary"
+    _write_primary_voice(primary, inventory)
+    vectors = {
+        occurrence_id: np.array([1.0, 0.0], dtype=np.float32) for occurrence_id in ids
+    }
+    embedding = tmp_path / "embedding"
+    run_production_embedding_stage(
+        inventory=inventory,
+        primary_voice_root=primary,
+        output_root=embedding,
+        face_backend=PrecomputedEmbeddingBackend(vectors, model_identifier="face"),
+        speaker_backend=PrecomputedEmbeddingBackend(vectors, model_identifier="voice"),
+    )
+    audio = tmp_path / "audio"
+    _write_audio(audio, inventory)
+    output = tmp_path / "pairs"
+
+    summary = build_h3_production_pairs(
+        inventory=inventory,
+        audio_root=audio,
+        primary_voice_root=primary,
+        embedding_root=embedding,
+        output_root=output,
+    )
+
+    in_pairs = _read_jsonl(output / "in_pairs.jsonl")
+    cross_pairs = _read_jsonl(output / "cross_pairs.jsonl")
+    evidence = _read_jsonl(output / "pair_evidence.jsonl")
+    target_in = next(item for item in in_pairs if item["target_clip_uid"] == "clip-a")
+    assert len(target_in["subjects"]) == 2
+    assert not any(item["target_clip_uid"] == "clip-a" for item in cross_pairs)
+    assert summary.clips_without_complete_cross_pair_mapping == 1
+    assert summary.incomplete_cross_pair_reason_counts == {
+        "no_complete_strict_donor_mapping": 1
+    }
+    assert len(evidence) == 4
+    assert all(item["target_clip_uid"] != item["donor_clip_uid"] for item in evidence)
 
 
 def test_no_cross_donor_keeps_valid_in_pair(tmp_path: Path) -> None:
@@ -388,10 +588,10 @@ def test_no_cross_donor_keeps_valid_in_pair(tmp_path: Path) -> None:
         output_root=tmp_path / "pairs",
     )
 
-    assert summary.in_pair_count == 1
-    assert summary.cross_pair_eligible_target_count == 1
-    assert summary.cross_pair_count == 0
-    assert summary.target_without_cross_pair_count == 1
+    assert summary.in_pair_clip_sample_count == 1
+    assert summary.cross_pair_candidate_clip_count == 1
+    assert summary.cross_pair_clip_sample_count == 0
+    assert summary.clips_without_complete_cross_pair_mapping == 1
 
 
 def test_stage_reuse_never_reruns_completed_expensive_stage(tmp_path: Path) -> None:
@@ -420,6 +620,7 @@ def test_stage_reuse_never_reruns_completed_expensive_stage(tmp_path: Path) -> N
             "in_pairs.jsonl",
             "cross_pairs.jsonl",
             "pair_evidence.jsonl",
+            "review.html",
         ],
     }
     for stage, names in required.items():
@@ -430,12 +631,20 @@ def test_stage_reuse_never_reruns_completed_expensive_stage(tmp_path: Path) -> N
     status = orchestrate_production_stages(
         stages=("audio", "primary-voice", "embedding", "pair"),
         roots=roots,
-        runners={stage: lambda overwrite: (_ for _ in ()).throw(AssertionError()) for stage in roots},
+        runners={
+            stage: lambda overwrite: (_ for _ in ()).throw(AssertionError())
+            for stage in roots
+        },
     )
 
     assert status == {stage: "reused" for stage in roots}
     assert paths.root.name == "production"
-    assert [paths.audio.name, paths.primary_voice.name, paths.embedding.name, paths.pairs.name] == [
+    assert [
+        paths.audio.name,
+        paths.primary_voice.name,
+        paths.embedding.name,
+        paths.pairs.name,
+    ] == [
         "audio",
         "primary_voice",
         "embedding",
@@ -459,6 +668,7 @@ def test_overwrite_upstream_cannot_leave_completed_downstream_stale(
         "in_pairs.jsonl",
         "cross_pairs.jsonl",
         "pair_evidence.jsonl",
+        "review.html",
     ):
         (paths.pairs / name).write_text("\n")
 

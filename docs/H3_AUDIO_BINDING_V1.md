@@ -232,10 +232,20 @@ SpeechBrain, and PairPolicy implementations. Its fixed stage order is
 `$AUDIO_RUN_ROOT/production`. The production inventory is complete rather than
 sampled; face inference receives every eligible occurrence, speaker inference
 receives only occurrences with a valid primary voice, and absent evidence never
-deletes a valid in-pair. Cross-pair construction evaluates every complete
-cross-clip candidate with `h3_pair_policy_v1`, selects at most one donor by
-higher face cosine then occurrence ID, and performs no transitive clustering.
-See `docs/SERVER_AUDIO_PILOT_RUNBOOK.md` for exact stage commands.
+deletes a valid in-pair.
+
+Production keeps occurrence-to-occurrence identity decisions in
+`pair_evidence.jsonl`, but publishes `in_pairs.jsonl` and
+`cross_pairs.jsonl` as target-clip samples. An in-pair contains every included
+speaking subject with its own target picture and primary voice. A cross-pair
+keeps the target video, full audio, Audio sidecar, and target pictures, while
+substituting only donor primary voices. Multi-speaker cross-pairs require a
+complete one-to-one legal assignment. Assignment maximizes total face cosine
+and uses occurrence IDs for deterministic ties; voice remains only the frozen
+`>= 0.20` contradiction gate. Incomplete assignments retain the clip in-pair
+and publish no cross-pair. No transitive clustering is performed. Every selected
+subject mapping is included in `pairs/review.html`.
+See `docs/SERVER_AUDIO_PILOT_RUNBOOK.md` for exact stage and review commands.
 
 Each successful case produces:
 

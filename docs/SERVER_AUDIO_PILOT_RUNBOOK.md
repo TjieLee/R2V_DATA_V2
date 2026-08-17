@@ -616,6 +616,14 @@ occurrence is retained in the production inventory; missing Audio, primary
 voice, face, speaker, or donor evidence is recorded as unavailable rather than
 turning into dataset sampling.
 
+Published in/cross rows are target-clip samples, while
+`pair_evidence.jsonl` remains directional occurrence-level evidence. A
+cross-pair keeps the target video, target full audio, target Audio sidecar, and
+every target picture. Only each subject's primary voice reference is replaced
+by its selected donor primary voice. Multi-speaker targets require a complete,
+one-to-one legal assignment maximizing total face cosine; an incomplete
+assignment publishes no cross-pair and leaves the in-pair intact.
+
 All outputs use one stable root with no timestamp suffix. First inspect the
 complete metadata-only input set:
 
@@ -666,6 +674,19 @@ cd "$REPO"
   --stages pair
 ```
 
+After this publication-contract fix is deployed, overwrite **only** the existing
+production Pair stage. This command reuses Audio, primary voice, face, and
+speaker artifacts and atomically replaces only `production/pairs`:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_audio_production.py \
+  --run-root "$V3_RUN" \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --stages pair \
+  --overwrite
+```
+
 The fixed artifacts are:
 
 ```text
@@ -675,6 +696,12 @@ $AUDIO_RUN_ROOT/production/
   primary_voice/
   embedding/
   pairs/
+    in_pairs.jsonl       # clip-level target samples
+    cross_pairs.jsonl    # clip-level target samples
+    pair_evidence.jsonl  # directional occurrence evidence
+    summary.json
+    review.html
+    review_media/
 ```
 
 Inspect the final aggregate and deterministic pair rows with:
@@ -687,6 +714,20 @@ wc -l \
   "$H3_PRODUCTION_ROOT/pairs/pair_evidence.jsonl"
 ```
 
+Serve the production root so every copied target/donor face and voice asset is
+available to the review page:
+
+```bash
+cd "$H3_PRODUCTION_ROOT"
+"$R2V_PYTHON" -m http.server 8765 --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8765/pairs/review.html` through the SSH port forward.
+The page includes every selected subject mapping, supports 1/2/3 and
+j/k/arrow navigation, and exports JSONL. These labels validate the accepted
+assets only; they never change PairPolicy thresholds or production identity.
+
+Except for an explicit pair-only contract migration such as the command above,
 `--overwrite` is debug-only. Overwriting an upstream stage fails unless every
 already-completed downstream stage is requested in the same invocation, which
 prevents stale primary-voice, embedding, or pair artifacts.
