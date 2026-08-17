@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -478,6 +479,177 @@ def test_model_contracts_fail_before_optional_model_imports(tmp_path: Path) -> N
     (model / "weights.ckpt").write_bytes(b"weights")
     assert len(fingerprint_local_model_path(model)) == 64
     assert validate_speaker_model_path(model) == model
+
+
+def _face_worker_args(tmp_path: Path) -> SimpleNamespace:
+    model_root = tmp_path / "face-models"
+    pack = model_root / "models" / "test-pack"
+    pack.mkdir(parents=True)
+    (pack / "recognition.onnx").write_bytes(b"model")
+    return SimpleNamespace(
+        model_root=model_root,
+        model_name="test-pack",
+        model_identifier="test/arcface",
+        model_fingerprint=fingerprint_local_model_path(pack),
+        device="cuda:0",
+        det_size=640,
+        det_threshold=0.5,
+    )
+
+
+def _install_fake_face_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    events: list[str],
+    available_providers: list[str],
+    session_providers: list[str] | None = None,
+    initialization_error: Exception | None = None,
+) -> None:
+    ort = ModuleType("onnxruntime")
+    ort.__version__ = "1.26.0"
+
+    def preload_dlls() -> None:
+        events.append("preload_dlls")
+
+    ort.preload_dlls = preload_dlls  # type: ignore[attr-defined]
+    ort.get_available_providers = (  # type: ignore[attr-defined]
+        lambda: available_providers
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+    monkeypatch.setitem(sys.modules, "cv2", ModuleType("cv2"))
+
+    insightface = ModuleType("insightface")
+
+    class FakeSession:
+        def get_providers(self) -> list[str]:
+            return session_providers or ["CUDAExecutionProvider"]
+
+    class FakeApp:
+        def __init__(self) -> None:
+            self.models = {"recognition": SimpleNamespace(session=FakeSession())}
+
+        def prepare(self, **kwargs: object) -> None:
+            del kwargs
+            events.append("prepare")
+
+    def face_analysis(**kwargs: object) -> FakeApp:
+        del kwargs
+        events.append("face_analysis")
+        if initialization_error is not None:
+            raise initialization_error
+        return FakeApp()
+
+    insightface.app = SimpleNamespace(FaceAnalysis=face_analysis)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "insightface", insightface)
+    insightface_utils = ModuleType("insightface.utils")
+    insightface_utils.face_align = SimpleNamespace()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "insightface.utils", insightface_utils)
+
+
+def test_face_worker_preloads_ort_before_insightface_session_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _install_fake_face_runtime(
+        monkeypatch,
+        events=events,
+        available_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    worker = InsightFaceWorker(_face_worker_args(tmp_path))
+
+    assert events == ["preload_dlls", "face_analysis", "prepare"]
+    assert worker.cuda_requested is True
+    assert worker.onnxruntime_version == "1.26.0"
+
+
+def test_face_worker_fails_closed_when_requested_cuda_provider_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _install_fake_face_runtime(
+        monkeypatch,
+        events=events,
+        available_providers=["CPUExecutionProvider"],
+    )
+
+    with pytest.raises(RuntimeError, match="requested but is unavailable"):
+        InsightFaceWorker(_face_worker_args(tmp_path))
+
+    assert events == ["preload_dlls"]
+
+
+def test_face_worker_rejects_silent_cpu_provider_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _install_fake_face_runtime(
+        monkeypatch,
+        events=events,
+        available_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        session_providers=["CPUExecutionProvider"],
+    )
+
+    with pytest.raises(RuntimeError, match="CUDA session initialization failed"):
+        InsightFaceWorker(_face_worker_args(tmp_path))
+
+    assert events == ["preload_dlls", "face_analysis"]
+
+
+def test_face_worker_reports_cuda_runtime_initialization_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _install_fake_face_runtime(
+        monkeypatch,
+        events=events,
+        available_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        initialization_error=OSError("libcudnn.so could not be loaded"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="verify CUDA 12 and cuDNN runtime loading",
+    ):
+        InsightFaceWorker(_face_worker_args(tmp_path))
+
+
+def test_broken_worker_stdin_during_close_does_not_mask_original_error(
+    tmp_path: Path,
+) -> None:
+    class BrokenStdin:
+        def close(self) -> None:
+            raise BrokenPipeError("worker already exited")
+
+    class ClosedProcess:
+        stdin = BrokenStdin()
+        stdout = io.StringIO()
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+    backend = PersistentSubprocessEmbeddingBackend(
+        executable=[sys.executable],
+        model_identifier="test",
+        checkpoint_sha256="d" * 64,
+        timeout_seconds=1,
+        diagnostics_root=tmp_path / "logs",
+    )
+    backend._process = ClosedProcess()  # type: ignore[assignment]
+    backend._stderr_stream = io.StringIO()
+
+    with pytest.raises(RuntimeError, match="original worker error"):
+        try:
+            raise RuntimeError("original worker error")
+        finally:
+            backend.close()
+
+    assert backend._process is None
 
 
 @pytest.mark.parametrize(

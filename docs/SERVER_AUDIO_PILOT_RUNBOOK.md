@@ -110,11 +110,12 @@ CUDA stack rather than replacing the node's working GPU runtime implicitly.
 uv venv --python 3.12 "$EMBEDDING_ENV"
 
 uv pip install --python "$EMBEDDING_ENV/bin/python" \
-  torch torchvision torchaudio
+  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu121
 
 uv pip install --python "$EMBEDDING_ENV/bin/python" \
-  insightface onnxruntime-gpu opencv-python-headless \
-  speechbrain soundfile Pillow numpy
+  insightface "onnxruntime-gpu==1.26.0" opencv-python-headless \
+  speechbrain soundfile Pillow numpy "pydantic>=2,<3"
 ```
 
 Record the resolved package versions after installation:
@@ -139,6 +140,14 @@ the locally staged `speechbrain/spkrec-ecapa-voxceleb` snapshot. Both workers
 verify a deterministic model-directory fingerprint before importing or loading
 the model. Set `CUDA_VISIBLE_DEVICES` in the parent shell; a selected physical
 GPU is exposed to each worker as process-local `cuda:0`.
+
+`onnxruntime-gpu==1.26.0` is intentional for the validated
+Torch 2.5.1+cu121 environment: it is a CUDA 12/cuDNN 9 build and provides
+`onnxruntime.preload_dlls()`. PyPI `onnxruntime-gpu` 1.27 and newer default to
+CUDA 13 and must not be substituted in this environment. The face worker
+preloads CUDA/cuDNN libraries before constructing any InsightFace session,
+requires `CUDAExecutionProvider` when `cuda:N` is requested, and fails closed
+if a created session falls back to CPU.
 
 ## LR-ASD checkout and weights
 

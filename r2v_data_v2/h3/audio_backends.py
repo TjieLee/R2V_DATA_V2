@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import uuid
 import wave
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Protocol, Self
@@ -859,11 +860,14 @@ class PersistentSubprocessEmbeddingBackend:
                     process.wait(timeout=self.timeout_seconds)
         finally:
             if process.stdin is not None:
-                process.stdin.close()
+                with suppress(BrokenPipeError, OSError):
+                    process.stdin.close()
             if process.stdout is not None:
-                process.stdout.close()
+                with suppress(BrokenPipeError, OSError):
+                    process.stdout.close()
             if self._stderr_stream is not None:
-                self._stderr_stream.close()
+                with suppress(BrokenPipeError, OSError):
+                    self._stderr_stream.close()
             self._process = None
             self._stderr_stream = None
 

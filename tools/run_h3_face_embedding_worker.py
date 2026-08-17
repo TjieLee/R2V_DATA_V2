@@ -59,33 +59,81 @@ class InsightFaceWorker:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-        import cv2  # type: ignore[import-not-found]
-        import insightface  # type: ignore[import-not-found]
-        from insightface.utils import face_align  # type: ignore[import-not-found]
+        import onnxruntime as ort  # type: ignore[import-not-found]
+
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                ort.preload_dlls()
+        except Exception as exc:
+            raise RuntimeError(
+                "ONNX Runtime CUDA/cuDNN preload failed before InsightFace "
+                "session creation"
+            ) from exc
 
         if args.device == "cpu":
             providers = ["CPUExecutionProvider"]
             context_id = -1
         elif args.device.startswith("cuda:"):
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            context_id = int(args.device.split(":", maxsplit=1)[1])
+            device_index = args.device.split(":", maxsplit=1)[1]
+            if not device_index.isdigit():
+                raise ValueError("face CUDA device must use cuda:N with N >= 0")
+            context_id = int(device_index)
+            available_providers = set(ort.get_available_providers())
+            if "CUDAExecutionProvider" not in available_providers:
+                raise RuntimeError(
+                    "CUDAExecutionProvider was requested but is unavailable; "
+                    "verify the CUDA-12 ONNX Runtime and cuDNN installation"
+                )
+            providers = ["CUDAExecutionProvider"]
         else:
             raise ValueError("face device must be cpu or cuda:N")
-        app = insightface.app.FaceAnalysis(
-            name=args.model_name,
-            root=str(args.model_root.expanduser().resolve(strict=True)),
-            providers=providers,
-        )
-        app.prepare(
-            ctx_id=context_id,
-            det_size=(args.det_size, args.det_size),
-            det_thresh=args.det_threshold,
-        )
+
+        import cv2  # type: ignore[import-not-found]
+        import insightface  # type: ignore[import-not-found]
+        from insightface.utils import face_align  # type: ignore[import-not-found]
+
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                app = insightface.app.FaceAnalysis(
+                    name=args.model_name,
+                    root=str(args.model_root.expanduser().resolve(strict=True)),
+                    providers=providers,
+                )
+                if context_id >= 0:
+                    for model in app.models.values():
+                        session = getattr(model, "session", None)
+                        if session is None or not hasattr(session, "get_providers"):
+                            raise RuntimeError(
+                                "InsightFace model does not expose ONNX provider state"
+                            )
+                        active_providers = session.get_providers()
+                        if (
+                            not active_providers
+                            or active_providers[0] != "CUDAExecutionProvider"
+                        ):
+                            raise RuntimeError(
+                                "InsightFace CUDA session silently fell back from "
+                                "CUDAExecutionProvider"
+                            )
+                app.prepare(
+                    ctx_id=context_id,
+                    det_size=(args.det_size, args.det_size),
+                    det_thresh=args.det_threshold,
+                )
+        except Exception as exc:
+            if context_id >= 0:
+                raise RuntimeError(
+                    "InsightFace CUDA session initialization failed; verify "
+                    "CUDA 12 and cuDNN runtime loading"
+                ) from exc
+            raise
         self.args = args
         self.app = app
         self.cv2 = cv2
         self.face_align = face_align
         self.backend_version = _package_version("insightface")
+        self.onnxruntime_version = str(ort.__version__)
+        self.cuda_requested = context_id >= 0
 
     def process(self, request: dict[str, Any]) -> dict[str, Any]:
         image_path = Path(str(request["image_path"])).expanduser().resolve(strict=True)
@@ -93,9 +141,18 @@ class InsightFaceWorker:
         image = self.cv2.imread(str(image_path), self.cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("canonical face source is not a readable image")
+        try:
+            detected_faces = self.app.get(image)
+        except Exception as exc:
+            if self.cuda_requested:
+                raise RuntimeError(
+                    "InsightFace CUDA inference failed; verify CUDA 12 and cuDNN "
+                    "runtime loading"
+                ) from exc
+            raise
         faces = [
             face
-            for face in self.app.get(image)
+            for face in detected_faces
             if float(face.det_score) >= self.args.det_threshold
         ]
         common = {
@@ -140,6 +197,7 @@ class InsightFaceWorker:
             "backend_metadata": {
                 "backend_name": "insightface_arcface",
                 "backend_version": self.backend_version,
+                "onnxruntime_version": self.onnxruntime_version,
                 "detector_confidence": float(face.det_score),
                 "detected_bbox_xyxy": np.asarray(face.bbox, dtype=float).tolist(),
                 "landmarks_xy": landmarks.astype(float).tolist(),
