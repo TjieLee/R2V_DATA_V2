@@ -168,6 +168,58 @@ print("silero imports OK")
 PY
 ```
 
+## Select a Visual-eligible smoke clip
+
+Do not use `--limit 1` for the first smoke test. The pilot's bounded limit is
+applied to the sorted raw clip paths before Visual eligibility checks, so the
+first path may legitimately have failed a Visual gate such as coverage.
+
+Select an explicit clip that satisfies the same Visual prerequisites as the
+pilot loader:
+
+```bash
+cd "$REPO"
+export R2V_PYTHON=$REPO/.venv/bin/python
+
+export SMOKE_CLIP=$(
+"$R2V_PYTHON" - <<'PY'
+import os
+from pathlib import Path
+from r2v_data_v2.v3.schemas import ClipRecord, SampledFramesArtifact, TrackedMasksArtifact
+
+root = Path(os.environ["V3_RUN"])
+for clip_path in sorted((root / "clips").glob("*/clip.json")):
+    try:
+        clip = ClipRecord.model_validate_json(clip_path.read_text(encoding="utf-8"))
+        if clip.annotation is None or clip.annotation.status != "ready":
+            continue
+        if clip.coverage is None or not clip.coverage.passed:
+            continue
+        if clip.pairing is None or clip.pairing.status != "ready":
+            continue
+        frames = SampledFramesArtifact.model_validate_json(
+            (clip_path.parent / "frames" / "frames.json").read_text(encoding="utf-8")
+        )
+        masks = TrackedMasksArtifact.model_validate_json(
+            (clip_path.parent / "masks.rle.json").read_text(encoding="utf-8")
+        )
+        if frames.clip_uid != clip.clip_uid or masks.clip_uid != clip.clip_uid:
+            continue
+        if not any(entity.status == "ready" for entity in masks.entities.values()):
+            continue
+        if not Path(clip.source.video_path).expanduser().is_file():
+            continue
+        print(clip.clip_uid)
+        break
+    except Exception:
+        continue
+PY
+)
+
+echo "SMOKE_CLIP=$SMOKE_CLIP"
+test -n "$SMOKE_CLIP"
+```
+
 ## Pilot command
 
 Run the pilot from the R2V repository while keeping all output outside the
@@ -179,12 +231,12 @@ cd "$REPO"
 export AUDIO_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs
 mkdir -p "$AUDIO_RUN_ROOT"
 
-export PILOT_OUT=$AUDIO_RUN_ROOT/lr-asd-pilot-$(date +%Y%m%d-%H%M%S)
+export PILOT_OUT=$AUDIO_RUN_ROOT/lr-asd-smoke-${SMOKE_CLIP}-$(date +%Y%m%d-%H%M%S)
 
-python tools/eval_h3_audio_binding_lr_asd.py \
+"$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
   --run-root "$V3_RUN" \
   --output-root "$PILOT_OUT" \
-  --limit 1
+  --clip-id "$SMOKE_CLIP"
 ```
 
 The R2V driver should use the repository Python environment. LR-ASD and Silero
