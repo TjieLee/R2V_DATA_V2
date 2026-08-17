@@ -110,6 +110,40 @@ PY
 )
 ```
 
+## uv venv subprocess wrapper
+
+The current Audio runtime resolves configured Python executable paths before
+launching LR-ASD, Silero, and review subprocesses. A uv-created venv normally
+uses a symlink at `bin/python`; resolving that symlink can bypass the venv and
+run the managed base interpreter without the venv's site-packages. The symptom
+is that direct `$AUDIO_ENV/bin/python` imports succeed while the pilot subprocess
+reports modules such as `tqdm` missing.
+
+Until the runtime stops resolving interpreter symlinks, use a regular executable
+wrapper stored on the shared workspace:
+
+```bash
+export AUDIO_PY_WRAPPER=$AUDIO_DEPS/audio-python-wrapper
+
+cat > "$AUDIO_PY_WRAPPER" <<EOF
+#!/usr/bin/env bash
+exec "$AUDIO_ENV/bin/python" "\$@"
+EOF
+chmod 755 "$AUDIO_PY_WRAPPER"
+
+export LR_ASD_PYTHON=$AUDIO_PY_WRAPPER
+export SILERO_VAD_PYTHON=$AUDIO_PY_WRAPPER
+```
+
+Verify the wrapper before a pilot:
+
+```bash
+"$LR_ASD_PYTHON" -c 'import sys, tqdm, torch; print(sys.executable); print(tqdm.__file__); print(torch.__version__)'
+```
+
+Do not point `LR_ASD_PYTHON` or `SILERO_VAD_PYTHON` directly at the uv venv
+symlink while this workaround is required.
+
 ## Runtime environment variables
 
 After changing nodes or starting a new shell, restore:
@@ -123,10 +157,12 @@ export AUDIO_ENV=$AUDIO_DEPS/lr-asd-venv
 export UV_PYTHON_INSTALL_DIR=$AUDIO_DEPS/uv-python
 
 export LR_ASD_CODE_ROOT=$AUDIO_DEPS/LR-ASD
-export LR_ASD_PYTHON=$AUDIO_ENV/bin/python
 export LR_ASD_MODEL_PATH=$LR_ASD_CODE_ROOT/weight/pretrain_AVA.model
 
-export SILERO_VAD_PYTHON=$AUDIO_ENV/bin/python
+export AUDIO_PY_WRAPPER=$AUDIO_DEPS/audio-python-wrapper
+export LR_ASD_PYTHON=$AUDIO_PY_WRAPPER
+export SILERO_VAD_PYTHON=$AUDIO_PY_WRAPPER
+
 export SILERO_VAD_MODEL_PATH=$(
 "$AUDIO_ENV/bin/python" - <<'PY'
 from importlib.resources import files
@@ -155,15 +191,18 @@ test -f "$LR_ASD_CODE_ROOT/Columbia_test.py"
 test -f "$LR_ASD_MODEL_PATH"
 test -f "$LR_ASD_CODE_ROOT/model/faceDetector/s3fd/sfd_face.pth"
 test -f "$SILERO_VAD_MODEL_PATH"
+test -x "$AUDIO_PY_WRAPPER"
 
-"$AUDIO_ENV/bin/python" - <<'PY'
+"$LR_ASD_PYTHON" - <<'PY'
 import torch
+import tqdm
 from silero_vad import get_speech_timestamps, read_audio
 print("torch", torch.__version__)
 print("torch cuda", torch.version.cuda)
 print("cuda available", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("gpu0", torch.cuda.get_device_name(0))
+print("tqdm", tqdm.__file__)
 print("silero imports OK")
 PY
 ```
@@ -240,5 +279,5 @@ export PILOT_OUT=$AUDIO_RUN_ROOT/lr-asd-smoke-${SMOKE_CLIP}-$(date +%Y%m%d-%H%M%
 ```
 
 The R2V driver should use the repository Python environment. LR-ASD and Silero
-are invoked through the explicit `LR_ASD_PYTHON` and `SILERO_VAD_PYTHON`
-subprocess paths above.
+are invoked through the explicit wrapper paths above until interpreter symlink
+resolution is fixed in the runtime.
