@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -22,17 +23,15 @@ from r2v_data_v2.h3.audio_schemas import (
     SpeechTurn,
 )
 
+H3_PAIR_POLICY_VERSION = "h3_pair_policy_v1"
+H3_PAIR_POLICY_FACE_THRESHOLD = 0.72
+H3_PAIR_POLICY_VOICE_THRESHOLD = 0.20
+
 
 @dataclass(frozen=True)
 class AudioPairingConfig:
-    top_k: int = 20
-    block_size: int = 256
-    face_strict_threshold: float = 0.70
-    face_without_text_strict_threshold: float = 0.75
-    face_margin_threshold: float = 0.04
-    voice_strict_threshold: float = 0.75
-    voice_margin_threshold: float = 0.04
-    text_threshold: float = 0.30
+    face_threshold: float = H3_PAIR_POLICY_FACE_THRESHOLD
+    voice_threshold: float = H3_PAIR_POLICY_VOICE_THRESHOLD
     minimum_local_binding_confidence: float = 0.80
     max_cross_pair_variants_per_target: int = 1
     renderer_profile: str = "h3_v1"
@@ -40,21 +39,18 @@ class AudioPairingConfig:
     speech_close_tag: str = "</d>"
 
     def __post_init__(self) -> None:
-        if self.top_k <= 0 or self.block_size <= 0:
-            raise ValueError("pair top-K and block size must be positive")
         thresholds = (
-            self.face_strict_threshold,
-            self.face_without_text_strict_threshold,
-            self.face_margin_threshold,
-            self.voice_strict_threshold,
-            self.voice_margin_threshold,
-            self.text_threshold,
+            self.face_threshold,
+            self.voice_threshold,
             self.minimum_local_binding_confidence,
         )
         if any(not -1 <= value <= 1 for value in thresholds):
             raise ValueError("pair thresholds must be finite cosine/probability values")
-        if self.face_without_text_strict_threshold < self.face_strict_threshold:
-            raise ValueError("missing-text face threshold must not be weaker")
+        if (
+            self.face_threshold != H3_PAIR_POLICY_FACE_THRESHOLD
+            or self.voice_threshold != H3_PAIR_POLICY_VOICE_THRESHOLD
+        ):
+            raise ValueError("H3 PairPolicy V1 thresholds are frozen at 0.72/0.20")
         if self.max_cross_pair_variants_per_target not in {0, 1}:
             raise ValueError("max cross-pair variants must be 0 or 1 in V1")
         if (
@@ -210,6 +206,29 @@ def _neighbor_maps(
     return neighbors, similarities
 
 
+def _exact_neighbor_maps(
+    occurrences: list[EntityOccurrence],
+    vectors: np.ndarray,
+) -> tuple[dict[str, list[str]], dict[tuple[str, str], float]]:
+    matrix = _normalize_matrix(vectors)
+    similarities: dict[tuple[str, str], float] = {}
+    neighbors: dict[str, list[str]] = {}
+    for left_index, left in enumerate(occurrences):
+        values: list[tuple[float, str]] = []
+        left_clip = left.entity_occurrence_id.split("/", 1)[0]
+        for right_index, right in enumerate(occurrences):
+            right_clip = right.entity_occurrence_id.split("/", 1)[0]
+            if left_index == right_index or left_clip == right_clip:
+                continue
+            score = _bounded_cosine(float(np.dot(matrix[left_index], matrix[right_index])))
+            right_id = right.entity_occurrence_id
+            similarities[(left.entity_occurrence_id, right_id)] = score
+            values.append((score, right_id))
+        values.sort(key=lambda item: (-item[0], item[1]))
+        neighbors[left.entity_occurrence_id] = [item[1] for item in values]
+    return neighbors, similarities
+
+
 def _rank(neighbors: dict[str, list[str]], left: str, right: str) -> int | None:
     try:
         return neighbors[left].index(right) + 1
@@ -292,6 +311,60 @@ def _draft_annotation(
     )
 
 
+def evaluate_pair_policy_v1(
+    *,
+    target_entity_occurrence_id: str,
+    reference_entity_occurrence_id: str,
+    face_similarity: float,
+    voice_similarity: float,
+    config: AudioPairingConfig | None = None,
+    text_similarity: float | None = None,
+    face_rank_left_to_right: int | None = None,
+    face_rank_right_to_left: int | None = None,
+    voice_rank_left_to_right: int | None = None,
+    voice_rank_right_to_left: int | None = None,
+    face_margin: float = 0.0,
+    voice_margin: float = 0.0,
+) -> PairEvidence:
+    active = config or AudioPairingConfig()
+    face_score = _bounded_cosine(face_similarity)
+    voice_score = _bounded_cosine(voice_similarity)
+    person_accepted = face_score >= active.face_threshold
+    voice_accepted = voice_score >= active.voice_threshold
+    return PairEvidence(
+        target_entity_occurrence_id=target_entity_occurrence_id,
+        reference_entity_occurrence_id=reference_entity_occurrence_id,
+        same_person=SamePersonEvidence(
+            status="accepted" if person_accepted else "rejected",
+            face_similarity=face_score,
+            text_similarity=text_similarity,
+            face_rank_left_to_right=face_rank_left_to_right,
+            face_rank_right_to_left=face_rank_right_to_left,
+            face_margin=face_margin,
+            policy_version=H3_PAIR_POLICY_VERSION,
+            reason_codes=(
+                ["pair_policy_v1_face_passed"]
+                if person_accepted
+                else ["face_below_pair_policy_v1_threshold"]
+            ),
+        ),
+        same_voice=SameVoiceEvidence(
+            status="accepted" if voice_accepted else "rejected",
+            voice_similarity=voice_score,
+            voice_rank_left_to_right=voice_rank_left_to_right,
+            voice_rank_right_to_left=voice_rank_right_to_left,
+            voice_margin=voice_margin,
+            policy_version=H3_PAIR_POLICY_VERSION,
+            reason_codes=(
+                ["pair_policy_v1_voice_floor_passed"]
+                if voice_accepted
+                else ["voice_below_pair_policy_v1_floor"]
+            ),
+        ),
+        combined_score=face_score + voice_score + (text_similarity or 0.0),
+    )
+
+
 def build_pairwise_evidence(
     bindings: list[AudioClipBinding],
     *,
@@ -301,6 +374,10 @@ def build_pairwise_evidence(
     voice_index_backend: object | None = None,
 ) -> list[PairEvidence]:
     active = config or AudioPairingConfig()
+    # The public backend parameters remain accepted for API compatibility. PairPolicy
+    # V1 deliberately uses exact cross-clip scores so approximate/top-K retrieval can
+    # never become an acceptance gate.
+    del face_index_backend, voice_index_backend
     occurrences = sorted(
         (
             occurrence
@@ -320,40 +397,25 @@ def build_pairwise_evidence(
     voice_vectors = np.stack(
         [_load_embedding(audio_root, item, "voice") for item in occurrences]
     )
-    face_backend = face_index_backend or NumpyBlockwiseTopKIndex(
-        block_size=active.block_size
-    )
-    voice_backend = voice_index_backend or NumpyBlockwiseTopKIndex(
-        block_size=active.block_size
-    )
-    face_neighbors, face_scores = _neighbor_maps(
-        occurrences,
-        face_vectors,
-        top_k=active.top_k,
-        index_backend=face_backend,
-    )
-    voice_neighbors, voice_scores = _neighbor_maps(
-        occurrences,
-        voice_vectors,
-        top_k=active.top_k,
-        index_backend=voice_backend,
-    )
-    by_id = {item.entity_occurrence_id: item for item in occurrences}
-    candidates = sorted(set(face_scores).intersection(voice_scores))
+    face_neighbors, face_scores = _exact_neighbor_maps(occurrences, face_vectors)
+    voice_neighbors, voice_scores = _exact_neighbor_maps(occurrences, voice_vectors)
+    candidates = sorted(face_scores)
+    text_vectors = {
+        item.entity_occurrence_id: _load_embedding(audio_root, item, "text")
+        for item in occurrences
+        if item.identity_text_specific
+        and item.identity_text_embedding_asset is not None
+    }
     evidence: list[PairEvidence] = []
     for left_id, right_id in candidates:
-        left = by_id[left_id]
-        right = by_id[right_id]
         left_clip = left_id.split("/", 1)[0]
         right_clip = right_id.split("/", 1)[0]
         if left_clip == right_clip:
             continue
         face_score = face_scores[(left_id, right_id)]
         voice_score = voice_scores[(left_id, right_id)]
-        face_reverse = face_scores.get((right_id, left_id))
-        voice_reverse = voice_scores.get((right_id, left_id))
-        face_mutual = face_reverse is not None
-        voice_mutual = voice_reverse is not None
+        face_reverse = face_scores[(right_id, left_id)]
+        voice_reverse = voice_scores[(right_id, left_id)]
         face_margin = min(
             _pair_margin(
                 left=left_id,
@@ -365,7 +427,7 @@ def build_pairwise_evidence(
             _pair_margin(
                 left=right_id,
                 right=left_id,
-                score=face_reverse if face_reverse is not None else -1.0,
+                score=face_reverse,
                 neighbors=face_neighbors,
                 similarities=face_scores,
             ),
@@ -381,90 +443,31 @@ def build_pairwise_evidence(
             _pair_margin(
                 left=right_id,
                 right=left_id,
-                score=voice_reverse if voice_reverse is not None else -1.0,
+                score=voice_reverse,
                 neighbors=voice_neighbors,
                 similarities=voice_scores,
             ),
         )
         text_similarity = None
-        text_available = (
-            left.identity_text_specific
-            and right.identity_text_specific
-            and left.identity_text_embedding_asset is not None
-            and right.identity_text_embedding_asset is not None
-        )
+        text_available = left_id in text_vectors and right_id in text_vectors
         if text_available:
             text_similarity = _bounded_cosine(
-                np.dot(
-                    _load_embedding(audio_root, left, "text"),
-                    _load_embedding(audio_root, right, "text"),
-                )
+                np.dot(text_vectors[left_id], text_vectors[right_id])
             )
-        face_threshold = (
-            active.face_strict_threshold
-            if text_available
-            else active.face_without_text_strict_threshold
-        )
-        person_reasons: list[str] = []
-        if face_score < face_threshold:
-            person_reasons.append("face_below_strict_threshold")
-        if not face_mutual:
-            person_reasons.append("face_not_mutual_top_k")
-        if face_margin < active.face_margin_threshold:
-            person_reasons.append("face_margin_too_small")
-        if text_similarity is not None and text_similarity < active.text_threshold:
-            person_reasons.append("identity_text_conflict")
-        person_accepted = not person_reasons
-        person_candidate = (
-            not person_accepted and face_score >= active.face_strict_threshold
-        )
-        voice_reasons: list[str] = []
-        if voice_score < active.voice_strict_threshold:
-            voice_reasons.append("voice_below_strict_threshold")
-        if not voice_mutual:
-            voice_reasons.append("voice_not_mutual_top_k")
-        if voice_margin < active.voice_margin_threshold:
-            voice_reasons.append("voice_margin_too_small")
-        voice_accepted = not voice_reasons
-        voice_candidate = (
-            not voice_accepted and voice_score >= active.voice_strict_threshold
-        )
         evidence.append(
-            PairEvidence(
+            evaluate_pair_policy_v1(
                 target_entity_occurrence_id=left_id,
                 reference_entity_occurrence_id=right_id,
-                same_person=SamePersonEvidence(
-                    status=(
-                        "accepted"
-                        if person_accepted
-                        else "candidate"
-                        if person_candidate
-                        else "rejected"
-                    ),
-                    face_similarity=face_score,
-                    text_similarity=text_similarity,
-                    face_rank_left_to_right=_rank(face_neighbors, left_id, right_id),
-                    face_rank_right_to_left=_rank(face_neighbors, right_id, left_id),
-                    face_margin=face_margin,
-                    policy_version="strict_pairwise_v1",
-                    reason_codes=person_reasons or ["strict_face_policy_passed"],
-                ),
-                same_voice=SameVoiceEvidence(
-                    status=(
-                        "accepted"
-                        if voice_accepted
-                        else "candidate"
-                        if voice_candidate
-                        else "rejected"
-                    ),
-                    voice_similarity=voice_score,
-                    voice_rank_left_to_right=_rank(voice_neighbors, left_id, right_id),
-                    voice_rank_right_to_left=_rank(voice_neighbors, right_id, left_id),
-                    voice_margin=voice_margin,
-                    policy_version="strict_pairwise_v1",
-                    reason_codes=voice_reasons or ["strict_voice_policy_passed"],
-                ),
-                combined_score=face_score + voice_score + (text_similarity or 0.0),
+                face_similarity=face_score,
+                voice_similarity=voice_score,
+                config=active,
+                text_similarity=text_similarity,
+                face_rank_left_to_right=_rank(face_neighbors, left_id, right_id),
+                face_rank_right_to_left=_rank(face_neighbors, right_id, left_id),
+                voice_rank_left_to_right=_rank(voice_neighbors, left_id, right_id),
+                voice_rank_right_to_left=_rank(voice_neighbors, right_id, left_id),
+                face_margin=face_margin,
+                voice_margin=voice_margin,
             )
         )
     return evidence
@@ -482,8 +485,9 @@ def _target(binding: AudioClipBinding) -> PairTarget:
 def _producer(config: AudioPairingConfig) -> ProducerProvenance:
     return ProducerProvenance(
         producer="r2v_data_v2.h3.audio_pairing",
-        version="v1",
+        version=H3_PAIR_POLICY_VERSION,
         config_fingerprint=config.fingerprint(),
+        thresholds_calibrated=True,
     )
 
 
@@ -499,38 +503,41 @@ def _published_speech_turns(
     ]
 
 
-def _best_complete_matching(
-    candidate_sets: list[list[tuple[PairEvidence, EntityOccurrence]]],
-) -> list[tuple[PairEvidence, EntityOccurrence]] | None:
-    best: list[tuple[PairEvidence, EntityOccurrence]] | None = None
+def select_complete_donor_matching(
+    candidate_sets: list[list[PairEvidence]],
+) -> list[PairEvidence] | None:
+    best: list[PairEvidence] | None = None
     best_key: tuple[float, tuple[str, ...]] | None = None
 
     def search(
         target_index: int,
-        selected: list[tuple[PairEvidence, EntityOccurrence]],
+        selected: list[PairEvidence],
         used_reference_ids: set[str],
         score: float,
     ) -> None:
         nonlocal best, best_key
         if target_index == len(candidate_sets):
-            reference_ids = tuple(item[1].entity_occurrence_id for item in selected)
+            reference_ids = tuple(
+                item.reference_entity_occurrence_id for item in selected
+            )
             key = (-score, reference_ids)
             if best_key is None or key < best_key:
                 best = list(selected)
                 best_key = key
             return
-        for edge, reference in candidate_sets[target_index]:
-            if reference.entity_occurrence_id in used_reference_ids:
+        for edge in candidate_sets[target_index]:
+            reference_id = edge.reference_entity_occurrence_id
+            if reference_id in used_reference_ids:
                 continue
-            selected.append((edge, reference))
-            used_reference_ids.add(reference.entity_occurrence_id)
+            selected.append(edge)
+            used_reference_ids.add(reference_id)
             search(
                 target_index + 1,
                 selected,
                 used_reference_ids,
-                score + edge.combined_score,
+                score + edge.same_person.face_similarity,
             )
-            used_reference_ids.remove(reference.entity_occurrence_id)
+            used_reference_ids.remove(reference_id)
             selected.pop()
 
     search(0, [], set(), 0.0)
@@ -633,9 +640,9 @@ def build_audio_pair_samples(
             )
             continue
         cross_targets = speaking
-        candidate_sets: list[list[tuple[PairEvidence, EntityOccurrence]]] = []
+        candidate_sets: list[list[PairEvidence]] = []
         for target_occurrence in cross_targets:
-            candidates: list[tuple[PairEvidence, EntityOccurrence]] = []
+            candidates: list[PairEvidence] = []
             for edge in edge_by_target.get(target_occurrence.entity_occurrence_id, []):
                 reference = occurrence_by_id[edge.reference_entity_occurrence_id]
                 reference_clip = binding_by_clip[
@@ -659,11 +666,17 @@ def build_audio_pair_samples(
                     and target_voice.source_end == reference_voice.source_end
                 ):
                     continue
-                candidates.append((edge, reference))
+                candidates.append(edge)
             candidate_sets.append(
-                sorted(candidates, key=lambda item: item[1].entity_occurrence_id)
+                sorted(
+                    candidates,
+                    key=lambda item: (
+                        -item.same_person.face_similarity,
+                        item.reference_entity_occurrence_id,
+                    ),
+                )
             )
-        matching = _best_complete_matching(candidate_sets)
+        matching = select_complete_donor_matching(candidate_sets)
         if matching is None:
             incomplete_cross.append(
                 {
@@ -672,8 +685,11 @@ def build_audio_pair_samples(
                 }
             )
             continue
-        selected_edges = [item[0] for item in matching]
-        reference_occurrences = [item[1] for item in matching]
+        selected_edges = matching
+        reference_occurrences = [
+            occurrence_by_id[item.reference_entity_occurrence_id]
+            for item in matching
+        ]
         subject_bindings = [
             PairSubjectBinding(
                 subject_id=f"subject_{index}",
@@ -735,12 +751,30 @@ def build_audio_pair_samples(
         )
     samples.sort(key=lambda item: (item.target.clip_uid, item.pair_kind, item.pair_id))
     report = {
-        "thresholds_calibrated": False,
+        "thresholds_calibrated": True,
+        "pair_policy_version": H3_PAIR_POLICY_VERSION,
+        "face_threshold": active.face_threshold,
+        "voice_threshold": active.voice_threshold,
+        "rank_gate_enabled": False,
+        "margin_gate_enabled": False,
+        "text_gate_enabled": False,
         "config": asdict(active),
         "pairwise_edge_count": len(pairwise),
         "in_pair_count": sum(item.pair_kind == "in_pair" for item in samples),
         "cross_pair_count": sum(item.pair_kind == "cross_pair" for item in samples),
         "incomplete_cross_pair_targets": incomplete_cross,
+        "rejection_reason_counts": dict(
+            sorted(
+                Counter(
+                    code
+                    for item in pairwise
+                    for evidence in (item.same_person, item.same_voice)
+                    if evidence.status != "accepted"
+                    for code in evidence.reason_codes
+                ).items()
+            )
+        ),
         "transitive_clustering_performed": False,
+        "parent_quota_applied": False,
     }
     return samples, pairwise, report

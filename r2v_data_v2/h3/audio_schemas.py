@@ -278,7 +278,7 @@ class ProducerProvenance(SchemaModel):
     producer: str
     version: str
     config_fingerprint: str
-    thresholds_calibrated: Literal[False] = False
+    thresholds_calibrated: bool = False
 
     @model_validator(mode="after")
     def validate_producer(self) -> ProducerProvenance:

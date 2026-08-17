@@ -547,6 +547,65 @@ production clustering, donor selection, pair publication, or threshold
 acceptance. Every production-eligible occurrence remains retained; uncertainty
 means no pair rather than dataset truncation.
 
+## Frozen H3 PairPolicy V1 and accepted-pair pilot
+
+HUMAN calibration freezes production `h3_pair_policy_v1` at face cosine
+`>= 0.72` and voice cosine `>= 0.20`. The voice threshold is a low
+contradiction floor; it cannot rescue a face score below `0.72`. Rank, margin,
+and identity text remain diagnostics only. Production candidate evaluation is
+exact across every eligible cross-clip occurrence, with no top-K intersection,
+parent quota, clustering, or in/cross ratio gate. Donor selection uses the
+highest passing face cosine and then `entity_occurrence_id` as the deterministic
+tie-break. Every valid in-pair remains published when no strict cross-pair is
+available.
+
+Build the fixed real-artifact pilot without rerunning Visual, LR-ASD, primary
+voice selection, InsightFace, or ECAPA:
+
+```bash
+export PAIR_AUDIO_ROOT=$PAIR_CALIBRATION_ROOT/audio
+export PAIR_EMBEDDING_ROOT=$PAIR_CALIBRATION_ROOT/embedding
+export PAIRING_PILOT_ROOT=$PAIR_CALIBRATION_ROOT/pairing_pilot
+
+cd "$REPO"
+"$R2V_PYTHON" tools/build_h3_pairing_pilot.py \
+  --audio-pilot-root "$PAIR_AUDIO_ROOT" \
+  --embedding-root "$PAIR_EMBEDDING_ROOT" \
+  --output-root "$PAIRING_PILOT_ROOT"
+
+cat "$PAIRING_PILOT_ROOT/summary.json"
+```
+
+The tool reads existing Audio sidecars, primary voice assets, face crops, and
+face/speaker embeddings. It validates source hashes, uses no HUMAN calibration
+labels as production identity truth, and writes only the fixed pilot output.
+`review.html` contains every accepted target/donor mapping.
+
+Serve the shared calibration directory so the page can load sibling embedding
+and primary-voice assets, then review every accepted mapping with `1`, `2`, or
+`3` for CORRECT, WRONG, or UNCERTAIN:
+
+```bash
+"$R2V_PYTHON" -m http.server 8765 --directory "$PAIR_CALIBRATION_ROOT"
+# Open http://127.0.0.1:8765/pairing_pilot/review.html
+```
+
+Export the browser labels and place them at the explicit path below. Reporting
+never changes PairPolicy thresholds:
+
+```bash
+export ACCEPTED_PAIR_LABELS=$PAIRING_PILOT_ROOT/accepted_pair_review_labels.jsonl
+export ACCEPTED_PAIR_REPORT=$PAIRING_PILOT_ROOT/accepted_pair_review_report.json
+
+cd "$REPO"
+"$R2V_PYTHON" tools/report_h3_accepted_pair_review.py \
+  --pairing-pilot-root "$PAIRING_PILOT_ROOT" \
+  --labels "$ACCEPTED_PAIR_LABELS" \
+  --output "$ACCEPTED_PAIR_REPORT"
+
+cat "$ACCEPTED_PAIR_REPORT"
+```
+
 ## Fixed 60-clip pair-calibration expansion
 
 This workflow expands the manually reviewed pilot into a bounded calibration

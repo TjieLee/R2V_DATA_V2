@@ -33,10 +33,12 @@ from r2v_data_v2.h3.audio_export import (
     publish_audio_pair_dataset,
 )
 from r2v_data_v2.h3.audio_pairing import (
+    H3_PAIR_POLICY_VERSION,
     AudioPairingConfig,
     NumpyBlockwiseTopKIndex,
     build_audio_pair_samples,
     build_pairwise_evidence,
+    evaluate_pair_policy_v1,
 )
 from r2v_data_v2.h3.audio_schemas import (
     AudioClipBinding,
@@ -75,6 +77,7 @@ from r2v_data_v2.h3.schemas import (
     PictureAsset,
     SemanticSubject,
 )
+from tools import audio_data
 
 
 def _sha256(path: Path) -> str:
@@ -770,6 +773,63 @@ def test_text_similarity_cannot_rescue_low_face_score(tmp_path: Path) -> None:
     assert all(item.same_voice.status == "accepted" for item in edges)
 
 
+def test_frozen_pair_policy_uses_only_face_and_voice_thresholds() -> None:
+    passing = evaluate_pair_policy_v1(
+        target_entity_occurrence_id="clip-a/e1",
+        reference_entity_occurrence_id="clip-b/e1",
+        face_similarity=0.72,
+        voice_similarity=0.20,
+        text_similarity=-1.0,
+        face_rank_left_to_right=99,
+        face_rank_right_to_left=98,
+        voice_rank_left_to_right=97,
+        voice_rank_right_to_left=96,
+        face_margin=-1.0,
+        voice_margin=-1.0,
+    )
+    low_face = evaluate_pair_policy_v1(
+        target_entity_occurrence_id="clip-a/e1",
+        reference_entity_occurrence_id="clip-b/e1",
+        face_similarity=0.719999,
+        voice_similarity=1.0,
+    )
+    low_voice = evaluate_pair_policy_v1(
+        target_entity_occurrence_id="clip-a/e1",
+        reference_entity_occurrence_id="clip-b/e1",
+        face_similarity=1.0,
+        voice_similarity=0.199999,
+    )
+
+    assert passing.same_person.status == "accepted"
+    assert passing.same_voice.status == "accepted"
+    assert passing.same_person.policy_version == H3_PAIR_POLICY_VERSION
+    assert low_face.same_person.status == "rejected"
+    assert low_face.same_voice.status == "accepted"
+    assert low_voice.same_person.status == "accepted"
+    assert low_voice.same_voice.status == "rejected"
+
+
+def test_production_pair_cli_exposes_only_frozen_identity_thresholds() -> None:
+    arguments = audio_data._parser().parse_args(
+        [
+            "pair",
+            "--audio-root",
+            "/tmp/audio",
+            "--output-root",
+            "/tmp/pairs",
+        ]
+    )
+
+    assert arguments.face_threshold == 0.72
+    assert arguments.voice_threshold == 0.20
+    assert not hasattr(arguments, "face_margin")
+    assert not hasattr(arguments, "voice_margin")
+    assert not hasattr(arguments, "text_threshold")
+    assert not hasattr(arguments, "top_k")
+    with pytest.raises(ValueError, match="thresholds are frozen"):
+        AudioPairingConfig(face_threshold=0.73)
+
+
 def test_strict_cross_pair_requires_face_and_voice_and_preserves_target_text(
     tmp_path: Path,
 ) -> None:
@@ -799,6 +859,9 @@ def test_strict_cross_pair_requires_face_and_voice_and_preserves_target_text(
 
     assert report["in_pair_count"] == 2
     assert report["cross_pair_count"] == 2
+    assert report["thresholds_calibrated"] is True
+    assert cross_a.producer_provenance.thresholds_calibrated is True
+    assert cross_a.producer_provenance.version == H3_PAIR_POLICY_VERSION
     assert "target words" in cross_a.annotation_draft.text
     assert "reference words" not in cross_a.annotation_draft.text
     assert cross_a.source_clip_binding_ids == [
@@ -953,7 +1016,7 @@ def test_face_only_and_voice_only_matches_never_enter_strict_export(
     assert all(sample.pair_kind == "in_pair" for sample in voice_samples)
 
 
-def test_candidate_and_nonmutual_edges_do_not_enter_strict_export(tmp_path: Path) -> None:
+def test_exact_candidate_evaluation_is_not_gated_by_top_k_rank(tmp_path: Path) -> None:
     bindings = [
         _canonical_binding(
             tmp_path,
@@ -974,26 +1037,59 @@ def test_candidate_and_nonmutual_edges_do_not_enter_strict_export(tmp_path: Path
             voice=[0.8, 0.6],
         ),
     ]
-    config = AudioPairingConfig(top_k=1)
-
     samples, edges, _ = build_audio_pair_samples(
         bindings,
         audio_root=tmp_path,
-        config=config,
     )
     edge = next(
         item
         for item in edges
         if item.target_entity_occurrence_id == "clip-a/e1"
-        and item.reference_entity_occurrence_id == "clip-b/e1"
+        and item.reference_entity_occurrence_id == "clip-c/e1"
     )
 
-    assert edge.same_person.status != "accepted"
-    assert "face_not_mutual_top_k" in edge.same_person.reason_codes
-    assert not any(
+    assert edge.same_person.status == "accepted"
+    assert edge.same_voice.status == "accepted"
+    assert edge.same_person.face_rank_left_to_right == 2
+    assert any(
         sample.pair_kind == "cross_pair" and sample.target.clip_uid == "clip-a"
         for sample in samples
     )
+
+
+def test_highest_face_donor_and_occurrence_id_tie_break_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    target = _canonical_binding(
+        tmp_path,
+        "clip-a",
+        face=[1.0, 0.0],
+        voice=[1.0, 0.0],
+    )
+    first = _canonical_binding(
+        tmp_path,
+        "clip-b",
+        face=[0.9, math.sqrt(0.19)],
+        voice=[1.0, 0.0],
+    )
+    second = _canonical_binding(
+        tmp_path,
+        "clip-c",
+        face=[0.9, math.sqrt(0.19)],
+        voice=[1.0, 0.0],
+    )
+
+    samples, _, _ = build_audio_pair_samples(
+        [second, target, first],
+        audio_root=tmp_path,
+    )
+    cross = next(
+        item
+        for item in samples
+        if item.pair_kind == "cross_pair" and item.target.clip_uid == "clip-a"
+    )
+
+    assert cross.subjects[0].voice_entity_occurrence_id == "clip-b/e1"
 
 
 def test_missing_one_subject_reference_blocks_cross_but_not_in_pair(

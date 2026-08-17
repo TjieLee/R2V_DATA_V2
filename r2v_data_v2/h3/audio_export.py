@@ -153,8 +153,9 @@ def publish_audio_pair_dataset(
             if samples
             else ProducerProvenance(
                 producer="r2v_data_v2.h3.audio_pairing",
-                version="v1",
+                version="h3_pair_policy_v1",
                 config_fingerprint=(config or AudioPairingConfig()).fingerprint(),
+                thresholds_calibrated=True,
             )
         )
         manifest = AudioDatasetManifest(

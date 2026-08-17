@@ -50,12 +50,8 @@ def _parser() -> argparse.ArgumentParser:
     pair = subparsers.add_parser("pair", help="Build strict in/cross-pair samples")
     pair.add_argument("--audio-root", type=Path, required=True)
     pair.add_argument("--output-root", type=Path, required=True)
-    pair.add_argument("--top-k", type=int, default=20)
-    pair.add_argument("--face-threshold", type=float, default=0.70)
-    pair.add_argument("--face-margin", type=float, default=0.04)
-    pair.add_argument("--voice-threshold", type=float, default=0.75)
-    pair.add_argument("--voice-margin", type=float, default=0.04)
-    pair.add_argument("--text-threshold", type=float, default=0.30)
+    pair.add_argument("--face-threshold", type=float, default=0.72)
+    pair.add_argument("--voice-threshold", type=float, default=0.20)
     pair.add_argument("--max-cross-pair-variants", type=int, default=1)
     pair.add_argument("--speech-open-tag", default="<d>")
     pair.add_argument("--speech-close-tag", default="</d>")
@@ -175,12 +171,8 @@ def _bind(arguments: argparse.Namespace) -> dict[str, object]:
 
 def _pair(arguments: argparse.Namespace) -> dict[str, object]:
     config = AudioPairingConfig(
-        top_k=arguments.top_k,
-        face_strict_threshold=arguments.face_threshold,
-        face_margin_threshold=arguments.face_margin,
-        voice_strict_threshold=arguments.voice_threshold,
-        voice_margin_threshold=arguments.voice_margin,
-        text_threshold=arguments.text_threshold,
+        face_threshold=arguments.face_threshold,
+        voice_threshold=arguments.voice_threshold,
         max_cross_pair_variants_per_target=arguments.max_cross_pair_variants,
         speech_open_tag=arguments.speech_open_tag,
         speech_close_tag=arguments.speech_close_tag,
