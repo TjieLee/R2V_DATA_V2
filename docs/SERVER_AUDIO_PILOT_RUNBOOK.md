@@ -12,8 +12,7 @@ attempt.
 ├── audio_deps/                          # Audio-only dependencies
 │   ├── LR-ASD/                          # pinned vendor checkout
 │   ├── lr-asd-venv/                     # Python 3.10 uv venv
-│   ├── uv-python/                       # uv managed Python
-│   └── audio-python-wrapper             # temporary venv symlink workaround
+│   └── uv-python/                       # uv managed Python
 └── r2v_audio_runs/
     ├── smoke/                           # one reusable single-clip smoke output
     ├── pilot20/                         # one reusable 20-clip validation output
@@ -40,9 +39,8 @@ export UV_PYTHON_INSTALL_DIR=$AUDIO_DEPS/uv-python
 export LR_ASD_CODE_ROOT=$AUDIO_DEPS/LR-ASD
 export LR_ASD_MODEL_PATH=$LR_ASD_CODE_ROOT/weight/pretrain_AVA.model
 
-export AUDIO_PY_WRAPPER=$AUDIO_DEPS/audio-python-wrapper
-export LR_ASD_PYTHON=$AUDIO_PY_WRAPPER
-export SILERO_VAD_PYTHON=$AUDIO_PY_WRAPPER
+export LR_ASD_PYTHON=$AUDIO_ENV/bin/python
+export SILERO_VAD_PYTHON=$AUDIO_ENV/bin/python
 
 export SILERO_VAD_MODEL_PATH=$(
 "$AUDIO_ENV/bin/python" - <<'PY'
@@ -116,20 +114,12 @@ mkdir -p model/faceDetector/s3fd
 
 Recent `gdown` uses the Drive ID as a positional argument; do not use `--id`.
 
-## Temporary uv interpreter wrapper
+## Audio interpreter launch
 
-The current Audio runtime resolves configured Python executable paths before
-launching LR-ASD and Silero. Resolving a uv venv `bin/python` symlink can bypass
-the venv site-packages. Until that runtime bug is removed, use one regular
-wrapper file:
-
-```bash
-cat > "$AUDIO_PY_WRAPPER" <<EOF
-#!/usr/bin/env bash
-exec "$AUDIO_ENV/bin/python" "\$@"
-EOF
-chmod 755 "$AUDIO_PY_WRAPPER"
-```
+The Audio runtime validates the configured Python executable without resolving
+the uv venv symlink before subprocess launch. Use `$AUDIO_ENV/bin/python`
+directly for LR-ASD, Silero VAD, and review rendering; the old
+`audio-python-wrapper` workaround is no longer needed.
 
 Verify:
 
@@ -161,7 +151,8 @@ cd "$REPO"
 "$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
   --run-root "$V3_RUN" \
   --output-root "$SMOKE_OUT" \
-  --clip-id "$SMOKE_CLIP"
+  --clip-id "$SMOKE_CLIP" \
+  --workers 1
 ```
 
 Inspect only the stable paths:
@@ -184,7 +175,30 @@ cd "$REPO"
 "$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
   --run-root "$V3_RUN" \
   --output-root "$PILOT20_OUT" \
-  --limit 20
+  --limit 20 \
+  --workers 1
+```
+
+The verified pilot20 reported `clips_attempted=20`, `clips_succeeded=20`,
+`clips_failed=0`, and `asd_runtime_failures=0`. Manual review of the generated
+binding videos found no persistent speaker/entity misbinding. Keep
+`$AUDIO_RUN_ROOT/smoke` and `$AUDIO_RUN_ROOT/pilot20` as the fixed reusable
+smoke and validation directories.
+
+Before production, benchmark the same bounded clip set with 1, 2, 4, and 6
+clip-level worker processes. Use separate disposable outputs so the summaries
+and deterministic JSONL files can be compared:
+
+```bash
+for workers in 1 2 4 6; do
+  output="$AUDIO_RUN_ROOT/worker-benchmark-$workers"
+  rm -rf "$output"
+  time "$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
+    --run-root "$V3_RUN" \
+    --output-root "$output" \
+    --limit 20 \
+    --workers "$workers"
+done
 ```
 
 Only preserve/archive a run when it is actually useful for comparison or an

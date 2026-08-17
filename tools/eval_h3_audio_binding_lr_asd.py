@@ -21,6 +21,13 @@ from r2v_data_v2.h3.pilot import run_h3_audio_binding_pilot
 from r2v_data_v2.h3.review import ExternalReviewMediaBackend
 
 
+def _positive_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a bounded read-only LR-ASD H3 audio-binding pilot",
@@ -29,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--clip-id", action="append")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--workers", type=_positive_integer, default=1)
     parser.add_argument("--lr-asd-code-root", type=Path)
     parser.add_argument("--lr-asd-python", type=Path)
     parser.add_argument("--lr-asd-model-path", type=Path)
@@ -96,6 +104,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ),
         clip_ids=arguments.clip_id,
         limit=arguments.limit,
+        workers=arguments.workers,
         association_policy=FaceEntityAssociationPolicy(
             maximum_timestamp_delta_seconds=(
                 arguments.maximum_timestamp_delta_seconds

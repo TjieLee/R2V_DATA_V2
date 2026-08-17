@@ -34,6 +34,10 @@ class SpeechActivityRuntimeError(RuntimeError):
     pass
 
 
+def _launch_executable(path: Path) -> Path:
+    return path.expanduser().absolute()
+
+
 class LRASDBackend(Protocol):
     def analyze(
         self,
@@ -80,7 +84,7 @@ class LRASDRuntimeConfig:
 
     def validate(self) -> None:
         code_root = self.code_root.expanduser().resolve(strict=True)
-        python_path = self.python_path.expanduser().resolve(strict=True)
+        python_path = _launch_executable(self.python_path)
         model_path = self.model_path.expanduser().resolve(strict=True)
         if not (code_root / "Columbia_test.py").is_file():
             raise ValueError("LR_ASD_CODE_ROOT must contain Columbia_test.py")
@@ -99,7 +103,7 @@ class SileroVADRuntimeConfig:
     timeout_seconds: float = 300.0
 
     def validate(self) -> None:
-        if not self.python_path.expanduser().resolve(strict=True).is_file():
+        if not _launch_executable(self.python_path).is_file():
             raise ValueError("Silero VAD python path must be a local file")
         if not self.model_path.expanduser().resolve(strict=True).is_file():
             raise ValueError("Silero VAD model path must be a local file")
@@ -171,7 +175,7 @@ class LRASDSubprocessBackend:
         stdout_path = destination / "lr_asd.stdout.log"
         stderr_path = destination / "lr_asd.stderr.log"
         command = [
-            str(self.config.python_path.resolve()),
+            str(_launch_executable(self.config.python_path)),
             str((self.config.code_root / "Columbia_test.py").resolve()),
             "--videoName",
             "source",
@@ -193,7 +197,7 @@ class LRASDSubprocessBackend:
             "convert_lr_asd_native.py"
         )
         converter_command = [
-            str(self.config.python_path.resolve()),
+            str(_launch_executable(self.config.python_path)),
             str(converter),
             "--clip-uid",
             clip_uid,
@@ -248,7 +252,7 @@ class SileroVADSubprocessBackend:
             "run_h3_silero_vad_bridge.py"
         )
         command = [
-            str(self.config.python_path.resolve()),
+            str(_launch_executable(self.config.python_path)),
             str(bridge),
             "--clip-uid",
             clip_uid,

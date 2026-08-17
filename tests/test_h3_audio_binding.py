@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
+from r2v_data_v2.h3 import lr_asd as lr_asd_module
 from r2v_data_v2.h3.association import (
     FaceEntityAssociationPolicy,
     associate_face_tracks_to_entities,
@@ -32,9 +33,13 @@ from r2v_data_v2.h3.fusion import (
     render_h3_audio_instruction,
 )
 from r2v_data_v2.h3.lr_asd import (
+    LRASDRuntimeConfig,
     LRASDRuntimeError,
+    LRASDSubprocessBackend,
     PrecomputedLRASDBackend,
     PrecomputedSpeechActivityBackend,
+    SileroVADRuntimeConfig,
+    SileroVADSubprocessBackend,
     normalize_lr_asd_evidence,
 )
 from r2v_data_v2.h3.pilot import run_h3_audio_binding_pilot
@@ -45,7 +50,7 @@ from r2v_data_v2.h3.pilot_schemas import (
     SpeechActivityArtifact,
     SpeechActivityInterval,
 )
-from r2v_data_v2.h3.review import build_review_timeline
+from r2v_data_v2.h3.review import ExternalReviewMediaBackend, build_review_timeline
 from r2v_data_v2.h3.schemas import (
     ActiveSpeakerInterval,
     ASDModelProvenance,
@@ -82,6 +87,7 @@ from r2v_data_v2.v3.schemas import (
 )
 from run_pipeline_v3 import STAGE_ORDER
 from tools.build_v3_h3_audio_binding_sidecar import main as sidecar_main
+from tools.eval_h3_audio_binding_lr_asd import _parser as lr_asd_pilot_parser
 
 
 def _visibility() -> EntityVisibilitySummary:
@@ -1301,6 +1307,190 @@ def test_pilot_isolates_lr_asd_failure_and_runs_backend_once_per_clip(
         }
     ]
     assert _tree_hashes(run_root) == before
+
+
+def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    native_artifacts = {}
+    speech_artifacts = {}
+    for clip_uid in ("clip-3", "clip-1", "clip-2"):
+        source = tmp_path / f"{clip_uid}.mp4"
+        audio = tmp_path / f"{clip_uid}.wav"
+        source.write_bytes(b"video")
+        audio.write_bytes(b"audio")
+        _write_pilot_clip(
+            run_root,
+            _pilot_clip(clip_uid, source),
+            masks_by_entity={"e1": _full_entity_mask()},
+        )
+        native_artifacts[clip_uid] = _native_artifact(
+            clip_uid=clip_uid,
+            source_video=source,
+            audio_path=audio,
+            logits_by_track=[[0.7] * 10],
+        )
+        speech_artifacts[clip_uid] = _speech_artifact(
+            clip_uid,
+            audio,
+            speech=True,
+        )
+
+    serial_root = tmp_path / "serial"
+    parallel_root = tmp_path / "parallel"
+    serial_summary = run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=serial_root,
+        lr_asd_backend=_CountingLRASDBackend(
+            native_artifacts,
+            fail_clip_uid="clip-2",
+        ),
+        speech_backend=PrecomputedSpeechActivityBackend(speech_artifacts),
+        review_media_backend=_FakeReviewMediaBackend(),
+        limit=3,
+        workers=1,
+    )
+    parallel_summary = run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=parallel_root,
+        lr_asd_backend=_CountingLRASDBackend(
+            native_artifacts,
+            fail_clip_uid="clip-2",
+        ),
+        speech_backend=PrecomputedSpeechActivityBackend(speech_artifacts),
+        review_media_backend=_FakeReviewMediaBackend(),
+        limit=3,
+        workers=2,
+    )
+
+    serial_counters = serial_summary.model_dump(mode="json")
+    parallel_counters = parallel_summary.model_dump(mode="json")
+    serial_counters.pop("output_root")
+    parallel_counters.pop("output_root")
+    assert parallel_counters == serial_counters
+    assert parallel_summary.clips_succeeded == 2
+    assert parallel_summary.clips_failed == 1
+    assert parallel_summary.asd_runtime_failures == 1
+    assert (parallel_root / "audio_bindings.jsonl").read_bytes() == (
+        serial_root / "audio_bindings.jsonl"
+    ).read_bytes()
+    assert (parallel_root / "failures.jsonl").read_bytes() == (
+        serial_root / "failures.jsonl"
+    ).read_bytes()
+    records = [
+        json.loads(line)
+        for line in (parallel_root / "audio_bindings.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["clip_uid"] for record in records] == ["clip-1", "clip-3"]
+    for clip_uid in ("clip-1", "clip-3"):
+        assert (
+            parallel_root / "clips" / clip_uid / "audio_binding.json"
+        ).read_bytes() == (
+            serial_root / "clips" / clip_uid / "audio_binding.json"
+        ).read_bytes()
+        assert (
+            parallel_root
+            / "review"
+            / clip_uid
+            / "face_entity_association.json"
+        ).read_bytes() == (
+            serial_root
+            / "review"
+            / clip_uid
+            / "face_entity_association.json"
+        ).read_bytes()
+
+
+def test_pilot_workers_cli_defaults_to_one_and_accepts_parallel_count() -> None:
+    required = ["--run-root", "/run", "--output-root", "/output", "--limit", "1"]
+
+    assert lr_asd_pilot_parser().parse_args(required).workers == 1
+    assert lr_asd_pilot_parser().parse_args([*required, "--workers", "4"]).workers == 4
+    with pytest.raises(SystemExit):
+        lr_asd_pilot_parser().parse_args([*required, "--workers", "0"])
+
+
+def test_audio_subprocesses_preserve_configured_python_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "uv-python"
+    target.write_bytes(b"python")
+    target.chmod(0o755)
+    python_path = tmp_path / "venv" / "bin" / "python"
+    python_path.parent.mkdir(parents=True)
+    python_path.symlink_to(target)
+    code_root = tmp_path / "LR-ASD"
+    code_root.mkdir()
+    (code_root / "Columbia_test.py").write_text("# vendor entry\n", encoding="utf-8")
+    model_path = tmp_path / "pretrain.model"
+    model_path.write_bytes(b"model")
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    commands: list[list[str]] = []
+
+    def fake_run_logged_command(
+        command: list[str],
+        **kwargs: object,
+    ) -> None:
+        commands.append(command)
+        error_type = kwargs["error_type"]
+        raise error_type("stop after command capture")  # type: ignore[operator]
+
+    monkeypatch.setattr(
+        lr_asd_module,
+        "_run_logged_command",
+        fake_run_logged_command,
+    )
+    lr_backend = LRASDSubprocessBackend(
+        LRASDRuntimeConfig(
+            code_root=code_root,
+            python_path=python_path,
+            model_path=model_path,
+        )
+    )
+    with pytest.raises(LRASDRuntimeError, match="command capture"):
+        lr_backend.analyze(
+            clip_uid="clip-1",
+            source_video_path=source,
+            work_dir=tmp_path / "lr-work",
+        )
+    assert commands[-1][0] == str(python_path)
+    assert commands[-1][0] != str(target)
+
+    silero_backend = SileroVADSubprocessBackend(
+        SileroVADRuntimeConfig(
+            python_path=python_path,
+            model_path=model_path,
+        )
+    )
+    with pytest.raises(lr_asd_module.SpeechActivityRuntimeError, match="command capture"):
+        silero_backend.detect(
+            clip_uid="clip-1",
+            audio_path=source,
+            duration_seconds=1.0,
+            work_dir=tmp_path / "vad-work",
+        )
+    assert commands[-1][0] == str(python_path)
+    assert commands[-1][0] != str(target)
+
+    review_backend = ExternalReviewMediaBackend(python_path=python_path)
+    review_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        review_backend,
+        "_run",
+        lambda command, *, destination_path: review_commands.append(command),
+    )
+    review_backend.render_visualization(
+        source_video_path=source,
+        timeline_path=tmp_path / "timeline.json",
+        destination_path=tmp_path / "review.mp4",
+    )
+    assert review_commands[0][0] == str(python_path)
+    assert review_commands[0][0] != str(target)
 
 
 def test_review_bundle_metadata_is_deterministic_and_keeps_native_evidence(

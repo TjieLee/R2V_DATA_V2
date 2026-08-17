@@ -41,7 +41,9 @@ class ExternalReviewMediaBackend:
         ffmpeg_path: str = "ffmpeg",
         timeout_seconds: float = 300.0,
     ) -> None:
-        self.python_path = python_path.expanduser().resolve(strict=True)
+        self.python_path = python_path.expanduser().absolute()
+        if not self.python_path.is_file():
+            raise ValueError("review media python path must be a local file")
         self.ffmpeg_path = ffmpeg_path
         self.timeout_seconds = timeout_seconds
         if timeout_seconds <= 0:
