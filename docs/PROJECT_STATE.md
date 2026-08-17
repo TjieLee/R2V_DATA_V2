@@ -37,16 +37,20 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Build producer-only MiniMax-H3-compatible audio-to-visual entity binding,
-strict pairwise in-pair/cross-pair construction, and a self-contained H3 dataset
-export. Pose, expression, camera control, model training, offscreen identity
-propagation, global transitive identity clustering, and production-stage
-integration remain out of scope.
+Run the frozen MiniMax-H3-compatible Audio path over the complete eligible V3
+set with explicit, reusable production stages. Pose, expression, camera control,
+model training, offscreen identity propagation, global transitive identity
+clustering, and Omni remain out of scope.
 
 ## Current Pass
 
 The Audio/H3 V1 integration branch is based on the latest Visual integrity
 branch and retains the earlier audio scaffold as isolated commits. It adds:
+
+- fixed-root production orchestration for complete Visual occurrence
+  enumeration, Audio binding, primary voice, face/speaker embeddings, and
+  frozen in/cross pair publication without calibration sampling or HUMAN-label
+  dependencies;
 
 - `r2v.audio.clip_binding.1` with deterministic merged speech turns, one final
   Visual reference per occurrence, one primary voice reference per bound
@@ -66,9 +70,11 @@ branch and retains the earlier audio scaffold as isolated commits. It adds:
   transcript-segment assignment, and optimal one-to-one multi-subject donors;
 - explicit draft `<Subject N>` / `<Picture N>` / `<Audio N>` bindings.
 
-The face, speaker, ASR, and pair thresholds remain unvalidated. No real model,
-GPU, server run, or production data has been exercised in this Mac pass. See
-`docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for the canonical contract.
+The face and speaker models remain evidence adapters rather than standalone
+acceptance policy. Real server pilots validated Audio binding and froze the
+primary-voice and pair policies; this Mac implementation pass does not rerun
+models, GPUs, or production data. See `docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for
+the canonical contract.
 
 ### Earlier audio scaffold
 
@@ -107,18 +113,19 @@ or production artifact may change in this pass.
 Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
-python -m pytest tests/test_h3_audio_dataset.py \
-  tests/test_h3_audio_binding.py -q
-# 74 passed
+python -m pytest tests/test_h3_audio_production.py \
+  tests/test_h3_audio_binding.py \
+  tests/test_h3_primary_voice.py \
+  tests/test_h3_embedding_pilot.py \
+  tests/test_h3_pairing_pilot.py \
+  tests/test_h3_audio_dataset.py -q
+# 119 passed
 
 python -m pytest -q
-# 1741 passed, 1 existing Pillow deprecation warning
+# 1819 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
-
-python -m compileall r2v_data_v2 tools tests
-# passed
 
 git diff --check
 # passed

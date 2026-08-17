@@ -606,6 +606,91 @@ cd "$REPO"
 cat "$ACCEPTED_PAIR_REPORT"
 ```
 
+## Frozen 1000-clip H3 production workflow
+
+The HUMAN-reviewed accepted-pair pilot freezes `h3_pair_policy_v1` at face
+cosine `>= 0.72` and voice cosine `>= 0.20`. Production uses no rank, margin,
+text, parent-count, source-count, or in/cross-ratio gate. It never consumes
+HUMAN labels or any `pair_calibration/` artifact. Every Visual-eligible subject
+occurrence is retained in the production inventory; missing Audio, primary
+voice, face, speaker, or donor evidence is recorded as unavailable rather than
+turning into dataset sampling.
+
+All outputs use one stable root with no timestamp suffix. First inspect the
+complete metadata-only input set:
+
+```bash
+export H3_PRODUCTION_ROOT=$AUDIO_RUN_ROOT/production
+
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_audio_production.py \
+  --run-root "$V3_RUN" \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --dry-run
+```
+
+The dry run writes nothing and exposes no `--limit` or parent quota. Run each
+expensive stage explicitly so completed outputs are reused rather than silently
+regenerated:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_audio_production.py \
+  --run-root "$V3_RUN" \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --stages audio \
+  --workers 4
+
+"$R2V_PYTHON" tools/run_h3_audio_production.py \
+  --run-root "$V3_RUN" \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --stages primary-voice
+
+"$R2V_PYTHON" tools/run_h3_audio_production.py \
+  --run-root "$V3_RUN" \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --stages embedding \
+  --face-python "$FACE_EMBEDDING_PYTHON" \
+  --face-model-root "$FACE_MODEL_ROOT" \
+  --face-model-name buffalo_l \
+  --face-model-identifier insightface/buffalo_l \
+  --speaker-python "$SPEAKER_EMBEDDING_PYTHON" \
+  --speaker-model-path "$SPEAKER_MODEL_PATH" \
+  --speaker-model-identifier speechbrain/spkrec-ecapa-voxceleb \
+  --device cuda:0 \
+  --cuda-visible-devices "$CUDA_VISIBLE_DEVICES"
+
+"$R2V_PYTHON" tools/run_h3_audio_production.py \
+  --run-root "$V3_RUN" \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --stages pair
+```
+
+The fixed artifacts are:
+
+```text
+$AUDIO_RUN_ROOT/production/
+  source_inventory.json
+  audio/
+  primary_voice/
+  embedding/
+  pairs/
+```
+
+Inspect the final aggregate and deterministic pair rows with:
+
+```bash
+cat "$H3_PRODUCTION_ROOT/pairs/summary.json"
+wc -l \
+  "$H3_PRODUCTION_ROOT/pairs/in_pairs.jsonl" \
+  "$H3_PRODUCTION_ROOT/pairs/cross_pairs.jsonl" \
+  "$H3_PRODUCTION_ROOT/pairs/pair_evidence.jsonl"
+```
+
+`--overwrite` is debug-only. Overwriting an upstream stage fails unless every
+already-completed downstream stage is requested in the same invocation, which
+prevents stale primary-voice, embedding, or pair artifacts.
+
 ## Fixed 60-clip pair-calibration expansion
 
 This workflow expands the manually reviewed pilot into a bounded calibration

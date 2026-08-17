@@ -195,17 +195,16 @@ Intermediate scores, close scores, missing association, or failed
 quality/synchronization evidence also produce `ambiguous`. The system never
 forces every speech interval onto an entity.
 
-All thresholds in the scaffold and pilot remain unvalidated defaults. They are
-not production values. Server evidence must justify timestamp tolerance,
-face-mask coverage, matched-slot count, temporal consistency, association
-margin/confidence, speech duration, synchronization, and voice-quality policies
-before any adapter or threshold is frozen.
+Unfrozen scaffold thresholds remain diagnostic defaults. Production keeps the
+manually reviewed Audio binding semantics, calibrated
+`voice_reference_quality_v1`, and HUMAN-validated `h3_pair_policy_v1` unchanged;
+this orchestration does not retune any of them.
 
 ## LR-ASD Pilot CLI
 
-The independent pilot accepts explicit clip IDs and/or a bounded limit. It does
-not appear in `run_pipeline_v3.STAGE_ORDER`, and its output must be outside the
-source run:
+The independent calibration pilot accepts explicit clip IDs and/or a bounded
+limit. It does not appear in `run_pipeline_v3.STAGE_ORDER`, and its output must
+be outside the source run:
 
 ```bash
 export LR_ASD_CODE_ROOT=/path/to/Junhua-Liao/LR-ASD
@@ -224,6 +223,19 @@ The LR-ASD environment is responsible for its official dependencies and
 `ffmpeg`. The Silero environment must contain its local package and JIT model;
 the bridge never downloads a model. Per-clip failures are written to
 `failures.jsonl` and do not stop neighboring clips.
+
+The formal batch path is a separate read-only production orchestration. It
+enumerates every eligible Visual subject occurrence without a limit or parent
+quota, then reuses the frozen Audio binding, primary voice, InsightFace,
+SpeechBrain, and PairPolicy implementations. Its fixed stage order is
+`audio -> primary-voice -> embedding -> pair`, under
+`$AUDIO_RUN_ROOT/production`. The production inventory is complete rather than
+sampled; face inference receives every eligible occurrence, speaker inference
+receives only occurrences with a valid primary voice, and absent evidence never
+deletes a valid in-pair. Cross-pair construction evaluates every complete
+cross-clip candidate with `h3_pair_policy_v1`, selects at most one donor by
+higher face cosine then occurrence ID, and performs no transitive clustering.
+See `docs/SERVER_AUDIO_PILOT_RUNBOOK.md` for exact stage commands.
 
 Each successful case produces:
 
