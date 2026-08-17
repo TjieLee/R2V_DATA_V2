@@ -88,12 +88,16 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
         frame_indices = [int(value) for value in track["frame"]]
         bboxes = [[float(value) for value in bbox] for bbox in track["bbox"]]
         logits = [float(value) for value in track_scores]
-        if not (len(frame_indices) == len(bboxes) == len(logits)):
-            raise ValueError("official LR-ASD track frames, boxes, and scores differ")
+        if len(frame_indices) != len(bboxes):
+            raise ValueError("official LR-ASD track frames and boxes differ")
+        if len(logits) not in {len(frame_indices), len(frame_indices) - 1}:
+            raise ValueError("official LR-ASD track frames and scores differ")
+        scored_frame_indices = frame_indices[: len(logits)]
+        scored_bboxes = bboxes[: len(logits)]
         samples = []
         for frame_index, bbox, logit in zip(
-            frame_indices,
-            bboxes,
+            scored_frame_indices,
+            scored_bboxes,
             logits,
             strict=True,
         ):
