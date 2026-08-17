@@ -18,6 +18,11 @@ attempt.
 └── r2v_audio_runs/
     ├── smoke/                           # one reusable single-clip smoke output
     ├── pilot20/                         # one reusable 20-clip validation output
+    ├── pair_calibration/                # fixed pair-calibration workspace
+    │   ├── plan/                        # deterministic Visual clip plan
+    │   ├── audio/                       # LR-ASD Audio binding outputs
+    │   ├── primary_voice/               # frozen V1 primary voice references
+    │   └── embedding/                   # face/speaker retrieval diagnostics
     └── production/                      # create only when batch production starts
 ```
 
@@ -388,6 +393,111 @@ cat "$EMBEDDING_OUT/summary.json"
 `thresholds_calibrated=false` is mandatory. Similarities, directional ranks,
 and the face/voice top-K intersection are retrieval diagnostics only; they do
 not assert same-person, same-voice, cross-pair eligibility, or final acceptance.
+
+## Fixed 60-clip pair-calibration expansion
+
+This workflow expands the manually reviewed pilot into a bounded calibration
+set with more likely repeated human occurrences. It does not rerun Visual V3,
+assign same-person labels, calibrate thresholds, or publish cross-pairs. The
+planner reads the frozen Visual run and seed Audio pilot without modifying
+either one. It preserves eligible seed clips first, then complete endpoint pairs
+from accepted V3 cross-reference provenance, then fills the remaining budget by
+deterministic round-robin across same-parent multi-clip groups. Same parent and
+existing V3 donor provenance are candidate priors only, never identity truth.
+The first same-parent round selects enough clips to form a two-clip comparison
+unit; later rounds add at most one more clip per parent until the configured cap.
+
+Use one fixed workspace and no timestamped calibration directories:
+
+```bash
+export PAIR_CALIBRATION_ROOT=$AUDIO_RUN_ROOT/pair_calibration
+export PAIR_PLAN_ROOT=$PAIR_CALIBRATION_ROOT/plan
+export PAIR_AUDIO_ROOT=$PAIR_CALIBRATION_ROOT/audio
+export PAIR_PRIMARY_VOICE_ROOT=$PAIR_CALIBRATION_ROOT/primary_voice
+export PAIR_EMBEDDING_ROOT=$PAIR_CALIBRATION_ROOT/embedding
+```
+
+Build the deterministic 60-clip plan. The seed path deliberately points to the
+existing reviewed pilot; only still-valid clips are retained:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/plan_h3_pair_calibration.py \
+  --run-root "$V3_RUN" \
+  --seed-audio-pilot-root "$AUDIO_RUN_ROOT/voice_quality_pilot20" \
+  --output-root "$PAIR_PLAN_ROOT" \
+  --max-clips 60 \
+  --max-clips-per-parent 4
+
+cat "$PAIR_PLAN_ROOT/plan.json"
+wc -l "$PAIR_PLAN_ROOT/clip_ids.txt"
+```
+
+Run the unchanged Audio binding pipeline over exactly the planned clip IDs.
+The file order is deterministic, blank lines and full-line comments are ignored,
+and duplicate IDs are removed before the existing worker path runs:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/eval_h3_audio_binding_lr_asd.py \
+  --run-root "$V3_RUN" \
+  --output-root "$PAIR_AUDIO_ROOT" \
+  --clip-id-file "$PAIR_PLAN_ROOT/clip_ids.txt" \
+  --workers 4
+
+cat "$PAIR_AUDIO_ROOT/summary.json"
+cat "$PAIR_AUDIO_ROOT/failures.jsonl" 2>/dev/null || true
+```
+
+Apply the frozen `voice_reference_quality_v1` policy and export only accepted
+primary voice turns. This step reuses Audio artifacts and does not rerun LR-ASD,
+S3FD, or Silero:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/export_h3_primary_voice_references.py \
+  --pilot-root "$PAIR_AUDIO_ROOT" \
+  --output-root "$PAIR_PRIMARY_VOICE_ROOT"
+
+cat "$PAIR_PRIMARY_VOICE_ROOT/summary.json"
+```
+
+Run the validated persistent InsightFace `buffalo_l` and SpeechBrain ECAPA
+workers. These outputs remain calibration-only retrieval diagnostics:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/eval_h3_embedding_pilot.py \
+  --audio-pilot-root "$PAIR_AUDIO_ROOT" \
+  --primary-voice-root "$PAIR_PRIMARY_VOICE_ROOT" \
+  --output-root "$PAIR_EMBEDDING_ROOT" \
+  --face-python "$FACE_EMBEDDING_PYTHON" \
+  --face-model-root "$FACE_MODEL_ROOT" \
+  --face-model-name buffalo_l \
+  --face-model-identifier insightface/buffalo_l \
+  --speaker-python "$SPEAKER_EMBEDDING_PYTHON" \
+  --speaker-model-path "$SPEAKER_MODEL_PATH" \
+  --speaker-model-identifier speechbrain/spkrec-ecapa-voxceleb \
+  --device cuda:0 \
+  --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
+  --top-k 5
+```
+
+Inspect the summary plus the top 100 face, voice, and joint candidates with the
+existing bounded inspection tool:
+
+```bash
+cat "$PAIR_EMBEDDING_ROOT/summary.json"
+
+"$R2V_PYTHON" tools/inspect_h3_embedding_pilot.py \
+  --embedding-root "$PAIR_EMBEDDING_ROOT" \
+  --top 100
+```
+
+`plan.json` and every `visual_candidate_pairs.jsonl` row retain
+`thresholds_calibrated=false`; every candidate pair has
+`same_person_label=null`. Human review remains mandatory before any later
+threshold or cross-pair policy work.
 
 Routine benchmark outputs are disposable after the results are recorded.
 

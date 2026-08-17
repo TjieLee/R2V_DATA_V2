@@ -63,9 +63,7 @@ def _selected_clip_paths(
     if not clip_ids and limit is None:
         raise ValueError("pilot requires explicit clip IDs or a bounded limit")
     if clip_ids:
-        unique_ids = sorted(set(clip_ids))
-        if len(unique_ids) != len(clip_ids):
-            raise ValueError("pilot clip IDs must be unique")
+        unique_ids = list(dict.fromkeys(clip_ids))
         if any(
             _SAFE_COMPONENT.fullmatch(clip_uid) is None
             or clip_uid in {".", ".."}
