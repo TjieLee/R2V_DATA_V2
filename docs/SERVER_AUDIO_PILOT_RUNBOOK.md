@@ -190,6 +190,13 @@ cd "$REPO"
 Only preserve/archive a run when it is actually useful for comparison or an
 accepted production checkpoint. Routine failed smoke attempts are disposable.
 
+Verified server note: official LR-ASD track boxes may extend slightly outside
+the model-video bounds because the vendor crop pads the frame. The R2V bridge
+clips only the published artifact coordinates to the model-video bounds; it
+continues to use the raw vendor box for detection-confidence matching.
+`face_entity_association_failures` in the pilot summary counts unmatched
+face-track associations, not failed clips.
+
 ## Cleanup of old timestamped smoke attempts
 
 Preview first:

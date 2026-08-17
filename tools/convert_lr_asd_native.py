@@ -47,6 +47,28 @@ def _detection_confidence(
     return confidence if overlap >= 0.5 else None
 
 
+def _clip_bbox_for_artifact(
+    bbox: list[float],
+    *,
+    width: int,
+    height: int,
+) -> list[float]:
+    if len(bbox) != 4 or not all(math.isfinite(value) for value in bbox):
+        raise ValueError("official LR-ASD returned an invalid track bbox")
+    x1, y1, x2, y2 = bbox
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError("official LR-ASD returned a degenerate track bbox")
+    clipped = [
+        min(max(x1, 0.0), float(width)),
+        min(max(y1, 0.0), float(height)),
+        min(max(x2, 0.0), float(width)),
+        min(max(y2, 0.0), float(height)),
+    ]
+    if clipped[0] >= clipped[2] or clipped[1] >= clipped[3]:
+        raise ValueError("official LR-ASD track bbox is outside the model video")
+    return clipped
+
+
 def _video_metadata(path: Path, *, model_fps: float) -> tuple[int, int, float]:
     import cv2
 
@@ -92,12 +114,18 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
             raise ValueError("official LR-ASD track frames and boxes differ")
         if len(logits) not in {len(frame_indices), len(frame_indices) - 1}:
             raise ValueError("official LR-ASD track frames and scores differ")
+        artifact_bboxes = [
+            _clip_bbox_for_artifact(bbox, width=width, height=height)
+            for bbox in bboxes
+        ]
         scored_frame_indices = frame_indices[: len(logits)]
-        scored_bboxes = bboxes[: len(logits)]
+        scored_raw_bboxes = bboxes[: len(logits)]
+        scored_artifact_bboxes = artifact_bboxes[: len(logits)]
         samples = []
-        for frame_index, bbox, logit in zip(
+        for frame_index, raw_bbox, artifact_bbox, logit in zip(
             scored_frame_indices,
-            scored_bboxes,
+            scored_raw_bboxes,
+            scored_artifact_bboxes,
             logits,
             strict=True,
         ):
@@ -107,11 +135,11 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
                 {
                     "frame_index": frame_index,
                     "timestamp_seconds": frame_index / model_fps,
-                    "bbox_xyxy": bbox,
+                    "bbox_xyxy": artifact_bbox,
                     "detection_confidence": _detection_confidence(
                         detections,
                         frame_index=frame_index,
-                        bbox=bbox,
+                        bbox=raw_bbox,
                     ),
                     "raw_class1_logit": logit,
                     "backend_native_active": logit >= 0,
