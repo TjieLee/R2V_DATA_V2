@@ -22,6 +22,7 @@ attempt.
     │   ├── plan/                        # deterministic Visual clip plan
     │   ├── face_mining/                 # Visual-only face retrieval + review
     │   ├── face_audio_plan/              # HUMAN SAME pair Audio endpoints
+    │   ├── pair_policy_review/           # HUMAN hard-negative review/report
     │   ├── audio/                       # LR-ASD Audio binding outputs
     │   ├── primary_voice/               # frozen V1 primary voice references
     │   └── embedding/                   # face/speaker retrieval diagnostics
@@ -470,6 +471,81 @@ UNCERTAIN=0. The one confirmed positive was
 `17270abd38d44def5a88391d/e1` versus `9d1d740ad31c0deacb7287fd/e1`, with face
 cosine 0.728202 and voice cosine 0.390468. These identifiers and values are not
 hard-coded, do not define a threshold, and do not make thresholds calibrated.
+
+## PairPolicy hard-negative review
+
+Do not freeze production cross-pair acceptance from positives alone. The current
+complete calibration evidence contains 11 HUMAN-confirmed positive pairs: one
+from the initial pilot and ten face-first pairs with valid voice on both
+endpoints. Face cosine spans 0.729658 to 0.960353 with median 0.878478. Voice
+cosine spans 0.239183 to 0.627407 with median 0.453455. In particular,
+`2acb9056.../e1` versus `ca86f70e.../e1` has face cosine 0.931867 and voice
+cosine 0.239183. Speaker cosine therefore remains supporting or contradiction
+evidence; do not invent a high speaker threshold that silently removes this
+confirmed positive.
+
+Build a fixed top-50 UNKNOWN hard-negative review from the embedding run where
+both modalities are available. The confirmed file may contain direct HUMAN SAME
+edges from multiple reviewed calibration rounds. Direct SAME pairs and pairs
+implied by their calibration-only connected components are excluded from the
+review queue, but implied pairs are not published as production identity truth:
+
+```bash
+export PAIR_POLICY_EMBEDDING_ROOT=$PAIR_CALIBRATION_ROOT/positive_embedding
+export CONFIRMED_FACE_PAIRS=$PAIR_CALIBRATION_ROOT/confirmed_face_pairs.jsonl
+export PAIR_POLICY_REVIEW_ROOT=$PAIR_CALIBRATION_ROOT/pair_policy_review
+
+cd "$REPO"
+"$R2V_PYTHON" tools/build_h3_pair_policy_review.py \
+  --embedding-root "$PAIR_POLICY_EMBEDDING_ROOT" \
+  --confirmed-face-pairs "$CONFIRMED_FACE_PAIRS" \
+  --face-mining-root "$FACE_MINING_ROOT" \
+  --output-root "$PAIR_POLICY_REVIEW_ROOT" \
+  --top 50
+
+cat "$PAIR_POLICY_REVIEW_ROOT/summary.json"
+```
+
+Serve the shared calibration root so the review page can reach sibling face
+crops and primary voice FLAC files. Forward port 8765 over SSH, then open the
+shown URL:
+
+```bash
+"$R2V_PYTHON" -m http.server 8765 --directory "$PAIR_CALIBRATION_ROOT"
+# Open http://127.0.0.1:8765/pair_policy_review/review.html
+```
+
+The identity question is whether the two entity occurrences are the same
+physical person. Audio is supporting evidence only. Use `1`, `2`, `3` for SAME,
+DIFFERENT, UNCERTAIN and `j`/`k` or arrows to navigate. Export the HUMAN labels
+as `pair_policy_review_labels.jsonl`, place them at an explicit writable path,
+then generate the calibration report:
+
+```bash
+export PAIR_POLICY_LABELS=$PAIR_POLICY_REVIEW_ROOT/pair_policy_review_labels.jsonl
+
+cd "$REPO"
+"$R2V_PYTHON" tools/report_h3_pair_policy_calibration.py \
+  --embedding-root "$PAIR_POLICY_EMBEDDING_ROOT" \
+  --confirmed-face-pairs "$CONFIRMED_FACE_PAIRS" \
+  --hard-negative-labels "$PAIR_POLICY_LABELS" \
+  --face-mining-root "$FACE_MINING_ROOT" \
+  --output-root "$PAIR_POLICY_REVIEW_ROOT"
+
+cat "$PAIR_POLICY_REVIEW_ROOT/pair_policy_calibration_report.json"
+```
+
+The report contains raw distributions, rank/margin diagnostics, and boundary
+cases. Optional threshold simulation runs only when explicit `--simulate-*`
+arguments are supplied. It reports TP/FP/FN/TN, precision, and recall but never
+searches for a best threshold or writes production configuration. Both review
+and report retain `thresholds_calibrated=false` until a human explicitly freezes
+a later precision-oriented policy.
+
+This entire workflow is calibration-only. It introduces no parent quota,
+production clustering, donor selection, pair publication, or threshold
+acceptance. Every production-eligible occurrence remains retained; uncertainty
+means no pair rather than dataset truncation.
 
 ## Fixed 60-clip pair-calibration expansion
 

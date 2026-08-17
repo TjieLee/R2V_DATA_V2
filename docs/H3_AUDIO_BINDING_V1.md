@@ -40,6 +40,17 @@ uncertainty produces no pair rather than truncating the dataset. Production
 configuration must not expose `max_clips_per_parent` or call calibration
 selection helpers with their sampling limits intact.
 
+PairPolicy calibration may use direct HUMAN SAME labels to exclude all members
+of the same connected calibration component from a hard-negative review queue.
+That closure is bookkeeping for human review only: it does not create a
+production identity cluster or publish implied pairs. HUMAN DIFFERENT labels are
+negative calibration evidence, while UNCERTAIN labels contribute to neither
+positive nor negative distributions. Offline threshold simulation may report
+confusion counts for an explicitly supplied policy, but it must not optimize,
+select, or persist a production threshold. Speaker similarity remains supporting
+evidence until the reviewed positive and hard-negative distributions justify a
+specific policy; a low speaker cosine alone is not currently a hard rejection.
+
 ## Evidence-First Architecture
 
 ```text
