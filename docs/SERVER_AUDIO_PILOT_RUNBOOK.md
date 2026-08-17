@@ -12,6 +12,8 @@ attempt.
 ├── audio_deps/                          # Audio-only dependencies
 │   ├── LR-ASD/                          # pinned vendor checkout
 │   ├── lr-asd-venv/                     # Python 3.10 uv venv
+│   ├── embedding-venv/                  # isolated face/speaker inference env
+│   ├── embedding_models/                # manually staged local model files
 │   └── uv-python/                       # uv managed Python
 └── r2v_audio_runs/
     ├── smoke/                           # one reusable single-clip smoke output
@@ -34,6 +36,8 @@ export V3_RUN=/mnt/workspace/litengjie/data/r2v_v3_runs/e2e1000-s0-samfix-202608
 
 export AUDIO_DEPS=/mnt/workspace/litengjie/data/audio_deps
 export AUDIO_ENV=$AUDIO_DEPS/lr-asd-venv
+export EMBEDDING_ENV=$AUDIO_DEPS/embedding-venv
+export EMBEDDING_MODELS=$AUDIO_DEPS/embedding_models
 export UV_PYTHON_INSTALL_DIR=$AUDIO_DEPS/uv-python
 
 export LR_ASD_CODE_ROOT=$AUDIO_DEPS/LR-ASD
@@ -51,6 +55,15 @@ PY
 
 export R2V_PYTHON=$REPO/.venv/bin/python
 export AUDIO_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs
+
+export FACE_EMBEDDING_PYTHON=$EMBEDDING_ENV/bin/python
+export FACE_MODEL_ROOT=$EMBEDDING_MODELS/face
+export FACE_MODEL_NAME=YOUR_LOCAL_ARCFACE_PACK_NAME
+export FACE_MODEL_IDENTIFIER=insightface/$FACE_MODEL_NAME
+
+export SPEAKER_EMBEDDING_PYTHON=$EMBEDDING_ENV/bin/python
+export SPEAKER_MODEL_PATH=$EMBEDDING_MODELS/speaker/spkrec-ecapa-voxceleb
+export SPEAKER_MODEL_IDENTIFIER=speechbrain/spkrec-ecapa-voxceleb
 
 # Known Visual-eligible smoke clip from the current 1000-clip run.
 export SMOKE_CLIP=00e8c6125ed42d4aaed9fbde
@@ -85,6 +98,47 @@ uv pip install \
 
 `numpy==1.23.5` is intentional. The pinned LR-ASD S3FD code still uses removed
 NumPy aliases such as `np.int`; NumPy 1.26.4 fails during face detection.
+
+## Embedding environment and local models
+
+Keep face and speaker inference out of the constrained LR-ASD environment. The
+following creates the separate environment and installs adapter dependencies;
+select the Torch/torchaudio build that is already verified for the server's
+CUDA stack rather than replacing the node's working GPU runtime implicitly.
+
+```bash
+uv venv --python 3.12 "$EMBEDDING_ENV"
+
+uv pip install --python "$EMBEDDING_ENV/bin/python" \
+  torch torchvision torchaudio
+
+uv pip install --python "$EMBEDDING_ENV/bin/python" \
+  insightface onnxruntime-gpu opencv-python-headless \
+  speechbrain soundfile Pillow numpy
+```
+
+Record the resolved package versions after installation:
+
+```bash
+uv pip freeze --python "$EMBEDDING_ENV/bin/python" \
+  > "$AUDIO_DEPS/embedding-venv.freeze.txt"
+```
+
+Model files are staged manually. Neither adapter downloads a checkpoint or
+accepts an implicit cache-only model ID. The expected local layouts are:
+
+```text
+$FACE_MODEL_ROOT/models/$FACE_MODEL_NAME/*.onnx
+$SPEAKER_MODEL_PATH/hyperparams.yaml
+$SPEAKER_MODEL_PATH/...local SpeechBrain checkpoint files...
+```
+
+`FACE_MODEL_NAME` is deliberately deployment-configured; the repository does
+not bundle or select a private ArcFace model pack. The speaker adapter supports
+the locally staged `speechbrain/spkrec-ecapa-voxceleb` snapshot. Both workers
+verify a deterministic model-directory fingerprint before importing or loading
+the model. Set `CUDA_VISIBLE_DEVICES` in the parent shell; a selected physical
+GPU is exposed to each worker as process-local `cuda:0`.
 
 ## LR-ASD checkout and weights
 
@@ -273,6 +327,58 @@ head -n 5 "$PRIMARY_VOICE_OUT/primary_voice_references.jsonl"
 The exporter cuts the exact selected sample interval from the existing 16 kHz
 mono PCM LR-ASD audio and losslessly encodes it as mono FLAC. It performs no
 padding, normalization, enhancement, denoising, speaker embedding, or pairing.
+
+## Face and speaker embedding calibration pilot
+
+Run this only after the formal primary-voice export exists. The pilot consumes
+only occurrences whose `primary_voice_reference` is non-null. It uses each
+occurrence's one canonical Visual reference and exact selected 16 kHz mono
+FLAC; it does not rerun video/frame search, LR-ASD, S3FD, Silero, calibration,
+or primary-voice selection.
+
+```bash
+export PRIMARY_VOICE_OUT="${PILOT20_OUT}-primary-voice-v1"
+export EMBEDDING_OUT=$AUDIO_RUN_ROOT/embedding_pilot20
+
+cd "$REPO"
+"$R2V_PYTHON" tools/eval_h3_embedding_pilot.py \
+  --audio-pilot-root "$PILOT20_OUT" \
+  --primary-voice-root "$PRIMARY_VOICE_OUT" \
+  --output-root "$EMBEDDING_OUT" \
+  --face-python "$FACE_EMBEDDING_PYTHON" \
+  --face-model-root "$FACE_MODEL_ROOT" \
+  --face-model-name "$FACE_MODEL_NAME" \
+  --face-model-identifier "$FACE_MODEL_IDENTIFIER" \
+  --speaker-python "$SPEAKER_EMBEDDING_PYTHON" \
+  --speaker-model-path "$SPEAKER_MODEL_PATH" \
+  --speaker-model-identifier "$SPEAKER_MODEL_IDENTIFIER" \
+  --device cuda:0 \
+  --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
+  --top-k 5
+```
+
+Each persistent worker loads its model once and serves JSONL requests. Normal
+logs go to fixed sibling diagnostics under
+`$AUDIO_RUN_ROOT/.embedding_pilot20.worker_diagnostics`; model stdout remains
+machine-readable. Face detection fails closed on zero or multiple reliable
+faces in the canonical reference and never searches another frame. Speaker
+inference performs no additional trim, VAD, denoise, enhancement,
+normalization, padding, or utterance averaging. R2V stores both modalities as
+L2-normalized float32 `.npy` files.
+
+Inspect the bounded calibration evidence:
+
+```bash
+cat "$EMBEDDING_OUT/summary.json"
+
+"$R2V_PYTHON" tools/inspect_h3_embedding_pilot.py \
+  --embedding-root "$EMBEDDING_OUT" \
+  --top 30
+```
+
+`thresholds_calibrated=false` is mandatory. Similarities, directional ranks,
+and the face/voice top-K intersection are retrieval diagnostics only; they do
+not assert same-person, same-voice, cross-pair eligibility, or final acceptance.
 
 Routine benchmark outputs are disposable after the results are recorded.
 

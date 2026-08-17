@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import shutil
 import subprocess
 import uuid
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import IO, Protocol, Self
 
 import numpy as np
 from PIL import Image
@@ -40,6 +41,25 @@ class FaceEmbeddingResult:
     embedding: EmbeddingResult | None = None
     face_crop: Image.Image | None = None
     reason: str | None = None
+
+
+def fingerprint_local_model_path(path: Path) -> str:
+    """Hash one explicit local model file/directory without resolving a cache ID."""
+    source = path.expanduser().resolve(strict=True)
+    files = [source] if source.is_file() else sorted(
+        item for item in source.rglob("*") if item.is_file()
+    )
+    if not files:
+        raise ValueError("local embedding model path contains no files")
+    digest = hashlib.sha256()
+    for item in files:
+        relative = item.name if source.is_file() else item.relative_to(source).as_posix()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        with item.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 class FaceEmbeddingBackend(Protocol):
@@ -613,6 +633,239 @@ class ExternalSubprocessEmbeddingBackend:
             },
             request_id,
         )[0]
+
+
+class PersistentSubprocessEmbeddingBackend:
+    """Long-lived JSONL embedding adapter that loads one model per process."""
+
+    def __init__(
+        self,
+        *,
+        executable: list[str],
+        model_identifier: str,
+        checkpoint_sha256: str,
+        timeout_seconds: float,
+        diagnostics_root: Path,
+        environment: dict[str, str] | None = None,
+    ) -> None:
+        if not executable or timeout_seconds <= 0:
+            raise ValueError("persistent embedding backend requires command and timeout")
+        if len(checkpoint_sha256) != 64:
+            raise ValueError("persistent embedding backend requires model fingerprint")
+        executable_path = Path(executable[0]).expanduser()
+        if executable_path.parent != Path(".") and not executable_path.exists():
+            raise FileNotFoundError(f"embedding Python executable is missing: {executable[0]}")
+        self.executable = list(executable)
+        self.model_identifier = model_identifier
+        self.checkpoint_sha256 = checkpoint_sha256
+        self.timeout_seconds = timeout_seconds
+        self.diagnostics_root = diagnostics_root
+        self.environment = environment or {}
+        self._process: subprocess.Popen[str] | None = None
+        self._stderr_stream: IO[str] | None = None
+
+    def __enter__(self) -> Self:
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
+
+    def start(self) -> None:
+        if self._process is not None:
+            return
+        self.diagnostics_root.mkdir(parents=True, exist_ok=True)
+        stderr_stream = (self.diagnostics_root / "worker.stderr.log").open(
+            "w",
+            encoding="utf-8",
+        )
+        try:
+            process = subprocess.Popen(
+                self.executable,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_stream,
+                text=True,
+                bufsize=1,
+                env={**os.environ, **self.environment},
+            )
+        except Exception:
+            stderr_stream.close()
+            raise
+        if process.stdin is None or process.stdout is None:
+            process.terminate()
+            stderr_stream.close()
+            raise RuntimeError("persistent embedding worker pipes are unavailable")
+        self._process = process
+        self._stderr_stream = stderr_stream
+
+    def _readline(self) -> str:
+        assert self._process is not None
+        assert self._process.stdout is not None
+        ready, _, _ = select.select(
+            [self._process.stdout],
+            [],
+            [],
+            self.timeout_seconds,
+        )
+        if not ready:
+            raise TimeoutError("persistent embedding worker response timed out")
+        line = self._process.stdout.readline()
+        if not line:
+            return_code = self._process.poll()
+            raise RuntimeError(
+                "persistent embedding worker exited without a response "
+                f"(returncode={return_code})"
+            )
+        return line
+
+    def _request(self, payload: dict[str, object]) -> dict[str, object]:
+        self.start()
+        assert self._process is not None
+        assert self._process.stdin is not None
+        request_id = str(payload["request_id"])
+        try:
+            self._process.stdin.write(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError("persistent embedding worker request failed") from exc
+        try:
+            response = json.loads(self._readline())
+        except json.JSONDecodeError as exc:
+            raise ValueError("persistent embedding worker returned invalid JSON") from exc
+        if not isinstance(response, dict) or response.get("request_id") != request_id:
+            raise ValueError("persistent embedding worker response request_id mismatch")
+        return response
+
+    def _embedding(self, response: dict[str, object]) -> EmbeddingResult:
+        if response.get("status") != "available":
+            reason = str(response.get("reason") or "embedding_runtime_failed")
+            raise RuntimeError(reason)
+        if response.get("model_identifier") != self.model_identifier:
+            raise ValueError("persistent embedding worker model identifier mismatch")
+        if response.get("model_fingerprint") != self.checkpoint_sha256:
+            raise ValueError("persistent embedding worker model fingerprint mismatch")
+        vector = np.asarray(response.get("embedding"), dtype=np.float32).reshape(-1)
+        if (
+            vector.size == 0
+            or not np.isfinite(vector).all()
+            or response.get("dimension") != vector.size
+            or response.get("dtype") != "float32"
+        ):
+            raise ValueError("persistent embedding worker vector is invalid")
+        metadata = response.get("backend_metadata")
+        if not isinstance(metadata, dict):
+            raise TypeError("persistent embedding worker metadata is invalid")
+        return EmbeddingResult(
+            vector=vector,
+            model_identifier=self.model_identifier,
+            checkpoint_sha256=self.checkpoint_sha256,
+            backend_metadata={
+                **metadata,
+                "backend": "persistent_subprocess",
+            },
+        )
+
+    def embed_face(
+        self,
+        *,
+        entity_occurrence_id: str,
+        image_path: Path,
+    ) -> FaceEmbeddingResult:
+        request_id = hashlib.sha256(
+            f"face\0{entity_occurrence_id}".encode()
+        ).hexdigest()[:20]
+        crop_path = self.diagnostics_root / "face_crops" / f"{request_id}.png"
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        response = self._request(
+            {
+                "request_id": request_id,
+                "operation": "face_embedding",
+                "entity_occurrence_id": entity_occurrence_id,
+                "image_path": str(image_path),
+                "face_crop_output_path": str(crop_path),
+                "model_identifier": self.model_identifier,
+            }
+        )
+        status = response.get("status")
+        if status == "unavailable":
+            return FaceEmbeddingResult(
+                status="unavailable",
+                reason=str(response.get("reason") or "face_not_found"),
+            )
+        embedding = self._embedding(response)
+        returned_crop = Path(str(response.get("face_crop_path", ""))).resolve(
+            strict=True
+        )
+        if returned_crop != crop_path.resolve(strict=True):
+            raise ValueError("persistent face worker crop path mismatch")
+        with Image.open(returned_crop) as opened:
+            opened.load()
+            crop = opened.convert("RGB")
+        return FaceEmbeddingResult(
+            status="available",
+            embedding=embedding,
+            face_crop=crop,
+        )
+
+    def embed_speaker(
+        self,
+        *,
+        entity_occurrence_id: str,
+        audio_path: Path,
+    ) -> EmbeddingResult:
+        request_id = hashlib.sha256(
+            f"speaker\0{entity_occurrence_id}".encode()
+        ).hexdigest()[:20]
+        response = self._request(
+            {
+                "request_id": request_id,
+                "operation": "speaker_embedding",
+                "entity_occurrence_id": entity_occurrence_id,
+                "audio_path": str(audio_path),
+                "model_identifier": self.model_identifier,
+            }
+        )
+        return self._embedding(response)
+
+    def close(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                try:
+                    self._request(
+                        {
+                            "request_id": "shutdown",
+                            "operation": "shutdown",
+                        }
+                    )
+                except (
+                    BrokenPipeError,
+                    OSError,
+                    RuntimeError,
+                    TimeoutError,
+                    ValueError,
+                ):
+                    process.terminate()
+                try:
+                    process.wait(timeout=self.timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    process.wait(timeout=self.timeout_seconds)
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
+            if self._stderr_stream is not None:
+                self._stderr_stream.close()
+            self._process = None
+            self._stderr_stream = None
 
 
 class ExternalSubprocessTranscriptBackend:

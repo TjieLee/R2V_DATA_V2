@@ -14,6 +14,10 @@ from r2v_data_v2.h3.audio_schemas import (
     AudioPairSample,
     H3Sample,
 )
+from r2v_data_v2.h3.embedding_pilot import (
+    load_embedding_pilot_inputs,
+    run_embedding_pilot,
+)
 from r2v_data_v2.h3.fusion import AudioBindingPolicy, build_audio_binding_sidecar
 from r2v_data_v2.h3.primary_voice import (
     VoiceReferenceQualityPolicy,
@@ -41,4 +45,6 @@ __all__ = [
     "build_audio_pair_samples",
     "coalesce_audio_bindings",
     "export_primary_voice_references",
+    "load_embedding_pilot_inputs",
+    "run_embedding_pilot",
 ]
