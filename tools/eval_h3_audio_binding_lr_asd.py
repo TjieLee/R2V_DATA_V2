@@ -120,6 +120,12 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ),
     )
     result = summary.model_dump(mode="json")
+    quality_summary_path = (
+        Path(summary.output_root) / "voice_reference_quality_summary.json"
+    )
+    result["voice_reference_quality"] = json.loads(
+        quality_summary_path.read_text(encoding="utf-8")
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return result
 

@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
+import wave
+from array import array
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -849,6 +852,7 @@ def _native_artifact(
     audio_path: Path,
     logits_by_track: list[list[float]],
     bboxes: list[tuple[float, float, float, float]] | None = None,
+    duration_seconds: float = 0.4,
 ) -> LRASDNativeArtifact:
     active_bboxes = bboxes or [(2.0, 2.0, 8.0, 8.0)] * len(logits_by_track)
     return LRASDNativeArtifact(
@@ -864,7 +868,7 @@ def _native_artifact(
         ),
         width=20,
         height=20,
-        duration_seconds=0.4,
+        duration_seconds=duration_seconds,
         tracks=[
             LRASDNativeTrack(
                 face_track_id=f"face_{track_index}",
@@ -890,19 +894,29 @@ def _speech_artifact(
     audio_path: Path,
     *,
     speech: bool,
+    duration_seconds: float = 0.4,
 ) -> SpeechActivityArtifact:
     return SpeechActivityArtifact(
         clip_uid=clip_uid,
         backend="silero_vad",
         model_identifier="silero_vad.jit",
         source_audio_path=str(audio_path),
-        duration_seconds=0.4,
+        duration_seconds=duration_seconds,
         intervals=(
-            [SpeechActivityInterval(start_time=0.0, end_time=0.4)]
+            [SpeechActivityInterval(start_time=0.0, end_time=duration_seconds)]
             if speech
             else []
         ),
     )
+
+
+def _write_pcm16_wav(path: Path, samples: list[int]) -> None:
+    payload = array("h", samples)
+    with wave.open(str(path), "wb") as destination:
+        destination.setnchannels(1)
+        destination.setsampwidth(2)
+        destination.setframerate(16000)
+        destination.writeframes(payload.tobytes())
 
 
 def _full_entity_mask() -> np.ndarray:
@@ -1126,7 +1140,7 @@ class _FakeReviewMediaBackend:
         end_time: float,
         destination_path: Path,
     ) -> None:
-        assert source_audio_path.read_bytes() == b"audio"
+        assert source_audio_path.is_file()
         destination_path.write_bytes(f"{start_time:.3f}-{end_time:.3f}".encode())
 
 
@@ -1315,11 +1329,12 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
     run_root = tmp_path / "run"
     native_artifacts = {}
     speech_artifacts = {}
+    waveform = [0, 16384, -16384, 32767, -32768] * 2560
     for clip_uid in ("clip-3", "clip-1", "clip-2"):
         source = tmp_path / f"{clip_uid}.mp4"
         audio = tmp_path / f"{clip_uid}.wav"
         source.write_bytes(b"video")
-        audio.write_bytes(b"audio")
+        _write_pcm16_wav(audio, waveform)
         _write_pilot_clip(
             run_root,
             _pilot_clip(clip_uid, source),
@@ -1329,12 +1344,14 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
             clip_uid=clip_uid,
             source_video=source,
             audio_path=audio,
-            logits_by_track=[[0.7] * 10],
+            logits_by_track=[[0.7] * 20],
+            duration_seconds=0.8,
         )
         speech_artifacts[clip_uid] = _speech_artifact(
             clip_uid,
             audio,
             speech=True,
+            duration_seconds=0.8,
         )
 
     serial_root = tmp_path / "serial"
@@ -1361,7 +1378,7 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
         speech_backend=PrecomputedSpeechActivityBackend(speech_artifacts),
         review_media_backend=_FakeReviewMediaBackend(),
         limit=3,
-        workers=2,
+        workers=4,
     )
 
     serial_counters = serial_summary.model_dump(mode="json")
@@ -1378,6 +1395,14 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
     assert (parallel_root / "failures.jsonl").read_bytes() == (
         serial_root / "failures.jsonl"
     ).read_bytes()
+    assert (parallel_root / "voice_reference_quality.jsonl").read_bytes() == (
+        serial_root / "voice_reference_quality.jsonl"
+    ).read_bytes()
+    assert (
+        parallel_root / "voice_reference_quality_summary.json"
+    ).read_bytes() == (
+        serial_root / "voice_reference_quality_summary.json"
+    ).read_bytes()
     records = [
         json.loads(line)
         for line in (parallel_root / "audio_bindings.jsonl")
@@ -1385,11 +1410,58 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
         .splitlines()
     ]
     assert [record["clip_uid"] for record in records] == ["clip-1", "clip-3"]
+    quality_records = [
+        json.loads(line)
+        for line in (parallel_root / "voice_reference_quality.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["clip_uid"] for record in quality_records] == [
+        "clip-1",
+        "clip-3",
+    ]
+    quality = quality_records[0]
+    assert "source_binding_ids" not in quality
+    assert quality["duration_seconds"] == pytest.approx(0.8)
+    assert quality["sample_count"] == 12800
+    expected_rms = math.sqrt(
+        (0**2 + 16384**2 + (-16384) ** 2 + 32767**2 + (-32768) ** 2) / 5
+    ) / 32768
+    assert quality["rms_amplitude"] == pytest.approx(expected_rms)
+    assert quality["rms_dbfs"] == pytest.approx(20 * math.log10(expected_rms))
+    assert quality["peak_amplitude"] == 1.0
+    assert quality["peak_dbfs"] == 0.0
+    assert quality["clipping_ratio"] == pytest.approx(0.4)
+    assert quality["lr_asd_raw_native_score"] == pytest.approx(
+        {"mean": 0.7, "min": 0.7, "p10": 0.7}
+    )
+    assert quality["association_confidence"] == pytest.approx(
+        {"mean": 1.0, "min": 1.0}
+    )
+    quality_summary = json.loads(
+        (parallel_root / "voice_reference_quality_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert quality_summary["thresholds_calibrated"] is False
+    assert quality_summary["candidate_turn_count"] == 2
+    assert quality_summary["diagnostics_failed_clip_count"] == 0
     for clip_uid in ("clip-1", "clip-3"):
         assert (
             parallel_root / "clips" / clip_uid / "audio_binding.json"
         ).read_bytes() == (
             serial_root / "clips" / clip_uid / "audio_binding.json"
+        ).read_bytes()
+        assert (
+            parallel_root
+            / "clips"
+            / clip_uid
+            / "voice_reference_quality.json"
+        ).read_bytes() == (
+            serial_root
+            / "clips"
+            / clip_uid
+            / "voice_reference_quality.json"
         ).read_bytes()
         assert (
             parallel_root
@@ -1402,6 +1474,79 @@ def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(
             / clip_uid
             / "face_entity_association.json"
         ).read_bytes()
+
+
+def test_voice_quality_failure_does_not_change_binding_result(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    source = tmp_path / "clip-1.mp4"
+    invalid_audio = tmp_path / "clip-1.wav"
+    source.write_bytes(b"video")
+    invalid_audio.write_bytes(b"not-a-wave")
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    output_root = tmp_path / "pilot"
+
+    summary = run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=output_root,
+        lr_asd_backend=PrecomputedLRASDBackend(
+            {
+                "clip-1": _native_artifact(
+                    clip_uid="clip-1",
+                    source_video=source,
+                    audio_path=invalid_audio,
+                    logits_by_track=[[0.7] * 20],
+                    duration_seconds=0.8,
+                )
+            }
+        ),
+        speech_backend=PrecomputedSpeechActivityBackend(
+            {
+                "clip-1": _speech_artifact(
+                    "clip-1",
+                    invalid_audio,
+                    speech=True,
+                    duration_seconds=0.8,
+                )
+            }
+        ),
+        review_media_backend=_FakeReviewMediaBackend(),
+        clip_ids=["clip-1"],
+    )
+
+    assert summary.clips_succeeded == 1
+    assert summary.clips_failed == 0
+    sidecar = json.loads(
+        (output_root / "clips" / "clip-1" / "audio_binding.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {binding["status"] for binding in sidecar["bindings"]} == {"bound"}
+    assert all(
+        binding["evidence"]["audio_quality_usable"]
+        and binding["evidence"]["synchronization_plausible"]
+        for binding in sidecar["bindings"]
+    )
+    diagnostics = json.loads(
+        (
+            output_root
+            / "clips"
+            / "clip-1"
+            / "voice_reference_quality.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert diagnostics["status"] == "failed"
+    assert diagnostics["candidate_turns"] == []
+    quality_summary = json.loads(
+        (output_root / "voice_reference_quality_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert quality_summary["diagnostics_failed_clip_count"] == 1
+    assert quality_summary["candidate_turn_count"] == 0
 
 
 def test_pilot_workers_cli_defaults_to_one_and_accepts_parallel_count() -> None:

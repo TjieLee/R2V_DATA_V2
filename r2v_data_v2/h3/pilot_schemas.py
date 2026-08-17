@@ -176,3 +176,126 @@ class H3AudioBindingPilotSummary(SchemaModel):
         if self.clips_attempted != self.clips_succeeded + self.clips_failed:
             raise ValueError("pilot attempted clip count must reconcile")
         return self
+
+
+class LRASDScoreDiagnostics(SchemaModel):
+    mean: float
+    min: float
+    p10: float
+
+
+class AssociationConfidenceDiagnostics(SchemaModel):
+    mean: float = Field(ge=0, le=1)
+    min: float = Field(ge=0, le=1)
+
+
+class VoiceReferenceTurnDiagnostics(SchemaModel):
+    clip_uid: str
+    turn_id: str
+    entity_id: str
+    face_track_id: str
+    start_time: float = Field(ge=0)
+    end_time: float = Field(gt=0)
+    duration_seconds: float = Field(gt=0)
+    sample_count: int = Field(gt=0)
+    rms_amplitude: float = Field(ge=0, le=1)
+    rms_dbfs: float | None = None
+    peak_amplitude: float = Field(ge=0, le=1)
+    peak_dbfs: float | None = None
+    clipping_ratio: float = Field(ge=0, le=1)
+    lr_asd_raw_native_score: LRASDScoreDiagnostics
+    association_confidence: AssociationConfidenceDiagnostics
+    voice_reference_eligible: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_turn(self) -> VoiceReferenceTurnDiagnostics:
+        if not self.clip_uid.strip() or not self.turn_id.strip():
+            raise ValueError("voice-quality turn IDs must not be empty")
+        if not self.entity_id.strip() or not self.face_track_id.strip():
+            raise ValueError("voice-quality entity and face IDs must not be empty")
+        if self.end_time <= self.start_time or not math.isclose(
+            self.duration_seconds,
+            self.end_time - self.start_time,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("voice-quality turn duration must match its extent")
+        numeric = (
+            self.rms_amplitude,
+            self.peak_amplitude,
+            self.clipping_ratio,
+            self.lr_asd_raw_native_score.mean,
+            self.lr_asd_raw_native_score.min,
+            self.lr_asd_raw_native_score.p10,
+            self.association_confidence.mean,
+            self.association_confidence.min,
+        )
+        optional = (self.rms_dbfs, self.peak_dbfs)
+        if not all(math.isfinite(value) for value in numeric) or any(
+            value is not None and not math.isfinite(value) for value in optional
+        ):
+            raise ValueError("voice-quality metrics must be finite")
+        return self
+
+
+class VoiceReferenceClipDiagnostics(SchemaModel):
+    schema_version: Literal["r2v.h3.voice_reference_quality.1"] = (
+        "r2v.h3.voice_reference_quality.1"
+    )
+    clip_uid: str
+    source_audio_path: str
+    status: Literal["ready", "failed"]
+    thresholds_calibrated: Literal[False] = False
+    candidate_turns: list[VoiceReferenceTurnDiagnostics] = Field(
+        default_factory=list
+    )
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> VoiceReferenceClipDiagnostics:
+        if not self.clip_uid.strip() or not self.source_audio_path.strip():
+            raise ValueError("voice-quality clip and source audio are required")
+        if self.status == "ready" and self.reason is not None:
+            raise ValueError("ready voice-quality diagnostics cannot have a reason")
+        if self.status == "failed":
+            if self.reason is None or not self.reason.strip():
+                raise ValueError("failed voice-quality diagnostics require a reason")
+            if self.candidate_turns:
+                raise ValueError("failed voice-quality diagnostics cannot publish turns")
+        if self.candidate_turns != sorted(
+            self.candidate_turns,
+            key=lambda item: (item.start_time, item.end_time, item.turn_id),
+        ):
+            raise ValueError("voice-quality turns must use deterministic order")
+        return self
+
+
+class VoiceQualityMetricDistribution(SchemaModel):
+    count: int = Field(ge=0)
+    min: float | None = None
+    max: float | None = None
+    mean: float | None = None
+    p10: float | None = None
+    p50: float | None = None
+    p90: float | None = None
+
+
+class VoiceReferenceQualityPilotReport(SchemaModel):
+    schema_version: Literal["r2v.h3.voice_reference_quality_report.1"] = (
+        "r2v.h3.voice_reference_quality_report.1"
+    )
+    thresholds_calibrated: Literal[False] = False
+    clip_report_count: int = Field(ge=0)
+    diagnostics_ready_clip_count: int = Field(ge=0)
+    diagnostics_failed_clip_count: int = Field(ge=0)
+    clips_with_candidate_turns: int = Field(ge=0)
+    candidate_turn_count: int = Field(ge=0)
+    metric_distributions: dict[str, VoiceQualityMetricDistribution]
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> VoiceReferenceQualityPilotReport:
+        if self.clip_report_count != (
+            self.diagnostics_ready_clip_count + self.diagnostics_failed_clip_count
+        ):
+            raise ValueError("voice-quality clip counts must reconcile")
+        return self

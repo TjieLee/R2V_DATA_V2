@@ -23,9 +23,14 @@ from r2v_data_v2.h3.pilot_schemas import (
     H3AudioBindingPilotSummary,
     LRASDNativeArtifact,
     SpeechActivityArtifact,
+    VoiceReferenceClipDiagnostics,
 )
 from r2v_data_v2.h3.review import ReviewMediaBackend, write_review_bundle
 from r2v_data_v2.h3.schemas import H3TaskSpecification
+from r2v_data_v2.h3.voice_quality import (
+    build_voice_reference_quality_diagnostics,
+    build_voice_reference_quality_report,
+)
 from r2v_data_v2.v3.schemas import (
     ClipRecord,
     SampledFramesArtifact,
@@ -185,6 +190,7 @@ class _PilotClipResult:
     clip_uid: str
     counters: dict[str, int]
     sidecar_payload: dict[str, object] | None = None
+    voice_quality_payload: dict[str, object] | None = None
     failure: dict[str, object] | None = None
 
 
@@ -279,6 +285,20 @@ def _run_pilot_clip(
                 f"pilot reference-generation sidecar is {sidecar.status}: "
                 f"{sidecar.reason}"
             )
+        try:
+            voice_quality = build_voice_reference_quality_diagnostics(
+                native=native,
+                sidecar=sidecar,
+                source_audio_path=Path(runtime_native.audio_path),
+                published_audio_path=native.audio_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics do not gate binding
+            voice_quality = VoiceReferenceClipDiagnostics(
+                clip_uid=clip_uid,
+                source_audio_path=native.audio_path,
+                status="failed",
+                reason=f"{type(exc).__name__}: {exc}",
+            )
         stage = "review_bundle"
         write_review_bundle(
             destination=temporary / "review" / clip_uid,
@@ -290,9 +310,18 @@ def _run_pilot_clip(
             source_audio_path=Path(runtime_native.audio_path),
         )
         sidecar_payload = sidecar.model_dump(mode="json")
+        voice_quality_payload = voice_quality.model_dump(mode="json")
+        _write_json(
+            temporary / "review" / clip_uid / "voice_reference_quality.json",
+            voice_quality_payload,
+        )
         _write_json(
             temporary / "clips" / clip_uid / "audio_binding.json",
             sidecar_payload,
+        )
+        _write_json(
+            temporary / "clips" / clip_uid / "voice_reference_quality.json",
+            voice_quality_payload,
         )
         counters["clips_succeeded"] = 1
         counters["clips_with_speech"] = int(bool(speech.intervals))
@@ -313,6 +342,7 @@ def _run_pilot_clip(
             clip_uid=clip_uid,
             counters=counters,
             sidecar_payload=sidecar_payload,
+            voice_quality_payload=voice_quality_payload,
         )
     except Exception as exc:  # noqa: BLE001 - isolate pilot clips
         counters["clips_failed"] = 1
@@ -366,6 +396,7 @@ def run_h3_audio_binding_pilot(
     }
     failures: list[dict[str, object]] = []
     canonical_sidecars: list[dict[str, object]] = []
+    voice_quality_reports: list[VoiceReferenceClipDiagnostics] = []
     try:
         temporary.mkdir()
         clip_arguments = [
@@ -398,6 +429,12 @@ def run_h3_audio_binding_pilot(
                 counters[name] += value
             if result.sidecar_payload is not None:
                 canonical_sidecars.append(result.sidecar_payload)
+            if result.voice_quality_payload is not None:
+                voice_quality_reports.append(
+                    VoiceReferenceClipDiagnostics.model_validate(
+                        result.voice_quality_payload
+                    )
+                )
             if result.failure is not None:
                 failures.append(result.failure)
         summary = H3AudioBindingPilotSummary(
@@ -408,6 +445,22 @@ def run_h3_audio_binding_pilot(
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
         _write_jsonl(temporary / "failures.jsonl", failures)
         _write_jsonl(temporary / "audio_bindings.jsonl", canonical_sidecars)
+        voice_quality_turns = [
+            turn.model_dump(mode="json")
+            for report in voice_quality_reports
+            for turn in report.candidate_turns
+        ]
+        _write_jsonl(
+            temporary / "voice_reference_quality.jsonl",
+            voice_quality_turns,
+        )
+        voice_quality_summary = build_voice_reference_quality_report(
+            voice_quality_reports
+        )
+        _write_json(
+            temporary / "voice_reference_quality_summary.json",
+            voice_quality_summary.model_dump(mode="json"),
+        )
         temporary.replace(destination)
         return summary
     except Exception:

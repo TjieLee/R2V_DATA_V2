@@ -201,6 +201,42 @@ for workers in 1 2 4 6; do
 done
 ```
 
+The verified worker benchmark completed with semantically matching outputs:
+
+```text
+workers=1  399s
+workers=2  223s
+workers=4  155s
+workers=6  146s
+```
+
+Use `--workers 4` as the current production starting point. The CLI default
+remains `--workers 1` for conservative compatibility.
+
+## Voice-reference quality diagnostics
+
+The pilot writes calibration-only diagnostics without changing binding status,
+voice-reference eligibility, or any Audio/Visual threshold:
+
+```text
+$PILOT20_OUT/clips/<clip_uid>/voice_reference_quality.json
+$PILOT20_OUT/review/<clip_uid>/voice_reference_quality.json
+$PILOT20_OUT/voice_reference_quality.jsonl
+$PILOT20_OUT/voice_reference_quality_summary.json
+```
+
+Inspect the bounded turn-level report after a pilot:
+
+```bash
+cat "$PILOT20_OUT/voice_reference_quality_summary.json"
+head -n 5 "$PILOT20_OUT/voice_reference_quality.jsonl"
+```
+
+These measurements use coalesced bound speech turns and the existing LR-ASD
+16 kHz mono PCM audio. They are for calibration and inspection only;
+`thresholds_calibrated=false`. Do not use them as a production
+voice-reference gate until the real pilot distributions have been reviewed.
+
 Only preserve/archive a run when it is actually useful for comparison or an
 accepted production checkpoint. Routine failed smoke attempts are disposable.
 
