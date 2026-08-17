@@ -23,7 +23,7 @@ from r2v_data_v2.v3.schemas import (
     TrackedMasksArtifact,
 )
 
-PAIR_CALIBRATION_POLICY_VERSION = "h3_pair_calibration_selection_v1"
+PAIR_CALIBRATION_POLICY_VERSION = "h3_pair_calibration_selection_v2"
 PAIR_CALIBRATION_PLAN_SCHEMA_VERSION = "r2v.h3.pair_calibration_plan.1"
 PAIR_CALIBRATION_PAIR_SCHEMA_VERSION = "r2v.h3.visual_candidate_pair.1"
 CalibrationSelectionSource = Literal[
@@ -75,7 +75,7 @@ class PairCalibrationPlan(SchemaModel):
     selected_clips: list[PairCalibrationSelectedClip]
     skipped_priority_a_pairs: list[PairCalibrationSkippedPair]
     deterministic_selection_policy_version: Literal[
-        "h3_pair_calibration_selection_v1"
+        "h3_pair_calibration_selection_v2"
     ] = PAIR_CALIBRATION_POLICY_VERSION
     thresholds_calibrated: Literal[False] = False
 
@@ -133,12 +133,36 @@ class VisualCandidatePair(SchemaModel):
 class _EligibleSubject:
     entity: AnnotationEntity
     reference: EntityReferenceState
+    canonical_reference_path: Path
+    canonical_reference_sha256: str
+    visual_integrity_provenance: dict[str, object]
 
 
 @dataclass(frozen=True)
 class _EligibleClip:
     clip: ClipRecord
     subjects: tuple[_EligibleSubject, ...]
+
+
+@dataclass(frozen=True)
+class EligibleVisualFaceOccurrence:
+    entity_occurrence_id: str
+    clip_uid: str
+    entity_id: str
+    parent_video_id: str
+    clip_suffix: str
+    canonical_reference_path: Path
+    canonical_reference_sha256: str
+    canonical_reference_run_path: str
+    existing_v3_cross_pair_provenance: dict[str, str] | None
+    visual_integrity_provenance: dict[str, object]
+
+
+@dataclass(frozen=True)
+class VisualFaceOccurrenceLoadResult:
+    run_root: Path
+    occurrences: tuple[EligibleVisualFaceOccurrence, ...]
+    skip_reason_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -223,6 +247,24 @@ def _integrity_allows_subject(clip: ClipRecord, entity_id: str) -> bool:
     return len(matching) == 1 and matching[0].status in {"accepted", "skipped"}
 
 
+def _integrity_provenance(clip: ClipRecord, entity_id: str) -> dict[str, object]:
+    integrity = clip.reference_integrity
+    if integrity is None:
+        return {"stage_status": "not_present", "entity_status": "not_reviewed"}
+    matching = [item for item in integrity.entities if item.entity_id == entity_id]
+    if len(matching) != 1:
+        return {"stage_status": integrity.status, "entity_status": "missing"}
+    item = matching[0]
+    return {
+        "stage_status": integrity.status,
+        "entity_status": item.status,
+        "reviewed": item.reviewed,
+        "final_reference_path": item.final_reference_path,
+        "review_verdict": item.review.verdict if item.review is not None else None,
+        "reason": item.reason,
+    }
+
+
 def _load_eligible_clip(run_root: Path, clip_path: Path) -> _EligibleClip:
     clip = ClipRecord.model_validate_json(clip_path.read_text(encoding="utf-8"))
     if clip.clip_uid != clip_path.parent.name:
@@ -267,8 +309,16 @@ def _load_eligible_clip(run_root: Path, clip_path: Path) -> _EligibleClip:
             or not _integrity_allows_subject(clip, entity_id)
         ):
             continue
-        _resolve_run_artifact(run_root, reference.image_path)
-        subjects.append(_EligibleSubject(entity=entity, reference=reference))
+        canonical_path = _resolve_run_artifact(run_root, reference.image_path)
+        subjects.append(
+            _EligibleSubject(
+                entity=entity,
+                reference=reference,
+                canonical_reference_path=canonical_path,
+                canonical_reference_sha256=_sha256(canonical_path),
+                visual_integrity_provenance=_integrity_provenance(clip, entity_id),
+            )
+        )
     if not subjects:
         raise ValueError("no_ready_human_subject")
     return _EligibleClip(clip=clip, subjects=tuple(subjects))
@@ -285,6 +335,60 @@ def _skip_reason(exc: Exception) -> str:
         "no_ready_human_subject",
     }
     return message if message in recognized else "invalid_visual_clip"
+
+
+def load_eligible_visual_face_occurrences(
+    run_root: Path,
+) -> VisualFaceOccurrenceLoadResult:
+    source = run_root.expanduser().resolve(strict=True)
+    if not (source / "run.json").is_file() or not (source / "clips").is_dir():
+        raise ValueError("run_root is not an initialized V3 run")
+    skip_reasons: Counter[str] = Counter()
+    occurrences: list[EligibleVisualFaceOccurrence] = []
+    for clip_path in sorted((source / "clips").glob("*/clip.json")):
+        try:
+            eligible = _load_eligible_clip(source, clip_path)
+        except Exception as exc:  # noqa: BLE001 - invalid clips are exclusions
+            skip_reasons[_skip_reason(exc)] += 1
+            continue
+        for subject in eligible.subjects:
+            reference = subject.reference
+            source_clip_uid = reference.source_clip_uid
+            provenance = None
+            if source_clip_uid not in {None, eligible.clip.clip_uid}:
+                assert reference.source_entity_id is not None
+                provenance = {
+                    "target_clip_uid": eligible.clip.clip_uid,
+                    "target_entity_id": subject.entity.entity_id,
+                    "donor_clip_uid": source_clip_uid,
+                    "donor_entity_id": reference.source_entity_id,
+                }
+            occurrences.append(
+                EligibleVisualFaceOccurrence(
+                    entity_occurrence_id=(
+                        f"{eligible.clip.clip_uid}/{subject.entity.entity_id}"
+                    ),
+                    clip_uid=eligible.clip.clip_uid,
+                    entity_id=subject.entity.entity_id,
+                    parent_video_id=eligible.clip.source.parent_video_id,
+                    clip_suffix=eligible.clip.source.clip_suffix,
+                    canonical_reference_path=subject.canonical_reference_path,
+                    canonical_reference_sha256=(
+                        subject.canonical_reference_sha256
+                    ),
+                    canonical_reference_run_path=str(reference.image_path),
+                    existing_v3_cross_pair_provenance=provenance,
+                    visual_integrity_provenance=(
+                        subject.visual_integrity_provenance
+                    ),
+                )
+            )
+    occurrences.sort(key=lambda item: item.entity_occurrence_id)
+    return VisualFaceOccurrenceLoadResult(
+        run_root=source,
+        occurrences=tuple(occurrences),
+        skip_reason_counts=dict(sorted(skip_reasons.items())),
+    )
 
 
 def _seed_clip_ids(seed_root: Path | None) -> list[str]:
@@ -555,7 +659,8 @@ def plan_h3_pair_calibration(
     selected: list[str] = []
     selected_set: set[str] = set()
     selected_sources: dict[str, CalibrationSelectionSource] = {}
-    parent_counts: Counter[str] = Counter()
+    selected_parent_counts: Counter[str] = Counter()
+    expansion_parent_counts: Counter[str] = Counter()
 
     def add(clip_uid: str, selection_source: CalibrationSelectionSource) -> None:
         if clip_uid in selected_set:
@@ -563,23 +668,23 @@ def plan_h3_pair_calibration(
         selected.append(clip_uid)
         selected_set.add(clip_uid)
         selected_sources[clip_uid] = selection_source
-        parent_counts[eligible[clip_uid].clip.source.parent_video_id] += 1
+        parent = eligible[clip_uid].clip.source.parent_video_id
+        selected_parent_counts[parent] += 1
+        if selection_source != "seed_audio_pilot":
+            expansion_parent_counts[parent] += 1
 
+    eligible_seed_ids: list[str] = []
     for clip_uid in _seed_clip_ids(seed_root):
         if clip_uid not in eligible:
             skip_reasons["seed_clip_not_eligible"] += 1
             continue
-        reason = _can_add(
-            [clip_uid],
-            selected=selected_set,
-            parent_counts=parent_counts,
-            eligible=eligible,
-            max_clips=max_clips,
-            max_clips_per_parent=max_clips_per_parent,
+        eligible_seed_ids.append(clip_uid)
+    if len(eligible_seed_ids) > max_clips:
+        raise ValueError(
+            "eligible seed clip count exceeds max_clips: "
+            f"{len(eligible_seed_ids)} > {max_clips}"
         )
-        if reason is not None:
-            skip_reasons[f"seed_{reason}"] += 1
-            continue
+    for clip_uid in eligible_seed_ids:
         add(clip_uid, "seed_audio_pilot")
 
     priority_a = _priority_a_relations(eligible)
@@ -590,7 +695,7 @@ def plan_h3_pair_calibration(
         reason = _can_add(
             endpoints,
             selected=selected_set,
-            parent_counts=parent_counts,
+            parent_counts=expansion_parent_counts,
             eligible=eligible,
             max_clips=max_clips,
             max_clips_per_parent=max_clips_per_parent,
@@ -616,7 +721,7 @@ def plan_h3_pair_calibration(
 
     group_positions = {parent: 0 for parent in parent_groups}
     for parent in sorted(parent_groups):
-        needed = max(0, 2 - parent_counts[parent])
+        needed = max(0, 2 - selected_parent_counts[parent])
         if needed == 0:
             continue
         clip_uids = parent_groups[parent]
@@ -632,7 +737,7 @@ def plan_h3_pair_calibration(
         reason = _can_add(
             candidates,
             selected=selected_set,
-            parent_counts=parent_counts,
+            parent_counts=expansion_parent_counts,
             eligible=eligible,
             max_clips=max_clips,
             max_clips_per_parent=max_clips_per_parent,
@@ -660,7 +765,7 @@ def plan_h3_pair_calibration(
             reason = _can_add(
                 [clip_uid],
                 selected=selected_set,
-                parent_counts=parent_counts,
+                parent_counts=expansion_parent_counts,
                 eligible=eligible,
                 max_clips=max_clips,
                 max_clips_per_parent=max_clips_per_parent,
@@ -690,9 +795,6 @@ def plan_h3_pair_calibration(
         )
         for clip_uid in selected
     ]
-    selected_parent_counts = Counter(
-        eligible[clip_uid].clip.source.parent_video_id for clip_uid in selected
-    )
     selected_parent_group_count = sum(
         selected_parent_counts[parent] >= 2 for parent in parent_groups
     )

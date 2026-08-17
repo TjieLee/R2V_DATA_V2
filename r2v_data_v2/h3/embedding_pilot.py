@@ -39,6 +39,12 @@ class EmbeddingPilotInput:
     local_binding_valid: bool
 
 
+@dataclass(frozen=True)
+class MaterializedFaceEmbedding:
+    result: EmbeddingPilotModalityResult
+    normalized_vector: np.ndarray | None
+
+
 class EmbeddingPilotModalityResult(SchemaModel):
     modality: Literal["face", "speaker"]
     status: Literal["available", "unavailable", "failed"]
@@ -261,6 +267,80 @@ def _face_reason(value: str | None) -> str:
     return "face_embedding_runtime_failed"
 
 
+def materialize_face_embedding(
+    *,
+    backend: FaceEmbeddingBackend,
+    entity_occurrence_id: str,
+    clip_uid: str,
+    entity_id: str,
+    canonical_reference_path: Path,
+    canonical_reference_sha256: str,
+    output_root: Path,
+) -> MaterializedFaceEmbedding:
+    """Run the frozen single-face policy and publish its bounded artifacts."""
+    identifier, fingerprint = _backend_identity(backend)
+    try:
+        result = backend.embed_face(
+            entity_occurrence_id=entity_occurrence_id,
+            image_path=canonical_reference_path,
+        )
+        if (
+            result.status != "available"
+            or result.embedding is None
+            or result.face_crop is None
+        ):
+            return MaterializedFaceEmbedding(
+                result=EmbeddingPilotModalityResult(
+                    modality="face",
+                    status="unavailable",
+                    model_identifier=identifier,
+                    model_fingerprint=fingerprint,
+                    failure_reason=_face_reason(result.reason),
+                ),
+                normalized_vector=None,
+            )
+        crop_path = output_root / "face_crops" / clip_uid / f"{entity_id}.png"
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        result.face_crop.convert("RGB").save(crop_path, format="PNG")
+        embedding_path = (
+            output_root / "embeddings" / "face" / clip_uid / f"{entity_id}.npy"
+        )
+        metadata = {
+            **(result.embedding.backend_metadata or {}),
+            "input_reference_sha256": canonical_reference_sha256,
+        }
+        asset = _save_embedding(
+            vector=result.embedding.vector,
+            path=embedding_path,
+            root=output_root,
+            model_identifier=result.embedding.model_identifier,
+            checkpoint_sha256=result.embedding.checkpoint_sha256,
+            backend_metadata=metadata,
+        )
+        return MaterializedFaceEmbedding(
+            result=EmbeddingPilotModalityResult(
+                modality="face",
+                status="available",
+                crop_asset=_file_asset(crop_path, output_root, "image/png"),
+                embedding_asset=asset,
+                model_identifier=result.embedding.model_identifier,
+                model_fingerprint=result.embedding.checkpoint_sha256,
+            ),
+            normalized_vector=_normalize(result.embedding.vector),
+        )
+    except Exception:  # noqa: BLE001 - one model failure isolates one occurrence
+        return MaterializedFaceEmbedding(
+            result=EmbeddingPilotModalityResult(
+                modality="face",
+                status="failed",
+                model_identifier=identifier,
+                model_fingerprint=fingerprint,
+                failure_reason="face_embedding_runtime_failed",
+            ),
+            normalized_vector=None,
+        )
+
+
 def _jsonl(values: Sequence[SchemaModel]) -> str:
     return "".join(
         json.dumps(
@@ -454,71 +534,19 @@ def run_embedding_pilot(
     try:
         temporary.mkdir()
         for item in ordered_inputs:
-            try:
-                result = face_backend.embed_face(
-                    entity_occurrence_id=item.entity_occurrence_id,
-                    image_path=item.visual_reference_path,
-                )
-                if (
-                    result.status != "available"
-                    or result.embedding is None
-                    or result.face_crop is None
-                ):
-                    face_results[item.entity_occurrence_id] = (
-                        EmbeddingPilotModalityResult(
-                            modality="face",
-                            status="unavailable",
-                            model_identifier=face_identifier,
-                            model_fingerprint=face_fingerprint,
-                            failure_reason=_face_reason(result.reason),
-                        )
-                    )
-                    continue
-                crop_path = (
-                    temporary
-                    / "face_crops"
-                    / item.clip_uid
-                    / f"{item.entity_id}.png"
-                )
-                crop_path.parent.mkdir(parents=True, exist_ok=True)
-                result.face_crop.convert("RGB").save(crop_path, format="PNG")
-                embedding_path = (
-                    temporary
-                    / "embeddings"
-                    / "face"
-                    / item.clip_uid
-                    / f"{item.entity_id}.npy"
-                )
-                metadata = {
-                    **(result.embedding.backend_metadata or {}),
-                    "input_reference_sha256": item.visual_reference_sha256,
-                }
-                asset = _save_embedding(
-                    vector=result.embedding.vector,
-                    path=embedding_path,
-                    root=temporary,
-                    model_identifier=result.embedding.model_identifier,
-                    checkpoint_sha256=result.embedding.checkpoint_sha256,
-                    backend_metadata=metadata,
-                )
-                face_vectors[item.entity_occurrence_id] = _normalize(
-                    result.embedding.vector
-                )
-                face_results[item.entity_occurrence_id] = EmbeddingPilotModalityResult(
-                    modality="face",
-                    status="available",
-                    crop_asset=_file_asset(crop_path, temporary, "image/png"),
-                    embedding_asset=asset,
-                    model_identifier=result.embedding.model_identifier,
-                    model_fingerprint=result.embedding.checkpoint_sha256,
-                )
-            except Exception:  # noqa: BLE001 - one model failure isolates one occurrence
-                face_results[item.entity_occurrence_id] = EmbeddingPilotModalityResult(
-                    modality="face",
-                    status="failed",
-                    model_identifier=face_identifier,
-                    model_fingerprint=face_fingerprint,
-                    failure_reason="face_embedding_runtime_failed",
+            materialized = materialize_face_embedding(
+                backend=face_backend,
+                entity_occurrence_id=item.entity_occurrence_id,
+                clip_uid=item.clip_uid,
+                entity_id=item.entity_id,
+                canonical_reference_path=item.visual_reference_path,
+                canonical_reference_sha256=item.visual_reference_sha256,
+                output_root=temporary,
+            )
+            face_results[item.entity_occurrence_id] = materialized.result
+            if materialized.normalized_vector is not None:
+                face_vectors[item.entity_occurrence_id] = (
+                    materialized.normalized_vector
                 )
 
         for item in ordered_inputs:

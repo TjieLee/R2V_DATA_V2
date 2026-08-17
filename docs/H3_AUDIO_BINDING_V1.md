@@ -29,6 +29,17 @@ V1 does not use these as clean entity-bound supervision:
 
 These rules apply only to the new audio-binding sidecar dataset.
 
+Calibration planners may bound a review sample, but their sampling quotas are
+not production policy. In particular, `max_clips_per_parent` is confined to the
+pair-calibration planner. Production H3 paths retain every eligible occurrence,
+allow every eligible occurrence to receive face embeddings, and allow every
+occurrence with a valid primary voice reference to receive speaker embeddings.
+Parent/source provenance may influence retrieval ordering, never eligibility or
+a count quota. Strict identity evidence decides whether a pair is usable;
+uncertainty produces no pair rather than truncating the dataset. Production
+configuration must not expose `max_clips_per_parent` or call calibration
+selection helpers with their sampling limits intact.
+
 ## Evidence-First Architecture
 
 ```text

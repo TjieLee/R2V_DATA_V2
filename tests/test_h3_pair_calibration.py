@@ -331,6 +331,66 @@ def test_priority_b_round_robin_enforces_parent_and_total_caps(tmp_path: Path) -
     assert all(row["same_person_label"] is None for row in _pair_rows(tmp_path / "plan"))
 
 
+def test_seed_clips_are_preserved_before_parent_capped_expansion(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    _initialize_run(run)
+    seed_ids = ["seed-a", "seed-b", "seed-c"]
+    for index, clip_uid in enumerate(seed_ids, start=1):
+        _write_clip(
+            run,
+            clip_uid=clip_uid,
+            parent_video_id="shared-parent",
+            clip_suffix=str(index),
+        )
+    seed = tmp_path / "seed"
+    _write_seed(seed, seed_ids)
+
+    plan = plan_h3_pair_calibration(
+        run_root=run,
+        output_root=tmp_path / "plan",
+        seed_audio_pilot_root=seed,
+        max_clips=3,
+        max_clips_per_parent=1,
+    )
+
+    assert [item.clip_uid for item in plan.selected_clips] == seed_ids
+    assert plan.seed_clip_count == 3
+    assert plan.priority_a_clip_count == 0
+    assert plan.priority_b_clip_count == 0
+
+
+def test_eligible_seed_count_over_global_max_fails_deterministically(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "run"
+    _initialize_run(run)
+    seed_ids = ["seed-a", "seed-b", "seed-c"]
+    for index, clip_uid in enumerate(seed_ids, start=1):
+        _write_clip(
+            run,
+            clip_uid=clip_uid,
+            parent_video_id="shared-parent",
+            clip_suffix=str(index),
+        )
+    seed = tmp_path / "seed"
+    _write_seed(seed, seed_ids)
+
+    with pytest.raises(
+        ValueError,
+        match="eligible seed clip count exceeds max_clips: 3 > 2",
+    ):
+        plan_h3_pair_calibration(
+            run_root=run,
+            output_root=tmp_path / "plan",
+            seed_audio_pilot_root=seed,
+            max_clips=2,
+            max_clips_per_parent=1,
+        )
+    assert not (tmp_path / "plan").exists()
+
+
 def test_priority_a_pair_is_not_partially_selected_when_budget_cannot_fit(
     tmp_path: Path,
 ) -> None:

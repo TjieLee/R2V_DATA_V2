@@ -20,6 +20,8 @@ attempt.
     ├── pilot20/                         # one reusable 20-clip validation output
     ├── pair_calibration/                # fixed pair-calibration workspace
     │   ├── plan/                        # deterministic Visual clip plan
+    │   ├── face_mining/                 # Visual-only face retrieval + review
+    │   ├── face_audio_plan/              # HUMAN SAME pair Audio endpoints
     │   ├── audio/                       # LR-ASD Audio binding outputs
     │   ├── primary_voice/               # frozen V1 primary voice references
     │   └── embedding/                   # face/speaker retrieval diagnostics
@@ -394,6 +396,81 @@ cat "$EMBEDDING_OUT/summary.json"
 and the face/voice top-K intersection are retrieval diagnostics only; they do
 not assert same-person, same-voice, cross-pair eligibility, or final acceptance.
 
+## Visual-first face identity mining
+
+Run Visual-only face mining before expanding expensive LR-ASD calibration. It
+enumerates every eligible retained subject occurrence in the frozen V3 run,
+opens only its canonical Visual reference, and applies the existing strict
+single-face InsightFace worker. It does not require Audio binding, speech, or a
+primary voice reference. Zero-face, multi-face, and runtime failures remain
+fail closed. Retrieval scores and ranks are diagnostics only; no identity
+threshold or automatic SAME label is produced.
+
+Use the fixed output directory:
+
+```bash
+export PAIR_CALIBRATION_ROOT=$AUDIO_RUN_ROOT/pair_calibration
+export FACE_MINING_ROOT=$PAIR_CALIBRATION_ROOT/face_mining
+export FACE_AUDIO_PLAN_ROOT=$PAIR_CALIBRATION_ROOT/face_audio_plan
+
+cd "$REPO"
+"$R2V_PYTHON" tools/mine_h3_face_identity_candidates.py \
+  --run-root "$V3_RUN" \
+  --output-root "$FACE_MINING_ROOT" \
+  --face-python "$FACE_EMBEDDING_PYTHON" \
+  --face-model-root "$FACE_MODEL_ROOT" \
+  --face-model-name buffalo_l \
+  --face-model-identifier insightface/buffalo_l \
+  --device cuda:0 \
+  --cuda-visible-devices "$CUDA_VISIBLE_DEVICES" \
+  --top-k 5
+
+cat "$FACE_MINING_ROOT/summary.json"
+```
+
+Build and open the fixed HUMAN review page. Forward port 8765 over SSH when the
+server has no desktop browser:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/build_h3_face_identity_review.py \
+  --face-mining-root "$FACE_MINING_ROOT"
+
+"$R2V_PYTHON" -m http.server 8765 --directory "$FACE_MINING_ROOT"
+# Open http://127.0.0.1:8765/review.html through the SSH port forward.
+```
+
+The page asks only whether the two occurrences are the same physical person.
+Keys `1`, `2`, and `3` assign SAME, DIFFERENT, and UNCERTAIN; `j`/`k` or arrow
+keys navigate. Labels stay in browser localStorage until **Export JSONL** is
+used. Put that exported file at an explicit writable path, then build the Audio
+endpoint plan:
+
+```bash
+export FACE_LABELS=$FACE_MINING_ROOT/face_identity_labels.jsonl
+
+cd "$REPO"
+"$R2V_PYTHON" tools/plan_h3_audio_from_face_labels.py \
+  --face-mining-root "$FACE_MINING_ROOT" \
+  --labels "$FACE_LABELS" \
+  --output-root "$FACE_AUDIO_PLAN_ROOT"
+
+cat "$FACE_AUDIO_PLAN_ROOT/plan.json"
+cat "$FACE_AUDIO_PLAN_ROOT/clip_ids.txt"
+```
+
+Only HUMAN SAME pairs contribute endpoints. Both endpoints are retained as a
+unit; DIFFERENT and UNCERTAIN are excluded. The resulting `clip_ids.txt` feeds
+the unchanged LR-ASD command through `--clip-id-file`. Human SAME labels remain
+calibration evidence and never become automatic production identity truth.
+
+Initial manually reviewed calibration evidence is retained for provenance: an
+8-occurrence pilot yielded 28 unordered pairs, with SAME=1, DIFFERENT=27, and
+UNCERTAIN=0. The one confirmed positive was
+`17270abd38d44def5a88391d/e1` versus `9d1d740ad31c0deacb7287fd/e1`, with face
+cosine 0.728202 and voice cosine 0.390468. These identifiers and values are not
+hard-coded, do not define a threshold, and do not make thresholds calibrated.
+
 ## Fixed 60-clip pair-calibration expansion
 
 This workflow expands the manually reviewed pilot into a bounded calibration
@@ -406,6 +483,18 @@ deterministic round-robin across same-parent multi-clip groups. Same parent and
 existing V3 donor provenance are candidate priors only, never identity truth.
 The first same-parent round selects enough clips to form a two-clip comparison
 unit; later rounds add at most one more clip per parent until the configured cap.
+Eligible seed clips are retained before expansion and are not subject to the
+parent cap; they still count toward the global maximum, and eligible seeds over
+that maximum fail deterministically instead of being silently truncated.
+
+`max_clips_per_parent` is calibration-sampling-only. It applies only to this
+planner's newly mined Priority A/B expansion. It must never appear in production
+H3 eligibility, embedding, retrieval, identity, donor, or pair-construction
+configuration or behavior. Production retains every eligible occurrence; source
+and parent provenance may be a retrieval prior but never a quota. Strict identity
+gates decide pair usability, and uncertainty yields no pair rather than dataset
+truncation. Calibration selection helpers must not be reused by production
+candidate generation unless every sampling limit has been removed.
 
 Use one fixed workspace and no timestamped calibration directories:
 
