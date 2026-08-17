@@ -15,6 +15,10 @@ from r2v_data_v2.h3.audio_schemas import (
     H3Sample,
 )
 from r2v_data_v2.h3.fusion import AudioBindingPolicy, build_audio_binding_sidecar
+from r2v_data_v2.h3.primary_voice import (
+    VoiceReferenceQualityPolicy,
+    export_primary_voice_references,
+)
 from r2v_data_v2.h3.schemas import (
     AudioBindingSidecar,
     H3AudioBindingIR,
@@ -31,8 +35,10 @@ __all__ = [
     "H3AudioBindingIR",
     "H3Sample",
     "H3TaskSpecification",
+    "VoiceReferenceQualityPolicy",
     "build_audio_binding_sidecar",
     "build_audio_clip_binding_dataset",
     "build_audio_pair_samples",
     "coalesce_audio_bindings",
+    "export_primary_voice_references",
 ]

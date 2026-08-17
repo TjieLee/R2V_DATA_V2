@@ -6,7 +6,7 @@ import math
 import shutil
 import uuid
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +31,15 @@ from r2v_data_v2.h3.audio_schemas import (
     TranscriptProvenance,
     VisualReferenceProvenance,
     VisualSourceProvenance,
-    VoiceReferenceArtifact,
+)
+from r2v_data_v2.h3.primary_voice import (
+    VoiceReferenceQualityPolicy,
+    assess_voice_reference_clip,
+    build_voice_reference_artifact,
+    load_voice_reference_quality_diagnostics,
+    resolve_voice_quality_audio_path,
+    select_primary_voice_assessments,
+    voice_turn_sample_range,
 )
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, AudioEntityBinding
 
@@ -46,6 +54,9 @@ class AudioBindingProductionConfig:
     voice_sample_rate_hz: int = 16000
     voice_format: str = "flac"
     minimum_binding_confidence: float = 0.80
+    voice_reference_quality_policy: VoiceReferenceQualityPolicy = field(
+        default_factory=VoiceReferenceQualityPolicy
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -67,6 +78,8 @@ class AudioBindingProductionConfig:
             "wav",
         }:
             raise ValueError("audio output formats must be flac or wav")
+        if self.voice_sample_rate_hz != 16000 or self.voice_format != "flac":
+            raise ValueError("formal V1 voice references must be 16 kHz FLAC")
         if not 0 <= self.minimum_binding_confidence <= 1:
             raise ValueError("binding confidence must be in [0, 1]")
 
@@ -545,6 +558,22 @@ def _build_audio_clip_binding_batch(
                 raise ValueError(
                     f"audio sidecar is {sidecar_record.status}: {sidecar_record.reason}"
                 )
+            quality_report = load_voice_reference_quality_diagnostics(
+                sidecar_root=sidecar,
+                clip_uid=visual.clip_uid,
+            )
+            quality_assessments = assess_voice_reference_clip(
+                quality_report,
+                policy=active.voice_reference_quality_policy,
+            )
+            selected_assessments = select_primary_voice_assessments(
+                quality_assessments,
+                entity_order=[entity.entity_id for entity in visual.entities],
+            )
+            quality_source_audio = resolve_voice_quality_audio_path(
+                pilot_root=sidecar,
+                source_audio_path=quality_report.source_audio_path,
+            )
             full_path = temporary / "full_audio" / (
                 f"{visual.clip_uid}.{active.full_audio_format}"
             )
@@ -568,11 +597,7 @@ def _build_audio_clip_binding_batch(
                     visual.clip_uid, ()
                 ),
             )
-            selected_turns = select_primary_voice_turns(
-                turns,
-                entity_order=[entity.entity_id for entity in visual.entities],
-                minimum_binding_confidence=active.minimum_binding_confidence,
-            )
+            turn_by_id = {turn.turn_id: turn for turn in turns}
             diagnostics_path = (
                 temporary
                 / "diagnostics"
@@ -581,6 +606,22 @@ def _build_audio_clip_binding_batch(
             )
             diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(sidecar_path, diagnostics_path)
+            assessment_path = (
+                temporary
+                / "diagnostics"
+                / visual.clip_uid
+                / "voice_reference_quality_assessments.json"
+            )
+            assessment_path.write_text(
+                json.dumps(
+                    [item.model_dump(mode="json") for item in quality_assessments],
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             occurrences: list[EntityOccurrence] = []
             for entity in visual.entities:
                 occurrence_id = f"{visual.clip_uid}/{entity.entity_id}"
@@ -645,8 +686,31 @@ def _build_audio_clip_binding_batch(
                     reason_codes.append("not_a_bound_human_subject")
                 voice_reference = None
                 voice_embedding = None
-                selected_turn = selected_turns.get(entity.entity_id)
-                if selected_turn is not None and entity.reference_type == "subject":
+                selected_assessment = selected_assessments.get(entity.entity_id)
+                if selected_assessment is not None and entity.reference_type == "subject":
+                    selected_turn = turn_by_id.get(selected_assessment.turn_id)
+                    if (
+                        selected_turn is None
+                        or selected_turn.entity_id != entity.entity_id
+                        or not math.isclose(
+                            selected_turn.start_time,
+                            selected_assessment.metrics.start_time,
+                            rel_tol=0,
+                            abs_tol=1e-9,
+                        )
+                        or not math.isclose(
+                            selected_turn.end_time,
+                            selected_assessment.metrics.end_time,
+                            rel_tol=0,
+                            abs_tol=1e-9,
+                        )
+                    ):
+                        raise ValueError(
+                            "voice-quality assessment does not match coalesced speech turn"
+                        )
+                    start_sample, end_sample = voice_turn_sample_range(
+                        selected_assessment.metrics
+                    )
                     voice_path = (
                         temporary
                         / "voice_refs"
@@ -657,30 +721,20 @@ def _build_audio_clip_binding_batch(
                     audio_backend.extract_voice_reference(
                         clip_uid=visual.clip_uid,
                         entity_id=entity.entity_id,
-                        full_audio_path=full.path,
+                        full_audio_path=quality_source_audio,
                         start_time=selected_turn.start_time,
                         end_time=selected_turn.end_time,
                         destination=voice_path,
                         sample_rate_hz=active.voice_sample_rate_hz,
                         output_format=active.voice_format,
+                        source_audio_path=quality_source_audio,
+                        source_start_sample=start_sample,
+                        source_end_sample=end_sample,
                     )
-                    voice_reference = VoiceReferenceArtifact(
-                        voice_reference_id="voice_ref_1",
-                        entity_occurrence_id=occurrence_id,
-                        source_turn_id=selected_turn.turn_id,
-                        source_start=selected_turn.start_time,
-                        source_end=selected_turn.end_time,
-                        source_start_sample=selected_turn.start_sample,
-                        source_end_sample=selected_turn.end_sample,
-                        asset=_file_asset(
-                            voice_path,
-                            temporary,
-                            "audio/flac"
-                            if active.voice_format == "flac"
-                            else "audio/wav",
-                        ),
-                        quality_score=selected_turn.binding_confidence,
-                        quality_metadata={"selection_policy": "confidence_duration_time_v1"},
+                    voice_reference = build_voice_reference_artifact(
+                        assessment=selected_assessment,
+                        asset_path=voice_path,
+                        output_root=temporary,
                     )
                     speaker = speaker_backend.embed_speaker(
                         entity_occurrence_id=occurrence_id,
@@ -702,6 +756,22 @@ def _build_audio_clip_binding_batch(
                     )
                 else:
                     reason_codes.append("primary_voice_reference_unavailable")
+                    entity_assessments = [
+                        item
+                        for item in quality_assessments
+                        if item.metrics.entity_id == entity.entity_id
+                    ]
+                    if entity.reference_type == "subject":
+                        reason_codes.append(
+                            "no_voice_reference_candidate_turn"
+                            if not entity_assessments
+                            else "no_voice_reference_passed_quality_gate"
+                        )
+                        reason_codes.extend(
+                            code
+                            for item in entity_assessments
+                            for code in item.reason_codes
+                        )
                 text_embedding = None
                 identity_text = entity.phrase
                 identity_text_specific = len(identity_text.split()) >= 3

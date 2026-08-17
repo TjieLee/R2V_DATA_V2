@@ -1017,7 +1017,7 @@ def test_lr_asd_native_scores_preserve_logit_decision_and_provenance(
     source = tmp_path / "source.mp4"
     audio = tmp_path / "audio.wav"
     source.write_bytes(b"video")
-    audio.write_bytes(b"audio")
+    _write_pcm16_wav(audio, [1000] * 6400)
     native = _native_artifact(
         clip_uid="clip-1",
         source_video=source,

@@ -11,8 +11,9 @@ pair reports, and H3 samples are published to separate roots.
 All face, speaker, transcript, and media backends are injectable. The base
 installation supports precomputed evidence and local FFmpeg media extraction;
 server models may be connected through explicit subprocess adapters. No adapter
-downloads weights. The numeric thresholds in V1 are scaffold defaults and have
-not been calibrated for production.
+downloads weights. Pair-retrieval thresholds remain scaffold defaults. The
+turn-level primary voice-reference policy is separately calibrated and frozen
+as `voice_reference_quality_v1`.
 
 ## Data Flow
 
@@ -25,17 +26,23 @@ not been calibrated for production.
    time base as provenance.
 3. Coalesce adjacent bound 25 FPS frame bindings when their entity ID and
    face-track ID match and their gap is within policy. Overlap, offscreen,
-   ambiguous, no-speech, and identity changes are hard turn boundaries. Voice
-   eligibility is recomputed after merge from the full turn duration plus every
-   frame's audio-quality and synchronization evidence; a 40 ms frame is not
-   required to be independently voice-reference eligible.
-4. Select at most one primary voice-reference turn per bound subject using
-   confidence descending, duration descending, start time ascending, and turn
-   ID ascending.
-5. Copy exactly the final published Visual reference for an occurrence. The
+   ambiguous, no-speech, and identity changes are hard turn boundaries. Existing
+   frame-level audio-quality and synchronization flags remain binding evidence,
+   not the final primary-voice quality decision; a 40 ms frame is never judged
+   as a final voice reference by itself.
+4. Apply the calibrated V1 hard gate to the existing turn diagnostics: duration
+   at least 1.0 seconds, association confidence at least 0.85, LR-ASD mean at
+   least 0.50, LR-ASD p10 at least 0.20, RMS at least -40 dBFS, clipping ratio at
+   most 0.0001, explicit local noise context, and estimated SNR at least 10 dB.
+   This gate does not alter any frame-level binding status.
+5. Select at most one accepted primary voice-reference turn per bound subject
+   by SNR, LR-ASD p10, LR-ASD mean, duration, association confidence, then
+   earlier start time and turn ID. Export its exact 16 kHz sample range as mono
+   FLAC without enhancement or normalization.
+6. Copy exactly the final published Visual reference for an occurrence. The
    bytes, synthetic flag, source frame, donor provenance, token, scope, and
    visible region are preserved. No sampled frame is searched or decoded.
-6. Produce at most one canonical face crop/embedding and one speaker embedding
+7. Produce at most one canonical face crop/embedding and one speaker embedding
    per occurrence. Embeddings are L2-normalized `float32` `.npy` assets; JSONL
    stores model ID, checkpoint hash when supplied, dimension, path, and asset
    hash.

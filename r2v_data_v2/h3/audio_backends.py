@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import uuid
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -95,6 +96,9 @@ class AudioMediaBackend(Protocol):
         destination: Path,
         sample_rate_hz: int,
         output_format: str,
+        source_audio_path: Path | None = None,
+        source_start_sample: int | None = None,
+        source_end_sample: int | None = None,
     ) -> Path: ...
 
 
@@ -228,8 +232,20 @@ class PrecomputedAudioMediaBackend:
         destination: Path,
         sample_rate_hz: int,
         output_format: str,
+        source_audio_path: Path | None = None,
+        source_start_sample: int | None = None,
+        source_end_sample: int | None = None,
     ) -> Path:
-        del full_audio_path, start_time, end_time, sample_rate_hz, output_format
+        del (
+            full_audio_path,
+            start_time,
+            end_time,
+            sample_rate_hz,
+            output_format,
+            source_audio_path,
+            source_start_sample,
+            source_end_sample,
+        )
         return self._copy(
             self.voice_audio_by_occurrence[f"{clip_uid}/{entity_id}"],
             destination,
@@ -300,6 +316,39 @@ class FFmpegAudioMediaBackend:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @staticmethod
+    def _write_pcm16_mono_slice(
+        *,
+        source: Path,
+        destination: Path,
+        sample_rate_hz: int,
+        start_sample: int,
+        end_sample: int,
+    ) -> None:
+        if start_sample < 0 or end_sample <= start_sample:
+            raise ValueError("voice-reference sample extent is invalid")
+        with wave.open(str(source), "rb") as input_audio:
+            if (
+                input_audio.getnchannels() != 1
+                or input_audio.getsampwidth() != 2
+                or input_audio.getframerate() != sample_rate_hz
+                or input_audio.getcomptype() != "NONE"
+            ):
+                raise ValueError(
+                    "exact voice-reference extraction requires mono PCM16 source audio"
+                )
+            if end_sample > input_audio.getnframes():
+                raise ValueError("voice-reference sample extent exceeds source audio")
+            input_audio.setpos(start_sample)
+            frames = input_audio.readframes(end_sample - start_sample)
+        if len(frames) != (end_sample - start_sample) * 2:
+            raise ValueError("voice-reference source audio ended unexpectedly")
+        with wave.open(str(destination), "wb") as output_audio:
+            output_audio.setnchannels(1)
+            output_audio.setsampwidth(2)
+            output_audio.setframerate(sample_rate_hz)
+            output_audio.writeframes(frames)
+
     def materialize_full_audio(
         self,
         *,
@@ -351,9 +400,55 @@ class FFmpegAudioMediaBackend:
         destination: Path,
         sample_rate_hz: int,
         output_format: str,
+        source_audio_path: Path | None = None,
+        source_start_sample: int | None = None,
+        source_end_sample: int | None = None,
     ) -> Path:
         del clip_uid, entity_id
         codec = "flac" if output_format == "flac" else "pcm_s16le"
+        exact_values = (
+            source_audio_path,
+            source_start_sample,
+            source_end_sample,
+        )
+        if any(value is not None for value in exact_values):
+            if not all(value is not None for value in exact_values):
+                raise ValueError("exact voice-reference extraction requires all sample inputs")
+            assert source_audio_path is not None
+            assert source_start_sample is not None
+            assert source_end_sample is not None
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            slice_path = destination.with_name(
+                f".{destination.stem}.pcm-slice-{uuid.uuid4().hex}.wav"
+            )
+            try:
+                self._write_pcm16_mono_slice(
+                    source=source_audio_path,
+                    destination=slice_path,
+                    sample_rate_hz=sample_rate_hz,
+                    start_sample=source_start_sample,
+                    end_sample=source_end_sample,
+                )
+                self._publish_command(
+                    [
+                        self.ffmpeg,
+                        "-v",
+                        "error",
+                        "-i",
+                        str(slice_path),
+                        "-ar",
+                        str(sample_rate_hz),
+                        "-ac",
+                        "1",
+                        "-c:a",
+                        codec,
+                        "-y",
+                    ],
+                    destination,
+                )
+            finally:
+                slice_path.unlink(missing_ok=True)
+            return destination
         self._publish_command(
             [
                 self.ffmpeg,

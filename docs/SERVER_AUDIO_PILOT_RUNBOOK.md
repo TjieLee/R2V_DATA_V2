@@ -227,9 +227,9 @@ head -n 5 "$PILOT20_OUT/voice_reference_quality.jsonl"
 ```
 
 These measurements use coalesced bound speech turns and the existing LR-ASD
-16 kHz mono PCM audio. They are for calibration and inspection only;
-`thresholds_calibrated=false`. Do not use them as a production
-voice-reference gate until the real pilot distributions have been reviewed.
+16 kHz mono PCM audio. The diagnostics-v2 artifacts retain their historical
+calibration provenance with `thresholds_calibrated=false`; the formal policy
+below consumes those measurements without changing frame-level binding status.
 
 Local background diagnostics use only `no_speech` bindings within two seconds
 before or after each candidate turn. They exclude `offscreen`, `ambiguous`, and
@@ -248,12 +248,31 @@ cd "$REPO"
 cat "$PILOT20_OUT/voice_reference_quality_summary.json"
 ```
 
-The current V1 calibration candidates are duration at least 1.0 seconds,
+The calibrated V1 primary-voice policy requires duration at least 1.0 seconds,
 minimum association confidence at least 0.85, mean LR-ASD score at least 0.50,
-LR-ASD p10 at least 0.20, RMS dBFS at least -40, and clipping ratio at most
-0.0001. These values are not enabled gates. In particular, local noise and SNR
-must be reviewed on real pilot distributions before any production threshold is
-introduced.
+LR-ASD p10 at least 0.20, RMS dBFS at least -40, clipping ratio at most 0.0001,
+available local no-speech context, and estimated SNR at least 10 dB. All gates
+must pass. Missing noise context fails closed; it is never estimated from
+offscreen or ambiguous speech.
+
+Export primary voice references from an existing pilot without running LR-ASD,
+S3FD, Silero, review rendering, or any embedding model:
+
+```bash
+PRIMARY_VOICE_OUT="${PILOT20_OUT}-primary-voice-v1"
+
+cd "$REPO"
+"$R2V_PYTHON" tools/export_h3_primary_voice_references.py \
+  --pilot-root "$PILOT20_OUT" \
+  --output-root "$PRIMARY_VOICE_OUT"
+
+cat "$PRIMARY_VOICE_OUT/summary.json"
+head -n 5 "$PRIMARY_VOICE_OUT/primary_voice_references.jsonl"
+```
+
+The exporter cuts the exact selected sample interval from the existing 16 kHz
+mono PCM LR-ASD audio and losslessly encodes it as mono FLAC. It performs no
+padding, normalization, enhancement, denoising, speaker embedding, or pairing.
 
 Routine benchmark outputs are disposable after the results are recorded.
 

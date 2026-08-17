@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,12 @@ from r2v_data_v2.h3.audio_schemas import (
     VisualReferenceProvenance,
     VisualSourceProvenance,
     VoiceReferenceArtifact,
+)
+from r2v_data_v2.h3.pilot_schemas import (
+    AssociationConfidenceDiagnostics,
+    LRASDScoreDiagnostics,
+    VoiceReferenceClipDiagnostics,
+    VoiceReferenceTurnDiagnostics,
 )
 from r2v_data_v2.h3.schemas import (
     AudioBindingEvidence,
@@ -520,6 +527,50 @@ def _visual_and_sidecar_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path,
     sidecar_path = sidecar_root / "clips" / "clip-a" / "audio_binding.json"
     sidecar_path.parent.mkdir(parents=True)
     sidecar_path.write_text(sidecar_record.model_dump_json(), encoding="utf-8")
+    quality_audio = sidecar_root / "runtime" / "clip-a" / "audio.wav"
+    quality_audio.parent.mkdir(parents=True)
+    quality_audio.write_bytes(b"precomputed-16-khz-mono-pcm")
+    quality = VoiceReferenceClipDiagnostics(
+        clip_uid="clip-a",
+        source_audio_path=quality_audio.relative_to(sidecar_root).as_posix(),
+        status="ready",
+        candidate_turns=[
+            VoiceReferenceTurnDiagnostics(
+                clip_uid="clip-a",
+                turn_id="turn_1",
+                entity_id="e1",
+                face_track_id="face_1",
+                start_time=0.0,
+                end_time=1.0,
+                duration_seconds=1.0,
+                sample_count=16000,
+                rms_amplitude=0.1,
+                rms_dbfs=-20.0,
+                peak_amplitude=0.2,
+                peak_dbfs=20 * math.log10(0.2),
+                clipping_ratio=0.0,
+                local_noise_context_available=True,
+                local_noise_sample_count=3200,
+                local_noise_duration_seconds=0.2,
+                local_noise_rms_amplitude=0.01,
+                local_noise_rms_dbfs=-40.0,
+                estimated_snr_db=20.0,
+                lr_asd_raw_native_score=LRASDScoreDiagnostics(
+                    mean=0.9,
+                    min=0.8,
+                    p10=0.85,
+                ),
+                association_confidence=AssociationConfidenceDiagnostics(
+                    mean=0.95,
+                    min=0.95,
+                ),
+            )
+        ],
+    )
+    (sidecar_path.parent / "voice_reference_quality.json").write_text(
+        quality.model_dump_json(),
+        encoding="utf-8",
+    )
     full_audio = tmp_path / "fixtures" / "full.flac"
     voice_audio = tmp_path / "fixtures" / "voice.flac"
     full_audio.parent.mkdir()
@@ -1348,6 +1399,7 @@ def test_external_embedding_contract_records_command_and_normalized_metadata(
 
 def test_audio_config_thresholds_are_explicitly_uncalibrated() -> None:
     assert AudioBindingProductionConfig().fingerprint()
+    assert AudioBindingProductionConfig().voice_reference_quality_policy.thresholds_calibrated
     assert AudioPairingConfig().fingerprint()
     assert _producer().thresholds_calibrated is False
 
@@ -1409,6 +1461,14 @@ def test_precomputed_end_to_end_binding_uses_one_immutable_visual_reference(
     assert occurrence.face_embedding_asset is not None
     assert occurrence.voice_embedding_asset is not None
     assert occurrence.primary_voice_reference is not None
+    assert occurrence.primary_voice_reference.source_start_sample == 0
+    assert occurrence.primary_voice_reference.source_end_sample == 16000
+    assert occurrence.primary_voice_reference.quality_score == 1.0
+    assert occurrence.primary_voice_reference.quality_metadata["thresholds_calibrated"]
+    assert (
+        occurrence.primary_voice_reference.quality_metadata["assessment"]["status"]
+        == "accepted"
+    )
     assert occurrence.in_pair_eligible is True
     assert occurrence.cross_pair_eligible is True
     assert source_hashes == {
@@ -1416,6 +1476,59 @@ def test_precomputed_end_to_end_binding_uses_one_immutable_visual_reference(
         "visual": _tree_hashes(visual_root),
         "sidecar": _tree_hashes(sidecar_root),
     }
+
+
+def test_failed_turn_quality_gate_blocks_voice_asset_embedding_and_pairing(
+    tmp_path: Path,
+) -> None:
+    run_root, visual_root, sidecar_root, full_audio, voice_audio = (
+        _visual_and_sidecar_fixture(tmp_path)
+    )
+    quality_path = (
+        sidecar_root / "clips" / "clip-a" / "voice_reference_quality.json"
+    )
+    quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    quality["candidate_turns"][0]["estimated_snr_db"] = 7.0
+    quality["candidate_turns"][0]["local_noise_rms_dbfs"] = -27.0
+    quality["candidate_turns"][0]["local_noise_rms_amplitude"] = 10 ** (-27 / 20)
+    quality_path.write_text(json.dumps(quality), encoding="utf-8")
+
+    outputs = build_audio_clip_binding_dataset(
+        run_root=run_root,
+        visual_export_root=visual_root,
+        sidecar_root=sidecar_root,
+        output_root=tmp_path / "audio-output",
+        audio_backend=PrecomputedAudioMediaBackend(
+            {"clip-a": full_audio},
+            {"clip-a/e1": voice_audio},
+            {
+                "clip-a": AudioStreamProvenance(
+                    stream_index=0,
+                    codec_name="aac",
+                    original_sample_rate_hz=48000,
+                    original_channels=2,
+                    duration_seconds=2.0,
+                    time_base="1/48000",
+                )
+            },
+        ),
+        face_backend=PrecomputedEmbeddingBackend(
+            {"clip-a/e1": np.asarray([1.0, 0.0], dtype=np.float32)},
+            model_identifier="fake-face",
+        ),
+        speaker_backend=PrecomputedEmbeddingBackend(
+            {},
+            model_identifier="must-not-run",
+        ),
+    )
+
+    occurrence = outputs[0].entity_occurrences[0]
+    assert occurrence.primary_voice_reference is None
+    assert occurrence.voice_embedding_asset is None
+    assert occurrence.in_pair_eligible is False
+    assert occurrence.cross_pair_eligible is False
+    assert "voice_snr_too_low" in occurrence.reason_codes
+    assert "no_voice_reference_passed_quality_gate" in occurrence.reason_codes
 
 
 @pytest.mark.skipif(
@@ -1457,6 +1570,14 @@ def test_clip_failure_is_isolated_and_recorded(tmp_path: Path) -> None:
     sidecar_b_path = sidecar_root / "clips" / "clip-b" / "audio_binding.json"
     sidecar_b_path.parent.mkdir()
     sidecar_b_path.write_text(json.dumps(sidecar_b_payload), encoding="utf-8")
+    quality_a_path = sidecar_a_path.parent / "voice_reference_quality.json"
+    quality_b_payload = json.loads(quality_a_path.read_text(encoding="utf-8"))
+    quality_b_payload["clip_uid"] = "clip-b"
+    quality_b_payload["candidate_turns"][0]["clip_uid"] = "clip-b"
+    (sidecar_b_path.parent / "voice_reference_quality.json").write_text(
+        json.dumps(quality_b_payload),
+        encoding="utf-8",
+    )
     media = PrecomputedAudioMediaBackend(
         {"clip-a": full_audio},
         {"clip-a/e1": voice_audio},
