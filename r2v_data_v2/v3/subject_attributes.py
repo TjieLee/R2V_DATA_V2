@@ -8,7 +8,7 @@ import os
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
-from r2v_data_v2.v3.config import QwenServiceConfig, V3Config
+from r2v_data_v2.v3.config import QwenServiceConfig, Sam3Config, V3Config
 from r2v_data_v2.v3.mask_codec import decode_binary_mask
 from r2v_data_v2.v3.pair import (
     EntityReferenceCandidate,
@@ -29,16 +29,12 @@ from r2v_data_v2.v3.pair import (
     mask_component_diagnostics,
 )
 from r2v_data_v2.v3.profiling import profiled_openai_call
-from r2v_data_v2.v3.sam3_backend import (
-    EntityTrackResult,
-    Sam3SegmentationBackend,
-    SegmentationBackend,
-)
+from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     ClipRecord,
     EntityReferenceState,
-    SampledFramesArtifact,
+    RunRecord,
     TrackedMasksArtifact,
     render_annotation_plain_text,
 )
@@ -406,6 +402,56 @@ class SubjectAttributeReviewClient(Protocol):
         owner: AnnotationEntity,
         candidates: list[PendingAttributeCandidate],
     ) -> SubjectAttributeReviewBatch: ...
+
+
+class AttributeFrameSegmentationBackend(Protocol):
+    def segment_frame(
+        self,
+        *,
+        frame_path: Path,
+        frame_slot: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]: ...
+
+
+class Sam3AttributeFrameSegmenter:
+    """Subject-attributes-local SAM3 adapter with no temporal propagation."""
+
+    def __init__(
+        self,
+        config: Sam3Config,
+        *,
+        backend: Sam3SegmentationBackend | None = None,
+    ) -> None:
+        self._backend = backend or Sam3SegmentationBackend(config)
+
+    def segment_frame(
+        self,
+        *,
+        frame_path: Path,
+        frame_slot: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        resolved = frame_path.expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"attribute candidate frame is missing: {resolved}")
+        if not grounding_prompt.strip():
+            raise ValueError("attribute grounding prompt must not be empty")
+        predictor = self._backend._load_predictor()
+        observations = self._backend._prompt_frame(
+            predictor,
+            frames_dir=resolved.parent,
+            slot=frame_slot,
+            grounding_prompt=grounding_prompt,
+        )
+        return tuple(
+            np.asarray(observation.mask, dtype=bool).copy()
+            for observation in observations
+            if observation.valid and np.asarray(observation.mask, dtype=bool).any()
+        )
+
+    def close(self) -> None:
+        self._backend.close()
 
 
 DISCOVERY_SYSTEM_PROMPT = """Inspect one explicitly identified V3 subject in
@@ -875,22 +921,11 @@ def _select_attribute_candidate(
     owner_candidates: list[EntityReferenceCandidate],
     owner_reference: EntityReferenceState,
     masks: TrackedMasksArtifact,
-    track: EntityTrackResult,
     storage: RunStorage,
     other_subject_ids: list[str],
     crop_padding_ratio: float,
+    segmentation_backend: AttributeFrameSegmentationBackend,
 ) -> PendingAttributeCandidate | SubjectAttributeRecord:
-    if track.status != "ready":
-        reason = f"sam3_{track.status}"
-        if track.reason:
-            reason = f"{reason}:{track.reason}"
-        return _rejected_record(
-            discovered,
-            attribute_id=attribute_id,
-            owner_entity_id=owner.entity_id,
-            reason=reason,
-        )
-    observations = {observation.slot: observation for observation in track.observations}
     owner_reference_is_local = owner_reference.source_clip_uid in {None, clip_uid}
     ordered = prefer_attribute_candidate_frames(
         owner_candidates,
@@ -901,12 +936,18 @@ def _select_attribute_candidate(
     geometry_rejections: list[
         tuple[EntityReferenceCandidate, OwnershipGeometry]
     ] = []
+    probe_failures: list[str] = []
     for owner_candidate in ordered:
-        observation = observations.get(owner_candidate.frame_slot)
-        if observation is None:
+        frame_path = (storage.root / owner_candidate.image_path).resolve(strict=False)
+        try:
+            attribute_masks = segmentation_backend.segment_frame(
+                frame_path=frame_path,
+                frame_slot=owner_candidate.frame_slot,
+                grounding_prompt=discovered.grounding_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001 - try the next bounded candidate
+            probe_failures.append(f"{type(exc).__name__}:{exc}")
             continue
-        attribute_mask = np.asarray(observation.mask, dtype=bool)
-        owner_mask = owner_candidate.mask
         other_masks = {
             entity_id: decoded
             for entity_id in other_subject_ids
@@ -919,31 +960,33 @@ def _select_attribute_candidate(
             )
             is not None
         }
-        geometry = evaluate_ownership_geometry(
-            attribute_mask,
-            owner_mask,
-            other_masks,
-            owner_padding_ratio=crop_padding_ratio,
-        )
-        if not geometry.passed:
-            geometry_rejections.append((owner_candidate, geometry))
-            continue
-        source = _source_image(storage, owner_candidate)
-        crop, _ = build_reference_crop(
-            source,
-            attribute_mask,
-            crop_padding_ratio=crop_padding_ratio,
-        )
-        return PendingAttributeCandidate(
-            discovered=discovered,
-            attribute_id=attribute_id,
-            owner_entity_id=owner.entity_id,
-            owner_candidate=owner_candidate,
-            attribute_mask=attribute_mask,
-            source_image=source,
-            crop=crop,
-            geometry=geometry,
-        )
+        for attribute_mask in attribute_masks:
+            owner_mask = owner_candidate.mask
+            geometry = evaluate_ownership_geometry(
+                attribute_mask,
+                owner_mask,
+                other_masks,
+                owner_padding_ratio=crop_padding_ratio,
+            )
+            if not geometry.passed:
+                geometry_rejections.append((owner_candidate, geometry))
+                continue
+            source = _source_image(storage, owner_candidate)
+            crop, _ = build_reference_crop(
+                source,
+                attribute_mask,
+                crop_padding_ratio=crop_padding_ratio,
+            )
+            return PendingAttributeCandidate(
+                discovered=discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner.entity_id,
+                owner_candidate=owner_candidate,
+                attribute_mask=attribute_mask,
+                source_image=source,
+                crop=crop,
+                geometry=geometry,
+            )
     if geometry_rejections:
         owner_candidate, geometry = geometry_rejections[0]
         return _rejected_record(
@@ -961,11 +1004,14 @@ def _select_attribute_candidate(
                 == owner_reference.source_frame_index
             ),
         )
+    reason = "sam3_no_owner_candidate_frame_mask"
+    if probe_failures:
+        reason = f"sam3_candidate_frame_probe_failed:{probe_failures[0]}"
     return _rejected_record(
         discovered,
         attribute_id=attribute_id,
         owner_entity_id=owner.entity_id,
-        reason="sam3_no_owner_candidate_frame_mask",
+        reason=reason,
     )
 
 
@@ -1048,12 +1094,11 @@ def _process_owner(
     clip: ClipRecord,
     owner: AnnotationEntity,
     owner_candidates: list[EntityReferenceCandidate],
-    frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
     attribute_id_start: int,
     discovery_client: SubjectAttributeDiscoveryClient,
     review_client: SubjectAttributeReviewClient,
-    segmentation_backend: SegmentationBackend,
+    segmentation_backend: AttributeFrameSegmentationBackend,
 ) -> OwnerEnrichmentArtifact:
     metrics = OwnerEnrichmentMetrics(discovery_calls=1)
     owner_reference = _published_reference(clip, owner.entity_id)
@@ -1103,14 +1148,11 @@ def _process_owner(
     discovered_by_type = Counter(
         attribute.attribute_type for attribute in discovery.attributes
     )
-    frame_paths = [storage.frame_path(clip.clip_uid, frame.slot) for frame in frames.frames]
-    retained_subject_ids = [
+    other_subject_ids = [
         entity.entity_id
         for entity in clip.annotation.entities
         if (
             entity.reference_type == "subject"
-            and clip.pairing is not None
-            and entity.entity_id in clip.pairing.retained_entity_ids
             and entity.entity_id != owner.entity_id
         )
     ]
@@ -1122,20 +1164,6 @@ def _process_owner(
         attribute_id = f"a{attribute_id_start + offset}"
         sam_started = time.perf_counter()
         try:
-            track = segmentation_backend.track(
-                frame_paths=frame_paths,
-                entity_id=f"{owner.entity_id}-{attribute_id}",
-                reference_type="object",
-                grounding_prompt=discovered.grounding_prompt,
-                entity_phrase=discovered.phrase,
-            )
-        except Exception as exc:  # noqa: BLE001 - isolate one SAM3 attribute attempt
-            track = EntityTrackResult(
-                status="failed",
-                reason=f"{type(exc).__name__}:{exc}",
-            )
-        sam_seconds += time.perf_counter() - sam_started
-        try:
             selected = _select_attribute_candidate(
                 discovered=discovered,
                 attribute_id=attribute_id,
@@ -1144,10 +1172,10 @@ def _process_owner(
                 owner_candidates=owner_candidates,
                 owner_reference=owner_reference,
                 masks=masks,
-                track=track,
                 storage=storage,
-                other_subject_ids=retained_subject_ids,
+                other_subject_ids=other_subject_ids,
                 crop_padding_ratio=config.pair.crop_padding_ratio,
+                segmentation_backend=segmentation_backend,
             )
         except Exception as exc:  # noqa: BLE001 - isolate one attribute
             processing_failures += 1
@@ -1157,6 +1185,7 @@ def _process_owner(
                 owner_entity_id=owner.entity_id,
                 reason=f"attribute_processing_failed:{type(exc).__name__}:{exc}",
             )
+        sam_seconds += time.perf_counter() - sam_started
         if isinstance(selected, SubjectAttributeRecord):
             records_by_id[attribute_id] = selected
         else:
@@ -1299,6 +1328,8 @@ _RELATION_PHRASE: dict[AttributeType, str] = {
 def _render_enriched_instruction(
     clip: ClipRecord,
     accepted_attributes: list[SubjectAttributeRecord],
+    *,
+    source_run_root: Path,
 ) -> tuple[str, list[EnrichedReference]]:
     if (
         clip.annotation is None
@@ -1334,7 +1365,11 @@ def _render_enriched_instruction(
                 kind=annotation.reference_type,
                 origin="visual_run",
                 entity_id=entity_id,
-                image_path=reference.image_path or "",
+                image_path=_normalize_visual_run_image_path(
+                    source_run_root,
+                    clip_uid=reference.source_clip_uid or clip.clip_uid,
+                    image_path=reference.image_path or "",
+                ),
                 source_frame_index=reference.source_frame_index,
             )
         )
@@ -1367,7 +1402,11 @@ def _render_enriched_instruction(
                 image_index=new_index,
                 kind="background",
                 origin="visual_run",
-                image_path=background.output_image_path,
+                image_path=_normalize_visual_run_image_path(
+                    source_run_root,
+                    clip_uid=clip.clip_uid,
+                    image_path=background.output_image_path,
+                ),
                 source_frame_index=background.source_frame_index,
             )
         )
@@ -1412,7 +1451,11 @@ def _build_enriched_sample(
     if clip.annotation is None or clip.instruction is None:
         raise ValueError("enriched sample requires annotation and instruction")
     accepted = [record for record in records if record.status == "accepted"]
-    enriched_instruction, references = _render_enriched_instruction(clip, accepted)
+    enriched_instruction, references = _render_enriched_instruction(
+        clip,
+        accepted,
+        source_run_root=storage.root,
+    )
     return EnrichedSample(
         sample_id=clip.clip_uid,
         clip_uid=clip.clip_uid,
@@ -1489,6 +1532,46 @@ def _validate_output_root(
         )
 
 
+def _normalize_visual_run_image_path(
+    source_run_root: Path,
+    *,
+    clip_uid: str,
+    image_path: str,
+) -> str:
+    path = Path(image_path).expanduser()
+    resolved_root = source_run_root.expanduser().resolve(strict=False)
+    if path.is_absolute():
+        candidate = path
+    elif path.parts[:1] == ("frames",):
+        candidate = resolved_root / "clips" / clip_uid / path
+    else:
+        candidate = resolved_root / path
+    resolved = candidate.resolve(strict=False)
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("Visual reference image must remain inside source run_root") from exc
+    if not relative.parts:
+        raise ValueError("Visual reference image path must identify an artifact")
+    return relative.as_posix()
+
+
+def _validate_source_run_identity(config: V3Config, run: RunRecord) -> None:
+    mismatches: list[str] = []
+    if run.config_hash != config.fingerprint():
+        mismatches.append("config_hash")
+    if run.model_identifiers != config.model_identifiers():
+        mismatches.append("model_identifiers")
+    expected_manifest = str(config.dataset_json.expanduser().resolve(strict=False))
+    if run.source_manifest_path != expected_manifest:
+        mismatches.append("source_manifest_path")
+    if mismatches:
+        raise ValueError(
+            "supplied config does not match the source Visual run identity: "
+            + ", ".join(mismatches)
+        )
+
+
 def _clear_enrichment_artifacts(output_root: Path) -> None:
     for directory, pattern in (
         (output_root / "references", "*.png"),
@@ -1519,14 +1602,18 @@ def run_subject_attribute_enrichment(
     overwrite: bool = False,
     discovery_client: SubjectAttributeDiscoveryClient | None = None,
     review_client: SubjectAttributeReviewClient | None = None,
-    segmentation_backend: SegmentationBackend | None = None,
+    segmentation_backend: AttributeFrameSegmentationBackend | None = None,
 ) -> dict[str, object]:
     if isinstance(max_owners, bool) or not isinstance(max_owners, int) or max_owners < 1:
         raise ValueError("max_owners must be a positive integer")
-    effective_config = replace(config, run_root=Path(run_root))
+    requested_run_root = Path(run_root).expanduser().resolve(strict=False)
+    if config.resolved_run_root != requested_run_root:
+        raise ValueError("supplied config run_root does not match source run_root")
+    effective_config = config
     effective_config.validate()
     storage = RunStorage(effective_config)
     run = storage.read_run()
+    _validate_source_run_identity(effective_config, run)
     output_root = Path(output_root).expanduser().resolve(strict=False)
     _validate_output_root(
         storage.root,
@@ -1547,11 +1634,11 @@ def run_subject_attribute_enrichment(
         owned_qwen = QwenSubjectAttributeClient(service)
         discovery_client = discovery_client or owned_qwen
         review_client = review_client or owned_qwen
-    owned_segmenter: Sam3SegmentationBackend | None = None
+    owned_segmenter: Sam3AttributeFrameSegmenter | None = None
     if segmentation_backend is None:
         if effective_config.sam3.model_path is None:
             raise ValueError("sam3.model_path is required for attribute enrichment")
-        owned_segmenter = Sam3SegmentationBackend(effective_config.sam3)
+        owned_segmenter = Sam3AttributeFrameSegmenter(effective_config.sam3)
         segmentation_backend = owned_segmenter
     assert discovery_client is not None
     assert review_client is not None
@@ -1633,7 +1720,6 @@ def run_subject_attribute_enrichment(
                             clip=clip,
                             owner=owner,
                             owner_candidates=candidates,
-                            frames=frames,
                             masks=masks,
                             attribute_id_start=sample_attribute_start,
                             discovery_client=discovery_client,
@@ -1757,12 +1843,14 @@ def run_subject_attribute_enrichment(
 
 
 __all__ = [
+    "AttributeFrameSegmentationBackend",
     "DiscoveredSubjectAttribute",
     "EnrichedSample",
     "OwnerEligibility",
     "OwnershipGeometry",
     "PendingAttributeCandidate",
     "QwenSubjectAttributeClient",
+    "Sam3AttributeFrameSegmenter",
     "SubjectAttributeDiscovery",
     "SubjectAttributeRecord",
     "SubjectAttributeReview",

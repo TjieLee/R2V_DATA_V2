@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,14 +12,22 @@ from pydantic import ValidationError
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3 import subject_attributes
-from r2v_data_v2.v3.pair import EntityReferenceCandidate
-from r2v_data_v2.v3.sam3_backend import (
-    BackendMaskObservation,
-    EntityTrackResult,
+from r2v_data_v2.v3.config import (
+    QwenAnnotationConfig,
+    QwenServiceConfig,
+    QwenServicesConfig,
+    RemoveConfig,
+    Sam3Config,
+    SourceConfig,
+    V3Config,
 )
+from r2v_data_v2.v3.mask_codec import encode_binary_mask
+from r2v_data_v2.v3.pair import EntityReferenceCandidate
+from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     AnnotationState,
+    BackgroundReferenceState,
     ClipRecord,
     ClipSource,
     CoverageState,
@@ -31,9 +40,12 @@ from r2v_data_v2.v3.schemas import (
     ReferencesState,
     SampledFrame,
     SampledFramesArtifact,
+    TrackedEntityMasks,
+    TrackedMaskFrame,
     TrackedMasksArtifact,
     render_inline_instruction_text,
 )
+from r2v_data_v2.v3.storage import RunStorage
 from r2v_data_v2.v3.subject_attributes import (
     DiscoveredSubjectAttribute,
     OwnerEnrichmentArtifact,
@@ -428,6 +440,7 @@ def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
     enriched, references = subject_attributes._render_enriched_instruction(
         clip,
         attributes,
+        source_run_root=Path("/source-run"),
     )
     assert [(reference.kind, reference.owner_entity_id) for reference in references] == [
         ("subject", None),
@@ -443,6 +456,7 @@ def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
     without_second, remaining = subject_attributes._render_enriched_instruction(
         clip,
         [attributes[0]],
+        source_run_root=Path("/source-run"),
     )
     assert "clothing shown" not in without_second
     assert [reference.kind for reference in remaining] == [
@@ -455,6 +469,46 @@ def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
         "2",
         "3",
     }
+
+
+def test_clean_raw_background_visual_path_is_source_run_relative(tmp_path: Path) -> None:
+    clip = _clip()
+    assert clip.instruction is not None
+    clip = clip.model_copy(
+        update={
+            "references": clip.references.model_copy(
+                update={
+                    "background": BackgroundReferenceState(
+                        status="clean_raw",
+                        source_image_path="frames/05.jpg",
+                        output_image_path="frames/05.jpg",
+                        source_frame_slot=5,
+                        source_frame_index=50,
+                        source_foreground_area_pixels=0,
+                        source_foreground_area_ratio=0.0,
+                    )
+                }
+            ),
+            "pairing": clip.pairing.model_copy(
+                update={"background_token": "<ref_bg_1>"}
+            ),
+            "instruction": clip.instruction.model_copy(
+                update={
+                    "instruction_body_template": (
+                        "{{image_1}} crosses {{image_2}}."
+                    )
+                }
+            ),
+        }
+    )
+    _, references = subject_attributes._render_enriched_instruction(
+        clip,
+        [],
+        source_run_root=tmp_path / "run",
+    )
+    background = next(reference for reference in references if reference.kind == "background")
+    assert background.origin == "visual_run"
+    assert background.image_path == "clips/clip-1/frames/05.jpg"
 
 
 class _FakeStorage:
@@ -504,31 +558,51 @@ class _ReviewClient:
 
 
 class _SegmentationBackend:
-    def __init__(self) -> None:
-        self.calls = 0
+    def __init__(self, mask: np.ndarray | None = None) -> None:
+        self.calls: list[int] = []
+        self.mask = mask
 
     def track(self, **kwargs):
-        self.calls += 1
-        assert kwargs["reference_type"] == "object"
+        raise AssertionError("attribute enrichment must not call full track")
+
+    def segment_frame(self, *, frame_path, frame_slot, grounding_prompt):
+        assert frame_path.name == f"{frame_slot:02d}.jpg"
+        assert grounding_prompt
+        self.calls.append(frame_slot)
+        if self.mask is not None:
+            return (self.mask,)
         mask = np.zeros((100, 100), dtype=bool)
         mask[30:45, 30:45] = True
-        return EntityTrackResult(
-            status="ready",
-            observations=(
-                BackendMaskObservation(
-                    slot=0,
-                    mask=mask,
-                    confidence=0.9,
-                    object_id="attribute",
-                ),
-                BackendMaskObservation(
-                    slot=1,
-                    mask=mask,
-                    confidence=0.9,
-                    object_id="attribute",
-                ),
-            ),
-        )
+        return (mask,)
+
+
+class _PromptOnlyPredictor:
+    def __init__(self) -> None:
+        self.request_types: list[str] = []
+        self.stream_calls = 0
+
+    def handle_request(self, request):
+        self.request_types.append(request["type"])
+        if request["type"] == "start_session":
+            return {"session_id": "attribute-probe"}
+        if request["type"] == "add_prompt":
+            mask = np.zeros((100, 100), dtype=np.uint8)
+            mask[30:45, 30:45] = 1
+            return {
+                "frame_index": request["frame_index"],
+                "outputs": {
+                    "out_binary_masks": mask[None, ...],
+                    "out_probs": np.array([0.9]),
+                    "out_obj_ids": np.array([1]),
+                },
+            }
+        if request["type"] == "close_session":
+            return {}
+        raise AssertionError(f"unexpected SAM3 request: {request['type']}")
+
+    def handle_stream_request(self, request):
+        self.stream_calls += 1
+        raise AssertionError("attribute enrichment must not propagate in video")
 
 
 def _frames(root: Path) -> SampledFramesArtifact:
@@ -555,8 +629,105 @@ def _frames(root: Path) -> SampledFramesArtifact:
     )
 
 
-def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
+def _tracked_subject(mask: np.ndarray) -> TrackedEntityMasks:
+    height, width = mask.shape
+    bbox = (0, 0, width, height)
+    frames: list[TrackedMaskFrame] = []
+    for slot in range(10):
+        encoded = encode_binary_mask(mask)
+        frames.append(
+            TrackedMaskFrame(
+                slot=slot,
+                present=True,
+                confidence=0.9,
+                backend_confidences=[0.9],
+                backend_object_ids=["subject"],
+                area_pixels=int(mask.sum()),
+                area_ratio=float(mask.mean()),
+                bbox_xyxy=bbox,
+                rle=encoded,
+            )
+        )
+    return TrackedEntityMasks(
+        status="ready",
+        reference_type="subject",
+        grounding_prompt="the other person",
+        backend_object_ids=["subject"],
+        frames=frames,
+    )
+
+
+def test_subject_attribute_sam3_helper_never_propagates(tmp_path: Path) -> None:
     frames = _frames(tmp_path / "run")
+    predictor = _PromptOnlyPredictor()
+    core_backend = Sam3SegmentationBackend(
+        Sam3Config(),
+        predictor=predictor,
+    )
+    segmenter = subject_attributes.Sam3AttributeFrameSegmenter(
+        Sam3Config(),
+        backend=core_backend,
+    )
+    masks = segmenter.segment_frame(
+        frame_path=tmp_path / "run" / "clips" / "clip-1" / frames.frames[1].image_path,
+        frame_slot=1,
+        grounding_prompt="the red jacket worn by person 1",
+    )
+    assert len(masks) == 1
+    assert predictor.request_types == ["start_session", "add_prompt", "close_session"]
+    assert predictor.stream_calls == 0
+
+
+def test_only_owner_candidate_frames_are_probed(tmp_path: Path) -> None:
+    _frames(tmp_path / "run")
+    candidates = [
+        _candidate("candidate_1", slot=2, source_frame_index=20),
+        _candidate("candidate_2", slot=5, source_frame_index=50),
+    ]
+
+    class _CandidateOnlySegmenter:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def segment_frame(self, *, frame_path, frame_slot, grounding_prompt):
+            self.calls.append(frame_slot)
+            if frame_slot != 5:
+                return ()
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[30:45, 30:45] = True
+            return (mask,)
+
+    segmenter = _CandidateOnlySegmenter()
+    clip = _clip()
+    selected = subject_attributes._select_attribute_candidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="hair",
+            phrase="long black hair",
+            grounding_prompt="the long black hair of person 1",
+        ),
+        attribute_id="a1",
+        clip_uid=clip.clip_uid,
+        owner=clip.annotation.entities[0],
+        owner_candidates=candidates,
+        owner_reference=_ready_reference("e1"),
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={},
+        ),
+        storage=_FakeStorage(tmp_path / "run"),
+        other_subject_ids=[],
+        crop_padding_ratio=0.08,
+        segmentation_backend=segmenter,
+    )
+    assert isinstance(selected, subject_attributes.PendingAttributeCandidate)
+    assert selected.owner_candidate.frame_slot == 5
+    assert segmenter.calls == [2, 5]
+
+
+def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
+    _frames(tmp_path / "run")
     owner_mask = np.zeros((100, 100), dtype=bool)
     owner_mask[20:80, 20:80] = True
     candidates = [
@@ -573,7 +744,6 @@ def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Pat
         clip=_clip(),
         owner=_clip().annotation.entities[0],
         owner_candidates=candidates,
-        frames=frames,
         masks=TrackedMasksArtifact(
             clip_uid="clip-1",
             height=100,
@@ -587,7 +757,7 @@ def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Pat
     )
     assert discovery.calls == 1
     assert review.calls == 1
-    assert segmenter.calls == 2
+    assert segmenter.calls == [1, 1]
     assert artifact.metrics.discovery_calls == 1
     assert artifact.metrics.review_calls == 1
     assert artifact.metrics.sam3_attempts == 2
@@ -598,6 +768,66 @@ def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Pat
         assert record.image_path is not None
         with Image.open(tmp_path / "output" / record.image_path) as opened:
             assert opened.mode == "RGBA"
+
+
+def test_nonretained_subject_mask_rejects_wrong_owner_attribute(tmp_path: Path) -> None:
+    _frames(tmp_path / "run")
+    owner_mask = np.zeros((100, 100), dtype=bool)
+    owner_mask[20:80, 10:50] = True
+    other_mask = np.zeros_like(owner_mask)
+    other_mask[20:80, 55:95] = True
+    wrong_attribute = np.zeros_like(owner_mask)
+    wrong_attribute[30:50, 65:85] = True
+    clip = _clip(
+        entity_types=("subject", "subject"),
+        retained_ids=("e1",),
+    )
+
+    class _OneAttributeDiscovery:
+        def discover(self, *, owner, owner_candidates, source_images):
+            return SubjectAttributeDiscovery(
+                owner_entity_id=owner.entity_id,
+                owner_is_human=True,
+                attributes=[
+                    DiscoveredSubjectAttribute(
+                        attribute_type="upper_clothing",
+                        phrase="red jacket",
+                        grounding_prompt="the red jacket worn by person 1",
+                    )
+                ],
+            )
+
+    review = _ReviewClient()
+    artifact = subject_attributes._process_owner(
+        config=SimpleNamespace(pair=SimpleNamespace(crop_padding_ratio=0.08)),
+        storage=_FakeStorage(tmp_path / "run"),
+        output_root=tmp_path / "output",
+        clip=clip,
+        owner=clip.annotation.entities[0],
+        owner_candidates=[
+            _candidate(
+                "candidate_1",
+                slot=1,
+                source_frame_index=10,
+                mask=owner_mask,
+            )
+        ],
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={"e2": _tracked_subject(other_mask)},
+        ),
+        attribute_id_start=1,
+        discovery_client=_OneAttributeDiscovery(),
+        review_client=review,
+        segmentation_backend=_SegmentationBackend(wrong_attribute),
+    )
+    assert review.calls == 0
+    assert len(artifact.records) == 1
+    assert artifact.records[0].reason == (
+        "ownership_geometry:attribute_primarily_belongs_to_other_subject"
+    )
 
 
 def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
@@ -643,6 +873,95 @@ def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
         owner_entity_id="e1",
         attribute_id_start=2,
     ) is None
+
+
+def _source_run_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> V3Config:
+    writable = (tmp_path / "workspace" / "data").resolve()
+    dataset_root = (tmp_path / "public" / "dataset").resolve()
+    pretrained = (tmp_path / "public" / "pretrained").resolve()
+    user_models = (writable / "models").resolve()
+    for path in (writable, dataset_root, pretrained, user_models):
+        path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(v3_config_module, "ALLOWED_WRITABLE_ROOT", writable)
+    monkeypatch.setattr(v3_config_module, "ALLOWED_DATASET_ROOT", dataset_root)
+    monkeypatch.setattr(v3_config_module, "ALLOWED_PRETRAINED_ROOT", pretrained)
+    monkeypatch.setattr(v3_config_module, "ALLOWED_USER_MODEL_ROOT", user_models)
+    dataset_json = dataset_root / "source.jsonl"
+    dataset_json.write_text("", encoding="utf-8")
+    qwen_model = pretrained / "Qwen" / "Qwen3-VL-32B-Instruct"
+    config = V3Config(
+        dataset_json=dataset_json,
+        run_root=writable / "runs" / "visual-source",
+        export_root=writable / "datasets" / "visual-source-v1",
+        source=SourceConfig(limit=100),
+        qwen=QwenServicesConfig(
+            annotation=QwenAnnotationConfig(model=str(qwen_model)),
+            instruction_writer=QwenServiceConfig(model=str(qwen_model)),
+            candidate_judge=QwenServiceConfig(model=str(qwen_model)),
+            background_remove_judge=QwenServiceConfig(model=str(qwen_model)),
+        ),
+        remove=RemoveConfig(
+            base_model_path=pretrained / "Qwen" / "Qwen-Image-Edit-2511",
+            adapter_path=user_models / "Qwen-Image-Edit-2511-Object-Remover",
+        ),
+    )
+    config.validate()
+    return config
+
+
+def test_wrong_source_config_fails_before_model_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_config = _source_run_config(tmp_path, monkeypatch)
+    RunStorage(source_config).initialize(git_commit="visual-source")
+    assert source_config.qwen.candidate_judge is not None
+    wrong_service = replace(
+        source_config.qwen.candidate_judge,
+        model=str(
+            source_config.dataset_json.parent.parent
+            / "pretrained"
+            / "Qwen"
+            / "wrong-model"
+        ),
+    )
+    wrong_config = replace(
+        source_config,
+        qwen=replace(source_config.qwen, candidate_judge=wrong_service),
+    )
+
+    class _ForbiddenModelCalls:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def discover(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("Qwen discovery must not be called")
+
+        def review(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("Qwen review must not be called")
+
+        def segment_frame(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("SAM3 must not be called")
+
+    forbidden = _ForbiddenModelCalls()
+    with pytest.raises(ValueError, match="config_hash.*model_identifiers"):
+        subject_attributes.run_subject_attribute_enrichment(
+            wrong_config,
+            run_root=source_config.run_root,
+            output_root=(
+                v3_config_module.ALLOWED_WRITABLE_ROOT / "attribute-enrichment"
+            ),
+            discovery_client=forbidden,
+            review_client=forbidden,
+            segmentation_backend=forbidden,
+        )
+    assert forbidden.calls == 0
 
 
 def test_attribute_output_cannot_overlap_source_run_or_visual_export(
