@@ -39,6 +39,7 @@ from r2v_data_v2.h3.audio_pairing import (
 )
 from r2v_data_v2.h3.audio_schemas import (
     AudioClipBinding,
+    AudioDatasetManifest,
     AudioStreamProvenance,
     EmbeddingAsset,
     EntityOccurrence,
@@ -341,7 +342,15 @@ def _write_bindings(root: Path, bindings: list[AudioClipBinding]) -> None:
     )
     (root / "pair_samples.jsonl").write_text("", encoding="utf-8")
     (root / "pair_report.json").write_text("{}\n", encoding="utf-8")
-    (root / "dataset.json").write_text("{}\n", encoding="utf-8")
+    (root / "dataset.json").write_text(
+        AudioDatasetManifest(
+            clip_binding_count=len(bindings),
+            pair_sample_count=0,
+            producer_provenance=_producer(),
+        ).model_dump_json(indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _two_subject_binding(root: Path, clip_uid: str) -> AudioClipBinding:
@@ -1110,6 +1119,71 @@ def test_h3_export_is_relative_hash_checked_and_tree_exact(tmp_path: Path) -> No
         if path.is_file()
     }
     assert actual == declared
+
+
+def test_pair_and_h3_export_preserve_binding_accounting(tmp_path: Path) -> None:
+    binding_root = tmp_path / "binding"
+    binding_root.mkdir()
+    binding = _canonical_binding(
+        binding_root,
+        "clip-a",
+        face=[1.0, 0.0],
+        voice=[1.0, 0.0],
+    )
+    _write_bindings(binding_root, [binding])
+    source_report = {
+        "selected_clip_count": 2,
+        "clip_binding_count": 1,
+        "ineligible_clip_count": 1,
+        "failed_clip_count": 0,
+        "pair_sample_count": 0,
+    }
+    (binding_root / "pair_report.json").write_text(
+        json.dumps(source_report) + "\n",
+        encoding="utf-8",
+    )
+    (binding_root / "failures.jsonl").write_text(
+        json.dumps(
+            {
+                "clip_uid": "clip-ineligible",
+                "status": "ineligible",
+                "reason": "no clean visible speech",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (binding_root / "dataset.json").write_text(
+        AudioDatasetManifest(
+            clip_binding_count=1,
+            failed_clip_count=0,
+            pair_sample_count=0,
+            producer_provenance=_producer(),
+        ).model_dump_json(indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    pair_root = tmp_path / "pairs"
+
+    report = publish_audio_pair_dataset(
+        audio_binding_root=binding_root,
+        output_root=pair_root,
+    )
+
+    for key, expected in source_report.items():
+        assert report[key] == (1 if key == "pair_sample_count" else expected)
+    pair_manifest = AudioDatasetManifest.model_validate_json(
+        (pair_root / "dataset.json").read_text(encoding="utf-8")
+    )
+    assert pair_manifest.failed_clip_count == 0
+
+    h3_root = tmp_path / "h3"
+    export_h3_audio_dataset(audio_root=pair_root, output_root=h3_root)
+    copied_report = json.loads(
+        (h3_root / "pair_report.json").read_text(encoding="utf-8")
+    )
+    for key, expected in source_report.items():
+        assert copied_report[key] == (1 if key == "pair_sample_count" else expected)
 
 
 def test_h3_overwrite_failure_preserves_previous_output(

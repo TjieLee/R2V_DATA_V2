@@ -184,6 +184,7 @@ The LR-ASD pilot publishes each successful sidecar both in its diagnostic
 canonical tree can therefore be passed directly to `audio_data.py bind`.
 Non-ready sidecars and binding failures remain per-clip records, while
 `pair_report.json` accounts for selected, ready, ineligible, and failed clips.
+These binding counts are preserved through pair publication and H3 export.
 
 ## Server Adapter Boundary
 

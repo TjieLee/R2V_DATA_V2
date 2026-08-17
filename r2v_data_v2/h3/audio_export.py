@@ -109,6 +109,24 @@ def publish_audio_pair_dataset(
     if destination.exists() and not overwrite:
         raise FileExistsError(f"output root already exists: {destination}")
     bindings = load_clip_bindings(source / "clip_bindings.jsonl")
+    source_manifest = AudioDatasetManifest.model_validate_json(
+        (source / "dataset.json").read_text(encoding="utf-8")
+    )
+    source_report_path = source / "pair_report.json"
+    source_report = (
+        json.loads(source_report_path.read_text(encoding="utf-8"))
+        if source_report_path.is_file()
+        else {}
+    )
+    accounting_keys = (
+        "selected_clip_count",
+        "clip_binding_count",
+        "ineligible_clip_count",
+        "failed_clip_count",
+    )
+    source_accounting = {
+        key: source_report[key] for key in accounting_keys if key in source_report
+    }
     samples, edges, report = build_audio_pair_samples(
         bindings,
         audio_root=source,
@@ -116,6 +134,8 @@ def publish_audio_pair_dataset(
     )
     report = {
         **report,
+        **source_accounting,
+        "pair_sample_count": len(samples),
         "pairwise_edges": [item.model_dump(mode="json") for item in edges],
     }
     if report_only:
@@ -139,15 +159,7 @@ def publish_audio_pair_dataset(
         )
         manifest = AudioDatasetManifest(
             clip_binding_count=len(bindings),
-            failed_clip_count=sum(
-                1
-                for line in (temporary / "failures.jsonl").read_text(
-                    encoding="utf-8"
-                ).splitlines()
-                if line
-            )
-            if (temporary / "failures.jsonl").is_file()
-            else 0,
+            failed_clip_count=source_manifest.failed_clip_count,
             pair_sample_count=len(samples),
             producer_provenance=producer,
         )
