@@ -37,12 +37,13 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Produce authoritative original-language transcripts for every frozen bound
-speech turn with a dedicated Whisper-large-v3 ASR stage. The ASR inventory is
-keyed by unique target clip and authoritative turn, never by cross-pair sample,
-and does not modify completed Visual, Audio, primary voice, embedding, or
-PairPolicy outputs. Model training, diarization, speech enhancement, semantic
-annotation, and final H3 rendering remain out of scope.
+Close out the dedicated Whisper-large-v3 ASR V1 pilot with deterministic human
+QA export and model-free review regeneration. The ASR inventory is keyed by
+unique target clip and authoritative turn, never by cross-pair sample, and does
+not modify completed Visual, Audio, primary voice, embedding, or PairPolicy
+outputs. Raw pilot transcripts are not final H3 truth. Model training,
+diarization, speech enhancement, semantic annotation, and final H3 rendering
+remain out of scope.
 
 ## Current Pass
 
@@ -92,6 +93,14 @@ entity-binding provenance, including an optional anonymous speaker-cluster ID.
 A future DiariZen inventory may replace the boundaries after clip-level
 cluster-to-Visual-entity overlap mapping without changing Whisper inference.
 DiariZen and identity propagation are documentation-only in this pass.
+
+The validated server pilot selected 20 of 75 target clips and 82 turns. After
+installing the required CUDA runtime wheels, it produced 81 transcribed, one
+uncertain, and zero failed records. Human QA labeled all 82 turns: 59 `CORRECT`,
+15 `WRONG`, and 8 `UNCERTAIN` (59/74, or 79.7%, among explicit correct/wrong
+decisions). Whisper-large-v3 remains the dedicated ASR baseline, while
+language/accent, proper-name, short-context, and segmentation errors block any
+claim that raw output is final transcript ground truth.
 
 The dots3 native-video runtime remains technically operational, but human QA of
 the 20-clip semantic pilot found severe hallucinated dialogue. Existing
@@ -145,13 +154,13 @@ Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_asr_transcription.py -q
-# 15 passed
+# 18 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 186 passed
+# 189 passed
 
 python -m pytest -q
-# 1853 passed, 1 existing Pillow deprecation warning
+# 1856 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -178,9 +187,9 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-On the server, stage a local CTranslate2 Whisper-large-v3 checkpoint in the
-dedicated `asr-venv`, dry-run the deterministic inventory, then run and inspect
-the fixed `asr_pilot20`. Accept it only after human review checks verbatim
-original-language transcription, hallucination, repeated text, missed speech,
-and empty-output behavior. Do not run complete ASR production until that review
-passes, and do not run dots3 semantic production.
+Export and retain the completed ASR pilot QA JSON with its inventory
+fingerprint. The next major investigation is DiariZen-based canonical speaker
+segmentation and continuity, followed later by aggregate LR-ASD/Visual identity
+anchors and constrained unresolved-speaker handling. None of those future
+stages is implemented here. Do not run complete ASR or dots3 semantic production
+until the corresponding segmentation and transcript-truth policy is approved.

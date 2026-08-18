@@ -10,8 +10,12 @@ import numpy as np
 import pytest
 
 from r2v_data_v2.h3.asr_transcription import (
+    ASR_HUMAN_QA_LABELS,
     ASRBackendResult,
     ASRDecoderDiagnostics,
+    ASRHumanQACounts,
+    ASRHumanQAExport,
+    ASRHumanQALabel,
     ASRTranscriptionFailure,
     ASRTurnRecord,
     ASRTurnSegmentationProvenance,
@@ -653,6 +657,161 @@ def test_outputs_and_review_are_deterministic_and_pairs_remain_read_only(
     assert _tree_hashes(pairs) == before
 
 
+def test_review_page_exports_deterministic_human_qa_contract(tmp_path: Path) -> None:
+    pairs = _write_pairs(
+        tmp_path,
+        [("clip-a", [(0.0, 0.4, "e1"), (0.8, 1.2, "e2")])],
+    )
+    inventory = build_asr_inventory(pairs_root=pairs, mode="pilot20")
+    output_root = tmp_path / "asr"
+    run_asr_transcription(
+        inventory=inventory,
+        output_root=output_root,
+        backend=_FakeBackend(),
+    )
+
+    review = (output_root / "review.html").read_text(encoding="utf-8")
+    metadata_text = review.split("const qaMetadata = ", 1)[1].split(
+        ";\nconst qaAllowedLabels",
+        1,
+    )[0]
+    metadata = json.loads(metadata_text)
+
+    assert "Export QA JSON" in review
+    assert "Clear QA labels" in review
+    assert "qa-progress" in review
+    assert all(
+        name in review
+        for name in (
+            "qa-correct-count",
+            "qa-wrong-count",
+            "qa-uncertain-count",
+            "qa-unlabeled-count",
+        )
+    )
+    assert metadata["schema_version"] == "r2v.h3.asr_human_qa.1"
+    assert metadata["inventory_fingerprint"] == inventory.inventory_fingerprint
+    assert metadata["mode"] == "pilot20"
+    assert metadata["allowed_labels"] == list(ASR_HUMAN_QA_LABELS)
+    assert [item["turn_id"] for item in metadata["turns"]] == [
+        "turn_1",
+        "turn_2",
+    ]
+    assert "asr_pilot20_human_qa.json" in review
+    assert "restoreQALabels();" in review
+    assert "updateQACounts();" in review
+    assert "onchange='saveLabel(this)'" in review
+    assert "window.confirm(" in review
+    assert "localStorage.removeItem(turn.storage_key)" in review
+    assert "localStorage.clear(" not in review
+
+
+def test_human_qa_schema_reconciles_labels_and_unlabeled_count() -> None:
+    export = ASRHumanQAExport(
+        inventory_fingerprint="a" * 64,
+        mode="pilot20",
+        label_count=2,
+        total_turn_count=3,
+        counts=ASRHumanQACounts(
+            CORRECT=1,
+            WRONG=1,
+            UNCERTAIN=0,
+            UNLABELED=1,
+        ),
+        labels=[
+            ASRHumanQALabel(
+                target_clip_uid="clip-a",
+                turn_id="turn_1",
+                entity_occurrence_id="clip-a/e1",
+                label="CORRECT",
+            ),
+            ASRHumanQALabel(
+                target_clip_uid="clip-a",
+                turn_id="turn_2",
+                entity_occurrence_id="clip-a/e2",
+                label="WRONG",
+            ),
+        ],
+    )
+
+    assert export.counts.UNLABELED == 1
+    label_schema = ASRHumanQALabel.model_json_schema()["properties"]["label"]
+    assert label_schema["enum"] == list(ASR_HUMAN_QA_LABELS)
+    with pytest.raises(ValueError):
+        ASRHumanQALabel(
+            target_clip_uid="clip-a",
+            turn_id="turn_1",
+            entity_occurrence_id="clip-a/e1",
+            label="ACCEPT",  # type: ignore[arg-type]
+        )
+
+
+def test_review_only_regeneration_uses_no_inventory_builder_or_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pairs = _write_pairs(tmp_path, [("clip-a", [(0.125, 0.225, "e1")])])
+    inventory = build_asr_inventory(pairs_root=pairs, mode="pilot20")
+    output_root = tmp_path / "asr_pilot20"
+    run_asr_transcription(
+        inventory=inventory,
+        output_root=output_root,
+        backend=_FakeBackend(),
+    )
+    immutable_names = ("inventory.json", "turns.jsonl", "summary.json")
+    before = {name: (output_root / name).read_bytes() for name in immutable_names}
+    turn_media = output_root / "review_media" / "clip-a" / "turn_1.wav"
+    turn_media.unlink()
+    (output_root / "review.html").write_text("stale review", encoding="utf-8")
+
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("review-only regeneration must not construct inference")
+
+    monkeypatch.setattr(
+        "tools.run_h3_asr_transcription.build_asr_inventory",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        "tools.run_h3_asr_transcription.FasterWhisperASRBackend",
+        unexpected_call,
+    )
+
+    result = asr_main(
+        [
+            "--audio-run-root",
+            str(tmp_path),
+            "--mode",
+            "pilot20",
+            "--regenerate-review",
+        ]
+    )
+
+    assert result == {
+        "mode": "pilot20",
+        "review_regenerated": True,
+        "model_loaded": False,
+        "backend_calls": 0,
+        "turn_count": 1,
+        "inventory_fingerprint": inventory.inventory_fingerprint,
+        "regenerated_turn_media_count": 1,
+    }
+    assert json.loads(capsys.readouterr().out) == result
+    assert {name: (output_root / name).read_bytes() for name in immutable_names} == before
+    assert turn_media.is_file()
+    assert "Export QA JSON" in (output_root / "review.html").read_text(
+        encoding="utf-8"
+    )
+    with wave.open(str(turn_media), "rb") as source:
+        assert source.getframerate() == 16000
+        assert source.getnframes() == 1600
+        recreated = np.frombuffer(source.readframes(1600), dtype="<i2")
+    expected = (np.arange(2000, 3600, dtype=np.int32) % 20000 - 10000).astype(
+        np.int16
+    )
+    np.testing.assert_array_equal(recreated, expected)
+
+
 def test_dry_run_has_no_model_and_reports_fixed_output_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -692,6 +851,7 @@ def test_cli_has_no_limit_parent_quota_or_translation_options() -> None:
         "model_fingerprint",
         "device",
         "compute_type",
+        "regenerate_review",
     } <= destinations
     assert asr_output_root(Path("/tmp/audio"), mode="production") == (
         Path("/tmp/audio").resolve() / "production" / "asr"

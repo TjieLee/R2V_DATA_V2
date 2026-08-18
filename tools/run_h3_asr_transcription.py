@@ -22,6 +22,7 @@ from r2v_data_v2.h3.asr_transcription import (
     asr_output_root,
     asr_stage_is_complete,
     build_asr_inventory,
+    regenerate_asr_review,
     run_asr_transcription,
 )
 from r2v_data_v2.h3.audio_backends import fingerprint_local_model_path
@@ -34,6 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-run-root", type=Path, required=True)
     parser.add_argument("--mode", choices=("pilot20", "production"), required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--regenerate-review", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--model")
     parser.add_argument("--model-path", type=Path)
@@ -110,9 +112,20 @@ def _reuse_existing(
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     audio_run_root = arguments.audio_run_root.expanduser().resolve(strict=True)
+    output_root = asr_output_root(audio_run_root, mode=arguments.mode)
+    if arguments.regenerate_review:
+        if arguments.dry_run or arguments.overwrite:
+            raise ValueError(
+                "--regenerate-review cannot be combined with --dry-run or --overwrite"
+            )
+        result = regenerate_asr_review(
+            output_root=output_root,
+            expected_mode=arguments.mode,
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return result
     pairs_root = (audio_run_root / "production" / "pairs").resolve(strict=True)
     inventory = build_asr_inventory(pairs_root=pairs_root, mode=arguments.mode)
-    output_root = asr_output_root(audio_run_root, mode=arguments.mode)
     plan: dict[str, object] = {
         "mode": arguments.mode,
         "source_pairs_path": inventory.source_pairs_path,

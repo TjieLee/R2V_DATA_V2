@@ -4,52 +4,84 @@ This is the operational runbook for the server-side Audio/H3 pilot. Keep the
 layout small and stable. Do not create a timestamped directory for every smoke
 attempt.
 
-## Canonical Whisper ASR sequence
+## Canonical Whisper ASR Sequence
 
 Current milestone boundaries:
 
 - Visual, Audio binding, primary voice, embeddings, and PairPolicy V1 are **COMPLETE / FROZEN**.
-- Whisper-large-v3 ASR is the active **PILOT / PRODUCTION** workflow.
+- Whisper-large-v3 ASR is the retained baseline; raw transcripts are not yet
+  final H3 transcript truth.
 - dots3 transcript generation is **BLOCKED AFTER FAILED HUMAN QA**.
 - The existing `semantic_pilot20` is diagnostic evidence only; do not delete it
   and do not run complete semantic production.
 - DiariZen, speech enhancement, trusted-transcript dots3 annotation, and final
   H3 rendering are future work.
 
-### A. Create the dedicated ASR environment
+### One-Time Setup
 
 ```bash
 export ASR_ENV=/mnt/workspace/litengjie/data/audio_deps/asr-venv
+export ASR_HF_MODEL=/mnt/workspace/public/pretrained/LongCat-Video-Avatar-1.5/whisper-large-v3
+export ASR_MODEL_PATH=/mnt/workspace/litengjie/data/audio_deps/asr_models/whisper-large-v3-ct2
+
 uv venv --python 3.12 --seed "$ASR_ENV"
 uv pip install --python "$ASR_ENV/bin/python" \
-  faster-whisper "pydantic>=2,<3" Pillow
+  faster-whisper transformers "pydantic>=2,<3" Pillow \
+  nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-nvrtc-cu12
+
+"$ASR_ENV/bin/ct2-transformers-converter" \
+  --model "$ASR_HF_MODEL" \
+  --output_dir "$ASR_MODEL_PATH" \
+  --copy_files tokenizer.json preprocessor_config.json \
+  --quantization float16
 ```
 
 Keep this environment separate from system Python, LR-ASD, embeddings, and
-dots3/vLLM. The server must provide a faster-whisper-compatible CUDA 12/cuBLAS
-and cuDNN 9 runtime.
+dots3/vLLM. The complete 32-decoder-layer large-v3 checkpoint above was selected
+for the accuracy baseline; the available four-decoder-layer turbo checkpoint
+was not used.
 
-### B. Configure a local Whisper-large-v3 checkpoint
+The first real pilot failed safely for all 82 calls with
+`RuntimeError: Library libcublas.so.12 is not found or cannot be loaded`. After
+installing the NVIDIA runtime wheels above, this was the validated library setup
+and smoke check:
+
+```bash
+ASR_SITE=$(
+"$ASR_ENV/bin/python" - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PY
+)
+export LD_LIBRARY_PATH="$ASR_SITE/nvidia/cublas/lib:$ASR_SITE/nvidia/cudnn/lib:$ASR_SITE/nvidia/cuda_nvrtc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+"$ASR_ENV/bin/python" - <<'PY'
+import ctypes
+ctypes.CDLL("libcublas.so.12")
+ctypes.CDLL("libcudnn.so.9")
+print("CUDA libs OK")
+PY
+```
+
+### Normal Pilot And Production Run
 
 ```bash
 export REPO=/mnt/workspace/litengjie/data/R2V_DATA_V2
 export AUDIO_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs
-export ASR_MODEL_PATH=/mnt/workspace/public/pretrained/<local-whisper-large-v3-ct2>
+export ASR_ENV=/mnt/workspace/litengjie/data/audio_deps/asr-venv
+export ASR_MODEL_PATH=/mnt/workspace/litengjie/data/audio_deps/asr_models/whisper-large-v3-ct2
 export ASR_MODEL=large-v3
-# Optional for an identifier; local paths are fingerprinted automatically:
-# export ASR_MODEL_FINGERPRINT=<64-character-sha256>
 export ASR_DEVICE=cuda:0
 export ASR_COMPUTE_TYPE=float16
-```
 
-`ASR_MODEL_PATH` takes precedence. Production loading is local-only and a
-requested CUDA device never silently falls back to CPU. A local model path is
-content-fingerprinted automatically; an explicitly supplied fingerprint must
-match and becomes part of strict output-reuse validation.
+ASR_SITE=$(
+"$ASR_ENV/bin/python" - <<'PY'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PY
+)
+export LD_LIBRARY_PATH="$ASR_SITE/nvidia/cublas/lib:$ASR_SITE/nvidia/cudnn/lib:$ASR_SITE/nvidia/cuda_nvrtc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-### C. Dry-run the fixed pilot inventory without loading a model
-
-```bash
 cd "$REPO"
 "$ASR_ENV/bin/python" tools/run_h3_asr_transcription.py \
   --audio-run-root "$AUDIO_RUN_ROOT" \
@@ -60,7 +92,7 @@ cd "$REPO"
 Confirm `parent_quota_applied=false`, `donor_media_used=false`, the selected
 target count, turn count, and output root `$AUDIO_RUN_ROOT/asr_pilot20`.
 
-### D. Run and review the fixed pilot
+Run the fixed pilot only when inference regeneration is intended:
 
 ```bash
 cd "$REPO"
@@ -68,15 +100,28 @@ cd "$REPO"
   --audio-run-root "$AUDIO_RUN_ROOT" \
   --mode pilot20 \
   --overwrite
+```
+
+Regenerate the static QA page without loading Whisper, CUDA, or changing
+`inventory.json`, `turns.jsonl`, or `summary.json`:
+
+```bash
+cd "$REPO"
+"$ASR_ENV/bin/python" tools/run_h3_asr_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --regenerate-review
 
 cd "$AUDIO_RUN_ROOT/asr_pilot20"
 python -m http.server 8766 --bind 127.0.0.1
 ```
 
-Review exact turn crops for hallucination, translation, repeated text, language
-errors, missed speech, and incorrect empty output.
+Review exact turn crops, then use **Export QA JSON**. Labels persist in browser
+localStorage; export includes `r2v.h3.asr_human_qa.1`, the inventory
+fingerprint, deterministic turn order, and explicit unlabeled count.
 
-### E. Run formal ASR production only after pilot acceptance
+Formal production remains gated on ASR/segmentation policy decisions. Once that
+gate is explicitly cleared, use:
 
 ```bash
 cd "$REPO"
@@ -89,6 +134,21 @@ python -m json.tool "$AUDIO_RUN_ROOT/production/asr/summary.json"
 
 Production includes every authoritative turn from every unique target in-pair.
 It has no `limit`, parent quota, calibration sampler, or cross-pair duplication.
+
+### Validated Pilot Milestone
+
+- Source inventory: 75 unique production target clips.
+- Pilot: 20 clips, 82 turns, 82 backend calls.
+- Runtime after CUDA library repair: 81 transcribed, one uncertain, zero failed.
+- Human QA: 59 `CORRECT`, 15 `WRONG`, 8 `UNCERTAIN`; all 82 labeled.
+- Explicit `CORRECT` rate among `CORRECT` plus `WRONG`: 59/74 (79.7%).
+
+The QA set includes Cantonese, Hong Kong-accented Mandarin, isolated phonetic
+substitutions, proper-name/near-homophone errors, and likely short-context or
+segmentation limitations. Dedicated Whisper-large-v3 remains the baseline and
+is more trustworthy than dots3-generated dialogue, but raw ASR is not final H3
+truth. DiariZen speaker segmentation/continuity and constrained contextual
+resolution remain future work, not implemented production behavior.
 
 ## Blocked dots3 diagnostic sequence
 
@@ -232,6 +292,7 @@ python -m json.tool "$AUDIO_RUN_ROOT/semantic_pilot20/summary.json"
 │   ├── lr-asd-venv/                     # Python 3.10 uv venv
 │   ├── embedding-venv/                  # isolated face/speaker inference env
 │   ├── asr-venv/                        # isolated Whisper/faster-whisper env
+│   ├── asr_models/                      # writable local CT2 Whisper models
 │   ├── embedding_models/                # manually staged local model files
 │   └── uv-python/                       # uv managed Python
 └── r2v_audio_runs/

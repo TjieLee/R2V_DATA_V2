@@ -30,6 +30,7 @@ from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 ASR_TURN_SCHEMA_VERSION = "r2v.h3.asr_turn.1"
 ASR_INVENTORY_SCHEMA_VERSION = "r2v.h3.asr_inventory.1"
 ASR_SUMMARY_SCHEMA_VERSION = "r2v.h3.asr_summary.1"
+ASR_HUMAN_QA_SCHEMA_VERSION = "r2v.h3.asr_human_qa.1"
 ASR_REQUEST_CONTRACT_VERSION = "h3_whisper_authoritative_turn_asr_v1"
 ASR_PREPROCESSING_VERSION = "pcm16_exact_turn_crop_v1"
 CURRENT_BOUNDARY_SOURCE = "frozen_audio_binding_turns_v1"
@@ -39,6 +40,7 @@ DEFAULT_ASR_DEVICE = "cuda:0"
 DEFAULT_ASR_COMPUTE_TYPE = "float16"
 ASR_INPUT_SAMPLE_RATE_HZ = 16000
 PILOT_TARGET_COUNT = 20
+ASR_HUMAN_QA_LABELS = ("CORRECT", "WRONG", "UNCERTAIN")
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -428,6 +430,70 @@ class ASRSummary(SchemaModel):
             or self.target_clip_count != self.source_target_count
         ):
             raise ValueError("production ASR summary must cover every target")
+        return self
+
+
+class ASRHumanQACounts(SchemaModel):
+    CORRECT: int = Field(ge=0)
+    WRONG: int = Field(ge=0)
+    UNCERTAIN: int = Field(ge=0)
+    UNLABELED: int = Field(ge=0)
+
+
+class ASRHumanQALabel(SchemaModel):
+    target_clip_uid: str
+    turn_id: str
+    entity_occurrence_id: str
+    label: Literal["CORRECT", "WRONG", "UNCERTAIN"]
+
+    @model_validator(mode="after")
+    def validate_label(self) -> ASRHumanQALabel:
+        if any(
+            not value.strip()
+            for value in (
+                self.target_clip_uid,
+                self.turn_id,
+                self.entity_occurrence_id,
+            )
+        ):
+            raise ValueError("ASR human-QA label identity must not be empty")
+        return self
+
+
+class ASRHumanQAExport(SchemaModel):
+    schema_version: Literal["r2v.h3.asr_human_qa.1"] = (
+        ASR_HUMAN_QA_SCHEMA_VERSION
+    )
+    inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mode: Literal["pilot20", "production"]
+    label_count: int = Field(ge=0)
+    total_turn_count: int = Field(ge=0)
+    counts: ASRHumanQACounts
+    labels: list[ASRHumanQALabel]
+
+    @model_validator(mode="after")
+    def validate_export(self) -> ASRHumanQAExport:
+        label_ids = [
+            (item.target_clip_uid, item.turn_id)
+            for item in self.labels
+        ]
+        if len(label_ids) != len(set(label_ids)):
+            raise ValueError("ASR human-QA labels must be unique")
+        actual_counts = Counter(item.label for item in self.labels)
+        if any(
+            getattr(self.counts, label) != actual_counts[label]
+            for label in ASR_HUMAN_QA_LABELS
+        ):
+            raise ValueError("ASR human-QA per-label counts are inconsistent")
+        labeled_count = (
+            self.counts.CORRECT
+            + self.counts.WRONG
+            + self.counts.UNCERTAIN
+        )
+        if self.label_count != len(self.labels) or self.label_count != labeled_count:
+            raise ValueError("ASR human-QA label count is inconsistent")
+        if self.total_turn_count != self.label_count + self.counts.UNLABELED:
+            raise ValueError("ASR human-QA total count is inconsistent")
         return self
 
 
@@ -901,6 +967,31 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
     )
 
 
+def _review_video_name(target: ASRTargetClip) -> str:
+    suffix = Path(target.target_video_path).suffix.lower() or ".media"
+    return f"{target.target_clip_uid}.video{suffix}"
+
+
+def _review_audio_name(target: ASRTargetClip) -> str:
+    suffix = Path(target.source_audio_path).suffix.lower() or ".media"
+    return f"{target.target_clip_uid}.full-audio{suffix}"
+
+
+def _review_turn_name(job: ASRTurnJob) -> str:
+    if _SAFE_ID.fullmatch(job.turn_id) is None:
+        raise ValueError("ASR turn ID is not review-path-safe")
+    return f"{job.target_clip_uid}/{job.turn_id}.wav"
+
+
+def _qa_input_name(record: ASRTurnRecord) -> str:
+    return f"qa-{record.target_clip_uid}-{record.turn_id}"
+
+
+def _qa_storage_key(record: ASRTurnRecord) -> str:
+    # Preserve the original review-page key so completed browser QA survives refreshes.
+    return f"h3-asr-{_qa_input_name(record)}"
+
+
 def _review_html(
     *,
     inventory: ASRInventory,
@@ -909,6 +1000,30 @@ def _review_html(
     audio_names: dict[str, str],
     turn_names: dict[tuple[str, str], str | None],
 ) -> str:
+    export_filename = (
+        "asr_pilot20_human_qa.json"
+        if inventory.mode == "pilot20"
+        else "asr_production_human_qa.json"
+    )
+    qa_metadata = {
+        "schema_version": ASR_HUMAN_QA_SCHEMA_VERSION,
+        "inventory_fingerprint": inventory.inventory_fingerprint,
+        "mode": inventory.mode,
+        "total_turn_count": len(records),
+        "allowed_labels": list(ASR_HUMAN_QA_LABELS),
+        "export_filename": export_filename,
+        "turns": [
+            {
+                "target_clip_uid": record.target_clip_uid,
+                "turn_id": record.turn_id,
+                "entity_occurrence_id": record.entity_occurrence_id,
+                "input_name": _qa_input_name(record),
+                "storage_key": _qa_storage_key(record),
+            }
+            for record in records
+        ],
+    }
+    qa_metadata_json = _compact_json(qa_metadata).replace("<", "\\u003c")
     by_clip: dict[str, list[ASRTurnRecord]] = {}
     for record in records:
         by_clip.setdefault(record.target_clip_uid, []).append(record)
@@ -933,7 +1048,8 @@ def _review_html(
                     "<audio controls preload='metadata' "
                     f"src='review_media/{html.escape(media_name)}'></audio>"
                 )
-            qa_name = f"qa-{record.target_clip_uid}-{record.turn_id}"
+            qa_name = _qa_input_name(record)
+            qa_key = _qa_storage_key(record)
             rows.append(
                 "<tr>"
                 f"<td>{html.escape(record.turn_id)}</td>"
@@ -948,8 +1064,9 @@ def _review_html(
                 "<td>"
                 + " ".join(
                     f"<label><input type='radio' name='{html.escape(qa_name)}' "
+                    f"data-qa-storage-key='{html.escape(qa_key)}' "
                     f"value='{label}' onchange='saveLabel(this)'>{label}</label>"
-                    for label in ("CORRECT", "WRONG", "UNCERTAIN")
+                    for label in ASR_HUMAN_QA_LABELS
                 )
                 + "</td></tr>"
             )
@@ -971,18 +1088,109 @@ body{font-family:system-ui,sans-serif;margin:24px;background:#f5f6f7;color:#1717
 header,.case{max-width:1400px;margin:0 auto 24px;background:white;border:1px solid #ccc;padding:18px}
 h1,h2{letter-spacing:0}video{width:100%;max-height:520px;background:#111}audio{width:100%;min-width:180px}
 table{width:100%;border-collapse:collapse;margin-top:14px}th,td{border:1px solid #ccc;padding:7px;text-align:left;vertical-align:top}
-label{display:block;white-space:nowrap}
+label{display:block;white-space:nowrap}.qa-controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:14px;padding:12px;border:1px solid #bbb;background:#f7f7f7}
+.qa-counts{display:flex;flex-wrap:wrap;gap:10px}.qa-actions{display:flex;gap:8px;margin-left:auto}button{padding:7px 11px;cursor:pointer}
 </style></head><body>
 <header><h1>H3 Whisper-large-v3 ASR review</h1>
-<p>Human labels are QA only. Check hallucination, translation, repeated text, language errors, missed speech, and incorrect empty output.</p></header>
+<p>Human labels are QA only. Check hallucination, translation, repeated text, language errors, missed speech, and incorrect empty output.</p>
+<section class="qa-controls" aria-label="Human QA controls">
+<strong id="qa-progress">labeled 0 / 0</strong>
+<div class="qa-counts">
+<span>CORRECT: <strong id="qa-correct-count">0</strong></span>
+<span>WRONG: <strong id="qa-wrong-count">0</strong></span>
+<span>UNCERTAIN: <strong id="qa-uncertain-count">0</strong></span>
+<span>UNLABELED: <strong id="qa-unlabeled-count">0</strong></span>
+</div>
+<div class="qa-actions">
+<button type="button" onclick="exportQAJSON()">Export QA JSON</button>
+<button type="button" onclick="clearQALabels()">Clear QA labels</button>
+</div>
+</section></header>
 """
         + "".join(cards)
-        + """
+        + f"""
 <script>
-function saveLabel(input){localStorage.setItem('h3-asr-'+input.name,input.value);}
-document.querySelectorAll('input[type=radio]').forEach(function(input){
- const saved=localStorage.getItem('h3-asr-'+input.name); if(saved===input.value) input.checked=true;
-});
+const qaMetadata = {qa_metadata_json};
+const qaAllowedLabels = new Set(qaMetadata.allowed_labels);
+
+function collectQACounts() {{
+  const counts = {{CORRECT: 0, WRONG: 0, UNCERTAIN: 0, UNLABELED: 0}};
+  qaMetadata.turns.forEach(function(turn) {{
+    const label = localStorage.getItem(turn.storage_key);
+    if (qaAllowedLabels.has(label)) counts[label] += 1;
+    else counts.UNLABELED += 1;
+  }});
+  return counts;
+}}
+
+function updateQACounts() {{
+  const counts = collectQACounts();
+  const labeled = qaMetadata.total_turn_count - counts.UNLABELED;
+  document.getElementById('qa-progress').textContent =
+    'labeled ' + labeled + ' / ' + qaMetadata.total_turn_count;
+  document.getElementById('qa-correct-count').textContent = counts.CORRECT;
+  document.getElementById('qa-wrong-count').textContent = counts.WRONG;
+  document.getElementById('qa-uncertain-count').textContent = counts.UNCERTAIN;
+  document.getElementById('qa-unlabeled-count').textContent = counts.UNLABELED;
+}}
+
+function saveLabel(input) {{
+  if (!qaAllowedLabels.has(input.value)) return;
+  localStorage.setItem(input.dataset.qaStorageKey, input.value);
+  updateQACounts();
+}}
+
+function restoreQALabels() {{
+  document.querySelectorAll('input[data-qa-storage-key]').forEach(function(input) {{
+    const saved = localStorage.getItem(input.dataset.qaStorageKey);
+    input.checked = qaAllowedLabels.has(saved) && saved === input.value;
+  }});
+  updateQACounts();
+}}
+
+function exportQAJSON() {{
+  const labels = [];
+  qaMetadata.turns.forEach(function(turn) {{
+    const label = localStorage.getItem(turn.storage_key);
+    if (qaAllowedLabels.has(label)) {{
+      labels.push({{
+        target_clip_uid: turn.target_clip_uid,
+        turn_id: turn.turn_id,
+        entity_occurrence_id: turn.entity_occurrence_id,
+        label: label
+      }});
+    }}
+  }});
+  const counts = collectQACounts();
+  const payload = {{
+    schema_version: qaMetadata.schema_version,
+    inventory_fingerprint: qaMetadata.inventory_fingerprint,
+    mode: qaMetadata.mode,
+    label_count: labels.length,
+    total_turn_count: qaMetadata.total_turn_count,
+    counts: counts,
+    labels: labels
+  }};
+  const blob = new Blob([JSON.stringify(payload, null, 2) + '\\n'], {{type: 'application/json'}});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = qaMetadata.export_filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}}
+
+function clearQALabels() {{
+  if (!window.confirm('Clear QA labels for this ASR review?')) return;
+  qaMetadata.turns.forEach(function(turn) {{
+    localStorage.removeItem(turn.storage_key);
+  }});
+  restoreQALabels();
+}}
+
+restoreQALabels();
 </script></body></html>
 """
     )
@@ -1027,8 +1235,8 @@ def run_asr_transcription(
         for target in inventory.targets:
             video = Path(target.target_video_path)
             audio = Path(target.source_audio_path)
-            video_name = f"{target.target_clip_uid}.video{video.suffix.lower() or '.media'}"
-            audio_name = f"{target.target_clip_uid}.full-audio{audio.suffix.lower() or '.media'}"
+            video_name = _review_video_name(target)
+            audio_name = _review_audio_name(target)
             (review_root / video_name).symlink_to(video)
             (review_root / audio_name).symlink_to(audio)
             video_names[target.target_clip_uid] = video_name
@@ -1037,7 +1245,7 @@ def run_asr_transcription(
         for job in inventory.jobs:
             try:
                 prepared = prepare_asr_audio(job)
-                turn_name = f"{job.target_clip_uid}/{job.turn_id}.wav"
+                turn_name = _review_turn_name(job)
                 _write_review_wav(review_root / turn_name, prepared.waveform)
                 turn_names[(job.target_clip_uid, job.turn_id)] = turn_name
                 backend_call_count += 1
@@ -1053,7 +1261,7 @@ def run_asr_transcription(
                 )
             except ASRTranscriptionFailure as exc:
                 failure_counts.update([exc.code])
-                turn_name = f"{job.target_clip_uid}/{job.turn_id}.wav"
+                turn_name = _review_turn_name(job)
                 turn_names[(job.target_clip_uid, job.turn_id)] = (
                     turn_name if (review_root / turn_name).is_file() else None
                 )
@@ -1098,6 +1306,147 @@ def run_asr_transcription(
         if temporary.exists():
             shutil.rmtree(temporary)
         raise
+
+
+def _validate_review_source(
+    *,
+    inventory: ASRInventory,
+    records: Sequence[ASRTurnRecord],
+    summary: ASRSummary,
+    expected_mode: Literal["pilot20", "production"],
+) -> None:
+    expected_fingerprint = _inventory_fingerprint(
+        source_pairs_sha256=inventory.source_pairs_sha256,
+        mode=inventory.mode,
+        targets=inventory.targets,
+        jobs=inventory.jobs,
+    )
+    if inventory.inventory_fingerprint != expected_fingerprint:
+        raise ValueError("stored ASR inventory fingerprint is inconsistent")
+    if inventory.mode != expected_mode or summary.mode != expected_mode:
+        raise ValueError("stored ASR review mode does not match the request")
+    if summary.inventory_fingerprint != inventory.inventory_fingerprint:
+        raise ValueError("stored ASR summary fingerprint does not match inventory")
+    if len(records) != len(inventory.jobs) or summary.turn_count != len(records):
+        raise ValueError("stored ASR turn count is inconsistent")
+    job_fields = tuple(ASRTurnJob.model_fields)
+    for job, record in zip(inventory.jobs, records, strict=True):
+        record_job = ASRTurnJob.model_validate(
+            {field: getattr(record, field) for field in job_fields}
+        )
+        if record_job != job:
+            raise ValueError("stored ASR turn record does not match inventory order")
+        if record.backend_provenance != summary.backend_provenance:
+            raise ValueError("stored ASR backend provenance is inconsistent")
+
+
+def _ensure_review_symlink(*, destination: Path, source: Path) -> None:
+    source_resolved = source.expanduser().resolve(strict=True)
+    if not source_resolved.is_file():
+        raise ValueError(f"ASR review source is not a file: {source_resolved}")
+    if destination.is_symlink():
+        try:
+            if destination.resolve(strict=True) == source_resolved:
+                return
+        except FileNotFoundError:
+            pass
+    elif destination.exists():
+        raise ValueError(f"ASR review media path is not a symlink: {destination}")
+    temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
+    temporary.symlink_to(source_resolved)
+    temporary.replace(destination)
+
+
+def regenerate_asr_review(
+    *,
+    output_root: Path,
+    expected_mode: Literal["pilot20", "production"],
+) -> dict[str, object]:
+    root = output_root.expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("ASR review output root must be a directory")
+    inventory = ASRInventory.model_validate_json(
+        (root / "inventory.json").read_text(encoding="utf-8")
+    )
+    records = [
+        ASRTurnRecord.model_validate(item)
+        for item in _read_jsonl(root / "turns.jsonl")
+    ]
+    summary = ASRSummary.model_validate_json(
+        (root / "summary.json").read_text(encoding="utf-8")
+    )
+    _validate_review_source(
+        inventory=inventory,
+        records=records,
+        summary=summary,
+        expected_mode=expected_mode,
+    )
+
+    review_root = root / "review_media"
+    review_root.mkdir(exist_ok=True)
+    review_root = review_root.resolve(strict=True)
+    review_root.relative_to(root)
+    video_names: dict[str, str] = {}
+    audio_names: dict[str, str] = {}
+    for target in inventory.targets:
+        video_name = _review_video_name(target)
+        audio_name = _review_audio_name(target)
+        _ensure_review_symlink(
+            destination=review_root / video_name,
+            source=Path(target.target_video_path),
+        )
+        _ensure_review_symlink(
+            destination=review_root / audio_name,
+            source=Path(target.source_audio_path),
+        )
+        video_names[target.target_clip_uid] = video_name
+        audio_names[target.target_clip_uid] = audio_name
+
+    regenerated_turn_media_count = 0
+    turn_names: dict[tuple[str, str], str | None] = {}
+    for job in inventory.jobs:
+        turn_name = _review_turn_name(job)
+        turn_path = review_root / turn_name
+        if not turn_path.is_file():
+            if turn_path.exists() or turn_path.is_symlink():
+                raise ValueError(f"ASR turn review media is invalid: {turn_path}")
+            prepared = prepare_asr_audio(job)
+            temporary = turn_path.with_name(
+                f".{turn_path.name}.tmp-{uuid.uuid4().hex}"
+            )
+            _write_review_wav(temporary, prepared.waveform)
+            temporary.replace(turn_path)
+            regenerated_turn_media_count += 1
+        turn_names[(job.target_clip_uid, job.turn_id)] = turn_name
+
+    review_path = root / "review.html"
+    temporary_review = review_path.with_name(
+        f".{review_path.name}.tmp-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary_review.write_text(
+            _review_html(
+                inventory=inventory,
+                records=records,
+                video_names=video_names,
+                audio_names=audio_names,
+                turn_names=turn_names,
+            ),
+            encoding="utf-8",
+        )
+        temporary_review.replace(review_path)
+    finally:
+        if temporary_review.exists():
+            temporary_review.unlink()
+    return {
+        "mode": inventory.mode,
+        "review_regenerated": True,
+        "model_loaded": False,
+        "backend_calls": 0,
+        "turn_count": len(records),
+        "inventory_fingerprint": inventory.inventory_fingerprint,
+        "regenerated_turn_media_count": regenerated_turn_media_count,
+    }
 
 
 def asr_output_root(
