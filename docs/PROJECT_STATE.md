@@ -80,15 +80,25 @@ the canonical contract.
 
 Audio binding, primary voice, embeddings, and PairPolicy V1 are complete and
 frozen. The current semantic producer reads `production/pairs/in_pairs.jsonl`,
-calls `dots-studio/dots3-note-prev-fp8` through an external OpenAI-compatible
-vLLM endpoint at most once per target clip, and publishes fixed
+calls the local `/mnt/workspace/public/pretrained/dots3-note-prev` checkpoint
+through an external OpenAI-compatible vLLM endpoint at most once per target
+clip, and publishes fixed
 `semantic_pilot20` or `production/semantic` outputs. Model output supplies only
 turn ID plus transcript status/text/language; code copies canonical entity
-identity and timestamps from input. Each request contains the target video and
-separate target full audio, never donor media. Failed semantics never delete a
-valid pair. The H3 exporter remains demo/not final, and the Visual subject
-attribute workstream remains separate and is not consumed. See
+identity and timestamps from input. Each request contains text and the native
+target video only; Dots3Note consumes the video's embedded audio. The canonical
+extracted full-audio path and hash remain verified provenance and are not sent
+as a separate model input. Donor media is never sent. Failed semantics never
+delete a valid pair. The H3 exporter remains demo/not final, and the Visual
+subject attribute workstream remains separate and is not consumed. See
 `docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for the runtime contract.
+
+The validated dedicated runtime uses checkpoint architecture
+`Dots3NoteForCausalLM` / model type `dots3_note`, `bfloat16`, unquantized
+weights, and vLLM commit `e0e5a7fb2808504ba86c94f7b379e38496002fd0`
+(`0.27.2rc1.dev191+ge0e5a7fb2`). Its canonical media contract is shared-root
+`file` transport under `/mnt/workspace`; no separate HTTP media server is
+required.
 
 ### Earlier audio scaffold
 
@@ -128,13 +138,13 @@ Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_semantic_augmentation.py -q
-# 16 passed
+# 17 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 170 passed
+# 171 passed
 
 python -m pytest -q
-# 1837 passed, 1 existing Pillow deprecation warning
+# 1838 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -161,9 +171,10 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-On the server, start the dedicated 8-H200 dots3/vLLM service, configure the
-root-confined media transport, build the read-only semantic inventory, then run
-and inspect the fixed 20-target pilot. Accept the pilot only after human review checks
-transcripts, unclear-speech handling, non-speech events, and factual summaries.
+On the server, reuse the validated dedicated 8-H200 dots3/vLLM service and
+shared-root native-video transport, build the read-only semantic inventory,
+then run and inspect the fixed 20-target pilot. Accept the pilot only after
+human review checks transcripts, unclear-speech handling, non-speech events,
+and factual summaries.
 Do not run complete semantic production or implement the final H3 renderer until
 that review is accepted.

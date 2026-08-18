@@ -34,9 +34,9 @@ from r2v_data_v2.structured_output import (
 SEMANTIC_SCHEMA_VERSION = "r2v.h3.semantic_clip.2"
 SEMANTIC_INVENTORY_VERSION = "r2v.h3.semantic_inventory.2"
 SEMANTIC_SUMMARY_VERSION = "r2v.h3.semantic_summary.2"
-SEMANTIC_PROMPT_VERSION = "h3_dots3_target_semantics_v1"
+SEMANTIC_PROMPT_VERSION = "h3_dots3_native_video_semantics_v2"
 DEFAULT_DOTS3_MODEL = "dots3-note-prev"
-DEFAULT_DOTS3_CHECKPOINT_ID = "dots-studio/dots3-note-prev-fp8"
+DEFAULT_DOTS3_CHECKPOINT_ID = "/mnt/workspace/public/pretrained/dots3-note-prev"
 PILOT_TARGET_COUNT = 20
 
 SYSTEM_PROMPT = """You extract factual audio-video semantics for one target clip.
@@ -171,7 +171,9 @@ class SemanticBackendProvenance(SchemaModel):
     model_identifier: str
     served_model_name: str
     checkpoint_id: str
-    prompt_version: Literal["h3_dots3_target_semantics_v1"] = SEMANTIC_PROMPT_VERSION
+    prompt_version: Literal["h3_dots3_native_video_semantics_v2"] = (
+        SEMANTIC_PROMPT_VERSION
+    )
     streaming: Literal[False] = False
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
     repair_retries: Literal[1] = 1
@@ -784,7 +786,7 @@ def _user_prompt(job: SemanticInventoryItem) -> str:
         ],
     }
     return (
-        "Analyze the attached target video and separate target full-audio item. The "
+        "Analyze the attached target video, including its native audio track. The "
         "input speech-turn identities and timestamps are authoritative. Return only "
         "turn_id, status, text, and language for every supplied turn and no others; "
         "the producer copies identity and timing from input. Use null text rather than "
@@ -813,6 +815,11 @@ def _repair_prompt(
 
 
 def _verify_source_hash(*, path: Path, expected: str, kind: str) -> None:
+    if not path.is_file():
+        raise SemanticAugmentationFailure(
+            code=f"source_{kind}_changed",
+            reason=f"target {kind} is unavailable after inventory construction",
+        )
     if _sha256_file(path) != expected:
         raise SemanticAugmentationFailure(
             code=f"source_{kind}_changed",
@@ -856,7 +863,6 @@ class OpenAIDots3VLLMBackend:
             kind="audio",
         )
         video_url = self.config.media_resolver.resolve(video_path)
-        audio_url = self.config.media_resolver.resolve(audio_path)
         try:
             completion = self.client.chat.completions.create(
                 model=self.config.served_model_name,
@@ -869,10 +875,6 @@ class OpenAIDots3VLLMBackend:
                             {
                                 "type": "video_url",
                                 "video_url": {"url": video_url},
-                            },
-                            {
-                                "type": "audio_url",
-                                "audio_url": {"url": audio_url},
                             },
                         ],
                     },

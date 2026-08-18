@@ -3,8 +3,8 @@
 This milestone adds read-only target-clip semantics after the frozen
 `r2v.h3.production_pairs.2` pair stage. The R2V producer is an OpenAI-compatible
 client of a separately managed vLLM server running
-`dots-studio/dots3-note-prev-fp8`. It never loads the model, starts vLLM, or
-allocates model GPUs.
+`/mnt/workspace/public/pretrained/dots3-note-prev`. It never loads the model,
+starts vLLM, or allocates model GPUs.
 
 Status boundaries:
 
@@ -26,11 +26,15 @@ reuse that target record and never cause another model call. Donor video, donor
 face/voice, target primary voice, embeddings, and PairPolicy evidence are never
 sent to dots3.
 
-Every request contains three content items in one user message:
+Every request contains two content items in one user message:
 
 1. text with frozen bound-turn metadata and the strict JSON schema;
-2. `video_url` for `target_video_path`;
-3. `audio_url` for `target_full_audio_path`.
+2. `video_url` for `target_video_path`.
+
+The target video's embedded audio is consumed by the native Dots3Note video
+processor. The canonical extracted `target_full_audio_path` and its SHA-256
+remain frozen provenance and integrity evidence: the producer verifies the file
+and hash before every request, but never sends it as a separate `audio_url` item.
 
 The model may return only `turn_id`, transcript `status`, `text`, and `language`
 for each speech turn. The producer copies `entity_id`, `entity_occurrence_id`,
@@ -43,62 +47,55 @@ there is no heuristic transcript fallback.
 Runtime configuration belongs on the R2V producer node:
 
 ```bash
-export DOTS3_BASE_URL='http://<H200_NODE_PRIVATE_IP>:8000/v1'
+export DOTS3_BASE_URL='http://6.167.57.88:8000/v1'
 export DOTS3_API_KEY='EMPTY'
 export DOTS3_MODEL='dots3-note-prev'
-export DOTS3_CHECKPOINT_ID='dots-studio/dots3-note-prev-fp8'
+export DOTS3_CHECKPOINT_ID='/mnt/workspace/public/pretrained/dots3-note-prev'
 ```
 
 The client uses ordinary non-streaming Chat Completions with
-`enable_thinking=false`, video and audio URL content items, temperature zero,
-and text output. The first malformed structured response receives exactly one
+`enable_thinking=false`, text plus one native-video URL content item,
+temperature zero, and text output. The first malformed structured response receives exactly one
 repair request with the malformed text and validation issues. API errors,
 timeouts, empty output, or a second invalid response produce a failed semantic
 record. No Qwen or other backend fallback exists. Raw model text is retained in
 the semantic output's `raw/` directory for diagnostics.
 
 Durable provenance records `backend=vllm`, the served name
-`dots3-note-prev`, the checkpoint ID `dots-studio/dots3-note-prev-fp8`, the
+`dots3-note-prev`, the checkpoint ID
+`/mnt/workspace/public/pretrained/dots3-note-prev`, the
 endpoint, media transport, prompt version, and a configuration fingerprint. API
 keys are never persisted.
 
+The validated checkpoint reports `Dots3NoteForCausalLM`, model type
+`dots3_note`, `bfloat16`, and unquantized weights. The dedicated environment is
+`/mnt/workspace/litengjie/data/audio_deps/dots3-vllm-env`. It uses vLLM commit
+`e0e5a7fb2808504ba86c94f7b379e38496002fd0`, observed as
+`0.27.2rc1.dev191+ge0e5a7fb2`; the vLLM runtime also requires its audio optional
+dependencies, including PyAV and soundfile.
+
 ## Media Transport
 
-Only two root-confined transports are supported. Neither mode copies,
-transcodes, resizes, or Base64-encodes media.
-
-### HTTP mode (canonical cross-node path)
-
-```bash
-export DOTS3_MEDIA_MODE=http
-export DOTS3_MEDIA_ROOT=/mnt/workspace/litengjie/data
-export DOTS3_MEDIA_BASE_URL='http://<DATA_NODE_PRIVATE_IP>:8767/'
-
-cd "$DOTS3_MEDIA_ROOT"
-python -m http.server 8767 --bind 0.0.0.0
-```
-
-For example, `$DOTS3_MEDIA_ROOT/foo/bar.mp4` maps deterministically to
-`$DOTS3_MEDIA_BASE_URL/foo/bar.mp4`. The media server must be restricted to the
-private production network.
-
-### File mode (shared filesystem only)
+The validated deployment uses root-confined `file` transport over the shared
+filesystem. It does not copy, transcode, resize, Base64-encode, or HTTP-serve
+media:
 
 ```bash
 export DOTS3_MEDIA_MODE=file
-export DOTS3_MEDIA_ROOT=/mnt/workspace/litengjie/data
+export DOTS3_MEDIA_ROOT=/mnt/workspace
 unset DOTS3_MEDIA_BASE_URL
 ```
 
-File mode is valid only when both nodes see the exact same absolute paths. Start
-vLLM with the trusted root added as:
+Start vLLM with the same trusted root:
 
 ```text
---allowed-local-media-path /mnt/workspace/litengjie/data
+--allowed-local-media-path /mnt/workspace
 ```
 
-Both modes resolve symlinks and reject missing files, path traversal, or any
-resolved path outside `DOTS3_MEDIA_ROOT`.
+The producer resolves symlinks and rejects missing files, path traversal, or
+any resolved path outside `DOTS3_MEDIA_ROOT`. No port 8767 media server is
+needed. Although the resolver retains legacy HTTP-mode compatibility, HTTP
+media serving is not the canonical validated deployment.
 
 ## Fixed Outputs
 

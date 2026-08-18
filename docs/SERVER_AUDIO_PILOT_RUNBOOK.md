@@ -24,36 +24,42 @@ uv venv --python 3.12 --seed "$DOTS3_VLLM_ENV"
 source "$DOTS3_VLLM_ENV/bin/activate"
 ```
 
-### B. Install the current official vLLM nightly
+### B. Install the validated pinned vLLM runtime
 
-The dots3 model card currently requires native support from recent vLLM
-`main`. Do not replace this with an arbitrary stable-version pin:
+The validated environment uses vLLM `main` commit
+`e0e5a7fb2808504ba86c94f7b379e38496002fd0`, observed as
+`0.27.2rc1.dev191+ge0e5a7fb2`. Current PyPI vLLM is not a substitute for this
+validated revision. Dots3Note native video preprocessing also requires the
+audio optional dependencies PyAV and soundfile:
 
 ```bash
+export VLLM_COMMIT=e0e5a7fb2808504ba86c94f7b379e38496002fd0
 uv pip install -U vllm \
   --torch-backend=auto \
-  --extra-index-url https://wheels.vllm.ai/nightly
+  --extra-index-url "https://wheels.vllm.ai/$VLLM_COMMIT"
+uv pip install av soundfile
+
+python -c 'import vllm; print(vllm.__version__)'
 ```
 
 ### C. Start dots3 on all eight H200 GPUs
 
-This initial command stays aligned with the official FP8 topology and adds no
-unvalidated performance flags:
+The staged checkpoint is
+`/mnt/workspace/public/pretrained/dots3-note-prev`. Its inspected config reports
+`Dots3NoteForCausalLM`, model type `dots3_note`, `bfloat16`, and unquantized
+weights. The following is the validated serve shape:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-vllm serve dots-studio/dots3-note-prev-fp8 \
+vllm serve /mnt/workspace/public/pretrained/dots3-note-prev \
   --served-model-name dots3-note-prev \
   --host 0.0.0.0 \
   --port 8000 \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
-  --moe-backend deep_gemm \
-  --max-model-len 262144
+  --max-model-len 262144 \
+  --allowed-local-media-path /mnt/workspace
 ```
-
-For shared-filesystem `file` transport only, append the trusted
-`--allowed-local-media-path /mnt/workspace/litengjie/data` security boundary.
 
 ### D. Verify the OpenAI-compatible endpoint
 
@@ -64,30 +70,29 @@ curl --fail --silent --show-error \
 
 ### E. Configure the R2V producer
 
-Canonical cross-node production uses HTTP media transport:
+The validated endpoint and shared-file media contract are:
 
 ```bash
 export REPO=/mnt/workspace/litengjie/data/R2V_DATA_V2
 export R2V_PYTHON="$REPO/.venv/bin/python"
 export AUDIO_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs
-export DOTS3_BASE_URL='http://<H200_NODE_PRIVATE_IP>:8000/v1'
+export DOTS3_BASE_URL='http://6.167.57.88:8000/v1'
 export DOTS3_API_KEY='EMPTY'
 export DOTS3_MODEL='dots3-note-prev'
-export DOTS3_CHECKPOINT_ID='dots-studio/dots3-note-prev-fp8'
-export DOTS3_MEDIA_MODE=http
-export DOTS3_MEDIA_ROOT=/mnt/workspace/litengjie/data
-export DOTS3_MEDIA_BASE_URL='http://<DATA_NODE_PRIVATE_IP>:8767/'
+export DOTS3_CHECKPOINT_ID='/mnt/workspace/public/pretrained/dots3-note-prev'
+export DOTS3_MEDIA_MODE=file
+export DOTS3_MEDIA_ROOT=/mnt/workspace
+unset DOTS3_MEDIA_BASE_URL
 ```
 
-### F. Serve source media from the data node
+### F. Keep the native-video transport on the shared filesystem
 
-```bash
-cd "$DOTS3_MEDIA_ROOT"
-python -m http.server 8767 --bind 0.0.0.0
-```
-
-Restrict port 8767 to the private production network. No media is copied,
-transcoded, resized, or Base64-encoded by the producer.
+No HTTP media server is needed. In particular, do not start a port 8767 media
+server for this workflow. The semantic request contains text plus the native
+target video only; Dots3Note reads the embedded audio through native video
+preprocessing. The separately extracted canonical full-audio file remains
+path/hash provenance and is verified by the producer, but it is not sent as an
+`audio_url` item. No media is copied, transcoded, resized, or Base64-encoded.
 
 ### G. Build the semantic inventory without inference
 

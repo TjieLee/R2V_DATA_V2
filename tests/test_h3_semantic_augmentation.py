@@ -25,6 +25,7 @@ from r2v_data_v2.h3.schemas import (
 from r2v_data_v2.h3.semantic_augmentation import (
     DEFAULT_DOTS3_CHECKPOINT_ID,
     DEFAULT_DOTS3_MODEL,
+    SEMANTIC_PROMPT_VERSION,
     Dots3SemanticResponse,
     Dots3VLLMSemanticConfig,
     MediaURLResolver,
@@ -269,6 +270,9 @@ def test_inventory_deduplicates_targets_and_preserves_frozen_bound_turns(
     ]
     assert Path(inventory.jobs[0].target_full_audio_path).name == "clip-a.flac"
     assert len(inventory.jobs[0].target_full_audio_sha256) == 64
+    assert inventory.jobs[0].target_full_audio_sha256 == hashlib.sha256(
+        Path(inventory.jobs[0].target_full_audio_path).read_bytes()
+    ).hexdigest()
 
 
 def test_pilot20_forces_multi_subject_then_fills_deterministically(
@@ -326,6 +330,11 @@ def test_production_calls_once_per_target_and_never_reads_cross_donor(
     assert first_turn["start_time"] == 0.0
     assert first_turn["end_time"] == 1.0
     assert records[0]["source_audio_path"].endswith("clip-a.flac")
+    assert records[0]["source_audio_sha256"] == next(
+        item.target_full_audio_sha256
+        for item in inventory.jobs
+        if item.target_clip_uid == records[0]["target_clip_uid"]
+    )
     assert records[0]["backend_provenance"]["served_model_name"] == (
         DEFAULT_DOTS3_MODEL
     )
@@ -451,7 +460,7 @@ def _client(
     )
 
 
-def test_dots3_vllm_backend_sends_target_video_audio_and_repairs_once(
+def test_dots3_vllm_backend_sends_native_video_only_and_repairs_once(
     tmp_path: Path,
 ) -> None:
     pairs = _write_pairs(tmp_path, [("clip-a", 1)])
@@ -474,19 +483,45 @@ def test_dots3_vllm_backend_sends_target_video_audio_and_repairs_once(
     assert all("modalities" not in call for call in completions.calls)
     assert all(call["model"] == DEFAULT_DOTS3_MODEL for call in completions.calls)
     content = completions.calls[0]["messages"][1]["content"]
-    assert [item["type"] for item in content] == ["text", "video_url", "audio_url"]
+    assert [item["type"] for item in content] == ["text", "video_url"]
     assert content[1]["video_url"]["url"] == Path(job.target_video_path).as_uri()
-    assert content[2]["audio_url"]["url"] == Path(job.target_full_audio_path).as_uri()
+    assert all(item["type"] != "audio_url" for item in content)
+    assert "including its native audio track" in content[0]["text"]
+    assert backend.provenance.prompt_version == SEMANTIC_PROMPT_VERSION
+    assert SEMANTIC_PROMPT_VERSION == "h3_dots3_native_video_semantics_v2"
     assert completions.calls[0]["extra_body"] == {
         "chat_template_kwargs": {"enable_thinking": False}
     }
     request_text = json.dumps(completions.calls[0]["messages"])
+    assert job.target_full_audio_path not in request_text
     assert "donor-secret" not in request_text
     assert "/must/not/be/read.mp4" not in request_text
     assert (
         "Repair the previous JSON only"
         in completions.calls[1]["messages"][1]["content"][0]["text"]
     )
+
+
+def test_dots3_vllm_backend_checks_audio_hash_without_sending_audio(
+    tmp_path: Path,
+) -> None:
+    pairs = _write_pairs(tmp_path, [("clip-a", 1)])
+    job = build_semantic_inventory(pairs_root=pairs, mode="production").jobs[0]
+    Path(job.target_full_audio_path).write_bytes(b"changed-after-inventory")
+    client, completions = _client([_response(job).model_dump_json()])
+    backend = OpenAIDots3VLLMBackend(
+        Dots3VLLMSemanticConfig(
+            base_url="https://example.invalid/v1",
+            media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
+        ),
+        client=client,
+    )
+
+    with pytest.raises(SemanticAugmentationFailure) as exc_info:
+        backend.augment(job)
+
+    assert exc_info.value.code == "source_audio_changed"
+    assert completions.calls == []
 
 
 def test_openai_backend_both_malformed_responses_fail_closed(tmp_path: Path) -> None:
