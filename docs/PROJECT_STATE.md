@@ -37,12 +37,12 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Augment the frozen MiniMax-H3-compatible production target clips with factual
-dots3 transcript and audio-video semantics through a dedicated vLLM server. The semantic layer is keyed by
-unique target clip, never by pair sample, and does not modify completed Visual,
-Audio, embedding, or PairPolicy outputs. Pose, expression, camera control,
-model training, offscreen identity propagation, global transitive identity
-clustering, and final H3 rendering remain out of scope.
+Produce authoritative original-language transcripts for every frozen bound
+speech turn with a dedicated Whisper-large-v3 ASR stage. The ASR inventory is
+keyed by unique target clip and authoritative turn, never by cross-pair sample,
+and does not modify completed Visual, Audio, primary voice, embedding, or
+PairPolicy outputs. Model training, diarization, speech enhancement, semantic
+annotation, and final H3 rendering remain out of scope.
 
 ## Current Pass
 
@@ -79,19 +79,19 @@ models, GPUs, or production data. See `docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for
 the canonical contract.
 
 Audio binding, primary voice, embeddings, and PairPolicy V1 are complete and
-frozen. The current semantic producer reads `production/pairs/in_pairs.jsonl`,
-calls the local `/mnt/workspace/public/pretrained/dots3-note-prev` checkpoint
-through an external OpenAI-compatible vLLM endpoint at most once per target
-clip, and publishes fixed
-`semantic_pilot20` or `production/semantic` outputs. Model output supplies only
-turn ID plus transcript status/text/language; code copies canonical entity
-identity and timestamps from input. Each request contains text and the native
-target video only; Dots3Note consumes the video's embedded audio. The canonical
-extracted full-audio path and hash remain verified provenance and are not sent
-as a separate model input. Donor media is never sent. Failed semantics never
-delete a valid pair. The H3 exporter remains demo/not final, and the Visual
-subject attribute workstream remains separate and is not consumed. See
-`docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for the runtime contract.
+frozen. The active producer now reads `production/pairs/in_pairs.jsonl`, rebuilds
+the same canonical frozen bound turns, and sends each exact source-audio turn
+crop independently to Whisper-large-v3 with `task=transcribe`. Code owns all
+identity, entity, and timestamp fields. Cross-pairs never create extra jobs, and
+video, donor media, primary voice, embeddings, and PairPolicy evidence never
+reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
+
+The dots3 native-video runtime remains technically operational, but human QA of
+the 20-clip semantic pilot found severe hallucinated dialogue. Existing
+`semantic_pilot20` output is diagnostic evidence only. dots3 transcript
+generation and complete semantic production are blocked; do not delete or
+promote that pilot. The earlier native-video transport contract remains
+documented in `docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for diagnostics.
 
 The validated dedicated runtime uses checkpoint architecture
 `Dots3NoteForCausalLM` / model type `dots3_note`, `bfloat16`, unquantized
@@ -137,14 +137,14 @@ or production artifact may change in this pass.
 Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
-python -m pytest tests/test_h3_semantic_augmentation.py -q
-# 17 passed
+python -m pytest tests/test_h3_asr_transcription.py -q
+# 14 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 171 passed
+# 185 passed
 
 python -m pytest -q
-# 1838 passed, 1 existing Pillow deprecation warning
+# 1852 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -171,10 +171,9 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-On the server, reuse the validated dedicated 8-H200 dots3/vLLM service and
-shared-root native-video transport, build the read-only semantic inventory,
-then run and inspect the fixed 20-target pilot. Accept the pilot only after
-human review checks transcripts, unclear-speech handling, non-speech events,
-and factual summaries.
-Do not run complete semantic production or implement the final H3 renderer until
-that review is accepted.
+On the server, stage a local CTranslate2 Whisper-large-v3 checkpoint in the
+dedicated `asr-venv`, dry-run the deterministic inventory, then run and inspect
+the fixed `asr_pilot20`. Accept it only after human review checks verbatim
+original-language transcription, hallucination, repeated text, missed speech,
+and empty-output behavior. Do not run complete ASR production until that review
+passes, and do not run dots3 semantic production.

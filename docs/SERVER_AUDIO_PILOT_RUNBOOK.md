@@ -4,17 +4,105 @@ This is the operational runbook for the server-side Audio/H3 pilot. Keep the
 layout small and stable. Do not create a timestamped directory for every smoke
 attempt.
 
-## Canonical dots3 semantic sequence
+## Canonical Whisper ASR sequence
+
+Current milestone boundaries:
+
+- Visual, Audio binding, primary voice, embeddings, and PairPolicy V1 are **COMPLETE / FROZEN**.
+- Whisper-large-v3 ASR is the active **PILOT / PRODUCTION** workflow.
+- dots3 transcript generation is **BLOCKED AFTER FAILED HUMAN QA**.
+- The existing `semantic_pilot20` is diagnostic evidence only; do not delete it
+  and do not run complete semantic production.
+- DiariZen, speech enhancement, trusted-transcript dots3 annotation, and final
+  H3 rendering are future work.
+
+### A. Create the dedicated ASR environment
+
+```bash
+export ASR_ENV=/mnt/workspace/litengjie/data/audio_deps/asr-venv
+uv venv --python 3.12 --seed "$ASR_ENV"
+uv pip install --python "$ASR_ENV/bin/python" \
+  faster-whisper "pydantic>=2,<3" Pillow
+```
+
+Keep this environment separate from system Python, LR-ASD, embeddings, and
+dots3/vLLM. The server must provide a faster-whisper-compatible CUDA 12/cuBLAS
+and cuDNN 9 runtime.
+
+### B. Configure a local Whisper-large-v3 checkpoint
+
+```bash
+export REPO=/mnt/workspace/litengjie/data/R2V_DATA_V2
+export AUDIO_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs
+export ASR_MODEL_PATH=/mnt/workspace/public/pretrained/<local-whisper-large-v3-ct2>
+export ASR_MODEL=large-v3
+# Optional for an identifier; local paths are fingerprinted automatically:
+# export ASR_MODEL_FINGERPRINT=<64-character-sha256>
+export ASR_DEVICE=cuda:0
+export ASR_COMPUTE_TYPE=float16
+```
+
+`ASR_MODEL_PATH` takes precedence. Production loading is local-only and a
+requested CUDA device never silently falls back to CPU. A local model path is
+content-fingerprinted automatically; an explicitly supplied fingerprint must
+match and becomes part of strict output-reuse validation.
+
+### C. Dry-run the fixed pilot inventory without loading a model
+
+```bash
+cd "$REPO"
+"$ASR_ENV/bin/python" tools/run_h3_asr_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --dry-run
+```
+
+Confirm `parent_quota_applied=false`, `donor_media_used=false`, the selected
+target count, turn count, and output root `$AUDIO_RUN_ROOT/asr_pilot20`.
+
+### D. Run and review the fixed pilot
+
+```bash
+cd "$REPO"
+"$ASR_ENV/bin/python" tools/run_h3_asr_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --overwrite
+
+cd "$AUDIO_RUN_ROOT/asr_pilot20"
+python -m http.server 8766 --bind 127.0.0.1
+```
+
+Review exact turn crops for hallucination, translation, repeated text, language
+errors, missed speech, and incorrect empty output.
+
+### E. Run formal ASR production only after pilot acceptance
+
+```bash
+cd "$REPO"
+"$ASR_ENV/bin/python" tools/run_h3_asr_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production
+
+python -m json.tool "$AUDIO_RUN_ROOT/production/asr/summary.json"
+```
+
+Production includes every authoritative turn from every unique target in-pair.
+It has no `limit`, parent quota, calibration sampler, or cross-pair duplication.
+
+## Blocked dots3 diagnostic sequence
 
 Current milestone boundaries:
 
 - Audio binding, primary voice, embeddings, and PairPolicy V1 are **COMPLETE / FROZEN**.
-- dots3 semantic augmentation through vLLM is the active **PILOT / PRODUCTION** workflow.
+- dots3 native-video semantic augmentation is **BLOCKED AFTER FAILED HUMAN QA**.
 - The H3 exporter is **DEMO / NOT FINAL**.
 - Visual subject attributes are a separate workstream and are not consumed here.
 
 The old Qwen/DashScope semantic commands are obsolete and are not a production
-fallback. Use this single A-K sequence.
+fallback. The following records the validated dots3 runtime only. Do not run
+complete semantic production until a future trusted-ASR semantic contract is
+implemented and reviewed.
 
 ### A. Create the dedicated dots3 environment on the 8-H200 node
 
@@ -123,23 +211,15 @@ cd "$AUDIO_RUN_ROOT/semantic_pilot20"
 
 Open `http://127.0.0.1:8766/review.html` through the SSH port forward.
 
-### J. Run all unique production targets
+### J. Complete dots3 semantic production is blocked
+
+Do not run `tools/run_h3_omni_semantic.py --mode production`. The native-video
+20-clip pilot produced severe hallucinated dialogue and remains diagnostic only.
+
+### K. Inspect existing diagnostic output only
 
 ```bash
-cd "$REPO"
-"$R2V_PYTHON" tools/run_h3_omni_semantic.py \
-  --audio-run-root "$AUDIO_RUN_ROOT" \
-  --mode production
-```
-
-This uses every target in production `in_pairs.jsonl` (75 in the frozen pair
-set), with no bounded sampler or parent quota.
-
-### K. Inspect the concise production summary
-
-```bash
-python -m json.tool \
-  "$AUDIO_RUN_ROOT/production/semantic/summary.json"
+python -m json.tool "$AUDIO_RUN_ROOT/semantic_pilot20/summary.json"
 ```
 
 ## Canonical directory layout
@@ -151,11 +231,13 @@ python -m json.tool \
 │   ├── LR-ASD/                          # pinned vendor checkout
 │   ├── lr-asd-venv/                     # Python 3.10 uv venv
 │   ├── embedding-venv/                  # isolated face/speaker inference env
+│   ├── asr-venv/                        # isolated Whisper/faster-whisper env
 │   ├── embedding_models/                # manually staged local model files
 │   └── uv-python/                       # uv managed Python
 └── r2v_audio_runs/
     ├── smoke/                           # one reusable single-clip smoke output
     ├── pilot20/                         # one reusable 20-clip validation output
+    ├── asr_pilot20/                     # fixed Whisper ASR pilot output
     ├── pair_calibration/                # fixed pair-calibration workspace
     │   ├── plan/                        # deterministic Visual clip plan
     │   ├── face_mining/                 # Visual-only face retrieval + review
@@ -164,7 +246,9 @@ python -m json.tool \
     │   ├── audio/                       # LR-ASD Audio binding outputs
     │   ├── primary_voice/               # frozen V1 primary voice references
     │   └── embedding/                   # face/speaker retrieval diagnostics
-    └── production/                      # create only when batch production starts
+    └── production/                      # fixed formal production outputs
+        ├── pairs/                       # frozen in/cross pair source artifacts
+        └── asr/                         # all authoritative turn transcripts
 ```
 
 LR-ASD itself creates `pyavi`, `pyframes`, `pywork`, and `pycrop` under its
