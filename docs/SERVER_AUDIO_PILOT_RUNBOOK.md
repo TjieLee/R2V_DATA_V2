@@ -14,8 +14,11 @@ Current milestone boundaries:
 - dots3 transcript generation is **BLOCKED AFTER FAILED HUMAN QA**.
 - The existing `semantic_pilot20` is diagnostic evidence only; do not delete it
   and do not run complete semantic production.
-- DiariZen, speech enhancement, trusted-transcript dots3 annotation, and final
-  H3 rendering are future work.
+- The DiariZen-assisted speaker-binding pilot is implemented but its real
+  runtime and mapping quality are not yet server-validated. Production is
+  blocked pending human calibration.
+- Speech enhancement, trusted-transcript dots3 annotation, and final H3
+  rendering remain future work.
 
 ### One-Time Setup
 
@@ -148,7 +151,69 @@ substitutions, proper-name/near-homophone errors, and likely short-context or
 segmentation limitations. Dedicated Whisper-large-v3 remains the baseline and
 is more trustworthy than dots3-generated dialogue, but raw ASR is not final H3
 truth. DiariZen speaker segmentation/continuity and constrained contextual
-resolution remain future work, not implemented production behavior.
+resolution remain outside frozen ASR V1.
+
+## DiariZen-Assisted Speaker Binding Pilot (Unvalidated Runtime)
+
+This calibration stage reuses the exact ordered target list and fingerprint in
+`$AUDIO_RUN_ROOT/asr_pilot20/inventory.json`. It reads canonical full audio and
+raw frozen AudioEntityBinding evidence from production in-pairs, creates one
+DiariZen call per unique target clip, and never reads cross-pairs as jobs.
+Outputs use only `$AUDIO_RUN_ROOT/diarization_pilot20`.
+
+Dry-run before staging or loading the model:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --dry-run
+```
+
+Expected runtime variables after the separate environment and local cache have
+been staged:
+
+```bash
+export DIARIZEN_PYTHON=/mnt/workspace/litengjie/data/audio_deps/diarizen-venv/bin/python
+export DIARIZEN_CODE_ROOT=/mnt/workspace/litengjie/data/audio_deps/DiariZen
+export DIARIZEN_MODEL_PATH=/mnt/workspace/litengjie/data/audio_deps/diarizen-model-cache
+export DIARIZEN_MODEL_IDENTIFIER=BUT-FIT/diarizen-wavlm-large-s80-md-v2
+export DIARIZEN_DEVICE=cuda:0
+export DIARIZEN_TIMEOUT_SECONDS=900
+```
+
+Real pilot after an operator has validated the dedicated environment:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --overwrite
+
+cd "$AUDIO_RUN_ROOT/diarization_pilot20"
+"$R2V_PYTHON" -m http.server 8767 --bind 127.0.0.1
+```
+
+Review the overlap-preserving speaker lanes and export cluster QA JSON. Human
+labels are calibration evidence only. Future complete enumeration can be
+verified without loading DiariZen:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production \
+  --dry-run
+```
+
+Real production remains fail-closed with
+`production_blocked_pending_diarization_binding_calibration`. The model
+candidate and one-time staging procedure are recorded in
+`docs/H3_DIARIZEN_SPEAKER_BINDING.md`; that procedure is explicitly
+**UNVALIDATED**. Official source is MIT licensed, while released model weights
+are CC BY-NC 4.0 for research/non-commercial use.
 
 ## Blocked dots3 diagnostic sequence
 

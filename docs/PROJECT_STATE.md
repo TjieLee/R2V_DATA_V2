@@ -37,13 +37,11 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Close out the dedicated Whisper-large-v3 ASR V1 pilot with deterministic human
-QA export and model-free review regeneration. The ASR inventory is keyed by
-unique target clip and authoritative turn, never by cross-pair sample, and does
-not modify completed Visual, Audio, primary voice, embedding, or PairPolicy
-outputs. Raw pilot transcripts are not final H3 truth. Model training,
-diarization, speech enhancement, semantic annotation, and final H3 rendering
-remain out of scope.
+Calibrate DiariZen-assisted clip-local speaker continuity against the frozen
+LR-ASD plus Visual identity evidence. The pilot reuses the exact ordered 20
+targets already reviewed for ASR, preserves overlapping anonymous speaker
+segments, and propagates a sparsely anchored entity to all segments in the same
+cluster. Production execution remains blocked until human calibration.
 
 ## Current Pass
 
@@ -87,12 +85,20 @@ identity, entity, and timestamp fields. Cross-pairs never create extra jobs, and
 video, donor media, primary voice, embeddings, and PairPolicy evidence never
 reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
 
-The frozen LR-ASD-derived bound turns are a temporary V1 segmentation baseline,
+The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and
 entity-binding provenance, including an optional anonymous speaker-cluster ID.
 A future DiariZen inventory may replace the boundaries after clip-level
 cluster-to-Visual-entity overlap mapping without changing Whisper inference.
-DiariZen and identity propagation are documentation-only in this pass.
+The separate DiariZen-assisted binding pilot now implements that calibration
+inventory, raw overlap-preserving schemas, sample-domain sparse identity
+anchoring, cluster propagation, summary, and static human review. It does not
+modify or rerun ASR V1.
+
+The official DiariZen runtime and current model candidate remain unvalidated on
+the server. Real production execution is blocked, and the released model
+weights are research/non-commercial CC BY-NC 4.0. See
+`docs/H3_DIARIZEN_SPEAKER_BINDING.md`.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
@@ -150,17 +156,18 @@ or production artifact may change in this pass.
 
 ## Tested Commands
 
-Completed GPU-free validation for this integration pass with Python 3.12.13:
+Completed GPU-free validation for the DiariZen-assisted binding implementation
+with Python 3.12.13:
 
 ```bash
-python -m pytest tests/test_h3_asr_transcription.py -q
-# 18 passed
+python -m pytest tests/test_h3_diarization*.py -q
+# 16 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 189 passed
+# 205 passed
 
 python -m pytest -q
-# 1856 passed, 1 existing Pillow deprecation warning
+# 1872 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -187,9 +194,8 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Export and retain the completed ASR pilot QA JSON with its inventory
-fingerprint. The next major investigation is DiariZen-based canonical speaker
-segmentation and continuity, followed later by aggregate LR-ASD/Visual identity
-anchors and constrained unresolved-speaker handling. None of those future
-stages is implemented here. Do not run complete ASR or dots3 semantic production
-until the corresponding segmentation and transcript-truth policy is approved.
+Stage and validate the isolated DiariZen environment and local model cache, then
+run the fixed 20-clip pilot and review every cluster mapping. Use the review to
+calibrate a production mapping policy before lifting the explicit production
+block. ASR V2, enhancement, unresolved-speaker MLLM handling, entity-to-subject
+mapping, and final `<d>` rendering remain future work.
