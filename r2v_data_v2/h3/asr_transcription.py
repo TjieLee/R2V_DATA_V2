@@ -32,6 +32,8 @@ ASR_INVENTORY_SCHEMA_VERSION = "r2v.h3.asr_inventory.1"
 ASR_SUMMARY_SCHEMA_VERSION = "r2v.h3.asr_summary.1"
 ASR_REQUEST_CONTRACT_VERSION = "h3_whisper_authoritative_turn_asr_v1"
 ASR_PREPROCESSING_VERSION = "pcm16_exact_turn_crop_v1"
+CURRENT_BOUNDARY_SOURCE = "frozen_audio_binding_turns_v1"
+CURRENT_ENTITY_BINDING_SOURCE = "lr_asd_visual_entity_binding_v1"
 DEFAULT_ASR_MODEL = "large-v3"
 DEFAULT_ASR_DEVICE = "cuda:0"
 DEFAULT_ASR_COMPUTE_TYPE = "float16"
@@ -100,6 +102,29 @@ class ASRTargetClip(SchemaModel):
         return self
 
 
+class ASRTurnSegmentationProvenance(SchemaModel):
+    boundary_source: str
+    source_segment_id: str
+    speaker_cluster_id: str | None = None
+    entity_binding_source: str
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> ASRTurnSegmentationProvenance:
+        required = (
+            self.boundary_source,
+            self.source_segment_id,
+            self.entity_binding_source,
+        )
+        if any(not value.strip() for value in required):
+            raise ValueError("ASR turn segmentation provenance must not be empty")
+        if (
+            self.speaker_cluster_id is not None
+            and not self.speaker_cluster_id.strip()
+        ):
+            raise ValueError("ASR speaker cluster ID must be non-empty or null")
+        return self
+
+
 class ASRTurnJob(SchemaModel):
     target_clip_uid: str
     turn_id: str
@@ -113,6 +138,7 @@ class ASRTurnJob(SchemaModel):
     source_channels: int = Field(gt=0)
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
+    segment_provenance: ASRTurnSegmentationProvenance
 
     @model_validator(mode="after")
     def validate_job(self) -> ASRTurnJob:
@@ -730,6 +756,12 @@ def build_asr_inventory(
                 source_channels=audio.channels,
                 source_start_sample=turn.start_sample,
                 source_end_sample=turn.end_sample,
+                segment_provenance=ASRTurnSegmentationProvenance(
+                    boundary_source=CURRENT_BOUNDARY_SOURCE,
+                    source_segment_id=turn.turn_id,
+                    speaker_cluster_id=None,
+                    entity_binding_source=CURRENT_ENTITY_BINDING_SOURCE,
+                ),
             )
             for turn in turns
         ]

@@ -86,6 +86,13 @@ identity, entity, and timestamp fields. Cross-pairs never create extra jobs, and
 video, donor media, primary voice, embeddings, and PairPolicy evidence never
 reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
 
+The frozen LR-ASD-derived bound turns are a temporary V1 segmentation baseline,
+not a Whisper backend dependency. Turn records carry generic segmentation and
+entity-binding provenance, including an optional anonymous speaker-cluster ID.
+A future DiariZen inventory may replace the boundaries after clip-level
+cluster-to-Visual-entity overlap mapping without changing Whisper inference.
+DiariZen and identity propagation are documentation-only in this pass.
+
 The dots3 native-video runtime remains technically operational, but human QA of
 the 20-clip semantic pilot found severe hallucinated dialogue. Existing
 `semantic_pilot20` output is diagnostic evidence only. dots3 transcript
@@ -138,13 +145,13 @@ Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_asr_transcription.py -q
-# 14 passed
+# 15 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 185 passed
+# 186 passed
 
 python -m pytest -q
-# 1852 passed, 1 existing Pillow deprecation warning
+# 1853 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed

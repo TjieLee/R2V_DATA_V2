@@ -14,6 +14,7 @@ from r2v_data_v2.h3.asr_transcription import (
     ASRDecoderDiagnostics,
     ASRTranscriptionFailure,
     ASRTurnRecord,
+    ASRTurnSegmentationProvenance,
     FasterWhisperASRBackend,
     WhisperASRConfig,
     asr_output_root,
@@ -325,6 +326,12 @@ def test_inventory_uses_only_in_pairs_and_preserves_authoritative_turns(
     assert inventory.selected_turn_count == 3
     assert inventory.parent_quota_applied is False
     assert inventory.donor_media_used is False
+    assert first.segment_provenance.model_dump() == {
+        "boundary_source": "frozen_audio_binding_turns_v1",
+        "source_segment_id": "turn_1",
+        "speaker_cluster_id": None,
+        "entity_binding_source": "lr_asd_visual_entity_binding_v1",
+    }
     assert "donor-only" not in inventory.model_dump_json()
     backend = _FakeBackend()
     run_asr_transcription(
@@ -333,6 +340,42 @@ def test_inventory_uses_only_in_pairs_and_preserves_authoritative_turns(
         backend=backend,
     )
     assert len(backend.calls) == inventory.selected_turn_count == 3
+
+
+def test_replacement_segment_inventory_does_not_change_whisper_inference_contract(
+    tmp_path: Path,
+) -> None:
+    pairs = _write_pairs(tmp_path, [("clip-a", [(0.0, 0.4, "e1")])])
+    inventory = build_asr_inventory(pairs_root=pairs, mode="production")
+    replacement_job = inventory.jobs[0].model_copy(
+        update={
+            "segment_provenance": ASRTurnSegmentationProvenance(
+                boundary_source="diarization_speaker_segments_v1",
+                source_segment_id="speaker_2/segment_7",
+                speaker_cluster_id="speaker_2",
+                entity_binding_source="clip_overlap_entity_mapping_v1",
+            )
+        }
+    )
+    replacement_inventory = inventory.model_copy(update={"jobs": [replacement_job]})
+    backend = _FakeBackend()
+
+    run_asr_transcription(
+        inventory=replacement_inventory,
+        output_root=tmp_path / "asr",
+        backend=backend,
+    )
+
+    assert len(backend.calls) == 1
+    waveform, sample_rate_hz = backend.calls[0]
+    assert isinstance(waveform, np.ndarray)
+    assert sample_rate_hz == 16000
+    record = ASRTurnRecord.model_validate(
+        _read_records(tmp_path / "asr" / "turns.jsonl")[0]
+    )
+    assert record.entity_occurrence_id == "clip-a/e1"
+    assert record.segment_provenance.speaker_cluster_id == "speaker_2"
+    assert record.segment_provenance.source_segment_id == "speaker_2/segment_7"
 
 
 def test_production_keeps_every_target_and_turn_without_parent_quota(

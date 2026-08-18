@@ -25,6 +25,12 @@ Code, not Whisper, owns:
 - authoritative `start_time` and `end_time`;
 - exact source start/end sample indexes.
 
+Each turn also carries model-independent `segment_provenance`: the boundary
+source, source segment ID, optional anonymous speaker-cluster ID, and the source
+of the entity binding. V1 records `frozen_audio_binding_turns_v1` boundaries
+and `lr_asd_visual_entity_binding_v1` identity. These are provenance values,
+not Whisper inputs or hard-coded backend policy.
+
 Whisper receives only the exact turn waveform. It never receives target video,
 donor media, primary voice references, embeddings, PairPolicy evidence, or
 identity fields. It cannot add, remove, merge, split, retime, or re-identify
@@ -172,9 +178,15 @@ DiariZen
 LR-ASD + Visual
   -> visible speaker to entity ID
 temporal overlap join
-  -> DiariZen boundary plus existing Visual entity identity
+  -> aggregate speaker-cluster overlap with visible entity anchors
+confident cluster-to-entity mapping
+  -> propagate that entity identity to every segment in the cluster,
+     including occluded or offscreen segments with no Visual overlap
 ```
 
-This ASR V1 does not change the frozen production turns and does not implement
-DiariZen, overlap reconciliation, speech enhancement, dots3 annotation, or the
-final structured H3 renderer.
+The Whisper backend accepts only a waveform and sample rate. A future inventory
+builder may therefore replace the temporary LR-ASD-derived turn baseline with
+mapped DiariZen speaker segments while preserving the same inference and turn
+record publication path. This ASR V1 does not change the frozen production
+turns and does not implement DiariZen, overlap reconciliation, speech
+enhancement, dots3 annotation, or the final structured H3 renderer.
