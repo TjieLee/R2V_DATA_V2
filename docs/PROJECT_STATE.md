@@ -37,10 +37,12 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Run the frozen MiniMax-H3-compatible Audio path over the complete eligible V3
-set with explicit, reusable production stages. Pose, expression, camera control,
+Augment the frozen MiniMax-H3-compatible production target clips with factual
+Qwen Omni transcript and audio-video semantics. The semantic layer is keyed by
+unique target clip, never by pair sample, and does not modify completed Visual,
+Audio, embedding, or PairPolicy outputs. Pose, expression, camera control,
 model training, offscreen identity propagation, global transitive identity
-clustering, and Omni remain out of scope.
+clustering, and final H3 rendering remain out of scope.
 
 ## Current Pass
 
@@ -75,6 +77,13 @@ acceptance policy. Real server pilots validated Audio binding and froze the
 primary-voice and pair policies; this Mac implementation pass does not rerun
 models, GPUs, or production data. See `docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for
 the canonical contract.
+
+The current semantic producer reads `production/pairs/in_pairs.jsonl`, calls
+Qwen Omni at most once per target clip, strictly preserves canonical bound-turn
+identity and timestamps, and publishes fixed `semantic_pilot20` or
+`production/semantic` outputs. Donor media is never model input, and failed
+semantics never delete a valid pair. See
+`docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for the runtime contract.
 
 ### Earlier audio scaffold
 
@@ -113,16 +122,14 @@ or production artifact may change in this pass.
 Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
-python -m pytest tests/test_h3_audio_production.py \
-  tests/test_h3_audio_binding.py \
-  tests/test_h3_primary_voice.py \
-  tests/test_h3_embedding_pilot.py \
-  tests/test_h3_pairing_pilot.py \
-  tests/test_h3_audio_dataset.py -q
-# 119 passed
+python -m pytest tests/test_h3_semantic_augmentation.py -q
+# 12 passed
+
+python -m pytest tests/test_h3_*.py -q
+# 166 passed
 
 python -m pytest -q
-# 1819 passed, 1 existing Pillow deprecation warning
+# 1833 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -149,8 +156,8 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Review this bounded infrastructure, then configure isolated LR-ASD and Silero
-environments on the server and run a small explicit-clip pilot outside every V3
-run root. Inspect the review bundles before comparing Light-ASD or TalkNet.
-Do not add audio binding to the production V3 stage order until real evidence
-validates the provisional association and fusion policies.
+On the server, build the read-only semantic inventory, then run and inspect the
+fixed 20-target Qwen Omni pilot. Accept the pilot only after human review checks
+transcripts, unclear-speech handling, non-speech events, and factual summaries.
+Do not run complete semantic production or implement the final H3 renderer until
+that review is accepted.

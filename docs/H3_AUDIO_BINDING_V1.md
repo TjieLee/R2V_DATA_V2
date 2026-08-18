@@ -247,6 +247,13 @@ and publish no cross-pair. No transitive clustering is performed. Every selected
 subject mapping is included in `pairs/review.html`.
 See `docs/SERVER_AUDIO_PILOT_RUNBOOK.md` for exact stage and review commands.
 
+The subsequent Omni semantic milestone is deliberately separate from pair
+construction. It reads the final in-pair target inventory, analyzes each unique
+target video at most once, and reuses that same target semantic record for any
+cross-pair. It cannot change speech-turn identity/timestamps or consume donor
+media. See `docs/H3_OMNI_SEMANTIC_AUGMENTATION.md`; final H3 rendering remains
+out of scope.
+
 Each successful case produces:
 
 ```text
