@@ -58,6 +58,13 @@ def _strip_complete_json_fence(content: str) -> str:
     return match.group(1).strip()
 
 
+def parse_structured_json_response(raw: str, model: type[ModelT]) -> ModelT:
+    payload = json.loads(_strip_complete_json_fence(raw))
+    if not isinstance(payload, dict):
+        raise TypeError("structured response must be one JSON object")
+    return model.model_validate(payload)
+
+
 def parse_qwen_json_response(raw: str, model: type[ModelT]) -> ModelT:
     payload = json.loads(_strip_complete_json_fence(raw))
     if not isinstance(payload, dict):
@@ -65,12 +72,13 @@ def parse_qwen_json_response(raw: str, model: type[ModelT]) -> ModelT:
     return model.model_validate(payload)
 
 
-def parse_qwen_json_issues(
+def _parse_json_issues(
     raw: str,
     model: type[ModelT],
+    parser: Callable[[str, type[ModelT]], ModelT],
 ) -> tuple[ModelT | None, list[ValidationIssue]]:
     try:
-        return parse_qwen_json_response(raw, model), []
+        return parser(raw, model), []
     except json.JSONDecodeError as exc:
         return None, [
             ValidationIssue(
@@ -99,6 +107,20 @@ def parse_qwen_json_issues(
         return None, [
             ValidationIssue(code="invalid_json_object", field=None, message=str(exc))
         ]
+
+
+def parse_structured_json_issues(
+    raw: str,
+    model: type[ModelT],
+) -> tuple[ModelT | None, list[ValidationIssue]]:
+    return _parse_json_issues(raw, model, parse_structured_json_response)
+
+
+def parse_qwen_json_issues(
+    raw: str,
+    model: type[ModelT],
+) -> tuple[ModelT | None, list[ValidationIssue]]:
+    return _parse_json_issues(raw, model, parse_qwen_json_response)
 
 
 def build_structured_repair_prompt(
@@ -152,7 +174,7 @@ def request_structured_output(
                 attempt_count=attempt + 1,
             ) from exc
         raw_responses.append(raw)
-        result, issues = parse_qwen_json_issues(raw, model)
+        result, issues = parse_structured_json_issues(raw, model)
         if result is not None and validate is not None:
             issues = validate(result)
         if result is not None and not issues:

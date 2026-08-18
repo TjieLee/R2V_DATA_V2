@@ -12,10 +12,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.h3.semantic_augmentation import (
-    DEFAULT_MAX_BASE64_BYTES,
-    DEFAULT_QWEN_OMNI_MODEL,
-    OpenAIQwenOmniBackend,
-    QwenOmniSemanticConfig,
+    DEFAULT_DOTS3_CHECKPOINT_ID,
+    DEFAULT_DOTS3_MODEL,
+    Dots3VLLMSemanticConfig,
+    MediaURLResolver,
+    OpenAIDots3VLLMBackend,
     SemanticInventory,
     SemanticProductionSummary,
     build_semantic_inventory,
@@ -41,7 +42,7 @@ def _positive_float(value: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Augment frozen H3 production target clips with Qwen Omni semantics",
+        description="Augment frozen H3 target clips through dots3 on vLLM",
     )
     parser.add_argument("--audio-run-root", type=Path, required=True)
     parser.add_argument(
@@ -54,11 +55,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url")
     parser.add_argument("--api-key")
     parser.add_argument("--model")
-    parser.add_argument(
-        "--max-base64-bytes",
-        type=_positive_integer,
-        default=None,
-    )
+    parser.add_argument("--checkpoint-id")
+    parser.add_argument("--media-mode", choices=("file", "http"))
+    parser.add_argument("--media-root", type=Path)
+    parser.add_argument("--media-base-url")
     parser.add_argument("--timeout-seconds", type=_positive_float, default=600.0)
     parser.add_argument("--max-tokens", type=_positive_integer, default=4096)
     return parser
@@ -72,17 +72,8 @@ def _environment_or_argument(
 ) -> str:
     value = explicit or os.environ.get(environment_name) or default
     if value is None or not value.strip():
-        raise ValueError(f"missing Qwen Omni runtime input: {environment_name}")
+        raise ValueError(f"missing dots3/vLLM runtime input: {environment_name}")
     return value.strip()
-
-
-def _maximum_base64_bytes(explicit: int | None) -> int:
-    if explicit is not None:
-        return explicit
-    raw = os.environ.get("QWEN_OMNI_MAX_BASE64_BYTES")
-    if raw is None:
-        return DEFAULT_MAX_BASE64_BYTES
-    return _positive_integer(raw)
 
 
 def _reuse_existing(
@@ -90,6 +81,7 @@ def _reuse_existing(
     output_root: Path,
     inventory: SemanticInventory,
     model_identifier: str,
+    served_model_name: str,
 ) -> SemanticProductionSummary | None:
     if not semantic_stage_is_complete(output_root):
         return None
@@ -107,6 +99,10 @@ def _reuse_existing(
         raise ValueError(
             "existing semantic output uses a different model; pass --overwrite"
         )
+    if summary.backend_provenance.served_model_name != served_model_name:
+        raise ValueError(
+            "existing semantic output uses a different served model; pass --overwrite"
+        )
     return summary
 
 
@@ -119,10 +115,15 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         mode=arguments.mode,
     )
     output_root = semantic_output_root(audio_run_root, mode=arguments.mode)
-    model_identifier = _environment_or_argument(
+    served_model_name = _environment_or_argument(
         arguments.model,
-        "QWEN_OMNI_MODEL",
-        default=DEFAULT_QWEN_OMNI_MODEL,
+        "DOTS3_MODEL",
+        default=DEFAULT_DOTS3_MODEL,
+    )
+    checkpoint_id = _environment_or_argument(
+        arguments.checkpoint_id,
+        "DOTS3_CHECKPOINT_ID",
+        default=DEFAULT_DOTS3_CHECKPOINT_ID,
     )
     plan = {
         "mode": arguments.mode,
@@ -134,7 +135,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ),
         "inventory_fingerprint": inventory.inventory_fingerprint,
         "output_root": str(output_root),
-        "model_identifier": model_identifier,
+        "model_identifier": checkpoint_id,
+        "served_model_name": served_model_name,
         "bounded_selection_applied": inventory.bounded_selection_applied,
         "parent_quota_applied": False,
         "donor_media_used": False,
@@ -147,7 +149,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         existing = _reuse_existing(
             output_root=output_root,
             inventory=inventory,
-            model_identifier=model_identifier,
+            model_identifier=checkpoint_id,
+            served_model_name=served_model_name,
         )
         if existing is not None:
             result = {
@@ -158,24 +161,44 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             return result
 
-    config = QwenOmniSemanticConfig(
+    media_mode = _environment_or_argument(
+        arguments.media_mode,
+        "DOTS3_MEDIA_MODE",
+        default="file",
+    )
+    if media_mode not in {"file", "http"}:
+        raise ValueError("DOTS3_MEDIA_MODE must be file or http")
+    media_root = Path(
+        _environment_or_argument(
+            None if arguments.media_root is None else str(arguments.media_root),
+            "DOTS3_MEDIA_ROOT",
+        )
+    )
+    media_base_url = arguments.media_base_url or os.environ.get("DOTS3_MEDIA_BASE_URL")
+    config = Dots3VLLMSemanticConfig(
         base_url=_environment_or_argument(
             arguments.base_url,
-            "QWEN_OMNI_BASE_URL",
+            "DOTS3_BASE_URL",
         ),
         api_key=_environment_or_argument(
             arguments.api_key,
-            "DASHSCOPE_API_KEY",
+            "DOTS3_API_KEY",
+            default="EMPTY",
         ),
-        model=model_identifier,
-        max_base64_bytes=_maximum_base64_bytes(arguments.max_base64_bytes),
+        served_model_name=served_model_name,
+        checkpoint_id=checkpoint_id,
+        media_resolver=MediaURLResolver(
+            mode=media_mode,
+            media_root=media_root,
+            media_base_url=media_base_url if media_mode == "http" else None,
+        ),
         timeout_seconds=arguments.timeout_seconds,
         max_tokens=arguments.max_tokens,
     )
     summary = run_semantic_augmentation(
         inventory=inventory,
         output_root=output_root,
-        backend=OpenAIQwenOmniBackend(config),
+        backend=OpenAIDots3VLLMBackend(config),
         overwrite=arguments.overwrite,
     )
     result = {

@@ -1,6 +1,6 @@
 # R2V_DATA_V2 Project State
 
-Last updated: 2026-08-17
+Last updated: 2026-08-18
 
 ## Repository
 
@@ -38,7 +38,7 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 ## Current Development Goal
 
 Augment the frozen MiniMax-H3-compatible production target clips with factual
-Qwen Omni transcript and audio-video semantics. The semantic layer is keyed by
+dots3 transcript and audio-video semantics through a dedicated vLLM server. The semantic layer is keyed by
 unique target clip, never by pair sample, and does not modify completed Visual,
 Audio, embedding, or PairPolicy outputs. Pose, expression, camera control,
 model training, offscreen identity propagation, global transitive identity
@@ -78,11 +78,16 @@ primary-voice and pair policies; this Mac implementation pass does not rerun
 models, GPUs, or production data. See `docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for
 the canonical contract.
 
-The current semantic producer reads `production/pairs/in_pairs.jsonl`, calls
-Qwen Omni at most once per target clip, strictly preserves canonical bound-turn
-identity and timestamps, and publishes fixed `semantic_pilot20` or
-`production/semantic` outputs. Donor media is never model input, and failed
-semantics never delete a valid pair. See
+Audio binding, primary voice, embeddings, and PairPolicy V1 are complete and
+frozen. The current semantic producer reads `production/pairs/in_pairs.jsonl`,
+calls `dots-studio/dots3-note-prev-fp8` through an external OpenAI-compatible
+vLLM endpoint at most once per target clip, and publishes fixed
+`semantic_pilot20` or `production/semantic` outputs. Model output supplies only
+turn ID plus transcript status/text/language; code copies canonical entity
+identity and timestamps from input. Each request contains the target video and
+separate target full audio, never donor media. Failed semantics never delete a
+valid pair. The H3 exporter remains demo/not final, and the Visual subject
+attribute workstream remains separate and is not consumed. See
 `docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for the runtime contract.
 
 ### Earlier audio scaffold
@@ -123,13 +128,13 @@ Completed GPU-free validation for this integration pass with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_semantic_augmentation.py -q
-# 12 passed
+# 16 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 166 passed
+# 170 passed
 
 python -m pytest -q
-# 1833 passed, 1 existing Pillow deprecation warning
+# 1837 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -156,8 +161,9 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-On the server, build the read-only semantic inventory, then run and inspect the
-fixed 20-target Qwen Omni pilot. Accept the pilot only after human review checks
+On the server, start the dedicated 8-H200 dots3/vLLM service, configure the
+root-confined media transport, build the read-only semantic inventory, then run
+and inspect the fixed 20-target pilot. Accept the pilot only after human review checks
 transcripts, unclear-speech handling, non-speech events, and factual summaries.
 Do not run complete semantic production or implement the final H3 renderer until
 that review is accepted.

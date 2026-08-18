@@ -23,10 +23,13 @@ from r2v_data_v2.h3.schemas import (
     SemanticSubject,
 )
 from r2v_data_v2.h3.semantic_augmentation import (
-    DEFAULT_MAX_BASE64_BYTES,
-    OmniSemanticResponse,
-    OpenAIQwenOmniBackend,
-    QwenOmniSemanticConfig,
+    DEFAULT_DOTS3_CHECKPOINT_ID,
+    DEFAULT_DOTS3_MODEL,
+    Dots3SemanticResponse,
+    Dots3VLLMSemanticConfig,
+    MediaURLResolver,
+    ModelSpeechTurnTranscript,
+    OpenAIDots3VLLMBackend,
     SemanticAugmentationFailure,
     SemanticBackendResult,
     SemanticInventoryItem,
@@ -131,7 +134,9 @@ def _write_target(
             bindings=bindings,
         ),
     )
-    sidecar_path = pairs_root.parent / "audio" / "clips" / clip_uid / "audio_binding.json"
+    sidecar_path = (
+        pairs_root.parent / "audio" / "clips" / clip_uid / "audio_binding.json"
+    )
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar_path.write_text(sidecar.model_dump_json(indent=2) + "\n", encoding="utf-8")
     return H3ProductionInPair(
@@ -181,11 +186,13 @@ def _write_pairs(
     return pairs_root
 
 
-def _response(job: SemanticInventoryItem, *, uncertain: bool = False) -> OmniSemanticResponse:
-    return OmniSemanticResponse(
+def _response(
+    job: SemanticInventoryItem, *, uncertain: bool = False
+) -> Dots3SemanticResponse:
+    return Dots3SemanticResponse(
         speech_turn_transcripts=[
-            SemanticSpeechTurnTranscript(
-                **turn.model_dump(mode="python"),
+            ModelSpeechTurnTranscript(
+                turn_id=turn.turn_id,
                 status="uncertain" if uncertain else "transcribed",
                 text=None if uncertain else f"Transcript for {turn.turn_id}.",
                 language=None if uncertain else "English",
@@ -206,12 +213,12 @@ def _response(job: SemanticInventoryItem, *, uncertain: bool = False) -> OmniSem
 
 
 class _FakeBackend:
-    model_identifier = "test/qwen-omni"
+    model_identifier = DEFAULT_DOTS3_CHECKPOINT_ID
 
-    provenance = QwenOmniSemanticConfig(
+    provenance = Dots3VLLMSemanticConfig(
         base_url="https://example.invalid/v1",
-        api_key="not-recorded",
-        model=model_identifier,
+        media_resolver=MediaURLResolver(mode="file", media_root=Path("/")),
+        checkpoint_id=model_identifier,
     ).provenance()
 
     def __init__(self, *, fail_clip: str | None = None) -> None:
@@ -229,7 +236,7 @@ class _FakeBackend:
             )
         return SemanticBackendResult(
             response=_response(job),
-            raw_responses=("{\"valid\":true}",),
+            raw_responses=('{"valid":true}',),
         )
 
 
@@ -260,9 +267,13 @@ def test_inventory_deduplicates_targets_and_preserves_frozen_bound_turns(
         (0.0, 1.0),
         (1.2, 2.2),
     ]
+    assert Path(inventory.jobs[0].target_full_audio_path).name == "clip-a.flac"
+    assert len(inventory.jobs[0].target_full_audio_sha256) == 64
 
 
-def test_pilot20_forces_multi_subject_then_fills_deterministically(tmp_path: Path) -> None:
+def test_pilot20_forces_multi_subject_then_fills_deterministically(
+    tmp_path: Path,
+) -> None:
     specs = [(f"clip-{index:02d}", 1) for index in range(22)]
     specs[-1] = ("clip-99", 2)
     pairs = _write_pairs(tmp_path, specs)
@@ -293,11 +304,41 @@ def test_production_calls_once_per_target_and_never_reads_cross_donor(
     )
 
     assert backend.calls == ["clip-a", "clip-b"]
-    assert "donor-secret" not in (tmp_path / "production" / "semantic" / "inventory.json").read_text()
+    assert (
+        "donor-secret"
+        not in (tmp_path / "production" / "semantic" / "inventory.json").read_text()
+    )
     assert summary.semantic_record_count == 2
     assert summary.valid_pair_inputs_retained_count == 2
     assert summary.donor_media_used is False
     assert summary.backend_provenance.output_modalities == ["text"]
+    assert summary.backend_provenance.backend == "vllm"
+    assert summary.backend_provenance.checkpoint_id == DEFAULT_DOTS3_CHECKPOINT_ID
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "production" / "semantic" / "records.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    first_turn = records[0]["speech_turn_transcripts"][0]
+    assert first_turn["entity_id"] == "e1"
+    assert first_turn["entity_occurrence_id"].endswith("/e1")
+    assert first_turn["start_time"] == 0.0
+    assert first_turn["end_time"] == 1.0
+    assert records[0]["source_audio_path"].endswith("clip-a.flac")
+    assert records[0]["backend_provenance"]["served_model_name"] == (
+        DEFAULT_DOTS3_MODEL
+    )
+    assert records[0]["backend_provenance"]["checkpoint_id"] == (
+        DEFAULT_DOTS3_CHECKPOINT_ID
+    )
+    raw = json.loads(
+        (tmp_path / "production" / "semantic" / "raw" / "clip-a.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw["raw_responses"] == ['{"valid":true}']
+    assert raw["backend_provenance"]["checkpoint_id"] == (DEFAULT_DOTS3_CHECKPOINT_ID)
     assert "api_key" not in summary.backend_provenance.model_dump()
     assert _tree_hashes(pairs) == before
 
@@ -331,7 +372,7 @@ def test_failed_semantics_publish_null_dialogue_without_deleting_pair(
     assert _tree_hashes(pairs) == before
 
 
-def test_frozen_turn_validation_rejects_unknown_missing_and_changed_fields(
+def test_model_output_turn_ids_are_strict_and_cannot_override_frozen_fields(
     tmp_path: Path,
 ) -> None:
     pairs = _write_pairs(tmp_path, [("clip-a", 1)])
@@ -341,35 +382,26 @@ def test_frozen_turn_validation_rejects_unknown_missing_and_changed_fields(
     unknown = valid.model_copy(
         update={
             "speech_turn_transcripts": [
-                valid.speech_turn_transcripts[0].model_copy(update={"turn_id": "turn_9"})
+                valid.speech_turn_transcripts[0].model_copy(
+                    update={"turn_id": "turn_9"}
+                )
             ]
         }
     )
-    changed_time = valid.model_copy(
-        update={
-            "speech_turn_transcripts": [
-                valid.speech_turn_transcripts[0].model_copy(update={"start_time": 0.1})
-            ]
-        }
-    )
-    changed_entity = valid.model_copy(
-        update={
-            "speech_turn_transcripts": [
-                valid.speech_turn_transcripts[0].model_copy(update={"entity_id": "e2"})
-            ]
-        }
-    )
+    missing = valid.model_copy(update={"speech_turn_transcripts": []})
 
     assert {item.code for item in _response_validation_issues(unknown, job)} == {
         "unknown_turn_id",
         "missing_turn_id",
     }
-    assert [item.code for item in _response_validation_issues(changed_time, job)] == [
-        "frozen_turn_field_changed"
+    assert [item.code for item in _response_validation_issues(missing, job)] == [
+        "missing_turn_id"
     ]
-    assert [item.code for item in _response_validation_issues(changed_entity, job)] == [
-        "frozen_turn_field_changed"
-    ]
+    payload = valid.model_dump(mode="json")
+    payload["speech_turn_transcripts"][0]["entity_id"] = "e2"
+    payload["speech_turn_transcripts"][0]["start_time"] = 99.0
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        Dots3SemanticResponse.model_validate(payload)
 
 
 def test_uncertain_speech_requires_null_text(tmp_path: Path) -> None:
@@ -387,24 +419,31 @@ def test_uncertain_speech_requires_null_text(tmp_path: Path) -> None:
         )
 
 
+def test_model_turn_schema_excludes_authoritative_identity_and_timing() -> None:
+    schema = Dots3SemanticResponse.model_json_schema()
+    properties = schema["$defs"]["ModelSpeechTurnTranscript"]["properties"]
+
+    assert set(properties) == {"turn_id", "status", "text", "language"}
+
+
 class _FakeCompletions:
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[str | Exception]) -> None:
         self.responses = responses
         self.calls: list[dict[str, object]] = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
         response = self.responses.pop(0)
-        midpoint = len(response) // 2
-        return [
-            SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content=part))]
-            )
-            for part in (response[:midpoint], response[midpoint:])
-        ]
+        if isinstance(response, Exception):
+            raise response
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=response))]
+        )
 
 
-def _client(responses: list[str]) -> tuple[SimpleNamespace, _FakeCompletions]:
+def _client(
+    responses: list[str | Exception],
+) -> tuple[SimpleNamespace, _FakeCompletions]:
     completions = _FakeCompletions(responses)
     return (
         SimpleNamespace(chat=SimpleNamespace(completions=completions)),
@@ -412,18 +451,17 @@ def _client(responses: list[str]) -> tuple[SimpleNamespace, _FakeCompletions]:
     )
 
 
-def test_openai_backend_streams_text_only_and_repairs_malformed_json(
+def test_dots3_vllm_backend_sends_target_video_audio_and_repairs_once(
     tmp_path: Path,
 ) -> None:
     pairs = _write_pairs(tmp_path, [("clip-a", 1)])
     job = build_semantic_inventory(pairs_root=pairs, mode="production").jobs[0]
     valid = _response(job).model_dump_json()
     client, completions = _client(["not json", valid])
-    backend = OpenAIQwenOmniBackend(
-        QwenOmniSemanticConfig(
+    backend = OpenAIDots3VLLMBackend(
+        Dots3VLLMSemanticConfig(
             base_url="https://example.invalid/v1",
-            api_key="test-key",
-            max_base64_bytes=DEFAULT_MAX_BASE64_BYTES,
+            media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
         ),
         client=client,
     )
@@ -432,28 +470,33 @@ def test_openai_backend_streams_text_only_and_repairs_malformed_json(
 
     assert result.response == _response(job)
     assert len(result.raw_responses) == len(completions.calls) == 2
-    assert all(call["stream"] is True for call in completions.calls)
-    assert all(call["modalities"] == ["text"] for call in completions.calls)
-    assert all("audio" not in call for call in completions.calls)
-    assert completions.calls[0]["messages"][1]["content"][0]["video_url"][
-        "url"
-    ].startswith("data:video/mp4;base64,")
+    assert all(call["stream"] is False for call in completions.calls)
+    assert all("modalities" not in call for call in completions.calls)
+    assert all(call["model"] == DEFAULT_DOTS3_MODEL for call in completions.calls)
+    content = completions.calls[0]["messages"][1]["content"]
+    assert [item["type"] for item in content] == ["text", "video_url", "audio_url"]
+    assert content[1]["video_url"]["url"] == Path(job.target_video_path).as_uri()
+    assert content[2]["audio_url"]["url"] == Path(job.target_full_audio_path).as_uri()
+    assert completions.calls[0]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
     request_text = json.dumps(completions.calls[0]["messages"])
     assert "donor-secret" not in request_text
     assert "/must/not/be/read.mp4" not in request_text
-    assert "Repair the previous JSON only" in completions.calls[1]["messages"][1][
-        "content"
-    ][1]["text"]
+    assert (
+        "Repair the previous JSON only"
+        in completions.calls[1]["messages"][1]["content"][0]["text"]
+    )
 
 
 def test_openai_backend_both_malformed_responses_fail_closed(tmp_path: Path) -> None:
     pairs = _write_pairs(tmp_path, [("clip-a", 1)])
     job = build_semantic_inventory(pairs_root=pairs, mode="production").jobs[0]
     client, completions = _client(["bad", "still bad"])
-    backend = OpenAIQwenOmniBackend(
-        QwenOmniSemanticConfig(
+    backend = OpenAIDots3VLLMBackend(
+        Dots3VLLMSemanticConfig(
             base_url="https://example.invalid/v1",
-            api_key="test-key",
+            media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
         ),
         client=client,
     )
@@ -466,32 +509,52 @@ def test_openai_backend_both_malformed_responses_fail_closed(tmp_path: Path) -> 
     assert len(completions.calls) == 2
 
 
-def test_base64_preflight_fails_before_api_without_changing_source(
+def test_media_url_resolvers_are_deterministic_and_root_confined(
     tmp_path: Path,
 ) -> None:
+    media_root = tmp_path / "media root"
+    media = media_root / "nested" / "clip one.mp4"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"video")
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+
+    file_resolver = MediaURLResolver(mode="file", media_root=media_root)
+    http_resolver = MediaURLResolver(
+        mode="http",
+        media_root=media_root,
+        media_base_url="http://10.0.0.2:8767/root/",
+    )
+
+    assert file_resolver.resolve(media) == media.resolve().as_uri()
+    assert http_resolver.resolve(media) == (
+        "http://10.0.0.2:8767/root/nested/clip%20one.mp4"
+    )
+    with pytest.raises(ValueError, match="outside DOTS3_MEDIA_ROOT"):
+        file_resolver.resolve(outside)
+    with pytest.raises(ValueError, match="outside DOTS3_MEDIA_ROOT"):
+        http_resolver.resolve(outside)
+
+
+def test_dots3_api_failure_fails_closed_without_fallback(tmp_path: Path) -> None:
     pairs = _write_pairs(tmp_path, [("clip-a", 1)])
     job = build_semantic_inventory(pairs_root=pairs, mode="production").jobs[0]
-    source = Path(job.target_video_path)
-    before = source.read_bytes()
-    client, completions = _client([])
-    backend = OpenAIQwenOmniBackend(
-        QwenOmniSemanticConfig(
+    client, completions = _client([RuntimeError("server unavailable")])
+    backend = OpenAIDots3VLLMBackend(
+        Dots3VLLMSemanticConfig(
             base_url="https://example.invalid/v1",
-            api_key="test-key",
-            max_base64_bytes=4,
+            media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
         ),
         client=client,
     )
 
-    with pytest.raises(
-        SemanticAugmentationFailure,
-        match="encoded target video exceeds",
-    ) as exc_info:
+    with pytest.raises(SemanticAugmentationFailure) as exc_info:
         backend.augment(job)
 
-    assert exc_info.value.code == "local_base64_media_limit_exceeded"
-    assert completions.calls == []
-    assert source.read_bytes() == before
+    assert exc_info.value.code == "dots3_vllm_request_failed"
+    assert exc_info.value.attempt_count == 1
+    assert len(completions.calls) == 1
+    assert exc_info.value.raw_responses == ()
 
 
 def test_review_page_and_fixed_output_roots_cover_every_record(tmp_path: Path) -> None:
@@ -514,6 +577,7 @@ def test_review_page_and_fixed_output_roots_cover_every_record(tmp_path: Path) -
     assert all(clip_uid in review for clip_uid in ("clip-a", "clip-b"))
     assert all(label in review for label in ("CORRECT", "WRONG", "UNCERTAIN"))
     assert (output / "media" / "clip-a.mp4").is_symlink()
+    assert (output / "media" / "clip-a.audio.flac").is_symlink()
 
 
 def test_cli_has_no_limit_or_parent_quota_options() -> None:
@@ -521,7 +585,16 @@ def test_cli_has_no_limit_or_parent_quota_options() -> None:
 
     assert "limit" not in destinations
     assert "max_clips_per_parent" not in destinations
-    assert {"audio_run_root", "mode", "dry_run", "overwrite"} <= destinations
+    assert {
+        "audio_run_root",
+        "mode",
+        "dry_run",
+        "overwrite",
+        "media_mode",
+        "media_root",
+        "media_base_url",
+        "checkpoint_id",
+    } <= destinations
 
 
 def test_cli_dry_run_builds_inventory_without_api_credentials(
@@ -530,7 +603,15 @@ def test_cli_dry_run_builds_inventory_without_api_credentials(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write_pairs(tmp_path, [("clip-a", 1), ("clip-b", 1)])
-    for name in ("DASHSCOPE_API_KEY", "QWEN_OMNI_BASE_URL", "QWEN_OMNI_MODEL"):
+    for name in (
+        "DOTS3_API_KEY",
+        "DOTS3_BASE_URL",
+        "DOTS3_MODEL",
+        "DOTS3_CHECKPOINT_ID",
+        "DOTS3_MEDIA_MODE",
+        "DOTS3_MEDIA_ROOT",
+        "DOTS3_MEDIA_BASE_URL",
+    ):
         monkeypatch.delenv(name, raising=False)
 
     result = semantic_main(
@@ -544,6 +625,53 @@ def test_cli_dry_run_builds_inventory_without_api_credentials(
     )
 
     assert result["selected_target_count"] == 2
-    assert result["model_identifier"] == "qwen3.5-omni-plus"
+    assert result["model_identifier"] == DEFAULT_DOTS3_CHECKPOINT_ID
+    assert result["served_model_name"] == DEFAULT_DOTS3_MODEL
     assert result["donor_media_used"] is False
     assert json.loads(capsys.readouterr().out)["selected_target_count"] == 2
+
+
+def test_cli_dry_run_uses_dots3_model_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_pairs(tmp_path, [("clip-a", 1)])
+    monkeypatch.setenv("DOTS3_MODEL", "served-test-name")
+    monkeypatch.setenv("DOTS3_CHECKPOINT_ID", "checkpoint/test-id")
+
+    result = semantic_main(
+        [
+            "--audio-run-root",
+            str(tmp_path),
+            "--mode",
+            "production",
+            "--dry-run",
+        ]
+    )
+
+    assert result["served_model_name"] == "served-test-name"
+    assert result["model_identifier"] == "checkpoint/test-id"
+    assert json.loads(capsys.readouterr().out)["served_model_name"] == (
+        "served-test-name"
+    )
+
+
+def test_semantic_runtime_has_no_obsolete_backend_dependency() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    source = "\n".join(
+        (repository / path).read_text(encoding="utf-8")
+        for path in (
+            "r2v_data_v2/h3/semantic_augmentation.py",
+            "tools/run_h3_omni_semantic.py",
+        )
+    ).lower()
+
+    for obsolete in (
+        "qwen3.5-omni-plus",
+        "dashscope",
+        "qwen_omni",
+        "dashscope_api_key",
+        "base64",
+    ):
+        assert obsolete not in source

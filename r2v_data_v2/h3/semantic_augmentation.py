@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import html
 import json
 import math
-import mimetypes
 import re
 import shutil
 import uuid
@@ -14,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from urllib.parse import quote, urlsplit
 
 from openai import OpenAI
 from pydantic import Field, StrictFloat, StrictStr, model_validator
@@ -29,21 +28,22 @@ from r2v_data_v2.h3.audio_production import (
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 from r2v_data_v2.structured_output import (
     ValidationIssue,
-    parse_qwen_json_issues,
+    parse_structured_json_issues,
 )
 
-SEMANTIC_SCHEMA_VERSION = "r2v.h3.semantic_clip.1"
-SEMANTIC_INVENTORY_VERSION = "r2v.h3.semantic_inventory.1"
-SEMANTIC_SUMMARY_VERSION = "r2v.h3.semantic_summary.1"
-SEMANTIC_PROMPT_VERSION = "h3_omni_target_semantics_v1"
-DEFAULT_QWEN_OMNI_MODEL = "qwen3.5-omni-plus"
-DEFAULT_MAX_BASE64_BYTES = 10_000_000
+SEMANTIC_SCHEMA_VERSION = "r2v.h3.semantic_clip.2"
+SEMANTIC_INVENTORY_VERSION = "r2v.h3.semantic_inventory.2"
+SEMANTIC_SUMMARY_VERSION = "r2v.h3.semantic_summary.2"
+SEMANTIC_PROMPT_VERSION = "h3_dots3_target_semantics_v1"
+DEFAULT_DOTS3_MODEL = "dots3-note-prev"
+DEFAULT_DOTS3_CHECKPOINT_ID = "dots-studio/dots3-note-prev-fp8"
 PILOT_TARGET_COUNT = 20
 
 SYSTEM_PROMPT = """You extract factual audio-video semantics for one target clip.
 The supplied speech-turn timestamps and entity bindings are authoritative input.
 Do not re-identify speakers, alter entity IDs, alter timestamps, merge turns, split
-turns, or invent new turns. Transcribe only the supplied bound speech turns. If
+turns, or invent new turns. Output only turn_id, status, text, and language for each
+speech turn; do not emit identity or timing fields. Transcribe only the supplied bound speech turns. If
 speech is unclear or inaudible, use null text and the appropriate status instead of
 guessing dialogue. Report background and non-speech sounds separately using only
 the allowed categories. The audiovisual summary must describe only the target clip,
@@ -70,13 +70,16 @@ class SemanticSpeechTurnInput(SchemaModel):
         return self
 
 
-class SemanticSpeechTurnTranscript(SemanticSpeechTurnInput):
+class ModelSpeechTurnTranscript(SchemaModel):
+    turn_id: str
     status: Literal["transcribed", "uncertain", "inaudible"]
     text: StrictStr | None = None
     language: StrictStr | None = None
 
     @model_validator(mode="after")
-    def validate_transcript(self) -> SemanticSpeechTurnTranscript:
+    def validate_transcript(self) -> ModelSpeechTurnTranscript:
+        if not self.turn_id.strip():
+            raise ValueError("semantic transcript turn ID must not be empty")
         if self.text is not None and not self.text.strip():
             raise ValueError("semantic transcript text must be non-empty or null")
         if self.language is not None and not self.language.strip():
@@ -85,6 +88,22 @@ class SemanticSpeechTurnTranscript(SemanticSpeechTurnInput):
             raise ValueError("transcribed speech requires text")
         if self.status != "transcribed" and self.text is not None:
             raise ValueError("uncertain or inaudible speech must not guess text")
+        return self
+
+
+class SemanticSpeechTurnTranscript(SemanticSpeechTurnInput):
+    status: Literal["transcribed", "uncertain", "inaudible"]
+    text: StrictStr | None = None
+    language: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_transcript(self) -> SemanticSpeechTurnTranscript:
+        ModelSpeechTurnTranscript(
+            turn_id=self.turn_id,
+            status=self.status,
+            text=self.text,
+            language=self.language,
+        )
         return self
 
 
@@ -109,14 +128,14 @@ class SemanticNonSpeechEvent(SchemaModel):
         return self
 
 
-class OmniSemanticResponse(SchemaModel):
-    speech_turn_transcripts: list[SemanticSpeechTurnTranscript]
+class Dots3SemanticResponse(SchemaModel):
+    speech_turn_transcripts: list[ModelSpeechTurnTranscript]
     non_speech_events: list[SemanticNonSpeechEvent]
     audiovisual_summary: StrictStr
     warnings: list[StrictStr] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_response(self) -> OmniSemanticResponse:
+    def validate_response(self) -> Dots3SemanticResponse:
         turn_ids = [item.turn_id for item in self.speech_turn_transcripts]
         if len(turn_ids) != len(set(turn_ids)):
             raise ValueError("semantic response turn IDs must be unique")
@@ -147,21 +166,44 @@ class SemanticFailure(SchemaModel):
 
 
 class SemanticBackendProvenance(SchemaModel):
-    backend: Literal["openai_compatible_qwen_omni"] = "openai_compatible_qwen_omni"
+    backend: Literal["vllm"] = "vllm"
     base_url: str
     model_identifier: str
-    prompt_version: Literal["h3_omni_target_semantics_v1"] = SEMANTIC_PROMPT_VERSION
-    streaming: Literal[True] = True
+    served_model_name: str
+    checkpoint_id: str
+    prompt_version: Literal["h3_dots3_target_semantics_v1"] = SEMANTIC_PROMPT_VERSION
+    streaming: Literal[False] = False
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
     repair_retries: Literal[1] = 1
     max_tokens: int = Field(gt=0)
-    max_base64_bytes: int = Field(gt=0)
+    media_mode: Literal["file", "http"]
+    media_root: str
+    media_base_url: str | None = None
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def validate_provenance(self) -> SemanticBackendProvenance:
-        if not self.base_url.strip() or not self.model_identifier.strip():
+        if (
+            not self.base_url.strip()
+            or not self.model_identifier.strip()
+            or not self.served_model_name.strip()
+            or not self.checkpoint_id.strip()
+            or not self.media_root.strip()
+        ):
             raise ValueError("semantic backend endpoint and model are required")
+        if self.model_identifier != self.checkpoint_id:
+            raise ValueError("semantic model identifier must equal checkpoint ID")
+        if (self.media_mode == "http") != (self.media_base_url is not None):
+            raise ValueError("semantic HTTP media provenance requires one base URL")
+        if self.media_base_url is not None:
+            parsed_media_url = urlsplit(self.media_base_url)
+            if (
+                parsed_media_url.scheme not in {"http", "https"}
+                or not parsed_media_url.netloc
+            ):
+                raise ValueError(
+                    "semantic HTTP media provenance has an invalid base URL"
+                )
         if self.output_modalities != ["text"]:
             raise ValueError("semantic backend must request text output only")
         expected = _sha256_text(
@@ -170,12 +212,16 @@ class SemanticBackendProvenance(SchemaModel):
                     "backend": self.backend,
                     "base_url": self.base_url,
                     "model_identifier": self.model_identifier,
+                    "served_model_name": self.served_model_name,
+                    "checkpoint_id": self.checkpoint_id,
                     "prompt_version": self.prompt_version,
                     "streaming": self.streaming,
                     "output_modalities": self.output_modalities,
                     "repair_retries": self.repair_retries,
                     "max_tokens": self.max_tokens,
-                    "max_base64_bytes": self.max_base64_bytes,
+                    "media_mode": self.media_mode,
+                    "media_root": self.media_root,
+                    "media_base_url": self.media_base_url,
                 }
             )
         )
@@ -185,10 +231,12 @@ class SemanticBackendProvenance(SchemaModel):
 
 
 class SemanticClipRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.semantic_clip.1"] = SEMANTIC_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.semantic_clip.2"] = SEMANTIC_SCHEMA_VERSION
     target_clip_uid: str
     source_video_path: str
     source_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_audio_path: str
+    source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_identifier: str
     backend_provenance: SemanticBackendProvenance
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -201,7 +249,11 @@ class SemanticClipRecord(SchemaModel):
 
     @model_validator(mode="after")
     def validate_record(self) -> SemanticClipRecord:
-        if not self.target_clip_uid.strip() or not self.source_video_path.strip():
+        if (
+            not self.target_clip_uid.strip()
+            or not self.source_video_path.strip()
+            or not self.source_audio_path.strip()
+        ):
             raise ValueError("semantic record source identity must not be empty")
         if not self.model_identifier.strip():
             raise ValueError("semantic record model identifier must not be empty")
@@ -241,6 +293,8 @@ class SemanticInventoryItem(SchemaModel):
     pair_id: str
     target_video_path: str
     target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_full_audio_path: str
+    target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_audio_binding_path: str
     subject_count: int = Field(gt=0)
     speech_turns: list[SemanticSpeechTurnInput]
@@ -263,9 +317,7 @@ class SemanticInventoryItem(SchemaModel):
 
 
 class SemanticInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.semantic_inventory.1"] = (
-        SEMANTIC_INVENTORY_VERSION
-    )
+    schema_version: Literal["r2v.h3.semantic_inventory.2"] = SEMANTIC_INVENTORY_VERSION
     source_pair_schema_version: Literal["r2v.h3.production_pairs.2"] = (
         PRODUCTION_PAIR_VERSION
     )
@@ -305,7 +357,7 @@ class SemanticInventory(SchemaModel):
 
 
 class SemanticProductionSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.semantic_summary.1"] = SEMANTIC_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.semantic_summary.2"] = SEMANTIC_SUMMARY_VERSION
     mode: Literal["pilot20", "production"]
     model_identifier: str
     backend_provenance: SemanticBackendProvenance
@@ -344,7 +396,7 @@ class SemanticProductionSummary(SchemaModel):
 
 @dataclass(frozen=True)
 class SemanticBackendResult:
-    response: OmniSemanticResponse
+    response: Dots3SemanticResponse
     raw_responses: tuple[str, ...]
 
 
@@ -379,33 +431,89 @@ class SemanticAugmentationBackend(Protocol):
 
 
 @dataclass(frozen=True)
-class QwenOmniSemanticConfig:
+class MediaURLResolver:
+    mode: Literal["file", "http"]
+    media_root: Path
+    media_base_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"file", "http"}:
+            raise ValueError("DOTS3 media mode must be file or http")
+        root = self.media_root.expanduser().resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("DOTS3 media root must be a directory")
+        object.__setattr__(self, "media_root", root)
+        if self.mode == "file":
+            if self.media_base_url is not None:
+                raise ValueError("file media mode cannot define an HTTP base URL")
+            return
+        if self.media_base_url is None:
+            raise ValueError("http media mode requires DOTS3_MEDIA_BASE_URL")
+        parsed = urlsplit(self.media_base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("DOTS3 HTTP media base URL must be an HTTP(S) root")
+        normalized = self.media_base_url.rstrip("/") + "/"
+        object.__setattr__(self, "media_base_url", normalized)
+
+    def resolve(self, source_path: Path) -> str:
+        source = source_path.expanduser().resolve(strict=True)
+        if not source.is_file():
+            raise ValueError("semantic media source must be a file")
+        try:
+            relative = source.relative_to(self.media_root)
+        except ValueError as exc:
+            raise ValueError(
+                "semantic media source is outside DOTS3_MEDIA_ROOT"
+            ) from exc
+        if self.mode == "file":
+            return source.as_uri()
+        assert self.media_base_url is not None
+        return self.media_base_url + quote(relative.as_posix(), safe="/")
+
+
+@dataclass(frozen=True)
+class Dots3VLLMSemanticConfig:
     base_url: str
-    api_key: str
-    model: str = DEFAULT_QWEN_OMNI_MODEL
-    max_base64_bytes: int = DEFAULT_MAX_BASE64_BYTES
+    media_resolver: MediaURLResolver
+    api_key: str = "EMPTY"
+    served_model_name: str = DEFAULT_DOTS3_MODEL
+    checkpoint_id: str = DEFAULT_DOTS3_CHECKPOINT_ID
     timeout_seconds: float = 600.0
     max_tokens: int = 4096
 
     def __post_init__(self) -> None:
-        if not self.base_url.strip() or not self.api_key.strip() or not self.model.strip():
-            raise ValueError("Qwen Omni endpoint, API key, and model are required")
-        if self.max_base64_bytes <= 0 or self.max_tokens <= 0:
-            raise ValueError("Qwen Omni byte/token limits must be positive")
+        if (
+            not self.base_url.strip()
+            or not self.api_key.strip()
+            or not self.served_model_name.strip()
+            or not self.checkpoint_id.strip()
+        ):
+            raise ValueError("dots3/vLLM endpoint, API key, and model IDs are required")
+        if self.max_tokens <= 0:
+            raise ValueError("dots3/vLLM token limit must be positive")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
-            raise ValueError("Qwen Omni timeout must be positive")
+            raise ValueError("dots3/vLLM timeout must be positive")
 
     def provenance(self) -> SemanticBackendProvenance:
         values = {
-            "backend": "openai_compatible_qwen_omni",
+            "backend": "vllm",
             "base_url": self.base_url,
-            "model_identifier": self.model,
+            "model_identifier": self.checkpoint_id,
+            "served_model_name": self.served_model_name,
+            "checkpoint_id": self.checkpoint_id,
             "prompt_version": SEMANTIC_PROMPT_VERSION,
-            "streaming": True,
+            "streaming": False,
             "output_modalities": ["text"],
             "repair_retries": 1,
             "max_tokens": self.max_tokens,
-            "max_base64_bytes": self.max_base64_bytes,
+            "media_mode": self.media_resolver.mode,
+            "media_root": str(self.media_resolver.media_root),
+            "media_base_url": self.media_resolver.media_base_url,
         }
         return SemanticBackendProvenance(
             **values,
@@ -436,7 +544,9 @@ def _sha256_text(value: str) -> str:
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     values = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         if not line.strip():
             continue
         payload = json.loads(line)
@@ -504,7 +614,9 @@ def build_semantic_inventory(
     root = pairs_root.expanduser().resolve(strict=True)
     source_path = (root / "in_pairs.jsonl").resolve(strict=True)
     source_path.relative_to(root)
-    pairs = [H3ProductionInPair.model_validate(item) for item in _read_jsonl(source_path)]
+    pairs = [
+        H3ProductionInPair.model_validate(item) for item in _read_jsonl(source_path)
+    ]
     if not pairs:
         raise ValueError("semantic production requires at least one target in-pair")
     pairs.sort(key=lambda item: item.target_clip_uid)
@@ -515,23 +627,42 @@ def build_semantic_inventory(
     all_jobs = []
     for pair in pairs:
         video_path = Path(pair.target_video_path).expanduser().resolve(strict=True)
-        sidecar_path = Path(pair.target_audio_binding_path).expanduser().resolve(strict=True)
-        if not video_path.is_file() or not sidecar_path.is_file():
+        audio_path = Path(pair.target_full_audio_path).expanduser().resolve(strict=True)
+        sidecar_path = (
+            Path(pair.target_audio_binding_path).expanduser().resolve(strict=True)
+        )
+        if (
+            not video_path.is_file()
+            or not audio_path.is_file()
+            or not sidecar_path.is_file()
+        ):
             raise ValueError("semantic target media or Audio sidecar is unavailable")
         sidecar = AudioBindingSidecar.model_validate_json(
             sidecar_path.read_text(encoding="utf-8")
         )
         if sidecar.clip_uid != pair.target_clip_uid:
             raise ValueError("semantic Audio sidecar clip identity does not match pair")
-        sidecar_video = Path(sidecar.source_video_path).expanduser().resolve(strict=True)
+        if sidecar.status != "ready" or sidecar.evidence is None:
+            raise ValueError("semantic augmentation requires a ready Audio sidecar")
+        sidecar_video = (
+            Path(sidecar.source_video_path).expanduser().resolve(strict=True)
+        )
         if sidecar_video != video_path:
             raise ValueError("semantic Audio sidecar source video does not match pair")
+        sidecar_audio_value = sidecar.evidence.audio.full_audio_path
+        if sidecar_audio_value is None:
+            raise ValueError("semantic Audio sidecar lacks full-audio evidence")
+        sidecar_audio = Path(sidecar_audio_value).expanduser().resolve(strict=True)
+        if sidecar_audio != audio_path:
+            raise ValueError("semantic Audio sidecar full audio does not match pair")
         all_jobs.append(
             SemanticInventoryItem(
                 target_clip_uid=pair.target_clip_uid,
                 pair_id=pair.pair_id,
                 target_video_path=str(video_path),
                 target_video_sha256=_sha256_file(video_path),
+                target_full_audio_path=str(audio_path),
+                target_full_audio_sha256=_sha256_file(audio_path),
                 target_audio_binding_path=str(sidecar_path),
                 subject_count=len(pair.subjects),
                 speech_turns=_canonical_bound_turns(
@@ -588,6 +719,7 @@ def semantic_request_fingerprint(
                 ),
                 "target_clip_uid": job.target_clip_uid,
                 "source_video_sha256": job.target_video_sha256,
+                "source_audio_sha256": job.target_full_audio_sha256,
                 "speech_turns": [
                     item.model_dump(mode="json") for item in job.speech_turns
                 ],
@@ -597,7 +729,7 @@ def semantic_request_fingerprint(
 
 
 def _response_validation_issues(
-    response: OmniSemanticResponse,
+    response: Dots3SemanticResponse,
     job: SemanticInventoryItem,
 ) -> list[ValidationIssue]:
     expected = job.speech_turns
@@ -632,23 +764,6 @@ def _response_validation_issues(
                     message="speech turns must preserve input order",
                 )
             )
-        return issues
-    for index, (source, transcript) in enumerate(zip(expected, actual, strict=True)):
-        prefix = f"speech_turn_transcripts.{index}"
-        for field_name in (
-            "entity_id",
-            "entity_occurrence_id",
-            "start_time",
-            "end_time",
-        ):
-            if getattr(source, field_name) != getattr(transcript, field_name):
-                issues.append(
-                    ValidationIssue(
-                        code="frozen_turn_field_changed",
-                        field=f"{prefix}.{field_name}",
-                        message=f"{field_name} must exactly match authoritative input",
-                    )
-                )
     return issues
 
 
@@ -669,12 +784,13 @@ def _user_prompt(job: SemanticInventoryItem) -> str:
         ],
     }
     return (
-        "Analyze the attached target video with its original audio. Preserve every "
-        "authoritative speech-turn identity and timestamp exactly. Return one output "
-        "transcript for every supplied turn and no others. Use null text rather than "
+        "Analyze the attached target video and separate target full-audio item. The "
+        "input speech-turn identities and timestamps are authoritative. Return only "
+        "turn_id, status, text, and language for every supplied turn and no others; "
+        "the producer copies identity and timing from input. Use null text rather than "
         "guessing unclear speech.\nInput:\n"
         f"{_compact_json(payload)}\nJSON Schema:\n"
-        f"{_compact_json(OmniSemanticResponse.model_json_schema())}"
+        f"{_compact_json(Dots3SemanticResponse.model_json_schema())}"
     )
 
 
@@ -686,8 +802,9 @@ def _repair_prompt(
 ) -> str:
     return (
         "Repair the previous JSON only. Reinspect the same target video when needed. "
-        "Do not invent dialogue. Preserve all authoritative turn IDs, entity bindings, "
-        "and timestamps exactly. Return one compact JSON object only, with no markdown "
+        "Do not invent dialogue. Return every authoritative turn ID exactly once; "
+        "identity and timing are copied from input and must not be emitted. Return one "
+        "compact JSON object only, with no markdown "
         "or explanation.\nOriginal request:\n"
         f"{_user_prompt(job)}\nValidation issues:\n"
         f"{_compact_json([item.to_dict() for item in issues])}\n"
@@ -695,47 +812,18 @@ def _repair_prompt(
     )
 
 
-def _video_mime_type(path: Path) -> str:
-    guessed, _ = mimetypes.guess_type(path.name)
-    if guessed is None or not guessed.startswith("video/"):
+def _verify_source_hash(*, path: Path, expected: str, kind: str) -> None:
+    if _sha256_file(path) != expected:
         raise SemanticAugmentationFailure(
-            code="unsupported_local_video_format",
-            reason=f"cannot derive a video MIME type for {path.name}",
+            code=f"source_{kind}_changed",
+            reason=f"target {kind} bytes changed after semantic inventory construction",
         )
-    return guessed
 
 
-def _encoded_video_data_uri(
-    job: SemanticInventoryItem,
-    *,
-    maximum_bytes: int,
-) -> str:
-    path = Path(job.target_video_path)
-    stat_size = path.stat().st_size
-    encoded_size = 4 * ((stat_size + 2) // 3)
-    if encoded_size >= maximum_bytes:
-        raise SemanticAugmentationFailure(
-            code="local_base64_media_limit_exceeded",
-            reason=(
-                "encoded target video exceeds the configured local Base64 limit: "
-                f"source_bytes={stat_size}, encoded_bytes={encoded_size}, "
-                f"limit_bytes={maximum_bytes}"
-            ),
-        )
-    content = path.read_bytes()
-    if hashlib.sha256(content).hexdigest() != job.target_video_sha256:
-        raise SemanticAugmentationFailure(
-            code="source_video_changed",
-            reason="target video bytes changed after semantic inventory construction",
-        )
-    mime_type = _video_mime_type(path)
-    return f"data:{mime_type};base64,{base64.b64encode(content).decode('ascii')}"
-
-
-class OpenAIQwenOmniBackend:
+class OpenAIDots3VLLMBackend:
     def __init__(
         self,
-        config: QwenOmniSemanticConfig,
+        config: Dots3VLLMSemanticConfig,
         *,
         client: Any | None = None,
     ) -> None:
@@ -748,68 +836,75 @@ class OpenAIQwenOmniBackend:
 
     @property
     def model_identifier(self) -> str:
-        return self.config.model
+        return self.config.checkpoint_id
 
     @property
     def provenance(self) -> SemanticBackendProvenance:
         return self.config.provenance()
 
-    def _stream_text(self, *, video_data_uri: str, prompt: str) -> str:
+    def _request_text(self, *, job: SemanticInventoryItem, prompt: str) -> str:
+        video_path = Path(job.target_video_path)
+        audio_path = Path(job.target_full_audio_path)
+        _verify_source_hash(
+            path=video_path,
+            expected=job.target_video_sha256,
+            kind="video",
+        )
+        _verify_source_hash(
+            path=audio_path,
+            expected=job.target_full_audio_sha256,
+            kind="audio",
+        )
+        video_url = self.config.media_resolver.resolve(video_path)
+        audio_url = self.config.media_resolver.resolve(audio_path)
         try:
-            stream = self.client.chat.completions.create(
-                model=self.config.model,
+            completion = self.client.chat.completions.create(
+                model=self.config.served_model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
                         "content": [
+                            {"type": "text", "text": prompt},
                             {
                                 "type": "video_url",
-                                "video_url": {"url": video_data_uri},
+                                "video_url": {"url": video_url},
                             },
-                            {"type": "text", "text": prompt},
+                            {
+                                "type": "audio_url",
+                                "audio_url": {"url": audio_url},
+                            },
                         ],
                     },
                 ],
-                modalities=["text"],
                 temperature=0.0,
                 max_tokens=self.config.max_tokens,
-                stream=True,
-                stream_options={"include_usage": True},
+                stream=False,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            parts = []
-            for chunk in stream:
-                choices = getattr(chunk, "choices", None)
-                if not choices:
-                    continue
-                content = getattr(choices[0].delta, "content", None)
-                if content is None:
-                    continue
-                if not isinstance(content, str):
-                    raise TypeError("Qwen Omni streamed text chunk must be a string")
-                parts.append(content)
-            response = "".join(parts)
+            choices = getattr(completion, "choices", None)
+            if not choices:
+                raise TypeError("dots3/vLLM response has no choices")
+            response = getattr(choices[0].message, "content", None)
+            if not isinstance(response, str):
+                raise TypeError("dots3/vLLM response text must be a string")
         except SemanticAugmentationFailure:
             raise
         except Exception as exc:
             raise SemanticAugmentationFailure(
-                code="qwen_omni_request_failed",
+                code="dots3_vllm_request_failed",
                 reason=f"{type(exc).__name__}: {exc}",
                 attempt_count=1,
             ) from exc
         if not response.strip():
             raise SemanticAugmentationFailure(
-                code="qwen_omni_empty_response",
-                reason="Qwen Omni returned no text",
+                code="dots3_vllm_empty_response",
+                reason="dots3/vLLM returned no text",
                 raw_responses=[response],
             )
         return response
 
     def augment(self, job: SemanticInventoryItem) -> SemanticBackendResult:
-        video_data_uri = _encoded_video_data_uri(
-            job,
-            maximum_bytes=self.config.max_base64_bytes,
-        )
         raw_responses = []
         issues: list[ValidationIssue] = []
         for attempt in range(2):
@@ -821,7 +916,7 @@ class OpenAIQwenOmniBackend:
                     issues=issues,
                 )
             try:
-                raw = self._stream_text(video_data_uri=video_data_uri, prompt=prompt)
+                raw = self._request_text(job=job, prompt=prompt)
             except SemanticAugmentationFailure as exc:
                 raise SemanticAugmentationFailure(
                     code=exc.code,
@@ -831,7 +926,7 @@ class OpenAIQwenOmniBackend:
                     attempt_count=attempt + 1,
                 ) from exc
             raw_responses.append(raw)
-            response, issues = parse_qwen_json_issues(raw, OmniSemanticResponse)
+            response, issues = parse_structured_json_issues(raw, Dots3SemanticResponse)
             if response is not None:
                 issues = _response_validation_issues(response, job)
             if response is not None and not issues:
@@ -841,10 +936,30 @@ class OpenAIQwenOmniBackend:
                 )
         raise SemanticAugmentationFailure(
             code="structured_output_failed",
-            reason="Qwen Omni structured output failed closed after one repair",
+            reason="dots3 structured output failed closed after one repair",
             raw_responses=raw_responses,
             issues=issues,
         )
+
+
+def _materialize_transcripts(
+    *,
+    job: SemanticInventoryItem,
+    response: Dots3SemanticResponse,
+) -> list[SemanticSpeechTurnTranscript]:
+    return [
+        SemanticSpeechTurnTranscript(
+            **source.model_dump(mode="python"),
+            status=decision.status,
+            text=decision.text,
+            language=decision.language,
+        )
+        for source, decision in zip(
+            job.speech_turns,
+            response.speech_turn_transcripts,
+            strict=True,
+        )
+    ]
 
 
 def _failed_transcripts(
@@ -870,13 +985,16 @@ def _success_record(
     issues = _response_validation_issues(result.response, job)
     if issues:
         raise RuntimeError("semantic backend returned an unvalidated response")
+    transcripts = _materialize_transcripts(job=job, response=result.response)
     status: Literal["ready", "partial"] = "ready"
-    if any(item.status != "transcribed" for item in result.response.speech_turn_transcripts):
+    if any(item.status != "transcribed" for item in transcripts):
         status = "partial"
     return SemanticClipRecord(
         target_clip_uid=job.target_clip_uid,
         source_video_path=job.target_video_path,
         source_video_sha256=job.target_video_sha256,
+        source_audio_path=job.target_full_audio_path,
+        source_audio_sha256=job.target_full_audio_sha256,
         model_identifier=backend_provenance.model_identifier,
         backend_provenance=backend_provenance,
         request_fingerprint=semantic_request_fingerprint(
@@ -884,7 +1002,7 @@ def _success_record(
             backend_provenance=backend_provenance,
         ),
         status=status,
-        speech_turn_transcripts=result.response.speech_turn_transcripts,
+        speech_turn_transcripts=transcripts,
         non_speech_events=result.response.non_speech_events,
         audiovisual_summary=result.response.audiovisual_summary,
         warnings=result.response.warnings,
@@ -901,6 +1019,8 @@ def _failed_record(
         target_clip_uid=job.target_clip_uid,
         source_video_path=job.target_video_path,
         source_video_sha256=job.target_video_sha256,
+        source_audio_path=job.target_full_audio_path,
+        source_audio_sha256=job.target_full_audio_sha256,
         model_identifier=backend_provenance.model_identifier,
         backend_provenance=backend_provenance,
         request_fingerprint=semantic_request_fingerprint(
@@ -931,9 +1051,7 @@ def _write_json(path: Path, value: object) -> None:
 
 def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
     path.write_text(
-        "".join(
-            _compact_json(item.model_dump(mode="json")) + "\n" for item in values
-        ),
+        "".join(_compact_json(item.model_dump(mode="json")) + "\n" for item in values),
         encoding="utf-8",
     )
 
@@ -942,7 +1060,8 @@ def _review_html(
     *,
     inventory: SemanticInventory,
     records: Sequence[SemanticClipRecord],
-    media_names: dict[str, str],
+    video_media_names: dict[str, str],
+    audio_media_names: dict[str, str],
 ) -> str:
     record_by_clip = {item.target_clip_uid: item for item in records}
     cards = []
@@ -962,13 +1081,16 @@ def _review_html(
                 f"<td>{html.escape(transcript.language or '[null]')}</td>"
                 "</tr>"
             )
-        events = "".join(
-            "<li>"
-            f"{event.start_time:.3f}-{event.end_time:.3f} "
-            f"[{html.escape(event.category)}] {html.escape(event.description)}"
-            "</li>"
-            for event in record.non_speech_events
-        ) or "<li>None reported</li>"
+        events = (
+            "".join(
+                "<li>"
+                f"{event.start_time:.3f}-{event.end_time:.3f} "
+                f"[{html.escape(event.category)}] {html.escape(event.description)}"
+                "</li>"
+                for event in record.non_speech_events
+            )
+            or "<li>None reported</li>"
+        )
         failure = (
             "None"
             if record.failure is None
@@ -977,7 +1099,8 @@ def _review_html(
         cards.append(
             f"<article class='case' data-clip='{html.escape(job.target_clip_uid)}'>"
             f"<h2>{html.escape(job.target_clip_uid)} <span>{record.status}</span></h2>"
-            f"<video controls preload='metadata' src='media/{html.escape(media_names[job.target_clip_uid])}'></video>"
+            f"<video controls preload='metadata' src='media/{html.escape(video_media_names[job.target_clip_uid])}'></video>"
+            f"<audio controls preload='metadata' src='media/{html.escape(audio_media_names[job.target_clip_uid])}'></audio>"
             "<table><thead><tr><th>turn</th><th>entity</th><th>time</th>"
             "<th>status</th><th>transcript</th><th>language</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table>"
@@ -993,18 +1116,21 @@ def _review_html(
             )
             + "</div></article>"
         )
-    return """<!doctype html>
+    return (
+        """<!doctype html>
 <html><head><meta charset="utf-8"><title>H3 Omni semantic review</title>
 <style>
 body{font-family:system-ui,sans-serif;margin:24px;background:#f5f6f7;color:#171717}
 header,.case{max-width:1100px;margin:0 auto 24px;background:white;border:1px solid #ccc;padding:18px}
-h1,h2,h3{letter-spacing:0}h2 span{font-size:14px;color:#555}video{width:100%;max-height:560px;background:#111}
+h1,h2,h3{letter-spacing:0}h2 span{font-size:14px;color:#555}video{width:100%;max-height:560px;background:#111}audio{width:100%;margin-top:10px}
 table{width:100%;border-collapse:collapse;margin-top:14px}th,td{border:1px solid #ccc;padding:7px;text-align:left;vertical-align:top}
 .labels{padding:12px;background:#eef2f5}.labels label{margin-right:18px}
 </style></head><body>
 <header><h1>H3 Omni semantic review</h1><p>Human labels are QA only and are not identity truth.</p>
 <p>Check hallucinated dialogue, wrong transcription, missing audible events, and hallucinated audio-video facts.</p></header>
-""" + "".join(cards) + """
+"""
+        + "".join(cards)
+        + """
 <script>
 function saveLabel(input){localStorage.setItem('h3-semantic-'+input.name,input.value);}
 document.querySelectorAll('.labels input').forEach(function(input){
@@ -1012,6 +1138,7 @@ document.querySelectorAll('.labels input').forEach(function(input){
 });
 </script></body></html>
 """
+    )
 
 
 def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -> None:
@@ -1045,7 +1172,8 @@ def run_semantic_augmentation(
     initial_call_count = 0
     repair_call_count = 0
     failure_counts: Counter[str] = Counter()
-    media_names: dict[str, str] = {}
+    video_media_names: dict[str, str] = {}
+    audio_media_names: dict[str, str] = {}
     try:
         temporary.mkdir()
         (temporary / "raw").mkdir()
@@ -1085,21 +1213,29 @@ def run_semantic_augmentation(
                 {
                     "target_clip_uid": job.target_clip_uid,
                     "model_identifier": backend.model_identifier,
+                    "backend_provenance": backend.provenance.model_dump(mode="json"),
                     "request_fingerprint": record.request_fingerprint,
                     "status": record.status,
                     "raw_responses": list(raw_responses),
                     "failure": (
-                        None if failure is None else record.failure.model_dump(mode="json")
+                        None
+                        if failure is None
+                        else record.failure.model_dump(mode="json")
                     ),
                 },
             )
-            source = Path(job.target_video_path)
-            suffix = source.suffix.lower() or ".video"
-            media_name = f"{job.target_clip_uid}{suffix}"
-            if "/" in media_name or "\\" in media_name:
+            video_source = Path(job.target_video_path)
+            video_suffix = video_source.suffix.lower() or ".video"
+            video_name = f"{job.target_clip_uid}{video_suffix}"
+            audio_source = Path(job.target_full_audio_path)
+            audio_suffix = audio_source.suffix.lower() or ".audio"
+            audio_name = f"{job.target_clip_uid}.audio{audio_suffix}"
+            if any("/" in name or "\\" in name for name in (video_name, audio_name)):
                 raise ValueError("semantic clip UID cannot contain path separators")
-            (temporary / "media" / media_name).symlink_to(source)
-            media_names[job.target_clip_uid] = media_name
+            (temporary / "media" / video_name).symlink_to(video_source)
+            (temporary / "media" / audio_name).symlink_to(audio_source)
+            video_media_names[job.target_clip_uid] = video_name
+            audio_media_names[job.target_clip_uid] = audio_name
 
         status_counts = Counter(item.status for item in records)
         summary = SemanticProductionSummary(
@@ -1129,7 +1265,8 @@ def run_semantic_augmentation(
             _review_html(
                 inventory=inventory,
                 records=records,
-                media_names=media_names,
+                video_media_names=video_media_names,
+                audio_media_names=audio_media_names,
             ),
             encoding="utf-8",
         )
@@ -1153,7 +1290,16 @@ def semantic_output_root(
 
 
 def semantic_stage_is_complete(path: Path) -> bool:
-    return path.is_dir() and all(
-        (path / name).is_file()
-        for name in ("inventory.json", "records.jsonl", "summary.json", "review.html")
-    ) and (path / "raw").is_dir()
+    return (
+        path.is_dir()
+        and all(
+            (path / name).is_file()
+            for name in (
+                "inventory.json",
+                "records.jsonl",
+                "summary.json",
+                "review.html",
+            )
+        )
+        and (path / "raw").is_dir()
+    )

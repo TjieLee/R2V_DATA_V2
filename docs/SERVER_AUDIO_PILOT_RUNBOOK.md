@@ -4,6 +4,139 @@ This is the operational runbook for the server-side Audio/H3 pilot. Keep the
 layout small and stable. Do not create a timestamped directory for every smoke
 attempt.
 
+## Canonical dots3 semantic sequence
+
+Current milestone boundaries:
+
+- Audio binding, primary voice, embeddings, and PairPolicy V1 are **COMPLETE / FROZEN**.
+- dots3 semantic augmentation through vLLM is the active **PILOT / PRODUCTION** workflow.
+- The H3 exporter is **DEMO / NOT FINAL**.
+- Visual subject attributes are a separate workstream and are not consumed here.
+
+The old Qwen/DashScope semantic commands are obsolete and are not a production
+fallback. Use this single A-K sequence.
+
+### A. Create the dedicated dots3 environment on the 8-H200 node
+
+```bash
+export DOTS3_VLLM_ENV=/mnt/workspace/litengjie/data/audio_deps/dots3-vllm-env
+uv venv --python 3.12 --seed "$DOTS3_VLLM_ENV"
+source "$DOTS3_VLLM_ENV/bin/activate"
+```
+
+### B. Install the current official vLLM nightly
+
+The dots3 model card currently requires native support from recent vLLM
+`main`. Do not replace this with an arbitrary stable-version pin:
+
+```bash
+uv pip install -U vllm \
+  --torch-backend=auto \
+  --extra-index-url https://wheels.vllm.ai/nightly
+```
+
+### C. Start dots3 on all eight H200 GPUs
+
+This initial command stays aligned with the official FP8 topology and adds no
+unvalidated performance flags:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve dots-studio/dots3-note-prev-fp8 \
+  --served-model-name dots3-note-prev \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --moe-backend deep_gemm \
+  --max-model-len 262144
+```
+
+For shared-filesystem `file` transport only, append the trusted
+`--allowed-local-media-path /mnt/workspace/litengjie/data` security boundary.
+
+### D. Verify the OpenAI-compatible endpoint
+
+```bash
+curl --fail --silent --show-error \
+  http://127.0.0.1:8000/v1/models | python -m json.tool
+```
+
+### E. Configure the R2V producer
+
+Canonical cross-node production uses HTTP media transport:
+
+```bash
+export REPO=/mnt/workspace/litengjie/data/R2V_DATA_V2
+export R2V_PYTHON="$REPO/.venv/bin/python"
+export AUDIO_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs
+export DOTS3_BASE_URL='http://<H200_NODE_PRIVATE_IP>:8000/v1'
+export DOTS3_API_KEY='EMPTY'
+export DOTS3_MODEL='dots3-note-prev'
+export DOTS3_CHECKPOINT_ID='dots-studio/dots3-note-prev-fp8'
+export DOTS3_MEDIA_MODE=http
+export DOTS3_MEDIA_ROOT=/mnt/workspace/litengjie/data
+export DOTS3_MEDIA_BASE_URL='http://<DATA_NODE_PRIVATE_IP>:8767/'
+```
+
+### F. Serve source media from the data node
+
+```bash
+cd "$DOTS3_MEDIA_ROOT"
+python -m http.server 8767 --bind 0.0.0.0
+```
+
+Restrict port 8767 to the private production network. No media is copied,
+transcoded, resized, or Base64-encoded by the producer.
+
+### G. Build the semantic inventory without inference
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_omni_semantic.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --dry-run
+```
+
+### H. Run the fixed 20-target pilot
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_omni_semantic.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --overwrite
+```
+
+### I. Serve and review the pilot
+
+```bash
+cd "$AUDIO_RUN_ROOT/semantic_pilot20"
+"$R2V_PYTHON" -m http.server 8766 --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8766/review.html` through the SSH port forward.
+
+### J. Run all unique production targets
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_omni_semantic.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production
+```
+
+This uses every target in production `in_pairs.jsonl` (75 in the frozen pair
+set), with no bounded sampler or parent quota.
+
+### K. Inspect the concise production summary
+
+```bash
+python -m json.tool \
+  "$AUDIO_RUN_ROOT/production/semantic/summary.json"
+```
+
 ## Canonical directory layout
 
 ```text
