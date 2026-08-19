@@ -41,15 +41,16 @@ from r2v_data_v2.h3.schemas import (
 )
 
 DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.1"
-DIARIZATION_SEGMENT_VERSION = "r2v.h3.diarization_segment.1"
+DIARIZATION_SEGMENT_VERSION = "r2v.h3.diarization_segment.2"
 DIARIZATION_CLUSTER_BINDING_VERSION = "r2v.h3.diarization_cluster_binding.1"
 DIARIZATION_BOUND_SEGMENT_VERSION = "r2v.h3.diarization_bound_segment.1"
 DIARIZATION_CLIP_RESULT_VERSION = "r2v.h3.diarization_clip_result.1"
-DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.1"
+DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.2"
 DIARIZATION_HUMAN_QA_VERSION = "r2v.h3.diarization_human_qa.1"
 DIARIZATION_MAPPING_POLICY_VERSION = "h3_diarizen_sparse_anchor_candidate_v1"
 DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v1"
 DIARIZATION_PREPROCESSING_VERSION = "official_torchaudio_first_channel_passthrough_v1"
+DIARIZATION_BOUNDARY_POLICY_VERSION = "canonical_source_intersection_v1"
 DEFAULT_DIARIZEN_MODEL_IDENTIFIER = "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
 DEFAULT_DIARIZEN_DEVICE = "cuda:0"
 DEFAULT_DIARIZEN_TIMEOUT_SECONDS = 900.0
@@ -235,14 +236,50 @@ class DiarizationBackendSegment(SchemaModel):
         return self
 
 
+class DiarizationBoundaryReconciliation(SchemaModel):
+    policy_version: Literal["canonical_source_intersection_v1"] = (
+        DIARIZATION_BOUNDARY_POLICY_VERSION
+    )
+    adjusted: bool
+    end_clamped: bool
+    end_overrun_samples: int = Field(ge=0)
+    end_overrun_seconds: float = Field(ge=0)
+    reason: Literal["end_clamped_to_canonical_source"] | None = None
+
+    @model_validator(mode="after")
+    def validate_reconciliation(self) -> DiarizationBoundaryReconciliation:
+        if self.adjusted:
+            if (
+                not self.end_clamped
+                or self.end_overrun_samples <= 0
+                or self.end_overrun_seconds <= 0
+                or self.reason != "end_clamped_to_canonical_source"
+            ):
+                raise ValueError("adjusted diarization boundary evidence is incomplete")
+        elif (
+            self.end_clamped
+            or self.end_overrun_samples != 0
+            or self.end_overrun_seconds != 0
+            or self.reason is not None
+        ):
+            raise ValueError(
+                "unchanged diarization boundary cannot claim reconciliation"
+            )
+        return self
+
+
 class RawDiarizationSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_segment.1"] = (
+    schema_version: Literal["r2v.h3.diarization_segment.2"] = (
         DIARIZATION_SEGMENT_VERSION
     )
     target_clip_uid: str
     segment_id: str
     speaker_cluster_id: str
     backend_speaker_label: str
+    backend_reported_start_time: float = Field(ge=0)
+    backend_reported_end_time: float = Field(gt=0)
+    backend_reported_start_sample: int = Field(ge=0)
+    backend_reported_end_sample: int = Field(gt=0)
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
     source_start_sample: int = Field(ge=0)
@@ -257,9 +294,16 @@ class RawDiarizationSegment(SchemaModel):
     input_preprocessing: Literal["official_torchaudio_first_channel_passthrough_v1"] = (
         DIARIZATION_PREPROCESSING_VERSION
     )
+    boundary_reconciliation: DiarizationBoundaryReconciliation
 
     @model_validator(mode="after")
     def validate_times(self) -> RawDiarizationSegment:
+        if (
+            not math.isfinite(self.backend_reported_start_time)
+            or not math.isfinite(self.backend_reported_end_time)
+            or self.backend_reported_end_time <= self.backend_reported_start_time
+        ):
+            raise ValueError("backend-reported diarization interval is invalid")
         if self.end_time <= self.start_time:
             raise ValueError("raw diarization segment must have positive duration")
         if self.source_end_sample <= self.source_start_sample:
@@ -270,6 +314,32 @@ class RawDiarizationSegment(SchemaModel):
             self.end_time * self.source_sample_rate_hz
         ):
             raise ValueError("raw diarization samples must match source times")
+        if self.backend_reported_start_sample != round(
+            self.backend_reported_start_time * self.source_sample_rate_hz
+        ) or self.backend_reported_end_sample != round(
+            self.backend_reported_end_time * self.source_sample_rate_hz
+        ):
+            raise ValueError("backend-reported samples must match backend times")
+        if self.source_start_sample != self.backend_reported_start_sample:
+            raise ValueError("boundary reconciliation must not shift segment start")
+        reconciliation = self.boundary_reconciliation
+        if reconciliation.adjusted:
+            if (
+                self.backend_reported_end_sample - self.source_end_sample
+                != reconciliation.end_overrun_samples
+                or not math.isclose(
+                    reconciliation.end_overrun_seconds,
+                    reconciliation.end_overrun_samples / self.source_sample_rate_hz,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("diarization end-clamp provenance is inconsistent")
+        elif (
+            self.backend_reported_start_sample != self.source_start_sample
+            or self.backend_reported_end_sample != self.source_end_sample
+        ):
+            raise ValueError("unchanged diarization segment must preserve samples")
         return self
 
 
@@ -410,7 +480,7 @@ class DiarizationClipResult(SchemaModel):
 
 
 class DiarizationSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_summary.1"] = (
+    schema_version: Literal["r2v.h3.diarization_summary.2"] = (
         DIARIZATION_SUMMARY_VERSION
     )
     mode: Literal["pilot20"] = "pilot20"
@@ -434,13 +504,22 @@ class DiarizationSummary(SchemaModel):
     usable_direct_anchor_seconds: float = Field(ge=0)
     contested_anchor_seconds: float = Field(ge=0)
     mapped_speaker_seconds: float = Field(ge=0)
-    propagated_only_speaker_seconds: float = Field(ge=0)
+    mapped_direct_anchor_speaker_seconds: float = Field(ge=0)
+    identity_propagated_speaker_seconds: float = Field(ge=0)
+    fully_propagated_segment_speaker_seconds: float = Field(ge=0)
     unbound_speaker_seconds: float = Field(ge=0)
     ambiguous_speaker_seconds: float = Field(ge=0)
     conflict_speaker_seconds: float = Field(ge=0)
     legacy_coalesced_bound_turn_count: int = Field(ge=0)
     legacy_bound_turn_median_duration: float | None = Field(default=None, ge=0)
     diarization_segment_median_duration: float | None = Field(default=None, ge=0)
+    boundary_adjusted_segment_count: int = Field(ge=0)
+    boundary_adjusted_clip_count: int = Field(ge=0)
+    end_clamped_segment_count: int = Field(ge=0)
+    total_end_overrun_seconds: float = Field(ge=0)
+    max_end_overrun_seconds: float = Field(ge=0)
+    max_end_overrun_samples: int = Field(ge=0)
+    median_positive_end_overrun_seconds: float | None = Field(default=None, gt=0)
     failure_reason_counts: dict[str, int]
     thresholds_calibrated: Literal[False] = False
     parent_quota_applied: Literal[False] = False
@@ -461,6 +540,38 @@ class DiarizationSummary(SchemaModel):
             + self.conflict_cluster_count
         ):
             raise ValueError("diarization cluster counts must reconcile")
+        if not math.isclose(
+            self.mapped_speaker_seconds,
+            self.mapped_direct_anchor_speaker_seconds
+            + self.identity_propagated_speaker_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("mapped speaker identity seconds must reconcile")
+        if (
+            self.fully_propagated_segment_speaker_seconds
+            > self.identity_propagated_speaker_seconds + 1e-9
+        ):
+            raise ValueError("fully propagated segments exceed propagated identity")
+        if self.boundary_adjusted_segment_count != self.end_clamped_segment_count:
+            raise ValueError("boundary-adjusted and end-clamped counts must reconcile")
+        if self.boundary_adjusted_clip_count > self.boundary_adjusted_segment_count:
+            raise ValueError("adjusted clip count cannot exceed adjusted segments")
+        if self.boundary_adjusted_segment_count == 0:
+            if (
+                self.total_end_overrun_seconds != 0
+                or self.max_end_overrun_seconds != 0
+                or self.max_end_overrun_samples != 0
+                or self.median_positive_end_overrun_seconds is not None
+            ):
+                raise ValueError("empty boundary diagnostics must be zero")
+        elif (
+            self.total_end_overrun_seconds <= 0
+            or self.max_end_overrun_seconds <= 0
+            or self.max_end_overrun_samples <= 0
+            or self.median_positive_end_overrun_seconds is None
+        ):
+            raise ValueError("adjusted boundary diagnostics must be positive")
         return self
 
 
@@ -953,16 +1064,19 @@ def _normalize_segments(
     cluster_by_label: dict[str, str] = {}
     output: list[RawDiarizationSegment] = []
     for index, item in enumerate(ordered, start=1):
-        start_sample = round(item.start_time * target.source_sample_rate_hz)
-        end_sample = round(item.end_time * target.source_sample_rate_hz)
-        if (
-            start_sample < 0
-            or end_sample <= start_sample
-            or end_sample > target.source_frame_count
-        ):
+        reported_start_sample = round(item.start_time * target.source_sample_rate_hz)
+        reported_end_sample = round(item.end_time * target.source_sample_rate_hz)
+        if reported_start_sample >= target.source_frame_count:
             raise DiarizationBackendFailure(
-                "diarization segment exceeds canonical source audio"
+                "diarization segment starts at or after canonical source EOF"
             )
+        end_sample = min(reported_end_sample, target.source_frame_count)
+        if reported_start_sample < 0 or end_sample <= reported_start_sample:
+            raise DiarizationBackendFailure(
+                "diarization segment has no positive canonical source intersection"
+            )
+        end_overrun_samples = reported_end_sample - end_sample
+        end_clamped = end_overrun_samples > 0
         if item.speaker_label not in cluster_by_label:
             cluster_by_label[item.speaker_label] = f"speaker_{len(cluster_by_label)}"
         output.append(
@@ -971,9 +1085,13 @@ def _normalize_segments(
                 segment_id=f"segment_{index:04d}",
                 speaker_cluster_id=cluster_by_label[item.speaker_label],
                 backend_speaker_label=item.speaker_label,
-                start_time=start_sample / target.source_sample_rate_hz,
+                backend_reported_start_time=item.start_time,
+                backend_reported_end_time=item.end_time,
+                backend_reported_start_sample=reported_start_sample,
+                backend_reported_end_sample=reported_end_sample,
+                start_time=reported_start_sample / target.source_sample_rate_hz,
                 end_time=end_sample / target.source_sample_rate_hz,
-                source_start_sample=start_sample,
+                source_start_sample=reported_start_sample,
                 source_end_sample=end_sample,
                 source_audio_path=target.source_audio_path,
                 source_audio_sha256=target.source_audio_sha256,
@@ -983,6 +1101,15 @@ def _normalize_segments(
                 model_fingerprint=provenance.model_fingerprint,
                 backend_configuration_fingerprint=(
                     provenance.configuration_fingerprint
+                ),
+                boundary_reconciliation=DiarizationBoundaryReconciliation(
+                    adjusted=end_clamped,
+                    end_clamped=end_clamped,
+                    end_overrun_samples=end_overrun_samples,
+                    end_overrun_seconds=(
+                        end_overrun_samples / target.source_sample_rate_hz
+                    ),
+                    reason=("end_clamped_to_canonical_source" if end_clamped else None),
                 ),
             )
         )
@@ -1348,6 +1475,51 @@ def _timeline_union_samples(segments: Sequence[RawDiarizationSegment]) -> int:
     )
 
 
+def _mapped_identity_duration_metrics(
+    *,
+    raw_segments: Sequence[RawDiarizationSegment],
+    cluster_bindings: Sequence[DiarizationClusterBinding],
+    bound_segments: Sequence[BoundDiarizationSegment],
+) -> tuple[float, float, float]:
+    bound_by_key = {
+        (item.target_clip_uid, item.segment_id): item for item in bound_segments
+    }
+    fully_propagated_by_cluster: dict[tuple[str, str], list[_SampleSpan]] = defaultdict(
+        list
+    )
+    sample_rate_by_cluster: dict[tuple[str, str], int] = {}
+    for raw in raw_segments:
+        if (
+            bound_by_key[(raw.target_clip_uid, raw.segment_id)].identity_scope
+            != "cluster_propagated_only"
+        ):
+            continue
+        key = (raw.target_clip_uid, raw.speaker_cluster_id)
+        fully_propagated_by_cluster[key].append(
+            _SampleSpan(raw.source_start_sample, raw.source_end_sample)
+        )
+        sample_rate_by_cluster[key] = raw.source_sample_rate_hz
+    fully_propagated_segments = sum(
+        _union_sample_count(spans) / sample_rate_by_cluster[key]
+        for key, spans in fully_propagated_by_cluster.items()
+    )
+    mapped_clusters = [
+        item for item in cluster_bindings if item.status == "candidate_mapped"
+    ]
+    mapped_direct_anchor_seconds = sum(
+        item.usable_anchor_duration for item in mapped_clusters
+    )
+    identity_propagated_seconds = sum(
+        item.cluster_speaker_seconds - item.usable_anchor_duration
+        for item in mapped_clusters
+    )
+    return (
+        mapped_direct_anchor_seconds,
+        identity_propagated_seconds,
+        fully_propagated_segments,
+    )
+
+
 def _summary(
     *,
     inventory: DiarizationInventory,
@@ -1368,20 +1540,26 @@ def _summary(
             _timeline_union_samples(by_clip[target.target_clip_uid])
             / target.source_sample_rate_hz
         )
-    bound_by_key = {
-        (item.target_clip_uid, item.segment_id): item for item in bound_segments
-    }
     speaker_seconds_by_status: Counter[str] = Counter()
     for cluster in cluster_bindings:
         speaker_seconds_by_status.update(
             {cluster.status: cluster.cluster_speaker_seconds}
         )
-    propagated_only = 0.0
-    for raw in raw_segments:
-        bound = bound_by_key[(raw.target_clip_uid, raw.segment_id)]
-        duration = raw.end_time - raw.start_time
-        if bound.identity_scope == "cluster_propagated_only":
-            propagated_only += duration - bound.direct_anchor_seconds
+    (
+        mapped_direct_anchor_seconds,
+        identity_propagated_seconds,
+        fully_propagated_segments,
+    ) = _mapped_identity_duration_metrics(
+        raw_segments=raw_segments,
+        cluster_bindings=cluster_bindings,
+        bound_segments=bound_segments,
+    )
+    adjusted_segments = [
+        item for item in raw_segments if item.boundary_reconciliation.adjusted
+    ]
+    positive_overruns = [
+        item.boundary_reconciliation.end_overrun_seconds for item in adjusted_segments
+    ]
     all_legacy_durations = [
         value for item in clip_results for value in item.legacy_bound_turn_durations
     ]
@@ -1427,7 +1605,9 @@ def _summary(
             for item in clip_results
         ),
         mapped_speaker_seconds=speaker_seconds_by_status["candidate_mapped"],
-        propagated_only_speaker_seconds=propagated_only,
+        mapped_direct_anchor_speaker_seconds=mapped_direct_anchor_seconds,
+        identity_propagated_speaker_seconds=identity_propagated_seconds,
+        fully_propagated_segment_speaker_seconds=fully_propagated_segments,
         unbound_speaker_seconds=speaker_seconds_by_status["unbound"],
         ambiguous_speaker_seconds=speaker_seconds_by_status["ambiguous"],
         conflict_speaker_seconds=speaker_seconds_by_status["conflict"],
@@ -1439,6 +1619,25 @@ def _summary(
         ),
         diarization_segment_median_duration=(
             median(all_diarization_durations) if all_diarization_durations else None
+        ),
+        boundary_adjusted_segment_count=len(adjusted_segments),
+        boundary_adjusted_clip_count=len(
+            {item.target_clip_uid for item in adjusted_segments}
+        ),
+        end_clamped_segment_count=sum(
+            item.boundary_reconciliation.end_clamped for item in adjusted_segments
+        ),
+        total_end_overrun_seconds=sum(positive_overruns),
+        max_end_overrun_seconds=max(positive_overruns, default=0.0),
+        max_end_overrun_samples=max(
+            (
+                item.boundary_reconciliation.end_overrun_samples
+                for item in adjusted_segments
+            ),
+            default=0,
+        ),
+        median_positive_end_overrun_seconds=(
+            median(positive_overruns) if positive_overruns else None
         ),
         failure_reason_counts=dict(sorted(failure_counts.items())),
     )
@@ -1560,8 +1759,19 @@ def _review_html(
                     continue
                 bound = bound_by_key[(clip_id, segment.segment_id)]
                 segment_path = media[clip_id]["segments"][segment.segment_id]  # type: ignore[index]
+                reconciliation = segment.boundary_reconciliation
+                boundary_html = ""
+                if reconciliation.adjusted:
+                    boundary_html = (
+                        '<span class="warning-badge">EOF CLAMP</span> '
+                        f"REPORTED: {segment.backend_reported_start_time:.3f}-"
+                        f"{segment.backend_reported_end_time:.3f}s; "
+                        f"CANONICAL: {segment.start_time:.3f}-{segment.end_time:.3f}s; "
+                        f"EOF CLAMP: +{reconciliation.end_overrun_seconds:.3f}s "
+                    )
                 segment_rows.append(
                     "<li>"
+                    f"{boundary_html}"
                     f"{segment.segment_id} {segment.start_time:.3f}-{segment.end_time:.3f}s "
                     f"{html.escape(bound.identity_scope)} entity={html.escape(str(bound.entity_id))} "
                     f'<audio controls preload="none" src="{html.escape(str(segment_path))}"></audio>'
@@ -1615,7 +1825,7 @@ def _review_html(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>H3 DiariZen Binding Review</title>
 <style>
-body{{font-family:system-ui,sans-serif;margin:20px;background:#f5f6f7;color:#17191c}}section{{background:white;border:1px solid #ccd0d5;margin:18px 0;padding:16px;border-radius:6px}}video{{max-width:640px;max-height:360px;display:block}}audio{{vertical-align:middle}}.visuals{{display:flex;gap:10px;flex-wrap:wrap}}figure{{margin:8px}}figure img{{max-width:180px;max-height:180px}}.lane{{display:grid;grid-template-columns:150px 1fr;gap:8px;margin:5px 0}}.track{{height:24px;background:#e7e9ec;position:relative}}.block{{position:absolute;top:2px;height:20px;min-width:2px}}.anchor{{background:#d1495b}}.speaker{{background:#247ba0}}.cluster_propagated_only{{background:#2a9d8f}}.unresolved{{background:#7b7f86}}.cluster{{border-top:1px solid #ddd;padding-top:8px;margin-top:12px}}.qa label{{margin-right:12px}}#qa-controls{{position:sticky;top:0;background:#fff;border:1px solid #aaa;padding:12px;z-index:3}}button{{margin-right:8px}}
+body{{font-family:system-ui,sans-serif;margin:20px;background:#f5f6f7;color:#17191c}}section{{background:white;border:1px solid #ccd0d5;margin:18px 0;padding:16px;border-radius:6px}}video{{max-width:640px;max-height:360px;display:block}}audio{{vertical-align:middle}}.visuals{{display:flex;gap:10px;flex-wrap:wrap}}figure{{margin:8px}}figure img{{max-width:180px;max-height:180px}}.lane{{display:grid;grid-template-columns:150px 1fr;gap:8px;margin:5px 0}}.track{{height:24px;background:#e7e9ec;position:relative}}.block{{position:absolute;top:2px;height:20px;min-width:2px}}.anchor{{background:#d1495b}}.speaker{{background:#247ba0}}.cluster_propagated_only{{background:#2a9d8f}}.unresolved{{background:#7b7f86}}.warning-badge{{display:inline-block;background:#b42318;color:white;font-weight:700;padding:2px 5px;margin-right:4px;border-radius:3px}}.cluster{{border-top:1px solid #ddd;padding-top:8px;margin-top:12px}}.qa label{{margin-right:12px}}#qa-controls{{position:sticky;top:0;background:#fff;border:1px solid #aaa;padding:12px;z-index:3}}button{{margin-right:8px}}
 </style></head><body>
 <h1>DiariZen-assisted speaker binding pilot20</h1>
 <div id="qa-controls"><b id="qa-progress">labeled 0 / {len(qa_rows)}</b> <span id="qa-counts"></span><br><button onclick="exportQA()">Export QA JSON</button><button onclick="clearQA()">Clear QA labels</button></div>

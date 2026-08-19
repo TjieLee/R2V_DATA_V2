@@ -20,11 +20,13 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationBackendFailure,
     DiarizationBackendProvenance,
     DiarizationBackendSegment,
+    DiarizationBoundaryReconciliation,
     DiarizationHumanQAExport,
     DiarizationHumanQALabel,
     DiarizationTargetClip,
     PersistentDiariZenBackend,
     RawDiarizationSegment,
+    _mapped_identity_duration_metrics,
     _normalize_segments,
     bind_diarization_segments,
     build_diarization_inventory,
@@ -281,6 +283,10 @@ def _raw(
         segment_id=f"segment_{index:04d}",
         speaker_cluster_id=cluster,
         backend_speaker_label=cluster,
+        backend_reported_start_time=start,
+        backend_reported_end_time=end,
+        backend_reported_start_sample=round(start * active.source_sample_rate_hz),
+        backend_reported_end_sample=round(end * active.source_sample_rate_hz),
         start_time=start,
         end_time=end,
         source_start_sample=round(start * active.source_sample_rate_hz),
@@ -292,6 +298,12 @@ def _raw(
         model_identifier="fixture/diarizen-v2",
         model_fingerprint="a" * 64,
         backend_configuration_fingerprint="b" * 64,
+        boundary_reconciliation=DiarizationBoundaryReconciliation(
+            adjusted=False,
+            end_clamped=False,
+            end_overrun_samples=0,
+            end_overrun_seconds=0.0,
+        ),
     )
 
 
@@ -361,6 +373,13 @@ def test_pilot_calls_backend_once_per_target_and_never_for_cross_pairs(
 
     assert [item[0] for item in backend.calls] == expected
     assert summary.backend_call_count == 20
+    assert summary.schema_version == "r2v.h3.diarization_summary.2"
+    assert summary.boundary_adjusted_segment_count == 0
+    assert summary.boundary_adjusted_clip_count == 0
+    assert summary.total_end_overrun_seconds == 0
+    assert summary.max_end_overrun_seconds == 0
+    assert summary.max_end_overrun_samples == 0
+    assert summary.median_positive_end_overrun_seconds is None
     assert all(item[0] != "must-not-be-diarized" for item in backend.calls)
     frozen_after = {
         path.relative_to(root).as_posix(): _sha256(path)
@@ -415,6 +434,101 @@ def test_overlapping_segments_are_preserved_and_cluster_ids_are_clip_local() -> 
     assert other[0].speaker_cluster_id == "speaker_0"
 
 
+def test_terminal_segments_intersect_canonical_source_and_preserve_provenance() -> None:
+    target = _target()
+    normalized = _normalize_segments(
+        target=target,
+        segments=[
+            DiarizationBackendSegment(
+                start_time=1.0,
+                end_time=2.0,
+                speaker_label="inside",
+            ),
+            DiarizationBackendSegment(
+                start_time=2.0,
+                end_time=10.0,
+                speaker_label="exact-eof",
+            ),
+            DiarizationBackendSegment(
+                start_time=7.92,
+                end_time=30.0,
+                speaker_label="crossing-a",
+            ),
+            DiarizationBackendSegment(
+                start_time=8.0,
+                end_time=11.25,
+                speaker_label="crossing-b",
+            ),
+        ],
+        provenance=_provenance(),
+    )
+
+    inside, exact, crossing_a, crossing_b = normalized
+    assert inside.source_end_sample == 200
+    assert inside.boundary_reconciliation.adjusted is False
+    assert exact.source_end_sample == target.source_frame_count
+    assert exact.boundary_reconciliation.adjusted is False
+
+    assert crossing_a.schema_version == "r2v.h3.diarization_segment.2"
+    assert crossing_a.backend_reported_start_time == 7.92
+    assert crossing_a.backend_reported_end_time == 30.0
+    assert crossing_a.backend_reported_start_sample == 792
+    assert crossing_a.backend_reported_end_sample == 3000
+    assert crossing_a.source_start_sample == 792
+    assert crossing_a.source_end_sample == target.source_frame_count
+    assert crossing_a.end_time == 10.0
+    assert crossing_a.boundary_reconciliation.model_dump() == {
+        "policy_version": "canonical_source_intersection_v1",
+        "adjusted": True,
+        "end_clamped": True,
+        "end_overrun_samples": 2000,
+        "end_overrun_seconds": 20.0,
+        "reason": "end_clamped_to_canonical_source",
+    }
+    assert crossing_b.source_start_sample == 800
+    assert crossing_b.source_end_sample == 1000
+    assert crossing_b.boundary_reconciliation.end_overrun_samples == 125
+    assert max(crossing_a.source_start_sample, crossing_b.source_start_sample) < min(
+        crossing_a.source_end_sample,
+        crossing_b.source_end_sample,
+    )
+
+
+def test_segment_without_positive_canonical_intersection_fails_closed() -> None:
+    target = _target()
+    with pytest.raises(
+        DiarizationBackendFailure,
+        match="starts at or after canonical source EOF",
+    ):
+        _normalize_segments(
+            target=target,
+            segments=[
+                DiarizationBackendSegment(
+                    start_time=10.0,
+                    end_time=11.0,
+                    speaker_label="after-eof",
+                )
+            ],
+            provenance=_provenance(),
+        )
+
+    with pytest.raises(
+        DiarizationBackendFailure,
+        match="no positive canonical source intersection",
+    ):
+        _normalize_segments(
+            target=target,
+            segments=[
+                DiarizationBackendSegment(
+                    start_time=0.001,
+                    end_time=0.004,
+                    speaker_label="rounds-to-zero",
+                )
+            ],
+            provenance=_provenance(),
+        )
+
+
 def test_sparse_raw_anchor_maps_cluster_and_propagates_to_zero_overlap_segment() -> (
     None
 ):
@@ -438,6 +552,109 @@ def test_sparse_raw_anchor_maps_cluster_and_propagates_to_zero_overlap_segment()
         "cluster_propagated_only",
     ]
     assert mapping.bound_segments[1].entity_id == "e1"
+
+
+def test_identity_propagation_metrics_include_unanchored_part_of_mixed_segment() -> (
+    None
+):
+    target = _target()
+    raw = [_raw("speaker_0", 0.0, 4.0, index=1)]
+    mapping = bind_diarization_segments(
+        target=target,
+        raw_segments=raw,
+        frozen_bindings=[_binding(0.8, 1.2)],
+    )
+
+    direct, propagated, fully_propagated = _mapped_identity_duration_metrics(
+        raw_segments=raw,
+        cluster_bindings=mapping.bindings,
+        bound_segments=mapping.bound_segments,
+    )
+
+    assert mapping.bindings[0].cluster_speaker_seconds == pytest.approx(4.0)
+    assert direct == pytest.approx(0.4)
+    assert propagated == pytest.approx(3.6)
+    assert fully_propagated == 0.0
+    assert direct + propagated == pytest.approx(4.0)
+
+
+def test_identity_propagation_metrics_are_union_safe_and_status_scoped() -> None:
+    target = _target()
+    overlapping_raw = [
+        _raw("speaker_0", 0.0, 2.0, index=1),
+        _raw("speaker_0", 1.0, 3.0, index=2),
+    ]
+    overlapping = bind_diarization_segments(
+        target=target,
+        raw_segments=overlapping_raw,
+        frozen_bindings=[_binding(0.0, 0.4)],
+    )
+    direct, propagated, fully = _mapped_identity_duration_metrics(
+        raw_segments=overlapping_raw,
+        cluster_bindings=overlapping.bindings,
+        bound_segments=overlapping.bound_segments,
+    )
+    assert overlapping.bindings[0].cluster_speaker_seconds == pytest.approx(3.0)
+    assert direct == pytest.approx(0.4)
+    assert propagated == pytest.approx(2.6)
+    assert fully == pytest.approx(2.0)
+
+    zero_anchor_overlap_raw = [
+        _raw("speaker_0", 0.0, 2.0, index=1),
+        _raw("speaker_0", 1.0, 3.0, index=2),
+        _raw("speaker_0", 4.0, 5.0, index=3),
+    ]
+    zero_anchor_overlap = bind_diarization_segments(
+        target=target,
+        raw_segments=zero_anchor_overlap_raw,
+        frozen_bindings=[_binding(4.0, 5.0)],
+    )
+    assert _mapped_identity_duration_metrics(
+        raw_segments=zero_anchor_overlap_raw,
+        cluster_bindings=zero_anchor_overlap.bindings,
+        bound_segments=zero_anchor_overlap.bound_segments,
+    ) == pytest.approx((1.0, 3.0, 3.0))
+
+    fully_anchored_raw = [_raw("speaker_0", 0.0, 1.0, index=1)]
+    fully_anchored = bind_diarization_segments(
+        target=target,
+        raw_segments=fully_anchored_raw,
+        frozen_bindings=[_binding(0.0, 1.0)],
+    )
+    assert _mapped_identity_duration_metrics(
+        raw_segments=fully_anchored_raw,
+        cluster_bindings=fully_anchored.bindings,
+        bound_segments=fully_anchored.bound_segments,
+    ) == pytest.approx((1.0, 0.0, 0.0))
+
+    ambiguous_raw = [_raw("speaker_0", 0.0, 1.0, index=1)]
+    ambiguous = bind_diarization_segments(
+        target=target,
+        raw_segments=ambiguous_raw,
+        frozen_bindings=[_binding(0.0, 0.4, "e1"), _binding(0.4, 0.8, "e2")],
+    )
+    assert ambiguous.bindings[0].status == "ambiguous"
+    assert _mapped_identity_duration_metrics(
+        raw_segments=ambiguous_raw,
+        cluster_bindings=ambiguous.bindings,
+        bound_segments=ambiguous.bound_segments,
+    ) == pytest.approx((0.0, 0.0, 0.0))
+
+    conflict_raw = [
+        _raw("speaker_0", 0.0, 2.0, index=1),
+        _raw("speaker_1", 1.0, 3.0, index=2),
+    ]
+    conflict = bind_diarization_segments(
+        target=target,
+        raw_segments=conflict_raw,
+        frozen_bindings=[_binding(0.0, 0.4, "e1"), _binding(2.4, 2.8, "e1")],
+    )
+    assert [item.status for item in conflict.bindings] == ["conflict", "conflict"]
+    assert _mapped_identity_duration_metrics(
+        raw_segments=conflict_raw,
+        cluster_bindings=conflict.bindings,
+        bound_segments=conflict.bound_segments,
+    ) == pytest.approx((0.0, 0.0, 0.0))
 
 
 def test_only_frozen_bound_sync_identity_evidence_contributes() -> None:
@@ -589,7 +806,10 @@ def test_summary_distinguishes_speaker_wallclock_and_propagated_seconds(
     # Remaining 19 clips each contribute 0.8 speaker/wall-clock seconds.
     assert summary.diarized_speaker_seconds == pytest.approx(16.4)
     assert summary.diarized_wallclock_speech_seconds == pytest.approx(16.2)
-    assert summary.propagated_only_speaker_seconds == pytest.approx(0.4)
+    assert summary.mapped_speaker_seconds == pytest.approx(16.1)
+    assert summary.mapped_direct_anchor_speaker_seconds == pytest.approx(4.0)
+    assert summary.identity_propagated_speaker_seconds == pytest.approx(12.1)
+    assert summary.fully_propagated_segment_speaker_seconds == pytest.approx(0.4)
 
 
 def test_source_hash_change_fails_only_that_clip_without_backend_call(
@@ -641,6 +861,71 @@ def test_review_preserves_overlap_lanes_and_qa_fingerprint(tmp_path: Path) -> No
     assert inventory.inventory_fingerprint in review
     assert inventory.source_asr_inventory_fingerprint in review
     assert "localStorage.clear()" not in review
+
+
+def test_boundary_summary_review_and_audio_use_effective_canonical_intervals(
+    tmp_path: Path,
+) -> None:
+    root, selected = _audio_run(tmp_path)
+    inventory = build_diarization_inventory(audio_run_root=root, mode="pilot20")
+    backend = _FakeBackend(
+        {
+            selected[0]: [
+                DiarizationBackendSegment(
+                    start_time=0.0,
+                    end_time=1.13,
+                    speaker_label="left",
+                ),
+                DiarizationBackendSegment(
+                    start_time=0.7,
+                    end_time=1.2,
+                    speaker_label="right",
+                ),
+            ]
+        }
+    )
+    output = diarization_output_root(root, mode="pilot20")
+
+    summary = run_diarization_binding_pilot(
+        inventory=inventory,
+        output_root=output,
+        backend=backend,
+    )
+
+    assert summary.failed_clip_count == 0
+    assert summary.boundary_adjusted_segment_count == 2
+    assert summary.boundary_adjusted_clip_count == 1
+    assert summary.end_clamped_segment_count == 2
+    assert summary.total_end_overrun_seconds == pytest.approx(0.33)
+    assert summary.max_end_overrun_seconds == pytest.approx(0.2)
+    assert summary.max_end_overrun_samples == 3200
+    assert summary.median_positive_end_overrun_seconds == pytest.approx(0.165)
+
+    rows = [
+        json.loads(line)
+        for line in (output / "raw_segments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if json.loads(line)["target_clip_uid"] == selected[0]
+    ]
+    assert [item["backend_reported_end_time"] for item in rows] == [1.13, 1.2]
+    assert [item["source_end_sample"] for item in rows] == [16000, 16000]
+    review = (output / "review.html").read_text(encoding="utf-8")
+    assert review.count("EOF CLAMP") >= 4
+    assert "REPORTED: 0.000-1.130s" in review
+    assert "CANONICAL: 0.000-1.000s" in review
+    assert "EOF CLAMP: +0.130s" in review
+
+    first_audio = (
+        output / "review_media" / "segments" / selected[0] / "segment_0001.wav"
+    )
+    second_audio = (
+        output / "review_media" / "segments" / selected[0] / "segment_0002.wav"
+    )
+    with wave.open(str(first_audio), "rb") as stream:
+        assert stream.getnframes() == 16000
+    with wave.open(str(second_audio), "rb") as stream:
+        assert stream.getnframes() == 4800
 
 
 def test_qa_schema_allows_only_fixed_labels_and_deterministic_order() -> None:

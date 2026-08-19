@@ -14,9 +14,10 @@ Current milestone boundaries:
 - dots3 transcript generation is **BLOCKED AFTER FAILED HUMAN QA**.
 - The existing `semantic_pilot20` is diagnostic evidence only; do not delete it
   and do not run complete semantic production.
-- The DiariZen-assisted speaker-binding pilot is implemented but its real
-  runtime and mapping quality are not yet server-validated. Production is
-  blocked pending human calibration.
+- The DiariZen runtime completed a first real 20-call server attempt. Nine clips
+  exposed the now-fixed terminal source-boundary normalization issue; the full
+  pilot must be rerun before mapping-quality calibration. Production remains
+  blocked.
 - Speech enhancement, trusted-transcript dots3 annotation, and final H3
   rendering remain future work.
 
@@ -153,7 +154,7 @@ is more trustworthy than dots3-generated dialogue, but raw ASR is not final H3
 truth. DiariZen speaker segmentation/continuity and constrained contextual
 resolution remain outside frozen ASR V1.
 
-## DiariZen-Assisted Speaker Binding Pilot (Unvalidated Runtime)
+## DiariZen-Assisted Speaker Binding Pilot
 
 This calibration stage reuses the exact ordered target list and fingerprint in
 `$AUDIO_RUN_ROOT/asr_pilot20/inventory.json`. It reads canonical full audio and
@@ -196,6 +197,37 @@ cd "$AUDIO_RUN_ROOT/diarization_pilot20"
 "$R2V_PYTHON" -m http.server 8767 --bind 127.0.0.1
 ```
 
+### First Real Attempt And Required Rerun
+
+The validated runtime loaded
+`BUT-FIT/diarizen-wavlm-large-s80-md-v2` through the official pipeline and made
+20 backend calls. The first attempt produced 11 ready clips, nine failed clips,
+and no empty clips. All nine failures were
+`DiarizationBackendFailure: diarization segment exceeds canonical source audio`.
+The successful subset contained 27 raw segments and 12 clusters: 11 mapped, one
+ambiguous, zero unbound, and zero conflict. Its 2.54-second median DiariZen
+segment and 1.08-second legacy median turn are partial 11-ready-clip evidence,
+not final pilot-quality results.
+
+The bridge now intersects a reported terminal segment with authoritative
+canonical sample extent, clamps only its effective end to EOF, and preserves
+reported times plus exact overrun diagnostics. This is not an arbitrary time
+tolerance. Rerun all 20 clips before reviewing or calibrating mapping policy:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --overwrite
+```
+
+In `summary.json`, `identity_propagated_speaker_seconds` means mapped speaker
+duration whose identity comes from within-cluster speaker continuity rather
+than direct LR-ASD/Visual evidence. It includes unanchored portions of a segment
+that also contains a direct anchor. Boundary counts and exact overrun
+distribution must be inspected before any production policy is approved.
+
 Review the overlap-preserving speaker lanes and export cluster QA JSON. Human
 labels are calibration evidence only. Future complete enumeration can be
 verified without loading DiariZen:
@@ -210,9 +242,8 @@ cd "$REPO"
 
 Real production remains fail-closed with
 `production_blocked_pending_diarization_binding_calibration`. The model
-candidate and one-time staging procedure are recorded in
-`docs/H3_DIARIZEN_SPEAKER_BINDING.md`; that procedure is explicitly
-**UNVALIDATED**. Official source is MIT licensed, while released model weights
+candidate and staging procedure are recorded in
+`docs/H3_DIARIZEN_SPEAKER_BINDING.md`. Official source is MIT licensed, while released model weights
 are CC BY-NC 4.0 for research/non-commercial use.
 
 ## Blocked dots3 diagnostic sequence

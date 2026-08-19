@@ -1,6 +1,6 @@
 # R2V_DATA_V2 Project State
 
-Last updated: 2026-08-18
+Last updated: 2026-08-19
 
 ## Repository
 
@@ -95,10 +95,23 @@ inventory, raw overlap-preserving schemas, sample-domain sparse identity
 anchoring, cluster propagation, summary, and static human review. It does not
 modify or rerun ASR V1.
 
-The official DiariZen runtime and current model candidate remain unvalidated on
-the server. Real production execution is blocked, and the released model
-weights are research/non-commercial CC BY-NC 4.0. See
-`docs/H3_DIARIZEN_SPEAKER_BINDING.md`.
+The official DiariZen pipeline and current model candidate completed a first
+real 20-call server attempt. Eleven clips were ready and nine failed because the
+old bridge rejected terminal segments extending beyond canonical EOF. The model
+runtime itself worked. Raw segment v2 now preserves reported coordinates while
+intersecting the effective interval with canonical sample extent; summary v2
+adds exact boundary diagnostics and union-safe continuity propagation seconds.
+The full 20 clips must be rerun before mapping calibration. Real production
+execution remains blocked, and released model weights are research/non-commercial
+CC BY-NC 4.0. See `docs/H3_DIARIZEN_SPEAKER_BINDING.md`.
+
+The 11-ready-clip subset contained 27 raw segments and 12 clusters: 11 mapped,
+one ambiguous, zero unbound, and zero conflict. Its 2.54-second DiariZen median
+segment and 1.08-second legacy turn median are partial observations, not a final
+quality result. `identity_propagated_speaker_seconds` now measures mapped
+speaker time carried by within-cluster continuity rather than direct
+LR-ASD/Visual evidence, including unanchored portions of partly anchored
+segments.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
@@ -161,13 +174,13 @@ with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_diarization*.py -q
-# 16 passed
+# 21 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 205 passed
+# 210 passed
 
 python -m pytest -q
-# 1872 passed, 1 existing Pillow deprecation warning
+# 1877 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -194,8 +207,8 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Stage and validate the isolated DiariZen environment and local model cache, then
-run the fixed 20-clip pilot and review every cluster mapping. Use the review to
-calibrate a production mapping policy before lifting the explicit production
-block. ASR V2, enhancement, unresolved-speaker MLLM handling, entity-to-subject
-mapping, and final `<d>` rendering remain future work.
+Rerun the fixed 20-clip DiariZen pilot after the terminal boundary repair,
+inspect the full overrun distribution and every cluster mapping, then calibrate
+a production mapping policy before lifting the explicit production block. ASR
+V2, enhancement, unresolved-speaker MLLM handling, entity-to-subject mapping,
+and final `<d>` rendering remain future work.

@@ -2,10 +2,11 @@
 
 ## Status
 
-This is an implemented **calibration pilot** with a fake-backend-tested runtime
-boundary. The real DiariZen environment, CUDA runtime, model cache, throughput,
-and mapping quality are **UNVALIDATED** until the fixed server pilot is run.
-Production execution is intentionally blocked by
+This is an implemented **calibration pilot**. The dedicated DiariZen environment,
+CUDA runtime, local model cache, persistent worker, and official pipeline have
+now completed a first real 20-call server attempt. Mapping quality remains
+**UNCALIBRATED**, and the complete fixed pilot must be rerun after the terminal
+boundary repair below. Production execution is intentionally blocked by
 `production_blocked_pending_diarization_binding_calibration`.
 
 Completed and frozen inputs remain unchanged:
@@ -47,14 +48,51 @@ cluster, including offscreen or occluded segments with zero direct Visual
 overlap. Overlapped anchor spans with more than one active speaker cluster are
 contested and support no cluster.
 
+## First Real Pilot Attempt
+
+The first server attempt used
+`BUT-FIT/diarizen-wavlm-large-s80-md-v2` through the official pipeline and made
+20 backend calls. Eleven clips were ready, nine failed, and none were empty.
+Every failure had the same reason:
+`DiarizationBackendFailure: diarization segment exceeds canonical source audio`.
+The model/runtime worked; the old R2V normalization rejected a whole clip when
+a reported terminal end rounded beyond the physical WAV extent.
+
+The successful 11-clip subset contained 27 raw segments and 12 clusters: 11
+`candidate_mapped`, one `ambiguous`, zero `unbound`, and zero `conflict`.
+DiariZen median segment duration was 2.54 seconds versus 1.08 seconds for legacy
+LR-ASD turns. These are partial observations from the ready subset, not a final
+pilot-quality result.
+
+Raw segment schema v2 now intersects the backend-reported sample interval with
+the authoritative canonical extent `[0, source_frame_count)`. A segment that
+starts before EOF and ends beyond it keeps its exact reported times/samples,
+uses `source_frame_count` as its effective end, and records exact overrun
+evidence under `canonical_source_intersection_v1`. A segment starting at or
+after EOF, or having no positive effective duration, still fails closed. This
+is physical-domain reconciliation, not a millisecond tolerance.
+
+Summary schema v2 distinguishes:
+
+- `mapped_direct_anchor_speaker_seconds`: mapped-cluster duration directly
+  supported by usable LR-ASD/Visual identity evidence;
+- `identity_propagated_speaker_seconds`: mapped speaker duration whose identity
+  is carried by within-cluster continuity rather than direct evidence;
+- `fully_propagated_segment_speaker_seconds`: mapped segments containing no
+  direct anchor anywhere in that segment.
+
+For mapped clusters, `mapped_speaker_seconds` must reconcile with mapped direct
+anchor seconds plus identity-propagated seconds. Accounting uses cluster-level
+unioned speaker time, not a naive sum over overlapping segments.
+
 ## Versioned Artifacts
 
 - `r2v.h3.diarization_inventory.1`
-- `r2v.h3.diarization_segment.1`
+- `r2v.h3.diarization_segment.2`
 - `r2v.h3.diarization_cluster_binding.1`
 - `r2v.h3.diarization_bound_segment.1`
 - `r2v.h3.diarization_clip_result.1`
-- `r2v.h3.diarization_summary.1`
+- `r2v.h3.diarization_summary.2`
 - `r2v.h3.diarization_human_qa.1`
 
 `speaker_cluster_id` is always clip-local. The stage performs no cross-clip or
@@ -78,7 +116,7 @@ worker:
   --dry-run
 ```
 
-Real fixed pilot after the separate runtime has been staged and validated:
+Rerun the full fixed pilot after updating the repository:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_diarization_binding.py \
@@ -125,11 +163,11 @@ canonical Audio V1 PCM16 WAV directly, verifies its hash before inference, and
 records `official_torchaudio_first_channel_passthrough_v1`. It performs no
 denoising, enhancement, interpolation, or timestamp shift.
 
-## Proposed One-Time Server Staging (Unvalidated)
+## Server Staging Reference
 
-The following is a proposed starting point based on the current official
-repository, not a validated server recipe. Inspect the checked-out revision and
-dependency resolver output before accepting it:
+The runtime has completed a real server attempt. The following remains a concise
+reproducible staging reference; inspect the checked-out revision and dependency
+resolver output before rebuilding an existing working environment:
 
 ```bash
 export DIARIZEN_ENV=/mnt/workspace/litengjie/data/audio_deps/diarizen-venv
