@@ -1461,10 +1461,10 @@ Do not run a 75-clip caption job or integrate the draft into final H3 before the
 20-clip human review is accepted.
 
 The existing `target_audio_caption_pilot20` completed 20/20 runtime calls. Its
-ASR-pilot clips are retained as a clean/negative QA set for checking abstention
-and hallucination; its review remains available/in progress. It is not adequate
-positive evidence for ambience, music, or non-speech-event recall and cannot by
-itself approve Target Audio Caption production.
+ASR-pilot clips are retained as a clean/negative set for checking abstention and
+hallucination. Formal QA was intentionally skipped because the set lacks useful
+positive background cases. It cannot establish ambience, music, or
+non-speech-event recall or approve Target Audio Caption production.
 
 ### Model-free background-audio scout
 
@@ -1487,11 +1487,25 @@ cd "$AUDIO_RUN_ROOT/background_audio_scout"
 ```
 
 Open `http://127.0.0.1:8765/report.html`, listen to the clips, and manually label
-exactly 20 as `background-rich`. The exported file is
+every obvious positive as `background-rich`. The current 75-target dataset has
+fewer than 20 such clips; this is dataset-distribution-specific, not a global
+assumption. The positive pilot is therefore dynamically sized and non-empty.
+Never fabricate positives to meet a quota. The exported file is
 `background_audio_pilot_selection.json`. Non-speech RMS/ratio/duration are
 sorting aids only; they do not establish that music or another background event
-is audible. Running the unchanged Dots3 Target Audio Caption prompt over that
-manual selection is a later stage.
+is audible. Run the unchanged Dots3 Target Audio Caption policy over exactly the
+manual selection, in its separate fixed output root:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --clip-selection-json /path/to/background_audio_pilot_selection.json
+
+cat "$AUDIO_RUN_ROOT/target_audio_caption_background_pilot/summary.json"
+```
+
+This command does not read the `asr_v2_pilot20` clip selection and does not
+overwrite `$AUDIO_RUN_ROOT/target_audio_caption_pilot20`.
 
 ## Cleanup of old timestamped smoke attempts
 

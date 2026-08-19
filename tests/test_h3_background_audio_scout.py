@@ -240,11 +240,15 @@ def test_scout_is_read_only_model_free_fixed_root_and_atomic(tmp_path: Path) -> 
     assert "Highest non-speech ratio" in report
     assert "Longest non-speech duration" in report
     assert "High non-speech energy is not an automatic" in report
-    assert "Exactly 20 background-rich clips are required" in report
+    assert "Export background-rich selection JSON" in report
+    assert "Select at least one background-rich clip" in report
+    assert "const keyPrefix='h3-background-audio-scout-'" in report
     assert "background_audio_pilot_selection.json" in report
 
 
-def test_final_selection_requires_exactly_20_manual_background_rich_clips() -> None:
+def test_final_selection_accepts_dynamic_nonempty_manual_background_rich_clips() -> (
+    None
+):
     reviews = [
         BackgroundAudioSelectionReview(
             target_clip_uid=f"clip-{index:03d}",
@@ -257,19 +261,72 @@ def test_final_selection_requires_exactly_20_manual_background_rich_clips() -> N
         source_scout_inventory_fingerprint="1" * 64,
         source_diarization_inventory_fingerprint="2" * 64,
         source_audio_evidence_fingerprint="3" * 64,
+        selection_count=20,
         selected_clip_ids=[item.target_clip_uid for item in reviews[:20]],
         reviews=reviews,
     )
     assert selection.selection_count == 20
     assert selection.selection_method == "manual_human_review_v1"
 
-    with pytest.raises(ValidationError, match="20 clips"):
+    one = BackgroundAudioPilotSelection(
+        source_scout_inventory_fingerprint="1" * 64,
+        source_diarization_inventory_fingerprint="2" * 64,
+        source_audio_evidence_fingerprint="3" * 64,
+        selection_count=1,
+        selected_clip_ids=[reviews[0].target_clip_uid],
+        reviews=[reviews[0]],
+    )
+    assert one.selected_clip_ids == ["clip-000"]
+
+    with pytest.raises(ValidationError, match="selection count"):
         BackgroundAudioPilotSelection(
             source_scout_inventory_fingerprint="1" * 64,
             source_diarization_inventory_fingerprint="2" * 64,
             source_audio_evidence_fingerprint="3" * 64,
             selection_count=20,
             selected_clip_ids=[item.target_clip_uid for item in reviews[:19]],
+            reviews=reviews,
+        )
+
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        BackgroundAudioPilotSelection(
+            source_scout_inventory_fingerprint="1" * 64,
+            source_diarization_inventory_fingerprint="2" * 64,
+            source_audio_evidence_fingerprint="3" * 64,
+            selection_count=0,
+            selected_clip_ids=[],
+            reviews=[],
+        )
+
+
+def test_selection_contains_only_background_rich_reviews_in_source_order() -> None:
+    reviews = [
+        BackgroundAudioSelectionReview(target_clip_uid="clip-a", label="clean"),
+        BackgroundAudioSelectionReview(
+            target_clip_uid="clip-b", label="background-rich"
+        ),
+        BackgroundAudioSelectionReview(target_clip_uid="clip-c", label="uncertain"),
+        BackgroundAudioSelectionReview(
+            target_clip_uid="clip-d", label="background-rich"
+        ),
+    ]
+    selection = BackgroundAudioPilotSelection(
+        source_scout_inventory_fingerprint="1" * 64,
+        source_diarization_inventory_fingerprint="2" * 64,
+        source_audio_evidence_fingerprint="3" * 64,
+        selection_count=2,
+        selected_clip_ids=["clip-b", "clip-d"],
+        reviews=reviews,
+    )
+    assert selection.selected_clip_ids == ["clip-b", "clip-d"]
+
+    with pytest.raises(ValidationError, match="background-rich reviews"):
+        BackgroundAudioPilotSelection(
+            source_scout_inventory_fingerprint="1" * 64,
+            source_diarization_inventory_fingerprint="2" * 64,
+            source_audio_evidence_fingerprint="3" * 64,
+            selection_count=2,
+            selected_clip_ids=["clip-a", "clip-b"],
             reviews=reviews,
         )
 

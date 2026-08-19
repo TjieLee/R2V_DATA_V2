@@ -8,11 +8,14 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import tools.run_h3_target_audio_caption as target_audio_caption_cli
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.target_audio_caption import (
     DEFAULT_DOTS3_CHECKPOINT_ID,
     QA_FLAGS,
     QA_LABELS,
+    SYSTEM_PROMPT,
+    TARGET_AUDIO_CAPTION_PROMPT_VERSION,
     BackgroundMusic,
     Dots3TargetAudioCaptionConfig,
     Dots3TargetAudioCaptionResponse,
@@ -27,6 +30,7 @@ from r2v_data_v2.h3.target_audio_caption import (
     TargetAudioCaptionJob,
     _model_input,
     _response_issues,
+    _validate_background_selection,
     _validate_pilot_selection,
     render_audio_prompt_draft,
     run_target_audio_caption_pilot,
@@ -86,7 +90,12 @@ class _FakeBackend:
         )
 
 
-def _inventory(tmp_path: Path) -> TargetAudioCaptionInventory:
+def _inventory(
+    tmp_path: Path,
+    *,
+    count: int = 20,
+    mode: str = "pilot20",
+) -> TargetAudioCaptionInventory:
     sources = {
         name: _write(tmp_path / "source" / name, name.encode())
         for name in (
@@ -109,7 +118,7 @@ def _inventory(tmp_path: Path) -> TargetAudioCaptionInventory:
     (tmp_path / "source" / "text_usability").mkdir()
     (tmp_path / "production" / "audio").mkdir(parents=True)
     jobs = []
-    for index in range(20):
+    for index in range(count):
         clip_uid = f"clip-{index:03d}"
         video = _write(
             tmp_path / "media" / f"{clip_uid}.mp4", f"video:{clip_uid}".encode()
@@ -143,10 +152,7 @@ def _inventory(tmp_path: Path) -> TargetAudioCaptionInventory:
         )
     values = {
         "schema_version": "r2v.h3.target_audio_caption_inventory.1",
-        "mode": "pilot20",
-        "source_pilot_inventory_path": str(sources["pilot.json"]),
-        "source_pilot_inventory_sha256": _sha256(sources["pilot.json"]),
-        "source_pilot_inventory_fingerprint": "1" * 64,
+        "mode": mode,
         "source_diarization_root": str(tmp_path / "source" / "diarization"),
         "source_diarization_inventory_path": str(sources["diar.json"]),
         "source_diarization_inventory_sha256": _sha256(sources["diar.json"]),
@@ -184,14 +190,35 @@ def _inventory(tmp_path: Path) -> TargetAudioCaptionInventory:
         "source_text_usability_summary_path": str(sources["text_summary.json"]),
         "source_text_usability_summary_sha256": _sha256(sources["text_summary.json"]),
         "source_audio_root": str(tmp_path / "production" / "audio"),
-        "selected_target_count": 20,
-        "selection_mode": "exact_asr_v2_pilot20_order_v1",
+        "selected_target_count": count,
+        "selection_mode": (
+            "exact_asr_v2_pilot20_order_v1"
+            if mode == "pilot20"
+            else "manual_background_audio_selection_v1"
+        ),
         "bounded_selection_applied": True,
         "parent_quota_applied": False,
         "transcript_supplied_to_model": False,
         "final_renderer_applied": False,
         "jobs": [item.model_dump(mode="json") for item in jobs],
     }
+    if mode == "pilot20":
+        values.update(
+            {
+                "source_pilot_inventory_path": str(sources["pilot.json"]),
+                "source_pilot_inventory_sha256": _sha256(sources["pilot.json"]),
+                "source_pilot_inventory_fingerprint": "1" * 64,
+            }
+        )
+    else:
+        selection = _write(tmp_path / "source" / "selection.json", b"selection")
+        values.update(
+            {
+                "source_selection_path": str(selection),
+                "source_selection_sha256": _sha256(selection),
+                "source_scout_inventory_fingerprint": "5" * 64,
+            }
+        )
     fingerprint = hashlib.sha256(
         json.dumps(
             values,
@@ -226,6 +253,66 @@ def test_exact_asr_v2_pilot20_selection_order_is_reused() -> None:
         _validate_pilot_selection(
             pilot_ids=pilot_ids[:-1],
             production_ids=production_ids,
+        )
+
+
+@pytest.mark.parametrize("selected_ids", [["clip-001"], ["clip-001", "clip-004"]])
+def test_background_selection_accepts_arbitrary_nonempty_source_order(
+    selected_ids: list[str],
+) -> None:
+    from r2v_data_v2.h3.background_audio_scout import BackgroundAudioPilotSelection
+
+    selection = BackgroundAudioPilotSelection(
+        source_scout_inventory_fingerprint="1" * 64,
+        source_diarization_inventory_fingerprint="2" * 64,
+        source_audio_evidence_fingerprint="3" * 64,
+        selection_count=len(selected_ids),
+        selected_clip_ids=selected_ids,
+        reviews=[
+            {"target_clip_uid": clip_uid, "label": "background-rich"}
+            for clip_uid in selected_ids
+        ],
+    )
+    assert (
+        _validate_background_selection(
+            selection=selection,
+            scout_clip_ids=[f"clip-{index:03d}" for index in range(6)],
+            scout_inventory_fingerprint="1" * 64,
+            diarization_inventory_fingerprint="2" * 64,
+            audio_evidence_fingerprint="3" * 64,
+            production_ids=[f"clip-{index:03d}" for index in range(6)],
+        )
+        == selected_ids
+    )
+
+
+def test_background_selection_rejects_fingerprint_or_order_drift() -> None:
+    from r2v_data_v2.h3.background_audio_scout import BackgroundAudioPilotSelection
+
+    selection = BackgroundAudioPilotSelection(
+        source_scout_inventory_fingerprint="1" * 64,
+        source_diarization_inventory_fingerprint="2" * 64,
+        source_audio_evidence_fingerprint="3" * 64,
+        selection_count=2,
+        selected_clip_ids=["clip-004", "clip-001"],
+        reviews=[
+            {"target_clip_uid": "clip-004", "label": "background-rich"},
+            {"target_clip_uid": "clip-001", "label": "background-rich"},
+        ],
+    )
+    kwargs = {
+        "selection": selection,
+        "scout_clip_ids": [f"clip-{index:03d}" for index in range(6)],
+        "scout_inventory_fingerprint": "1" * 64,
+        "diarization_inventory_fingerprint": "2" * 64,
+        "audio_evidence_fingerprint": "3" * 64,
+        "production_ids": [f"clip-{index:03d}" for index in range(6)],
+    }
+    with pytest.raises(ValueError, match="source order"):
+        _validate_background_selection(**kwargs)
+    with pytest.raises(ValueError, match="fingerprint"):
+        _validate_background_selection(
+            **{**kwargs, "scout_inventory_fingerprint": "9" * 64}
         )
 
 
@@ -357,6 +444,73 @@ def test_pilot_publication_is_atomic_read_only_and_continues_failures(
     assert "dialogue_leakage" in report
     assert "localStorage.clear" not in report
     assert "final_renderer" not in report
+
+
+def test_background_selection_runs_exact_order_in_separate_root_and_keeps_clean_pilot(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, count=2, mode="background_pilot")
+    clean_marker = _write(
+        target_audio_caption_output_root(tmp_path) / "keep.json", b"clean-pilot"
+    )
+    clean_hash = _sha256(clean_marker)
+    output = target_audio_caption_output_root(tmp_path, mode="background_pilot")
+    backend = _FakeBackend(tmp_path)
+
+    summary = run_target_audio_caption_pilot(
+        inventory=inventory,
+        output_root=output,
+        backend=backend,
+    )
+
+    assert backend.calls == ["clip-000", "clip-001"]
+    assert summary.mode == "background_pilot"
+    assert summary.target_clip_count == 2
+    assert output == tmp_path / "target_audio_caption_background_pilot"
+    assert _sha256(clean_marker) == clean_hash
+    report = (output / "report.html").read_text(encoding="utf-8")
+    assert "target_audio_caption_background_pilot_human_qa.json" in report
+    assert TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_dots3_target_audio_caption_v1"
+    assert "Never transcribe, quote, paraphrase" in SYSTEM_PROMPT
+
+
+def test_cli_passes_manual_selection_and_uses_background_output_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inventory = _inventory(tmp_path, count=1, mode="background_pilot")
+    selection_path = tmp_path / "manual-selection.json"
+    selection_path.write_text("{}\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_build(*, audio_run_root: Path, clip_selection_json: Path | None):
+        captured["audio_run_root"] = audio_run_root
+        captured["clip_selection_json"] = clip_selection_json
+        return inventory
+
+    monkeypatch.setattr(
+        target_audio_caption_cli,
+        "build_target_audio_caption_inventory",
+        fake_build,
+    )
+
+    result = target_audio_caption_cli.main(
+        [
+            "--audio-run-root",
+            str(tmp_path),
+            "--clip-selection-json",
+            str(selection_path),
+            "--dry-run",
+        ]
+    )
+
+    assert captured == {
+        "audio_run_root": tmp_path.resolve(),
+        "clip_selection_json": selection_path,
+    }
+    assert result["mode"] == "background_pilot"
+    assert result["output_root"] == str(
+        tmp_path / "target_audio_caption_background_pilot"
+    )
 
 
 def test_failed_atomic_build_does_not_publish_partial_output(tmp_path: Path) -> None:

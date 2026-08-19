@@ -38,8 +38,9 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 ## Current Development Goal
 
 Use a zero-model-call scout over all 75 frozen production Audio/DiariZen targets
-to manually choose a 20-clip background-rich Target Audio Caption positive
-pilot. The deterministic final renderer implementation is complete and frozen;
+to manually choose the non-empty background-rich Target Audio Caption positive
+pilot. This dataset has fewer than 20 obvious positives, so its pilot count is
+dynamic rather than quota-filled. The deterministic final renderer is frozen;
 the scout and both caption pilots do not feed or rebuild it.
 
 ## Current Pass
@@ -190,19 +191,19 @@ The current model-free background-audio scout enumerates all 75 production
 targets and computes only DiariZen temporal-union coverage and canonical PCM16
 RMS/peak diagnostics. It applies no threshold, model, quota, or automatic
 selection. The static review bundle under
-`$AUDIO_RUN_ROOT/background_audio_scout` exports exactly 20 manually labeled
-`background-rich` clips for the next positive pilot. See
+`$AUDIO_RUN_ROOT/background_audio_scout` exports all manually labeled
+`background-rich` clips in source order for the next positive pilot. See
 `docs/H3_TARGET_AUDIO_CAPTION.md`.
 
 Current milestone status is therefore:
 
 - **COMPLETE / FROZEN:** DiariZen, ASR V2, TextUsabilityPolicy V1, and the
   deterministic final renderer implementation;
-- **CLEAN / NEGATIVE PILOT:** 20/20 runtime complete, review available and human
-  QA in progress;
+- **CLEAN / NEGATIVE PILOT:** 20/20 runtime complete; formal QA intentionally
+  skipped because it lacks useful positive background cases;
 - **CURRENT:** manually select the background-rich positive pilot with the
   model-free scout;
-- **PENDING:** run the same Target Audio Caption policy on the selected 20,
+- **PENDING:** run the same Target Audio Caption policy on the dynamic selection,
   complete human QA, approve production, integrate with the renderer, and
   rebuild final H3;
 - **OPTIONAL LATER:** voice-reference enhancement or denoising experiments.

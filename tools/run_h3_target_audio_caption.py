@@ -42,6 +42,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Run the fixed 20-clip H3 target-audio-caption pilot",
     )
     parser.add_argument("--audio-run-root", type=Path, required=True)
+    parser.add_argument("--clip-selection-json", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--base-url")
@@ -71,10 +72,13 @@ def _value(
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     audio_run_root = arguments.audio_run_root.expanduser().resolve(strict=True)
-    inventory = build_target_audio_caption_inventory(audio_run_root=audio_run_root)
-    output_root = target_audio_caption_output_root(audio_run_root)
+    inventory = build_target_audio_caption_inventory(
+        audio_run_root=audio_run_root,
+        clip_selection_json=arguments.clip_selection_json,
+    )
+    output_root = target_audio_caption_output_root(audio_run_root, mode=inventory.mode)
     result: dict[str, object] = {
-        "mode": "pilot20",
+        "mode": inventory.mode,
         "selected_target_count": inventory.selected_target_count,
         "selection_mode": inventory.selection_mode,
         "inventory_fingerprint": inventory.inventory_fingerprint,

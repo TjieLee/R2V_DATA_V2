@@ -26,6 +26,10 @@ from r2v_data_v2.h3.asr_v2_transcription import (
 from r2v_data_v2.h3.asr_v2_transcription import (
     _inventory_fingerprint as _asr_v2_inventory_fingerprint,
 )
+from r2v_data_v2.h3.background_audio_scout import (
+    BackgroundAudioPilotSelection,
+    build_background_audio_scout_inventory,
+)
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.text_usability import (
@@ -47,6 +51,9 @@ TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.1"
 TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = "r2v.h3.target_audio_caption_human_qa.1"
 TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_dots3_target_audio_caption_v1"
 TARGET_AUDIO_CAPTION_OUTPUT_DIRECTORY = "target_audio_caption_pilot20"
+TARGET_AUDIO_CAPTION_BACKGROUND_OUTPUT_DIRECTORY = (
+    "target_audio_caption_background_pilot"
+)
 TARGET_AUDIO_INPUT_MODALITY = "native_target_video_with_embedded_audio"
 PILOT_TARGET_COUNT = 20
 DEFAULT_DOTS3_MODEL = "dots3-note-prev"
@@ -266,10 +273,19 @@ class TargetAudioCaptionInventory(SchemaModel):
     schema_version: Literal["r2v.h3.target_audio_caption_inventory.1"] = (
         TARGET_AUDIO_CAPTION_INVENTORY_VERSION
     )
-    mode: Literal["pilot20"] = "pilot20"
-    source_pilot_inventory_path: str
-    source_pilot_inventory_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_pilot_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mode: Literal["pilot20", "background_pilot"] = "pilot20"
+    source_pilot_inventory_path: str | None = None
+    source_pilot_inventory_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_pilot_inventory_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    source_selection_path: str | None = None
+    source_selection_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_scout_inventory_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     source_diarization_root: str
     source_diarization_inventory_path: str
     source_diarization_inventory_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -299,10 +315,10 @@ class TargetAudioCaptionInventory(SchemaModel):
     source_text_usability_summary_path: str
     source_text_usability_summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_audio_root: str
-    selected_target_count: Literal[20] = PILOT_TARGET_COUNT
-    selection_mode: Literal["exact_asr_v2_pilot20_order_v1"] = (
-        "exact_asr_v2_pilot20_order_v1"
-    )
+    selected_target_count: int = Field(gt=0)
+    selection_mode: Literal[
+        "exact_asr_v2_pilot20_order_v1", "manual_background_audio_selection_v1"
+    ] = "exact_asr_v2_pilot20_order_v1"
     bounded_selection_applied: Literal[True] = True
     parent_quota_applied: Literal[False] = False
     transcript_supplied_to_model: Literal[False] = False
@@ -312,8 +328,32 @@ class TargetAudioCaptionInventory(SchemaModel):
 
     @model_validator(mode="after")
     def validate_inventory(self) -> TargetAudioCaptionInventory:
-        if len(self.jobs) != PILOT_TARGET_COUNT:
-            raise ValueError("target audio caption pilot must contain exactly 20 clips")
+        if len(self.jobs) != self.selected_target_count:
+            raise ValueError("target audio caption job count is inconsistent")
+        pilot_sources = (
+            self.source_pilot_inventory_path,
+            self.source_pilot_inventory_sha256,
+            self.source_pilot_inventory_fingerprint,
+        )
+        selection_sources = (
+            self.source_selection_path,
+            self.source_selection_sha256,
+            self.source_scout_inventory_fingerprint,
+        )
+        if self.mode == "pilot20":
+            if (
+                self.selected_target_count != PILOT_TARGET_COUNT
+                or self.selection_mode != "exact_asr_v2_pilot20_order_v1"
+                or any(item is None for item in pilot_sources)
+                or any(item is not None for item in selection_sources)
+            ):
+                raise ValueError("target audio caption pilot20 provenance is invalid")
+        elif (
+            self.selection_mode != "manual_background_audio_selection_v1"
+            or any(item is None for item in selection_sources)
+            or any(item is not None for item in pilot_sources)
+        ):
+            raise ValueError("background target audio caption provenance is invalid")
         clip_ids = [item.target_clip_uid for item in self.jobs]
         if len(clip_ids) != len(set(clip_ids)):
             raise ValueError("target audio caption pilot clips must be unique")
@@ -372,11 +412,11 @@ class TargetAudioCaptionSummary(SchemaModel):
     schema_version: Literal["r2v.h3.target_audio_caption_summary.1"] = (
         TARGET_AUDIO_CAPTION_SUMMARY_VERSION
     )
-    mode: Literal["pilot20"] = "pilot20"
+    mode: Literal["pilot20", "background_pilot"] = "pilot20"
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_identifier: str
     backend_provenance: TargetAudioCaptionBackendProvenance
-    target_clip_count: Literal[20] = PILOT_TARGET_COUNT
+    target_clip_count: int = Field(gt=0)
     ready_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     initial_call_count: int = Field(ge=0)
@@ -417,9 +457,9 @@ class TargetAudioCaptionHumanQAExport(SchemaModel):
         TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION
     )
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    mode: Literal["pilot20"] = "pilot20"
+    mode: Literal["pilot20", "background_pilot"] = "pilot20"
     label_count: int = Field(ge=0)
-    total_clip_count: Literal[20] = PILOT_TARGET_COUNT
+    total_clip_count: int = Field(default=PILOT_TARGET_COUNT, gt=0)
     counts: dict[str, int]
     labels: list[TargetAudioCaptionHumanQALabel]
 
@@ -526,7 +566,9 @@ def _inventory_fingerprint(
     inventory: TargetAudioCaptionInventory | dict[str, object],
 ) -> str:
     values = (
-        inventory.model_dump(mode="json", exclude={"inventory_fingerprint"})
+        inventory.model_dump(
+            mode="json", exclude={"inventory_fingerprint"}, exclude_none=True
+        )
         if isinstance(inventory, TargetAudioCaptionInventory)
         else {
             key: value
@@ -803,24 +845,64 @@ def _validate_pilot_selection(
     return ordered
 
 
+def _validate_background_selection(
+    *,
+    selection: BackgroundAudioPilotSelection,
+    scout_clip_ids: Sequence[str],
+    scout_inventory_fingerprint: str,
+    diarization_inventory_fingerprint: str,
+    audio_evidence_fingerprint: str,
+    production_ids: Sequence[str],
+) -> list[str]:
+    if (
+        selection.source_scout_inventory_fingerprint != scout_inventory_fingerprint
+        or selection.source_diarization_inventory_fingerprint
+        != diarization_inventory_fingerprint
+        or selection.source_audio_evidence_fingerprint != audio_evidence_fingerprint
+    ):
+        raise ValueError("background-audio selection fingerprint is inconsistent")
+    ordered = list(selection.selected_clip_ids)
+    available = set(production_ids)
+    if any(clip_uid not in available for clip_uid in ordered):
+        raise ValueError("background-audio selected clip is absent from production")
+    selected = set(ordered)
+    expected_order = [clip_uid for clip_uid in scout_clip_ids if clip_uid in selected]
+    if ordered != expected_order:
+        raise ValueError("background-audio selection must preserve scout source order")
+    return ordered
+
+
 def build_target_audio_caption_inventory(
-    *, audio_run_root: Path
+    *, audio_run_root: Path, clip_selection_json: Path | None = None
 ) -> TargetAudioCaptionInventory:
     root = audio_run_root.expanduser().resolve(strict=True)
     pilot_path = root / "asr_v2_pilot20" / "inventory.json"
     asr_root = root / "production" / "asr_v2"
     text_root = root / "production" / "text_usability"
     audio_root = root / "production" / "audio"
-    pilot = load_asr_v2_inventory(pilot_path)
     production = load_asr_v2_inventory(asr_root / "inventory.json")
-    if not isinstance(pilot, ASRV2Inventory) or pilot.mode != "pilot20":
-        raise ValueError("target audio caption requires the ASR V2 pilot20 inventory")
     if not isinstance(production, ASRV2ProductionInventory):
         raise TypeError("target audio caption requires production ASR V2")
-    if pilot.inventory_fingerprint != _asr_v2_inventory_fingerprint(pilot):
-        raise ValueError("ASR V2 pilot inventory fingerprint is inconsistent")
     if production.inventory_fingerprint != _asr_v2_inventory_fingerprint(production):
         raise ValueError("production ASR V2 inventory fingerprint is inconsistent")
+
+    pilot: ASRV2Inventory | None = None
+    selection: BackgroundAudioPilotSelection | None = None
+    selection_path: Path | None = None
+    scout_inventory_fingerprint: str | None = None
+    if clip_selection_json is None:
+        pilot = load_asr_v2_inventory(pilot_path)
+        if not isinstance(pilot, ASRV2Inventory) or pilot.mode != "pilot20":
+            raise ValueError(
+                "target audio caption requires the ASR V2 pilot20 inventory"
+            )
+        if pilot.inventory_fingerprint != _asr_v2_inventory_fingerprint(pilot):
+            raise ValueError("ASR V2 pilot inventory fingerprint is inconsistent")
+    else:
+        selection_path = clip_selection_json.expanduser().resolve(strict=True)
+        selection = BackgroundAudioPilotSelection.model_validate_json(
+            selection_path.read_text(encoding="utf-8")
+        )
 
     asr_inventory_path = asr_root / "inventory.json"
     asr_segments_path = asr_root / "segments.jsonl"
@@ -904,17 +986,34 @@ def build_target_audio_caption_inventory(
         _verify_file(path, expected_hash, code=f"source_diarization_{name}")
 
     targets = {item.target_clip_uid: item for item in production.targets}
-    pilot_ids = _validate_pilot_selection(
-        pilot_ids=[item.target_clip_uid for item in pilot.targets],
-        production_ids=list(targets),
-    )
+    if selection is None:
+        assert pilot is not None
+        selected_ids = _validate_pilot_selection(
+            pilot_ids=[item.target_clip_uid for item in pilot.targets],
+            production_ids=list(targets),
+        )
+        mode = "pilot20"
+        selection_mode = "exact_asr_v2_pilot20_order_v1"
+    else:
+        scout = build_background_audio_scout_inventory(audio_run_root=root)
+        scout_inventory_fingerprint = scout.inventory_fingerprint
+        selected_ids = _validate_background_selection(
+            selection=selection,
+            scout_clip_ids=[item.target_clip_uid for item in scout.jobs],
+            scout_inventory_fingerprint=scout.inventory_fingerprint,
+            diarization_inventory_fingerprint=scout.source_diarization_inventory_fingerprint,
+            audio_evidence_fingerprint=scout.source_audio_evidence_fingerprint,
+            production_ids=list(targets),
+        )
+        mode = "background_pilot"
+        selection_mode = "manual_background_audio_selection_v1"
     jobs_by_clip: dict[str, list[ASRV2SegmentJob]] = defaultdict(list)
     for item in production.jobs:
         jobs_by_clip[item.target_clip_uid].append(item)
     records_by_clip = Counter(item.target_clip_uid for item in asr_records)
     text_by_clip = Counter(item.target_clip_uid for item in text_records)
     output_jobs: list[TargetAudioCaptionJob] = []
-    for clip_uid in pilot_ids:
+    for clip_uid in selected_ids:
         target = targets.get(clip_uid)
         assert target is not None
         if records_by_clip[clip_uid] != len(jobs_by_clip[clip_uid]) or text_by_clip[
@@ -958,10 +1057,7 @@ def build_target_audio_caption_inventory(
 
     values: dict[str, object] = {
         "schema_version": TARGET_AUDIO_CAPTION_INVENTORY_VERSION,
-        "mode": "pilot20",
-        "source_pilot_inventory_path": str(pilot_path.resolve(strict=True)),
-        "source_pilot_inventory_sha256": _sha256_file(pilot_path),
-        "source_pilot_inventory_fingerprint": pilot.inventory_fingerprint,
+        "mode": mode,
         "source_diarization_root": str(diar_root),
         "source_diarization_inventory_path": str(diar_inventory_path),
         "source_diarization_inventory_sha256": _sha256_file(diar_inventory_path),
@@ -1011,14 +1107,32 @@ def build_target_audio_caption_inventory(
         ),
         "source_text_usability_summary_sha256": text_hashes[text_root / "summary.json"],
         "source_audio_root": str(audio_root.resolve(strict=True)),
-        "selected_target_count": PILOT_TARGET_COUNT,
-        "selection_mode": "exact_asr_v2_pilot20_order_v1",
+        "selected_target_count": len(selected_ids),
+        "selection_mode": selection_mode,
         "bounded_selection_applied": True,
         "parent_quota_applied": False,
         "transcript_supplied_to_model": False,
         "final_renderer_applied": False,
         "jobs": [item.model_dump(mode="json") for item in output_jobs],
     }
+    if selection is None:
+        assert pilot is not None
+        values.update(
+            {
+                "source_pilot_inventory_path": str(pilot_path.resolve(strict=True)),
+                "source_pilot_inventory_sha256": _sha256_file(pilot_path),
+                "source_pilot_inventory_fingerprint": pilot.inventory_fingerprint,
+            }
+        )
+    else:
+        assert selection_path is not None and scout_inventory_fingerprint is not None
+        values.update(
+            {
+                "source_selection_path": str(selection_path),
+                "source_selection_sha256": _sha256_file(selection_path),
+                "source_scout_inventory_fingerprint": scout_inventory_fingerprint,
+            }
+        )
     return TargetAudioCaptionInventory(
         **values,
         inventory_fingerprint=_sha256_text(_compact_json(values)),
@@ -1026,11 +1140,7 @@ def build_target_audio_caption_inventory(
 
 
 def _verify_inventory_sources(inventory: TargetAudioCaptionInventory) -> None:
-    path_hash_pairs = (
-        (
-            inventory.source_pilot_inventory_path,
-            inventory.source_pilot_inventory_sha256,
-        ),
+    path_hash_pairs: list[tuple[str, str]] = [
         (
             inventory.source_diarization_inventory_path,
             inventory.source_diarization_inventory_sha256,
@@ -1072,7 +1182,22 @@ def _verify_inventory_sources(inventory: TargetAudioCaptionInventory) -> None:
             inventory.source_text_usability_summary_path,
             inventory.source_text_usability_summary_sha256,
         ),
-    )
+    ]
+    if inventory.mode == "pilot20":
+        assert inventory.source_pilot_inventory_path is not None
+        assert inventory.source_pilot_inventory_sha256 is not None
+        path_hash_pairs.append(
+            (
+                inventory.source_pilot_inventory_path,
+                inventory.source_pilot_inventory_sha256,
+            )
+        )
+    else:
+        assert inventory.source_selection_path is not None
+        assert inventory.source_selection_sha256 is not None
+        path_hash_pairs.append(
+            (inventory.source_selection_path, inventory.source_selection_sha256)
+        )
     for path_value, expected in path_hash_pairs:
         _verify_file(Path(path_value), expected, code="frozen_source")
     for job in inventory.jobs:
@@ -1251,17 +1376,33 @@ def _review_html(
             "</article>"
         )
     order = [item.target_clip_uid for item in inventory.jobs]
+    title = (
+        "H3 Target Audio Caption Pilot20"
+        if inventory.mode == "pilot20"
+        else "H3 Target Audio Caption Background Pilot"
+    )
+    qa_filename = (
+        "target_audio_caption_pilot20_human_qa.json"
+        if inventory.mode == "pilot20"
+        else "target_audio_caption_background_pilot_human_qa.json"
+    )
+    local_storage_prefix = (
+        "h3-target-audio-caption-pilot20-"
+        if inventory.mode == "pilot20"
+        else "h3-target-audio-caption-background-pilot-"
+    )
+    target_count = inventory.selected_target_count
     return f"""<!doctype html><html><head><meta charset='utf-8'>
-<title>H3 target audio caption pilot20 review</title><style>
+<title>{title} review</title><style>
 body{{font-family:system-ui,sans-serif;margin:24px;background:#f4f5f6;color:#171717}}
 header,.case{{max-width:1050px;margin:0 auto 22px;background:white;border:1px solid #bbb;padding:18px}}
 h1,h2,h3{{letter-spacing:0}}h2 span{{font-size:14px;color:#555}}audio{{width:100%}}
 pre{{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px}}
 .qa{{margin-top:14px;padding:12px;background:#eef2f5}}.qa label{{margin-right:14px}}
 button{{margin-right:10px;padding:8px 12px}}
-</style></head><body><header><h1>H3 Target Audio Caption Pilot20</h1>
+</style></head><body><header><h1>{title}</h1>
 <p>Review audible ambience, music, non-speech events, acoustic style, speaker delivery, and dialogue leakage.</p>
-<p id='progress'>Labeled 0 / {PILOT_TARGET_COUNT}</p>
+<p id='progress'>Labeled 0 / {target_count}</p>
 <button onclick='exportQA()'>Export QA JSON</button><button onclick='clearQA()'>Clear QA labels</button></header>
 {"".join(cards)}
 <script>
@@ -1269,13 +1410,13 @@ const inventoryFingerprint={json.dumps(inventory.inventory_fingerprint)};
 const clipOrder={json.dumps(order)};
 const labels=['CORRECT','WRONG','UNCERTAIN'];
 const flags={json.dumps(list(QA_FLAGS))};
-const keyPrefix='h3-target-audio-caption-pilot20-';
+const keyPrefix={json.dumps(local_storage_prefix)};
 function stateFor(clip){{try{{return JSON.parse(localStorage.getItem(keyPrefix+clip)||'null')}}catch(e){{return null}}}}
 function restore(){{document.querySelectorAll('.case').forEach(card=>{{const clip=card.dataset.clip;const state=stateFor(clip);if(!state)return;card.querySelectorAll("input[type='radio']").forEach(i=>i.checked=i.value===state.label);card.querySelectorAll("input[type='checkbox']").forEach(i=>i.checked=(state.failure_flags||[]).includes(i.dataset.flag));}});updateCounts();}}
 function saveQA(){{document.querySelectorAll('.case').forEach(card=>{{const selected=card.querySelector("input[type='radio']:checked");const selectedFlags=[...card.querySelectorAll("input[type='checkbox']:checked")].map(i=>i.dataset.flag);if(selected){{localStorage.setItem(keyPrefix+card.dataset.clip,JSON.stringify({{label:selected.value,failure_flags:selectedFlags}}));}}else{{localStorage.removeItem(keyPrefix+card.dataset.clip);}}}});updateCounts();}}
 function countsAndRows(){{const counts={{CORRECT:0,WRONG:0,UNCERTAIN:0,UNLABELED:0}};const rows=[];clipOrder.forEach(clip=>{{const state=stateFor(clip);if(state&&labels.includes(state.label)){{counts[state.label]++;rows.push({{target_clip_uid:clip,label:state.label,failure_flags:(state.failure_flags||[]).filter(flag=>flags.includes(flag))}});}}else counts.UNLABELED++;}});return {{counts,rows}};}}
-function updateCounts(){{const data=countsAndRows();document.getElementById('progress').textContent=`Labeled ${{data.rows.length}} / {PILOT_TARGET_COUNT} | CORRECT ${{data.counts.CORRECT}} | WRONG ${{data.counts.WRONG}} | UNCERTAIN ${{data.counts.UNCERTAIN}} | UNLABELED ${{data.counts.UNLABELED}}`;}}
-function exportQA(){{const data=countsAndRows();const payload={{schema_version:'{TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION}',inventory_fingerprint:inventoryFingerprint,mode:'pilot20',label_count:data.rows.length,total_clip_count:{PILOT_TARGET_COUNT},counts:data.counts,labels:data.rows}};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='target_audio_caption_pilot20_human_qa.json';a.click();URL.revokeObjectURL(a.href);}}
+function updateCounts(){{const data=countsAndRows();document.getElementById('progress').textContent=`Labeled ${{data.rows.length}} / {target_count} | CORRECT ${{data.counts.CORRECT}} | WRONG ${{data.counts.WRONG}} | UNCERTAIN ${{data.counts.UNCERTAIN}} | UNLABELED ${{data.counts.UNLABELED}}`;}}
+function exportQA(){{const data=countsAndRows();const payload={{schema_version:'{TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION}',inventory_fingerprint:inventoryFingerprint,mode:{json.dumps(inventory.mode)},label_count:data.rows.length,total_clip_count:{target_count},counts:data.counts,labels:data.rows}};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download={json.dumps(qa_filename)};a.click();URL.revokeObjectURL(a.href);}}
 function clearQA(){{if(!confirm('Clear Target Audio Caption QA labels?'))return;clipOrder.forEach(clip=>localStorage.removeItem(keyPrefix+clip));document.querySelectorAll('.qa input').forEach(i=>i.checked=false);updateCounts();}}
 restore();
 </script></body></html>"""
@@ -1299,11 +1440,17 @@ def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -
     shutil.rmtree(backup)
 
 
-def target_audio_caption_output_root(audio_run_root: Path) -> Path:
-    return (
-        audio_run_root.expanduser().resolve(strict=False)
-        / TARGET_AUDIO_CAPTION_OUTPUT_DIRECTORY
+def target_audio_caption_output_root(
+    audio_run_root: Path,
+    *,
+    mode: Literal["pilot20", "background_pilot"] = "pilot20",
+) -> Path:
+    directory = (
+        TARGET_AUDIO_CAPTION_OUTPUT_DIRECTORY
+        if mode == "pilot20"
+        else TARGET_AUDIO_CAPTION_BACKGROUND_OUTPUT_DIRECTORY
     )
+    return audio_run_root.expanduser().resolve(strict=False) / directory
 
 
 def run_target_audio_caption_pilot(
@@ -1317,8 +1464,8 @@ def run_target_audio_caption_pilot(
         raise ValueError("target audio caption inventory fingerprint is inconsistent")
     destination = output_root.expanduser().resolve(strict=False)
     source_audio_root = Path(inventory.source_audio_root).resolve(strict=True)
-    expected_destination = (
-        source_audio_root.parents[1] / TARGET_AUDIO_CAPTION_OUTPUT_DIRECTORY
+    expected_destination = target_audio_caption_output_root(
+        source_audio_root.parents[1], mode=inventory.mode
     )
     if destination != expected_destination:
         raise ValueError("target audio caption pilot output root is fixed")
@@ -1380,9 +1527,11 @@ def run_target_audio_caption_pilot(
         _verify_inventory_sources(inventory)
         status_counts = Counter(item.status for item in records)
         summary = TargetAudioCaptionSummary(
+            mode=inventory.mode,
             inventory_fingerprint=inventory.inventory_fingerprint,
             model_identifier=backend.model_identifier,
             backend_provenance=backend.provenance,
+            target_clip_count=inventory.selected_target_count,
             ready_count=status_counts["ready"],
             failed_count=status_counts["failed"],
             initial_call_count=initial_calls,

@@ -3,16 +3,17 @@
 ## Status
 
 The first bounded 20-clip runtime completed 20/20 and its review bundle is
-available. Those ASR-pilot clips are predominantly acoustically clean, so this
-set is retained as clean/negative evidence for hallucination and abstention QA.
-Human review remains in progress. It is insufficient for measuring recall on
-real ambience, music, or non-speech events and must not by itself approve
-production.
+available. Those ASR-pilot clips are predominantly acoustically clean, so formal
+QA was intentionally skipped: the set lacks useful positive background cases.
+It remains clean/negative evidence for hallucination and abstention behavior,
+but cannot measure recall on real ambience, music, or non-speech events.
 
 The current stage is a model-free scout over all 75 frozen production targets.
-It supports manual selection of a second, exactly 20-clip background-rich
-positive pilot. Neither pilot publishes production captions or modifies or
-feeds the deterministic final H3 renderer.
+This particular dataset contains fewer than 20 obvious background-rich clips,
+so the positive pilot size is the dynamic, non-empty set selected by a human.
+This is dataset-distribution-specific, not a global assumption; positives must
+never be fabricated to meet a quota. Neither pilot publishes production
+captions or modifies or feeds the deterministic final H3 renderer.
 
 The producer reads these frozen sources without modifying them:
 
@@ -35,8 +36,9 @@ $AUDIO_RUN_ROOT/background_audio_scout
 It computes temporal-union speech coverage plus PCM16 RMS/peak navigation
 diagnostics with zero model calls. High non-speech energy is not a semantic
 classification and never selects a clip automatically. Reviewers label clips
-`background-rich`, `clean`, or `uncertain`; export is accepted only when exactly
-20 clips are manually labeled `background-rich`.
+`background-rich`, `clean`, or `uncertain`; export contains every manually
+labeled `background-rich` clip in deterministic source order and requires at
+least one. Clean and uncertain clips are excluded.
 
 ## Ownership
 
@@ -150,6 +152,16 @@ cd "$AUDIO_RUN_ROOT/background_audio_scout"
 "$R2V_PYTHON" -m http.server 8765 --bind 127.0.0.1
 ```
 
-After manual review, export `background_audio_pilot_selection.json`. Running the
-same Target Audio Caption policy over that selected set is the next commit, not
-part of the scout.
+After manual review, export `background_audio_pilot_selection.json`, then run the
+same Target Audio Caption policy over exactly that selection:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --clip-selection-json /path/to/background_audio_pilot_selection.json
+```
+
+Output is written to
+`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot`. The backend, prompt
+version, native-video transport, repair policy, and structured schema are the
+same as the clean pilot, which remains untouched.

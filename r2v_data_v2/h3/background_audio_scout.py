@@ -210,7 +210,7 @@ class BackgroundAudioScoutSummary(SchemaModel):
     learned_audio_classifier_calls: Literal[0] = 0
     automatic_background_selection_applied: Literal[False] = False
     human_selection_required: Literal[True] = True
-    required_final_selection_count: Literal[20] = 20
+    required_final_selection_count: int = Field(default=1, ge=1)
     source_modified: Literal[False] = False
 
 
@@ -244,14 +244,14 @@ class BackgroundAudioPilotSelection(SchemaModel):
     source_diarization_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_audio_evidence_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     selection_method: Literal["manual_human_review_v1"] = "manual_human_review_v1"
-    selection_count: Literal[20] = 20
+    selection_count: int = Field(ge=1)
     selected_clip_ids: list[str]
     reviews: list[BackgroundAudioSelectionReview]
 
     @model_validator(mode="after")
     def validate_selection(self) -> BackgroundAudioPilotSelection:
-        if len(self.selected_clip_ids) != 20:
-            raise ValueError("background-rich pilot selection must contain 20 clips")
+        if self.selection_count != len(self.selected_clip_ids):
+            raise ValueError("selection count must equal selected clip ID count")
         if len(self.selected_clip_ids) != len(set(self.selected_clip_ids)):
             raise ValueError("background-rich selected clip IDs must be unique")
         review_ids = [item.target_clip_uid for item in self.reviews]
@@ -607,7 +607,7 @@ button,select{{margin:4px;padding:7px 10px}}
 <button onclick="sortCases('ratio')">Highest non-speech ratio</button>
 <button onclick="sortCases('seconds')">Longest non-speech duration</button>
 <select id='filter' onchange='filterCases()'><option value='all'>all</option><option value='background-rich'>background-rich</option><option value='clean'>clean</option><option value='uncertain'>uncertain</option><option value='unlabeled'>unlabeled</option></select>
-<button onclick='exportSelection()'>Export 20-clip selection JSON</button>
+<button onclick='exportSelection()'>Export background-rich selection JSON</button>
 <button onclick='clearReviews()'>Clear review labels</button></header><main>
 <table><thead><tr><th>clip/audio</th><th>duration</th><th>speech union</th><th>non-speech sec</th><th>non-speech ratio</th><th>non-speech RMS dBFS</th><th>full RMS dBFS</th><th>human review</th></tr></thead><tbody id='cases'>{"".join(rows)}</tbody></table>
 </main><script>
@@ -621,10 +621,10 @@ function stateFor(clip){{try{{return JSON.parse(localStorage.getItem(keyPrefix+c
 function saveReview(){{document.querySelectorAll('.case').forEach(row=>{{const selected=row.querySelector("input[type='radio']:checked");const selectedFlags=[...row.querySelectorAll("input[type='checkbox']:checked")].map(i=>i.dataset.flag);if(selected)localStorage.setItem(keyPrefix+row.dataset.clip,JSON.stringify({{label:selected.value,flags:selectedFlags}}));else localStorage.removeItem(keyPrefix+row.dataset.clip);}});updateCounts();filterCases();}}
 function restore(){{document.querySelectorAll('.case').forEach(row=>{{const state=stateFor(row.dataset.clip);if(!state)return;row.querySelectorAll("input[type='radio']").forEach(i=>i.checked=i.value===state.label);row.querySelectorAll("input[type='checkbox']").forEach(i=>i.checked=(state.flags||[]).includes(i.dataset.flag));}});updateCounts();}}
 function reviewRows(){{const rows=[];clipOrder.forEach(clip=>{{const state=stateFor(clip);if(state&&labels.includes(state.label))rows.push({{target_clip_uid:clip,label:state.label,flags:(state.flags||[]).filter(flag=>flags.includes(flag))}});}});return rows;}}
-function updateCounts(){{const reviews=reviewRows();const rich=reviews.filter(row=>row.label==='background-rich').length;document.getElementById('progress').textContent=`Reviewed ${{reviews.length}} / {EXPECTED_PRODUCTION_TARGET_COUNT}; background-rich ${{rich}} / 20`;}}
+function updateCounts(){{const reviews=reviewRows();const rich=reviews.filter(row=>row.label==='background-rich').length;document.getElementById('progress').textContent=`Reviewed ${{reviews.length}} / {EXPECTED_PRODUCTION_TARGET_COUNT}; background-rich ${{rich}}`;}}
 function sortCases(metric){{const tbody=document.getElementById('cases');[...tbody.children].sort((a,b)=>Number(b.dataset[metric])-Number(a.dataset[metric])||Number(a.dataset.index)-Number(b.dataset.index)).forEach(row=>tbody.appendChild(row));}}
 function filterCases(){{const value=document.getElementById('filter').value;document.querySelectorAll('.case').forEach(row=>{{const state=stateFor(row.dataset.clip);const label=state?state.label:'unlabeled';row.hidden=value!=='all'&&value!==label;}});}}
-function exportSelection(){{const reviews=reviewRows();const selected=reviews.filter(row=>row.label==='background-rich').map(row=>row.target_clip_uid);if(selected.length!==20){{alert(`Exactly 20 background-rich clips are required; currently ${{selected.length}}.`);return;}}const payload={{schema_version:'{BACKGROUND_AUDIO_SELECTION_VERSION}',source_scout_inventory_fingerprint:sourceScoutFingerprint,source_diarization_inventory_fingerprint:sourceDiarizationFingerprint,source_audio_evidence_fingerprint:sourceAudioFingerprint,selection_method:'manual_human_review_v1',selection_count:20,selected_clip_ids:selected,reviews:reviews}};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='background_audio_pilot_selection.json';a.click();URL.revokeObjectURL(a.href);}}
+function exportSelection(){{const reviews=reviewRows();const selected=reviews.filter(row=>row.label==='background-rich').map(row=>row.target_clip_uid);if(selected.length<1){{alert('Select at least one background-rich clip.');return;}}const payload={{schema_version:'{BACKGROUND_AUDIO_SELECTION_VERSION}',source_scout_inventory_fingerprint:sourceScoutFingerprint,source_diarization_inventory_fingerprint:sourceDiarizationFingerprint,source_audio_evidence_fingerprint:sourceAudioFingerprint,selection_method:'manual_human_review_v1',selection_count:selected.length,selected_clip_ids:selected,reviews:reviews}};const blob=new Blob([JSON.stringify(payload,null,2)+'\n'],{{type:'application/json'}});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='background_audio_pilot_selection.json';a.click();URL.revokeObjectURL(a.href);}}
 function clearReviews(){{if(!confirm('Clear background-audio scout labels?'))return;clipOrder.forEach(clip=>localStorage.removeItem(keyPrefix+clip));document.querySelectorAll('.case input').forEach(input=>input.checked=false);updateCounts();filterCases();}}
 restore();
 </script></body></html>"""
