@@ -469,6 +469,21 @@ vllm serve /mnt/workspace/public/pretrained/dots3-note-prev \
 
 ### D. Verify the OpenAI-compatible endpoint
 
+The current validated deployment endpoint is
+`http://6.167.57.88:8000/v1`. This is current server deployment configuration,
+not a stable API address, and may change later. Python code must never hardcode
+this IP; every producer continues to read `DOTS3_BASE_URL` from the environment.
+
+From another machine with network access to the deployment, verify:
+
+```bash
+curl --fail --silent --show-error \
+  http://6.167.57.88:8000/v1/models | python -m json.tool
+```
+
+When operating directly on the same host as vLLM, `127.0.0.1` is an optional
+same-host health-check alternative only:
+
 ```bash
 curl --fail --silent --show-error \
   http://127.0.0.1:8000/v1/models | python -m json.tool
@@ -1444,6 +1459,39 @@ inventory fingerprint and `CORRECT` / `WRONG` / `UNCERTAIN` decisions plus
 optional hallucination, ambience, delivery, dialogue-leakage, and other flags.
 Do not run a 75-clip caption job or integrate the draft into final H3 before the
 20-clip human review is accepted.
+
+The existing `target_audio_caption_pilot20` completed 20/20 runtime calls. Its
+ASR-pilot clips are retained as a clean/negative QA set for checking abstention
+and hallucination; its review remains available/in progress. It is not adequate
+positive evidence for ambience, music, or non-speech-event recall and cannot by
+itself approve Target Audio Caption production.
+
+### Model-free background-audio scout
+
+Build a separate navigation report over all 75 frozen production targets. This
+command reads `production/audio` and `production/diarization`, calls no model,
+applies no threshold or parent quota, and does not modify the clean pilot:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/scout_h3_background_audio.py \
+  --audio-run-root "$AUDIO_RUN_ROOT"
+```
+
+Inspect the fixed output and serve its static review page:
+
+```bash
+cat "$AUDIO_RUN_ROOT/background_audio_scout/summary.json"
+cd "$AUDIO_RUN_ROOT/background_audio_scout"
+"$R2V_PYTHON" -m http.server 8765 --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8765/report.html`, listen to the clips, and manually label
+exactly 20 as `background-rich`. The exported file is
+`background_audio_pilot_selection.json`. Non-speech RMS/ratio/duration are
+sorting aids only; they do not establish that music or another background event
+is audible. Running the unchanged Dots3 Target Audio Caption prompt over that
+manual selection is a later stage.
 
 ## Cleanup of old timestamped smoke attempts
 

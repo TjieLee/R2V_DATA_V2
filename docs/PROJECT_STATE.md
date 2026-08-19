@@ -37,10 +37,10 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Run a bounded Target Audio Caption MLLM pilot over the frozen DiariZen, raw ASR
-V2, TextUsabilityPolicy V1, and Audio outputs. The deterministic final renderer
-implementation is complete and frozen, but this pilot does not feed or rebuild
-it.
+Use a zero-model-call scout over all 75 frozen production Audio/DiariZen targets
+to manually choose a 20-clip background-rich Target Audio Caption positive
+pilot. The deterministic final renderer implementation is complete and frozen;
+the scout and both caption pilots do not feed or rebuild it.
 
 ## Current Pass
 
@@ -176,23 +176,35 @@ generation and complete semantic production are blocked; do not delete or
 promote that pilot. The earlier native-video transport contract remains
 documented in `docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for diagnostics.
 
-The current follow-up is the separate Target Audio Caption MLLM Pilot V1. It
-reuses the exact ordered ASR V2 pilot20 clip IDs and asks Dots3 only for audible
-ambience, music, non-speech events, acoustic style, and cluster-scoped vocal
-delivery. It sends no transcript, trusted text, language, entity ID, donor
-media, or separate audio item. Entity IDs are attached deterministically after
-inference. Output stays under
-`$AUDIO_RUN_ROOT/target_audio_caption_pilot20`; human QA, 75-clip production,
-final-renderer integration, and a rebuilt final H3 dataset remain pending. See
+The first Target Audio Caption MLLM Pilot V1 completed 20/20 runtime calls and
+its human-review bundle is available. It reuses the exact ordered ASR V2
+pilot20 clip IDs and asks Dots3 only for audible ambience, music, non-speech
+events, acoustic style, and cluster-scoped vocal delivery. It sends no
+transcript, trusted text, language, entity ID, donor media, or separate audio
+item. The clips are predominantly acoustically clean, so this remains
+clean/negative evidence for hallucination and abstention behavior; human review
+is in progress, and the set cannot validate positive recall or production
+readiness.
+
+The current model-free background-audio scout enumerates all 75 production
+targets and computes only DiariZen temporal-union coverage and canonical PCM16
+RMS/peak diagnostics. It applies no threshold, model, quota, or automatic
+selection. The static review bundle under
+`$AUDIO_RUN_ROOT/background_audio_scout` exports exactly 20 manually labeled
+`background-rich` clips for the next positive pilot. See
 `docs/H3_TARGET_AUDIO_CAPTION.md`.
 
 Current milestone status is therefore:
 
 - **COMPLETE / FROZEN:** DiariZen, ASR V2, TextUsabilityPolicy V1, and the
   deterministic final renderer implementation;
-- **CURRENT:** Target Audio Caption MLLM Pilot V1;
-- **PENDING:** pilot human QA, Target Audio Caption production, renderer
-  integration, and final H3 rebuild;
+- **CLEAN / NEGATIVE PILOT:** 20/20 runtime complete, review available and human
+  QA in progress;
+- **CURRENT:** manually select the background-rich positive pilot with the
+  model-free scout;
+- **PENDING:** run the same Target Audio Caption policy on the selected 20,
+  complete human QA, approve production, integrate with the renderer, and
+  rebuild final H3;
 - **OPTIONAL LATER:** voice-reference enhancement or denoising experiments.
 
 The validated dedicated runtime uses checkpoint architecture

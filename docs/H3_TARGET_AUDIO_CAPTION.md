@@ -2,8 +2,17 @@
 
 ## Status
 
-This is a bounded, human-reviewed 20-clip pilot. It does not publish production
-captions and does not modify or feed the deterministic final H3 renderer.
+The first bounded 20-clip runtime completed 20/20 and its review bundle is
+available. Those ASR-pilot clips are predominantly acoustically clean, so this
+set is retained as clean/negative evidence for hallucination and abstention QA.
+Human review remains in progress. It is insufficient for measuring recall on
+real ambience, music, or non-speech events and must not by itself approve
+production.
+
+The current stage is a model-free scout over all 75 frozen production targets.
+It supports manual selection of a second, exactly 20-clip background-rich
+positive pilot. Neither pilot publishes production captions or modifies or
+feeds the deterministic final H3 renderer.
 
 The producer reads these frozen sources without modifying them:
 
@@ -15,6 +24,19 @@ The producer reads these frozen sources without modifying them:
 The ordered clip identities come directly from
 `$AUDIO_RUN_ROOT/asr_v2_pilot20/inventory.json`. There is no second sampling
 policy, parent quota, donor job, or production mode.
+
+The background-audio scout instead enumerates every target in
+`$AUDIO_RUN_ROOT/production/diarization/inventory.json` and writes only to:
+
+```text
+$AUDIO_RUN_ROOT/background_audio_scout
+```
+
+It computes temporal-union speech coverage plus PCM16 RMS/peak navigation
+diagnostics with zero model calls. High non-speech energy is not a semantic
+classification and never selects a clip automatically. Reviewers label clips
+`background-rich`, `clean`, or `uncertain`; export is accepted only when exactly
+20 clips are manually labeled `background-rich`.
 
 ## Ownership
 
@@ -116,3 +138,18 @@ cd "$REPO"
 Use `--overwrite` only for an intentional pilot rebuild. The current stage has
 no 75-clip production command. Human QA, production approval, final-renderer
 integration, and a rebuilt final H3 dataset remain pending.
+
+Build the zero-model-call scouting report before the positive pilot:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/scout_h3_background_audio.py \
+  --audio-run-root "$AUDIO_RUN_ROOT"
+
+cd "$AUDIO_RUN_ROOT/background_audio_scout"
+"$R2V_PYTHON" -m http.server 8765 --bind 127.0.0.1
+```
+
+After manual review, export `background_audio_pilot_selection.json`. Running the
+same Target Audio Caption policy over that selected set is the next commit, not
+part of the scout.
