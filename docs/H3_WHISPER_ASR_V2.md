@@ -68,8 +68,9 @@ only waveform and sample rate.
 
 There is no transcript confidence or text-usability gate. Language probability,
 log probability, no-speech probability, compression ratio, and duration remain
-diagnostics. Transcript quality remains independent from speaker identity,
-primary voice, embeddings, and pair eligibility.
+diagnostics. Language probability is not transcript correctness probability.
+Transcript quality remains independent from speaker identity, primary voice,
+embeddings, and pair eligibility.
 
 ## Schemas And Roots
 
@@ -113,6 +114,9 @@ atomically. Review regeneration remains model-free and preserves inference JSON.
   --audio-run-root "$AUDIO_RUN_ROOT" --mode production --regenerate-review
 ```
 
-Future work remains transcript-usability calibration, unresolved-only MLLM,
-optional enhancement experiments, entity-to-subject mapping, and final H3
-rendering. None is part of the production raw-ASR stage.
+The current follow-up is the model-free, read-only transcript-usability
+calibration documented in `docs/H3_ASR_V2_TEXT_USABILITY.md`. It evaluates
+interpretable candidate gates and production shadow coverage, but freezes no
+threshold and does not modify raw-ASR artifacts. Later work remains
+unresolved-only MLLM, optional enhancement experiments, entity-to-subject
+mapping, and final H3 rendering. None is part of the production raw-ASR stage.

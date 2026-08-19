@@ -37,9 +37,9 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Run formal ASR V2 raw-transcript production over every segment in the frozen
-75-target DiariZen inventory, preserving the human-accepted segmentation policy
-and complete Whisper-large-v3 decoding semantics.
+Calibrate simple, model-free ASR V2 transcript-usability diagnostics against the
+complete 50-segment pilot human QA without modifying completed raw-ASR
+production or freezing a final text gate.
 
 ## Current Pass
 
@@ -133,6 +133,17 @@ human QA 41/3/6. The units differ, so this is not a paired per-turn accuracy
 delta. DiariZen-segment ASR V2 is accepted as the production raw-ASR baseline,
 not as final H3 transcript truth.
 
+Formal ASR V2 raw production is now complete and frozen: 75 clips, 179
+segments, 176 transcribed, three backend-uncertain, and zero failed. The current
+analysis reads those artifacts only as a production coverage shadow. The new
+model-free calibration analyzer evaluates `raw_text_available`, five
+one-dimensional diagnostic sweeps, bounded two-condition conjunctions,
+precision-first shortlists, and a Pareto frontier against the 41/3/6 pilot QA.
+It does not privilege `0.5`, train a classifier, use identity as a text gate,
+or claim production accuracy. `text_usability_policy_validated`,
+`text_usability_gate_applied`, and `transcript_confidence_threshold_used` all
+remain false. See `docs/H3_ASR_V2_TEXT_USABILITY.md`.
+
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
 uncertain, and zero failed records. Human QA labeled all 82 turns: 59 `CORRECT`,
@@ -189,12 +200,15 @@ or production artifact may change in this pass.
 
 ## Tested Commands
 
-Completed GPU-free validation for the DiariZen-assisted binding and ASR V2
-production promotion with Python 3.12.13:
+Completed GPU-free validation for the DiariZen-assisted binding, ASR V2 raw
+production, and model-free text-usability calibration with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_asr_v2_transcription.py -q
 # 15 passed
+
+python -m pytest tests/test_h3_asr_v2_text_calibration.py -q
+# 10 passed
 
 python -m pytest tests/test_h3_asr_transcription.py -q
 # 18 passed
@@ -203,10 +217,10 @@ python -m pytest tests/test_h3_diarization*.py -q
 # 22 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 226 passed
+# 236 passed
 
 python -m pytest -q
-# 1893 passed, 1 existing Pillow deprecation warning
+# 1903 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -233,7 +247,7 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Run formal ASR V2 production over the complete 75-target / currently 179-segment
-DiariZen inventory. Future work remains text-usability calibration, optional
-enhancement, unresolved-only MLLM handling, entity-to-subject mapping, and final
-`<d>` rendering.
+Run and human-review the model-free ASR V2 text-usability calibration report.
+Only a later evidence-based decision may freeze a text gate. Future work remains
+optional enhancement, unresolved-only MLLM handling, entity-to-subject mapping,
+and final `<d>` rendering.

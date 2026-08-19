@@ -17,8 +17,9 @@ Current milestone boundaries:
 - DiariZen sparse-anchor mapping policy V1 is **COMPLETE / FROZEN** after the
   repaired 20/20 pilot and 22/22 correct human cluster reviews. The active step
   has completed formal production over all 75 unique in-pair targets.
-- Formal DiariZen production is **COMPLETE / FROZEN**. The current step is the
-  formal ASR V2 raw-transcript production run over all 179 segments.
+- Formal DiariZen production is **COMPLETE / FROZEN**.
+- Formal ASR V2 raw-transcript production is **COMPLETE / FROZEN** over all 179
+  segments. The current step is model-free transcript-usability calibration.
 - ASR V2 segmentation calibration is **COMPLETE / FROZEN** after all 50 pilot
   segments received human QA. Raw transcripts remain observations, not final
   H3 text truth.
@@ -316,6 +317,32 @@ Serve the static production review:
 cd "$AUDIO_RUN_ROOT/production/asr_v2"
 python -m http.server 8768 --bind 127.0.0.1
 ```
+
+### ASR V2 transcript-usability calibration
+
+Raw ASR V2 production remains read-only. This analyzer joins the complete
+50-row pilot human QA to the frozen pilot, evaluates simple diagnostic rules,
+and applies shortlisted rules to production as coverage-only shadows. It does
+not run Whisper, DiariZen, a GPU, or a network model, and it does not freeze a
+text policy. In particular, `language_probability` is not transcript
+correctness probability.
+
+```bash
+export QA_JSON=/path/to/browser-exported/asr_v2_pilot20_human_qa.json
+
+"$R2V_PYTHON" tools/analyze_h3_asr_v2_text_usability.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --qa-json "$QA_JSON" \
+  --overwrite
+
+cd "$AUDIO_RUN_ROOT"
+python -m http.server 8768 --bind 127.0.0.1
+# Open asr_v2_text_calibration/report.html
+```
+
+The fixed output is `$AUDIO_RUN_ROOT/asr_v2_text_calibration`. Every shortlisted
+rule is `CALIBRATION CANDIDATE ONLY`; production shadow results are coverage,
+not precision or accuracy. See `docs/H3_ASR_V2_TEXT_USABILITY.md`.
 
 ## Blocked dots3 diagnostic sequence
 
