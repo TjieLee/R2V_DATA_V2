@@ -49,10 +49,10 @@ TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.1"
 TARGET_AUDIO_CAPTION_INVENTORY_VERSION = "r2v.h3.target_audio_caption_inventory.1"
 TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.1"
 TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = "r2v.h3.target_audio_caption_human_qa.1"
-TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_dots3_target_audio_caption_v1"
+TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_dots3_target_audio_caption_v2"
 TARGET_AUDIO_CAPTION_OUTPUT_DIRECTORY = "target_audio_caption_pilot20"
 TARGET_AUDIO_CAPTION_BACKGROUND_OUTPUT_DIRECTORY = (
-    "target_audio_caption_background_pilot"
+    "target_audio_caption_background_pilot_v2"
 )
 TARGET_AUDIO_INPUT_MODALITY = "native_target_video_with_embedded_audio"
 PILOT_TARGET_COUNT = 20
@@ -76,6 +76,12 @@ audio track. Visual content must never be used to guess a sound.
 Report only: audible ambient/background environment, background-music presence and
 style, non-speech sound events, acoustic atmosphere/style, and delivery/prosody for
 the supplied speaker clusters during their exact active time ranges.
+
+Any audible continuous or intermittent tonal/melodic accompaniment counts as
+background music, even when very faint, low-volume, partially masked by speech, or
+only clearly audible during speech pauses. Do not report no background music merely
+because speech is louder. Distinguish music from steady hum, fan noise, traffic
+noise, and other non-musical ambience.
 
 Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never identify a
 speaker or infer entity identity, subject identity, gender, age, nationality, or
@@ -158,13 +164,18 @@ class SpeakerClusterEvidence(SchemaModel):
 class BackgroundMusic(SchemaModel):
     present: StrictBool | None = None
     style: StrictStr | None = None
+    prominence: Literal["faint", "moderate", "prominent"] | None = None
 
     @model_validator(mode="after")
     def validate_music(self) -> BackgroundMusic:
         if self.style is not None and not self.style.strip():
             raise ValueError("background music style must be non-empty or null")
-        if self.present is False and self.style is not None:
-            raise ValueError("absent background music cannot have a style")
+        if self.present is False and (
+            self.style is not None or self.prominence is not None
+        ):
+            raise ValueError(
+                "absent background music cannot have a style or prominence"
+            )
         return self
 
 
@@ -224,9 +235,9 @@ class TargetAudioCaptionBackendProvenance(SchemaModel):
     served_model_name: str
     checkpoint_id: str
     base_url: str
-    prompt_version: Literal["h3_dots3_target_audio_caption_v1"] = (
-        TARGET_AUDIO_CAPTION_PROMPT_VERSION
-    )
+    prompt_version: Literal[
+        "h3_dots3_target_audio_caption_v1", "h3_dots3_target_audio_caption_v2"
+    ] = TARGET_AUDIO_CAPTION_PROMPT_VERSION
     input_modality: Literal["native_target_video_with_embedded_audio"] = (
         TARGET_AUDIO_INPUT_MODALITY
     )
@@ -1386,17 +1397,17 @@ def _review_html(
     title = (
         "H3 Target Audio Caption Pilot20"
         if inventory.mode == "pilot20"
-        else "H3 Target Audio Caption Background Pilot"
+        else "H3 Target Audio Caption Background Pilot V2"
     )
     qa_filename = (
         "target_audio_caption_pilot20_human_qa.json"
         if inventory.mode == "pilot20"
-        else "target_audio_caption_background_pilot_human_qa.json"
+        else "target_audio_caption_background_pilot_v2_human_qa.json"
     )
     local_storage_prefix = (
         "h3-target-audio-caption-pilot20-"
         if inventory.mode == "pilot20"
-        else "h3-target-audio-caption-background-pilot-"
+        else "h3-target-audio-caption-background-pilot-v2-"
     )
     target_count = inventory.selected_target_count
     return f"""<!doctype html><html><head><meta charset='utf-8'>

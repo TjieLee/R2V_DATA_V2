@@ -1493,19 +1493,21 @@ assumption. The positive pilot is therefore dynamically sized and non-empty.
 Never fabricate positives to meet a quota. The exported file is
 `background_audio_pilot_selection.json`. Non-speech RMS/ratio/duration are
 sorting aids only; they do not establish that music or another background event
-is audible. Run the unchanged Dots3 Target Audio Caption policy over exactly the
-manual selection, in its separate fixed output root:
+is audible. Prompt V2 explicitly treats faint or speech-masked tonal/melodic
+accompaniment as music and records nullable music prominence. Run it over
+exactly the same manual selection in its separate fixed output root:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
   --audio-run-root "$AUDIO_RUN_ROOT" \
   --clip-selection-json /path/to/background_audio_pilot_selection.json
 
-cat "$AUDIO_RUN_ROOT/target_audio_caption_background_pilot/summary.json"
+cat "$AUDIO_RUN_ROOT/target_audio_caption_background_pilot_v2/summary.json"
 ```
 
 This command does not read the `asr_v2_pilot20` clip selection and does not
-overwrite `$AUDIO_RUN_ROOT/target_audio_caption_pilot20`.
+overwrite `$AUDIO_RUN_ROOT/target_audio_caption_pilot20` or the V1 A/B baseline
+at `$AUDIO_RUN_ROOT/target_audio_caption_background_pilot`.
 
 ## Cleanup of old timestamped smoke attempts
 

@@ -1,4 +1,4 @@
-# H3 Target Audio Caption MLLM Pilot V1
+# H3 Target Audio Caption MLLM Pilot V1/V2
 
 ## Status
 
@@ -79,6 +79,14 @@ The exact system prompt is defined as `SYSTEM_PROMPT` in
 - return null or empty lists when evidence is unclear;
 - emit every supplied speaker cluster exactly once and no `entity_id`;
 - return one compact schema-valid JSON object.
+
+Prompt V2 (`h3_dots3_target_audio_caption_v2`) explicitly counts continuous or
+intermittent tonal/melodic accompaniment as background music even when it is
+faint, masked by speech, or clearest during speech pauses. It distinguishes
+music from non-musical hum, fan, and traffic ambience. The structured
+`background_music` result also records nullable `prominence` as `faint`,
+`moderate`, or `prominent`. Input transport, identity restrictions, and repair
+behavior are unchanged.
 
 Malformed JSON and cluster-set violations receive exactly one constrained
 repair. A second invalid response fails that clip closed while neighboring
@@ -161,7 +169,8 @@ same Target Audio Caption policy over exactly that selection:
   --clip-selection-json /path/to/background_audio_pilot_selection.json
 ```
 
-Output is written to
-`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot`. The backend, prompt
-version, native-video transport, repair policy, and structured schema are the
-same as the clean pilot, which remains untouched.
+Prompt V2 output is written to
+`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot_v2`. It reuses the exact
+manual selection for an A/B comparison while preserving the V1 background
+pilot at `$AUDIO_RUN_ROOT/target_audio_caption_background_pilot`. Native-video
+transport and the one-repair fail-closed policy remain unchanged.

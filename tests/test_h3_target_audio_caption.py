@@ -63,7 +63,11 @@ def _write(path: Path, value: bytes) -> Path:
 def _response(job: TargetAudioCaptionJob) -> Dots3TargetAudioCaptionResponse:
     return Dots3TargetAudioCaptionResponse(
         ambient_scene="busy indoor public space",
-        background_music=BackgroundMusic(present=True, style="soft upbeat pop"),
+        background_music=BackgroundMusic(
+            present=True,
+            style="soft upbeat pop",
+            prominence="moderate",
+        ),
         sound_events=["crowd chatter", "dish clatter"],
         acoustic_style=["moderately noisy", "reverberant"],
         speaker_delivery=[
@@ -579,6 +583,27 @@ def test_model_schema_forbids_entity_id_and_supports_unknown_values() -> None:
     assert render_audio_prompt_draft(response) == "Audio semantics are unknown."
 
 
+def test_v2_prompt_defines_faint_music_and_publishes_prominence() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_dots3_target_audio_caption_v2"
+    assert (
+        "Any audible continuous or intermittent tonal/melodic accompaniment counts "
+        "as background music, even when very faint, low-volume, partially masked by "
+        "speech, or only clearly audible during speech pauses."
+    ) in prompt
+    assert (
+        "Do not report no background music merely because speech is louder." in prompt
+    )
+    assert (
+        "Distinguish music from steady hum, fan noise, traffic noise, and other "
+        "non-musical ambience."
+    ) in prompt
+    music = BackgroundMusic(present=True, style="instrumental", prominence="faint")
+    assert music.model_dump(mode="json")["prominence"] == "faint"
+    with pytest.raises(ValidationError, match="style or prominence"):
+        BackgroundMusic(present=False, style=None, prominence="faint")
+
+
 def test_unknown_missing_and_duplicate_clusters_fail_validation(tmp_path: Path) -> None:
     job = _inventory(tmp_path).jobs[0]
     unknown = _response(job).model_copy(
@@ -682,6 +707,11 @@ def test_background_selection_runs_exact_order_in_separate_root_and_keeps_clean_
         target_audio_caption_output_root(tmp_path) / "keep.json", b"clean-pilot"
     )
     clean_hash = _sha256(clean_marker)
+    v1_marker = _write(
+        tmp_path / "target_audio_caption_background_pilot" / "keep.json",
+        b"background-pilot-v1",
+    )
+    v1_hash = _sha256(v1_marker)
     output = target_audio_caption_output_root(tmp_path, mode="background_pilot")
     backend = _FakeBackend(tmp_path)
 
@@ -694,11 +724,16 @@ def test_background_selection_runs_exact_order_in_separate_root_and_keeps_clean_
     assert backend.calls == ["clip-000", "clip-001"]
     assert summary.mode == "background_pilot"
     assert summary.target_clip_count == 2
-    assert output == tmp_path / "target_audio_caption_background_pilot"
+    assert summary.backend_provenance.prompt_version == (
+        "h3_dots3_target_audio_caption_v2"
+    )
+    assert output == tmp_path / "target_audio_caption_background_pilot_v2"
     assert _sha256(clean_marker) == clean_hash
+    assert _sha256(v1_marker) == v1_hash
     report = (output / "report.html").read_text(encoding="utf-8")
-    assert "target_audio_caption_background_pilot_human_qa.json" in report
-    assert TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_dots3_target_audio_caption_v1"
+    assert "target_audio_caption_background_pilot_v2_human_qa.json" in report
+    assert "h3-target-audio-caption-background-pilot-v2-" in report
+    assert "H3 Target Audio Caption Background Pilot V2" in report
     assert "Never transcribe, quote, paraphrase" in SYSTEM_PROMPT
 
 
@@ -737,7 +772,7 @@ def test_cli_passes_manual_selection_and_uses_background_output_root(
     }
     assert result["mode"] == "background_pilot"
     assert result["output_root"] == str(
-        tmp_path / "target_audio_caption_background_pilot"
+        tmp_path / "target_audio_caption_background_pilot_v2"
     )
 
 
