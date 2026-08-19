@@ -462,23 +462,37 @@ weak items; zero attributes is valid. Prefer useful face or hair, distinctive
 clothing, headwear or glasses, then shoes, bag, or another clear wearable
 accessory. Do not enumerate every small item. grounding_prompt must include the
 owner relation, for example 'the red jacket worn by the woman'. Return one JSON
-object with owner_entity_id and attributes. Each attribute has exactly
+object whose top level contains exactly owner_entity_id, owner_is_human, and
+attributes. Do not return owner_phrase, owner_grounding_prompt, or any other
+top-level field. attributes must be a JSON array. Each attribute has exactly
 attribute_type, phrase, and grounding_prompt. Allowed types are face, hair,
 headwear, glasses, upper_clothing, lower_clothing, dress_or_skirt, shoes, bag,
-and accessory. Also return owner_is_human. If the subject is an animal,
-non-human creature, or non-human character, set owner_is_human=false and return
-an empty attributes list. Return JSON only."""
+and accessory. The required shape is {"owner_entity_id":"e1",
+"owner_is_human":true,"attributes":[{"attribute_type":"hair",
+"phrase":"black hair","grounding_prompt":"black hair worn by the woman"}]}.
+If the subject is an animal, non-human creature, or non-human
+character, return owner_is_human=false and attributes=[]. Return JSON only."""
 
 
 REVIEW_SYSTEM_PROMPT = """Review all proposed subject-bound attribute crops for
-one known owner together. For every supplied attribute_id, judge only visible
-evidence. matches_attribute means the mask crop depicts the named component,
-owner_binding_correct means it belongs to the intended person, recognizable
-means it is not a sleeve fragment, shoe tip, tiny edge, stray hair, or other
-unidentifiable fragment, characteristic_appearance_visible means useful shape,
-color, texture, or structure remains, and usable_as_attribute_condition means
-the raw transparent crop is independently useful for conditioning. Do not apply
-whole-object completeness semantics to face, hair, clothing, or wearables.
+one known owner together. The isolated transparent crop is the CROP-ONLY
+QUALITY TARGET. Judge recognizable, characteristic_appearance_visible, and
+usable_as_attribute_condition from that isolated crop by itself. Do not use the
+owner context, supplied attribute phrase, or expected attribute type to rescue
+an otherwise ambiguous crop. The owner image is OWNERSHIP-ONLY CONTEXT and may
+be used only for owner_binding_correct. matches_attribute means the mask crop
+depicts the named component, and owner_binding_correct means it belongs to the
+intended person. For the three crop-only quality booleans, ask: if this isolated
+crop were shown alone, would a neutral viewer be able to identify what component
+it is and recover useful appearance information from it?
+Reject thin curved strips or contour-only hair; a few strands or only an edge
+of a hairstyle; an isolated sleeve, cuff, shoulder, hem, or trouser edge; a
+generic dark or light blob; a tiny partial wearable; a crop with color or
+texture but insufficient recognizable component structure; and any crop
+recognizable only because owner context or text identifies it. Do not require
+whole-object completeness. A partial face, hair, or clothing region is
+acceptable when the isolated crop still preserves clear component-level
+structure and characteristic appearance.
 Return one JSON object whose top level contains exactly owner_entity_id and
 reviews. reviews must be a JSON array preserving the supplied attribute order.
 Every review array item must contain exactly attribute_id,
@@ -633,7 +647,10 @@ class QwenSubjectAttributeClient:
                 (
                     {
                         "type": "text",
-                        "text": f"{candidate.attribute_id} owner context",
+                        "text": (
+                            f"{candidate.attribute_id} OWNERSHIP-ONLY CONTEXT "
+                            "(use only for owner_binding_correct)"
+                        ),
                     },
                     {
                         "type": "image_url",
@@ -641,7 +658,12 @@ class QwenSubjectAttributeClient:
                     },
                     {
                         "type": "text",
-                        "text": f"{candidate.attribute_id} isolated attribute crop",
+                        "text": (
+                            f"{candidate.attribute_id} CROP-ONLY QUALITY TARGET "
+                            "(judge recognizable, characteristic_appearance_visible, "
+                            "and usable_as_attribute_condition from this isolated "
+                            "transparent crop by itself)"
+                        ),
                     },
                     {
                         "type": "image_url",

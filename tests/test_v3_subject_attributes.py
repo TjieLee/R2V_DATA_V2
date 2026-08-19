@@ -378,6 +378,24 @@ def test_discovery_schema_enforces_owner_and_three_attribute_bound() -> None:
             owner_is_human=False,
             attributes=payload.attributes,
         )
+    with pytest.raises(ValidationError):
+        SubjectAttributeDiscovery.model_validate(
+            {
+                **payload.model_dump(),
+                "owner_phrase": "person 1",
+            }
+        )
+
+
+def test_discovery_prompt_requires_exact_top_level_contract() -> None:
+    prompt = " ".join(subject_attributes.DISCOVERY_SYSTEM_PROMPT.split())
+    assert (
+        "top level contains exactly owner_entity_id, owner_is_human, and attributes"
+        in prompt
+    )
+    assert "Do not return owner_phrase, owner_grounding_prompt" in prompt
+    assert "attributes must be a JSON array" in prompt
+    assert "return owner_is_human=false and attributes=[]" in prompt
 
 
 def test_different_owner_frame_is_preferred_and_same_frame_is_fallback() -> None:
@@ -438,6 +456,63 @@ def test_review_prompt_requires_canonical_batch_shape() -> None:
     assert "Every review array item must contain exactly attribute_id" in prompt
     assert "preserving the supplied attribute order" in prompt
     assert "Do not return an object keyed by a1, a2, a3" in prompt
+    assert "isolated transparent crop is the CROP-ONLY QUALITY TARGET" in prompt
+    assert "owner image is OWNERSHIP-ONLY CONTEXT" in prompt
+    assert "may be used only for owner_binding_correct" in prompt
+    assert "neutral viewer" in prompt
+    assert "contour-only hair" in prompt
+    assert "isolated sleeve, cuff, shoulder, hem, or trouser edge" in prompt
+    assert "Do not require whole-object completeness" in prompt
+
+
+def test_review_input_labels_separate_quality_from_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = subject_attributes.QwenSubjectAttributeClient(
+        QwenServiceConfig(),
+        client=SimpleNamespace(),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return SubjectAttributeReviewBatch(
+            owner_entity_id="e1",
+            reviews=[_accepted_review("a1")],
+        ).model_dump_json()
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    discovered = DiscoveredSubjectAttribute(
+        attribute_type="hair",
+        phrase="long black hair",
+        grounding_prompt="the long black hair of person 1",
+    )
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=discovered,
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate(
+            "candidate_1",
+            slot=1,
+            source_frame_index=10,
+        ),
+        attribute_mask=np.ones((100, 100), dtype=bool),
+        source_image=Image.new("RGB", (100, 100)),
+        crop=Image.new("RGBA", (20, 20)),
+        geometry=_geometry(),
+    )
+    owner = _clip().annotation.entities[0]
+    client.review(owner=owner, candidates=[candidate])
+
+    content = captured["content"]
+    assert isinstance(content, list)
+    labels = [
+        item["text"]
+        for item in content
+        if item.get("type") == "text" and isinstance(item.get("text"), str)
+    ]
+    assert "a1 OWNERSHIP-ONLY CONTEXT (use only for owner_binding_correct)" in labels
+    assert any(label.startswith("a1 CROP-ONLY QUALITY TARGET") for label in labels)
 
 
 def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
