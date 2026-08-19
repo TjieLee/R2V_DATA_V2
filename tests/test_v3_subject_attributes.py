@@ -502,6 +502,40 @@ def test_clothing_aspect_ratio_18_is_allowed() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("attribute_type", "long_side", "expected_reason"),
+    [
+        ("hair", 146, "hair_attribute_too_small"),
+        ("hair", 191, "hair_attribute_too_small"),
+        ("hair", 192, None),
+        ("hair", 193, None),
+        ("headwear", 56, "headwear_attribute_too_small"),
+        ("headwear", 127, "headwear_attribute_too_small"),
+        ("headwear", 128, None),
+        ("headwear", 129, None),
+        ("glasses", 57, None),
+        ("face", 57, None),
+        ("face", 500, None),
+        ("upper_clothing", 57, None),
+    ],
+)
+def test_type_specific_minimum_recognizable_size(
+    attribute_type: str,
+    long_side: int,
+    expected_reason: str | None,
+) -> None:
+    geometry = _geometry().model_copy(
+        update={"attribute_long_side_pixels": long_side}
+    )
+    assert (
+        subject_attributes._type_specific_size_rejection_reason(
+            attribute_type,
+            geometry,
+        )
+        == expected_reason
+    )
+
+
 def _pending_mask_stub(
     attribute_id: str,
     attribute_type: str,
@@ -729,9 +763,9 @@ class _DiscoveryClient:
             owner_is_human=True,
             attributes=[
                 DiscoveredSubjectAttribute(
-                    attribute_type="hair",
-                    phrase="long black hair",
-                    grounding_prompt="the long black hair of person 1",
+                    attribute_type="accessory",
+                    phrase="silver necklace",
+                    grounding_prompt="the silver necklace worn by person 1",
                 ),
                 DiscoveredSubjectAttribute(
                     attribute_type="upper_clothing",
@@ -901,9 +935,9 @@ def test_only_owner_candidate_frames_are_probed(tmp_path: Path) -> None:
     clip = _clip()
     selected = subject_attributes._select_attribute_candidate(
         discovered=DiscoveredSubjectAttribute(
-            attribute_type="hair",
-            phrase="long black hair",
-            grounding_prompt="the long black hair of person 1",
+            attribute_type="accessory",
+            phrase="silver necklace",
+            grounding_prompt="the silver necklace worn by person 1",
         ),
         attribute_id="a1",
         clip_uid=clip.clip_uid,
@@ -968,6 +1002,61 @@ def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Pat
         assert record.image_path is not None
         with Image.open(tmp_path / "output" / record.image_path) as opened:
             assert opened.mode == "RGBA"
+
+
+@pytest.mark.parametrize(
+    ("attribute_type", "expected_reason"),
+    [
+        ("hair", "hair_attribute_too_small"),
+        ("headwear", "headwear_attribute_too_small"),
+    ],
+)
+def test_type_specific_size_rejection_counts_as_deterministic(
+    tmp_path: Path,
+    attribute_type: str,
+    expected_reason: str,
+) -> None:
+    _frames(tmp_path / "run")
+
+    class _OneAttributeDiscovery:
+        def discover(self, *, owner, owner_candidates, source_images):
+            return SubjectAttributeDiscovery(
+                owner_entity_id=owner.entity_id,
+                owner_is_human=True,
+                attributes=[
+                    DiscoveredSubjectAttribute(
+                        attribute_type=attribute_type,
+                        phrase=attribute_type,
+                        grounding_prompt=f"the {attribute_type} of person 1",
+                    )
+                ],
+            )
+
+    review = _ReviewClient()
+    clip = _clip()
+    artifact = subject_attributes._process_owner(
+        config=SimpleNamespace(pair=SimpleNamespace(crop_padding_ratio=0.08)),
+        storage=_FakeStorage(tmp_path / "run"),
+        output_root=tmp_path / "output",
+        clip=clip,
+        owner=clip.annotation.entities[0],
+        owner_candidates=[
+            _candidate("candidate_1", slot=1, source_frame_index=10)
+        ],
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={},
+        ),
+        attribute_id_start=1,
+        discovery_client=_OneAttributeDiscovery(),
+        review_client=review,
+        segmentation_backend=_SegmentationBackend(),
+    )
+    assert review.calls == 0
+    assert artifact.records[0].reason == f"ownership_geometry:{expected_reason}"
+    assert artifact.metrics.deterministic_ownership_rejects == 1
 
 
 def test_nonretained_subject_mask_rejects_wrong_owner_attribute(tmp_path: Path) -> None:

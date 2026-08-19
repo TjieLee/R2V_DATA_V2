@@ -46,6 +46,8 @@ ENRICHED_SAMPLE_SCHEMA_VERSION = "r2v.v3.enriched_sample.1"
 MAX_ATTRIBUTES_PER_OWNER = 3
 MIN_ATTRIBUTE_AREA_PIXELS = 16
 MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 4
+HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 192
+HEADWEAR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 128
 MAX_ATTRIBUTE_TO_OWNER_AREA_RATIO = 0.85
 WRONG_OWNER_MINIMUM_OVERLAP_RATIO = 0.50
 CLOTHING_OWNER_LIKE_AREA_RATIO = 0.78
@@ -888,6 +890,26 @@ def _clothing_geometry_rejection_reason(
     return None
 
 
+def _type_specific_size_rejection_reason(
+    attribute_type: AttributeType,
+    geometry: OwnershipGeometry,
+) -> str | None:
+    if not geometry.passed:
+        return None
+    if (
+        attribute_type == "hair"
+        and geometry.attribute_long_side_pixels < HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS
+    ):
+        return "hair_attribute_too_small"
+    if (
+        attribute_type == "headwear"
+        and geometry.attribute_long_side_pixels
+        < HEADWEAR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS
+    ):
+        return "headwear_attribute_too_small"
+    return None
+
+
 def _duplicate_attribute_mask_conflicts(
     candidates: list[PendingAttributeCandidate],
 ) -> set[str]:
@@ -1051,6 +1073,20 @@ def _select_attribute_candidate(
             )
             if not geometry.passed:
                 geometry_rejections.append((owner_candidate, geometry))
+                continue
+            size_rejection = _type_specific_size_rejection_reason(
+                discovered.attribute_type,
+                geometry,
+            )
+            if size_rejection is not None:
+                geometry_rejections.append(
+                    (
+                        owner_candidate,
+                        geometry.model_copy(
+                            update={"passed": False, "reason": size_rejection}
+                        ),
+                    )
+                )
                 continue
             clothing_rejection = _clothing_geometry_rejection_reason(
                 discovered.attribute_type,
