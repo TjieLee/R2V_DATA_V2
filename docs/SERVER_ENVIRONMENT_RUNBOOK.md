@@ -1,43 +1,61 @@
 # R2V V3 Server Environment Runbook
 
-Last updated: 2026-08-13
+Last updated: 2026-08-19
 
 This file is the single source of truth for the Linux server environment used by
-the V3 pipeline. Update it whenever a runtime, model path, service endpoint, GPU
-assignment, launch command, or isolation rule changes. Do not reconstruct these
-values from chat history.
+the current integrated Visual V3 + subject-attribute pipeline. Update it whenever
+a runtime, model path, service endpoint, GPU assignment, launch command, or
+isolation rule changes. Do not reconstruct these values from chat history.
 
 `CONFIRMED` means the value is backed by repository/server evidence. `UNVERIFIED`
 means it must be checked on the server before use. Do not replace an unverified
 value with a guess.
 
-Current visual V3 development branch:
+Current integrated Visual + subject-attribute branch and validated code baseline:
 
 ```text
-feature/v3-runtime-integrity-v1
+branch: feature/v3-subject-attributes-v1
+code baseline: c1c056675dac9cdce5e585cd3f934c4bb573fc96
 ```
 
-Current validated code baseline before this documentation update:
+Frozen Visual baseline remains separate:
 
 ```text
-32a9e0e17598b6bd2d7912b6fafdb08d81187285
+branch: feature/v3-runtime-integrity-v1
+frozen HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
 ```
 
-Documentation-only commits may move repository HEAD. Record both the code
-baseline and the docs HEAD in freeze notes.
+Subject attributes are a sidecar extension and must not silently change the
+frozen Visual export/sample semantics or Visual thresholds. Documentation-only
+commits may move repository HEAD after the validated code baseline; record both
+when reproducing or freezing a run.
+
+For the detailed attribute contract and benchmark state, see
+`V3_SUBJECT_ATTRIBUTES_STATE.md`. Historical frozen Visual integrity evidence
+remains in `V3_RUNTIME_INTEGRITY_STATE.md`.
 
 ## 1. Runtime Layers
 
 ```text
 PRODUCTION
   main R2V .venv
-    - V3 orchestration
-    - SAM3 source through PYTHONPATH/in-process worker path
+    - V3 streaming orchestration
+    - persistent isolated GPU workers
     - OpenAI-compatible Qwen client
   external service
     - vLLM serving Qwen3-VL-32B-Instruct
   separate runtime
     - Boogu Image worker
+
+PERSISTENT GPU WORKERS
+  physical GPU 4
+    - Object Remover
+  physical GPU 5
+    - main temporal SAM3
+  physical GPU 6
+    - reference edit / Boogu worker path as configured
+  physical GPU 7
+    - subject-attribute single-frame SAM3
 
 AUDIT ONLY
   main R2V .venv
@@ -92,6 +110,7 @@ Writable roots:
 /mnt/workspace/litengjie/data/r2v_v3_logs
 /mnt/workspace/litengjie/data/r2v_v3_audits
 /mnt/workspace/litengjie/data/r2v_v3_reviews
+/mnt/workspace/litengjie/data/r2v_v3_subject_attributes
 /mnt/workspace/litengjie/data/cache
 /mnt/workspace/litengjie/data/tmp
 ```
@@ -106,30 +125,40 @@ Read-only roots:
 Never place caches, lock files, temporary outputs, or modified artifacts under
 the public roots.
 
-## 3. Preferred GPU Allocation
+## 3. Production GPU Allocation
+
+Current validated allocation:
 
 ```text
-physical GPU 0-3  Qwen3-VL vLLM tensor parallel 4
-physical GPU 4    Object remover
-physical GPU 5    SAM3
-physical GPU 6    Boogu
-physical GPU 7    spare
+physical GPU 0  Qwen3-VL DP replica 0, TP1
+physical GPU 1  Qwen3-VL DP replica 1, TP1
+physical GPU 2  Qwen3-VL DP replica 2, TP1
+physical GPU 3  Qwen3-VL DP replica 3, TP1
+physical GPU 4  Object Remover
+physical GPU 5  main temporal SAM3
+physical GPU 6  Boogu / reference-edit worker
+physical GPU 7  dedicated subject-attribute single-frame SAM3
 ```
 
-Do not globally export `CUDA_VISIBLE_DEVICES` in the normal production shell.
-Use explicit stage/device configuration or a stage-local launch rule.
+Do not globally export `CUDA_VISIBLE_DEVICES` in the normal parent pipeline
+shell. The parent runtime assigns physical GPUs to isolated workers. Before
+launching the full pipeline, use:
 
-Important ordinal rule:
+```bash
+unset CUDA_VISIBLE_DEVICES
+```
 
-- staged removal uses the configured physical `cuda:4`; do not wrap the main
-  process with `CUDA_VISIBLE_DEVICES=4`;
-- an isolated SAM3-only staged invocation may expose physical GPU 5 and use
-  worker-local `cuda`;
-- Boogu may expose physical GPU 6 to its isolated runtime where it appears as
-  local `cuda:0`.
+Important ordinal rules:
 
-For a full multi-stage process, inspect the active config instead of assuming a
-visible-device remap.
+- main SAM3 uses physical GPU5 through worker isolation and YAML
+  `sam3.device: cuda`; never put `cuda:5` in the worker-local SAM3 config;
+- dedicated attribute SAM3 uses physical GPU7 through the same isolation rule
+  and also uses worker-local `cuda`;
+- Object Remover is assigned physical GPU4 by runtime GPU-worker configuration;
+- Boogu is assigned physical GPU6 and sees its isolated local CUDA device as
+  `cuda:0`;
+- Qwen is an external vLLM service on physical GPUs 0-3 and is not launched by
+  `run_pipeline_v3.py`.
 
 ## 4. Fresh Production Shell
 
@@ -181,20 +210,34 @@ Never put credentials in this document.
 
 ## 5. Repository and Fixed-Path Preflight
 
+The production subject-attribute path runs from the integrated branch, not the
+Audio/H3 branch and not the frozen Visual branch.
+
 ```bash
 cd "$R2V_REPO_ROOT"
 
-git fetch origin
-git switch feature/v3-runtime-integrity-v1
-git pull --ff-only
-
-printf 'head=%s\nbranch=%s\npython=%s\n' \
-  "$(git rev-parse HEAD)" \
-  "$(git branch --show-current)" \
-  "$MAIN_PYTHON"
-
 git status --short
+git fetch origin feature/v3-subject-attributes-v1
+git switch feature/v3-subject-attributes-v1
+git pull --ff-only origin feature/v3-subject-attributes-v1
 
+git rev-parse HEAD
+git branch --show-current
+git status --short
+```
+
+Expected validated code baseline before documentation-only commits:
+
+```text
+c1c056675dac9cdce5e585cd3f934c4bb573fc96
+```
+
+If `git status --short` is non-empty before switching, stop. Do not stash,
+reset, force-switch, or overwrite another branch's changes.
+
+Fixed-path checks:
+
+```bash
 test -x "$MAIN_PYTHON" || echo 'ERROR: missing main Python'
 test -d "$SAM3_CODE_ROOT" || echo 'ERROR: missing SAM3 source'
 test -f "$SAM3_MODEL_PATH" || echo 'ERROR: missing SAM3 checkpoint'
@@ -221,7 +264,7 @@ print('SAM3 import PASS')
 PY
 ```
 
-Verify Boogu separately without inheriting the production `PYTHONPATH`:
+Verify Boogu separately without inheriting production `PYTHONPATH`:
 
 ```bash
 env -u PYTHONPATH "$BOOGU_PYTHON" - <<'PY'
@@ -234,45 +277,46 @@ PY
 
 ## 6. Qwen3-VL / vLLM
 
-Confirmed serving values:
+Current production serving baseline:
 
 ```text
-model:              /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
-host:               127.0.0.1
-port:               8000
-tensor parallel:    4
-max model length:   32768
-max sequences:      1
-GPU memory fraction: 0.90
-enforce eager:      yes
+model:                /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+endpoint:             http://127.0.0.1:8000/v1
+dtype:                BF16
+tensor parallel:      1
+data parallel:        4
+max model length:     32768
+pipeline max inflight: 4
 ```
 
-Confirmed cold-start command:
+The validated deployment direction is four independent TP1 replicas on physical
+GPUs 0-3 behind one vLLM endpoint. This replaced TP4 because the full streaming
+10-clip canary improved from about 889 seconds to about 327 seconds.
+
+Current launch shape:
 
 ```bash
-/usr/bin/python3 /usr/local/bin/vllm serve \
-  /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
-  --served-model-name /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --tensor-parallel-size 4 \
-  --media-io-kwargs '{"video":{"num_frames":-1}}' \
-  --allowed-local-media-path /mnt/workspace/public/dataset \
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export OMP_NUM_THREADS=1
+
+vllm serve /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 4 \
   --max-model-len 32768 \
-  --max-num-seqs 1 \
-  --gpu-memory-utilization 0.90 \
-  --enforce-eager
+  --allowed-local-media-path /mnt/workspace/public/dataset \
+  --port 8000
 ```
+
+This block records the required validated topology. Before restarting a live
+server, inspect `ps -ef` and preserve any machine/version-specific flags already
+verified on that server. Do not silently revert to TP4 or change dtype/FP8 as
+part of an unrelated pipeline run.
 
 Health check:
 
 ```bash
 curl -fsS --noproxy '*' http://127.0.0.1:8000/v1/models
 ```
-
-Do not copy an old 8B README example into production. Do not infer dtype,
-`trust_remote_code`, or a global `CUDA_VISIBLE_DEVICES` setting that was not
-explicitly deployed.
 
 Inspect the real service before terminating anything:
 
@@ -284,16 +328,27 @@ ps -ef | grep '[a]pi_server'
 Terminate only the specific verified PID with `kill -TERM`. Never use a broad
 `pkill -f python`.
 
-## 7. Current Production/Frozen Configuration Contract
+The pipeline-level global Qwen gate is:
 
-The current visual V3 defaults that must not be silently changed during final
-integrity validation are:
+```yaml
+runtime:
+  qwen_max_inflight: 4
+```
+
+The gate scans all global file-lock slots and takes the first available slot
+from a rotating start point. Profiling model-call metadata includes `qwen_slot`
+for diagnosis.
+
+## 7. Frozen Visual Contract + Sidecar Runtime Settings
+
+The frozen Visual semantics must remain unchanged by subject-attribute work:
 
 ```yaml
 source:
   selection_mode: fixed_selection_v1
 
 sam3:
+  device: cuda
   anchor_search_mode: progressive_v1
   object_rescue_mode: phrase_retry_v1
   not_found_rescue_mode: entity_phrase_retry_v1
@@ -311,7 +366,6 @@ pair:
 remove:
   inference_profile: object_remover_4step_v1
   num_inference_steps: 4
-  device: cuda:4
 
 reference_edit:
   scale_collapse_fallback_guard_mode: qwen_v1
@@ -321,23 +375,62 @@ reference_integrity:
   mode: targeted_qwen_v1
 ```
 
-Current fixed 120 selection:
+Current integrated runtime-capacity settings:
 
-```text
-/mnt/workspace/litengjie/data/r2v_v3_selections/density120-fixed.json
+```yaml
+runtime:
+  mode: streaming_v1
+  qwen_max_inflight: 4
+  stage_workers:
+    subject_attributes: 2
+  gpu_workers:
+    segment: "5"
+    subject_attributes_segment: "7"
+    remove: "4"
+    reference_edit: "6"
 ```
 
-Same-parent cross-pair remains disabled for the frozen visual V3 path.
+`runtime.stage_workers.subject_attributes` and
+`runtime.gpu_workers.subject_attributes_segment` are sidecar runtime-capacity
+settings and are excluded from the frozen Visual fingerprint/model identifiers.
+The Git commit remains part of run identity.
 
-## 8. Full Stage Order and Launch
+Same-parent cross-pair remains disabled for the frozen Visual path. Do not loosen
+Visual thresholds to increase export yield.
 
-The current complete stage order is:
+## 8. Subject-Attribute Runtime Contract
+
+Attribute enrichment is precision-first and fail-closed. Key production limits:
 
 ```text
-manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,export
+maximum discovered attributes per owner: 3
+Qwen discovery calls: <= 1 per eligible human owner
+SAM3 attribute mode: single frame only
+candidate frames: owner's existing Top3 only
+attribute temporal tracking: disabled
+attribute 7/10 coverage rule: not used
+attribute generative completion: not used
 ```
 
-Do not use old launch snippets that omit `reference_integrity`.
+Accepted attribute crops are source RGB plus mask exported as RGBA transparency.
+Every accepted record carries `owner_entity_id` and must pass deterministic
+ownership geometry plus strict batched Qwen recognizability/owner-binding review.
+
+Attribute outputs are sidecars below `<run_root>/subject_attributes/`; they do
+not mutate the frozen Visual `ClipRecord` or frozen Visual export schema.
+
+See `V3_SUBJECT_ATTRIBUTES_STATE.md` for the full contract and current evidence.
+
+## 9. Full Stage Order and Launch
+
+Current integrated full stage order:
+
+```text
+manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,subject_attributes,export
+```
+
+Do not use old snippets that omit `reference_integrity` or
+`subject_attributes` when running the integrated production branch.
 
 Set exact paths for the selected run:
 
@@ -354,12 +447,26 @@ git rev-parse HEAD
 git branch --show-current
 ```
 
+Before launch, verify at minimum:
+
+```text
+runtime.mode = streaming_v1
+runtime.qwen_max_inflight = 4
+runtime.gpu_workers.segment = "5"
+runtime.gpu_workers.subject_attributes_segment = "7"
+runtime.gpu_workers.remove = "4"
+runtime.gpu_workers.reference_edit = "6"
+sam3.device = cuda
+```
+
 Launch a fresh full run:
 
 ```bash
+unset CUDA_VISIBLE_DEVICES
+
 nohup "$MAIN_PYTHON" run_pipeline_v3.py \
   --config "$CONFIG" \
-  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,export \
+  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,subject_attributes,export \
   --profile \
   > "$LOG" 2>&1 &
 
@@ -369,11 +476,11 @@ echo $!
 Use a fresh run root. `run.json` binds run ID, Git commit, config hash, model
 identifiers, and source manifest path. Never weaken this identity check.
 
-## 9. Bounded Stage Replays
+## 10. Bounded Replays
 
 Prefer the smallest replay that can validate a change.
 
-SAM3 rescue A/B when annotation/frames are already prepared:
+Main SAM3 rescue A/B when annotation/frames are already prepared:
 
 ```bash
 "$MAIN_PYTHON" run_pipeline_v3.py \
@@ -392,46 +499,19 @@ already prepared:
   --profile
 ```
 
-Do not rerun Qwen annotation, SAM3, remover, or Boogu merely because final
-integrity code changed.
+Attribute-only integrated streaming replay is allowed when the required upstream
+artifacts are already valid and the fresh/current run identity matches:
 
-### Historical schema rule
-
-Old runs may fail current full `ClipRecord` validation because integrity schemas
-became stricter. For read-only evidence extraction from an old run, parse raw
-JSON and validate only the stable sections needed by the task, for example
-annotation, sampled frames, and tracked masks.
-
-For a replay that writes current artifacts, use a fresh run root with a matching
-current `run.json`. Do not delete `run.json` from a non-empty root. If old
-integrity already rejected references, preserve those rejections monotonically
-when preparing a strict-only replay and remove stale reference-edit entries that
-no longer point to ready references. Require `ClipRecord.model_validate()` before
-model calls.
-
-## 10. Current Final-Integrity Features
-
-The final stage now includes:
-
-- high-confidence deterministic semantic-policy rejection before Qwen;
-- one structured-output repair retry for malformed/truncated integrity JSON;
-- conservative `source_bbox_fallback_v1` for artifact-only failures;
-- explicit real-pixel provenance for accepted source bbox references;
-- existing Qwen review for represented content and other ambiguous semantic or
-  visual integrity cases.
-
-Deterministic semantic-policy reject never invokes source bbox fallback.
-
-The primary new counters are:
-
-```text
-semantic_policy_rejected
-judge_failed
-source_bbox_fallback_attempted
-source_bbox_fallback_accepted
-source_bbox_fallback_rejected
-source_bbox_fallback_judge_failed
+```bash
+"$MAIN_PYTHON" run_pipeline_v3.py \
+  --config "$CONFIG" \
+  --stages subject_attributes \
+  --profile
 ```
+
+If `subject_attributes_segment` is configured, this starts the dedicated GPU7
+segment worker for attribute probes. Without it, the code falls back to the main
+segment worker.
 
 ## 11. Monitoring
 
@@ -443,41 +523,78 @@ nvidia-smi
 
 tail -n 100 "$LOG"
 tail -f "$LOG"
-
-find "$RUN/clips" -name masks.rle.json | wc -l
-find "$RUN/clips" -name clip.json | wc -l
 ```
 
-SAM3 may appear as memory owned by the main pipeline process instead of a
-separate process name.
+Expected persistent-worker stderr logs include:
 
-Profiling files live under:
+```text
+$RUN/logs/streaming_segment_worker.stderr.log
+$RUN/logs/streaming_subject_attributes_segment_worker.stderr.log
+$RUN/logs/streaming_remove_worker.stderr.log
+$RUN/logs/streaming_reference_edit_worker.stderr.log
+```
+
+Profiling files:
 
 ```text
 $RUN/profiling/events.jsonl
 $RUN/profiling/summary.json
 ```
 
+Subject-attribute outputs:
+
+```text
+$RUN/subject_attributes/owners/
+$RUN/subject_attributes/references/
+$RUN/subject_attributes/samples/
+$RUN/subject_attributes/attributes.jsonl
+$RUN/subject_attributes/enriched_samples.jsonl
+$RUN/subject_attributes/summary.json
+```
+
 A missing profiling file may simply mean the run was not launched with
 `--profile`; it is not alone proof of model failure.
 
-## 12. Current Freeze Evidence Paths
+## 12. Current Evidence Paths
 
-SAM3 rescue A/B:
-
-```text
-run:    /mnt/workspace/litengjie/data/r2v_v3_runs/sam3-rescue120-20260813-110929
-config: /mnt/workspace/litengjie/data/r2v_v3_configs/sam3-rescue120-20260813-110929.yaml
-```
-
-Latest targeted bbox/integrity run:
+Frozen Visual 1000-clip canary:
 
 ```text
-run: /mnt/workspace/litengjie/data/r2v_v3_runs/integrity-bbox-targeted-20260813-174737
+run: /mnt/workspace/litengjie/data/r2v_v3_runs/e2e1000-s0-samfix-20260814-101818
+config: /mnt/workspace/litengjie/data/r2v_v3_configs/e2e1000-s0-samfix-20260814-101818.yaml
+export: /mnt/workspace/litengjie/data/r2v_v3_exports/e2e1000-s0-samfix-20260814-101818
 ```
 
-The exact real-run results and remaining five-case semantic check are maintained
-in `V3_RUNTIME_INTEGRITY_STATE.md`.
+Observed frozen Visual export:
+
+```text
+raw clips: 1000
+exported samples: 362
+references: 530
+yield: 36.2%
+```
+
+Integrated TP4 subject-attribute canary:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-b0790e-20260819-211823
+```
+
+TP1 x DP4 benchmark:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-dp4-889b45-20260819-221452
+```
+
+Current dedicated-GPU7 benchmark:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-dp4-sam7-c1c056-20260819-223752
+```
+
+Do not compare the two 10-clip attribute runs as identical compute paths; model
+responses changed some downstream workload. The validated large performance
+change is TP4 -> TP1 x DP4. The GPU7 worker is retained for resource isolation.
 
 ## 13. Failure Signatures
 
@@ -486,28 +603,59 @@ in `V3_RUNTIME_INTEGRITY_STATE.md`.
 Commit, config hash, model identifiers, manifest, or run ID differs. Use a fresh
 run root rather than weakening validation.
 
-### Historical clip fails newest schema
+### SAM3 worker reports invalid device / CUDA ordinal
 
-Do not treat this as evidence that the old SAM masks or frames are corrupt.
-Extract only required stable sections for read-only analysis, or construct a
-fresh current replay root with consistent downstream state.
+For isolated GPU5/GPU7 workers, YAML must use `sam3.device: cuda`, not
+`cuda:5`/`cuda:7`. Physical selection comes from runtime GPU-worker assignment.
+
+### Attribute probes unexpectedly block main temporal SAM3
+
+Check:
+
+```yaml
+runtime:
+  gpu_workers:
+    segment: "5"
+    subject_attributes_segment: "7"
+```
+
+Then inspect both persistent-worker logs. If the optional GPU7 assignment is
+absent, fallback to the main segment worker is expected behavior.
+
+### Qwen queue wait grows sharply
+
+Confirm the external service is still TP1 x DP4 and the pipeline config still
+uses `runtime.qwen_max_inflight: 4`. Profiling model-call metadata includes
+`queue_wait_seconds`, `qwen_inflight`, and `qwen_slot`.
 
 ### Qwen integrity JSON EOF / schema error
 
 Current code retries one structured-output repair. If both attempts fail, the
-entity fails closed and diagnostics retain all raw responses/finish reasons.
-Do not route a judge failure into bbox fallback.
+entity fails closed and diagnostics retain raw responses/finish reasons. Do not
+route a judge failure into bbox fallback.
 
-### No separate SAM3 process
+### Historical clip fails newest schema
 
-Expected when SAM3 runs in-process. Inspect the main pipeline process and GPU
-memory before diagnosing a missing worker.
+For read-only evidence extraction, parse only the stable sections required for
+the task. For a replay that writes current artifacts, use a fresh/current run
+root with consistent downstream state; do not delete `run.json` to bypass
+identity checks.
 
-### `nohup: ignoring input`
+## 14. Known Subject-Attribute Resume Edge Cases
 
-Normal `nohup` behavior.
+Two unusual resume/reconciliation cases remain tracked:
 
-## 14. Audit-Only Isolation
+1. If upstream rerun changes a previously eligible clip to export-ineligible,
+   stale durable attribute sidecars can remain unless explicitly invalidated by
+   overwrite/reconciliation.
+2. An owner exception outside durable owner-artifact creation can be visible in
+   the current runtime invocation but undercounted when the aggregate summary is
+   later rebuilt only from durable owner artifacts.
+
+These were not observed in the fresh production canaries. They are not a reason
+to relax attribute quality gates.
+
+## 15. Audit-Only Isolation
 
 The reference-filter/pose environment remains isolated from production:
 
@@ -518,23 +666,3 @@ The reference-filter/pose environment remains isolated from production:
 Use `env -u PYTHONPATH` for pose/SCRFD/MediaPipe commands. Do not install SAM3
 there. DINO/SigLIP/SCRFD/MediaPipe observations remain audit evidence and do not
 become production thresholds without an explicit reviewed change.
-
-Specialized historical audit procedures remain documented in the repository's
-V3 audit/reference-filter documents and Git history. They are not required for
-the final integrity replay.
-
-## 15. Safety and Maintenance
-
-Before giving or executing server commands:
-
-1. inspect this file and the current branch/HEAD;
-2. verify every fixed path with bounded `test -e/-f/-d/-x` checks;
-3. verify Qwen from the real health endpoint;
-4. verify SAM3 import origin and Boogu's separate runtime;
-5. do not globally export `CUDA_VISIBLE_DEVICES`;
-6. do not use broad `pkill` patterns;
-7. treat public dataset/model roots as read-only;
-8. use fresh run roots for changed identities;
-9. write audit/replay outputs outside immutable source runs;
-10. update this document whenever a path, GPU rule, service launch, production
-    stage order, or validated baseline changes.
