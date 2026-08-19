@@ -431,6 +431,15 @@ def test_recognizability_requires_every_review_boolean() -> None:
     assert fragment.accepted is False
 
 
+def test_review_prompt_requires_canonical_batch_shape() -> None:
+    prompt = " ".join(subject_attributes.REVIEW_SYSTEM_PROMPT.split())
+    assert "top level contains exactly owner_entity_id and reviews" in prompt
+    assert "reviews must be a JSON array" in prompt
+    assert "Every review array item must contain exactly attribute_id" in prompt
+    assert "preserving the supplied attribute order" in prompt
+    assert "Do not return an object keyed by a1, a2, a3" in prompt
+
+
 def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
     clip = _clip(entity_types=("subject", "subject"))
     attributes = [

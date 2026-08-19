@@ -479,8 +479,17 @@ unidentifiable fragment, characteristic_appearance_visible means useful shape,
 color, texture, or structure remains, and usable_as_attribute_condition means
 the raw transparent crop is independently useful for conditioning. Do not apply
 whole-object completeness semantics to face, hair, clothing, or wearables.
-Return exactly one review per supplied attribute in the same order, with all
-five booleans and one concise reason. Return JSON only."""
+Return one JSON object whose top level contains exactly owner_entity_id and
+reviews. reviews must be a JSON array preserving the supplied attribute order.
+Every review array item must contain exactly attribute_id,
+matches_attribute, owner_binding_correct, recognizable,
+characteristic_appearance_visible, usable_as_attribute_condition, and one
+concise reason. Copy each supplied attribute_id into its review item. Do not
+return an object keyed by a1, a2, a3, or any other attribute_id. The required
+shape is {"owner_entity_id":"e1","reviews":[{"attribute_id":"a1",
+"matches_attribute":true,"owner_binding_correct":true,"recognizable":true,
+"characteristic_appearance_visible":true,
+"usable_as_attribute_condition":true,"reason":"..."}]}. Return JSON only."""
 
 
 def _png_data_url(image: Image.Image) -> str:
