@@ -1142,7 +1142,7 @@ def build_target_audio_caption_inventory(
         )
     return TargetAudioCaptionInventory(
         **values,
-        inventory_fingerprint=_sha256_text(_compact_json(values)),
+        inventory_fingerprint=_inventory_fingerprint(values),
     )
 
 

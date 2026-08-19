@@ -8,7 +8,17 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import r2v_data_v2.h3.target_audio_caption as target_audio_caption_module
 import tools.run_h3_target_audio_caption as target_audio_caption_cli
+from r2v_data_v2.h3.asr_v2_transcription import (
+    ASRV2ProductionInventory,
+    ASRV2SegmentJob,
+)
+from r2v_data_v2.h3.background_audio_scout import (
+    BackgroundAudioPilotSelection,
+    build_background_audio_scout_inventory,
+)
+from r2v_data_v2.h3.diarization_binding import DiarizationBoundaryReconciliation
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.target_audio_caption import (
     DEFAULT_DOTS3_CHECKPOINT_ID,
@@ -37,6 +47,7 @@ from r2v_data_v2.h3.target_audio_caption import (
     run_target_audio_caption_pilot,
     target_audio_caption_output_root,
 )
+from tests.test_h3_background_audio_scout import _write_source
 
 
 def _sha256(path: Path) -> str:
@@ -289,6 +300,186 @@ def test_pilot20_inventory_fingerprint_uses_same_canonical_path(
     assert inventory.inventory_fingerprint == _inventory_fingerprint(inventory)
     assert (
         TargetAudioCaptionInventory.model_validate(inventory.model_dump(mode="json"))
+        == inventory
+    )
+
+
+def test_background_selection_builder_canonicalizes_nullable_cluster_entity_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diarization = _write_source(tmp_path)
+    scout = build_background_audio_scout_inventory(audio_run_root=tmp_path)
+    selection = BackgroundAudioPilotSelection(
+        source_scout_inventory_fingerprint=scout.inventory_fingerprint,
+        source_diarization_inventory_fingerprint=(
+            scout.source_diarization_inventory_fingerprint
+        ),
+        source_audio_evidence_fingerprint=scout.source_audio_evidence_fingerprint,
+        selection_count=1,
+        selected_clip_ids=["clip-000"],
+        reviews=[{"target_clip_uid": "clip-000", "label": "background-rich"}],
+    )
+    selection_path = tmp_path / "background-selection.json"
+    selection_path.write_text(
+        selection.model_dump_json(indent=2) + "\n", encoding="utf-8"
+    )
+
+    target = diarization.targets[0]
+    reconciliation = DiarizationBoundaryReconciliation(
+        adjusted=False,
+        end_clamped=False,
+        end_overrun_samples=0,
+        end_overrun_seconds=0.0,
+    )
+    common = {
+        "target_clip_uid": target.target_clip_uid,
+        "source_audio_path": target.source_audio_path,
+        "source_audio_sha256": target.source_audio_sha256,
+        "source_sample_rate_hz": target.source_sample_rate_hz,
+        "source_channels": target.source_channels,
+        "source_diarization_inventory_fingerprint": diarization.inventory_fingerprint,
+        "boundary_reconciliation": reconciliation,
+    }
+    jobs = [
+        ASRV2SegmentJob(
+            **common,
+            segment_id="segment-0",
+            speaker_cluster_id="speaker-0",
+            cluster_binding_status="candidate_mapped",
+            entity_id="e1",
+            entity_occurrence_id="clip-000/e1",
+            identity_scope="direct_anchor_present",
+            start_time=0.0,
+            end_time=0.4,
+            source_start_sample=0,
+            source_end_sample=40,
+            source_segment_id="segment-0",
+        ),
+        ASRV2SegmentJob(
+            **common,
+            segment_id="segment-1",
+            speaker_cluster_id="speaker-1",
+            cluster_binding_status="unbound",
+            entity_id=None,
+            entity_occurrence_id=None,
+            identity_scope="unresolved",
+            start_time=0.5,
+            end_time=0.9,
+            source_start_sample=50,
+            source_end_sample=90,
+            source_segment_id="segment-1",
+        ),
+    ]
+
+    diar_root = tmp_path / "production" / "diarization"
+    diar_paths = {
+        "inventory": diar_root / "inventory.json",
+        "raw_segments": diar_root / "raw_segments.jsonl",
+        "bound_segments": _write(diar_root / "bound_segments.jsonl", b""),
+        "cluster_bindings": _write(diar_root / "cluster_bindings.jsonl", b""),
+        "summary": _write(diar_root / "summary.json", b"{}\n"),
+    }
+    asr_root = tmp_path / "production" / "asr_v2"
+    _write(asr_root / "inventory.json", b"{}\n")
+    asr_segments_path = asr_root / "segments.jsonl"
+    asr_segments_path.write_text(
+        "".join(
+            json.dumps(job.model_dump(mode="json"), sort_keys=True) + "\n"
+            for job in jobs
+        ),
+        encoding="utf-8",
+    )
+    _write(asr_root / "summary.json", b"{}\n")
+    production_fingerprint = "a" * 64
+    production = ASRV2ProductionInventory.model_construct(
+        source_diarization_root=str(diar_root),
+        source_diarization_inventory_path=str(diar_paths["inventory"]),
+        source_diarization_inventory_sha256=_sha256(diar_paths["inventory"]),
+        source_diarization_inventory_fingerprint=diarization.inventory_fingerprint,
+        source_diarization_raw_segments_path=str(diar_paths["raw_segments"]),
+        source_diarization_raw_segments_sha256=_sha256(diar_paths["raw_segments"]),
+        source_diarization_bound_segments_path=str(diar_paths["bound_segments"]),
+        source_diarization_bound_segments_sha256=_sha256(diar_paths["bound_segments"]),
+        source_diarization_cluster_bindings_path=str(diar_paths["cluster_bindings"]),
+        source_diarization_cluster_bindings_sha256=_sha256(
+            diar_paths["cluster_bindings"]
+        ),
+        source_diarization_summary_path=str(diar_paths["summary"]),
+        source_diarization_summary_sha256=_sha256(diar_paths["summary"]),
+        inventory_fingerprint=production_fingerprint,
+        targets=[target],
+        jobs=jobs,
+    )
+
+    text_root = tmp_path / "production" / "text_usability"
+    text_paths = {
+        name: _write(text_root / name, b"{}\n")
+        for name in ("inventory.json", "segments.jsonl", "summary.json")
+    }
+    text_inventory = SimpleNamespace(
+        source_asr_v2_inventory_fingerprint=production_fingerprint,
+        inventory_fingerprint="b" * 64,
+    )
+    text_records = [
+        SimpleNamespace(
+            target_clip_uid=job.target_clip_uid,
+            segment_id=job.segment_id,
+            speaker_cluster_id=job.speaker_cluster_id,
+        )
+        for job in jobs
+    ]
+
+    class FakeSegmentRecord:
+        @classmethod
+        def model_validate(cls, value: object) -> ASRV2SegmentJob:
+            return ASRV2SegmentJob.model_validate(value)
+
+    monkeypatch.setattr(
+        target_audio_caption_module,
+        "load_asr_v2_inventory",
+        lambda _: production,
+    )
+    monkeypatch.setattr(
+        target_audio_caption_module,
+        "_asr_v2_inventory_fingerprint",
+        lambda _: production_fingerprint,
+    )
+    monkeypatch.setattr(
+        target_audio_caption_module,
+        "load_asr_v2_summary",
+        lambda _: SimpleNamespace(inventory_fingerprint=production_fingerprint),
+    )
+    monkeypatch.setattr(
+        target_audio_caption_module,
+        "ASRV2SegmentRecord",
+        FakeSegmentRecord,
+    )
+    monkeypatch.setattr(
+        target_audio_caption_module,
+        "_load_text_usability",
+        lambda _: (
+            text_inventory,
+            text_records,
+            SimpleNamespace(),
+            {path: _sha256(path) for path in text_paths.values()},
+        ),
+    )
+
+    inventory = target_audio_caption_module.build_target_audio_caption_inventory(
+        audio_run_root=tmp_path,
+        clip_selection_json=selection_path,
+    )
+
+    assert inventory.mode == "background_pilot"
+    assert inventory.selected_target_count == 1
+    assert [cluster.entity_id for cluster in inventory.jobs[0].speaker_clusters] == [
+        "e1",
+        None,
+    ]
+    assert inventory.inventory_fingerprint == _inventory_fingerprint(inventory)
+    assert (
+        TargetAudioCaptionInventory.model_validate_json(inventory.model_dump_json())
         == inventory
     )
 
