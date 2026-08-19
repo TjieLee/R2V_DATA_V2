@@ -9,12 +9,14 @@ import pytest
 
 import run_pipeline_v3 as pipeline_module
 from r2v_data_v2.v3.profiling import (
+    QwenConcurrencyGate,
     V3Profiler,
     _print_report,
     active_profiler,
     profile_model_call,
     profile_stage,
     profiled_openai_call,
+    qwen_concurrency_gate,
 )
 
 
@@ -158,6 +160,27 @@ def test_missing_openai_usage_is_recorded_as_null(tmp_path: Path) -> None:
     assert event["prompt_tokens"] is None
     assert event["completion_tokens"] is None
     assert event["total_tokens"] is None
+
+
+def test_qwen_gate_slot_is_recorded_in_model_profile_metadata(tmp_path: Path) -> None:
+    profiler = V3Profiler(tmp_path / "run", git_commit="abc123")
+    gate = QwenConcurrencyGate(1, lock_directory=tmp_path / "qwen")
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+    )
+
+    with active_profiler(profiler), qwen_concurrency_gate(gate):
+        profiled_openai_call(
+            lambda: response,
+            component="qwen_annotation",
+            operation="initial",
+            retry_index=0,
+            model="qwen",
+            messages=[],
+        )
+
+    event = _events(profiler)[0]
+    assert event["metadata"]["qwen_slot"] == 0
 
 
 class _Storage:

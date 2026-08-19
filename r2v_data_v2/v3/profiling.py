@@ -113,6 +113,7 @@ class ModelProfileContext:
 class QwenGateObservation:
     queue_wait_seconds: float
     inflight: int
+    qwen_slot: int
 
 
 class QwenConcurrencyGate:
@@ -142,16 +143,45 @@ class QwenConcurrencyGate:
         started = float(self._clock())
         self._local_budget.acquire()
         with self._state_lock:
-            slot_index = (os.getpid() + self._ticket) % self.maximum
+            start_slot = (os.getpid() + self._ticket) % self.maximum
             self._ticket += 1
-        slot_lock = self._slot_locks[slot_index]
-        slot_lock.acquire()
-        handle = (self.lock_directory / f"slot-{slot_index}.lock").open("a+")
+        slot_index: int | None = None
+        slot_lock: threading.Lock | None = None
+        handle: Any | None = None
         entered = False
         locked = False
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            locked = True
+            while slot_index is None:
+                for offset in range(self.maximum):
+                    candidate_index = (start_slot + offset) % self.maximum
+                    candidate_lock = self._slot_locks[candidate_index]
+                    if not candidate_lock.acquire(blocking=False):
+                        continue
+                    candidate_handle = None
+                    try:
+                        candidate_handle = (
+                            self.lock_directory / f"slot-{candidate_index}.lock"
+                        ).open("a+")
+                        try:
+                            fcntl.flock(
+                                candidate_handle.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        except BlockingIOError:
+                            continue
+                        slot_index = candidate_index
+                        slot_lock = candidate_lock
+                        handle = candidate_handle
+                        locked = True
+                        break
+                    finally:
+                        if slot_index != candidate_index:
+                            if candidate_handle is not None:
+                                candidate_handle.close()
+                            candidate_lock.release()
+                if slot_index is None:
+                    time.sleep(0.005)
+                    start_slot = (start_slot + 1) % self.maximum
             with self._state_lock:
                 self._inflight += 1
                 inflight = self._inflight
@@ -159,15 +189,19 @@ class QwenConcurrencyGate:
             yield QwenGateObservation(
                 queue_wait_seconds=float(self._clock()) - started,
                 inflight=inflight,
+                qwen_slot=slot_index,
             )
         finally:
             if entered:
                 with self._state_lock:
                     self._inflight -= 1
             if locked:
+                assert handle is not None
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            handle.close()
-            slot_lock.release()
+            if handle is not None:
+                handle.close()
+            if slot_lock is not None:
+                slot_lock.release()
             self._local_budget.release()
 
 
@@ -591,6 +625,7 @@ def profiled_openai_call(
                 {
                     "queue_wait_seconds": gate_observation.queue_wait_seconds,
                     "qwen_inflight": gate_observation.inflight,
+                    "qwen_slot": gate_observation.qwen_slot,
                 }
             )
         with profile_model_call(

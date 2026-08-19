@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import inspect
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -337,6 +339,73 @@ def test_global_qwen_budget_is_shared_by_concurrent_stage_tasks(
         ).run([f"clip-{index}" for index in range(6)])
 
     assert maximum == 2
+
+
+def test_qwen_gate_acquires_free_slot_instead_of_waiting_on_busy_preferred_slot(
+    tmp_path: Path,
+) -> None:
+    lock_directory = tmp_path / "qwen"
+    gate = QwenConcurrencyGate(2, lock_directory=lock_directory)
+    gate._ticket = -os.getpid() % gate.maximum
+    slot_zero = (lock_directory / "slot-0.lock").open("a+")
+    fcntl.flock(slot_zero.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    acquired = threading.Event()
+
+    def acquire() -> int:
+        with gate.acquire() as observation:
+            acquired.set()
+            return observation.qwen_slot
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(acquire)
+            assert acquired.wait(0.5)
+            assert future.result() == 1
+    finally:
+        fcntl.flock(slot_zero.fileno(), fcntl.LOCK_UN)
+        slot_zero.close()
+
+
+def test_independent_qwen_gates_share_global_slot_capacity(tmp_path: Path) -> None:
+    lock_directory = tmp_path / "qwen"
+    gates = [
+        QwenConcurrencyGate(2, lock_directory=lock_directory),
+        QwenConcurrencyGate(2, lock_directory=lock_directory),
+    ]
+    current = 0
+    maximum = 0
+    state_lock = threading.Lock()
+
+    def acquire(index: int) -> None:
+        nonlocal current, maximum
+        with gates[index % len(gates)].acquire():
+            with state_lock:
+                current += 1
+                maximum = max(maximum, current)
+            try:
+                time.sleep(0.02)
+            finally:
+                with state_lock:
+                    current -= 1
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(acquire, index) for index in range(12)]
+        for future in futures:
+            future.result()
+
+    assert maximum == 2
+
+
+def test_qwen_gate_maximum_one_and_exception_release_slot(tmp_path: Path) -> None:
+    gate = QwenConcurrencyGate(1, lock_directory=tmp_path / "qwen")
+
+    with pytest.raises(RuntimeError, match="request failed"):
+        with gate.acquire() as observation:
+            assert observation.qwen_slot == 0
+            raise RuntimeError("request failed")
+
+    with gate.acquire() as observation:
+        assert observation.qwen_slot == 0
 
 
 def test_subject_attribute_qwen_calls_use_existing_global_gate(tmp_path: Path) -> None:
