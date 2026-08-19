@@ -44,6 +44,7 @@ ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION = "r2v.v3.subject_attributes.1"
 ATTRIBUTE_OWNER_SCHEMA_VERSION = "r2v.v3.subject_attribute_owner.1"
 ENRICHED_SAMPLE_SCHEMA_VERSION = "r2v.v3.enriched_sample.1"
 MAX_ATTRIBUTES_PER_OWNER = 3
+QWEN_INPUT_MAX_LONG_SIDE_PIXELS = 768
 MIN_ATTRIBUTE_AREA_PIXELS = 16
 MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 4
 HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 192
@@ -537,6 +538,28 @@ def _png_data_url(image: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def _resize_qwen_input_image(image: Image.Image) -> Image.Image:
+    long_side = max(image.size)
+    if long_side <= QWEN_INPUT_MAX_LONG_SIDE_PIXELS:
+        return image.copy()
+    scale = QWEN_INPUT_MAX_LONG_SIDE_PIXELS / long_side
+    width, height = image.size
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return image.resize(size, resample=Image.Resampling.LANCZOS)
+
+
+def _owner_candidate_provenance_key(
+    candidate: EntityReferenceCandidate,
+) -> tuple[str, str, int, int, str]:
+    return (
+        candidate.entity_id,
+        candidate.candidate_id,
+        candidate.source_frame_index,
+        candidate.frame_slot,
+        candidate.image_path,
+    )
+
+
 class QwenSubjectAttributeClient:
     def __init__(
         self,
@@ -618,7 +641,9 @@ class QwenSubjectAttributeClient:
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": _png_data_url(context)},
+                        "image_url": {
+                            "url": _png_data_url(_resize_qwen_input_image(context))
+                        },
                     },
                 )
             )
@@ -657,24 +682,47 @@ class QwenSubjectAttributeClient:
                 ),
             }
         ]
+        context_groups: dict[
+            tuple[str, str, int, int, str],
+            list[PendingAttributeCandidate],
+        ] = {}
         for candidate in candidates:
-            owner_context = build_candidate_context_image(
-                candidate.source_image,
-                candidate.owner_candidate.mask,
-            )
+            key = _owner_candidate_provenance_key(candidate.owner_candidate)
+            context_groups.setdefault(key, []).append(candidate)
+        emitted_contexts: set[tuple[str, str, int, int, str]] = set()
+        for candidate in candidates:
+            context_key = _owner_candidate_provenance_key(candidate.owner_candidate)
+            if context_key not in emitted_contexts:
+                shared_attribute_ids = ", ".join(
+                    item.attribute_id for item in context_groups[context_key]
+                )
+                owner_context = build_candidate_context_image(
+                    candidate.source_image,
+                    candidate.owner_candidate.mask,
+                )
+                content.extend(
+                    (
+                        {
+                            "type": "text",
+                            "text": (
+                                "OWNERSHIP-ONLY CONTEXT for attributes "
+                                f"{shared_attribute_ids}\n"
+                                "(use only for owner_binding_correct)"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _png_data_url(
+                                    _resize_qwen_input_image(owner_context)
+                                )
+                            },
+                        },
+                    )
+                )
+                emitted_contexts.add(context_key)
             content.extend(
                 (
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{candidate.attribute_id} OWNERSHIP-ONLY CONTEXT "
-                            "(use only for owner_binding_correct)"
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": _png_data_url(owner_context)},
-                    },
                     {
                         "type": "text",
                         "text": (
@@ -687,7 +735,11 @@ class QwenSubjectAttributeClient:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": _png_data_url(candidate.crop.convert("RGBA"))
+                            "url": _png_data_url(
+                                _resize_qwen_input_image(
+                                    candidate.crop.convert("RGBA")
+                                )
+                            )
                         },
                     },
                 )

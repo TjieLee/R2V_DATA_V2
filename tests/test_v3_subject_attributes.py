@@ -241,6 +241,26 @@ def _geometry() -> OwnershipGeometry:
     )
 
 
+def _review_candidate(
+    attribute_id: str,
+    owner_candidate: EntityReferenceCandidate,
+) -> subject_attributes.PendingAttributeCandidate:
+    return subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="hair",
+            phrase="long black hair",
+            grounding_prompt="the long black hair of person 1",
+        ),
+        attribute_id=attribute_id,
+        owner_entity_id="e1",
+        owner_candidate=owner_candidate,
+        attribute_mask=np.ones((100, 100), dtype=bool),
+        source_image=Image.new("RGB", (100, 100)),
+        crop=Image.new("RGBA", (20, 20)),
+        geometry=_geometry(),
+    )
+
+
 def _attribute_record(
     attribute_id: str,
     owner_entity_id: str,
@@ -577,6 +597,43 @@ def test_recognizability_requires_every_review_boolean() -> None:
     assert fragment.accepted is False
 
 
+@pytest.mark.parametrize(
+    ("source_size", "expected_size"),
+    [
+        ((1920, 1080), (768, 432)),
+        ((1080, 1920), (432, 768)),
+        ((640, 480), (640, 480)),
+    ],
+)
+def test_qwen_input_resize_preserves_aspect_ratio_without_upscaling(
+    source_size: tuple[int, int],
+    expected_size: tuple[int, int],
+) -> None:
+    original = Image.new("RGB", source_size, (12, 34, 56))
+    original_pixels = original.tobytes()
+
+    resized = subject_attributes._resize_qwen_input_image(original)
+
+    assert resized.size == expected_size
+    assert resized.mode == "RGB"
+    assert resized is not original
+    assert original.size == source_size
+    assert original.tobytes() == original_pixels
+
+
+def test_qwen_input_resize_preserves_rgba_without_mutating_original() -> None:
+    original = Image.new("RGBA", (1024, 512), (12, 34, 56, 78))
+    original_pixels = original.tobytes()
+
+    resized = subject_attributes._resize_qwen_input_image(original)
+
+    assert resized.size == (768, 384)
+    assert resized.mode == "RGBA"
+    assert original.size == (1024, 512)
+    assert original.mode == "RGBA"
+    assert original.tobytes() == original_pixels
+
+
 def test_review_prompt_requires_canonical_batch_shape() -> None:
     prompt = " ".join(subject_attributes.REVIEW_SYSTEM_PROMPT.split())
     assert "top level contains exactly owner_entity_id and reviews" in prompt
@@ -619,24 +676,13 @@ def test_review_input_labels_separate_quality_from_ownership(
         ).model_dump_json()
 
     monkeypatch.setattr(client, "_request", fake_request)
-    discovered = DiscoveredSubjectAttribute(
-        attribute_type="hair",
-        phrase="long black hair",
-        grounding_prompt="the long black hair of person 1",
-    )
-    candidate = subject_attributes.PendingAttributeCandidate(
-        discovered=discovered,
-        attribute_id="a1",
-        owner_entity_id="e1",
-        owner_candidate=_candidate(
+    candidate = _review_candidate(
+        "a1",
+        _candidate(
             "candidate_1",
             slot=1,
             source_frame_index=10,
         ),
-        attribute_mask=np.ones((100, 100), dtype=bool),
-        source_image=Image.new("RGB", (100, 100)),
-        crop=Image.new("RGBA", (20, 20)),
-        geometry=_geometry(),
     )
     owner = _clip().annotation.entities[0]
     client.review(owner=owner, candidates=[candidate])
@@ -658,8 +704,95 @@ def test_review_input_labels_separate_quality_from_ownership(
         for item in content
         if item.get("type") == "text" and isinstance(item.get("text"), str)
     ]
-    assert "a1 OWNERSHIP-ONLY CONTEXT (use only for owner_binding_correct)" in labels
+    assert (
+        "OWNERSHIP-ONLY CONTEXT for attributes a1\n"
+        "(use only for owner_binding_correct)"
+    ) in labels
     assert any(label.startswith("a1 CROP-ONLY QUALITY TARGET") for label in labels)
+
+
+def _captured_review_content(
+    monkeypatch: pytest.MonkeyPatch,
+    candidates: list[subject_attributes.PendingAttributeCandidate],
+) -> tuple[list[dict[str, object]], SubjectAttributeReviewBatch]:
+    client = subject_attributes.QwenSubjectAttributeClient(
+        QwenServiceConfig(),
+        client=SimpleNamespace(),
+    )
+    captured: dict[str, object] = {}
+
+    def fake_request(**kwargs):
+        captured.update(kwargs)
+        return SubjectAttributeReviewBatch(
+            owner_entity_id="e1",
+            reviews=[
+                _accepted_review(candidate.attribute_id) for candidate in candidates
+            ],
+        ).model_dump_json()
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    payload = client.review(owner=_clip().annotation.entities[0], candidates=candidates)
+    content = captured["content"]
+    assert isinstance(content, list)
+    return content, payload
+
+
+def test_review_deduplicates_shared_owner_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_owner_candidate = _candidate(
+        "candidate_1",
+        slot=1,
+        source_frame_index=10,
+    )
+    content, _ = _captured_review_content(
+        monkeypatch,
+        [
+            _review_candidate("a1", shared_owner_candidate),
+            _review_candidate("a2", shared_owner_candidate),
+        ],
+    )
+    image_count = sum(item.get("type") == "image_url" for item in content)
+    labels = [
+        item["text"]
+        for item in content
+        if item.get("type") == "text" and isinstance(item.get("text"), str)
+    ]
+
+    assert image_count == 3
+    assert labels.count(
+        "OWNERSHIP-ONLY CONTEXT for attributes a1, a2\n"
+        "(use only for owner_binding_correct)"
+    ) == 1
+    assert sum("CROP-ONLY QUALITY TARGET" in label for label in labels) == 2
+
+
+def test_review_keeps_distinct_owner_contexts_and_output_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = [
+        _review_candidate(
+            attribute_id,
+            _candidate(
+                f"candidate_{index}",
+                slot=index,
+                source_frame_index=index * 10,
+            ),
+        )
+        for index, attribute_id in enumerate(("a1", "a2", "a3"), start=1)
+    ]
+    content, payload = _captured_review_content(monkeypatch, candidates)
+    context_labels = [
+        item["text"]
+        for item in content
+        if item.get("type") == "text"
+        and isinstance(item.get("text"), str)
+        and item["text"].startswith("OWNERSHIP-ONLY CONTEXT")
+    ]
+
+    assert sum(item.get("type") == "image_url" for item in content) == 6
+    assert len(context_labels) == 3
+    assert [review.attribute_id for review in payload.reviews] == ["a1", "a2", "a3"]
 
 
 def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
