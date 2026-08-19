@@ -16,7 +16,9 @@ Current milestone boundaries:
   and do not run complete semantic production.
 - DiariZen sparse-anchor mapping policy V1 is **COMPLETE / FROZEN** after the
   repaired 20/20 pilot and 22/22 correct human cluster reviews. The active step
-  is formal production over all 75 unique in-pair targets.
+  has completed formal production over all 75 unique in-pair targets.
+- Formal DiariZen production is **COMPLETE / FROZEN**. The current step is the
+  ASR V2 pilot20 segmentation A/B; real ASR V2 production remains blocked.
 - Speech enhancement, trusted-transcript dots3 annotation, and final H3
   rendering remain future work.
 
@@ -254,6 +256,57 @@ clip limit or parent quota, reads no cross-pair jobs, and does not rerun ASR.
 The model candidate and staging procedure are recorded in
 `docs/H3_DIARIZEN_SPEAKER_BINDING.md`. Official source is MIT licensed, while
 released model weights are CC BY-NC 4.0 for research/non-commercial use.
+
+### ASR V2 DiariZen-segment pilot
+
+Formal DiariZen production completed 75/75 clips with 179 raw segments and 81
+clusters: 79 candidate-mapped, one ambiguous, one unbound, and zero conflict.
+Mapped speaker time was 461.828 seconds: 371.345 direct-anchor and 90.483
+identity-propagated. Forty EOF-adjusted segments had median positive overrun
+0.0305 seconds and maximum 0.0805 seconds / 1288 samples. Do not claim all 81
+production clusters were human-reviewed; the accepted 22/22 QA belongs to the
+calibration pilot.
+
+ASR V2 uses the same complete Whisper-large-v3 CT2 float16 backend and decoder
+settings as V1. Only segmentation changes. It reads exact effective production
+DiariZen sample intervals, retains overlapping speakers and unresolved identity,
+and never reruns DiariZen or modifies ASR V1.
+
+```bash
+export ASR_MODEL_PATH=/mnt/workspace/litengjie/data/audio_deps/asr_models/whisper-large-v3-ct2
+export ASR_MODEL=large-v3
+export ASR_DEVICE=cuda:0
+export ASR_COMPUTE_TYPE=float16
+
+"$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --dry-run
+
+"$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --overwrite
+
+"$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode pilot20 \
+  --regenerate-review
+
+"$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production \
+  --dry-run
+```
+
+Serve the static pilot review:
+
+```bash
+cd "$AUDIO_RUN_ROOT/asr_v2_pilot20"
+python -m http.server 8768 --bind 127.0.0.1
+```
+
+Non-dry production ASR V2 remains fail-closed pending pilot human calibration.
 
 ## Blocked dots3 diagnostic sequence
 

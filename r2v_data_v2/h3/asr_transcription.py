@@ -631,7 +631,25 @@ class PreparedASRAudio:
     preprocessing: ASRPreprocessingProvenance
 
 
-def _verify_source_audio(job: ASRTurnJob) -> Path:
+class ExactASRAudioJob(Protocol):
+    source_audio_path: str
+    source_audio_sha256: str
+    source_sample_rate_hz: int
+    source_channels: int
+    source_start_sample: int
+    source_end_sample: int
+
+
+@dataclass(frozen=True)
+class PreparedExactASRWaveform:
+    waveform: np.ndarray
+    source_sample_rate_hz: int
+    source_channels: int
+    resampled: bool
+    downmixed: bool
+
+
+def _verify_source_audio(job: ExactASRAudioJob) -> Path:
     path = Path(job.source_audio_path)
     if not path.is_file():
         raise ASRTranscriptionFailure(
@@ -646,7 +664,11 @@ def _verify_source_audio(job: ASRTurnJob) -> Path:
     return path
 
 
-def prepare_asr_audio(job: ASRTurnJob) -> PreparedASRAudio:
+def prepare_exact_asr_waveform(
+    job: ExactASRAudioJob,
+    *,
+    unit_label: Literal["turn", "segment"],
+) -> PreparedExactASRWaveform:
     source_path = _verify_source_audio(job)
     try:
         with wave.open(str(source_path), "rb") as source:
@@ -660,7 +682,9 @@ def prepare_asr_audio(job: ASRTurnJob) -> PreparedASRAudio:
             ):
                 raise ValueError("canonical ASR audio metadata does not match source")
             if job.source_end_sample > source.getnframes():
-                raise ValueError("authoritative ASR turn exceeds canonical audio")
+                raise ValueError(
+                    f"authoritative ASR {unit_label} exceeds canonical audio"
+                )
             source.setpos(job.source_start_sample)
             frame_count = job.source_end_sample - job.source_start_sample
             frames = source.readframes(frame_count)
@@ -673,7 +697,7 @@ def prepare_asr_audio(job: ASRTurnJob) -> PreparedASRAudio:
     if len(frames) != expected_bytes:
         raise ASRTranscriptionFailure(
             code="source_audio_invalid",
-            reason="canonical full audio ended before the authoritative turn",
+            reason=f"canonical full audio ended before the authoritative {unit_label}",
         )
     pcm = np.frombuffer(frames, dtype="<i2").reshape(frame_count, channels)
     mono = pcm.astype(np.float32).mean(axis=1) / 32768.0
@@ -683,7 +707,9 @@ def prepare_asr_audio(job: ASRTurnJob) -> PreparedASRAudio:
         if output_count <= 0:
             raise ASRTranscriptionFailure(
                 code="source_audio_invalid",
-                reason="authoritative ASR turn is too short after resampling",
+                reason=(
+                    f"authoritative ASR {unit_label} is too short after resampling"
+                ),
             )
         positions = (
             np.arange(output_count, dtype=np.float64)
@@ -697,13 +723,24 @@ def prepare_asr_audio(job: ASRTurnJob) -> PreparedASRAudio:
         ).astype(np.float32)
     else:
         mono = np.ascontiguousarray(mono, dtype=np.float32)
-    return PreparedASRAudio(
+    return PreparedExactASRWaveform(
         waveform=mono,
+        source_sample_rate_hz=sample_rate,
+        source_channels=channels,
+        resampled=resampled,
+        downmixed=channels != 1,
+    )
+
+
+def prepare_asr_audio(job: ASRTurnJob) -> PreparedASRAudio:
+    prepared = prepare_exact_asr_waveform(job, unit_label="turn")
+    return PreparedASRAudio(
+        waveform=prepared.waveform,
         preprocessing=ASRPreprocessingProvenance(
-            source_sample_rate_hz=sample_rate,
-            source_channels=channels,
-            resampled=resampled,
-            downmixed=channels != 1,
+            source_sample_rate_hz=prepared.source_sample_rate_hz,
+            source_channels=prepared.source_channels,
+            resampled=prepared.resampled,
+            downmixed=prepared.downmixed,
         ),
     )
 

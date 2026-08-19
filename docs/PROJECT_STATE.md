@@ -37,10 +37,10 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Run formal DiariZen-assisted speaker binding over all 75 unique production
-in-pair targets using the human-validated sparse-anchor policy V1. Production
-preserves overlapping anonymous speaker segments and propagates a sparsely
-anchored entity across every segment in the mapped clip-local cluster.
+Run the ASR V2 pilot20 segmentation A/B: use formal production DiariZen
+segments as authoritative speech jobs while preserving the complete frozen
+Whisper-large-v3 ASR V1 decoder semantics. Full ASR V2 production remains
+blocked pending pilot human QA.
 
 ## Current Pass
 
@@ -87,8 +87,9 @@ reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
 The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and
 entity-binding provenance, including an optional anonymous speaker-cluster ID.
-A future ASR V2 may consume DiariZen boundaries after clip-level
-cluster-to-Visual-entity overlap mapping without changing Whisper inference.
+The current ASR V2 pilot consumes formal production DiariZen boundaries after
+clip-level cluster-to-Visual-entity overlap mapping without changing Whisper
+inference.
 The DiariZen-assisted binding stage now implements the frozen production
 inventory, raw overlap-preserving schemas, sample-domain sparse identity
 anchoring, cluster propagation, summary, and pilot-only static human review. It
@@ -108,6 +109,21 @@ and 24.7955 identity-propagated seconds, approximately 21.7% carried by
 within-cluster continuity. Nine manually accepted EOF intersections totaled
 0.2245 seconds; maximum overrun was 0.0525 seconds / 840 samples. No numeric
 coverage, support-share, or margin threshold is part of the production policy.
+
+Formal DiariZen production is now complete: 75/75 clips ready, 179 raw
+segments, and 81 clusters (79 candidate-mapped, one ambiguous, one unbound,
+zero conflict). It mapped 461.828 speaker-seconds: 371.345 direct-anchor and
+90.483 identity-propagated seconds. Forty EOF-adjusted segments had a 0.0305
+second median positive overrun and 0.0805 second / 1288-sample maximum. The 81
+production clusters were not all human-reviewed; 22/22 human acceptance applies
+only to the calibration pilot.
+
+ASR V2 consumes one exact effective DiariZen segment per Whisper job. It reuses
+the exact ordered ASR V1 pilot20 clip IDs for A/B selection, permits nullable
+entity identity for unresolved clusters, and transcribes candidate-mapped,
+ambiguous, unbound, and conflict segments alike. Production dry-run is enabled;
+real production inference is blocked pending human QA. See
+`docs/H3_WHISPER_ASR_V2.md`.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
@@ -165,18 +181,24 @@ or production artifact may change in this pass.
 
 ## Tested Commands
 
-Completed GPU-free validation for the DiariZen-assisted binding implementation
-with Python 3.12.13:
+Completed GPU-free validation for the DiariZen-assisted binding and ASR V2
+pilot implementation with Python 3.12.13:
 
 ```bash
+python -m pytest tests/test_h3_asr_v2_transcription.py -q
+# 14 passed
+
+python -m pytest tests/test_h3_asr_transcription.py -q
+# 18 passed
+
 python -m pytest tests/test_h3_diarization*.py -q
 # 22 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 211 passed
+# 225 passed
 
 python -m pytest -q
-# 1878 passed, 1 existing Pillow deprecation warning
+# 1892 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -203,7 +225,8 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Run formal 75-target DiariZen production and inspect completeness and failure
-diagnostics. ASR V2 over DiariZen segments, text-usability gating, optional
+Run the ASR V2 pilot20 dry-run and real pilot over production DiariZen segments,
+then human-review every transcript against the frozen V1 A/B reference. Future
+work remains full ASR V2 production, text-usability calibration, optional
 enhancement, unresolved-only MLLM handling, entity-to-subject mapping, and final
-`<d>` rendering remain future work.
+`<d>` rendering.
