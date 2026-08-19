@@ -2,12 +2,11 @@
 
 ## Status
 
-This is an implemented **calibration pilot**. The dedicated DiariZen environment,
-CUDA runtime, local model cache, persistent worker, and official pipeline have
-now completed a first real 20-call server attempt. Mapping quality remains
-**UNCALIBRATED**, and the complete fixed pilot must be rerun after the terminal
-boundary repair below. Production execution is intentionally blocked by
-`production_blocked_pending_diarization_binding_calibration`.
+The dedicated DiariZen environment, CUDA runtime, local model cache, persistent
+worker, and official pipeline are server-validated. The repaired fixed pilot
+completed 20/20 clips, and human QA accepted all 22 cluster decisions. The exact
+sparse-anchor mapping policy is now **FORMAL PRODUCTION V1**. The active step is
+the complete 75-target production run; ASR V2 remains future work.
 
 Completed and frozen inputs remain unchanged:
 
@@ -18,7 +17,8 @@ Completed and frozen inputs remain unchanged:
 - production in/cross pairs;
 - Whisper-large-v3 ASR V1 pilot records.
 
-The stage writes only to `$AUDIO_RUN_ROOT/diarization_pilot20`.
+Pilot output remains at `$AUDIO_RUN_ROOT/diarization_pilot20`; formal production
+writes to `$AUDIO_RUN_ROOT/production/diarization`.
 
 ## Data Flow
 
@@ -36,7 +36,8 @@ DiariZen owns speaker timeline and within-clip continuity. LR-ASD plus Visual V3
 provides sparse identity anchors. A later MLLM may inspect unresolved cases only;
 it does not replace deterministic binding.
 
-The current mapping policy has no numeric support or coverage threshold:
+The frozen `h3_diarizen_sparse_anchor_policy_v1` mapping policy has no numeric
+support or coverage threshold:
 
 - no usable entity support: `unbound`;
 - support for exactly one entity: `candidate_mapped`;
@@ -48,7 +49,7 @@ cluster, including offscreen or occluded segments with zero direct Visual
 overlap. Overlapped anchor spans with more than one active speaker cluster are
 contested and support no cluster.
 
-## First Real Pilot Attempt
+## Accepted Calibration
 
 The first server attempt used
 `BUT-FIT/diarizen-wavlm-large-s80-md-v2` through the official pipeline and made
@@ -72,7 +73,23 @@ evidence under `canonical_source_intersection_v1`. A segment starting at or
 after EOF, or having no positive effective duration, still fails closed. This
 is physical-domain reconciliation, not a millisecond tolerance.
 
-Summary schema v2 distinguishes:
+The repaired rerun completed all 20 targets with 50 raw segments and 22
+clusters: 21 `candidate_mapped`, one `ambiguous`, zero `unbound`, and zero
+`conflict`. Human QA labeled all 22 decisions `CORRECT`, including the single
+ambiguous fail-closed abstention; there were no wrong, uncertain, or unlabeled
+clusters. Pilot inventory fingerprint was
+`776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7`;
+the frozen source ASR pilot fingerprint was
+`ead8ce8aad5dc587517c4d38e74962152fbae96721fe1f92797b832d648c6a75`.
+
+Mapped speaker time was 114.4155 seconds: 89.62 seconds directly anchored and
+24.7955 seconds carried by within-cluster identity continuity, about 21.7% of
+mapped duration. Nine accepted EOF intersections totaled 0.2245 seconds; median
+positive overrun was 0.0205 seconds and maximum was 0.0525 seconds / 840
+samples. No additional numeric mapping threshold is justified by this accepted
+calibration.
+
+Summary schema v3 distinguishes:
 
 - `mapped_direct_anchor_speaker_seconds`: mapped-cluster duration directly
   supported by usable LR-ASD/Visual identity evidence;
@@ -87,12 +104,12 @@ unioned speaker time, not a naive sum over overlapping segments.
 
 ## Versioned Artifacts
 
-- `r2v.h3.diarization_inventory.1`
+- `r2v.h3.diarization_inventory.2`
 - `r2v.h3.diarization_segment.2`
-- `r2v.h3.diarization_cluster_binding.1`
+- `r2v.h3.diarization_cluster_binding.2`
 - `r2v.h3.diarization_bound_segment.1`
 - `r2v.h3.diarization_clip_result.1`
-- `r2v.h3.diarization_summary.2`
+- `r2v.h3.diarization_summary.3`
 - `r2v.h3.diarization_human_qa.1`
 
 `speaker_cluster_id` is always clip-local. The stage performs no cross-clip or
@@ -125,7 +142,7 @@ Rerun the full fixed pilot after updating the repository:
   --overwrite
 ```
 
-Future complete inventory proof, with no model or worker:
+Complete production inventory proof, with no model or worker:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_diarization_binding.py \
@@ -134,7 +151,18 @@ Future complete inventory proof, with no model or worker:
   --dry-run
 ```
 
-A non-dry-run production command fails closed pending human calibration.
+Formal production writes atomically to the fixed
+`$AUDIO_RUN_ROOT/production/diarization` root:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production
+```
+
+Use `--overwrite` only for an explicit complete rerun. Production independently
+enumerates all 75 current in-pair targets, applies no parent quota or clip
+limit, and does not use ASR pilot selection or cross-pairs as inference jobs.
 
 ## Runtime Contract
 
@@ -206,7 +234,7 @@ including the current candidate
 non-commercial/research use. Confirm authorization before staging or using the
 weights.
 
-This commit does not feed DiariZen segments to Whisper. A future ASR V2 can use
+Production DiariZen output does not yet feed segments to Whisper. A future ASR V2 can use
 `speaker_cluster_id` plus nullable `entity_id` without changing the frozen
 waveform-to-text backend. Transcript usability and voice-reference usability
 remain independent. Subject IDs, `<d>` rendering, enhancement, and unresolved

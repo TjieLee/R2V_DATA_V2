@@ -9,15 +9,14 @@ attempt.
 Current milestone boundaries:
 
 - Visual, Audio binding, primary voice, embeddings, and PairPolicy V1 are **COMPLETE / FROZEN**.
-- Whisper-large-v3 ASR is the retained baseline; raw transcripts are not yet
-  final H3 transcript truth.
+- Whisper-large-v3 ASR V1 baseline is **COMPLETE / FROZEN**; raw transcripts
+  are not yet final H3 transcript truth.
 - dots3 transcript generation is **BLOCKED AFTER FAILED HUMAN QA**.
 - The existing `semantic_pilot20` is diagnostic evidence only; do not delete it
   and do not run complete semantic production.
-- The DiariZen runtime completed a first real 20-call server attempt. Nine clips
-  exposed the now-fixed terminal source-boundary normalization issue; the full
-  pilot must be rerun before mapping-quality calibration. Production remains
-  blocked.
+- DiariZen sparse-anchor mapping policy V1 is **COMPLETE / FROZEN** after the
+  repaired 20/20 pilot and 22/22 correct human cluster reviews. The active step
+  is formal production over all 75 unique in-pair targets.
 - Speech enhancement, trusted-transcript dots3 annotation, and final H3
   rendering remain future work.
 
@@ -197,7 +196,7 @@ cd "$AUDIO_RUN_ROOT/diarization_pilot20"
 "$R2V_PYTHON" -m http.server 8767 --bind 127.0.0.1
 ```
 
-### First Real Attempt And Required Rerun
+### Accepted Calibration And Production
 
 The validated runtime loaded
 `BUT-FIT/diarizen-wavlm-large-s80-md-v2` through the official pipeline and made
@@ -212,25 +211,18 @@ not final pilot-quality results.
 The bridge now intersects a reported terminal segment with authoritative
 canonical sample extent, clamps only its effective end to EOF, and preserves
 reported times plus exact overrun diagnostics. This is not an arbitrary time
-tolerance. Rerun all 20 clips before reviewing or calibrating mapping policy:
+tolerance. The repaired rerun completed all 20 clips with 50 raw segments and
+22 clusters: 21 mapped, one ambiguous abstention, zero unbound, and zero
+conflict. Human QA marked all 22 cluster decisions `CORRECT`; none were wrong,
+uncertain, or unlabeled.
 
-```bash
-cd "$REPO"
-"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
-  --audio-run-root "$AUDIO_RUN_ROOT" \
-  --mode pilot20 \
-  --overwrite
-```
+Mapped speaker time was 114.4155 seconds, comprising 89.62 direct-anchor seconds
+and 24.7955 within-cluster identity-propagated seconds. Nine accepted EOF
+intersections totaled 0.2245 seconds, with median 0.0205 and maximum 0.0525
+seconds / 840 samples. This validates the existing threshold-free sparse-anchor
+policy; it does not introduce a coverage, share, or margin gate.
 
-In `summary.json`, `identity_propagated_speaker_seconds` means mapped speaker
-duration whose identity comes from within-cluster speaker continuity rather
-than direct LR-ASD/Visual evidence. It includes unanchored portions of a segment
-that also contains a direct anchor. Boundary counts and exact overrun
-distribution must be inspected before any production policy is approved.
-
-Review the overlap-preserving speaker lanes and export cluster QA JSON. Human
-labels are calibration evidence only. Future complete enumeration can be
-verified without loading DiariZen:
+Formal production dry-run:
 
 ```bash
 cd "$REPO"
@@ -240,11 +232,28 @@ cd "$REPO"
   --dry-run
 ```
 
-Real production remains fail-closed with
-`production_blocked_pending_diarization_binding_calibration`. The model
-candidate and staging procedure are recorded in
-`docs/H3_DIARIZEN_SPEAKER_BINDING.md`. Official source is MIT licensed, while released model weights
-are CC BY-NC 4.0 for research/non-commercial use.
+In `summary.json`, `identity_propagated_speaker_seconds` means mapped speaker
+duration whose identity comes from within-cluster speaker continuity rather
+than direct LR-ASD/Visual evidence. It includes unanchored portions of a segment
+that also contains a direct anchor. Boundary counts and exact overrun
+distribution remain part of production diagnostics.
+
+Review the overlap-preserving pilot lanes and retain exported cluster QA as
+calibration evidence only. Formal production uses all 75 targets and writes to
+the fixed `$AUDIO_RUN_ROOT/production/diarization` root:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_diarization_binding.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production
+```
+
+Add `--overwrite` only for an intentional complete rerun. Production has no
+clip limit or parent quota, reads no cross-pair jobs, and does not rerun ASR.
+The model candidate and staging procedure are recorded in
+`docs/H3_DIARIZEN_SPEAKER_BINDING.md`. Official source is MIT licensed, while
+released model weights are CC BY-NC 4.0 for research/non-commercial use.
 
 ## Blocked dots3 diagnostic sequence
 

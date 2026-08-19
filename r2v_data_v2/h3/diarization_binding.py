@@ -40,17 +40,23 @@ from r2v_data_v2.h3.schemas import (
     SchemaModel,
 )
 
-DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.1"
+DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.2"
 DIARIZATION_SEGMENT_VERSION = "r2v.h3.diarization_segment.2"
-DIARIZATION_CLUSTER_BINDING_VERSION = "r2v.h3.diarization_cluster_binding.1"
+DIARIZATION_CLUSTER_BINDING_VERSION = "r2v.h3.diarization_cluster_binding.2"
 DIARIZATION_BOUND_SEGMENT_VERSION = "r2v.h3.diarization_bound_segment.1"
 DIARIZATION_CLIP_RESULT_VERSION = "r2v.h3.diarization_clip_result.1"
-DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.2"
+DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.3"
 DIARIZATION_HUMAN_QA_VERSION = "r2v.h3.diarization_human_qa.1"
-DIARIZATION_MAPPING_POLICY_VERSION = "h3_diarizen_sparse_anchor_candidate_v1"
+DIARIZATION_MAPPING_POLICY_VERSION = "h3_diarizen_sparse_anchor_policy_v1"
 DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v1"
 DIARIZATION_PREPROCESSING_VERSION = "official_torchaudio_first_channel_passthrough_v1"
 DIARIZATION_BOUNDARY_POLICY_VERSION = "canonical_source_intersection_v1"
+DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT = (
+    "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
+)
+DIARIZATION_CALIBRATION_SOURCE_ASR_FINGERPRINT = (
+    "ead8ce8aad5dc587517c4d38e74962152fbae96721fe1f92797b832d648c6a75"
+)
 DEFAULT_DIARIZEN_MODEL_IDENTIFIER = "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
 DEFAULT_DIARIZEN_DEVICE = "cuda:0"
 DEFAULT_DIARIZEN_TIMEOUT_SECONDS = 900.0
@@ -151,14 +157,28 @@ class DiarizationTargetClip(SchemaModel):
 
 
 class DiarizationInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_inventory.1"] = (
+    schema_version: Literal["r2v.h3.diarization_inventory.2"] = (
         DIARIZATION_INVENTORY_VERSION
     )
     mode: Literal["pilot20", "production"]
     source_pairs_path: str
     source_pairs_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_asr_inventory_path: str
-    source_asr_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_asr_inventory_path: str | None = None
+    source_asr_inventory_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    mapping_policy_version: Literal["h3_diarizen_sparse_anchor_policy_v1"] = (
+        DIARIZATION_MAPPING_POLICY_VERSION
+    )
+    mapping_policy_validated: Literal[True] = True
+    numeric_mapping_thresholds_used: Literal[False] = False
+    calibration_inventory_fingerprint: Literal[
+        "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
+    ] = DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT
+    calibration_source_asr_inventory_fingerprint: Literal[
+        "ead8ce8aad5dc587517c4d38e74962152fbae96721fe1f92797b832d648c6a75"
+    ] = DIARIZATION_CALIBRATION_SOURCE_ASR_FINGERPRINT
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_target_count: int = Field(ge=0)
     selected_target_count: int = Field(ge=0)
@@ -170,7 +190,7 @@ class DiarizationInventory(SchemaModel):
     parent_quota_applied: Literal[False] = False
     donor_media_used: Literal[False] = False
     cross_pair_jobs_created: Literal[0] = 0
-    production_blocked: bool
+    production_blocked: Literal[False] = False
     targets: list[DiarizationTargetClip]
 
     @model_validator(mode="after")
@@ -188,17 +208,19 @@ class DiarizationInventory(SchemaModel):
                 or self.selected_target_count != PILOT_TARGET_COUNT
                 or self.source_target_count != EXPECTED_PRODUCTION_TARGET_COUNT
                 or not self.bounded_selection_applied
-                or self.production_blocked
+                or self.source_asr_inventory_path is None
+                or self.source_asr_inventory_fingerprint is None
             ):
                 raise ValueError("diarization pilot must reuse the frozen ASR pilot20")
         elif (
             self.selection_mode != "complete_in_pair_target_inventory_v1"
             or self.selected_target_count != self.source_target_count
             or self.bounded_selection_applied
-            or not self.production_blocked
+            or self.source_asr_inventory_path is not None
+            or self.source_asr_inventory_fingerprint is not None
         ):
             raise ValueError(
-                "production diarization inventory must be complete and blocked"
+                "production diarization inventory must independently be complete"
             )
         return self
 
@@ -352,7 +374,7 @@ class DiarizationEntitySupport(SchemaModel):
 
 
 class DiarizationClusterBinding(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_cluster_binding.1"] = (
+    schema_version: Literal["r2v.h3.diarization_cluster_binding.2"] = (
         DIARIZATION_CLUSTER_BINDING_VERSION
     )
     target_clip_uid: str
@@ -375,7 +397,7 @@ class DiarizationClusterBinding(SchemaModel):
     top1_top2_margin: float | None = Field(default=None, ge=0)
     visual_anchor_coverage_ratio: float = Field(ge=0, le=1)
     visual_anchor_coverage_is_diagnostic_only: Literal[True] = True
-    mapping_policy_version: Literal["h3_diarizen_sparse_anchor_candidate_v1"] = (
+    mapping_policy_version: Literal["h3_diarizen_sparse_anchor_policy_v1"] = (
         DIARIZATION_MAPPING_POLICY_VERSION
     )
     warnings: list[str] = Field(default_factory=list)
@@ -480,12 +502,26 @@ class DiarizationClipResult(SchemaModel):
 
 
 class DiarizationSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_summary.2"] = (
+    schema_version: Literal["r2v.h3.diarization_summary.3"] = (
         DIARIZATION_SUMMARY_VERSION
     )
-    mode: Literal["pilot20"] = "pilot20"
+    mode: Literal["pilot20", "production"]
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    source_asr_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_asr_inventory_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    mapping_policy_version: Literal["h3_diarizen_sparse_anchor_policy_v1"] = (
+        DIARIZATION_MAPPING_POLICY_VERSION
+    )
+    mapping_policy_validated: Literal[True] = True
+    numeric_mapping_thresholds_used: Literal[False] = False
+    calibration_inventory_fingerprint: Literal[
+        "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
+    ] = DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT
+    calibration_source_asr_inventory_fingerprint: Literal[
+        "ead8ce8aad5dc587517c4d38e74962152fbae96721fe1f92797b832d648c6a75"
+    ] = DIARIZATION_CALIBRATION_SOURCE_ASR_FINGERPRINT
     backend_provenance: DiarizationBackendProvenance
     target_clip_count: int = Field(ge=0)
     ready_clip_count: int = Field(ge=0)
@@ -529,6 +565,10 @@ class DiarizationSummary(SchemaModel):
 
     @model_validator(mode="after")
     def validate_counts(self) -> DiarizationSummary:
+        if (self.mode == "pilot20") != (
+            self.source_asr_inventory_fingerprint is not None
+        ):
+            raise ValueError("summary ASR pilot provenance must match its mode")
         if self.target_clip_count != (
             self.ready_clip_count + self.empty_clip_count + self.failed_clip_count
         ):
@@ -827,8 +867,10 @@ def diarization_output_root(
     *,
     mode: Literal["pilot20", "production"],
 ) -> Path:
-    name = "diarization_pilot20" if mode == "pilot20" else "diarization_production"
-    return audio_run_root.expanduser().resolve(strict=False) / name
+    root = audio_run_root.expanduser().resolve(strict=False)
+    if mode == "pilot20":
+        return root / "diarization_pilot20"
+    return root / "production" / "diarization"
 
 
 def _source_frame_count(path: Path, *, sample_rate: int, channels: int) -> int:
@@ -851,7 +893,7 @@ def _source_frame_count(path: Path, *, sample_rate: int, channels: int) -> int:
 def _inventory_fingerprint(
     *,
     source_pairs_sha256: str,
-    source_asr_inventory_fingerprint: str,
+    source_asr_inventory_fingerprint: str | None,
     mode: str,
     targets: Sequence[DiarizationTargetClip],
 ) -> str:
@@ -860,6 +902,15 @@ def _inventory_fingerprint(
             {
                 "source_pairs_sha256": source_pairs_sha256,
                 "source_asr_inventory_fingerprint": (source_asr_inventory_fingerprint),
+                "mapping_policy_version": DIARIZATION_MAPPING_POLICY_VERSION,
+                "mapping_policy_validated": True,
+                "numeric_mapping_thresholds_used": False,
+                "calibration_inventory_fingerprint": (
+                    DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT
+                ),
+                "calibration_source_asr_inventory_fingerprint": (
+                    DIARIZATION_CALIBRATION_SOURCE_ASR_FINGERPRINT
+                ),
                 "mode": mode,
                 "targets": [item.model_dump(mode="json") for item in targets],
             }
@@ -873,33 +924,8 @@ def build_diarization_inventory(
     mode: Literal["pilot20", "production"],
 ) -> DiarizationInventory:
     root = audio_run_root.expanduser().resolve(strict=True)
-    asr_path = (root / "asr_pilot20" / "inventory.json").resolve(strict=True)
-    asr_inventory = ASRInventory.model_validate_json(
-        asr_path.read_text(encoding="utf-8")
-    )
-    expected_asr_fingerprint = _asr_inventory_fingerprint(
-        source_pairs_sha256=asr_inventory.source_pairs_sha256,
-        mode=asr_inventory.mode,
-        targets=asr_inventory.targets,
-        jobs=asr_inventory.jobs,
-    )
-    if asr_inventory.inventory_fingerprint != expected_asr_fingerprint:
-        raise ValueError("source ASR pilot inventory fingerprint is inconsistent")
-    if (
-        asr_inventory.mode != "pilot20"
-        or asr_inventory.selected_target_count != PILOT_TARGET_COUNT
-        or asr_inventory.source_target_count != EXPECTED_PRODUCTION_TARGET_COUNT
-    ):
-        raise ValueError("source ASR inventory is not the frozen 20-of-75 pilot")
-
     pairs_path = (root / "production" / "pairs" / "in_pairs.jsonl").resolve(strict=True)
     pairs_sha256 = _sha256_file(pairs_path)
-    if (
-        str(pairs_path)
-        != str(Path(asr_inventory.source_pairs_path).resolve(strict=True))
-        or pairs_sha256 != asr_inventory.source_pairs_sha256
-    ):
-        raise ValueError("production in-pairs changed after ASR pilot selection")
     pairs = [
         H3ProductionInPair.model_validate(item) for item in _read_jsonl(pairs_path)
     ]
@@ -908,13 +934,39 @@ def build_diarization_inventory(
         raise ValueError("production in-pairs contain duplicate target clips")
     if len(pairs) != EXPECTED_PRODUCTION_TARGET_COUNT:
         raise ValueError("production in-pair target count is not the frozen 75")
-    selected_ids = (
-        [item.target_clip_uid for item in asr_inventory.targets]
-        if mode == "pilot20"
-        else sorted(pair_by_clip)
-    )
-    if any(clip_uid not in pair_by_clip for clip_uid in selected_ids):
-        raise ValueError("ASR pilot target is missing from production in-pairs")
+    asr_path: Path | None = None
+    source_asr_inventory_fingerprint: str | None = None
+    if mode == "pilot20":
+        asr_path = (root / "asr_pilot20" / "inventory.json").resolve(strict=True)
+        asr_inventory = ASRInventory.model_validate_json(
+            asr_path.read_text(encoding="utf-8")
+        )
+        expected_asr_fingerprint = _asr_inventory_fingerprint(
+            source_pairs_sha256=asr_inventory.source_pairs_sha256,
+            mode=asr_inventory.mode,
+            targets=asr_inventory.targets,
+            jobs=asr_inventory.jobs,
+        )
+        if asr_inventory.inventory_fingerprint != expected_asr_fingerprint:
+            raise ValueError("source ASR pilot inventory fingerprint is inconsistent")
+        if (
+            asr_inventory.mode != "pilot20"
+            or asr_inventory.selected_target_count != PILOT_TARGET_COUNT
+            or asr_inventory.source_target_count != EXPECTED_PRODUCTION_TARGET_COUNT
+        ):
+            raise ValueError("source ASR inventory is not the frozen 20-of-75 pilot")
+        if (
+            str(pairs_path)
+            != str(Path(asr_inventory.source_pairs_path).resolve(strict=True))
+            or pairs_sha256 != asr_inventory.source_pairs_sha256
+        ):
+            raise ValueError("production in-pairs changed after ASR pilot selection")
+        selected_ids = [item.target_clip_uid for item in asr_inventory.targets]
+        source_asr_inventory_fingerprint = asr_inventory.inventory_fingerprint
+        if any(clip_uid not in pair_by_clip for clip_uid in selected_ids):
+            raise ValueError("ASR pilot target is missing from production in-pairs")
+    else:
+        selected_ids = sorted(pair_by_clip)
 
     targets: list[DiarizationTargetClip] = []
     for clip_uid in selected_ids:
@@ -974,7 +1026,7 @@ def build_diarization_inventory(
         )
     fingerprint = _inventory_fingerprint(
         source_pairs_sha256=pairs_sha256,
-        source_asr_inventory_fingerprint=asr_inventory.inventory_fingerprint,
+        source_asr_inventory_fingerprint=source_asr_inventory_fingerprint,
         mode=mode,
         targets=targets,
     )
@@ -982,8 +1034,8 @@ def build_diarization_inventory(
         mode=mode,
         source_pairs_path=str(pairs_path),
         source_pairs_sha256=pairs_sha256,
-        source_asr_inventory_path=str(asr_path),
-        source_asr_inventory_fingerprint=asr_inventory.inventory_fingerprint,
+        source_asr_inventory_path=str(asr_path) if asr_path is not None else None,
+        source_asr_inventory_fingerprint=source_asr_inventory_fingerprint,
         inventory_fingerprint=fingerprint,
         source_target_count=len(pairs),
         selected_target_count=len(targets),
@@ -993,7 +1045,6 @@ def build_diarization_inventory(
             else "complete_in_pair_target_inventory_v1"
         ),
         bounded_selection_applied=mode == "pilot20",
-        production_blocked=mode == "production",
         targets=targets,
     )
 
@@ -1573,6 +1624,7 @@ def _summary(
         item.target_clip_uid: item.source_sample_rate_hz for item in inventory.targets
     }
     return DiarizationSummary(
+        mode=inventory.mode,
         inventory_fingerprint=inventory.inventory_fingerprint,
         source_asr_inventory_fingerprint=(inventory.source_asr_inventory_fingerprint),
         backend_provenance=provenance,
@@ -1844,6 +1896,63 @@ restoreLabels();
 </script></body></html>"""
 
 
+def _materialize_review_media(
+    *,
+    inventory: DiarizationInventory,
+    raw_segments: Sequence[RawDiarizationSegment],
+    review_root: Path,
+) -> dict[str, dict[str, object]]:
+    raw_by_clip: dict[str, list[RawDiarizationSegment]] = defaultdict(list)
+    for item in raw_segments:
+        raw_by_clip[item.target_clip_uid].append(item)
+    media: dict[str, dict[str, object]] = {}
+    for target in inventory.targets:
+        clip_uid = target.target_clip_uid
+        video_name = (
+            f"{clip_uid}.video{Path(target.target_video_path).suffix or '.media'}"
+        )
+        audio_name = (
+            f"{clip_uid}.audio{Path(target.source_audio_path).suffix or '.media'}"
+        )
+        (review_root / video_name).symlink_to(Path(target.target_video_path))
+        (review_root / audio_name).symlink_to(Path(target.source_audio_path))
+        visuals: list[dict[str, str]] = []
+        for reference in target.visual_references:
+            source = Path(reference.image_path).expanduser()
+            if not source.is_file():
+                continue
+            suffix = source.suffix.lower() or ".image"
+            relative = Path("visual") / clip_uid / f"{reference.entity_id}{suffix}"
+            destination_image = review_root / relative
+            destination_image.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination_image)
+            visuals.append(
+                {
+                    "entity_id": reference.entity_id,
+                    "path": f"review_media/{relative.as_posix()}",
+                }
+            )
+        segment_paths: dict[str, str] = {}
+        for segment in raw_by_clip[clip_uid]:
+            relative = Path("segments") / clip_uid / f"{segment.segment_id}.wav"
+            _write_segment_wav(
+                source_path=Path(target.source_audio_path),
+                destination=review_root / relative,
+                start_sample=segment.source_start_sample,
+                end_sample=segment.source_end_sample,
+                expected_sample_rate=target.source_sample_rate_hz,
+                expected_channels=target.source_channels,
+            )
+            segment_paths[segment.segment_id] = f"review_media/{relative.as_posix()}"
+        media[clip_uid] = {
+            "video": f"review_media/{video_name}",
+            "audio": f"review_media/{audio_name}",
+            "visuals": visuals,
+            "segments": segment_paths,
+        }
+    return media
+
+
 def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -> None:
     if not destination.exists():
         temporary.replace(destination)
@@ -1867,8 +1976,6 @@ def run_diarization_binding_pilot(
     backend: DiarizationBackend,
     overwrite: bool = False,
 ) -> DiarizationSummary:
-    if inventory.mode != "pilot20":
-        raise ValueError("production_blocked_pending_diarization_binding_calibration")
     destination = output_root.expanduser().resolve(strict=False)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
@@ -1877,11 +1984,8 @@ def run_diarization_binding_pilot(
     bound_segments: list[BoundDiarizationSegment] = []
     clip_results: list[DiarizationClipResult] = []
     anchors_by_clip: dict[str, list[AudioEntityBinding]] = {}
-    media: dict[str, dict[str, object]] = {}
     try:
         temporary.mkdir()
-        review_root = temporary / "review_media"
-        review_root.mkdir()
         (temporary / "diagnostics").mkdir()
         for target in inventory.targets:
             audio_path = Path(target.source_audio_path)
@@ -1921,7 +2025,7 @@ def run_diarization_binding_pilot(
                         status="ready" if clip_raw else "empty",
                     )
                 )
-            except Exception as exc:  # noqa: BLE001 - isolate one pilot clip
+            except Exception as exc:  # noqa: BLE001 - isolate one diarization clip
                 reason = f"{type(exc).__name__}:{exc}"
                 clip_results.append(
                     _failed_clip_result(
@@ -1963,56 +2067,6 @@ def run_diarization_binding_pilot(
         )
         clip_results.sort(key=lambda item: item.target_clip_uid)
 
-        raw_by_clip: dict[str, list[RawDiarizationSegment]] = defaultdict(list)
-        for item in raw_segments:
-            raw_by_clip[item.target_clip_uid].append(item)
-        for target in inventory.targets:
-            clip_uid = target.target_clip_uid
-            video_name = (
-                f"{clip_uid}.video{Path(target.target_video_path).suffix or '.media'}"
-            )
-            audio_name = (
-                f"{clip_uid}.audio{Path(target.source_audio_path).suffix or '.media'}"
-            )
-            (review_root / video_name).symlink_to(Path(target.target_video_path))
-            (review_root / audio_name).symlink_to(Path(target.source_audio_path))
-            visuals: list[dict[str, str]] = []
-            for reference in target.visual_references:
-                source = Path(reference.image_path).expanduser()
-                if not source.is_file():
-                    continue
-                suffix = source.suffix.lower() or ".image"
-                relative = Path("visual") / clip_uid / f"{reference.entity_id}{suffix}"
-                destination_image = review_root / relative
-                destination_image.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, destination_image)
-                visuals.append(
-                    {
-                        "entity_id": reference.entity_id,
-                        "path": f"review_media/{relative.as_posix()}",
-                    }
-                )
-            segment_paths: dict[str, str] = {}
-            for segment in raw_by_clip[clip_uid]:
-                relative = Path("segments") / clip_uid / f"{segment.segment_id}.wav"
-                _write_segment_wav(
-                    source_path=Path(target.source_audio_path),
-                    destination=review_root / relative,
-                    start_sample=segment.source_start_sample,
-                    end_sample=segment.source_end_sample,
-                    expected_sample_rate=target.source_sample_rate_hz,
-                    expected_channels=target.source_channels,
-                )
-                segment_paths[segment.segment_id] = (
-                    f"review_media/{relative.as_posix()}"
-                )
-            media[clip_uid] = {
-                "video": f"review_media/{video_name}",
-                "audio": f"review_media/{audio_name}",
-                "visuals": visuals,
-                "segments": segment_paths,
-            }
-
         summary = _summary(
             inventory=inventory,
             provenance=backend.provenance,
@@ -2027,18 +2081,26 @@ def run_diarization_binding_pilot(
         _write_jsonl(temporary / "bound_segments.jsonl", bound_segments)
         _write_jsonl(temporary / "clip_results.jsonl", clip_results)
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
-        (temporary / "review.html").write_text(
-            _review_html(
+        if inventory.mode == "pilot20":
+            review_root = temporary / "review_media"
+            review_root.mkdir()
+            media = _materialize_review_media(
                 inventory=inventory,
                 raw_segments=raw_segments,
-                cluster_bindings=cluster_bindings,
-                bound_segments=bound_segments,
-                clip_results=clip_results,
-                anchors_by_clip=anchors_by_clip,
-                media=media,
-            ),
-            encoding="utf-8",
-        )
+                review_root=review_root,
+            )
+            (temporary / "review.html").write_text(
+                _review_html(
+                    inventory=inventory,
+                    raw_segments=raw_segments,
+                    cluster_bindings=cluster_bindings,
+                    bound_segments=bound_segments,
+                    clip_results=clip_results,
+                    anchors_by_clip=anchors_by_clip,
+                    media=media,
+                ),
+                encoding="utf-8",
+            )
         copy_diagnostics = getattr(backend, "copy_diagnostics", None)
         if callable(copy_diagnostics):
             copy_diagnostics(temporary / "diagnostics")

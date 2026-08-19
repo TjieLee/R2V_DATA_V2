@@ -37,11 +37,10 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Calibrate DiariZen-assisted clip-local speaker continuity against the frozen
-LR-ASD plus Visual identity evidence. The pilot reuses the exact ordered 20
-targets already reviewed for ASR, preserves overlapping anonymous speaker
-segments, and propagates a sparsely anchored entity to all segments in the same
-cluster. Production execution remains blocked until human calibration.
+Run formal DiariZen-assisted speaker binding over all 75 unique production
+in-pair targets using the human-validated sparse-anchor policy V1. Production
+preserves overlapping anonymous speaker segments and propagates a sparsely
+anchored entity across every segment in the mapped clip-local cluster.
 
 ## Current Pass
 
@@ -88,30 +87,27 @@ reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
 The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and
 entity-binding provenance, including an optional anonymous speaker-cluster ID.
-A future DiariZen inventory may replace the boundaries after clip-level
+A future ASR V2 may consume DiariZen boundaries after clip-level
 cluster-to-Visual-entity overlap mapping without changing Whisper inference.
-The separate DiariZen-assisted binding pilot now implements that calibration
+The DiariZen-assisted binding stage now implements the frozen production
 inventory, raw overlap-preserving schemas, sample-domain sparse identity
-anchoring, cluster propagation, summary, and static human review. It does not
-modify or rerun ASR V1.
+anchoring, cluster propagation, summary, and pilot-only static human review. It
+does not modify or rerun ASR V1.
 
-The official DiariZen pipeline and current model candidate completed a first
-real 20-call server attempt. Eleven clips were ready and nine failed because the
-old bridge rejected terminal segments extending beyond canonical EOF. The model
-runtime itself worked. Raw segment v2 now preserves reported coordinates while
-intersecting the effective interval with canonical sample extent; summary v2
-adds exact boundary diagnostics and union-safe continuity propagation seconds.
-The full 20 clips must be rerun before mapping calibration. Real production
-execution remains blocked, and released model weights are research/non-commercial
-CC BY-NC 4.0. See `docs/H3_DIARIZEN_SPEAKER_BINDING.md`.
+The official DiariZen pipeline and current model completed the repaired 20/20
+server pilot. It produced 50 raw segments and 22 clusters: 21 mapped, one
+ambiguous fail-closed abstention, zero unbound, and zero conflict. Human QA
+marked all 22 cluster decisions `CORRECT`, with no wrong, uncertain, or
+unlabeled cases. The exact threshold-free `h3_diarizen_sparse_anchor_policy_v1`
+is now complete and frozen for production. Released model weights remain
+research/non-commercial CC BY-NC 4.0. See
+`docs/H3_DIARIZEN_SPEAKER_BINDING.md`.
 
-The 11-ready-clip subset contained 27 raw segments and 12 clusters: 11 mapped,
-one ambiguous, zero unbound, and zero conflict. Its 2.54-second DiariZen median
-segment and 1.08-second legacy turn median are partial observations, not a final
-quality result. `identity_propagated_speaker_seconds` now measures mapped
-speaker time carried by within-cluster continuity rather than direct
-LR-ASD/Visual evidence, including unanchored portions of partly anchored
-segments.
+The accepted pilot mapped 114.4155 speaker-seconds: 89.62 direct-anchor seconds
+and 24.7955 identity-propagated seconds, approximately 21.7% carried by
+within-cluster continuity. Nine manually accepted EOF intersections totaled
+0.2245 seconds; maximum overrun was 0.0525 seconds / 840 samples. No numeric
+coverage, support-share, or margin threshold is part of the production policy.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
@@ -174,13 +170,13 @@ with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_diarization*.py -q
-# 21 passed
+# 22 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 210 passed
+# 211 passed
 
 python -m pytest -q
-# 1877 passed, 1 existing Pillow deprecation warning
+# 1878 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -207,8 +203,7 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Rerun the fixed 20-clip DiariZen pilot after the terminal boundary repair,
-inspect the full overrun distribution and every cluster mapping, then calibrate
-a production mapping policy before lifting the explicit production block. ASR
-V2, enhancement, unresolved-speaker MLLM handling, entity-to-subject mapping,
-and final `<d>` rendering remain future work.
+Run formal 75-target DiariZen production and inspect completeness and failure
+diagnostics. ASR V2 over DiariZen segments, text-usability gating, optional
+enhancement, unresolved-only MLLM handling, entity-to-subject mapping, and final
+`<d>` rendering remain future work.

@@ -6,10 +6,12 @@ import json
 import sys
 import wave
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 import pytest
 
+import tools.run_h3_diarization_binding as diarization_cli
 from r2v_data_v2.h3.asr_transcription import build_asr_inventory
 from r2v_data_v2.h3.audio_production import (
     H3ProductionInPair,
@@ -44,7 +46,6 @@ from r2v_data_v2.h3.schemas import (
     PictureAsset,
     SemanticSubject,
 )
-from tools.run_h3_diarization_binding import main as diarization_main
 
 
 def _sha256(path: Path) -> str:
@@ -234,6 +235,12 @@ class _FakeBackend:
         self.responses = responses or {}
         self.calls: list[tuple[str, Path]] = []
 
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
     def diarize(
         self,
         *,
@@ -313,6 +320,7 @@ def test_inventory_reuses_exact_asr_pilot_order_and_production_is_complete(
     root, expected = _audio_run(tmp_path)
 
     pilot = build_diarization_inventory(audio_run_root=root, mode="pilot20")
+    (root / "asr_pilot20" / "inventory.json").unlink()
     production = build_diarization_inventory(
         audio_run_root=root,
         mode="production",
@@ -324,14 +332,29 @@ def test_inventory_reuses_exact_asr_pilot_order_and_production_is_complete(
     assert pilot.source_asr_inventory_fingerprint
     assert production.selected_target_count == 75
     assert production.parent_quota_applied is False
-    assert production.production_blocked is True
+    assert production.cross_pair_jobs_created == 0
+    assert production.production_blocked is False
+    assert production.source_asr_inventory_path is None
+    assert production.source_asr_inventory_fingerprint is None
+    assert production.mapping_policy_validated is True
+    assert production.numeric_mapping_thresholds_used is False
+    assert production.mapping_policy_version == "h3_diarizen_sparse_anchor_policy_v1"
+    assert production.schema_version == "r2v.h3.diarization_inventory.2"
+    assert production.calibration_inventory_fingerprint == (
+        "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
+    )
 
 
-def test_dry_run_imports_no_diarizen_and_real_production_is_blocked(
+def test_dry_run_imports_no_diarizen_and_real_production_is_enabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _ = _audio_run(tmp_path)
+    frozen_before = {
+        path.relative_to(root).as_posix(): _sha256(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
     original_import = builtins.__import__
 
     def guarded_import(name: str, *args: object, **kwargs: object) -> object:
@@ -340,17 +363,66 @@ def test_dry_run_imports_no_diarizen_and_real_production_is_blocked(
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded_import)
-    result = diarization_main(
+    result = diarization_cli.main(
         ["--audio-run-root", str(root), "--mode", "production", "--dry-run"]
     )
     assert result["selected_target_count"] == 75
     assert result["parent_quota_applied"] is False
     assert result["cross_pair_jobs_created"] == 0
-    with pytest.raises(
-        ValueError,
-        match="production_blocked_pending_diarization_binding_calibration",
-    ):
-        diarization_main(["--audio-run-root", str(root), "--mode", "production"])
+    assert result["production_blocked"] is False
+    assert result["output_root"] == str(root / "production" / "diarization")
+
+    backend = _FakeBackend()
+    hidden_diagnostics = root / ".fake-diarization-worker"
+    monkeypatch.setattr(
+        diarization_cli,
+        "_runtime_backend",
+        lambda *, output_root: (backend, hidden_diagnostics),
+    )
+    completed = diarization_cli.main(
+        ["--audio-run-root", str(root), "--mode", "production"]
+    )
+
+    assert completed["stage_status"] == "completed"
+    assert len(backend.calls) == 75
+    assert [item[0] for item in backend.calls] == sorted(
+        item[0] for item in backend.calls
+    )
+    output = root / "production" / "diarization"
+    assert output.is_dir()
+    assert not (output / "review.html").exists()
+    assert not (output / "review_media").exists()
+    assert sum(1 for _ in (output / "raw_segments.jsonl").open()) == 75
+    first_cluster = json.loads(
+        (output / "cluster_bindings.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert first_cluster["schema_version"] == "r2v.h3.diarization_cluster_binding.2"
+    assert first_cluster["mapping_policy_version"] == (
+        "h3_diarizen_sparse_anchor_policy_v1"
+    )
+    summary = completed["summary"]
+    assert isinstance(summary, dict)
+    assert summary["schema_version"] == "r2v.h3.diarization_summary.3"
+    assert summary["mode"] == "production"
+    assert summary["target_clip_count"] == 75
+    assert summary["backend_call_count"] == 75
+    assert summary["mapping_policy_validated"] is True
+    assert summary["mapping_policy_version"] == "h3_diarizen_sparse_anchor_policy_v1"
+    assert summary["thresholds_calibrated"] is False
+    assert summary["numeric_mapping_thresholds_used"] is False
+    assert summary["parent_quota_applied"] is False
+    assert summary["visual_anchor_coverage_used_as_gate"] is False
+    assert summary["mapped_speaker_seconds"] == pytest.approx(
+        summary["mapped_direct_anchor_speaker_seconds"]
+        + summary["identity_propagated_speaker_seconds"]
+    )
+    frozen_after = {
+        path.relative_to(root).as_posix(): _sha256(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and not path.relative_to(root).as_posix().startswith("production/diarization/")
+    }
+    assert frozen_after == frozen_before
 
 
 def test_pilot_calls_backend_once_per_target_and_never_for_cross_pairs(
@@ -373,7 +445,7 @@ def test_pilot_calls_backend_once_per_target_and_never_for_cross_pairs(
 
     assert [item[0] for item in backend.calls] == expected
     assert summary.backend_call_count == 20
-    assert summary.schema_version == "r2v.h3.diarization_summary.2"
+    assert summary.schema_version == "r2v.h3.diarization_summary.3"
     assert summary.boundary_adjusted_segment_count == 0
     assert summary.boundary_adjusted_clip_count == 0
     assert summary.total_end_overrun_seconds == 0
@@ -830,6 +902,27 @@ def test_source_hash_change_fails_only_that_clip_without_backend_call(
     assert summary.failed_clip_count == 1
     assert summary.backend_call_count == 19
     assert selected[0] not in [item[0] for item in backend.calls]
+
+
+def test_production_source_hash_change_fails_only_that_target(tmp_path: Path) -> None:
+    root, _ = _audio_run(tmp_path)
+    inventory = build_diarization_inventory(audio_run_root=root, mode="production")
+    first = inventory.targets[0]
+    Path(first.source_audio_path).write_bytes(b"changed")
+    backend = _FakeBackend()
+
+    summary = run_diarization_binding_pilot(
+        inventory=inventory,
+        output_root=diarization_output_root(root, mode="production"),
+        backend=backend,
+    )
+
+    assert summary.mode == "production"
+    assert summary.target_clip_count == 75
+    assert summary.failed_clip_count == 1
+    assert summary.backend_call_count == 74
+    assert first.target_clip_uid not in [item[0] for item in backend.calls]
+    assert summary.failure_reason_counts == {"ValueError:source_audio_hash_mismatch": 1}
 
 
 def test_review_preserves_overlap_lanes_and_qa_fingerprint(tmp_path: Path) -> None:

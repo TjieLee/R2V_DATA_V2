@@ -30,7 +30,7 @@ from r2v_data_v2.h3.diarization_binding import (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the read-only-input H3 DiariZen speaker binding pilot",
+        description="Run H3 DiariZen speaker binding",
     )
     parser.add_argument("--audio-run-root", type=Path, required=True)
     parser.add_argument("--mode", choices=("pilot20", "production"), required=True)
@@ -179,13 +179,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "donor_media_used": False,
         "cross_pair_jobs_created": 0,
         "production_blocked": inventory.production_blocked,
+        "mapping_policy_version": inventory.mapping_policy_version,
+        "mapping_policy_validated": inventory.mapping_policy_validated,
+        "numeric_mapping_thresholds_used": (inventory.numeric_mapping_thresholds_used),
     }
     if arguments.dry_run:
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
         return plan
-    if arguments.mode == "production":
-        raise ValueError("production_blocked_pending_diarization_binding_calibration")
-
     backend, diagnostics_root = _runtime_backend(output_root=output_root)
     try:
         with backend:
