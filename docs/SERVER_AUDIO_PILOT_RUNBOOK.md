@@ -25,8 +25,8 @@ Current milestone boundaries:
   H3 text truth.
 - TextUsabilityPolicy V1 is **COMPLETE / FROZEN** at the exact
   `language_probability >= 0.65` display threshold.
-- Entity-to-subject mapping and final H3 rendering are next. Speech enhancement
-  and unresolved-only MLLM remain future work.
+- Deterministic final H3 renderer V1 is **IMPLEMENTED / PENDING SERVER RUN**.
+  Speech enhancement and unresolved-only MLLM remain future optional work.
 
 ### One-Time Setup
 
@@ -375,7 +375,38 @@ python -m json.tool \
 The command reads `$AUDIO_RUN_ROOT/production/asr_v2` only and writes
 `$AUDIO_RUN_ROOT/production/text_usability`. It does not overwrite the retained
 calibration report. Use `--overwrite` only for an intentional atomic replacement
-of the derived sidecar. Final `<d>` rendering is not part of this command.
+of the derived sidecar. Final `<d>` rendering is a separate model-free stage.
+
+### Deterministic final H3 renderer
+
+First inspect the complete plan. This command reads frozen production
+artifacts, hashes source media, and writes nothing:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_final_renderer.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --dry-run
+```
+
+Publish every in-pair and cross-pair row to the fixed derived root:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_final_renderer.py \
+  --audio-run-root "$AUDIO_RUN_ROOT"
+
+python -m json.tool "$AUDIO_RUN_ROOT/production/h3/summary.json"
+wc -l \
+  "$AUDIO_RUN_ROOT/production/h3/samples.jsonl" \
+  "$AUDIO_RUN_ROOT/production/h3/failures.jsonl"
+```
+
+No Whisper, DiariZen, MLLM, GPU, or network service is needed. The renderer
+reuses the exact accepted Visual V3 instruction, frozen pair order, ASR V2
+timeline, and authoritative text-usability sidecar. Detected language is
+metadata only and is never inserted as prompt conditioning. Cross-pairs replace
+only the subject voice asset; donor transcript and donor timeline are never
+read. Use `--overwrite` only to atomically replace `production/h3` after an
+intentional derived-output rebuild. See `docs/H3_FINAL_RENDERER.md`.
 
 ## Blocked dots3 diagnostic sequence
 

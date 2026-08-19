@@ -37,9 +37,10 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Use the frozen DiariZen, raw ASR V2, and TextUsabilityPolicy V1 outputs for the
-next entity-to-subject and final H3 structured-rendering stage. The renderer is
-not implemented in the current pass.
+Use the frozen DiariZen, raw ASR V2, and TextUsabilityPolicy V1 outputs for
+deterministic entity-to-subject mapping and final H3 structured rendering. The
+renderer is implemented locally without model calls; formal server publication
+has not been run in this development pass.
 
 ## Current Pass
 
@@ -145,8 +146,20 @@ when the raw record is transcribed, text is non-empty, and
 policy writes every source segment under
 `$AUDIO_RUN_ROOT/production/text_usability`, preserves identity fields, and
 does not mutate raw ASR, voice, embeddings, or pairs. Language probability is
-not transcript correctness probability, identity is not a text gate, and no
-final `<d>` renderer exists yet. See `docs/H3_ASR_V2_TEXT_USABILITY.md`.
+not transcript correctness probability and identity is not a text gate. The
+model-free final renderer consumes this frozen sidecar without recalculating
+trust. See `docs/H3_ASR_V2_TEXT_USABILITY.md` and
+`docs/H3_FINAL_RENDERER.md`.
+
+Deterministic H3 final renderer V1 is implemented at the fixed
+`$AUDIO_RUN_ROOT/production/h3` root. It emits one sample for every frozen
+in-pair and cross-pair row, preserves target Visual instruction and target
+speech timeline, and changes only voice provenance for cross-pairs. Trusted
+subject-bound text is rendered verbatim inside `<d>`; trusted speech without a
+pair subject remains structured and unrendered. Language is preserved as
+metadata with `language_conditioning_applied=false`. Baseline rendering has
+zero model, MLLM, GPU, and parent-quota calls. Formal server dry-run counts and
+language distribution remain to be measured on the frozen production root.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
