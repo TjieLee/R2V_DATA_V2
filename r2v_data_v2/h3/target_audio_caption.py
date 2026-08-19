@@ -562,21 +562,28 @@ class Dots3TargetAudioCaptionConfig:
         )
 
 
+def _canonical_inventory_fingerprint_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _canonical_inventory_fingerprint_value(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [_canonical_inventory_fingerprint_value(item) for item in value]
+    return value
+
+
 def _inventory_fingerprint(
     inventory: TargetAudioCaptionInventory | dict[str, object],
 ) -> str:
-    values = (
-        inventory.model_dump(
-            mode="json", exclude={"inventory_fingerprint"}, exclude_none=True
-        )
+    raw = (
+        inventory.model_dump(mode="json")
         if isinstance(inventory, TargetAudioCaptionInventory)
-        else {
-            key: value
-            for key, value in inventory.items()
-            if key != "inventory_fingerprint"
-        }
+        else dict(inventory)
     )
-    return _sha256_text(_compact_json(values))
+    raw.pop("inventory_fingerprint", None)
+    return _sha256_text(_compact_json(_canonical_inventory_fingerprint_value(raw)))
 
 
 def _response_issues(

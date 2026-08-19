@@ -274,15 +274,21 @@ def test_generated_report_script_is_valid_and_exports_selection(
 
     browser_fixture = """
 const stored = new Map([
-  ['h3-background-audio-scout-clip-000', JSON.stringify({label:'background-rich',flags:['music']})],
+  ['h3-background-audio-scout-clip-000', JSON.stringify({label:'clean',flags:[]})],
   ['h3-background-audio-scout-clip-001', JSON.stringify({label:'clean',flags:[]})],
 ]);
-const rows = Array.from({length:75}, (_, index) => ({
-  dataset:{clip:`clip-${String(index).padStart(3,'0')}`,index:String(index),rms:'0',ratio:'0',seconds:'0'},
-  hidden:false,
-  querySelector:() => null,
-  querySelectorAll:() => [],
-}));
+const rows = Array.from({length:75}, (_, index) => {
+  const radios = ['background-rich','clean','uncertain'].map(value => ({value,checked:false}));
+  const checkboxes = ['music','crowd'].map(flag => ({dataset:{flag},checked:false}));
+  return {
+    dataset:{clip:`clip-${String(index).padStart(3,'0')}`,index:String(index),rms:'0',ratio:'0',seconds:'0'},
+    hidden:false,
+    radios,
+    checkboxes,
+    querySelector:selector => selector === "input[type='radio']:checked" ? radios.find(item => item.checked) || null : null,
+    querySelectorAll:selector => selector === "input[type='radio']" ? radios : selector === "input[type='checkbox']" ? checkboxes : selector === "input[type='checkbox']:checked" ? checkboxes.filter(item => item.checked) : [],
+  };
+});
 const progress = {textContent:''};
 const cases = {children:rows,appendChild:() => {}};
 globalThis.localStorage = {
@@ -303,6 +309,8 @@ globalThis.alert = message => {throw new Error(`unexpected alert: ${message}`);}
 globalThis.confirm = () => true;
 """
     assertions = """
+rows[0].radios.forEach(item => {item.checked = item.value === 'background-rich';});
+rows[0].checkboxes[0].checked = true;
 exportSelection();
 if (!exportedBlob) throw new Error('selection export did not create a Blob');
 const payload = JSON.parse(exportedBlob.parts.join(''));
@@ -310,6 +318,7 @@ if (downloadedName !== 'background_audio_pilot_selection.json') throw new Error(
 if (payload.selection_count !== 1) throw new Error('wrong selection count');
 if (JSON.stringify(payload.selected_clip_ids) !== JSON.stringify(['clip-000'])) throw new Error('wrong selected clips');
 if (payload.reviews[0].target_clip_uid !== 'clip-000' || payload.reviews[0].label !== 'background-rich') throw new Error('review order changed');
+if (payload.reviews[0].flags[0] !== 'music') throw new Error('visible DOM state was not synchronized');
 if (!exportedBlob.parts.join('').endsWith('\\n')) throw new Error('JSON export lacks final newline');
 """
     execution_path = tmp_path / "execute-background-audio-scout.js"

@@ -28,6 +28,7 @@ from r2v_data_v2.h3.target_audio_caption import (
     TargetAudioCaptionHumanQAExport,
     TargetAudioCaptionInventory,
     TargetAudioCaptionJob,
+    _inventory_fingerprint,
     _model_input,
     _response_issues,
     _validate_background_selection,
@@ -95,6 +96,7 @@ def _inventory(
     *,
     count: int = 20,
     mode: str = "pilot20",
+    mixed_nullable_clusters: bool = False,
 ) -> TargetAudioCaptionInventory:
     sources = {
         name: _write(tmp_path / "source" / name, name.encode())
@@ -130,6 +132,21 @@ def _inventory(
             tmp_path / "audio" / clip_uid / "audio_binding.json",
             f"sidecar:{clip_uid}".encode(),
         )
+        clusters = [
+            SpeakerClusterEvidence(
+                speaker_cluster_id="speaker_0",
+                entity_id="e1",
+                active_time_ranges=[SpeakerTimeRange(start_time=0.2, end_time=1.4)],
+            )
+        ]
+        if mixed_nullable_clusters and index == 0:
+            clusters.append(
+                SpeakerClusterEvidence(
+                    speaker_cluster_id="speaker_1",
+                    entity_id=None,
+                    active_time_ranges=[SpeakerTimeRange(start_time=1.5, end_time=2.2)],
+                )
+            )
         jobs.append(
             TargetAudioCaptionJob(
                 target_clip_uid=clip_uid,
@@ -139,15 +156,7 @@ def _inventory(
                 target_full_audio_sha256=_sha256(audio),
                 target_audio_binding_path=str(sidecar),
                 target_audio_binding_sha256=_sha256(sidecar),
-                speaker_clusters=[
-                    SpeakerClusterEvidence(
-                        speaker_cluster_id="speaker_0",
-                        entity_id="e1",
-                        active_time_ranges=[
-                            SpeakerTimeRange(start_time=0.2, end_time=1.4)
-                        ],
-                    )
-                ],
+                speaker_clusters=clusters,
             )
         )
     values = {
@@ -219,14 +228,7 @@ def _inventory(
                 "source_scout_inventory_fingerprint": "5" * 64,
             }
         )
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            values,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    fingerprint = _inventory_fingerprint(values)
     return TargetAudioCaptionInventory(**values, inventory_fingerprint=fingerprint)
 
 
@@ -254,6 +256,41 @@ def test_exact_asr_v2_pilot20_selection_order_is_reused() -> None:
             pilot_ids=pilot_ids[:-1],
             production_ids=production_ids,
         )
+
+
+def test_inventory_fingerprint_canonicalizes_nested_nullable_entity_ids(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        count=2,
+        mode="background_pilot",
+        mixed_nullable_clusters=True,
+    )
+    first_clusters = inventory.jobs[0].speaker_clusters
+
+    assert [item.entity_id for item in first_clusters] == ["e1", None]
+    assert inventory.inventory_fingerprint == _inventory_fingerprint(inventory)
+    assert inventory.inventory_fingerprint == _inventory_fingerprint(
+        inventory.model_dump(mode="json")
+    )
+    restored = TargetAudioCaptionInventory.model_validate_json(
+        inventory.model_dump_json()
+    )
+    assert restored.inventory_fingerprint == inventory.inventory_fingerprint
+    assert restored.jobs[0].speaker_clusters[1].entity_id is None
+
+
+def test_pilot20_inventory_fingerprint_uses_same_canonical_path(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, mixed_nullable_clusters=True)
+    assert inventory.mode == "pilot20"
+    assert inventory.inventory_fingerprint == _inventory_fingerprint(inventory)
+    assert (
+        TargetAudioCaptionInventory.model_validate(inventory.model_dump(mode="json"))
+        == inventory
+    )
 
 
 @pytest.mark.parametrize("selected_ids", [["clip-001"], ["clip-001", "clip-004"]])
