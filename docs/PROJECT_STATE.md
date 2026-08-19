@@ -37,10 +37,10 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Use the frozen DiariZen, raw ASR V2, and TextUsabilityPolicy V1 outputs for
-deterministic entity-to-subject mapping and final H3 structured rendering. The
-renderer is implemented locally without model calls; formal server publication
-has not been run in this development pass.
+Run a bounded Target Audio Caption MLLM pilot over the frozen DiariZen, raw ASR
+V2, TextUsabilityPolicy V1, and Audio outputs. The deterministic final renderer
+implementation is complete and frozen, but this pilot does not feed or rebuild
+it.
 
 ## Current Pass
 
@@ -175,6 +175,25 @@ the 20-clip semantic pilot found severe hallucinated dialogue. Existing
 generation and complete semantic production are blocked; do not delete or
 promote that pilot. The earlier native-video transport contract remains
 documented in `docs/H3_OMNI_SEMANTIC_AUGMENTATION.md` for diagnostics.
+
+The current follow-up is the separate Target Audio Caption MLLM Pilot V1. It
+reuses the exact ordered ASR V2 pilot20 clip IDs and asks Dots3 only for audible
+ambience, music, non-speech events, acoustic style, and cluster-scoped vocal
+delivery. It sends no transcript, trusted text, language, entity ID, donor
+media, or separate audio item. Entity IDs are attached deterministically after
+inference. Output stays under
+`$AUDIO_RUN_ROOT/target_audio_caption_pilot20`; human QA, 75-clip production,
+final-renderer integration, and a rebuilt final H3 dataset remain pending. See
+`docs/H3_TARGET_AUDIO_CAPTION.md`.
+
+Current milestone status is therefore:
+
+- **COMPLETE / FROZEN:** DiariZen, ASR V2, TextUsabilityPolicy V1, and the
+  deterministic final renderer implementation;
+- **CURRENT:** Target Audio Caption MLLM Pilot V1;
+- **PENDING:** pilot human QA, Target Audio Caption production, renderer
+  integration, and final H3 rebuild;
+- **OPTIONAL LATER:** voice-reference enhancement or denoising experiments.
 
 The validated dedicated runtime uses checkpoint architecture
 `Dots3NoteForCausalLM` / model type `dots3_note`, `bfloat16`, unquantized

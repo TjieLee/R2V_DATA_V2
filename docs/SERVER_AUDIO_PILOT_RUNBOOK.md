@@ -1397,6 +1397,54 @@ the model-video bounds because the vendor crop pads the frame. The R2V bridge
 clips only the published artifact coordinates to the model-video bounds; it
 continues to use the raw vendor box for detection-confidence matching.
 
+## Target Audio Caption MLLM Pilot V1
+
+This is a fixed 20-clip human-review pilot, not the blocked dialogue-producing
+semantic workflow and not a 75-clip production run. It reuses the exact ordered
+clip IDs in `$AUDIO_RUN_ROOT/asr_v2_pilot20` and reads the frozen production
+DiariZen, ASR V2, TextUsability, and Audio artifacts without modifying them.
+
+The validated Dots3 runtime above is fully reusable: checkpoint
+`/mnt/workspace/public/pretrained/dots3-note-prev`, served name
+`dots3-note-prev`, pinned vLLM commit
+`e0e5a7fb2808504ba86c94f7b379e38496002fd0`, shared `file://` media under
+`/mnt/workspace`, and endpoint `http://6.167.57.88:8000/v1`. The request is text
+plus native target video only. The video's embedded audio is analyzed; the
+canonical extracted full-audio path/hash remains verified provenance and is not
+sent separately.
+
+After starting vLLM with the already documented command and restoring the
+`DOTS3_*` environment variables, first verify the frozen inventory:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --dry-run
+```
+
+Run the pilot once:
+
+```bash
+cd "$REPO"
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-run-root "$AUDIO_RUN_ROOT"
+```
+
+Inspect the summary and serve the static review bundle:
+
+```bash
+cat "$AUDIO_RUN_ROOT/target_audio_caption_pilot20/summary.json"
+cd "$AUDIO_RUN_ROOT/target_audio_caption_pilot20"
+"$R2V_PYTHON" -m http.server 8765 --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8765/report.html`. Exported QA includes the frozen
+inventory fingerprint and `CORRECT` / `WRONG` / `UNCERTAIN` decisions plus
+optional hallucination, ambience, delivery, dialogue-leakage, and other flags.
+Do not run a 75-clip caption job or integrate the draft into final H3 before the
+20-clip human review is accepted.
+
 ## Cleanup of old timestamped smoke attempts
 
 Preview first:
