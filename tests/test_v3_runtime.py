@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 import r2v_data_v2.v3.config as config_module
+import run_pipeline_v3 as pipeline_module
 from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     QwenServicesConfig,
@@ -90,6 +91,7 @@ def test_runtime_defaults_preserve_legacy_staged_mode(
     assert config.runtime.stage_workers.remove == 1
     assert config.runtime.stage_workers.reference_edit == 1
     assert config.runtime.stage_workers.subject_attributes == 2
+    assert config.runtime.gpu_workers.subject_attributes_segment is None
     assert STAGE_ORDER.index("instruct") < STAGE_ORDER.index("subject_attributes")
     assert STAGE_ORDER.index("subject_attributes") < STAGE_ORDER.index("export")
 
@@ -124,6 +126,21 @@ def test_sidecar_worker_count_does_not_change_visual_run_identity(
     config = _config(tmp_path, monkeypatch)
     workers = replace(config.runtime.stage_workers, subject_attributes=3)
     changed = replace(config, runtime=replace(config.runtime, stage_workers=workers))
+
+    assert config.fingerprint() == changed.fingerprint()
+    assert config.model_identifiers() == changed.model_identifiers()
+
+
+def test_sidecar_gpu_assignment_does_not_change_visual_run_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    gpu_workers = replace(
+        config.runtime.gpu_workers,
+        subject_attributes_segment="7",
+    )
+    changed = replace(config, runtime=replace(config.runtime, gpu_workers=gpu_workers))
 
     assert config.fingerprint() == changed.fingerprint()
     assert config.model_identifiers() == changed.model_identifiers()
@@ -193,6 +210,7 @@ def test_runtime_yaml_loads_nested_worker_configuration(
                 "    subject_attributes: 3",
                 "  gpu_workers:",
                 "    segment: '5'",
+                "    subject_attributes_segment: '7'",
                 "    remove: '4'",
                 "    reference_edit: '6'",
             )
@@ -207,8 +225,219 @@ def test_runtime_yaml_loads_nested_worker_configuration(
     assert loaded.runtime.stage_workers.frames == 3
     assert loaded.runtime.stage_workers.subject_attributes == 3
     assert loaded.runtime.gpu_workers == RuntimeGpuWorkersConfig(
-        segment="5", remove="4", reference_edit="6"
+        segment="5",
+        subject_attributes_segment="7",
+        remove="4",
+        reference_edit="6",
     )
+
+
+def _exercise_streaming_segment_worker_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dedicated_gpu: str | None,
+    fail_scheduler: bool = False,
+) -> list[object]:
+    config = _config(tmp_path, monkeypatch)
+    gpu_workers = replace(
+        config.runtime.gpu_workers,
+        segment="5",
+        subject_attributes_segment=dedicated_gpu,
+    )
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            mode="streaming_v1",
+            gpu_workers=gpu_workers,
+        ),
+    )
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+
+    class FakeStorage:
+        root = config.resolved_run_root
+
+        def iter_clips(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(clip_uid="clip-a")]
+
+        def update_stage_counts(
+            self,
+            _stage: str,
+            _counts: dict[str, int],
+        ) -> None:
+            return None
+
+        def append_failure(self, **_kwargs: object) -> None:
+            return None
+
+    class FakeProcess:
+        instances: list[FakeProcess] = []
+
+        def __init__(self, worker_config: StageWorkerConfig) -> None:
+            self.config = worker_config
+            self.starts = 0
+            self.closes = 0
+            self.run_clip_requests: list[str] = []
+            self.attribute_probe_requests: list[str] = []
+            self.instances.append(self)
+
+        def start(self) -> None:
+            self.starts += 1
+
+        def close(self) -> None:
+            self.closes += 1
+
+        def request(self, clip_uid: str) -> dict[str, int]:
+            self.run_clip_requests.append(clip_uid)
+            return {"processed": 1}
+
+        def attribute_probe(self, **kwargs: object) -> tuple[np.ndarray, ...]:
+            self.attribute_probe_requests.append(str(kwargs["clip_uid"]))
+            return ()
+
+    def fake_stage_handler(
+        *,
+        stage: str,
+        process: FakeProcess | None,
+        attribute_segmentation_backend: object | None,
+        **_kwargs: object,
+    ) -> object:
+        if stage == "segment":
+            assert process is not None
+            return process.request
+        assert stage == "subject_attributes"
+        assert attribute_segmentation_backend is not None
+
+        def probe(clip_uid: str) -> dict[str, int]:
+            attribute_segmentation_backend._client.attribute_probe(
+                clip_uid=clip_uid,
+                frame_slot=1,
+                source_frame_index=10,
+                grounding_prompt="the red jacket",
+            )
+            return {"processed": 1}
+
+        return probe
+
+    class FakeScheduler:
+        def __init__(self, stages: list[StreamingStage], **_kwargs: object) -> None:
+            self.stages = stages
+
+        def run(self, clip_uids: list[str]) -> SimpleNamespace:
+            counts = {
+                stage.name: stage.handler(clip_uids[0]) for stage in self.stages
+            }
+            if fail_scheduler:
+                raise RuntimeError("scheduler failed")
+            return SimpleNamespace(
+                stage_counts=counts,
+                failed_tasks=[],
+                to_dict=lambda: {},
+            )
+
+    monkeypatch.setattr(pipeline_module, "PersistentStageProcess", FakeProcess)
+    monkeypatch.setattr(pipeline_module, "StreamingDAGScheduler", FakeScheduler)
+    monkeypatch.setattr(pipeline_module, "_streaming_stage_handler", fake_stage_handler)
+    monkeypatch.setattr(
+        pipeline_module,
+        "reconcile_subject_attribute_outputs",
+        lambda **_kwargs: {},
+    )
+
+    def call() -> dict[str, object]:
+        return pipeline_module._run_streaming_pipeline(
+            config_path=config_path,
+            config=config,
+            storage=FakeStorage(),
+            ordered_stages=("segment", "subject_attributes"),
+            overwrite=False,
+            profiler=None,
+            results={},
+            annotation_client=None,
+            frame_decoder=None,
+            segmentation_backend=None,
+            instruction_client=None,
+            background_removal_backend=None,
+            background_removal_judge=None,
+            entity_reference_judge=None,
+            cross_pair_judge=None,
+            background_final_judge=None,
+            reference_completion_backend=None,
+            reference_completion_judge=None,
+            reference_edit_backend=None,
+            reference_edit_judge=None,
+            reference_edit_sam_reviewer=None,
+            reference_integrity_judge=None,
+            subject_attribute_discovery_client=object(),
+            subject_attribute_review_client=object(),
+            attribute_segmentation_backend=None,
+            profile=False,
+        )
+    if fail_scheduler:
+        with pytest.raises(RuntimeError, match="scheduler failed"):
+            call()
+    else:
+        call()
+    return list(FakeProcess.instances)
+
+
+def test_dedicated_attribute_segment_worker_routes_probes_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _exercise_streaming_segment_worker_routing(
+        tmp_path,
+        monkeypatch,
+        dedicated_gpu="7",
+    )
+
+    assert len(processes) == 2
+    main = next(
+        process for process in processes if process.config.cuda_visible_devices == "5"
+    )
+    dedicated = next(
+        process for process in processes if process.config.cuda_visible_devices == "7"
+    )
+    assert main.config.stage == dedicated.config.stage == "segment"
+    assert main.run_clip_requests == ["clip-a"]
+    assert main.attribute_probe_requests == []
+    assert dedicated.run_clip_requests == []
+    assert dedicated.attribute_probe_requests == ["clip-a"]
+    assert dedicated.starts == 1
+    assert all(process.closes == 1 for process in processes)
+
+
+def test_attribute_segment_worker_falls_back_to_main_segment_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _exercise_streaming_segment_worker_routing(
+        tmp_path,
+        monkeypatch,
+        dedicated_gpu=None,
+    )
+
+    assert len(processes) == 1
+    assert processes[0].run_clip_requests == ["clip-a"]
+    assert processes[0].attribute_probe_requests == ["clip-a"]
+    assert processes[0].starts == processes[0].closes == 1
+
+
+def test_dedicated_attribute_segment_worker_closes_on_pipeline_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _exercise_streaming_segment_worker_routing(
+        tmp_path,
+        monkeypatch,
+        dedicated_gpu="7",
+        fail_scheduler=True,
+    )
+
+    assert len(processes) == 2
+    assert all(process.closes == 1 for process in processes)
 
 
 def test_dag_overlaps_different_clips_but_never_same_clip_writers() -> None:

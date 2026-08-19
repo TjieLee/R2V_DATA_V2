@@ -97,6 +97,7 @@ _IMPLEMENTED_STAGES = frozenset(
 )
 
 _STREAMING_GPU_STAGES = frozenset({"segment", "remove", "reference_edit"})
+_SUBJECT_ATTRIBUTE_SEGMENT_WORKER = "subject_attributes_segment"
 
 
 def _git_commit() -> str:
@@ -313,9 +314,15 @@ def _run_streaming_pipeline(
         worker_stages = [
             stage for stage in clip_stages if stage in _STREAMING_GPU_STAGES
         ]
+        dedicated_attribute_segment = (
+            "subject_attributes" in clip_stages
+            and attribute_segmentation_backend is None
+            and config.runtime.gpu_workers.subject_attributes_segment is not None
+        )
         if (
             "subject_attributes" in clip_stages
             and attribute_segmentation_backend is None
+            and not dedicated_attribute_segment
             and segmentation_backend is None
             and "segment" not in worker_stages
         ):
@@ -344,6 +351,20 @@ def _run_streaming_pipeline(
             worker.start()
             processes[stage] = worker
             stack.callback(worker.close)
+        if dedicated_attribute_segment:
+            worker = PersistentStageProcess(
+                runtime_worker_config(
+                    config,
+                    config_path=config_path,
+                    stage="segment",
+                    gpu_assignment=_SUBJECT_ATTRIBUTE_SEGMENT_WORKER,
+                    overwrite=overwrite,
+                    profile=profile,
+                )
+            )
+            worker.start()
+            processes[_SUBJECT_ATTRIBUTE_SEGMENT_WORKER] = worker
+            stack.callback(worker.close)
         owned_attribute_qwen: QwenSubjectAttributeClient | None = None
         if "subject_attributes" in clip_stages:
             if (
@@ -364,7 +385,9 @@ def _run_streaming_pipeline(
                     subject_attribute_review_client or owned_attribute_qwen
                 )
             if attribute_segmentation_backend is None:
-                segment_process = processes.get("segment")
+                segment_process = processes.get(
+                    _SUBJECT_ATTRIBUTE_SEGMENT_WORKER
+                ) or processes.get("segment")
                 if segment_process is None:
                     raise ValueError(
                         "subject attributes require the persistent segment worker "

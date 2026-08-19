@@ -504,13 +504,16 @@ def runtime_worker_config(
     *,
     config_path: str | Path,
     stage: str,
+    gpu_assignment: str | None = None,
     overwrite: bool,
     profile: bool,
 ) -> StageWorkerConfig:
-    visible = getattr(config.runtime.gpu_workers, stage)
+    assignment = gpu_assignment or stage
+    visible = getattr(config.runtime.gpu_workers, assignment)
     if visible is None:
         raise ValueError(
-            f"runtime.gpu_workers.{stage} is required for streaming model isolation"
+            f"runtime.gpu_workers.{assignment} is required for streaming model "
+            "isolation"
         )
     return StageWorkerConfig(
         stage=stage,
@@ -520,6 +523,8 @@ def runtime_worker_config(
         timeout_seconds=config.runtime.worker_timeout_seconds,
         profile=profile,
         stderr_log_path=(
-            config.resolved_run_root / "logs" / f"streaming_{stage}_worker.stderr.log"
+            config.resolved_run_root
+            / "logs"
+            / f"streaming_{assignment}_worker.stderr.log"
         ),
     )

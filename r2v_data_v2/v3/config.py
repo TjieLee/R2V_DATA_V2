@@ -217,6 +217,7 @@ class RuntimeStageWorkersConfig:
 @dataclass(frozen=True)
 class RuntimeGpuWorkersConfig:
     segment: str | None = None
+    subject_attributes_segment: str | None = None
     remove: str | None = None
     reference_edit: str | None = None
 
@@ -862,6 +863,8 @@ class V3Config:
     def model_identifiers(self) -> dict[str, str | None]:
         visual_stage_workers = asdict(self.runtime.stage_workers)
         visual_stage_workers.pop("subject_attributes", None)
+        visual_gpu_workers = asdict(self.runtime.gpu_workers)
+        visual_gpu_workers.pop("subject_attributes_segment", None)
         return {
             **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
             "remove.backend": self.remove.backend,
@@ -904,7 +907,7 @@ class V3Config:
                 visual_stage_workers, sort_keys=True
             ),
             "runtime.gpu_workers": json.dumps(
-                asdict(self.runtime.gpu_workers), sort_keys=True
+                visual_gpu_workers, sort_keys=True
             ),
         }
 
@@ -915,6 +918,9 @@ class V3Config:
             stage_workers = runtime.get("stage_workers")
             if isinstance(stage_workers, dict):
                 stage_workers.pop("subject_attributes", None)
+            gpu_workers = runtime.get("gpu_workers")
+            if isinstance(gpu_workers, dict):
+                gpu_workers.pop("subject_attributes_segment", None)
         source = value.get("source")
         if isinstance(source, dict) and source.get("selection_manifest") is None:
             source.pop("selection_manifest", None)
