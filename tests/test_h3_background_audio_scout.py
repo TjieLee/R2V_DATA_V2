@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import shutil
+import subprocess
 import wave
 from array import array
 from pathlib import Path
@@ -244,6 +246,84 @@ def test_scout_is_read_only_model_free_fixed_root_and_atomic(tmp_path: Path) -> 
     assert "Select at least one background-rich clip" in report
     assert "const keyPrefix='h3-background-audio-scout-'" in report
     assert "background_audio_pilot_selection.json" in report
+
+
+def test_generated_report_script_is_valid_and_exports_selection(
+    tmp_path: Path,
+) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for generated report JavaScript validation")
+    _write_source(tmp_path)
+    inventory = build_background_audio_scout_inventory(audio_run_root=tmp_path)
+    output = background_audio_scout_output_root(tmp_path)
+    run_background_audio_scout(inventory=inventory, output_root=output)
+    report = (output / "report.html").read_text(encoding="utf-8")
+    assert report.count("<script>") == report.count("</script>") == 1
+    script = report.split("<script>", 1)[1].split("</script>", 1)[0]
+    script_path = tmp_path / "generated-background-audio-scout.js"
+    script_path.write_text(script, encoding="utf-8")
+
+    syntax = subprocess.run(
+        [node, "--check", str(script_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    browser_fixture = """
+const stored = new Map([
+  ['h3-background-audio-scout-clip-000', JSON.stringify({label:'background-rich',flags:['music']})],
+  ['h3-background-audio-scout-clip-001', JSON.stringify({label:'clean',flags:[]})],
+]);
+const rows = Array.from({length:75}, (_, index) => ({
+  dataset:{clip:`clip-${String(index).padStart(3,'0')}`,index:String(index),rms:'0',ratio:'0',seconds:'0'},
+  hidden:false,
+  querySelector:() => null,
+  querySelectorAll:() => [],
+}));
+const progress = {textContent:''};
+const cases = {children:rows,appendChild:() => {}};
+globalThis.localStorage = {
+  getItem:key => stored.has(key) ? stored.get(key) : null,
+  setItem:(key,value) => stored.set(key,value),
+  removeItem:key => stored.delete(key),
+};
+let exportedBlob = null;
+let downloadedName = null;
+globalThis.Blob = class {constructor(parts,options){this.parts=parts;this.options=options;}};
+globalThis.URL = {createObjectURL:blob => {exportedBlob=blob;return 'blob:test';},revokeObjectURL:() => {}};
+globalThis.document = {
+  querySelectorAll:selector => selector === '.case' ? rows : [],
+  getElementById:id => id === 'progress' ? progress : id === 'filter' ? {value:'all'} : cases,
+  createElement:() => ({href:'',download:'',click(){downloadedName=this.download;}}),
+};
+globalThis.alert = message => {throw new Error(`unexpected alert: ${message}`);};
+globalThis.confirm = () => true;
+"""
+    assertions = """
+exportSelection();
+if (!exportedBlob) throw new Error('selection export did not create a Blob');
+const payload = JSON.parse(exportedBlob.parts.join(''));
+if (downloadedName !== 'background_audio_pilot_selection.json') throw new Error('wrong download name');
+if (payload.selection_count !== 1) throw new Error('wrong selection count');
+if (JSON.stringify(payload.selected_clip_ids) !== JSON.stringify(['clip-000'])) throw new Error('wrong selected clips');
+if (payload.reviews[0].target_clip_uid !== 'clip-000' || payload.reviews[0].label !== 'background-rich') throw new Error('review order changed');
+if (!exportedBlob.parts.join('').endsWith('\\n')) throw new Error('JSON export lacks final newline');
+"""
+    execution_path = tmp_path / "execute-background-audio-scout.js"
+    execution_path.write_text(
+        browser_fixture + "\n" + script + "\n" + assertions,
+        encoding="utf-8",
+    )
+    execution = subprocess.run(
+        [node, str(execution_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert execution.returncode == 0, execution.stderr
 
 
 def test_final_selection_accepts_dynamic_nonempty_manual_background_rich_clips() -> (
