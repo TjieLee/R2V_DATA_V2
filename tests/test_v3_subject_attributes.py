@@ -1045,6 +1045,41 @@ def test_subject_attribute_sam3_helper_never_propagates(tmp_path: Path) -> None:
     assert predictor.stream_calls == 0
 
 
+def test_persistent_worker_adapter_sends_exact_frame_provenance(tmp_path: Path) -> None:
+    frames = _frames(tmp_path / "run")
+    calls: list[dict[str, object]] = []
+
+    class _ProbeClient:
+        def attribute_probe(self, **kwargs):
+            calls.append(kwargs)
+            return (np.ones((2, 2), dtype=bool),)
+
+    storage = SimpleNamespace(
+        root=tmp_path / "run",
+        read_frames=lambda _clip_uid: frames,
+        clip_dir=lambda clip_uid: tmp_path / "run" / "clips" / clip_uid,
+    )
+    adapter = subject_attributes.PersistentWorkerAttributeFrameSegmenter(
+        storage,
+        _ProbeClient(),
+    )
+    masks = adapter.segment_frame(
+        frame_path=tmp_path / "run" / "clips" / "clip-1" / "frames" / "01.jpg",
+        frame_slot=1,
+        grounding_prompt="the red jacket worn by person 1",
+    )
+
+    assert len(masks) == 1
+    assert calls == [
+        {
+            "clip_uid": "clip-1",
+            "frame_slot": 1,
+            "source_frame_index": 10,
+            "grounding_prompt": "the red jacket worn by person 1",
+        }
+    ]
+
+
 def test_only_owner_candidate_frames_are_probed(tmp_path: Path) -> None:
     _frames(tmp_path / "run")
     candidates = [
@@ -1297,6 +1332,158 @@ def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
     ) is None
 
 
+def test_clip_primitive_uses_cached_owner_without_touching_visual_clip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clip = _clip()
+    run_root = tmp_path / "run"
+    clip_path = run_root / "clips" / clip.clip_uid / "clip.json"
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_text(clip.model_dump_json(), encoding="utf-8")
+    visual_bytes = clip_path.read_bytes()
+    output_root = tmp_path / "attributes"
+    cached = OwnerEnrichmentArtifact(
+        sample_id=clip.clip_uid,
+        owner_entity_id="e1",
+        owner_is_human=True,
+        attribute_id_start=1,
+        owner_phrase="person 1",
+        owner_grounding_prompt="the person 1",
+        records=[_attribute_record("a1", "e1", "hair", accepted=False)],
+        metrics=OwnerEnrichmentMetrics(
+            discovery_calls=1,
+            discovered_by_type={"hair": 1},
+        ),
+    )
+    artifact_path = output_root / "owners" / clip.clip_uid / "e1.json"
+    artifact_path.parent.mkdir(parents=True)
+    write_json_atomic(artifact_path, cached.model_dump(mode="json"))
+    monkeypatch.setattr(
+        subject_attributes,
+        "build_entity_reference_candidates",
+        lambda *_args, **_kwargs: [
+            _candidate("candidate_1", slot=1, source_frame_index=10)
+        ],
+    )
+
+    class _Storage:
+        root = run_root
+
+        def read_clip(self, _clip_uid):
+            return clip
+
+        def read_frames(self, _clip_uid):
+            return SimpleNamespace()
+
+        def read_masks(self, _clip_uid):
+            return TrackedMasksArtifact(
+                clip_uid=clip.clip_uid,
+                height=100,
+                width=100,
+                entities={},
+            )
+
+        def clip_path(self, _clip_uid):
+            return clip_path
+
+    class _ForbiddenModels:
+        calls = 0
+
+        def discover(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cached owner must skip Qwen")
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cached owner must skip Qwen")
+
+        def segment_frame(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cached owner must skip SAM3")
+
+    forbidden = _ForbiddenModels()
+    result = subject_attributes.process_subject_attribute_clip(
+        SimpleNamespace(pair=SimpleNamespace(crop_padding_ratio=0.08)),
+        storage=_Storage(),
+        output_root=output_root,
+        clip=clip,
+        discovery_client=forbidden,
+        review_client=forbidden,
+        segmentation_backend=forbidden,
+    )
+
+    assert result.totals.skipped_existing_owners == 1
+    assert forbidden.calls == 0
+    assert clip_path.read_bytes() == visual_bytes
+    assert (output_root / "samples" / f"{clip.clip_uid}.json").is_file()
+
+
+def test_sidecar_reconciliation_is_deterministic_after_out_of_order_completion(
+    tmp_path: Path,
+) -> None:
+    clips = [
+        _clip().model_copy(update={"clip_uid": "clip-a"}),
+        _clip().model_copy(update={"clip_uid": "clip-b"}),
+    ]
+    output_root = tmp_path / "attributes"
+    artifacts = {
+        "clip-a": OwnerEnrichmentArtifact(
+            sample_id="clip-a",
+            owner_entity_id="e1",
+            owner_is_human=True,
+            attribute_id_start=1,
+            owner_phrase="person 1",
+            owner_grounding_prompt="the person 1",
+            records=[_attribute_record("a1", "e1", "hair", accepted=False)],
+            metrics=OwnerEnrichmentMetrics(discovery_calls=1),
+        ),
+        "clip-b": OwnerEnrichmentArtifact(
+            sample_id="clip-b",
+            owner_entity_id="e1",
+            owner_is_human=True,
+            attribute_id_start=1,
+            owner_phrase="person 1",
+            owner_grounding_prompt="the person 1",
+            records=[_attribute_record("a1", "e1", "face", accepted=False)],
+            metrics=OwnerEnrichmentMetrics(discovery_calls=1),
+        ),
+    }
+    for clip_uid in ("clip-b", "clip-a"):
+        path = output_root / "owners" / clip_uid / "e1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, artifacts[clip_uid].model_dump(mode="json"))
+
+    storage = SimpleNamespace(
+        root=tmp_path / "run",
+        iter_clips=lambda: iter(clips),
+        read_run=lambda: SimpleNamespace(git_commit="test-commit"),
+    )
+    subject_attributes.reconcile_subject_attribute_outputs(
+        storage=storage,
+        output_root=output_root,
+        owner_limit=None,
+        invocation_wall_time_seconds=0.0,
+    )
+    first_attributes = (output_root / "attributes.jsonl").read_bytes()
+    first_samples = (output_root / "enriched_samples.jsonl").read_bytes()
+    attribute_types = [
+        json.loads(line)["attribute_type"]
+        for line in first_attributes.decode("utf-8").splitlines()
+    ]
+
+    subject_attributes.reconcile_subject_attribute_outputs(
+        storage=storage,
+        output_root=output_root,
+        owner_limit=None,
+        invocation_wall_time_seconds=0.0,
+    )
+
+    assert attribute_types == ["hair", "face"]
+    assert (output_root / "attributes.jsonl").read_bytes() == first_attributes
+    assert (output_root / "enriched_samples.jsonl").read_bytes() == first_samples
+
+
 def _source_run_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1332,6 +1519,110 @@ def _source_run_config(
     )
     config.validate()
     return config
+
+
+def test_standalone_enrichment_reuses_clip_primitive_and_owner_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _source_run_config(tmp_path, monkeypatch)
+    clips = [
+        _clip().model_copy(update={"clip_uid": "clip-a"}),
+        _clip().model_copy(update={"clip_uid": "clip-b"}),
+    ]
+    output_root = v3_config_module.ALLOWED_WRITABLE_ROOT / "attribute-enrichment"
+    for clip, attribute_type in zip(clips, ("hair", "face"), strict=True):
+        artifact = OwnerEnrichmentArtifact(
+            sample_id=clip.clip_uid,
+            owner_entity_id="e1",
+            owner_is_human=True,
+            attribute_id_start=1,
+            owner_phrase="person 1",
+            owner_grounding_prompt="the person 1",
+            records=[
+                _attribute_record("a1", "e1", attribute_type, accepted=False)
+            ],
+            metrics=OwnerEnrichmentMetrics(discovery_calls=1),
+        )
+        path = output_root / "owners" / clip.clip_uid / "e1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, artifact.model_dump(mode="json"))
+    monkeypatch.setattr(
+        subject_attributes,
+        "build_entity_reference_candidates",
+        lambda *_args, **_kwargs: [
+            _candidate("candidate_1", slot=1, source_frame_index=10)
+        ],
+    )
+
+    class _Storage:
+        root = config.resolved_run_root
+
+        def iter_clips(self):
+            return iter(clips)
+
+        def read_clip(self, clip_uid):
+            return next(clip for clip in clips if clip.clip_uid == clip_uid)
+
+        def read_frames(self, _clip_uid):
+            return SimpleNamespace()
+
+        def read_masks(self, clip_uid):
+            return TrackedMasksArtifact(
+                clip_uid=clip_uid,
+                height=100,
+                width=100,
+                entities={},
+            )
+
+        def clip_path(self, clip_uid):
+            return self.root / "clips" / clip_uid / "clip.json"
+
+        def read_run(self):
+            return SimpleNamespace(
+                git_commit="visual-source",
+                config_hash=config.fingerprint(),
+                model_identifiers=config.model_identifiers(),
+                source_manifest_path=str(config.dataset_json.resolve()),
+            )
+
+    class _ForbiddenModels:
+        calls = 0
+
+        def discover(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cached owner must skip Qwen")
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cached owner must skip Qwen")
+
+        def segment_frame(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("cached owner must skip SAM3")
+
+    storage = _Storage()
+    forbidden = _ForbiddenModels()
+    monkeypatch.setattr(subject_attributes, "RunStorage", lambda _config: storage)
+
+    summary = subject_attributes.run_subject_attribute_enrichment(
+        config,
+        run_root=config.run_root,
+        output_root=output_root,
+        max_owners=1,
+        discovery_client=forbidden,
+        review_client=forbidden,
+        segmentation_backend=forbidden,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (output_root / "attributes.jsonl").read_text().splitlines()
+    ]
+    assert summary["eligible_human_owner_count"] == 1
+    assert summary["skipped_existing_owner_count"] == 1
+    assert [record["attribute_type"] for record in records] == ["hair"]
+    assert forbidden.calls == 0
 
 
 def test_wrong_source_config_fails_before_model_calls(

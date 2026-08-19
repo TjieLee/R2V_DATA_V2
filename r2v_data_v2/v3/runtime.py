@@ -16,7 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
+import numpy as np
+
 from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.mask_codec import decode_binary_mask
 from r2v_data_v2.v3.profiling import V3Profiler
 from r2v_data_v2.v3.schemas import ClipRecord
 from r2v_data_v2.v3.storage import RunStorage
@@ -406,27 +409,60 @@ class PersistentStageProcess:
             self.terminate()
             raise
 
+    def _exchange(self, payload: Mapping[str, object]) -> dict[str, object]:
+        request_id = uuid.uuid4().hex
+        self._write(
+            {
+                "schema_version": 1,
+                "request_id": request_id,
+                **dict(payload),
+            }
+        )
+        response = self._read()
+        if response.get("request_id") != request_id:
+            self.terminate()
+            raise RuntimeError("streaming stage worker response ID mismatch")
+        if response.get("status") != "ok":
+            raise RuntimeError(str(response.get("reason") or "worker failed"))
+        return response
+
     def request(self, clip_uid: str) -> dict[str, object]:
         with self._request_lock:
-            request_id = uuid.uuid4().hex
-            self._write(
+            response = self._exchange(
                 {
-                    "schema_version": 1,
                     "type": "run_clip",
-                    "request_id": request_id,
                     "clip_uid": clip_uid,
                 }
             )
-            response = self._read()
-            if response.get("request_id") != request_id:
-                self.terminate()
-                raise RuntimeError("streaming stage worker response ID mismatch")
-            if response.get("status") != "ok":
-                raise RuntimeError(str(response.get("reason") or "worker failed"))
             counts = response.get("counts")
             if not isinstance(counts, dict):
                 raise TypeError("streaming stage worker omitted stage counts")
             return counts
+
+    def attribute_probe(
+        self,
+        *,
+        clip_uid: str,
+        frame_slot: int,
+        source_frame_index: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        if self.config.stage != "segment":
+            raise RuntimeError("attribute probes require the persistent segment worker")
+        with self._request_lock:
+            response = self._exchange(
+                {
+                    "type": "attribute_probe",
+                    "clip_uid": clip_uid,
+                    "frame_slot": frame_slot,
+                    "source_frame_index": source_frame_index,
+                    "grounding_prompt": grounding_prompt,
+                }
+            )
+        masks = response.get("masks")
+        if not isinstance(masks, list):
+            raise TypeError("segment worker omitted attribute probe masks")
+        return tuple(decode_binary_mask(mask) for mask in masks)
 
     def close(self) -> None:
         process = self._process

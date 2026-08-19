@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -8,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import r2v_data_v2.v3.config as config_module
@@ -28,6 +30,7 @@ from r2v_data_v2.v3.profiling import (
     profiled_openai_call,
     qwen_concurrency_gate,
 )
+from r2v_data_v2.v3 import subject_attributes
 from r2v_data_v2.v3.runtime import (
     PersistentStageProcess,
     StageWorkerConfig,
@@ -36,6 +39,8 @@ from r2v_data_v2.v3.runtime import (
     streaming_model_stage_enabled,
 )
 from r2v_data_v2.v3.storage import _append_jsonl
+from r2v_data_v2.v3.subject_attributes import QwenSubjectAttributeClient
+from run_pipeline_v3 import STAGE_ORDER
 from tools.run_v3_streaming_stage_worker import _StageRuntime
 
 
@@ -82,6 +87,9 @@ def test_runtime_defaults_preserve_legacy_staged_mode(
     assert config.runtime.stage_workers.segment == 1
     assert config.runtime.stage_workers.remove == 1
     assert config.runtime.stage_workers.reference_edit == 1
+    assert config.runtime.stage_workers.subject_attributes == 2
+    assert STAGE_ORDER.index("instruct") < STAGE_ORDER.index("subject_attributes")
+    assert STAGE_ORDER.index("subject_attributes") < STAGE_ORDER.index("export")
 
 
 def test_disabled_streaming_model_stage_does_not_require_worker_startup(
@@ -105,6 +113,18 @@ def test_runtime_selection_enters_config_fingerprint(
     )
 
     assert config.fingerprint() != changed.fingerprint()
+
+
+def test_sidecar_worker_count_does_not_change_visual_run_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    workers = replace(config.runtime.stage_workers, subject_attributes=3)
+    changed = replace(config, runtime=replace(config.runtime, stage_workers=workers))
+
+    assert config.fingerprint() == changed.fingerprint()
+    assert config.model_identifiers() == changed.model_identifiers()
 
 
 def test_streaming_rejects_same_parent_cross_pair(
@@ -168,6 +188,7 @@ def test_runtime_yaml_loads_nested_worker_configuration(
                 "  cpu_workers: 6",
                 "  stage_workers:",
                 "    frames: 3",
+                "    subject_attributes: 3",
                 "  gpu_workers:",
                 "    segment: '5'",
                 "    remove: '4'",
@@ -182,6 +203,7 @@ def test_runtime_yaml_loads_nested_worker_configuration(
     assert loaded.runtime.mode == "streaming_v1"
     assert loaded.runtime.cpu_workers == 6
     assert loaded.runtime.stage_workers.frames == 3
+    assert loaded.runtime.stage_workers.subject_attributes == 3
     assert loaded.runtime.gpu_workers == RuntimeGpuWorkersConfig(
         segment="5", remove="4", reference_edit="6"
     )
@@ -241,6 +263,40 @@ def test_dag_overlaps_different_clips_but_never_same_clip_writers() -> None:
     assert result.stage_counts["first"]["processed"] == 2
 
 
+def test_subject_attributes_stage_overlaps_upstream_work_for_other_clips() -> None:
+    slow_instruct_started = threading.Event()
+    attribute_started = threading.Event()
+    ordering: dict[str, list[str]] = {"a": [], "b": []}
+
+    def instruct(clip_uid: str) -> dict[str, int]:
+        ordering[clip_uid].append("instruct")
+        if clip_uid == "b":
+            slow_instruct_started.set()
+            assert attribute_started.wait(2)
+        return {"processed": 1}
+
+    def attributes(clip_uid: str) -> dict[str, int]:
+        ordering[clip_uid].append("subject_attributes")
+        if clip_uid == "a":
+            assert slow_instruct_started.wait(2)
+            attribute_started.set()
+        return {"processed": 1}
+
+    result = StreamingDAGScheduler(
+        [
+            StreamingStage("instruct", 2, instruct),
+            StreamingStage("subject_attributes", 2, attributes),
+        ],
+        cpu_workers=4,
+    ).run(["b", "a"])
+
+    assert result.failed_tasks == []
+    assert ordering == {
+        "a": ["instruct", "subject_attributes"],
+        "b": ["instruct", "subject_attributes"],
+    }
+
+
 def test_global_qwen_budget_is_shared_by_concurrent_stage_tasks(
     tmp_path: Path,
 ) -> None:
@@ -281,6 +337,56 @@ def test_global_qwen_budget_is_shared_by_concurrent_stage_tasks(
         ).run([f"clip-{index}" for index in range(6)])
 
     assert maximum == 2
+
+
+def test_subject_attribute_qwen_calls_use_existing_global_gate(tmp_path: Path) -> None:
+    current = 0
+    maximum = 0
+    lock = threading.Lock()
+
+    def request(**_kwargs: object) -> object:
+        nonlocal current, maximum
+        with lock:
+            current += 1
+            maximum = max(maximum, current)
+        try:
+            time.sleep(0.02)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+            )
+        finally:
+            with lock:
+                current -= 1
+
+    openai_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=request),
+        )
+    )
+    client = QwenSubjectAttributeClient(
+        QwenServiceConfig(model="fake"),
+        client=openai_client,
+    )
+
+    def handler(_: str) -> dict[str, int]:
+        client._request(
+            component="qwen_subject_attribute_discovery",
+            system_prompt="test",
+            content=[{"type": "text", "text": "test"}],
+        )
+        return {"processed": 1}
+
+    gate = QwenConcurrencyGate(2, lock_directory=tmp_path / "qwen")
+    with qwen_concurrency_gate(gate):
+        StreamingDAGScheduler(
+            [StreamingStage("subject_attributes", 6, handler)],
+            cpu_workers=6,
+        ).run([f"clip-{index}" for index in range(6)])
+
+    assert maximum == 2
+    source = inspect.getsource(subject_attributes)
+    assert "ThreadPoolExecutor" not in source
+    assert "Semaphore(" not in source
 
 
 def test_worker_exception_isolated_and_resume_can_skip_durable_work() -> None:
@@ -330,6 +436,37 @@ def test_worker_exception_isolated_and_resume_can_skip_durable_work() -> None:
     assert ("b", "final") in durable
 
 
+def test_subject_attribute_failure_is_clip_local() -> None:
+    completed: list[str] = []
+
+    def attributes(clip_uid: str) -> dict[str, int]:
+        if clip_uid == "b":
+            raise RuntimeError("attribute failure")
+        return {"processed": 1}
+
+    def downstream(clip_uid: str) -> dict[str, int]:
+        completed.append(clip_uid)
+        return {"processed": 1}
+
+    result = StreamingDAGScheduler(
+        [
+            StreamingStage("subject_attributes", 2, attributes),
+            StreamingStage("downstream", 2, downstream),
+        ],
+        cpu_workers=4,
+    ).run(["a", "b", "c"])
+
+    assert sorted(completed) == ["a", "c"]
+    assert result.failed_tasks == [
+        {
+            "clip_uid": "b",
+            "stage": "subject_attributes",
+            "error_type": "RuntimeError",
+            "reason": "attribute failure",
+        }
+    ]
+
+
 def test_profiler_shared_runtime_writes_are_valid_jsonl(tmp_path: Path) -> None:
     profiler = V3Profiler(tmp_path / "run", git_commit="abc")
 
@@ -375,7 +512,11 @@ for line in sys.stdin:
     if request['type'] == 'shutdown':
         print(json.dumps({'schema_version': 1, 'type': 'shutdown', 'request_id': request['request_id'], 'status': 'ok'}), flush=True)
         break
-    print(json.dumps({'schema_version': 1, 'type': 'response', 'request_id': request['request_id'], 'status': 'ok', 'counts': {'processed': 1}}), flush=True)
+    if request['type'] == 'attribute_probe':
+        response = {'schema_version': 1, 'type': 'response', 'request_id': request['request_id'], 'status': 'ok', 'masks': [{'size': [2, 2], 'counts': [0, 1, 3]}]}
+    else:
+        response = {'schema_version': 1, 'type': 'response', 'request_id': request['request_id'], 'status': 'ok', 'counts': {'processed': 1}}
+    print(json.dumps(response), flush=True)
 """,
         encoding="utf-8",
     )
@@ -396,11 +537,70 @@ for line in sys.stdin:
 
     worker.start()
     first = worker.request("clip-a")
+    masks = worker.attribute_probe(
+        clip_uid="clip-a",
+        frame_slot=1,
+        source_frame_index=10,
+        grounding_prompt="the red jacket",
+    )
     second = worker.request("clip-b")
     worker.close()
 
     assert first == second == {"processed": 1}
+    assert len(masks) == 1
+    assert np.array_equal(masks[0], np.array([[True, False], [False, False]]))
     assert worker.starts == 1
+
+
+def test_main_segment_and_attribute_probe_share_one_request_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+    worker = PersistentStageProcess(
+        StageWorkerConfig(
+            stage="segment",
+            config_path=config_path,
+            cuda_visible_devices="5",
+            overwrite=False,
+            timeout_seconds=5,
+            profile=False,
+            stderr_log_path=tmp_path / "worker.stderr.log",
+        )
+    )
+    active = 0
+    maximum = 0
+    state_lock = threading.Lock()
+
+    def fake_exchange(payload: dict[str, object]) -> dict[str, object]:
+        nonlocal active, maximum
+        with state_lock:
+            active += 1
+            maximum = max(maximum, active)
+        try:
+            time.sleep(0.03)
+            if payload["type"] == "attribute_probe":
+                return {"status": "ok", "masks": []}
+            return {"status": "ok", "counts": {"processed": 1}}
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(worker, "_exchange", fake_exchange)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        main_request = executor.submit(worker.request, "clip-a")
+        probe_request = executor.submit(
+            worker.attribute_probe,
+            clip_uid="clip-b",
+            frame_slot=1,
+            source_frame_index=10,
+            grounding_prompt="the red jacket",
+        )
+        assert main_request.result() == {"processed": 1}
+        assert probe_request.result() == ()
+
+    assert maximum == 1
 
 
 def test_persistent_segment_worker_reports_recall_counter_deltas_per_clip() -> None:

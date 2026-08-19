@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from r2v_data_v2.v3.config import V3Config, load_config
+from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.profiling import (
     QwenConcurrencyGate,
     V3Profiler,
@@ -57,6 +58,7 @@ class _StageRuntime:
         self._shared_lock = threading.Lock()
         self._closers: list[Any] = []
         self._segment_backend: Any | None = None
+        self._attribute_segmenter: Any | None = None
         self._first_reference_edit_request = True
         self._handler = self._initialize()
 
@@ -66,9 +68,16 @@ class _StageRuntime:
                 build_sam3_segment_backend,
                 segment_clips,
             )
+            from r2v_data_v2.v3.subject_attributes import (
+                Sam3AttributeFrameSegmenter,
+            )
 
             backend = build_sam3_segment_backend(self.config)
             self._segment_backend = backend
+            self._attribute_segmenter = Sam3AttributeFrameSegmenter(
+                self.config.sam3,
+                backend=backend,
+            )
             self._closers.append(backend)
             return lambda scoped: segment_clips(
                 self.config,
@@ -195,6 +204,28 @@ class _StageRuntime:
             self._first_reference_edit_request = False
         return counts
 
+    def attribute_probe(
+        self,
+        *,
+        clip_uid: str,
+        frame_slot: int,
+        source_frame_index: int,
+        grounding_prompt: str,
+    ) -> list[dict[str, object]]:
+        if self.stage != "segment" or self._attribute_segmenter is None:
+            raise RuntimeError("attribute probes require the segment worker")
+        frames = self.storage.read_frames(clip_uid)
+        frame = next((item for item in frames.frames if item.slot == frame_slot), None)
+        if frame is None or frame.source_frame_index != source_frame_index:
+            raise ValueError("attribute probe frame provenance does not match")
+        frame_path = self.storage.clip_dir(clip_uid) / frame.image_path
+        masks = self._attribute_segmenter.segment_frame(
+            frame_path=frame_path,
+            frame_slot=frame_slot,
+            grounding_prompt=grounding_prompt,
+        )
+        return [encode_binary_mask(mask).model_dump(mode="json") for mask in masks]
+
     def close(self) -> None:
         first_error: BaseException | None = None
         for resource in self._closers:
@@ -262,19 +293,61 @@ def serve(args: argparse.Namespace) -> int:
                             }
                         )
                         return 0
-                    if payload.get("type") != "run_clip":
+                    request_type = payload.get("type")
+                    if request_type not in {"run_clip", "attribute_probe"}:
                         raise ValueError("unsupported worker request type")
                     clip_uid = payload.get("clip_uid")
                     if not isinstance(clip_uid, str) or not clip_uid:
                         raise ValueError("worker clip_uid must be non-empty")
-                    counts = runtime.run_clip(clip_uid)
-                    response = {
-                        "schema_version": 1,
-                        "type": "response",
-                        "request_id": request_id,
-                        "status": "ok",
-                        "counts": counts,
-                    }
+                    if request_type == "run_clip":
+                        counts = runtime.run_clip(clip_uid)
+                        response = {
+                            "schema_version": 1,
+                            "type": "response",
+                            "request_id": request_id,
+                            "status": "ok",
+                            "counts": counts,
+                        }
+                    else:
+                        frame_slot = payload.get("frame_slot")
+                        source_frame_index = payload.get("source_frame_index")
+                        grounding_prompt = payload.get("grounding_prompt")
+                        if (
+                            isinstance(frame_slot, bool)
+                            or not isinstance(frame_slot, int)
+                            or frame_slot < 0
+                        ):
+                            raise ValueError(
+                                "attribute probe frame_slot must be non-negative"
+                            )
+                        if (
+                            isinstance(source_frame_index, bool)
+                            or not isinstance(source_frame_index, int)
+                            or source_frame_index < 0
+                        ):
+                            raise ValueError(
+                                "attribute probe source_frame_index must be non-negative"
+                            )
+                        if (
+                            not isinstance(grounding_prompt, str)
+                            or not grounding_prompt.strip()
+                        ):
+                            raise ValueError(
+                                "attribute probe grounding_prompt must be non-empty"
+                            )
+                        masks = runtime.attribute_probe(
+                            clip_uid=clip_uid,
+                            frame_slot=frame_slot,
+                            source_frame_index=source_frame_index,
+                            grounding_prompt=grounding_prompt,
+                        )
+                        response = {
+                            "schema_version": 1,
+                            "type": "response",
+                            "request_id": request_id,
+                            "status": "ok",
+                            "masks": masks,
+                        }
                 except Exception as exc:  # noqa: BLE001 - process boundary response
                     response = {
                         "schema_version": 1,

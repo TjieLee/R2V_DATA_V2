@@ -211,6 +211,7 @@ class RuntimeStageWorkersConfig:
     reference_edit: int = 1
     reference_integrity: int = 2
     instruct: int = 2
+    subject_attributes: int = 2
 
 
 @dataclass(frozen=True)
@@ -859,6 +860,8 @@ class V3Config:
         return services
 
     def model_identifiers(self) -> dict[str, str | None]:
+        visual_stage_workers = asdict(self.runtime.stage_workers)
+        visual_stage_workers.pop("subject_attributes", None)
         return {
             **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
             "remove.backend": self.remove.backend,
@@ -898,7 +901,7 @@ class V3Config:
             "runtime.mode": self.runtime.mode,
             "runtime.qwen_max_inflight": str(self.runtime.qwen_max_inflight),
             "runtime.stage_workers": json.dumps(
-                asdict(self.runtime.stage_workers), sort_keys=True
+                visual_stage_workers, sort_keys=True
             ),
             "runtime.gpu_workers": json.dumps(
                 asdict(self.runtime.gpu_workers), sort_keys=True
@@ -907,6 +910,11 @@ class V3Config:
 
     def fingerprint(self) -> str:
         value = _json_compatible(asdict(self))
+        runtime = value.get("runtime")
+        if isinstance(runtime, dict):
+            stage_workers = runtime.get("stage_workers")
+            if isinstance(stage_workers, dict):
+                stage_workers.pop("subject_attributes", None)
         source = value.get("source")
         if isinstance(source, dict) and source.get("selection_manifest") is None:
             source.pop("selection_manifest", None)

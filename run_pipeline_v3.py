@@ -52,7 +52,16 @@ from r2v_data_v2.v3.runtime import (
 )
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.segment import segment_clips
-from r2v_data_v2.v3.storage import DatasetExporter, RunStorage
+from r2v_data_v2.v3.storage import DatasetExporter, RunStorage, evaluate_export_state
+from r2v_data_v2.v3.subject_attributes import (
+    AttributeFrameSegmentationBackend,
+    PersistentWorkerAttributeFrameSegmenter,
+    QwenSubjectAttributeClient,
+    SubjectAttributeDiscoveryClient,
+    SubjectAttributeReviewClient,
+    process_subject_attribute_clip,
+    reconcile_subject_attribute_outputs,
+)
 
 STAGE_ORDER = (
     "manifest",
@@ -66,6 +75,7 @@ STAGE_ORDER = (
     "reference_edit",
     "reference_integrity",
     "instruct",
+    "subject_attributes",
     "export",
 )
 _IMPLEMENTED_STAGES = frozenset(
@@ -80,6 +90,7 @@ _IMPLEMENTED_STAGES = frozenset(
         "reference_edit",
         "reference_integrity",
         "instruct",
+        "subject_attributes",
         "remove",
         "export",
     }
@@ -126,6 +137,9 @@ def _streaming_stage_handler(
     reference_edit_judge: BooguReferenceEditJudge | None,
     reference_edit_sam_reviewer: BooguSamReviewer | None,
     reference_integrity_judge: ReferenceIntegrityJudge | None,
+    subject_attribute_discovery_client: SubjectAttributeDiscoveryClient | None,
+    subject_attribute_review_client: SubjectAttributeReviewClient | None,
+    attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
 ) -> object:
     if process is not None:
         return process.request
@@ -206,6 +220,32 @@ def _streaming_stage_handler(
                 overwrite=overwrite,
                 judge=reference_integrity_judge,
             )
+        elif stage == "subject_attributes":
+            if (
+                subject_attribute_discovery_client is None
+                or subject_attribute_review_client is None
+                or attribute_segmentation_backend is None
+            ):
+                raise RuntimeError(
+                    "subject attribute streaming clients are unavailable"
+                )
+            stored_clip = storage.read_clip(clip_uid)
+            visual_export = evaluate_export_state(
+                stored_clip,
+                require_reference_edit=config.reference_edit.enabled,
+                require_reference_integrity=config.reference_integrity.enabled,
+            )
+            accepted_clip = stored_clip.model_copy(update={"export": visual_export})
+            return process_subject_attribute_clip(
+                config,
+                storage=storage,
+                output_root=storage.root / "subject_attributes",
+                clip=accepted_clip,
+                discovery_client=subject_attribute_discovery_client,
+                review_client=subject_attribute_review_client,
+                segmentation_backend=attribute_segmentation_backend,
+                overwrite=overwrite,
+            ).to_counts()
         else:
             stats = instruct_clips(
                 config,
@@ -242,6 +282,9 @@ def _run_streaming_pipeline(
     reference_edit_judge: BooguReferenceEditJudge | None,
     reference_edit_sam_reviewer: BooguSamReviewer | None,
     reference_integrity_judge: ReferenceIntegrityJudge | None,
+    subject_attribute_discovery_client: SubjectAttributeDiscoveryClient | None,
+    subject_attribute_review_client: SubjectAttributeReviewClient | None,
+    attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
     profile: bool,
 ) -> dict[str, object]:
     if "manifest" in ordered_stages:
@@ -267,7 +310,17 @@ def _run_streaming_pipeline(
                 closer = getattr(reference_edit_backend, "close", None)
                 if callable(closer):
                     stack.callback(closer)
-        for stage in clip_stages:
+        worker_stages = [
+            stage for stage in clip_stages if stage in _STREAMING_GPU_STAGES
+        ]
+        if (
+            "subject_attributes" in clip_stages
+            and attribute_segmentation_backend is None
+            and segmentation_backend is None
+            and "segment" not in worker_stages
+        ):
+            worker_stages.append("segment")
+        for stage in worker_stages:
             injected = {
                 "segment": segmentation_backend,
                 "remove": background_removal_backend,
@@ -291,6 +344,38 @@ def _run_streaming_pipeline(
             worker.start()
             processes[stage] = worker
             stack.callback(worker.close)
+        owned_attribute_qwen: QwenSubjectAttributeClient | None = None
+        if "subject_attributes" in clip_stages:
+            if (
+                subject_attribute_discovery_client is None
+                or subject_attribute_review_client is None
+            ):
+                service = config.qwen.candidate_judge
+                if service is None:
+                    raise ValueError(
+                        "qwen.candidate_judge is required for subject attributes"
+                    )
+                owned_attribute_qwen = QwenSubjectAttributeClient(service)
+                stack.callback(owned_attribute_qwen.close)
+                subject_attribute_discovery_client = (
+                    subject_attribute_discovery_client or owned_attribute_qwen
+                )
+                subject_attribute_review_client = (
+                    subject_attribute_review_client or owned_attribute_qwen
+                )
+            if attribute_segmentation_backend is None:
+                segment_process = processes.get("segment")
+                if segment_process is None:
+                    raise ValueError(
+                        "subject attributes require the persistent segment worker "
+                        "or an injected attribute segmentation backend"
+                    )
+                attribute_segmentation_backend = (
+                    PersistentWorkerAttributeFrameSegmenter(
+                        storage,
+                        segment_process,
+                    )
+                )
         stages: list[StreamingStage] = []
         for stage in clip_stages:
             workers = getattr(config.runtime.stage_workers, stage)
@@ -321,6 +406,15 @@ def _run_streaming_pipeline(
                         reference_edit_judge=reference_edit_judge,
                         reference_edit_sam_reviewer=reference_edit_sam_reviewer,
                         reference_integrity_judge=reference_integrity_judge,
+                        subject_attribute_discovery_client=(
+                            subject_attribute_discovery_client
+                        ),
+                        subject_attribute_review_client=(
+                            subject_attribute_review_client
+                        ),
+                        attribute_segmentation_backend=(
+                            attribute_segmentation_backend
+                        ),
                     ),
                 )
             )
@@ -347,6 +441,19 @@ def _run_streaming_pipeline(
                     details={"exception_type": failure["error_type"]},
                 )
             results["runtime"] = runtime_result.to_dict()
+            if "subject_attributes" in clip_stages:
+                subject_counts = runtime_result.stage_counts["subject_attributes"]
+                results["subject_attributes_summary"] = (
+                    reconcile_subject_attribute_outputs(
+                        storage=storage,
+                        output_root=storage.root / "subject_attributes",
+                        owner_limit=None,
+                        invocation_wall_time_seconds=0.0,
+                        skipped_existing_owners=int(
+                            subject_counts.get("skipped_existing_owners", 0)
+                        ),
+                    )
+                )
     if "export" in ordered_stages:
         with profile_stage("export") as stage_profile:
             dataset = DatasetExporter(config, storage).export(overwrite=overwrite)
@@ -377,6 +484,9 @@ def run_pipeline_v3(
     reference_edit_judge: BooguReferenceEditJudge | None = None,
     reference_edit_sam_reviewer: BooguSamReviewer | None = None,
     reference_integrity_judge: ReferenceIntegrityJudge | None = None,
+    subject_attribute_discovery_client: SubjectAttributeDiscoveryClient | None = None,
+    subject_attribute_review_client: SubjectAttributeReviewClient | None = None,
+    attribute_segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     profile: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
@@ -387,12 +497,17 @@ def run_pipeline_v3(
         raise NotImplementedError(
             "this V3 implementation currently provides manifest, annotate, "
             "frames, segment, rank, background, remove, pair, reference_edit, "
-            "instruct, and export only; "
+            "instruct, subject_attributes, and export only; "
             f"unimplemented stages requested: {unavailable}"
         )
     requested = set(stages)
     ordered_stages = tuple(stage for stage in STAGE_ORDER if stage in requested)
     config = load_config(config_path)
+    if (
+        "subject_attributes" in ordered_stages
+        and config.runtime.mode != "streaming_v1"
+    ):
+        raise ValueError("subject_attributes is available only in streaming_v1")
     storage = RunStorage(config)
     run = storage.initialize(git_commit=git_commit or _git_commit())
     profiler = V3Profiler(storage.root, git_commit=run.git_commit) if profile else None
@@ -441,6 +556,15 @@ def run_pipeline_v3(
                         reference_edit_judge=reference_edit_judge,
                         reference_edit_sam_reviewer=reference_edit_sam_reviewer,
                         reference_integrity_judge=reference_integrity_judge,
+                        subject_attribute_discovery_client=(
+                            subject_attribute_discovery_client
+                        ),
+                        subject_attribute_review_client=(
+                            subject_attribute_review_client
+                        ),
+                        attribute_segmentation_backend=(
+                            attribute_segmentation_backend
+                        ),
                         profile=profile,
                     )
             for stage in ordered_stages:
@@ -555,7 +679,7 @@ def main() -> None:
         help=(
             "comma-separated V3 stages; manifest, annotate, frames, segment, "
             "rank, background, remove, pair, reference_edit, instruct, and "
-            "reference_integrity, "
+            "reference_integrity, subject_attributes, "
             "export are currently implemented"
         ),
     )

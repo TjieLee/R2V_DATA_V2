@@ -394,6 +394,34 @@ class EnrichmentTotals:
         self.failures += metrics.failures
 
 
+@dataclass(frozen=True)
+class ClipEnrichmentResult:
+    clip_uid: str
+    totals: EnrichmentTotals
+    owner_limit_reached: bool
+    enriched_sample: EnrichedSample | None
+
+    def to_counts(self) -> dict[str, int | float]:
+        return {
+            "eligible_human_owners": self.totals.eligible_human_owners,
+            "screened_nonhuman_subjects": self.totals.screened_nonhuman_subjects,
+            "skipped_existing_owners": self.totals.skipped_existing_owners,
+            "discovery_calls": self.totals.discovery_calls,
+            "review_calls": self.totals.review_calls,
+            "sam3_attempts": self.totals.sam3_attempts,
+            "deterministic_ownership_rejects": (
+                self.totals.deterministic_ownership_rejects
+            ),
+            "recognizability_rejects": self.totals.recognizability_rejects,
+            "accepted_attributes": self.totals.accepted_attributes,
+            "failures": self.totals.failures,
+            "qwen_model_call_time_seconds": (
+                self.totals.qwen_model_call_time_seconds
+            ),
+            "sam3_model_call_time_seconds": self.totals.sam3_model_call_time_seconds,
+        }
+
+
 class SubjectAttributeDiscoveryClient(Protocol):
     def discover(
         self,
@@ -419,6 +447,17 @@ class AttributeFrameSegmentationBackend(Protocol):
         *,
         frame_path: Path,
         frame_slot: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]: ...
+
+
+class AttributeProbeClient(Protocol):
+    def attribute_probe(
+        self,
+        *,
+        clip_uid: str,
+        frame_slot: int,
+        source_frame_index: int,
         grounding_prompt: str,
     ) -> tuple[np.ndarray, ...]: ...
 
@@ -461,6 +500,42 @@ class Sam3AttributeFrameSegmenter:
 
     def close(self) -> None:
         self._backend.close()
+
+
+class PersistentWorkerAttributeFrameSegmenter:
+    """Translate frame-local probes onto the existing persistent SAM3 worker."""
+
+    def __init__(self, storage: RunStorage, client: AttributeProbeClient) -> None:
+        self._storage = storage
+        self._client = client
+
+    def segment_frame(
+        self,
+        *,
+        frame_path: Path,
+        frame_slot: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        resolved = frame_path.expanduser().resolve(strict=False)
+        relative = resolved.relative_to(self._storage.root)
+        if len(relative.parts) != 4 or relative.parts[:1] != ("clips",):
+            raise ValueError("attribute frame must be a clip-scoped run artifact")
+        clip_uid = relative.parts[1]
+        frames = self._storage.read_frames(clip_uid)
+        frame = next((item for item in frames.frames if item.slot == frame_slot), None)
+        if frame is None:
+            raise ValueError("attribute frame slot is absent from sampled frames")
+        expected = (self._storage.clip_dir(clip_uid) / frame.image_path).resolve(
+            strict=False
+        )
+        if expected != resolved:
+            raise ValueError("attribute frame path does not match sampled provenance")
+        return self._client.attribute_probe(
+            clip_uid=clip_uid,
+            frame_slot=frame_slot,
+            source_frame_index=frame.source_frame_index,
+            grounding_prompt=grounding_prompt,
+        )
 
 
 DISCOVERY_SYSTEM_PROMPT = """Inspect one explicitly identified V3 subject in
@@ -1270,6 +1345,10 @@ def _owner_artifact_path(
     return output_root / "owners" / sample_id / f"{owner_entity_id}.json"
 
 
+def _clip_sample_path(output_root: Path, *, sample_id: str) -> Path:
+    return output_root / "samples" / f"{sample_id}.json"
+
+
 def _process_owner(
     *,
     config: V3Config,
@@ -1786,10 +1865,341 @@ def _clear_enrichment_artifacts(output_root: Path) -> None:
     for directory, pattern in (
         (output_root / "references", "*.png"),
         (output_root / "owners", "*.json"),
+        (output_root / "samples", "*.json"),
     ):
         if directory.is_dir():
             for path in directory.rglob(pattern):
                 path.unlink()
+
+
+def _clear_clip_enrichment_artifacts(output_root: Path, clip_uid: str) -> None:
+    owner_directory = output_root / "owners" / clip_uid
+    if owner_directory.is_dir():
+        for path in owner_directory.glob("*.json"):
+            path.unlink()
+    reference_directory = output_root / "references" / clip_uid
+    if reference_directory.is_dir():
+        for path in reference_directory.glob("*.png"):
+            path.unlink()
+    _clip_sample_path(output_root, sample_id=clip_uid).unlink(missing_ok=True)
+
+
+def process_subject_attribute_clip(
+    config: V3Config,
+    *,
+    storage: RunStorage,
+    output_root: Path,
+    clip: ClipRecord,
+    discovery_client: SubjectAttributeDiscoveryClient,
+    review_client: SubjectAttributeReviewClient,
+    segmentation_backend: AttributeFrameSegmentationBackend,
+    max_owners: int | None = None,
+    overwrite: bool = False,
+) -> ClipEnrichmentResult:
+    if max_owners is not None and (
+        isinstance(max_owners, bool)
+        or not isinstance(max_owners, int)
+        or max_owners < 1
+    ):
+        raise ValueError("max_owners must be a positive integer")
+    if clip.clip_uid != storage.read_clip(clip.clip_uid).clip_uid:
+        raise ValueError("subject attribute clip does not belong to source storage")
+    output_root.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        _clear_clip_enrichment_artifacts(output_root, clip.clip_uid)
+
+    totals = EnrichmentTotals()
+    if (
+        not clip.export.accepted
+        or clip.annotation is None
+        or clip.annotation.status != "ready"
+        or clip.pairing is None
+        or clip.pairing.status != "ready"
+    ):
+        return ClipEnrichmentResult(
+            clip_uid=clip.clip_uid,
+            totals=totals,
+            owner_limit_reached=False,
+            enriched_sample=None,
+        )
+    try:
+        frames = storage.read_frames(clip.clip_uid)
+        masks = storage.read_masks(clip.clip_uid)
+    except (OSError, ValueError):
+        return ClipEnrichmentResult(
+            clip_uid=clip.clip_uid,
+            totals=totals,
+            owner_limit_reached=False,
+            enriched_sample=None,
+        )
+
+    sample_attribute_start = 1
+    clip_records: list[SubjectAttributeRecord] = []
+    processed_owner = False
+    owner_limit_reached = False
+    for owner in clip.annotation.entities:
+        if owner.reference_type != "subject":
+            continue
+        try:
+            candidates = build_entity_reference_candidates(
+                config,
+                storage,
+                clip_uid=clip.clip_uid,
+                entity=owner,
+                frames=frames,
+                masks=masks,
+            )[:MAX_ATTRIBUTES_PER_OWNER]
+        except (OSError, ValueError):
+            candidates = []
+        eligibility = evaluate_owner_eligibility(
+            clip,
+            entity_id=owner.entity_id,
+            has_usable_candidate_evidence=bool(candidates),
+        )
+        if not eligibility.eligible:
+            continue
+        if max_owners is not None and totals.eligible_human_owners >= max_owners:
+            owner_limit_reached = True
+            break
+        artifact_path = _owner_artifact_path(
+            output_root,
+            sample_id=clip.clip_uid,
+            owner_entity_id=owner.entity_id,
+        )
+        cached = None
+        if not overwrite:
+            cached = _load_cached_owner_artifact(
+                artifact_path,
+                output_root=output_root,
+                sample_id=clip.clip_uid,
+                owner_entity_id=owner.entity_id,
+                attribute_id_start=sample_attribute_start,
+            )
+        if cached is not None:
+            artifact = cached
+            totals.skipped_existing_owners += 1
+        else:
+            try:
+                artifact = _process_owner(
+                    config=config,
+                    storage=storage,
+                    output_root=output_root,
+                    clip=clip,
+                    owner=owner,
+                    owner_candidates=candidates,
+                    masks=masks,
+                    attribute_id_start=sample_attribute_start,
+                    discovery_client=discovery_client,
+                    review_client=review_client,
+                    segmentation_backend=segmentation_backend,
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one owner
+                totals.failures += 1
+                totals.failure_reasons[
+                    f"owner_processing_failed:{type(exc).__name__}"
+                ] += 1
+                continue
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(artifact_path, artifact.model_dump(mode="json"))
+        if artifact.failure_reason:
+            totals.failure_reasons[artifact.failure_reason.split(":", 1)[0]] += 1
+        totals.add_owner_metrics(artifact.metrics)
+        if artifact.owner_is_human is True:
+            totals.eligible_human_owners += 1
+            processed_owner = True
+        elif artifact.owner_is_human is False:
+            totals.screened_nonhuman_subjects += 1
+        clip_records.extend(artifact.records)
+        sample_attribute_start += len(artifact.records)
+
+    enriched_sample = None
+    if processed_owner:
+        enriched_sample = _build_enriched_sample(
+            storage=storage,
+            clip=clip,
+            records=clip_records,
+        )
+        sample_path = _clip_sample_path(output_root, sample_id=clip.clip_uid)
+        sample_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(sample_path, enriched_sample.model_dump(mode="json"))
+    return ClipEnrichmentResult(
+        clip_uid=clip.clip_uid,
+        totals=totals,
+        owner_limit_reached=owner_limit_reached,
+        enriched_sample=enriched_sample,
+    )
+
+
+def _load_durable_owner_artifact(
+    path: Path,
+    *,
+    output_root: Path,
+    sample_id: str,
+    owner_entity_id: str,
+) -> OwnerEnrichmentArtifact | None:
+    if not path.is_file():
+        return None
+    try:
+        artifact = OwnerEnrichmentArtifact.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    return _load_cached_owner_artifact(
+        path,
+        output_root=output_root,
+        sample_id=sample_id,
+        owner_entity_id=owner_entity_id,
+        attribute_id_start=artifact.attribute_id_start,
+    )
+
+
+def reconcile_subject_attribute_outputs(
+    *,
+    storage: RunStorage,
+    output_root: Path,
+    owner_limit: int | None,
+    invocation_wall_time_seconds: float,
+    skipped_existing_owners: int = 0,
+    gpu_peak_memory_bytes_before: int | None = None,
+    gpu_peak_memory_bytes_after: int | None = None,
+) -> dict[str, object]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    totals = EnrichmentTotals(skipped_existing_owners=skipped_existing_owners)
+    all_records: list[SubjectAttributeRecord] = []
+    sample_records: list[EnrichedSample] = []
+    for clip in storage.iter_clips():
+        owner_limit_reached = False
+        if clip.annotation is not None:
+            for owner in clip.annotation.entities:
+                if owner.reference_type != "subject":
+                    continue
+                if (
+                    owner_limit is not None
+                    and totals.eligible_human_owners >= owner_limit
+                ):
+                    owner_limit_reached = True
+                    break
+                artifact = _load_durable_owner_artifact(
+                    _owner_artifact_path(
+                        output_root,
+                        sample_id=clip.clip_uid,
+                        owner_entity_id=owner.entity_id,
+                    ),
+                    output_root=output_root,
+                    sample_id=clip.clip_uid,
+                    owner_entity_id=owner.entity_id,
+                )
+                if artifact is None:
+                    continue
+                totals.add_owner_metrics(artifact.metrics)
+                if artifact.owner_is_human is True:
+                    totals.eligible_human_owners += 1
+                elif artifact.owner_is_human is False:
+                    totals.screened_nonhuman_subjects += 1
+                if artifact.failure_reason:
+                    totals.failure_reasons[
+                        artifact.failure_reason.split(":", 1)[0]
+                    ] += 1
+                all_records.extend(artifact.records)
+                if (
+                    owner_limit is not None
+                    and totals.eligible_human_owners >= owner_limit
+                ):
+                    owner_limit_reached = True
+                    break
+        sample_path = _clip_sample_path(output_root, sample_id=clip.clip_uid)
+        if sample_path.is_file():
+            try:
+                sample = EnrichedSample.model_validate_json(
+                    sample_path.read_text(encoding="utf-8")
+                )
+                if sample.sample_id == clip.clip_uid:
+                    sample_records.append(sample)
+            except (OSError, ValueError):
+                pass
+        if owner_limit_reached:
+            break
+
+    run = storage.read_run()
+    owner_count = totals.eligible_human_owners
+    qwen_calls = totals.discovery_calls + totals.review_calls
+    single_subject_example = next(
+        (
+            sample.sample_id
+            for sample in sample_records
+            if sample.accepted_attributes
+            and sum(reference.kind == "subject" for reference in sample.references) == 1
+        ),
+        None,
+    )
+    multi_subject_example = next(
+        (
+            sample.sample_id
+            for sample in sample_records
+            if sample.accepted_attributes
+            and sum(reference.kind == "subject" for reference in sample.references) >= 2
+        ),
+        None,
+    )
+    summary: dict[str, object] = {
+        "schema_version": ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION,
+        "source_run_root": str(storage.root),
+        "source_run_git_commit": run.git_commit,
+        "output_root": str(output_root),
+        "owner_limit": owner_limit,
+        "eligible_human_owner_count": owner_count,
+        "screened_nonhuman_subject_count": totals.screened_nonhuman_subjects,
+        "skipped_existing_owner_count": totals.skipped_existing_owners,
+        "qwen_discovery_calls": totals.discovery_calls,
+        "qwen_recognizability_calls": totals.review_calls,
+        "qwen_calls_total": qwen_calls,
+        "attributes_discovered_by_type": dict(
+            sorted(totals.discovered_by_type.items())
+        ),
+        "sam3_attempts": totals.sam3_attempts,
+        "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
+        "recognizability_rejects": totals.recognizability_rejects,
+        "accepted_attribute_references": totals.accepted_attributes,
+        "accepted_attributes_per_human_owner": (
+            totals.accepted_attributes / owner_count if owner_count else 0.0
+        ),
+        "average_extra_qwen_calls_per_human_owner": (
+            qwen_calls / owner_count if owner_count else 0.0
+        ),
+        "average_sam3_attempts_per_human_owner": (
+            totals.sam3_attempts / owner_count if owner_count else 0.0
+        ),
+        "same_frame_accepted": totals.same_frame_accepted,
+        "different_frame_accepted": totals.different_frame_accepted,
+        "invocation_wall_time_seconds": invocation_wall_time_seconds,
+        "qwen_model_call_time_seconds": totals.qwen_model_call_time_seconds,
+        "sam3_model_call_time_seconds": totals.sam3_model_call_time_seconds,
+        "model_call_time_seconds": (
+            totals.qwen_model_call_time_seconds
+            + totals.sam3_model_call_time_seconds
+        ),
+        "gpu_peak_memory_bytes_before": gpu_peak_memory_bytes_before,
+        "gpu_peak_memory_bytes_after": gpu_peak_memory_bytes_after,
+        "failures": totals.failures,
+        "failure_reasons": dict(sorted(totals.failure_reasons.items())),
+        "enriched_sample_count": len(sample_records),
+        "attribute_record_count": len(all_records),
+        "example_enriched_samples": {
+            "single_subject": single_subject_example,
+            "multi_subject": multi_subject_example,
+        },
+    }
+    _write_jsonl_atomic(
+        output_root / "attributes.jsonl",
+        [record.model_dump(mode="json") for record in all_records],
+    )
+    _write_jsonl_atomic(
+        output_root / "enriched_samples.jsonl",
+        [sample.model_dump(mode="json") for sample in sample_records],
+    )
+    write_json_atomic(output_root / "summary.json", summary)
+    return summary
 
 
 def _gpu_peak_bytes() -> int | None:
@@ -1856,209 +2266,52 @@ def run_subject_attribute_enrichment(
 
     started = time.perf_counter()
     gpu_before = _gpu_peak_bytes()
-    totals = EnrichmentTotals()
-    all_records: list[SubjectAttributeRecord] = []
-    sample_records: list[EnrichedSample] = []
-    reached_limit = False
+    processed_owners = 0
+    skipped_existing_owners = 0
     try:
         for clip in storage.iter_clips():
-            if reached_limit:
+            if processed_owners >= max_owners:
                 break
-            if (
-                not clip.export.accepted
-                or clip.annotation is None
-                or clip.annotation.status != "ready"
-                or clip.pairing is None
-                or clip.pairing.status != "ready"
-            ):
-                continue
-            try:
-                frames = storage.read_frames(clip.clip_uid)
-                masks = storage.read_masks(clip.clip_uid)
-            except (OSError, ValueError):
-                continue
-            sample_attribute_start = 1
-            clip_records: list[SubjectAttributeRecord] = []
-            processed_owner = False
-            for owner in clip.annotation.entities:
-                if owner.reference_type != "subject":
-                    continue
-                try:
-                    candidates = build_entity_reference_candidates(
-                        effective_config,
-                        storage,
-                        clip_uid=clip.clip_uid,
-                        entity=owner,
-                        frames=frames,
-                        masks=masks,
-                    )[:MAX_ATTRIBUTES_PER_OWNER]
-                except (OSError, ValueError):
-                    candidates = []
-                eligibility = evaluate_owner_eligibility(
-                    clip,
-                    entity_id=owner.entity_id,
-                    has_usable_candidate_evidence=bool(candidates),
-                )
-                if not eligibility.eligible:
-                    continue
-                if totals.eligible_human_owners >= max_owners:
-                    reached_limit = True
-                    break
-                artifact_path = _owner_artifact_path(
-                    output_root,
-                    sample_id=clip.clip_uid,
-                    owner_entity_id=owner.entity_id,
-                )
-                cached = None
-                if not overwrite:
-                    cached = _load_cached_owner_artifact(
-                        artifact_path,
-                        output_root=output_root,
-                        sample_id=clip.clip_uid,
-                        owner_entity_id=owner.entity_id,
-                        attribute_id_start=sample_attribute_start,
-                    )
-                if cached is not None:
-                    artifact = cached
-                    totals.skipped_existing_owners += 1
-                else:
-                    try:
-                        artifact = _process_owner(
-                            config=effective_config,
-                            storage=storage,
-                            output_root=output_root,
-                            clip=clip,
-                            owner=owner,
-                            owner_candidates=candidates,
-                            masks=masks,
-                            attribute_id_start=sample_attribute_start,
-                            discovery_client=discovery_client,
-                            review_client=review_client,
-                            segmentation_backend=segmentation_backend,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - isolate one owner
-                        totals.failures += 1
-                        totals.failure_reasons[
-                            f"owner_processing_failed:{type(exc).__name__}"
-                        ] += 1
-                        continue
-                    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                    write_json_atomic(
-                        artifact_path,
-                        artifact.model_dump(mode="json"),
-                    )
-                if artifact.failure_reason:
-                    totals.failure_reasons[artifact.failure_reason.split(":", 1)[0]] += 1
-                totals.add_owner_metrics(artifact.metrics)
-                if artifact.owner_is_human is True:
-                    totals.eligible_human_owners += 1
-                    processed_owner = True
-                elif artifact.owner_is_human is False:
-                    totals.screened_nonhuman_subjects += 1
-                clip_records.extend(artifact.records)
-                all_records.extend(artifact.records)
-                sample_attribute_start += len(artifact.records)
-            if processed_owner:
-                sample_records.append(
-                    _build_enriched_sample(
-                        storage=storage,
-                        clip=clip,
-                        records=clip_records,
-                    )
-                )
+            result = process_subject_attribute_clip(
+                effective_config,
+                storage=storage,
+                output_root=output_root,
+                clip=clip,
+                discovery_client=discovery_client,
+                review_client=review_client,
+                segmentation_backend=segmentation_backend,
+                max_owners=max_owners - processed_owners,
+                overwrite=False,
+            )
+            processed_owners += result.totals.eligible_human_owners
+            skipped_existing_owners += result.totals.skipped_existing_owners
     finally:
         if owned_segmenter is not None:
             owned_segmenter.close()
         if owned_qwen is not None:
             owned_qwen.close()
 
-    invocation_wall_time = time.perf_counter() - started
-    gpu_after = _gpu_peak_bytes()
-    owner_count = totals.eligible_human_owners
-    qwen_calls = totals.discovery_calls + totals.review_calls
-    single_subject_example = next(
-        (
-            sample.sample_id
-            for sample in sample_records
-            if sample.accepted_attributes
-            and sum(reference.kind == "subject" for reference in sample.references) == 1
-        ),
-        None,
+    return reconcile_subject_attribute_outputs(
+        storage=storage,
+        output_root=output_root,
+        owner_limit=max_owners,
+        invocation_wall_time_seconds=time.perf_counter() - started,
+        skipped_existing_owners=skipped_existing_owners,
+        gpu_peak_memory_bytes_before=gpu_before,
+        gpu_peak_memory_bytes_after=_gpu_peak_bytes(),
     )
-    multi_subject_example = next(
-        (
-            sample.sample_id
-            for sample in sample_records
-            if sample.accepted_attributes
-            and sum(reference.kind == "subject" for reference in sample.references) >= 2
-        ),
-        None,
-    )
-    summary: dict[str, object] = {
-        "schema_version": ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION,
-        "source_run_root": str(storage.root),
-        "source_run_git_commit": run.git_commit,
-        "output_root": str(output_root),
-        "owner_limit": max_owners,
-        "eligible_human_owner_count": owner_count,
-        "screened_nonhuman_subject_count": totals.screened_nonhuman_subjects,
-        "skipped_existing_owner_count": totals.skipped_existing_owners,
-        "qwen_discovery_calls": totals.discovery_calls,
-        "qwen_recognizability_calls": totals.review_calls,
-        "qwen_calls_total": qwen_calls,
-        "attributes_discovered_by_type": dict(sorted(totals.discovered_by_type.items())),
-        "sam3_attempts": totals.sam3_attempts,
-        "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
-        "recognizability_rejects": totals.recognizability_rejects,
-        "accepted_attribute_references": totals.accepted_attributes,
-        "accepted_attributes_per_human_owner": (
-            totals.accepted_attributes / owner_count if owner_count else 0.0
-        ),
-        "average_extra_qwen_calls_per_human_owner": (
-            qwen_calls / owner_count if owner_count else 0.0
-        ),
-        "average_sam3_attempts_per_human_owner": (
-            totals.sam3_attempts / owner_count if owner_count else 0.0
-        ),
-        "same_frame_accepted": totals.same_frame_accepted,
-        "different_frame_accepted": totals.different_frame_accepted,
-        "invocation_wall_time_seconds": invocation_wall_time,
-        "qwen_model_call_time_seconds": totals.qwen_model_call_time_seconds,
-        "sam3_model_call_time_seconds": totals.sam3_model_call_time_seconds,
-        "model_call_time_seconds": (
-            totals.qwen_model_call_time_seconds
-            + totals.sam3_model_call_time_seconds
-        ),
-        "gpu_peak_memory_bytes_before": gpu_before,
-        "gpu_peak_memory_bytes_after": gpu_after,
-        "failures": totals.failures,
-        "failure_reasons": dict(sorted(totals.failure_reasons.items())),
-        "enriched_sample_count": len(sample_records),
-        "attribute_record_count": len(all_records),
-        "example_enriched_samples": {
-            "single_subject": single_subject_example,
-            "multi_subject": multi_subject_example,
-        },
-    }
-    _write_jsonl_atomic(
-        output_root / "attributes.jsonl",
-        [record.model_dump(mode="json") for record in all_records],
-    )
-    _write_jsonl_atomic(
-        output_root / "enriched_samples.jsonl",
-        [sample.model_dump(mode="json") for sample in sample_records],
-    )
-    write_json_atomic(output_root / "summary.json", summary)
-    return summary
 
 
 __all__ = [
     "AttributeFrameSegmentationBackend",
+    "AttributeProbeClient",
+    "ClipEnrichmentResult",
     "DiscoveredSubjectAttribute",
     "EnrichedSample",
     "OwnerEligibility",
     "OwnershipGeometry",
     "PendingAttributeCandidate",
+    "PersistentWorkerAttributeFrameSegmenter",
     "QwenSubjectAttributeClient",
     "Sam3AttributeFrameSegmenter",
     "SubjectAttributeDiscovery",
@@ -2068,5 +2321,7 @@ __all__ = [
     "evaluate_owner_eligibility",
     "evaluate_ownership_geometry",
     "prefer_attribute_candidate_frames",
+    "process_subject_attribute_clip",
+    "reconcile_subject_attribute_outputs",
     "run_subject_attribute_enrichment",
 ]
