@@ -19,12 +19,14 @@ from r2v_data_v2.h3.asr_transcription import (
     WhisperASRConfig,
 )
 from r2v_data_v2.h3.asr_v2_transcription import (
-    ASRV2Inventory,
-    ASRV2Summary,
+    ASRV2InventoryRecord,
+    ASRV2SummaryRecord,
     asr_v2_output_root,
     asr_v2_stage_is_complete,
     build_asr_v2_backend_provenance,
     build_asr_v2_inventory,
+    load_asr_v2_inventory,
+    load_asr_v2_summary,
     regenerate_asr_v2_review,
     run_asr_v2_transcription,
 )
@@ -89,17 +91,13 @@ def _model_identity(arguments: argparse.Namespace) -> tuple[str, str | None]:
 def _reuse_existing(
     *,
     output_root: Path,
-    inventory: ASRV2Inventory,
+    inventory: ASRV2InventoryRecord,
     backend_config: WhisperASRConfig,
-) -> ASRV2Summary | None:
+) -> ASRV2SummaryRecord | None:
     if not asr_v2_stage_is_complete(output_root):
         return None
-    existing_inventory = ASRV2Inventory.model_validate_json(
-        (output_root / "inventory.json").read_text(encoding="utf-8")
-    )
-    summary = ASRV2Summary.model_validate_json(
-        (output_root / "summary.json").read_text(encoding="utf-8")
-    )
+    existing_inventory = load_asr_v2_inventory(output_root / "inventory.json")
+    summary = load_asr_v2_summary(output_root / "summary.json")
     if existing_inventory.inventory_fingerprint != inventory.inventory_fingerprint:
         raise ValueError(
             "existing ASR V2 output uses different inputs; pass --overwrite"
@@ -156,14 +154,64 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "parent_quota_applied": False,
         "donor_media_used": False,
         "cross_pair_jobs_created": 0,
-        "production_inference_blocked": inventory.production_inference_blocked,
+        "production_inference_enabled": (
+            inventory.mode == "production"
+            and getattr(inventory, "production_inference_enabled", False)
+        ),
+        "asr_v2_policy_validated": getattr(
+            inventory,
+            "asr_v2_policy_validated",
+            False,
+        ),
+        "calibration_inventory_fingerprint": getattr(
+            inventory,
+            "calibration_inventory_fingerprint",
+            None,
+        ),
+        "calibration_checkpoint_fingerprint": getattr(
+            inventory,
+            "calibration_checkpoint_fingerprint",
+            None,
+        ),
+        "calibration_human_qa_total": getattr(
+            inventory,
+            "calibration_human_qa_total",
+            None,
+        ),
+        "calibration_human_qa_correct": getattr(
+            inventory,
+            "calibration_human_qa_correct",
+            None,
+        ),
+        "calibration_human_qa_wrong": getattr(
+            inventory,
+            "calibration_human_qa_wrong",
+            None,
+        ),
+        "calibration_human_qa_uncertain": getattr(
+            inventory,
+            "calibration_human_qa_uncertain",
+            None,
+        ),
+        "calibration_human_qa_unlabeled": getattr(
+            inventory,
+            "calibration_human_qa_unlabeled",
+            None,
+        ),
+        "text_usability_gate_applied": getattr(
+            inventory,
+            "text_usability_gate_applied",
+            False,
+        ),
+        "transcript_confidence_threshold_used": getattr(
+            inventory,
+            "transcript_confidence_threshold_used",
+            False,
+        ),
     }
     if arguments.dry_run:
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
         return plan
-    if arguments.mode == "production":
-        raise ValueError("production_blocked_pending_asr_v2_human_calibration")
-
     model_identifier, checkpoint_fingerprint = _model_identity(arguments)
     config = WhisperASRConfig(
         model_identifier=model_identifier,

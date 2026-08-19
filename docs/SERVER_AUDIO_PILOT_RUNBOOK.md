@@ -18,7 +18,10 @@ Current milestone boundaries:
   repaired 20/20 pilot and 22/22 correct human cluster reviews. The active step
   has completed formal production over all 75 unique in-pair targets.
 - Formal DiariZen production is **COMPLETE / FROZEN**. The current step is the
-  ASR V2 pilot20 segmentation A/B; real ASR V2 production remains blocked.
+  formal ASR V2 raw-transcript production run over all 179 segments.
+- ASR V2 segmentation calibration is **COMPLETE / FROZEN** after all 50 pilot
+  segments received human QA. Raw transcripts remain observations, not final
+  H3 text truth.
 - Speech enhancement, trusted-transcript dots3 annotation, and final H3
   rendering remain future work.
 
@@ -257,7 +260,7 @@ The model candidate and staging procedure are recorded in
 `docs/H3_DIARIZEN_SPEAKER_BINDING.md`. Official source is MIT licensed, while
 released model weights are CC BY-NC 4.0 for research/non-commercial use.
 
-### ASR V2 DiariZen-segment pilot
+### ASR V2 DiariZen-segment production
 
 Formal DiariZen production completed 75/75 clips with 179 raw segments and 81
 clusters: 79 candidate-mapped, one ambiguous, one unbound, and zero conflict.
@@ -272,6 +275,14 @@ settings as V1. Only segmentation changes. It reads exact effective production
 DiariZen sample intervals, retains overlapping speakers and unresolved identity,
 and never reruns DiariZen or modifies ASR V1.
 
+The accepted same-clip/same-model pilot contained 20 clips and 50 segments: 48
+transcribed, two backend-uncertain, and zero failed. Human QA labeled all 50:
+41 `CORRECT`, three `WRONG`, six `UNCERTAIN`, and zero unlabeled. Backend
+uncertain `2` and human-QA uncertain `6` are different concepts. The ASR V1
+reference contained 82 shorter units with QA 59/15/8. Because the units differ,
+do not report this as a paired per-turn accuracy delta. Production remains raw
+ASR with no transcript-confidence or text-usability threshold.
+
 ```bash
 export ASR_MODEL_PATH=/mnt/workspace/litengjie/data/audio_deps/asr_models/whisper-large-v3-ct2
 export ASR_MODEL=large-v3
@@ -280,33 +291,31 @@ export ASR_COMPUTE_TYPE=float16
 
 "$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
   --audio-run-root "$AUDIO_RUN_ROOT" \
-  --mode pilot20 \
+  --mode production \
   --dry-run
 
 "$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
   --audio-run-root "$AUDIO_RUN_ROOT" \
-  --mode pilot20 \
+  --mode production
+
+# Explicit full replacement only when intentionally requested:
+"$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --mode production \
   --overwrite
 
 "$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
   --audio-run-root "$AUDIO_RUN_ROOT" \
-  --mode pilot20 \
-  --regenerate-review
-
-"$ASR_ENV/bin/python" tools/run_h3_asr_v2_transcription.py \
-  --audio-run-root "$AUDIO_RUN_ROOT" \
   --mode production \
-  --dry-run
+  --regenerate-review
 ```
 
-Serve the static pilot review:
+Serve the static production review:
 
 ```bash
-cd "$AUDIO_RUN_ROOT/asr_v2_pilot20"
+cd "$AUDIO_RUN_ROOT/production/asr_v2"
 python -m http.server 8768 --bind 127.0.0.1
 ```
-
-Non-dry production ASR V2 remains fail-closed pending pilot human calibration.
 
 ## Blocked dots3 diagnostic sequence
 

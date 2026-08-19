@@ -37,10 +37,9 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Run the ASR V2 pilot20 segmentation A/B: use formal production DiariZen
-segments as authoritative speech jobs while preserving the complete frozen
-Whisper-large-v3 ASR V1 decoder semantics. Full ASR V2 production remains
-blocked pending pilot human QA.
+Run formal ASR V2 raw-transcript production over every segment in the frozen
+75-target DiariZen inventory, preserving the human-accepted segmentation policy
+and complete Whisper-large-v3 decoding semantics.
 
 ## Current Pass
 
@@ -77,19 +76,18 @@ models, GPUs, or production data. See `docs/AUDIO_ENTITY_PAIRING_H3_V1.md` for
 the canonical contract.
 
 Audio binding, primary voice, embeddings, and PairPolicy V1 are complete and
-frozen. The active producer now reads `production/pairs/in_pairs.jsonl`, rebuilds
-the same canonical frozen bound turns, and sends each exact source-audio turn
-crop independently to Whisper-large-v3 with `task=transcribe`. Code owns all
-identity, entity, and timestamp fields. Cross-pairs never create extra jobs, and
-video, donor media, primary voice, embeddings, and PairPolicy evidence never
+frozen. The historical ASR V1 producer reads `production/pairs/in_pairs.jsonl`,
+rebuilds the same canonical frozen bound turns, and sends each exact source-audio
+turn crop independently to Whisper-large-v3 with `task=transcribe`. Code owns
+all identity, entity, and timestamp fields. Cross-pairs never create extra jobs,
+and video, donor media, primary voice, embeddings, and PairPolicy evidence never
 reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
 
 The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and
 entity-binding provenance, including an optional anonymous speaker-cluster ID.
-The current ASR V2 pilot consumes formal production DiariZen boundaries after
-clip-level cluster-to-Visual-entity overlap mapping without changing Whisper
-inference.
+The production ASR V2 stage consumes formal DiariZen boundaries after clip-level
+cluster-to-Visual-entity overlap mapping without changing Whisper inference.
 The DiariZen-assisted binding stage now implements the frozen production
 inventory, raw overlap-preserving schemas, sample-domain sparse identity
 anchoring, cluster propagation, summary, and pilot-only static human review. It
@@ -121,9 +119,19 @@ only to the calibration pilot.
 ASR V2 consumes one exact effective DiariZen segment per Whisper job. It reuses
 the exact ordered ASR V1 pilot20 clip IDs for A/B selection, permits nullable
 entity identity for unresolved clusters, and transcribes candidate-mapped,
-ambiguous, unbound, and conflict segments alike. Production dry-run is enabled;
-real production inference is blocked pending human QA. See
+ambiguous, unbound, and conflict segments alike. The accepted pilot contained
+50 segments: 48 transcribed, two backend-uncertain, and zero failed. Human QA
+labeled all 50 as 41 `CORRECT`, three `WRONG`, six `UNCERTAIN`, and zero
+unlabeled. Backend uncertain `2` and human-QA uncertain `6` are separate
+concepts. Production inference is now enabled with no transcript-confidence or
+text-usability gate. See
 `docs/H3_WHISPER_ASR_V2.md`.
+
+The controlled A/B reference used the same 20 clips and model. ASR V1 had 82
+LR-ASD-derived units with human QA 59/15/8; ASR V2 had 50 DiariZen units with
+human QA 41/3/6. The units differ, so this is not a paired per-turn accuracy
+delta. DiariZen-segment ASR V2 is accepted as the production raw-ASR baseline,
+not as final H3 transcript truth.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
@@ -182,11 +190,11 @@ or production artifact may change in this pass.
 ## Tested Commands
 
 Completed GPU-free validation for the DiariZen-assisted binding and ASR V2
-pilot implementation with Python 3.12.13:
+production promotion with Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_asr_v2_transcription.py -q
-# 14 passed
+# 15 passed
 
 python -m pytest tests/test_h3_asr_transcription.py -q
 # 18 passed
@@ -195,10 +203,10 @@ python -m pytest tests/test_h3_diarization*.py -q
 # 22 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 225 passed
+# 226 passed
 
 python -m pytest -q
-# 1892 passed, 1 existing Pillow deprecation warning
+# 1893 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -225,8 +233,7 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Run the ASR V2 pilot20 dry-run and real pilot over production DiariZen segments,
-then human-review every transcript against the frozen V1 A/B reference. Future
-work remains full ASR V2 production, text-usability calibration, optional
+Run formal ASR V2 production over the complete 75-target / currently 179-segment
+DiariZen inventory. Future work remains text-usability calibration, optional
 enhancement, unresolved-only MLLM handling, entity-to-subject mapping, and final
 `<d>` rendering.

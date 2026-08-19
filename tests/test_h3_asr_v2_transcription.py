@@ -29,8 +29,12 @@ from r2v_data_v2.h3.asr_transcription import (
     _inventory_fingerprint as _asr_v1_inventory_fingerprint,
 )
 from r2v_data_v2.h3.asr_v2_transcription import (
+    ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT,
+    ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT,
     ASRV2HumanQAExport,
     ASRV2HumanQALabel,
+    ASRV2ProductionInventory,
+    ASRV2ProductionSummary,
     ASRV2SegmentJob,
     ASRV2SegmentRecord,
     asr_v2_output_root,
@@ -284,9 +288,9 @@ def _write_diarization_source(root: Path) -> DiarizationInventory:
     bound_segments: list[BoundDiarizationSegment] = []
     clusters: list[DiarizationClusterBinding] = []
     special_statuses = {
-        "clip-018": "ambiguous",
-        "clip-017": "conflict",
-        "clip-019-extra": "unbound",
+        ("clip-018", "segment_001"): "ambiguous",
+        ("clip-017", "segment_001"): "conflict",
+        ("clip-019", "segment_002"): "unbound",
     }
     for index in range(75):
         clip_uid = f"clip-{index:03d}"
@@ -309,15 +313,20 @@ def _write_diarization_source(root: Path) -> DiarizationInventory:
                 visual_references=[],
             )
         )
-        segment_specs = [("segment_001", "speaker_1", 0.0, 1.0, clip_uid)]
-        if clip_uid == "clip-019":
-            segment_specs.append(
-                ("segment_002", "speaker_2", 0.5, 1.5, "clip-019-extra")
+        segment_count = 3 if index < 10 or 20 <= index < 39 else 2
+        segment_specs = [
+            ("segment_001", "speaker_1", 0.0, 1.0),
+            ("segment_002", "speaker_2", 0.5, 1.5),
+            ("segment_003", "speaker_3", 1.5, 2.5),
+        ][:segment_count]
+        for segment_id, cluster_id, start, end in segment_specs:
+            status = special_statuses.get(
+                (clip_uid, segment_id),
+                "candidate_mapped",
             )
-        for segment_id, cluster_id, start, end, status_key in segment_specs:
-            status = special_statuses.get(status_key, "candidate_mapped")
-            effective_end = 1.0 if clip_uid == "clip-015" else end
-            reported_end = 1.05 if clip_uid == "clip-015" else end
+            clamped = clip_uid == "clip-015" and segment_id == "segment_001"
+            effective_end = 1.0 if clamped else end
+            reported_end = 1.05 if clamped else end
             adjusted = reported_end != effective_end
             reconciliation = DiarizationBoundaryReconciliation(
                 adjusted=adjusted,
@@ -478,6 +487,7 @@ def _build(
         mode=mode,  # type: ignore[arg-type]
         expected_diarization_inventory_fingerprint=diarization.inventory_fingerprint,
         expected_asr_v1_inventory_fingerprint=asr_v1.inventory_fingerprint,
+        expected_calibration_checkpoint_fingerprint="a" * 64,
     )
 
 
@@ -522,8 +532,9 @@ def test_inventory_uses_exact_pilot_order_and_every_diarizen_segment(
         item.target_clip_uid for item in asr_v1.targets
     ]
     assert inventory.selected_target_count == 20
-    assert inventory.selected_segment_count == 21
+    assert inventory.selected_segment_count == 50
     assert inventory.source_target_count == 75
+    assert inventory.schema_version == "r2v.h3.asr_v2_inventory.1"
     assert inventory.bounded_selection_applied is True
     assert inventory.parent_quota_applied is False
     assert inventory.donor_media_used is False
@@ -549,9 +560,25 @@ def test_production_inventory_is_complete_and_fixed_root(tmp_path: Path) -> None
     )
 
     assert inventory.selected_target_count == inventory.source_target_count == 75
-    assert inventory.selected_segment_count == 76
+    assert isinstance(inventory, ASRV2ProductionInventory)
+    assert inventory.schema_version == "r2v.h3.asr_v2_inventory.2"
+    assert inventory.selected_segment_count == 179
     assert inventory.bounded_selection_applied is False
-    assert inventory.production_inference_blocked is True
+    assert inventory.production_inference_enabled is True
+    assert inventory.asr_v2_policy_validated is True
+    assert inventory.calibration_inventory_fingerprint == (
+        ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT
+    )
+    assert inventory.calibration_checkpoint_fingerprint == (
+        ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+    )
+    assert inventory.calibration_human_qa_total == 50
+    assert inventory.calibration_human_qa_correct == 41
+    assert inventory.calibration_human_qa_wrong == 3
+    assert inventory.calibration_human_qa_uncertain == 6
+    assert inventory.calibration_human_qa_unlabeled == 0
+    assert inventory.text_usability_gate_applied is False
+    assert inventory.transcript_confidence_threshold_used is False
     assert asr_v2_output_root(root, mode="pilot20") == root / "asr_v2_pilot20"
     assert asr_v2_output_root(root, mode="production") == (
         root / "production" / "asr_v2"
@@ -635,18 +662,18 @@ def test_pilot_transcribes_all_statuses_with_exact_crops_and_no_metadata(
         backend=backend,
     )
 
-    assert len(backend.calls) == len(inventory.jobs) == 21
+    assert len(backend.calls) == len(inventory.jobs) == 50
     assert all(sample_rate == 16000 for _, sample_rate in backend.calls)
     assert [len(audio) for audio, _ in backend.calls] == [
         item.source_end_sample - item.source_start_sample for item in inventory.jobs
     ]
-    assert summary.candidate_mapped_segment_count == 18
+    assert summary.candidate_mapped_segment_count == 47
     assert summary.ambiguous_segment_count == 1
     assert summary.unbound_segment_count == 1
     assert summary.conflict_segment_count == 1
     assert summary.unresolved_segment_count == 3
-    assert summary.transcribed_count == 21
-    assert summary.backend_call_count == 21
+    assert summary.transcribed_count == 50
+    assert summary.backend_call_count == 50
     assert summary.transcript_confidence_threshold_used is False
     assert summary.backend_provenance.device == "cuda:3"
     assert summary.backend_provenance.task == "transcribe"
@@ -720,11 +747,23 @@ def test_missing_v1_checkpoint_remains_explicitly_unverified() -> None:
     assert provenance.checkpoint_comparison == "unavailable_in_asr_v1"
 
 
-def test_production_execution_is_blocked_but_dry_run_never_loads_model(
+def test_production_dry_run_is_model_free_and_real_execution_is_enabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, asr_v1, diarization = _audio_run(tmp_path)
+    for name in ("primary_voice", "embedding"):
+        path = root / "production" / name / "sentinel.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{name}\n", encoding="utf-8")
+    protected_roots = [
+        root / "asr_pilot20",
+        root / "production" / "diarization",
+        root / "production" / "pairs",
+        root / "production" / "primary_voice",
+        root / "production" / "embedding",
+    ]
+    protected_before = {str(path): _tree_hashes(path) for path in protected_roots}
     inventory = _build(
         root,
         mode="production",
@@ -742,12 +781,74 @@ def test_production_execution_is_blocked_but_dry_run_never_loads_model(
         ["--audio-run-root", str(root), "--mode", "production", "--dry-run"]
     )
     assert plan["selected_target_count"] == 75
-    assert plan["selected_segment_count"] == 76
-    with pytest.raises(
-        ValueError,
-        match="production_blocked_pending_asr_v2_human_calibration",
-    ):
-        asr_v2_cli.main(["--audio-run-root", str(root), "--mode", "production"])
+    assert plan["selected_segment_count"] == 179
+    assert plan["production_inference_enabled"] is True
+    assert plan["asr_v2_policy_validated"] is True
+    assert plan["calibration_inventory_fingerprint"] == (
+        ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT
+    )
+    assert plan["calibration_checkpoint_fingerprint"] == (
+        ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+    )
+    assert plan["calibration_human_qa_total"] == 50
+    assert plan["calibration_human_qa_correct"] == 41
+    assert plan["calibration_human_qa_wrong"] == 3
+    assert plan["calibration_human_qa_uncertain"] == 6
+    assert plan["calibration_human_qa_unlabeled"] == 0
+    assert plan["text_usability_gate_applied"] is False
+    assert plan["transcript_confidence_threshold_used"] is False
+
+    backend = _FakeBackend(device="cuda:7")
+    monkeypatch.setattr(
+        asr_v2_cli,
+        "FasterWhisperASRBackend",
+        lambda _: backend,
+    )
+    result = asr_v2_cli.main(
+        [
+            "--audio-run-root",
+            str(root),
+            "--mode",
+            "production",
+            "--model",
+            "fixture/whisper-large-v3",
+            "--model-fingerprint",
+            "a" * 64,
+            "--device",
+            "cuda:7",
+        ]
+    )
+    assert result["stage_status"] == "completed"
+    assert len(backend.calls) == 179
+    summary = ASRV2ProductionSummary.model_validate(result["summary"])
+    assert summary.schema_version == "r2v.h3.asr_v2_summary.2"
+    assert summary.segment_count == 179
+    assert summary.backend_call_count == 179
+    assert summary.asr_v2_policy_validated is True
+    assert summary.calibration_checkpoint_fingerprint == (
+        ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+    )
+    assert summary.text_usability_gate_applied is False
+    assert summary.transcript_confidence_threshold_used is False
+    assert summary.production_inference_enabled is True
+    production_output = root / "production" / "asr_v2"
+    assert (production_output / "segments.jsonl").is_file()
+    inference_bytes = {
+        name: (production_output / name).read_bytes()
+        for name in ("inventory.json", "segments.jsonl", "summary.json")
+    }
+    regenerated = regenerate_asr_v2_review(
+        output_root=production_output,
+        expected_mode="production",
+    )
+    assert regenerated["backend_calls"] == 0
+    assert all(
+        (production_output / name).read_bytes() == value
+        for name, value in inference_bytes.items()
+    )
+    assert {str(path): _tree_hashes(path) for path in protected_roots} == (
+        protected_before
+    )
 
 
 def test_review_regeneration_is_model_free_and_preserves_inference_json(
@@ -797,6 +898,54 @@ def test_review_regeneration_is_model_free_and_preserves_inference_json(
     assert cli_result["backend_calls"] == 0
 
 
+def test_frozen_pilot_v1_output_remains_reusable_without_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, asr_v1, diarization = _audio_run(tmp_path)
+    inventory = _build(
+        root,
+        mode="pilot20",
+        asr_v1=asr_v1,
+        diarization=diarization,
+    )
+    output = root / "asr_v2_pilot20"
+    run_asr_v2_transcription(
+        inventory=inventory,
+        output_root=output,
+        backend=_FakeBackend(),
+    )
+    protected = {
+        name: (output / name).read_bytes()
+        for name in ("inventory.json", "segments.jsonl", "summary.json")
+    }
+    monkeypatch.setattr(asr_v2_cli, "build_asr_v2_inventory", lambda **_: inventory)
+
+    class _ForbiddenBackend:
+        def __init__(self, *_: object, **__: object) -> None:
+            raise AssertionError("frozen pilot reuse must not load Whisper")
+
+    monkeypatch.setattr(asr_v2_cli, "FasterWhisperASRBackend", _ForbiddenBackend)
+    result = asr_v2_cli.main(
+        [
+            "--audio-run-root",
+            str(root),
+            "--mode",
+            "pilot20",
+            "--model",
+            "fixture/whisper-large-v3",
+            "--model-fingerprint",
+            "a" * 64,
+            "--device",
+            "cuda:3",
+        ]
+    )
+    assert result["stage_status"] == "reused"
+    assert all(
+        (output / name).read_bytes() == value for name, value in protected.items()
+    )
+
+
 def test_human_qa_contract_supports_unresolved_segments() -> None:
     export = ASRV2HumanQAExport(
         inventory_fingerprint="a" * 64,
@@ -838,6 +987,15 @@ def test_source_fingerprints_fail_closed_before_inference(tmp_path: Path) -> Non
             mode="pilot20",
             expected_diarization_inventory_fingerprint=diarization.inventory_fingerprint,
             expected_asr_v1_inventory_fingerprint="f" * 64,
+        )
+    with pytest.raises(ValueError, match="calibrated baseline"):
+        build_asr_v2_inventory(
+            audio_run_root=root,
+            mode="production",
+            expected_diarization_inventory_fingerprint=(
+                diarization.inventory_fingerprint
+            ),
+            expected_asr_v1_inventory_fingerprint=asr_v1.inventory_fingerprint,
         )
 
 

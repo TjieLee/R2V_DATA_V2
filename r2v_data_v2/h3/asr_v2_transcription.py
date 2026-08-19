@@ -55,6 +55,8 @@ from r2v_data_v2.h3.schemas import SchemaModel
 ASR_V2_SEGMENT_SCHEMA_VERSION = "r2v.h3.asr_v2_segment.1"
 ASR_V2_INVENTORY_SCHEMA_VERSION = "r2v.h3.asr_v2_inventory.1"
 ASR_V2_SUMMARY_SCHEMA_VERSION = "r2v.h3.asr_v2_summary.1"
+ASR_V2_PRODUCTION_INVENTORY_SCHEMA_VERSION = "r2v.h3.asr_v2_inventory.2"
+ASR_V2_PRODUCTION_SUMMARY_SCHEMA_VERSION = "r2v.h3.asr_v2_summary.2"
 ASR_V2_HUMAN_QA_SCHEMA_VERSION = "r2v.h3.asr_v2_human_qa.1"
 ASR_V2_REQUEST_CONTRACT_VERSION = "h3_whisper_diarizen_segment_asr_v2"
 ASR_V2_PREPROCESSING_VERSION = "pcm16_exact_diarizen_segment_crop_v1"
@@ -66,6 +68,17 @@ ASR_V2_SOURCE_DIARIZATION_INVENTORY_FINGERPRINT = (
 ASR_V2_SOURCE_ASR_V1_INVENTORY_FINGERPRINT = (
     "ead8ce8aad5dc587517c4d38e74962152fbae96721fe1f92797b832d648c6a75"
 )
+ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT = (
+    "e57635fa61541d4e1aaed6d49ccabc4bf85152d52432b0bb2e96c6f7a824ebb0"
+)
+ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT = (
+    "10ea6fb8ae7cdd1fa26495deeb1f32e79c1fc882c19f80ae711bf5f0dd671db3"
+)
+ASR_V2_CALIBRATION_HUMAN_QA_TOTAL = 50
+ASR_V2_CALIBRATION_HUMAN_QA_CORRECT = 41
+ASR_V2_CALIBRATION_HUMAN_QA_WRONG = 3
+ASR_V2_CALIBRATION_HUMAN_QA_UNCERTAIN = 6
+ASR_V2_CALIBRATION_HUMAN_QA_UNLABELED = 0
 EXPECTED_PRODUCTION_TARGET_COUNT = 75
 
 
@@ -295,6 +308,102 @@ class ASRV2Inventory(SchemaModel):
         return self
 
 
+class ASRV2ProductionInventory(SchemaModel):
+    schema_version: Literal["r2v.h3.asr_v2_inventory.2"] = (
+        ASR_V2_PRODUCTION_INVENTORY_SCHEMA_VERSION
+    )
+    mode: Literal["production"] = "production"
+    source_diarization_root: str
+    source_diarization_inventory_path: str
+    source_diarization_inventory_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_raw_segments_path: str
+    source_diarization_raw_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_bound_segments_path: str
+    source_diarization_bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_cluster_bindings_path: str
+    source_diarization_cluster_bindings_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_summary_path: str
+    source_diarization_summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_mapping_policy_version: Literal[
+        "h3_diarizen_sparse_anchor_policy_v1"
+    ] = DIARIZATION_MAPPING_POLICY_VERSION
+    source_asr_v1_inventory_path: str
+    source_asr_v1_inventory_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_asr_v1_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_asr_v1_turns_path: str
+    source_asr_v1_turns_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_asr_v1_summary_path: str
+    source_asr_v1_summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    baseline_asr_v1_backend_provenance: ASRBackendProvenance
+    baseline_asr_v1_turn_count: int = Field(ge=0)
+    baseline_asr_v1_turn_median_duration: float | None = Field(default=None, gt=0)
+    inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_target_count: int = Field(ge=0)
+    selected_target_count: int = Field(ge=0)
+    selected_segment_count: int = Field(ge=0)
+    selection_mode: Literal["complete_production_diarization_targets_v1"] = (
+        "complete_production_diarization_targets_v1"
+    )
+    bounded_selection_applied: Literal[False] = False
+    parent_quota_applied: Literal[False] = False
+    donor_media_used: Literal[False] = False
+    cross_pair_jobs_created: Literal[0] = 0
+    production_inference_enabled: Literal[True] = True
+    asr_v2_policy_validated: Literal[True] = True
+    calibration_inventory_fingerprint: Literal[
+        "e57635fa61541d4e1aaed6d49ccabc4bf85152d52432b0bb2e96c6f7a824ebb0"
+    ] = ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT
+    calibration_checkpoint_fingerprint: Literal[
+        "10ea6fb8ae7cdd1fa26495deeb1f32e79c1fc882c19f80ae711bf5f0dd671db3"
+    ] = ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+    calibration_human_qa_total: Literal[50] = ASR_V2_CALIBRATION_HUMAN_QA_TOTAL
+    calibration_human_qa_correct: Literal[41] = ASR_V2_CALIBRATION_HUMAN_QA_CORRECT
+    calibration_human_qa_wrong: Literal[3] = ASR_V2_CALIBRATION_HUMAN_QA_WRONG
+    calibration_human_qa_uncertain: Literal[6] = ASR_V2_CALIBRATION_HUMAN_QA_UNCERTAIN
+    calibration_human_qa_unlabeled: Literal[0] = ASR_V2_CALIBRATION_HUMAN_QA_UNLABELED
+    text_usability_gate_applied: Literal[False] = False
+    transcript_confidence_threshold_used: Literal[False] = False
+    targets: list[ASRV2TargetClip]
+    jobs: list[ASRV2SegmentJob]
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> ASRV2ProductionInventory:
+        target_ids = [item.target_clip_uid for item in self.targets]
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("ASR V2 production targets must be unique")
+        if (
+            self.selected_target_count != len(self.targets)
+            or self.selected_target_count != self.source_target_count
+            or self.selected_target_count != EXPECTED_PRODUCTION_TARGET_COUNT
+        ):
+            raise ValueError("ASR V2 production target inventory must be complete")
+        if self.selected_segment_count != len(self.jobs):
+            raise ValueError("ASR V2 production segment count is inconsistent")
+        job_ids = [(item.target_clip_uid, item.segment_id) for item in self.jobs]
+        if len(job_ids) != len(set(job_ids)):
+            raise ValueError("ASR V2 production segment jobs must be unique")
+        target_set = set(target_ids)
+        if any(item.target_clip_uid not in target_set for item in self.jobs):
+            raise ValueError("ASR V2 production segment references an unknown target")
+        counts = Counter(item.target_clip_uid for item in self.jobs)
+        if any(
+            item.segment_count != counts[item.target_clip_uid] for item in self.targets
+        ):
+            raise ValueError("ASR V2 production per-target count is inconsistent")
+        if self.calibration_human_qa_total != (
+            self.calibration_human_qa_correct
+            + self.calibration_human_qa_wrong
+            + self.calibration_human_qa_uncertain
+            + self.calibration_human_qa_unlabeled
+        ):
+            raise ValueError("ASR V2 calibration human-QA counts are inconsistent")
+        return self
+
+
+ASRV2InventoryRecord = ASRV2Inventory | ASRV2ProductionInventory
+
+
 class ASRV2PreprocessingProvenance(SchemaModel):
     version: Literal["pcm16_exact_diarizen_segment_crop_v1"] = (
         ASR_V2_PREPROCESSING_VERSION
@@ -500,6 +609,99 @@ class ASRV2Summary(SchemaModel):
         return self
 
 
+class ASRV2ProductionSummary(SchemaModel):
+    schema_version: Literal["r2v.h3.asr_v2_summary.2"] = (
+        ASR_V2_PRODUCTION_SUMMARY_SCHEMA_VERSION
+    )
+    mode: Literal["production"] = "production"
+    inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_mapping_policy_version: Literal[
+        "h3_diarizen_sparse_anchor_policy_v1"
+    ] = DIARIZATION_MAPPING_POLICY_VERSION
+    source_asr_v1_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    calibration_inventory_fingerprint: Literal[
+        "e57635fa61541d4e1aaed6d49ccabc4bf85152d52432b0bb2e96c6f7a824ebb0"
+    ] = ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT
+    calibration_checkpoint_fingerprint: Literal[
+        "10ea6fb8ae7cdd1fa26495deeb1f32e79c1fc882c19f80ae711bf5f0dd671db3"
+    ] = ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+    backend_provenance: ASRV2BackendProvenance
+    source_target_count: int = Field(ge=0)
+    target_clip_count: int = Field(ge=0)
+    segment_count: int = Field(ge=0)
+    bounded_selection_applied: Literal[False] = False
+    parent_quota_applied: Literal[False] = False
+    donor_media_used: Literal[False] = False
+    cross_pair_jobs_created: Literal[0] = 0
+    candidate_mapped_segment_count: int = Field(ge=0)
+    ambiguous_segment_count: int = Field(ge=0)
+    unbound_segment_count: int = Field(ge=0)
+    conflict_segment_count: int = Field(ge=0)
+    direct_anchor_present_segment_count: int = Field(ge=0)
+    cluster_propagated_only_segment_count: int = Field(ge=0)
+    unresolved_segment_count: int = Field(ge=0)
+    transcribed_count: int = Field(ge=0)
+    uncertain_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    backend_call_count: int = Field(ge=0)
+    failure_reason_counts: dict[str, int]
+    total_segment_seconds: float = Field(ge=0)
+    segment_median_duration: float | None = Field(default=None, gt=0)
+    baseline_asr_v1_turn_count: int = Field(ge=0)
+    baseline_asr_v1_turn_median_duration: float | None = Field(default=None, gt=0)
+    asr_v2_policy_validated: Literal[True] = True
+    calibration_human_qa_total: Literal[50] = ASR_V2_CALIBRATION_HUMAN_QA_TOTAL
+    calibration_human_qa_correct: Literal[41] = ASR_V2_CALIBRATION_HUMAN_QA_CORRECT
+    calibration_human_qa_wrong: Literal[3] = ASR_V2_CALIBRATION_HUMAN_QA_WRONG
+    calibration_human_qa_uncertain: Literal[6] = ASR_V2_CALIBRATION_HUMAN_QA_UNCERTAIN
+    calibration_human_qa_unlabeled: Literal[0] = ASR_V2_CALIBRATION_HUMAN_QA_UNLABELED
+    text_usability_gate_applied: Literal[False] = False
+    transcript_confidence_threshold_used: Literal[False] = False
+    pair_assets_modified: Literal[False] = False
+    primary_voice_assets_modified: Literal[False] = False
+    embedding_assets_modified: Literal[False] = False
+    diarization_assets_modified: Literal[False] = False
+    asr_v1_assets_modified: Literal[False] = False
+    calibration_pilot_assets_modified: Literal[False] = False
+    production_inference_enabled: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> ASRV2ProductionSummary:
+        if self.target_clip_count != self.source_target_count:
+            raise ValueError("ASR V2 production target count must be complete")
+        if self.segment_count != (
+            self.candidate_mapped_segment_count
+            + self.ambiguous_segment_count
+            + self.unbound_segment_count
+            + self.conflict_segment_count
+        ):
+            raise ValueError("ASR V2 production identity counts must reconcile")
+        if self.segment_count != (
+            self.direct_anchor_present_segment_count
+            + self.cluster_propagated_only_segment_count
+            + self.unresolved_segment_count
+        ):
+            raise ValueError("ASR V2 production identity scopes must reconcile")
+        if self.segment_count != (
+            self.transcribed_count + self.uncertain_count + self.failed_count
+        ):
+            raise ValueError("ASR V2 production ASR status counts must reconcile")
+        if self.backend_call_count > self.segment_count:
+            raise ValueError("ASR V2 production backend calls cannot exceed segments")
+        if self.calibration_human_qa_total != (
+            self.calibration_human_qa_correct
+            + self.calibration_human_qa_wrong
+            + self.calibration_human_qa_uncertain
+            + self.calibration_human_qa_unlabeled
+        ):
+            raise ValueError("ASR V2 calibration human-QA counts are inconsistent")
+        return self
+
+
+ASRV2SummaryRecord = ASRV2Summary | ASRV2ProductionSummary
+
+
 class ASRV2HumanQALabel(SchemaModel):
     target_clip_uid: str
     segment_id: str
@@ -551,10 +753,12 @@ class ASRV2HumanQAExport(SchemaModel):
         return self
 
 
-def _inventory_fingerprint(inventory: ASRV2Inventory | dict[str, object]) -> str:
+def _inventory_fingerprint(
+    inventory: ASRV2InventoryRecord | dict[str, object],
+) -> str:
     values = (
         inventory.model_dump(mode="json", exclude={"inventory_fingerprint"})
-        if isinstance(inventory, ASRV2Inventory)
+        if isinstance(inventory, (ASRV2Inventory, ASRV2ProductionInventory))
         else {
             key: value
             for key, value in inventory.items()
@@ -611,7 +815,10 @@ def build_asr_v2_inventory(
     expected_asr_v1_inventory_fingerprint: str | None = (
         ASR_V2_SOURCE_ASR_V1_INVENTORY_FINGERPRINT
     ),
-) -> ASRV2Inventory:
+    expected_calibration_checkpoint_fingerprint: str | None = (
+        ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+    ),
+) -> ASRV2InventoryRecord:
     root = audio_run_root.expanduser().resolve(strict=True)
     diarization_root = (root / "production" / "diarization").resolve(strict=True)
     source_paths = {
@@ -716,6 +923,13 @@ def build_asr_v2_inventory(
         or len(asr_v1_records) != len(asr_v1_inventory.jobs)
     ):
         raise ValueError("frozen ASR V1 pilot artifacts are inconsistent")
+    if (
+        mode == "production"
+        and expected_calibration_checkpoint_fingerprint is not None
+        and asr_v1_summary.backend_provenance.checkpoint_fingerprint
+        != expected_calibration_checkpoint_fingerprint
+    ):
+        raise ValueError("ASR V2 production checkpoint is not the calibrated baseline")
     v1_job_fields = tuple(ASRTurnJob.model_fields)
     for job, record in zip(asr_v1_inventory.jobs, asr_v1_records, strict=True):
         record_job = ASRTurnJob.model_validate(
@@ -816,7 +1030,11 @@ def build_asr_v2_inventory(
             )
 
     values: dict[str, object] = {
-        "schema_version": ASR_V2_INVENTORY_SCHEMA_VERSION,
+        "schema_version": (
+            ASR_V2_INVENTORY_SCHEMA_VERSION
+            if mode == "pilot20"
+            else ASR_V2_PRODUCTION_INVENTORY_SCHEMA_VERSION
+        ),
         "mode": mode,
         "source_diarization_root": str(diarization_root),
         "source_diarization_inventory_path": str(source_paths["inventory"]),
@@ -859,17 +1077,44 @@ def build_asr_v2_inventory(
         "parent_quota_applied": False,
         "donor_media_used": False,
         "cross_pair_jobs_created": 0,
-        "production_inference_blocked": mode == "production",
         "targets": [item.model_dump(mode="json") for item in targets],
         "jobs": [item.model_dump(mode="json") for item in jobs],
     }
-    return ASRV2Inventory(
+    if mode == "production":
+        values.update(
+            {
+                "production_inference_enabled": True,
+                "asr_v2_policy_validated": True,
+                "calibration_inventory_fingerprint": (
+                    ASR_V2_CALIBRATION_INVENTORY_FINGERPRINT
+                ),
+                "calibration_checkpoint_fingerprint": (
+                    ASR_V2_CALIBRATION_CHECKPOINT_FINGERPRINT
+                ),
+                "calibration_human_qa_total": ASR_V2_CALIBRATION_HUMAN_QA_TOTAL,
+                "calibration_human_qa_correct": (ASR_V2_CALIBRATION_HUMAN_QA_CORRECT),
+                "calibration_human_qa_wrong": ASR_V2_CALIBRATION_HUMAN_QA_WRONG,
+                "calibration_human_qa_uncertain": (
+                    ASR_V2_CALIBRATION_HUMAN_QA_UNCERTAIN
+                ),
+                "calibration_human_qa_unlabeled": (
+                    ASR_V2_CALIBRATION_HUMAN_QA_UNLABELED
+                ),
+                "text_usability_gate_applied": False,
+                "transcript_confidence_threshold_used": False,
+            }
+        )
+        inventory_type = ASRV2ProductionInventory
+    else:
+        values["production_inference_blocked"] = False
+        inventory_type = ASRV2Inventory
+    return inventory_type(
         **values,
         inventory_fingerprint=_sha256_text(_compact_json(values)),
     )
 
 
-def _verify_inventory_sources(inventory: ASRV2Inventory) -> None:
+def _verify_inventory_sources(inventory: ASRV2InventoryRecord) -> None:
     expected = {
         inventory.source_diarization_inventory_path: inventory.source_diarization_inventory_sha256,
         inventory.source_diarization_raw_segments_path: inventory.source_diarization_raw_segments_sha256,
@@ -979,49 +1224,79 @@ def _failed_record(
 
 def _summary(
     *,
-    inventory: ASRV2Inventory,
+    inventory: ASRV2InventoryRecord,
     records: Sequence[ASRV2SegmentRecord],
     backend_provenance: ASRV2BackendProvenance,
     backend_call_count: int,
     failure_counts: Counter[str],
-) -> ASRV2Summary:
+) -> ASRV2SummaryRecord:
     status_counts = Counter(item.status for item in records)
     binding_counts = Counter(item.cluster_binding_status for item in records)
     scope_counts = Counter(item.identity_scope for item in records)
     durations = [item.end_time - item.start_time for item in records]
-    return ASRV2Summary(
-        mode=inventory.mode,
-        inventory_fingerprint=inventory.inventory_fingerprint,
-        source_diarization_inventory_fingerprint=(
+    values: dict[str, object] = {
+        "mode": inventory.mode,
+        "inventory_fingerprint": inventory.inventory_fingerprint,
+        "source_diarization_inventory_fingerprint": (
             inventory.source_diarization_inventory_fingerprint
         ),
-        source_asr_v1_inventory_fingerprint=(
+        "source_asr_v1_inventory_fingerprint": (
             inventory.source_asr_v1_inventory_fingerprint
         ),
-        backend_provenance=backend_provenance,
-        source_target_count=inventory.source_target_count,
-        target_clip_count=inventory.selected_target_count,
-        segment_count=len(records),
-        bounded_selection_applied=inventory.bounded_selection_applied,
-        candidate_mapped_segment_count=binding_counts["candidate_mapped"],
-        ambiguous_segment_count=binding_counts["ambiguous"],
-        unbound_segment_count=binding_counts["unbound"],
-        conflict_segment_count=binding_counts["conflict"],
-        direct_anchor_present_segment_count=scope_counts["direct_anchor_present"],
-        cluster_propagated_only_segment_count=scope_counts["cluster_propagated_only"],
-        unresolved_segment_count=scope_counts["unresolved"],
-        transcribed_count=status_counts["transcribed"],
-        uncertain_count=status_counts["uncertain"],
-        failed_count=status_counts["failed"],
-        backend_call_count=backend_call_count,
-        failure_reason_counts=dict(sorted(failure_counts.items())),
-        total_segment_seconds=float(math.fsum(durations)),
-        segment_median_duration=_median_duration(durations),
-        baseline_asr_v1_turn_count=inventory.baseline_asr_v1_turn_count,
-        baseline_asr_v1_turn_median_duration=(
+        "backend_provenance": backend_provenance,
+        "source_target_count": inventory.source_target_count,
+        "target_clip_count": inventory.selected_target_count,
+        "segment_count": len(records),
+        "bounded_selection_applied": inventory.bounded_selection_applied,
+        "candidate_mapped_segment_count": binding_counts["candidate_mapped"],
+        "ambiguous_segment_count": binding_counts["ambiguous"],
+        "unbound_segment_count": binding_counts["unbound"],
+        "conflict_segment_count": binding_counts["conflict"],
+        "direct_anchor_present_segment_count": scope_counts["direct_anchor_present"],
+        "cluster_propagated_only_segment_count": scope_counts[
+            "cluster_propagated_only"
+        ],
+        "unresolved_segment_count": scope_counts["unresolved"],
+        "transcribed_count": status_counts["transcribed"],
+        "uncertain_count": status_counts["uncertain"],
+        "failed_count": status_counts["failed"],
+        "backend_call_count": backend_call_count,
+        "failure_reason_counts": dict(sorted(failure_counts.items())),
+        "total_segment_seconds": float(math.fsum(durations)),
+        "segment_median_duration": _median_duration(durations),
+        "baseline_asr_v1_turn_count": inventory.baseline_asr_v1_turn_count,
+        "baseline_asr_v1_turn_median_duration": (
             inventory.baseline_asr_v1_turn_median_duration
         ),
-    )
+    }
+    if isinstance(inventory, ASRV2ProductionInventory):
+        values.update(
+            {
+                "calibration_inventory_fingerprint": (
+                    inventory.calibration_inventory_fingerprint
+                ),
+                "calibration_checkpoint_fingerprint": (
+                    inventory.calibration_checkpoint_fingerprint
+                ),
+                "asr_v2_policy_validated": True,
+                "calibration_human_qa_total": inventory.calibration_human_qa_total,
+                "calibration_human_qa_correct": (
+                    inventory.calibration_human_qa_correct
+                ),
+                "calibration_human_qa_wrong": inventory.calibration_human_qa_wrong,
+                "calibration_human_qa_uncertain": (
+                    inventory.calibration_human_qa_uncertain
+                ),
+                "calibration_human_qa_unlabeled": (
+                    inventory.calibration_human_qa_unlabeled
+                ),
+                "text_usability_gate_applied": False,
+                "transcript_confidence_threshold_used": False,
+                "production_inference_enabled": True,
+            }
+        )
+        return ASRV2ProductionSummary(**values)
+    return ASRV2Summary(**values)
 
 
 def _review_segment_name(job: ASRV2SegmentJob) -> str:
@@ -1039,7 +1314,7 @@ def _review_video_name(target: ASRV2TargetClip) -> str:
     return f"{target.target_clip_uid}.video{suffix}"
 
 
-def _load_v1_records(inventory: ASRV2Inventory) -> list[ASRTurnRecord]:
+def _load_v1_records(inventory: ASRV2InventoryRecord) -> list[ASRTurnRecord]:
     return [
         ASRTurnRecord.model_validate(item)
         for item in _read_jsonl(Path(inventory.source_asr_v1_turns_path))
@@ -1052,7 +1327,7 @@ def _qa_name(record: ASRV2SegmentRecord) -> str:
     )
 
 
-def _qa_key(inventory: ASRV2Inventory, record: ASRV2SegmentRecord) -> str:
+def _qa_key(inventory: ASRV2InventoryRecord, record: ASRV2SegmentRecord) -> str:
     return f"h3-asr-v2-{inventory.inventory_fingerprint}-{_qa_name(record)}"
 
 
@@ -1070,7 +1345,7 @@ def _diagnostic_text(diagnostics: ASRDecoderDiagnostics | None) -> str:
 
 def _review_html(
     *,
-    inventory: ASRV2Inventory,
+    inventory: ASRV2InventoryRecord,
     records: Sequence[ASRV2SegmentRecord],
     video_names: dict[str, str],
     segment_names: dict[tuple[str, str], str | None],
@@ -1264,7 +1539,7 @@ def _ensure_symlink(*, destination: Path, source: Path) -> None:
 
 def _materialize_review_video_links(
     *,
-    inventory: ASRV2Inventory,
+    inventory: ASRV2InventoryRecord,
     review_root: Path,
 ) -> dict[str, str]:
     video_names: dict[str, str] = {}
@@ -1293,15 +1568,33 @@ def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -
     shutil.rmtree(backup)
 
 
+def load_asr_v2_inventory(path: Path) -> ASRV2InventoryRecord:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    schema_version = payload.get("schema_version")
+    if schema_version == ASR_V2_INVENTORY_SCHEMA_VERSION:
+        return ASRV2Inventory.model_validate(payload)
+    if schema_version == ASR_V2_PRODUCTION_INVENTORY_SCHEMA_VERSION:
+        return ASRV2ProductionInventory.model_validate(payload)
+    raise ValueError(f"unsupported ASR V2 inventory schema: {schema_version!r}")
+
+
+def load_asr_v2_summary(path: Path) -> ASRV2SummaryRecord:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    schema_version = payload.get("schema_version")
+    if schema_version == ASR_V2_SUMMARY_SCHEMA_VERSION:
+        return ASRV2Summary.model_validate(payload)
+    if schema_version == ASR_V2_PRODUCTION_SUMMARY_SCHEMA_VERSION:
+        return ASRV2ProductionSummary.model_validate(payload)
+    raise ValueError(f"unsupported ASR V2 summary schema: {schema_version!r}")
+
+
 def run_asr_v2_transcription(
     *,
-    inventory: ASRV2Inventory,
+    inventory: ASRV2InventoryRecord,
     output_root: Path,
     backend: ASRBackend,
     overwrite: bool = False,
-) -> ASRV2Summary:
-    if inventory.mode == "production":
-        raise ValueError("production_blocked_pending_asr_v2_human_calibration")
+) -> ASRV2SummaryRecord:
     if inventory.inventory_fingerprint != _inventory_fingerprint(inventory):
         raise ValueError("ASR V2 inventory fingerprint is inconsistent")
     _verify_inventory_sources(inventory)
@@ -1383,9 +1676,9 @@ def run_asr_v2_transcription(
 
 def _validate_review_source(
     *,
-    inventory: ASRV2Inventory,
+    inventory: ASRV2InventoryRecord,
     records: Sequence[ASRV2SegmentRecord],
-    summary: ASRV2Summary,
+    summary: ASRV2SummaryRecord,
     expected_mode: Literal["pilot20", "production"],
 ) -> None:
     if inventory.inventory_fingerprint != _inventory_fingerprint(inventory):
@@ -1411,16 +1704,12 @@ def regenerate_asr_v2_review(
     expected_mode: Literal["pilot20", "production"],
 ) -> dict[str, object]:
     root = output_root.expanduser().resolve(strict=True)
-    inventory = ASRV2Inventory.model_validate_json(
-        (root / "inventory.json").read_text(encoding="utf-8")
-    )
+    inventory = load_asr_v2_inventory(root / "inventory.json")
     records = [
         ASRV2SegmentRecord.model_validate(item)
         for item in _read_jsonl(root / "segments.jsonl")
     ]
-    summary = ASRV2Summary.model_validate_json(
-        (root / "summary.json").read_text(encoding="utf-8")
-    )
+    summary = load_asr_v2_summary(root / "summary.json")
     _validate_review_source(
         inventory=inventory,
         records=records,

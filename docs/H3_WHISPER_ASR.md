@@ -1,8 +1,9 @@
 # H3 Whisper-large-v3 ASR
 
-> ASR V1 remains the complete, frozen LR-ASD-turn baseline. The active
-> segmentation A/B pilot is documented in `docs/H3_WHISPER_ASR_V2.md`; it does
-> not modify this schema, output root, model behavior, or human-QA evidence.
+> ASR V1 remains the complete, frozen LR-ASD-turn historical baseline. The
+> accepted DiariZen-segment production raw-ASR baseline is documented in
+> `docs/H3_WHISPER_ASR_V2.md`; it does not modify this schema, output root,
+> model behavior, or human-QA evidence.
 
 This stage produces dedicated ASR outputs for the frozen Audio/entity-bound
 speech turns. It is data production only and is independent of the diagnostic
