@@ -66,11 +66,12 @@ nullable. `candidate_mapped`, `ambiguous`, `unbound`, and `conflict` segments
 all enter Whisper; unresolved identity never suppresses speech. Whisper receives
 only waveform and sample rate.
 
-There is no transcript confidence or text-usability gate. Language probability,
-log probability, no-speech probability, compression ratio, and duration remain
-diagnostics. Language probability is not transcript correctness probability.
-Transcript quality remains independent from speaker identity, primary voice,
-embeddings, and pair eligibility.
+Raw ASR V2 itself has no transcript-confidence gate and remains immutable
+evidence. The separate frozen `TextUsabilityPolicy V1` sidecar permits text for
+later display only when the source status is `transcribed`, raw text is
+non-empty, and `language_probability >= 0.65`. Language probability is not
+transcript correctness probability. This derived decision remains independent
+from speaker identity, primary voice, embeddings, and pair eligibility.
 
 ## Schemas And Roots
 
@@ -114,9 +115,9 @@ atomically. Review regeneration remains model-free and preserves inference JSON.
   --audio-run-root "$AUDIO_RUN_ROOT" --mode production --regenerate-review
 ```
 
-The current follow-up is the model-free, read-only transcript-usability
-calibration documented in `docs/H3_ASR_V2_TEXT_USABILITY.md`. It evaluates
-interpretable candidate gates and production shadow coverage, but freezes no
-threshold and does not modify raw-ASR artifacts. Later work remains
-unresolved-only MLLM, optional enhancement experiments, entity-to-subject
-mapping, and final H3 rendering. None is part of the production raw-ASR stage.
+The model-free calibration evidence remains at
+`$AUDIO_RUN_ROOT/asr_v2_text_calibration`. The accepted, frozen policy writes a
+separate sidecar under `$AUDIO_RUN_ROOT/production/text_usability` without
+modifying raw-ASR artifacts. See `docs/H3_ASR_V2_TEXT_USABILITY.md`. The next
+step is entity-to-subject mapping and final H3 structured rendering;
+unresolved-only MLLM and optional enhancement remain future work.

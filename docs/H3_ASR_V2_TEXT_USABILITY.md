@@ -1,133 +1,137 @@
-# H3 ASR V2 Text Usability Calibration
+# H3 ASR V2 Text Usability
 
 ## Status
 
-This is a **MODEL-FREE CALIBRATION ANALYZER**. It does not freeze or apply a
-text-usability policy. Formal raw ASR V2 production is complete and read-only;
-the analyzer asks only whether a future renderer might trust a raw transcript
-enough to display it inside `<d>...</d>`.
+`TextUsabilityPolicy V1` is **COMPLETE / FROZEN**. It is a model-free,
+deterministic display-eligibility policy over immutable ASR V2 production
+records. It does not alter raw ASR, segment timing, speaker/entity identity,
+primary voice, embeddings, or pairs, and it does not render `<d>` markup.
 
 The three quality questions remain independent:
 
 ```text
 transcript usability
-!= speaker identity quality
-!= voice-reference quality
+!= speaker/entity identity usability
+!= voice-reference usability
 ```
 
-Hiding text under a calibration candidate never invalidates the raw ASR record,
-speaker cluster, entity mapping, primary voice, embeddings, pair assets, or
-canonical audio.
+Hidden text remains available as raw ASR evidence in the source production
+record. Hiding it does not mean the voice, speaker, entity, or segment is bad.
 
-## Frozen Inputs
+## Frozen Policy
 
-The reviewed pilot is `$AUDIO_RUN_ROOT/asr_v2_pilot20`, with inventory
-fingerprint
-`e57635fa61541d4e1aaed6d49ccabc4bf85152d52432b0bb2e96c6f7a824ebb0`.
-It contains 20 clips and 50 DiariZen segments: 48 transcribed, two backend
-uncertain, and zero failed. Human QA is complete: 41 `CORRECT`, three `WRONG`,
-six `UNCERTAIN`, and zero unlabeled.
-
-The browser-exported QA JSON is supplied explicitly with `--qa-json`. The
-analyzer validates schema, mode, fingerprint, exact frozen counts, and a strict
-one-to-one `(target_clip_uid, segment_id, speaker_cluster_id)` join. It copies
-the exact QA bytes and records their SHA-256 in the output.
-
-Formal production under `$AUDIO_RUN_ROOT/production/asr_v2` is a read-only
-shadow dataset. Its current 179 records are loaded dynamically; the analyzer
-does not hardcode production segment count.
-
-## Diagnostics And Rules
-
-`raw_text_available` requires `status == transcribed` and non-empty text.
-Backend-uncertain and failed records are never displayable. Candidate gates are
-evaluated only on raw-text-available records.
-
-The analyzer preserves duration, decoder segment count, and these decoder
-diagnostics:
-
-- `avg_log_probability`
-- `no_speech_probability`
-- `language_probability`
-- `compression_ratio`
-
-`language_probability` is a language-identification diagnostic. It is **not
-transcript correctness probability** and is never described as such.
-
-The baseline is `raw_text_available_only`. One-dimensional sweeps use observed
-finite pilot values and midpoints that create distinct decisions; there is no
-privileged or fixed `0.5` threshold. Missing values fail the condition
-explicitly. A bounded pairwise grid evaluates conjunctions of two different
-diagnostics, with at most nine observed decision thresholds per diagnostic.
-There are no three-condition rules, weighted scores, or learned classifiers.
-
-Every rule reports retained/rejected QA counts, correct retention, wrong
-leakage, uncertain retention, explicit and conservative precision, retained
-clip count, retained-WRONG clips, and an empirical normalized margin from the
-nearest rejected WRONG example.
-
-The report creates, but does not select:
-
-- a zero-WRONG shortlist;
-- an at-most-one-WRONG shortlist;
-- a compact Pareto frontier minimizing wrong retention, uncertain retention,
-  and complexity while maximizing correct retention.
-
-Every candidate is labeled `CALIBRATION CANDIDATE ONLY`.
-
-## Production Shadow
-
-Shortlisted rules are applied to production as read-only coverage simulations.
-The report includes raw-text-available, retained, and hidden counts, stratified
-by cluster-binding status and identity scope. Identity is analysis context only
-and is never a text-gate condition. Production has no human correctness labels,
-so the report makes no production precision or accuracy claim.
-
-## Artifacts And Command
-
-The fixed, atomically published output root is:
+Policy version:
 
 ```text
-$AUDIO_RUN_ROOT/asr_v2_text_calibration/
+h3_asr_v2_text_usability_policy_v1
+```
+
+A transcript is trusted for later display if and only if:
+
+```text
+status == transcribed
+AND raw text is non-empty
+AND language_probability >= 0.65
+```
+
+Otherwise the sidecar publishes `text_status=hidden` and
+`trusted_text=null`. The threshold is exactly `0.65`, an intentionally rounded,
+human-approved eligibility threshold selected after calibration. It is not the
+observed value `0.680419921875`, `0.516479492188`, an automatically optimized
+threshold, or a generic `0.5` probability cutoff.
+
+`language_probability` is a language-identification diagnostic. It is **not
+transcript correctness probability**. No log-probability, no-speech,
+compression-ratio, duration, weighted, multi-condition, or learned gate is part
+of V1.
+
+## Calibration Provenance
+
+The frozen calibration source is `$AUDIO_RUN_ROOT/asr_v2_pilot20`, inventory
+fingerprint
+`e57635fa61541d4e1aaed6d49ccabc4bf85152d52432b0bb2e96c6f7a824ebb0`.
+It contains 50 DiariZen segments with complete human QA: 41 `CORRECT`, three
+`WRONG`, six `UNCERTAIN`, and zero unlabeled.
+
+The earlier model-free analyzer and its evidence remain unchanged at:
+
+```text
+$AUDIO_RUN_ROOT/asr_v2_text_calibration
+```
+
+That analyzer's sweeps remain calibration evidence, not production execution.
+The V1 production implementation is a separate explicit predicate and does not
+depend on sweep ranking or a calibration output directory.
+
+## Production Source And Output
+
+The source is read-only:
+
+```text
+$AUDIO_RUN_ROOT/production/asr_v2
+inventory fingerprint:
+53550fd6206f90368023caaf5629eab3b9cc6e7a5ca9f9b8081d6e5d49c173de
+```
+
+The current formal source contains 75 clips and 179 segments: 176 transcribed,
+three backend-uncertain, and zero failed. Runtime enumeration is dynamic; 179
+is provenance, not an execution cap.
+
+The fixed, atomically published output is:
+
+```text
+$AUDIO_RUN_ROOT/production/text_usability/
 ├── inventory.json
-├── human_qa.json
-├── joined_segments.jsonl
-├── sweep.json
-├── summary.json
-└── report.html
+├── segments.jsonl
+└── summary.json
 ```
 
-Run from the repository root:
+Schemas:
+
+- `r2v.h3.text_usability_segment.1`
+- `r2v.h3.text_usability_inventory.1`
+- `r2v.h3.text_usability_summary.1`
+
+Every source segment receives one sidecar row in authoritative inventory order.
+Trusted text is copied character-for-character from raw ASR. Hidden rows retain
+source identity, request provenance, language probability, and raw-text hash,
+but do not duplicate hidden transcript content.
+
+The only hidden reason codes are:
+
+- `raw_text_unavailable`
+- `language_probability_unavailable`
+- `language_probability_below_threshold`
+
+Summary identity breakdowns are diagnostic only. `candidate_mapped`,
+`ambiguous`, `unbound`, and `conflict`, plus direct/propagated/unresolved scope,
+never participate in the text predicate.
+
+## Commands
+
+Dry-run requires no model environment:
 
 ```bash
-"$R2V_PYTHON" tools/analyze_h3_asr_v2_text_usability.py \
+"$R2V_PYTHON" tools/run_h3_text_usability.py \
   --audio-run-root "$AUDIO_RUN_ROOT" \
-  --qa-json "$QA_JSON" \
-  --overwrite
+  --dry-run
 ```
 
-The command performs zero Whisper calls, zero DiariZen calls, zero GPU calls,
-and zero network-model calls. It does not access model checkpoints. To inspect
-the static report while retaining optional sibling-media links, serve the audio
-run root:
+Publish once:
 
 ```bash
-cd "$AUDIO_RUN_ROOT"
-python -m http.server 8768 --bind 127.0.0.1
+"$R2V_PYTHON" tools/run_h3_text_usability.py \
+  --audio-run-root "$AUDIO_RUN_ROOT"
 ```
 
-Then open `asr_v2_text_calibration/report.html`.
+Use `--overwrite` only for an intentional deterministic replacement of this
+derived sidecar. The command verifies source inventory identity and source-file
+hash stability before atomic publication. It performs zero Whisper calls, zero
+DiariZen calls, zero GPU calls, and zero network-model calls.
 
 ## Decision Boundary
 
-The published inventory and summary retain:
-
-```text
-text_usability_policy_validated = false
-text_usability_gate_applied = false
-transcript_confidence_threshold_used = false
-```
-
-Human review of the report is the next step. A later, separate decision may
-freeze a simple rule if the evidence supports one. This analyzer does not alter
-the renderer, generate `<d>` markup, filter sidecars, or mutate production ASR.
+This stage establishes nullable `trusted_text` only. A future renderer may emit
+`<d>trusted_text</d>` when non-null and omit dialogue text otherwise. That
+renderer, entity-to-subject binding, unresolved-only MLLM handling, and optional
+enhancement experiments are not implemented here.

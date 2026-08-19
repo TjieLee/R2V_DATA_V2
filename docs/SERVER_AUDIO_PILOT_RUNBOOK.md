@@ -19,12 +19,14 @@ Current milestone boundaries:
   has completed formal production over all 75 unique in-pair targets.
 - Formal DiariZen production is **COMPLETE / FROZEN**.
 - Formal ASR V2 raw-transcript production is **COMPLETE / FROZEN** over all 179
-  segments. The current step is model-free transcript-usability calibration.
+  segments.
 - ASR V2 segmentation calibration is **COMPLETE / FROZEN** after all 50 pilot
   segments received human QA. Raw transcripts remain observations, not final
   H3 text truth.
-- Speech enhancement, trusted-transcript dots3 annotation, and final H3
-  rendering remain future work.
+- TextUsabilityPolicy V1 is **COMPLETE / FROZEN** at the exact
+  `language_probability >= 0.65` display threshold.
+- Entity-to-subject mapping and final H3 rendering are next. Speech enhancement
+  and unresolved-only MLLM remain future work.
 
 ### One-Time Setup
 
@@ -281,8 +283,9 @@ transcribed, two backend-uncertain, and zero failed. Human QA labeled all 50:
 41 `CORRECT`, three `WRONG`, six `UNCERTAIN`, and zero unlabeled. Backend
 uncertain `2` and human-QA uncertain `6` are different concepts. The ASR V1
 reference contained 82 shorter units with QA 59/15/8. Because the units differ,
-do not report this as a paired per-turn accuracy delta. Production remains raw
-ASR with no transcript-confidence or text-usability threshold.
+do not report this as a paired per-turn accuracy delta. Production raw ASR
+remains immutable and does not filter its own records. The separate
+text-usability sidecar applies the frozen display-only threshold.
 
 ```bash
 export ASR_MODEL_PATH=/mnt/workspace/litengjie/data/audio_deps/asr_models/whisper-large-v3-ct2
@@ -343,6 +346,36 @@ python -m http.server 8768 --bind 127.0.0.1
 The fixed output is `$AUDIO_RUN_ROOT/asr_v2_text_calibration`. Every shortlisted
 rule is `CALIBRATION CANDIDATE ONLY`; production shadow results are coverage,
 not precision or accuracy. See `docs/H3_ASR_V2_TEXT_USABILITY.md`.
+
+### Frozen ASR V2 text-usability policy
+
+The accepted V1 rule trusts display text only for `transcribed`, non-empty raw
+ASR records with `language_probability >= 0.65`. The exact threshold is a
+human-approved eligibility threshold, not transcript correctness probability.
+No identity, voice, pair, duration, or other decoder diagnostic is a text gate.
+
+Inspect the complete production plan without an ASR, DiariZen, or GPU runtime:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_text_usability.py \
+  --audio-run-root "$AUDIO_RUN_ROOT" \
+  --dry-run
+```
+
+Publish the fixed derived sidecar:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_text_usability.py \
+  --audio-run-root "$AUDIO_RUN_ROOT"
+
+python -m json.tool \
+  "$AUDIO_RUN_ROOT/production/text_usability/summary.json"
+```
+
+The command reads `$AUDIO_RUN_ROOT/production/asr_v2` only and writes
+`$AUDIO_RUN_ROOT/production/text_usability`. It does not overwrite the retained
+calibration report. Use `--overwrite` only for an intentional atomic replacement
+of the derived sidecar. Final `<d>` rendering is not part of this command.
 
 ## Blocked dots3 diagnostic sequence
 

@@ -37,9 +37,9 @@ baseline. Existing V3 production behavior remains frozen at the baseline above.
 
 ## Current Development Goal
 
-Calibrate simple, model-free ASR V2 transcript-usability diagnostics against the
-complete 50-segment pilot human QA without modifying completed raw-ASR
-production or freezing a final text gate.
+Use the frozen DiariZen, raw ASR V2, and TextUsabilityPolicy V1 outputs for the
+next entity-to-subject and final H3 structured-rendering stage. The renderer is
+not implemented in the current pass.
 
 ## Current Pass
 
@@ -133,16 +133,20 @@ human QA 41/3/6. The units differ, so this is not a paired per-turn accuracy
 delta. DiariZen-segment ASR V2 is accepted as the production raw-ASR baseline,
 not as final H3 transcript truth.
 
-Formal ASR V2 raw production is now complete and frozen: 75 clips, 179
-segments, 176 transcribed, three backend-uncertain, and zero failed. The current
-analysis reads those artifacts only as a production coverage shadow. The new
-model-free calibration analyzer evaluates `raw_text_available`, five
-one-dimensional diagnostic sweeps, bounded two-condition conjunctions,
-precision-first shortlists, and a Pareto frontier against the 41/3/6 pilot QA.
-It does not privilege `0.5`, train a classifier, use identity as a text gate,
-or claim production accuracy. `text_usability_policy_validated`,
-`text_usability_gate_applied`, and `transcript_confidence_threshold_used` all
-remain false. See `docs/H3_ASR_V2_TEXT_USABILITY.md`.
+Formal ASR V2 raw production is complete and frozen: 75 clips, 179 segments,
+176 transcribed, three backend-uncertain, and zero failed. The model-free
+calibration analyzer remains immutable evidence under
+`$AUDIO_RUN_ROOT/asr_v2_text_calibration`. Its human-reviewed result selected
+the intentionally rounded `0.65` language-probability eligibility threshold.
+
+TextUsabilityPolicy V1 is now complete and frozen. It trusts display text only
+when the raw record is transcribed, text is non-empty, and
+`language_probability >= 0.65`; otherwise the derived sidecar hides text. The
+policy writes every source segment under
+`$AUDIO_RUN_ROOT/production/text_usability`, preserves identity fields, and
+does not mutate raw ASR, voice, embeddings, or pairs. Language probability is
+not transcript correctness probability, identity is not a text gate, and no
+final `<d>` renderer exists yet. See `docs/H3_ASR_V2_TEXT_USABILITY.md`.
 
 The validated server pilot selected 20 of 75 target clips and 82 turns. After
 installing the required CUDA runtime wheels, it produced 81 transcribed, one
@@ -201,7 +205,8 @@ or production artifact may change in this pass.
 ## Tested Commands
 
 Completed GPU-free validation for the DiariZen-assisted binding, ASR V2 raw
-production, and model-free text-usability calibration with Python 3.12.13:
+production, model-free text-usability calibration, and the frozen policy with
+Python 3.12.13:
 
 ```bash
 python -m pytest tests/test_h3_asr_v2_transcription.py -q
@@ -210,6 +215,9 @@ python -m pytest tests/test_h3_asr_v2_transcription.py -q
 python -m pytest tests/test_h3_asr_v2_text_calibration.py -q
 # 10 passed
 
+python -m pytest tests/test_h3_text_usability.py -q
+# 14 passed
+
 python -m pytest tests/test_h3_asr_transcription.py -q
 # 18 passed
 
@@ -217,10 +225,10 @@ python -m pytest tests/test_h3_diarization*.py -q
 # 22 passed
 
 python -m pytest tests/test_h3_*.py -q
-# 236 passed
+# 250 passed
 
 python -m pytest -q
-# 1903 passed, 1 existing Pillow deprecation warning
+# 1917 passed, 1 existing Pillow deprecation warning
 
 python -m ruff check .
 # All checks passed
@@ -247,7 +255,6 @@ worked around by changing Visual code.
 
 ## Exact Next Task
 
-Run and human-review the model-free ASR V2 text-usability calibration report.
-Only a later evidence-based decision may freeze a text gate. Future work remains
-optional enhancement, unresolved-only MLLM handling, entity-to-subject mapping,
-and final `<d>` rendering.
+Implement entity-to-subject mapping and final H3 structured rendering from the
+frozen sidecars. Optional enhancement and unresolved-only MLLM handling remain
+future work; neither may redefine the frozen raw-ASR or text-usability policy.
