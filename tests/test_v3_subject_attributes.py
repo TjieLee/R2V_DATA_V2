@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -463,6 +464,15 @@ def test_review_prompt_requires_canonical_batch_shape() -> None:
     assert "contour-only hair" in prompt
     assert "isolated sleeve, cuff, shoulder, hem, or trouser edge" in prompt
     assert "Do not require whole-object completeness" in prompt
+    assert "dominant visible content of the isolated crop" in prompt
+    assert "substantial unrelated body regions, another garment" in prompt
+    assert "recognizable requires sufficient component structure" in prompt
+    assert "Hair needs a coherent hairstyle region or silhouette" in prompt
+    assert "Face needs enough facial structure to function independently" in prompt
+    assert "clothing needs coherent garment structure" in prompt
+    assert "beyond the main subject reference" in prompt
+    assert "pose-dominated cutout" in prompt
+    assert "meaning relies on the requested attribute_type or owner context" in prompt
 
 
 def test_review_input_labels_separate_quality_from_ownership(
@@ -506,6 +516,16 @@ def test_review_input_labels_separate_quality_from_ownership(
 
     content = captured["content"]
     assert isinstance(content, list)
+    metadata = json.loads(content[0]["text"])
+    assert metadata == {
+        "owner_entity_id": "e1",
+        "attributes": [
+            {
+                "attribute_id": "a1",
+                "attribute_type": "hair",
+            }
+        ],
+    }
     labels = [
         item["text"]
         for item in content

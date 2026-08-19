@@ -480,11 +480,27 @@ QUALITY TARGET. Judge recognizable, characteristic_appearance_visible, and
 usable_as_attribute_condition from that isolated crop by itself. Do not use the
 owner context, supplied attribute phrase, or expected attribute type to rescue
 an otherwise ambiguous crop. The owner image is OWNERSHIP-ONLY CONTEXT and may
-be used only for owner_binding_correct. matches_attribute means the mask crop
-depicts the named component, and owner_binding_correct means it belongs to the
-intended person. For the three crop-only quality booleans, ask: if this isolated
-crop were shown alone, would a neutral viewer be able to identify what component
-it is and recover useful appearance information from it?
+be used only for owner_binding_correct. matches_attribute=true only when the
+named component is the dominant visible content of the isolated crop. Reject
+matches_attribute when substantial unrelated body regions, another garment, or
+a general owner or body silhouette is present, even if the target component is
+also visible. owner_binding_correct means the component belongs to the intended
+person.
+recognizable requires sufficient component structure, not merely a guessable
+category. Hair needs a coherent hairstyle region or silhouette; reject fringe,
+arcs, isolated strands, or contour-only regions. Face needs enough facial
+structure to function independently; reject isolated patches. Upper or lower
+clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
+cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags, and
+accessories need enough of the item to identify its structure independently.
+usable_as_attribute_condition=true only when the isolated crop provides clean,
+useful appearance information beyond the main subject reference. Reject a
+generic owner or body silhouette, a pose-dominated cutout, an arbitrary subject-
+region cutout, an overly fragmentary component, or a crop whose meaning relies
+on the requested attribute_type or owner context.
+For the three crop-only quality booleans, ask: if this isolated crop were shown
+alone, would a neutral viewer be able to identify what component it is and
+recover useful appearance information from it?
 Reject thin curved strips or contour-only hair; a few strands or only an edge
 of a hairstyle; an isolated sleeve, cuff, shoulder, hem, or trouser edge; a
 generic dark or light blob; a tiny partial wearable; a crop with color or
@@ -621,15 +637,10 @@ class QwenSubjectAttributeClient:
                 "text": json.dumps(
                     {
                         "owner_entity_id": owner.entity_id,
-                        "owner_phrase": owner.phrase,
                         "attributes": [
                             {
                                 "attribute_id": candidate.attribute_id,
                                 "attribute_type": candidate.discovered.attribute_type,
-                                "phrase": candidate.discovered.phrase,
-                                "grounding_prompt": (
-                                    candidate.discovered.grounding_prompt
-                                ),
                             }
                             for candidate in candidates
                         ],
