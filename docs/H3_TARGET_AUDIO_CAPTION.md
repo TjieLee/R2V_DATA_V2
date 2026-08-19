@@ -1,4 +1,4 @@
-# H3 Target Audio Caption MLLM Pilot V1/V2
+# H3 Target Audio Caption MLLM Pilot V1/V2/V3
 
 ## Status
 
@@ -80,12 +80,15 @@ The exact system prompt is defined as `SYSTEM_PROMPT` in
 - emit every supplied speaker cluster exactly once and no `entity_id`;
 - return one compact schema-valid JSON object.
 
-Prompt V2 (`h3_dots3_target_audio_caption_v2`) explicitly counts continuous or
-intermittent tonal/melodic accompaniment as background music even when it is
-faint, masked by speech, or clearest during speech pauses. It distinguishes
-music from non-musical hum, fan, and traffic ambience. The structured
-`background_music` result also records nullable `prominence` as `faint`,
-`moderate`, or `prominent`. Input transport, identity restrictions, and repair
+Prompt V3 (`h3_dots3_target_audio_caption_v3`) deliberately removes the V2 audio
+taxonomy. Dots3 returns only one nullable, short English
+`background_audio_prompt` describing meaningful non-speech audio actually
+audible and one nullable delivery/prosody string for each frozen speaker
+cluster. It may freely mention music, ambience, effects, traffic, crowds,
+footsteps, doors, machinery, nature, or other audible background content;
+faint or partially masked accompaniment is included when audible. It does not
+separately classify ambient scene, music presence/style/prominence, sound-event
+lists, or acoustic style. Input transport, identity restrictions, and repair
 behavior are unchanged.
 
 Malformed JSON and cluster-set violations receive exactly one constrained
@@ -113,7 +116,7 @@ media/<clip_uid>.<audio-extension>
 
 Schemas are:
 
-- `r2v.h3.target_audio_caption.1`;
+- `r2v.h3.target_audio_caption.2`;
 - `r2v.h3.target_audio_caption_inventory.1`;
 - `r2v.h3.target_audio_caption_summary.1`;
 - `r2v.h3.target_audio_caption_human_qa.1`.
@@ -169,8 +172,9 @@ same Target Audio Caption policy over exactly that selection:
   --clip-selection-json /path/to/background_audio_pilot_selection.json
 ```
 
-Prompt V2 output is written to
-`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot_v2`. It reuses the exact
-manual selection for an A/B comparison while preserving the V1 background
-pilot at `$AUDIO_RUN_ROOT/target_audio_caption_background_pilot`. Native-video
+Prompt V3 output is written to
+`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot_v3`. It reuses the exact
+manual selection for an A/B comparison while preserving both V1 at
+`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot` and V2 at
+`$AUDIO_RUN_ROOT/target_audio_caption_background_pilot_v2`. Native-video
 transport and the one-repair fail-closed policy remain unchanged.

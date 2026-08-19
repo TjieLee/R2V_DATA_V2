@@ -26,7 +26,6 @@ from r2v_data_v2.h3.target_audio_caption import (
     QA_LABELS,
     SYSTEM_PROMPT,
     TARGET_AUDIO_CAPTION_PROMPT_VERSION,
-    BackgroundMusic,
     Dots3TargetAudioCaptionConfig,
     Dots3TargetAudioCaptionResponse,
     ModelSpeakerDelivery,
@@ -62,18 +61,13 @@ def _write(path: Path, value: bytes) -> Path:
 
 def _response(job: TargetAudioCaptionJob) -> Dots3TargetAudioCaptionResponse:
     return Dots3TargetAudioCaptionResponse(
-        ambient_scene="busy indoor public space",
-        background_music=BackgroundMusic(
-            present=True,
-            style="soft upbeat pop",
-            prominence="moderate",
+        background_audio_prompt=(
+            "Soft instrumental music plays under crowd chatter and dish clatter"
         ),
-        sound_events=["crowd chatter", "dish clatter"],
-        acoustic_style=["moderately noisy", "reverberant"],
         speaker_delivery=[
             ModelSpeakerDelivery(
                 speaker_cluster_id=cluster.speaker_cluster_id,
-                delivery_style=["calm", "conversational"],
+                delivery_style="calm and conversational",
             )
             for cluster in job.speaker_clusters
         ],
@@ -565,43 +559,46 @@ def test_model_schema_forbids_entity_id_and_supports_unknown_values() -> None:
             {
                 "speaker_cluster_id": "speaker_0",
                 "entity_id": "e1",
-                "delivery_style": ["calm"],
+                "delivery_style": "calm",
             }
         )
     response = Dots3TargetAudioCaptionResponse(
-        ambient_scene=None,
-        background_music=BackgroundMusic(present=None, style=None),
-        sound_events=[],
-        acoustic_style=[],
+        background_audio_prompt=None,
         speaker_delivery=[
             ModelSpeakerDelivery(
                 speaker_cluster_id="speaker_0",
-                delivery_style=[],
+                delivery_style=None,
             )
         ],
     )
     assert render_audio_prompt_draft(response) == "Audio semantics are unknown."
+    assert set(Dots3TargetAudioCaptionResponse.model_json_schema()["properties"]) == {
+        "background_audio_prompt",
+        "speaker_delivery",
+    }
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        Dots3TargetAudioCaptionResponse.model_validate(
+            {
+                "background_audio_prompt": None,
+                "speaker_delivery": [],
+                "background_music": {"present": True},
+            }
+        )
 
 
-def test_v2_prompt_defines_faint_music_and_publishes_prominence() -> None:
+def test_v3_prompt_is_freeform_non_speech_audio_and_delivery_only() -> None:
     prompt = " ".join(SYSTEM_PROMPT.split())
-    assert TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_dots3_target_audio_caption_v2"
+    assert TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_dots3_target_audio_caption_v3"
     assert (
-        "Any audible continuous or intermittent tonal/melodic accompaniment counts "
-        "as background music, even when very faint, low-volume, partially masked by "
-        "speech, or only clearly audible during speech pauses."
+        "background_audio_prompt: one short English description of meaningful "
+        "non-speech audio actually audible, or null when there is none."
     ) in prompt
     assert (
-        "Do not report no background music merely because speech is louder." in prompt
+        "Mention faint or partially masked accompaniment when it is audible." in prompt
     )
-    assert (
-        "Distinguish music from steady hum, fan noise, traffic noise, and other "
-        "non-musical ambience."
-    ) in prompt
-    music = BackgroundMusic(present=True, style="instrumental", prominence="faint")
-    assert music.model_dump(mode="json")["prominence"] == "faint"
-    with pytest.raises(ValidationError, match="style or prominence"):
-        BackgroundMusic(present=False, style=None, prominence="faint")
+    assert "Never transcribe, quote, paraphrase" in prompt
+    assert "Never infer speaker, entity, or subject identity" in prompt
+    assert "Never use visual appearance to invent sounds" in prompt
 
 
 def test_unknown_missing_and_duplicate_clusters_fail_validation(tmp_path: Path) -> None:
@@ -611,7 +608,7 @@ def test_unknown_missing_and_duplicate_clusters_fail_validation(tmp_path: Path) 
             "speaker_delivery": [
                 ModelSpeakerDelivery(
                     speaker_cluster_id="speaker_unknown",
-                    delivery_style=[],
+                    delivery_style=None,
                 )
             ]
         }
@@ -712,6 +709,11 @@ def test_background_selection_runs_exact_order_in_separate_root_and_keeps_clean_
         b"background-pilot-v1",
     )
     v1_hash = _sha256(v1_marker)
+    v2_marker = _write(
+        tmp_path / "target_audio_caption_background_pilot_v2" / "keep.json",
+        b"background-pilot-v2",
+    )
+    v2_hash = _sha256(v2_marker)
     output = target_audio_caption_output_root(tmp_path, mode="background_pilot")
     backend = _FakeBackend(tmp_path)
 
@@ -725,15 +727,37 @@ def test_background_selection_runs_exact_order_in_separate_root_and_keeps_clean_
     assert summary.mode == "background_pilot"
     assert summary.target_clip_count == 2
     assert summary.backend_provenance.prompt_version == (
-        "h3_dots3_target_audio_caption_v2"
+        "h3_dots3_target_audio_caption_v3"
     )
-    assert output == tmp_path / "target_audio_caption_background_pilot_v2"
+    assert output == tmp_path / "target_audio_caption_background_pilot_v3"
     assert _sha256(clean_marker) == clean_hash
     assert _sha256(v1_marker) == v1_hash
+    assert _sha256(v2_marker) == v2_hash
+    records = [
+        json.loads(line)
+        for line in (output / "records.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert records[0]["schema_version"] == "r2v.h3.target_audio_caption.2"
+    assert records[0]["background_audio_prompt"] == (
+        "Soft instrumental music plays under crowd chatter and dish clatter"
+    )
+    assert records[0]["speaker_delivery"] == [
+        {
+            "speaker_cluster_id": "speaker_0",
+            "entity_id": "e1",
+            "delivery_style": "calm and conversational",
+        }
+    ]
+    assert not {
+        "ambient_scene",
+        "background_music",
+        "sound_events",
+        "acoustic_style",
+    }.intersection(records[0])
     report = (output / "report.html").read_text(encoding="utf-8")
-    assert "target_audio_caption_background_pilot_v2_human_qa.json" in report
-    assert "h3-target-audio-caption-background-pilot-v2-" in report
-    assert "H3 Target Audio Caption Background Pilot V2" in report
+    assert "target_audio_caption_background_pilot_v3_human_qa.json" in report
+    assert "h3-target-audio-caption-background-pilot-v3-" in report
+    assert "H3 Target Audio Caption Background Pilot V3" in report
     assert "Never transcribe, quote, paraphrase" in SYSTEM_PROMPT
 
 
@@ -772,7 +796,7 @@ def test_cli_passes_manual_selection_and_uses_background_output_root(
     }
     assert result["mode"] == "background_pilot"
     assert result["output_root"] == str(
-        tmp_path / "target_audio_caption_background_pilot_v2"
+        tmp_path / "target_audio_caption_background_pilot_v3"
     )
 
 
@@ -799,10 +823,8 @@ def test_failed_atomic_build_does_not_publish_partial_output(tmp_path: Path) -> 
 def test_audio_prompt_draft_is_deterministic(tmp_path: Path) -> None:
     response = _response(_inventory(tmp_path).jobs[0])
     assert render_audio_prompt_draft(response) == (
-        "Busy indoor public space. Soft upbeat pop is audible. "
-        "Audible sound events include crowd chatter, dish clatter. "
-        "The acoustic style is moderately noisy, reverberant. "
-        "speaker_0 speaks in a calm, conversational manner."
+        "Soft instrumental music plays under crowd chatter and dish clatter. "
+        "speaker_0 speaks in a calm and conversational manner."
     )
 
 

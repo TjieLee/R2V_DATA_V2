@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from openai import OpenAI
-from pydantic import Field, StrictBool, StrictStr, model_validator
+from pydantic import Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.asr_v2_transcription import (
     ASRV2Inventory,
@@ -45,14 +45,14 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.1"
+TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.2"
 TARGET_AUDIO_CAPTION_INVENTORY_VERSION = "r2v.h3.target_audio_caption_inventory.1"
 TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.1"
 TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = "r2v.h3.target_audio_caption_human_qa.1"
-TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_dots3_target_audio_caption_v2"
+TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_dots3_target_audio_caption_v3"
 TARGET_AUDIO_CAPTION_OUTPUT_DIRECTORY = "target_audio_caption_pilot20"
 TARGET_AUDIO_CAPTION_BACKGROUND_OUTPUT_DIRECTORY = (
-    "target_audio_caption_background_pilot_v2"
+    "target_audio_caption_background_pilot_v3"
 )
 TARGET_AUDIO_INPUT_MODALITY = "native_target_video_with_embedded_audio"
 PILOT_TARGET_COUNT = 20
@@ -71,23 +71,21 @@ QA_FLAGS = (
 
 SYSTEM_PROMPT = """You analyze AUDIO SEMANTICS for one target clip.
 Use audible evidence only. The attached native target video includes its original
-audio track. Visual content must never be used to guess a sound.
+audio track. Never use visual appearance to invent sounds.
 
-Report only: audible ambient/background environment, background-music presence and
-style, non-speech sound events, acoustic atmosphere/style, and delivery/prosody for
-the supplied speaker clusters during their exact active time ranges.
+Return only:
+- background_audio_prompt: one short English description of meaningful non-speech
+  audio actually audible, or null when there is none. Decide freely whether it
+  includes music, ambience, sound effects, traffic, crowd, footsteps, doors,
+  machinery, nature, or other audible background content. Mention faint or partially
+  masked accompaniment when it is audible.
+- speaker_delivery: one entry per supplied speaker cluster, using its exact
+  speaker_cluster_id and a concise delivery/prosody description or null.
 
-Any audible continuous or intermittent tonal/melodic accompaniment counts as
-background music, even when very faint, low-volume, partially masked by speech, or
-only clearly audible during speech pauses. Do not report no background music merely
-because speech is louder. Distinguish music from steady hum, fan noise, traffic
-noise, and other non-musical ambience.
-
-Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never identify a
-speaker or infer entity identity, subject identity, gender, age, nationality, or
-intrinsic voice identity/timbre. Do not emit entity_id. If audible evidence is unclear,
-use null or an empty list and do not invent details. Return every supplied
-speaker_cluster_id exactly once, in supplied order, and no unknown cluster ID.
+Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
+speaker, entity, or subject identity, and never infer intrinsic voice identity or
+timbre. Do not emit entity_id. Return every supplied speaker_cluster_id exactly once,
+in supplied order, and no unknown cluster ID.
 
 Return exactly one compact JSON object matching the supplied schema, with no markdown
 or explanation."""
@@ -161,58 +159,30 @@ class SpeakerClusterEvidence(SchemaModel):
         return self
 
 
-class BackgroundMusic(SchemaModel):
-    present: StrictBool | None = None
-    style: StrictStr | None = None
-    prominence: Literal["faint", "moderate", "prominent"] | None = None
-
-    @model_validator(mode="after")
-    def validate_music(self) -> BackgroundMusic:
-        if self.style is not None and not self.style.strip():
-            raise ValueError("background music style must be non-empty or null")
-        if self.present is False and (
-            self.style is not None or self.prominence is not None
-        ):
-            raise ValueError(
-                "absent background music cannot have a style or prominence"
-            )
-        return self
-
-
 class ModelSpeakerDelivery(SchemaModel):
     speaker_cluster_id: StrictStr
-    delivery_style: list[StrictStr]
+    delivery_style: StrictStr | None = None
 
     @model_validator(mode="after")
     def validate_delivery(self) -> ModelSpeakerDelivery:
         if not self.speaker_cluster_id.strip():
             raise ValueError("speaker cluster ID must not be empty")
-        if any(not item.strip() for item in self.delivery_style):
-            raise ValueError("speaker delivery labels must not be empty")
-        if len(self.delivery_style) != len(set(self.delivery_style)):
-            raise ValueError("speaker delivery labels must be unique")
+        if self.delivery_style is not None and not self.delivery_style.strip():
+            raise ValueError("speaker delivery style must be non-empty or null")
         return self
 
 
 class Dots3TargetAudioCaptionResponse(SchemaModel):
-    ambient_scene: StrictStr | None = None
-    background_music: BackgroundMusic
-    sound_events: list[StrictStr]
-    acoustic_style: list[StrictStr]
+    background_audio_prompt: StrictStr | None = None
     speaker_delivery: list[ModelSpeakerDelivery]
 
     @model_validator(mode="after")
     def validate_response(self) -> Dots3TargetAudioCaptionResponse:
-        if self.ambient_scene is not None and not self.ambient_scene.strip():
-            raise ValueError("ambient scene must be non-empty or null")
-        for values, name in (
-            (self.sound_events, "sound event"),
-            (self.acoustic_style, "acoustic style"),
+        if (
+            self.background_audio_prompt is not None
+            and not self.background_audio_prompt.strip()
         ):
-            if any(not item.strip() for item in values):
-                raise ValueError(f"{name} values must not be empty")
-            if len(values) != len(set(values)):
-                raise ValueError(f"{name} values must be unique")
+            raise ValueError("background audio prompt must be non-empty or null")
         cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
         if len(cluster_ids) != len(set(cluster_ids)):
             raise ValueError("speaker delivery cluster IDs must be unique")
@@ -236,7 +206,9 @@ class TargetAudioCaptionBackendProvenance(SchemaModel):
     checkpoint_id: str
     base_url: str
     prompt_version: Literal[
-        "h3_dots3_target_audio_caption_v1", "h3_dots3_target_audio_caption_v2"
+        "h3_dots3_target_audio_caption_v1",
+        "h3_dots3_target_audio_caption_v2",
+        "h3_dots3_target_audio_caption_v3",
     ] = TARGET_AUDIO_CAPTION_PROMPT_VERSION
     input_modality: Literal["native_target_video_with_embedded_audio"] = (
         TARGET_AUDIO_INPUT_MODALITY
@@ -374,15 +346,12 @@ class TargetAudioCaptionInventory(SchemaModel):
 
 
 class TargetAudioCaptionRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption.1"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption.2"] = (
         TARGET_AUDIO_CAPTION_SCHEMA_VERSION
     )
     target_clip_uid: str
     status: Literal["ready", "failed"]
-    ambient_scene: str | None = None
-    background_music: BackgroundMusic | None = None
-    sound_events: list[str] = Field(default_factory=list)
-    acoustic_style: list[str] = Field(default_factory=list)
+    background_audio_prompt: str | None = None
     speaker_delivery: list[TargetSpeakerDelivery] = Field(default_factory=list)
     audio_prompt_draft: str | None = None
     input_modality: Literal["native_target_video_with_embedded_audio"] = (
@@ -401,16 +370,13 @@ class TargetAudioCaptionRecord(SchemaModel):
     @model_validator(mode="after")
     def validate_record(self) -> TargetAudioCaptionRecord:
         if self.status == "ready":
-            if self.failure is not None or self.background_music is None:
+            if self.failure is not None:
                 raise ValueError("ready target audio caption requires model output")
             if self.audio_prompt_draft is None or not self.audio_prompt_draft.strip():
                 raise ValueError("ready target audio caption requires preview text")
         elif self.failure is None or any(
             (
-                self.ambient_scene is not None,
-                self.background_music is not None,
-                bool(self.sound_events),
-                bool(self.acoustic_style),
+                self.background_audio_prompt is not None,
                 bool(self.speaker_delivery),
                 self.audio_prompt_draft is not None,
             )
@@ -642,12 +608,13 @@ def _user_prompt(job: TargetAudioCaptionJob) -> str:
     return (
         "Analyze only sounds actually audible in the attached target video's native "
         "audio track. Do not use visuals to infer sounds. Do not transcribe, quote, "
-        "paraphrase, correct, or summarize speech. Do not infer speaker identity, "
-        "entity, gender, age, nationality, or timbre. Describe only ambient scene, "
-        "background music, non-speech events, acoustic style, and delivery/prosody "
-        "for the supplied speaker clusters. Use null or [] when uncertain. The "
-        "speaker cluster IDs and time ranges are frozen evidence. Return each cluster "
-        "exactly once and no entity_id.\nInput:\n"
+        "paraphrase, correct, or summarize speech. Do not infer speaker, entity, or "
+        "subject identity or timbre. Return only one short English "
+        "background_audio_prompt for meaningful non-speech audio actually audible, "
+        "or null when none is meaningful, plus concise nullable delivery/prosody for "
+        "the supplied speaker clusters. Mention faint or partially masked "
+        "accompaniment when audible. The speaker cluster IDs and time ranges are "
+        "frozen evidence. Return each cluster exactly once and no entity_id.\nInput:\n"
         f"{_compact_json(_model_input(job))}\nJSON schema:\n{_compact_json(schema)}"
     )
 
@@ -1243,28 +1210,13 @@ def _sentence(value: str) -> str:
 
 def render_audio_prompt_draft(response: Dots3TargetAudioCaptionResponse) -> str:
     sentences: list[str] = []
-    if response.ambient_scene is not None:
-        sentences.append(_sentence(response.ambient_scene))
-    if response.background_music.present is True:
-        style = response.background_music.style or "Background music"
-        sentences.append(_sentence(f"{style} is audible"))
-    elif response.background_music.present is False:
-        sentences.append("No background music is audible.")
-    if response.sound_events:
-        sentences.append(
-            _sentence(
-                "Audible sound events include " + ", ".join(response.sound_events)
-            )
-        )
-    if response.acoustic_style:
-        sentences.append(
-            _sentence("The acoustic style is " + ", ".join(response.acoustic_style))
-        )
+    if response.background_audio_prompt is not None:
+        sentences.append(_sentence(response.background_audio_prompt))
     for delivery in response.speaker_delivery:
         if delivery.delivery_style:
             sentences.append(
                 f"{delivery.speaker_cluster_id} speaks in a "
-                + ", ".join(delivery.delivery_style)
+                + delivery.delivery_style
                 + " manner."
             )
     return " ".join(sentences) or "Audio semantics are unknown."
@@ -1310,10 +1262,7 @@ def _ready_record(
     return TargetAudioCaptionRecord(
         target_clip_uid=job.target_clip_uid,
         status="ready",
-        ambient_scene=result.response.ambient_scene,
-        background_music=result.response.background_music,
-        sound_events=result.response.sound_events,
-        acoustic_style=result.response.acoustic_style,
+        background_audio_prompt=result.response.background_audio_prompt,
         speaker_delivery=deliveries,
         audio_prompt_draft=render_audio_prompt_draft(result.response),
         target_video_path=job.target_video_path,
@@ -1397,17 +1346,17 @@ def _review_html(
     title = (
         "H3 Target Audio Caption Pilot20"
         if inventory.mode == "pilot20"
-        else "H3 Target Audio Caption Background Pilot V2"
+        else "H3 Target Audio Caption Background Pilot V3"
     )
     qa_filename = (
         "target_audio_caption_pilot20_human_qa.json"
         if inventory.mode == "pilot20"
-        else "target_audio_caption_background_pilot_v2_human_qa.json"
+        else "target_audio_caption_background_pilot_v3_human_qa.json"
     )
     local_storage_prefix = (
         "h3-target-audio-caption-pilot20-"
         if inventory.mode == "pilot20"
-        else "h3-target-audio-caption-background-pilot-v2-"
+        else "h3-target-audio-caption-background-pilot-v3-"
     )
     target_count = inventory.selected_target_count
     return f"""<!doctype html><html><head><meta charset='utf-8'>
@@ -1419,7 +1368,7 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f6f6f6;padding:12px}
 .qa{{margin-top:14px;padding:12px;background:#eef2f5}}.qa label{{margin-right:14px}}
 button{{margin-right:10px;padding:8px 12px}}
 </style></head><body><header><h1>{title}</h1>
-<p>Review audible ambience, music, non-speech events, acoustic style, speaker delivery, and dialogue leakage.</p>
+<p>Review the background-audio prompt, speaker delivery, and dialogue leakage.</p>
 <p id='progress'>Labeled 0 / {target_count}</p>
 <button onclick='exportQA()'>Export QA JSON</button><button onclick='clearQA()'>Clear QA labels</button></header>
 {"".join(cards)}
