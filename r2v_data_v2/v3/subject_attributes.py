@@ -29,7 +29,7 @@ from r2v_data_v2.v3.pair import (
     mask_component_diagnostics,
 )
 from r2v_data_v2.v3.profiling import profiled_openai_call
-from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
+from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend, mask_iou
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     ClipRecord,
@@ -48,6 +48,12 @@ MIN_ATTRIBUTE_AREA_PIXELS = 16
 MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 4
 MAX_ATTRIBUTE_TO_OWNER_AREA_RATIO = 0.85
 WRONG_OWNER_MINIMUM_OVERLAP_RATIO = 0.50
+CLOTHING_OWNER_LIKE_AREA_RATIO = 0.78
+CLOTHING_STRIP_ASPECT_RATIO = 3.0
+ATTRIBUTE_DUPLICATE_MASK_IOU = 0.90
+CLOTHING_ATTRIBUTE_TYPES = frozenset(
+    {"upper_clothing", "lower_clothing", "dress_or_skirt"}
+)
 
 _IMAGE_PLACEHOLDER = re.compile(r"\{\{image_([1-9]\d*)\}\}")
 _ANGLE_IMAGE_LABEL = re.compile(r"<Image ([1-9]\d*)>")
@@ -864,6 +870,39 @@ def evaluate_ownership_geometry(
     )
 
 
+def _clothing_geometry_rejection_reason(
+    attribute_type: AttributeType,
+    attribute_mask: np.ndarray,
+    geometry: OwnershipGeometry,
+) -> str | None:
+    if attribute_type not in CLOTHING_ATTRIBUTE_TYPES or not geometry.passed:
+        return None
+    if geometry.attribute_to_owner_area_ratio >= CLOTHING_OWNER_LIKE_AREA_RATIO:
+        return "clothing_mask_too_owner_like"
+    x1, y1, x2, y2 = _bbox(np.asarray(attribute_mask, dtype=bool))
+    width = x2 - x1
+    height = y2 - y1
+    bbox_aspect_ratio = max(width / height, height / width)
+    if bbox_aspect_ratio >= CLOTHING_STRIP_ASPECT_RATIO:
+        return "clothing_mask_too_strip_like"
+    return None
+
+
+def _duplicate_attribute_mask_conflicts(
+    candidates: list[PendingAttributeCandidate],
+) -> set[str]:
+    conflicts: set[str] = set()
+    for index, first in enumerate(candidates):
+        for second in candidates[index + 1 :]:
+            if first.discovered.attribute_type == second.discovered.attribute_type:
+                continue
+            if mask_iou(first.attribute_mask, second.attribute_mask) >= (
+                ATTRIBUTE_DUPLICATE_MASK_IOU
+            ):
+                conflicts.update((first.attribute_id, second.attribute_id))
+    return conflicts
+
+
 def prefer_attribute_candidate_frames(
     candidates: list[EntityReferenceCandidate],
     *,
@@ -1012,6 +1051,21 @@ def _select_attribute_candidate(
             )
             if not geometry.passed:
                 geometry_rejections.append((owner_candidate, geometry))
+                continue
+            clothing_rejection = _clothing_geometry_rejection_reason(
+                discovered.attribute_type,
+                attribute_mask,
+                geometry,
+            )
+            if clothing_rejection is not None:
+                geometry_rejections.append(
+                    (
+                        owner_candidate,
+                        geometry.model_copy(
+                            update={"passed": False, "reason": clothing_rejection}
+                        ),
+                    )
+                )
                 continue
             source = _source_image(storage, owner_candidate)
             crop, _ = build_reference_crop(
@@ -1233,6 +1287,31 @@ def _process_owner(
         else:
             pending.append(selected)
 
+    duplicate_conflicts = _duplicate_attribute_mask_conflicts(pending)
+    if duplicate_conflicts:
+        retained_pending: list[PendingAttributeCandidate] = []
+        for candidate in pending:
+            if candidate.attribute_id not in duplicate_conflicts:
+                retained_pending.append(candidate)
+                continue
+            same_frame = (
+                owner_reference.source_clip_uid in {None, clip.clip_uid}
+                and candidate.owner_candidate.source_frame_index
+                == owner_reference.source_frame_index
+            )
+            records_by_id[candidate.attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=candidate.attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason="attribute_mask_duplicate_conflict",
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=same_frame,
+            )
+        pending = retained_pending
+
     review_calls = 0
     review_failure: str | None = None
     reviews: dict[str, SubjectAttributeReview] = {}
@@ -1310,6 +1389,7 @@ def _process_owner(
     ]
     deterministic_rejects = sum(
         record.reason.startswith("ownership_geometry:")
+        or record.reason == "attribute_mask_duplicate_conflict"
         for record in ordered_records
     )
     recognizability_rejects = sum(

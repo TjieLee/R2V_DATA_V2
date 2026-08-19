@@ -444,6 +444,99 @@ def test_ownership_geometry_accepts_intended_owner_and_rejects_wrong_owner() -> 
     assert rejected.reason == "attribute_primarily_belongs_to_other_subject"
 
 
+def _rectangular_mask(*, width: int, height: int) -> np.ndarray:
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[10 : 10 + height, 10 : 10 + width] = True
+    return mask
+
+
+def test_clothing_owner_ratio_079_is_rejected() -> None:
+    geometry = _geometry().model_copy(
+        update={"attribute_to_owner_area_ratio": 0.79}
+    )
+    assert subject_attributes._clothing_geometry_rejection_reason(
+        "upper_clothing", _rectangular_mask(width=20, height=20), geometry
+    ) == "clothing_mask_too_owner_like"
+
+
+def test_clothing_owner_ratio_073_is_allowed() -> None:
+    geometry = _geometry().model_copy(
+        update={"attribute_to_owner_area_ratio": 0.73}
+    )
+    assert (
+        subject_attributes._clothing_geometry_rejection_reason(
+            "lower_clothing", _rectangular_mask(width=20, height=20), geometry
+        )
+        is None
+    )
+
+
+def test_nonclothing_owner_ratio_079_is_not_rejected_by_clothing_rule() -> None:
+    geometry = _geometry().model_copy(
+        update={"attribute_to_owner_area_ratio": 0.79}
+    )
+    assert (
+        subject_attributes._clothing_geometry_rejection_reason(
+            "hair", _rectangular_mask(width=20, height=20), geometry
+        )
+        is None
+    )
+
+
+def test_clothing_aspect_ratio_40_is_rejected() -> None:
+    assert subject_attributes._clothing_geometry_rejection_reason(
+        "dress_or_skirt",
+        _rectangular_mask(width=40, height=10),
+        _geometry(),
+    ) == "clothing_mask_too_strip_like"
+
+
+def test_clothing_aspect_ratio_18_is_allowed() -> None:
+    assert (
+        subject_attributes._clothing_geometry_rejection_reason(
+            "upper_clothing",
+            _rectangular_mask(width=18, height=10),
+            _geometry(),
+        )
+        is None
+    )
+
+
+def _pending_mask_stub(
+    attribute_id: str,
+    attribute_type: str,
+    mask: np.ndarray,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        attribute_id=attribute_id,
+        discovered=SimpleNamespace(attribute_type=attribute_type),
+        attribute_mask=mask,
+    )
+
+
+def test_different_attribute_types_with_mask_iou_090_conflict() -> None:
+    first = _rectangular_mask(width=20, height=20)
+    second = first.copy()
+    second[10, 10:20] = False
+    assert subject_attributes._duplicate_attribute_mask_conflicts(
+        [
+            _pending_mask_stub("a1", "upper_clothing", first),
+            _pending_mask_stub("a2", "lower_clothing", second),
+        ]
+    ) == {"a1", "a2"}
+
+
+def test_clearly_different_attribute_masks_do_not_conflict() -> None:
+    first = _rectangular_mask(width=20, height=20)
+    second = np.roll(first, shift=50, axis=1)
+    assert not subject_attributes._duplicate_attribute_mask_conflicts(
+        [
+            _pending_mask_stub("a1", "hair", first),
+            _pending_mask_stub("a2", "upper_clothing", second),
+        ]
+    )
+
+
 def test_recognizability_requires_every_review_boolean() -> None:
     assert _accepted_review("a1").accepted is True
     fragment = _accepted_review("a1").model_copy(update={"recognizable": False})
@@ -676,7 +769,10 @@ class _SegmentationBackend:
         if self.mask is not None:
             return (self.mask,)
         mask = np.zeros((100, 100), dtype=bool)
-        mask[30:45, 30:45] = True
+        if "jacket" in grounding_prompt:
+            mask[50:65, 50:65] = True
+        else:
+            mask[30:45, 30:45] = True
         return (mask,)
 
 
