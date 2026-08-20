@@ -45,7 +45,7 @@ def _validate_edit_request(payload: object) -> dict[str, Any]:
         "width",
         "height",
     }
-    allowed = required | {"seed"}
+    allowed = required | {"instruction_rewrite_enabled", "seed"}
     missing = sorted(required - set(payload))
     unknown = sorted(set(payload) - allowed)
     if missing or unknown:
@@ -75,6 +75,9 @@ def _validate_edit_request(payload: object) -> dict[str, Any]:
         or request_seed < 0
     ):
         raise ValueError("seed must be a non-negative integer when supplied")
+    rewrite_enabled = payload.get("instruction_rewrite_enabled")
+    if rewrite_enabled is not None and not isinstance(rewrite_enabled, bool):
+        raise TypeError("instruction_rewrite_enabled must be a boolean")
     return payload
 
 
@@ -153,6 +156,9 @@ def _run_loaded_request(
     height = int(request["height"])
     instruction = str(request["instruction"]).strip()
     thinking_enabled = bool(request["thinking_enabled"])
+    instruction_rewrite_enabled = bool(
+        request.get("instruction_rewrite_enabled", thinking_enabled)
+    )
     effective_seed = int(request.get("seed", seed))
     with Image.open(input_path) as loaded:
         loaded.load()
@@ -185,11 +191,11 @@ def _run_loaded_request(
             use_dmd_student_inference=True,
             dmd_conditioning_sigma=0.0,
             generator=torch_module.Generator(device).manual_seed(effective_seed),
-            use_rewrite_text_instruction=thinking_enabled,
+            use_rewrite_text_instruction=instruction_rewrite_enabled,
             merge_original_and_rewritten_instructions=True,
-            save_rewritten_instruction=thinking_enabled,
+            save_rewritten_instruction=instruction_rewrite_enabled,
             save_rewritten_instruction_path=(
-                str(rewrite_path) if thinking_enabled else None
+                str(rewrite_path) if instruction_rewrite_enabled else None
             ),
             output_type="pil",
         )
@@ -209,7 +215,7 @@ def _run_loaded_request(
 
     rewritten: str | None = None
     effective = instruction
-    if thinking_enabled:
+    if instruction_rewrite_enabled:
         rewritten, effective = _load_rewrite_result(rewrite_path, instruction)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     candidate.save(output_path, format="PNG")
@@ -225,6 +231,7 @@ def _run_loaded_request(
         "rewritten_instruction": rewritten,
         "effective_instruction": effective,
         "thinking_enabled": thinking_enabled,
+        "instruction_rewrite_enabled": instruction_rewrite_enabled,
         "requested_size": [width, height],
         "returned_size": [candidate.width, candidate.height],
         "seed": effective_seed,

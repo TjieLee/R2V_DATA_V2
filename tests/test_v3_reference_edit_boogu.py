@@ -122,13 +122,20 @@ class _Backend:
         height = int(kwargs["height"])
         output_size = self.returned_size or (width, height)
         self.output_bytes = _png_bytes(output_size, color=(191, 22, 43))
-        thinking = bool(kwargs["thinking_enabled"])
+        rewrite_enabled = bool(
+            kwargs.get(
+                "instruction_rewrite_enabled",
+                kwargs["thinking_enabled"],
+            )
+        )
         instruction = str(kwargs["instruction"])
         return BooguEditOutput(
             png_bytes=self.output_bytes,
             original_instruction=instruction,
-            rewritten_instruction="rewritten" if thinking else None,
-            effective_instruction="rewritten" if thinking else instruction,
+            rewritten_instruction="rewritten" if rewrite_enabled else None,
+            effective_instruction=(
+                "rewritten" if rewrite_enabled else instruction
+            ),
             worker_metadata={"returned_size": list(output_size)},
         )
 
@@ -429,6 +436,12 @@ def test_background_uses_thinking_false_and_no_source_restoration(
 
     assert result.status == "accepted"
     assert backend.calls[0]["thinking_enabled"] is False
+    assert backend.calls[0]["instruction_rewrite_enabled"] is False
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["thinking_enabled"] is False
+    assert metadata["instruction_rewrite_enabled"] is False
+    assert metadata["rewritten_instruction"] is None
+    assert metadata["effective_instruction"] == "Add a quiet studio background."
     assert canonical.read_bytes() == canonical_bytes
     assert result.final_reference_path is not None
     assert result.final_reference_path.read_bytes() == backend.output_bytes
@@ -1001,6 +1014,7 @@ for line in sys.stdin:
         width=1360,
         height=768,
         thinking_enabled=False,
+        instruction_rewrite_enabled=False,
     )
     second = backend.edit(
         source_rgb=Image.new("RGB", (160, 90)),
@@ -1033,6 +1047,8 @@ for line in sys.stdin:
     assert events[0]["argv"][:2] == [str(worker.resolve()), "--serve"]
     assert events[0]["cuda"] == "3"
     assert events[1]["request_id"] != events[2]["request_id"]
+    assert events[1]["thinking_enabled"] is False
+    assert events[1]["instruction_rewrite_enabled"] is False
     assert "seed" not in events[1]
     assert "seed" not in events[2]
     assert events[3]["seed"] == 17
@@ -1282,6 +1298,9 @@ def test_worker_passes_explicit_size_and_thinking_to_fake_pipeline(
     assert call["enable_inner_devices_manager"] is False
     assert call["align_res"] is False
     assert call["use_rewrite_text_instruction"] is True
+    assert call["save_rewritten_instruction"] is True
+    assert response["thinking_enabled"] is True
+    assert response["instruction_rewrite_enabled"] is True
     assert call["input_images"][0][0].size == (19, 23)
     assert call["input_images"][0][0].mode == "RGB"
     assert response["rewritten_instruction"] == "Complete the same object."
@@ -1343,6 +1362,7 @@ def test_jsonl_worker_loads_pipeline_once_for_multiple_entities(
             "output_image_path": str((tmp_path / "entity_1.png").resolve()),
             "instruction": "Edit entity_1.",
             "thinking_enabled": False,
+            "instruction_rewrite_enabled": False,
             "width": 32,
             "height": 32,
         },
@@ -1387,6 +1407,13 @@ def test_jsonl_worker_loads_pipeline_once_for_multiple_entities(
     assert len(inference_calls) == 2
     assert [call["generator"].seed for call in inference_calls] == [0, 17]
     assert [call["num_inference_steps"] for call in inference_calls] == [4, 4]
+    assert [
+        call["use_rewrite_text_instruction"] for call in inference_calls
+    ] == [False, False]
+    assert [call["save_rewritten_instruction"] for call in inference_calls] == [
+        False,
+        False,
+    ]
     assert [item["request_id"] for item in responses[1:3]] == [
         "entity_1",
         "entity_2",

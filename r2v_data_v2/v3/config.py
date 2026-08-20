@@ -183,6 +183,8 @@ class ReferenceEditConfig:
     target_area: int = 1024 * 1024
     alignment: int = 16
     timeout_seconds: int = 3600
+    completion_instruction_rewrite_enabled: bool = True
+    background_instruction_rewrite_enabled: bool = False
     add_background_to_complete: bool = True
     fallback_policy: str = "keep_source"
     scale_collapse_fallback_guard_mode: str = "off"
@@ -805,6 +807,18 @@ class V3Config:
             raise ValueError(
                 "reference_edit.timeout_seconds must be a positive integer"
             )
+        for name, value in (
+            (
+                "completion_instruction_rewrite_enabled",
+                self.reference_edit.completion_instruction_rewrite_enabled,
+            ),
+            (
+                "background_instruction_rewrite_enabled",
+                self.reference_edit.background_instruction_rewrite_enabled,
+            ),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"reference_edit.{name} must be a boolean")
         if self.reference_edit.add_background_to_complete is not True:
             raise ValueError("reference_edit.add_background_to_complete must be true")
         if self.reference_edit.fallback_policy not in {
@@ -931,6 +945,12 @@ class V3Config:
             "reference_edit.backend": self.reference_edit.backend,
             "reference_edit.model": str(self.reference_edit.model_path),
             "reference_edit.model_revision": self.reference_edit.model_revision,
+            "reference_edit.completion_instruction_rewrite_enabled": str(
+                self.reference_edit.completion_instruction_rewrite_enabled
+            ).lower(),
+            "reference_edit.background_instruction_rewrite_enabled": str(
+                self.reference_edit.background_instruction_rewrite_enabled
+            ).lower(),
             "sam3.backend": self.sam3.backend,
             "sam3.model": (
                 str(self.sam3.model_path) if self.sam3.model_path is not None else None

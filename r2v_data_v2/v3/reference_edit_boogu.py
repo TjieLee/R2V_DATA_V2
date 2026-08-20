@@ -297,6 +297,7 @@ class BooguReferenceEditBackend(Protocol):
         width: int,
         height: int,
         thinking_enabled: bool,
+        instruction_rewrite_enabled: bool | None = None,
         seed: int | None = None,
     ) -> BooguEditOutput: ...
 
@@ -960,12 +961,18 @@ class BooguSubprocessBackend:
         width: int,
         height: int,
         thinking_enabled: bool,
+        instruction_rewrite_enabled: bool | None = None,
         seed: int | None = None,
     ) -> BooguEditOutput:
         if source_rgb.mode != "RGB":
             raise ValueError("Boogu source image must be RGB")
         instruction = _nonempty(instruction, "instruction")
         _validate_output_dimensions(width, height)
+        if instruction_rewrite_enabled is not None and not isinstance(
+            instruction_rewrite_enabled,
+            bool,
+        ):
+            raise TypeError("instruction_rewrite_enabled must be a boolean")
         if seed is not None and (
             not isinstance(seed, int) or isinstance(seed, bool) or seed < 0
         ):
@@ -1002,6 +1009,10 @@ class BooguSubprocessBackend:
             }
             if seed is not None:
                 request["seed"] = seed
+            if instruction_rewrite_enabled is not None:
+                request["instruction_rewrite_enabled"] = (
+                    instruction_rewrite_enabled
+                )
             try:
                 self._write_request(request)
                 result = self._read_response()
@@ -1287,6 +1298,7 @@ def run_boogu_reference_edit(
     backend: BooguReferenceEditBackend,
     judge: BooguReferenceEditJudge,
     sam_reviewer: BooguSamReviewer | None = None,
+    instruction_rewrite_enabled: bool | None = None,
     target_area: int = DEFAULT_TARGET_AREA,
     alignment: int = DEFAULT_ALIGNMENT,
     min_source_content_area_pixels: int = DEFAULT_MIN_SOURCE_CONTENT_AREA_PIXELS,
@@ -1304,6 +1316,10 @@ def run_boogu_reference_edit(
 
     if operation not in {"complete_entity", "add_entity_background"}:
         raise ValueError(f"unsupported Boogu edit operation: {operation}")
+    if instruction_rewrite_enabled is None:
+        instruction_rewrite_enabled = operation == "complete_entity"
+    if not isinstance(instruction_rewrite_enabled, bool):
+        raise TypeError("instruction_rewrite_enabled must be a boolean")
     instruction = _nonempty(instruction, "instruction")
     entity_phrase = _nonempty(entity_phrase, "entity_phrase")
     grounding_prompt = (
@@ -1422,6 +1438,7 @@ def run_boogu_reference_edit(
                 "width": width,
                 "height": height,
                 "thinking_enabled": thinking_enabled,
+                "instruction_rewrite_enabled": instruction_rewrite_enabled,
             },
         ):
             output = backend.edit(
@@ -1430,6 +1447,7 @@ def run_boogu_reference_edit(
                 width=width,
                 height=height,
                 thinking_enabled=thinking_enabled,
+                instruction_rewrite_enabled=instruction_rewrite_enabled,
             )
         if output.original_instruction != instruction:
             raise RuntimeError("backend changed original instruction metadata")
@@ -1562,6 +1580,7 @@ def run_boogu_reference_edit(
             output.effective_instruction if output is not None else instruction
         ),
         "thinking_enabled": thinking_enabled,
+        "instruction_rewrite_enabled": instruction_rewrite_enabled,
         "output_sha256": output_sha256,
         "canonical_source_sha256": canonical_sha256,
         "source_image_path": source_evidence_path.relative_to(root).as_posix(),

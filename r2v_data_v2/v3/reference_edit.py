@@ -81,7 +81,14 @@ COMPLETION_PROMPT_TEMPLATE = (
     "如果补全不了，则只保留最能表示该实体的部分，"
     "去除零散且不合理的部分。"
 )
-BACKGROUND_PROMPT = "给图像添加符合风格的背景，不要增加任何实例。"
+BACKGROUND_PROMPT = """Generate a contextually appropriate background for the foreground subject.
+Choose an environment that best fits the subject’s identity, visual style, clothing, action, emotion, and cinematic tone.
+Adapt the scene automatically so it feels believable and visually coherent.
+Preserve the subject exactly as it is, and focus on creating a background with matching atmosphere, perspective, lighting, and color palette.
+Make sure the subject remains the visual focal point, while the background provides depth, context, and visual coherence.
+Blend everything seamlessly into a polished final image.
+Do not add extra people, duplicate the subject, or introduce distracting foreground objects.
+Do not default to an outdoor scene; choose indoor or outdoor context only if it best matches the subject."""
 _ENTITY_COUNTER_FIELDS = (
     "entities_eligible",
     "entities_accepted",
@@ -250,6 +257,14 @@ def _instruction(operation: str, entity: AnnotationEntity) -> str:
     if operation == "complete_entity":
         return COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity.phrase)
     return BACKGROUND_PROMPT
+
+
+def _instruction_rewrite_enabled(config: V3Config, operation: str) -> bool:
+    if operation == "complete_entity":
+        return config.reference_edit.completion_instruction_rewrite_enabled
+    if operation == "add_entity_background":
+        return config.reference_edit.background_instruction_rewrite_enabled
+    raise ValueError(f"unsupported reference-edit operation: {operation}")
 
 
 def _accepted_reference(
@@ -610,6 +625,10 @@ def reference_edit_clips(
                             backend=operation_backend,
                             judge=operation_judge,
                             sam_reviewer=operation_sam,
+                            instruction_rewrite_enabled=_instruction_rewrite_enabled(
+                                config,
+                                operation,
+                            ),
                             target_area=config.reference_edit.target_area,
                             alignment=config.reference_edit.alignment,
                             min_source_content_area_pixels=(

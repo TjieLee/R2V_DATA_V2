@@ -4761,6 +4761,9 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     assert backend.close_calls == 1
     assert judge.calls == ["complete_entity", "add_entity_background"]
     assert [call["thinking_enabled"] for call in backend.calls] == [True, False]
+    assert [
+        call["instruction_rewrite_enabled"] for call in backend.calls
+    ] == [True, False]
     entity_phrase = storage.read_clip("clip-1").annotation.entities[0].phrase
     assert [call["instruction"] for call in backend.calls] == [
         COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity_phrase),
@@ -4828,6 +4831,44 @@ def test_complete_reference_runs_only_background_with_exact_prompt(
     assert len(backend.calls) == 1
     assert backend.calls[0]["instruction"] == BACKGROUND_PROMPT
     assert backend.calls[0]["thinking_enabled"] is False
+    assert backend.calls[0]["instruction_rewrite_enabled"] is False
+    assert config.reference_edit.completion_instruction_rewrite_enabled is True
+    assert config.reference_edit.background_instruction_rewrite_enabled is False
+
+
+def test_background_prompt_matches_contextual_generation_contract() -> None:
+    assert BACKGROUND_PROMPT == """Generate a contextually appropriate background for the foreground subject.
+Choose an environment that best fits the subject’s identity, visual style, clothing, action, emotion, and cinematic tone.
+Adapt the scene automatically so it feels believable and visually coherent.
+Preserve the subject exactly as it is, and focus on creating a background with matching atmosphere, perspective, lighting, and color palette.
+Make sure the subject remains the visual focal point, while the background provides depth, context, and visual coherence.
+Blend everything seamlessly into a polished final image.
+Do not add extra people, duplicate the subject, or introduce distracting foreground objects.
+Do not default to an outdoor scene; choose indoor or outdoor context only if it best matches the subject."""
+
+
+def test_reference_edit_rewrite_switches_are_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    config = replace(
+        config,
+        reference_edit=replace(
+            config.reference_edit,
+            completion_instruction_rewrite_enabled=False,
+            background_instruction_rewrite_enabled=True,
+        ),
+    )
+
+    assert reference_edit_module._instruction_rewrite_enabled(
+        config,
+        "complete_entity",
+    ) is False
+    assert reference_edit_module._instruction_rewrite_enabled(
+        config,
+        "add_entity_background",
+    ) is True
 
 
 def test_reference_edit_operation_routing_distinguishes_local_and_repairable() -> None:
