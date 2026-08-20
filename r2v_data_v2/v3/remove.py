@@ -17,13 +17,19 @@ from r2v_data_v2.v3.background import (
     validate_background_inputs,
     validate_background_reference,
 )
-from r2v_data_v2.v3.config import V3Config
+from r2v_data_v2.v3.boogu_remove_backend import (
+    build_boogu_background_removal_prompt,
+    create_boogu_background_removal_backend,
+)
+from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, V3Config
 from r2v_data_v2.v3.frames import validate_sampled_frames
 from r2v_data_v2.v3.qwen_image_edit_backend import (
     BackgroundRemovalBackend,
     QwenImageEditRemovalBackend,
     build_background_removal_prompt,
 )
+from r2v_data_v2.v3.profiling import profile_model_call
+from r2v_data_v2.v3.reference_edit_boogu import resolve_boogu_1k_size
 from r2v_data_v2.v3.removal_judge import (
     BackgroundRemovalJudge,
     QwenBackgroundRemovalJudge,
@@ -645,7 +651,13 @@ def remove_backgrounds(
                     continue
 
                 if active_backend is None:
-                    active_backend = QwenImageEditRemovalBackend(config.remove)
+                    if config.remove.backend == BOOGU_REMOVE_BACKEND:
+                        active_backend = create_boogu_background_removal_backend(
+                            config,
+                            storage,
+                        )
+                    else:
+                        active_backend = QwenImageEditRemovalBackend(config.remove)
                     owned_backend = True
                 if active_judge is None:
                     service = config.qwen.background_remove_judge
@@ -656,10 +668,26 @@ def remove_backgrounds(
                     active_judge = QwenBackgroundRemovalJudge(service)
                     owned_judge = True
 
-                prompt = build_background_removal_prompt(
-                    removal_phrases=inputs.removal_phrases,
-                    background_phrase=inputs.background_phrase,
-                )
+                if config.remove.backend == BOOGU_REMOVE_BACKEND:
+                    prompt = build_boogu_background_removal_prompt(
+                        inputs.removal_phrases
+                    )
+                    generation_width, generation_height = resolve_boogu_1k_size(
+                        inputs.source_image.width,
+                        inputs.source_image.height,
+                        target_area=config.reference_edit.target_area,
+                        alignment=config.reference_edit.alignment,
+                    )
+                    profile_component = "boogu_background_remove"
+                    profile_model = str(config.reference_edit.model_path)
+                else:
+                    prompt = build_background_removal_prompt(
+                        removal_phrases=inputs.removal_phrases,
+                        background_phrase=inputs.background_phrase,
+                    )
+                    generation_width, generation_height = inputs.source_image.size
+                    profile_component = "qwen_image_edit_object_remover"
+                    profile_model = str(config.remove.base_model_path)
                 source_mask_image = Image.fromarray(
                     inputs.source_mask.astype(np.uint8) * 255,
                     mode="L",
@@ -670,19 +698,36 @@ def remove_backgrounds(
                 )
                 attempts: list[BackgroundRemovalAttempt] = []
                 accepted: tuple[Image.Image, bytes, str, int] | None = None
-                for seed in config.remove.candidate_seeds:
+                for retry_index, seed in enumerate(config.remove.candidate_seeds):
                     started = time.monotonic()
                     candidate: Image.Image | None = None
                     candidate_sha: str | None = None
                     review: BackgroundRemovalReview | None = None
                     try:
-                        edited = active_backend.remove(
-                            image=inputs.source_image,
-                            removal_phrases=inputs.removal_phrases,
-                            background_phrase=inputs.background_phrase,
-                            prompt=prompt,
-                            seed=seed,
-                        )
+                        with profile_model_call(
+                            component=profile_component,
+                            operation="background_remove",
+                            retry_index=retry_index,
+                            model=profile_model,
+                            input_text_chars=len(prompt),
+                            input_image_count=1,
+                            metadata={
+                                "clip_uid": clip_uid,
+                                "seed": seed,
+                                "source_width": inputs.source_image.width,
+                                "source_height": inputs.source_image.height,
+                                "generation_width": generation_width,
+                                "generation_height": generation_height,
+                                "thinking_enabled": False,
+                            },
+                        ):
+                            edited = active_backend.remove(
+                                image=inputs.source_image,
+                                removal_phrases=inputs.removal_phrases,
+                                background_phrase=inputs.background_phrase,
+                                prompt=prompt,
+                                seed=seed,
+                            )
                         if not isinstance(edited, Image.Image):
                             raise TypeError(
                                 "background removal backend did not return a PIL image"

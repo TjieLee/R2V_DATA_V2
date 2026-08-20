@@ -297,6 +297,7 @@ class BooguReferenceEditBackend(Protocol):
         width: int,
         height: int,
         thinking_enabled: bool,
+        seed: int | None = None,
     ) -> BooguEditOutput: ...
 
 
@@ -959,11 +960,16 @@ class BooguSubprocessBackend:
         width: int,
         height: int,
         thinking_enabled: bool,
+        seed: int | None = None,
     ) -> BooguEditOutput:
         if source_rgb.mode != "RGB":
             raise ValueError("Boogu source image must be RGB")
         instruction = _nonempty(instruction, "instruction")
         _validate_output_dimensions(width, height)
+        if seed is not None and (
+            not isinstance(seed, int) or isinstance(seed, bool) or seed < 0
+        ):
+            raise ValueError("Boogu request seed must be a non-negative integer")
         if self._process is None:
             raise RuntimeError("Boogu worker must be started before editing")
         config = self.config
@@ -994,6 +1000,8 @@ class BooguSubprocessBackend:
                 "width": width,
                 "height": height,
             }
+            if seed is not None:
+                request["seed"] = seed
             try:
                 self._write_request(request)
                 result = self._read_response()

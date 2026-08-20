@@ -18,6 +18,7 @@ ANNOTATION_MODEL_RELATIVE_PATH = Path("Qwen/Qwen3-VL-32B-Instruct")
 REMOVE_MODEL_RELATIVE_PATH = Path("Qwen/Qwen-Image-Edit-2511")
 REMOVE_ADAPTER_NAME = "Qwen-Image-Edit-2511-Object-Remover"
 REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
+BOOGU_REMOVE_BACKEND = "boogu_image_0_1_edit_turbo"
 REFERENCE_EDIT_BACKEND = "boogu_image_0_1_edit_turbo"
 REFERENCE_EDIT_MODEL_REVISION = "hotfix-1k-20260708"
 DEFAULT_MAX_ANNOTATION_ENTITIES = 5
@@ -576,7 +577,7 @@ class V3Config:
             raise ValueError(
                 "qwen.background_remove_judge is required when remove.enabled is true"
             )
-        if self.remove.backend != REMOVE_BACKEND:
+        if self.remove.backend not in {REMOVE_BACKEND, BOOGU_REMOVE_BACKEND}:
             raise ValueError(f"unsupported V3 remove backend: {self.remove.backend}")
         if self.remove.fallback_to_raw:
             raise ValueError("V3 remove.fallback_to_raw must be false")
@@ -599,11 +600,12 @@ class V3Config:
             raise ValueError("remove.dtype must be bfloat16, float16, or float32")
         if self.remove.inference_profile not in {
             "object_remover_4step_v1",
+            "boogu_4step_v1",
             "experimental_override",
         }:
             raise ValueError(
-                "remove.inference_profile must be object_remover_4step_v1 or "
-                "experimental_override"
+                "remove.inference_profile must be object_remover_4step_v1, "
+                "boogu_4step_v1, or experimental_override"
             )
         if (
             not isinstance(self.remove.num_inference_steps, int)
@@ -619,7 +621,39 @@ class V3Config:
                 "remove.inference_profile=object_remover_4step_v1 requires "
                 "num_inference_steps=4"
             )
-        if self.remove.enabled and self.remove.adapter_path is None:
+        if (
+            self.remove.inference_profile == "boogu_4step_v1"
+            and self.remove.num_inference_steps != 4
+        ):
+            raise ValueError(
+                "remove.inference_profile=boogu_4step_v1 requires "
+                "num_inference_steps=4"
+            )
+        if (
+            self.remove.backend == REMOVE_BACKEND
+            and self.remove.inference_profile
+            not in {
+                "object_remover_4step_v1",
+                "experimental_override",
+            }
+        ):
+            raise ValueError(
+                "remove.backend=qwen_image_edit_2511_object_remover is incompatible "
+                f"with inference_profile={self.remove.inference_profile}"
+            )
+        if (
+            self.remove.backend == BOOGU_REMOVE_BACKEND
+            and self.remove.inference_profile != "boogu_4step_v1"
+        ):
+            raise ValueError(
+                "remove.backend=boogu_image_0_1_edit_turbo requires "
+                "inference_profile=boogu_4step_v1"
+            )
+        if (
+            self.remove.enabled
+            and self.remove.backend == REMOVE_BACKEND
+            and self.remove.adapter_path is None
+        ):
             raise ValueError(
                 "remove.adapter_path is required when the Object-Remover stage is enabled"
             )
@@ -731,7 +765,10 @@ class V3Config:
                 "runtime.mode=streaming_v1 does not support "
                 "pair.same_parent_fallback_enabled=true"
             )
-        if self.reference_edit.enabled:
+        boogu_remove_enabled = (
+            self.remove.enabled and self.remove.backend == BOOGU_REMOVE_BACKEND
+        )
+        if self.reference_edit.enabled or boogu_remove_enabled:
             for name, path in (
                 ("python_executable", self.reference_edit.python_executable),
                 ("code_root", self.reference_edit.code_root),

@@ -158,6 +158,21 @@ previous 32768 context-length infrastructure failure. This bounded canary is
 functional evidence only. Its 3 exports from 10 inputs are not a production
 yield estimate.
 
+## Pending Boogu background-removal canary
+
+The intended production removal configuration now selects
+`boogu_image_0_1_edit_turbo` with `boogu_4step_v1`, four inference steps, and
+thinking disabled. The persistent removal worker is isolated to physical GPU4
+and reuses the pinned Boogu runtime/model settings under `reference_edit`.
+Qwen3-VL-32B-Instruct remains the full-resolution background-removal judge and
+is not the image generator. The separate reference-edit Boogu worker remains
+on physical GPU6.
+
+This switch is not production-validated until a server canary passes. It does
+not create or rename the `prod-v1` production version, and it does not change
+the existing removal masks, local compositing, semantic judge, final guard,
+retry, or fail-closed contracts.
+
 ## Shards and cursor semantics
 
 The default shard size is 1000 source records. Complete shards are sealed by

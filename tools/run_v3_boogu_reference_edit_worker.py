@@ -45,8 +45,9 @@ def _validate_edit_request(payload: object) -> dict[str, Any]:
         "width",
         "height",
     }
+    allowed = required | {"seed"}
     missing = sorted(required - set(payload))
-    unknown = sorted(set(payload) - required)
+    unknown = sorted(set(payload) - allowed)
     if missing or unknown:
         raise ValueError(
             f"invalid worker request keys: missing={missing}, unknown={unknown}"
@@ -67,6 +68,13 @@ def _validate_edit_request(payload: object) -> dict[str, Any]:
             raise ValueError(f"{name} must be a positive integer")
         if value % 16:
             raise ValueError(f"{name} must be aligned to 16 pixels")
+    request_seed = payload.get("seed")
+    if request_seed is not None and (
+        not isinstance(request_seed, int)
+        or isinstance(request_seed, bool)
+        or request_seed < 0
+    ):
+        raise ValueError("seed must be a non-negative integer when supplied")
     return payload
 
 
@@ -145,6 +153,7 @@ def _run_loaded_request(
     height = int(request["height"])
     instruction = str(request["instruction"]).strip()
     thinking_enabled = bool(request["thinking_enabled"])
+    effective_seed = int(request.get("seed", seed))
     with Image.open(input_path) as loaded:
         loaded.load()
         if loaded.mode != "RGB":
@@ -175,7 +184,7 @@ def _run_loaded_request(
             empty_instruction_guidance_scale=0.0,
             use_dmd_student_inference=True,
             dmd_conditioning_sigma=0.0,
-            generator=torch_module.Generator(device).manual_seed(seed),
+            generator=torch_module.Generator(device).manual_seed(effective_seed),
             use_rewrite_text_instruction=thinking_enabled,
             merge_original_and_rewritten_instructions=True,
             save_rewritten_instruction=thinking_enabled,
@@ -218,7 +227,7 @@ def _run_loaded_request(
         "thinking_enabled": thinking_enabled,
         "requested_size": [width, height],
         "returned_size": [candidate.width, candidate.height],
-        "seed": seed,
+        "seed": effective_seed,
         "num_inference_steps": 4,
     }
 

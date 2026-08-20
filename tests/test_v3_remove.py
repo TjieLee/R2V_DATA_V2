@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Iterator
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -10,11 +12,18 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
+import r2v_data_v2.v3.boogu_remove_backend as boogu_remove_module
 import r2v_data_v2.v3.config as config_module
 import r2v_data_v2.v3.remove as remove_module
+from r2v_data_v2.v3.boogu_remove_backend import (
+    BooguBackgroundRemovalBackend,
+    build_boogu_background_removal_prompt,
+    create_boogu_background_removal_backend,
+)
 from r2v_data_v2.reconciliation import write_json_atomic
 from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.config import (
+    BOOGU_REMOVE_BACKEND,
     BackgroundConfig,
     DebugConfig,
     QwenServiceConfig,
@@ -24,6 +33,8 @@ from r2v_data_v2.v3.config import (
     V3Config,
 )
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
+from r2v_data_v2.v3.profiling import V3Profiler, active_profiler
+from r2v_data_v2.v3.reference_edit_boogu import BooguEditOutput
 from r2v_data_v2.v3.remove import (
     build_generation_mask,
     composite_candidate,
@@ -138,6 +149,31 @@ class _Judge:
         self.closed = True
 
 
+class _BooguWorker:
+    def __init__(self, color: tuple[int, int, int] = (220, 30, 40)) -> None:
+        self.color = color
+        self.calls: list[dict[str, object]] = []
+        self.closed = False
+
+    def edit(self, **kwargs: object) -> BooguEditOutput:
+        self.calls.append(dict(kwargs))
+        width = int(kwargs["width"])
+        height = int(kwargs["height"])
+        output = BytesIO()
+        Image.new("RGB", (width, height), self.color).save(output, format="PNG")
+        instruction = str(kwargs["instruction"])
+        return BooguEditOutput(
+            png_bytes=output.getvalue(),
+            original_instruction=instruction,
+            rewritten_instruction=None,
+            effective_instruction=instruction,
+            worker_metadata={"seed": kwargs.get("seed")},
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -189,6 +225,28 @@ def _config(
     )
     config.validate()
     return config
+
+
+def _boogu_config(config: V3Config, *, target_area: int = 32 * 32) -> V3Config:
+    writable = config.run_root.parents[1]
+    changed = replace(
+        config,
+        remove=replace(
+            config.remove,
+            backend=BOOGU_REMOVE_BACKEND,
+            inference_profile="boogu_4step_v1",
+            adapter_path=None,
+        ),
+        reference_edit=replace(
+            config.reference_edit,
+            python_executable=writable / "venvs" / "boogu" / "python",
+            code_root=writable / "vendor" / "Boogu-Image",
+            model_path=writable / "models" / "Boogu-Image",
+            target_area=target_area,
+        ),
+    )
+    changed.validate()
+    return changed
 
 
 def _mask(y: int = 2, x: int = 2) -> np.ndarray:
@@ -373,6 +431,197 @@ def test_generation_mask_dilation_zero_is_exact_copy() -> None:
     result = build_generation_mask(source, dilation_pixels=0)
     assert np.array_equal(result, source)
     assert result is not source
+
+
+def test_boogu_remove_prompt_is_short_and_uses_only_entity_phrases() -> None:
+    prompt = build_boogu_background_removal_prompt(
+        ["person in red", "small brown dog"]
+    )
+
+    assert prompt == (
+        "Remove the following foreground entities from the image: person in red, "
+        "small brown dog.\n"
+        "Fill the removed areas naturally with the surrounding background."
+    )
+    assert "open plaza" not in prompt
+    assert "mask" not in prompt.casefold()
+
+
+def test_boogu_remove_adapter_forwards_seed_disables_thinking_and_resizes_exactly(
+) -> None:
+    worker = _BooguWorker()
+    backend = BooguBackgroundRemovalBackend(
+        worker,  # type: ignore[arg-type]
+        target_area=32 * 32,
+        alignment=16,
+    )
+    source = Image.new("RGB", (63, 35), (10, 20, 30))
+    original_bytes = source.tobytes()
+    prompt = build_boogu_background_removal_prompt(["person", "dog"])
+
+    result = backend.remove(
+        image=source,
+        removal_phrases=["person", "dog"],
+        background_phrase="open plaza",
+        prompt=prompt,
+        seed=17,
+    )
+
+    assert result.size == source.size
+    assert result.mode == "RGB"
+    assert source.size == (63, 35)
+    assert source.tobytes() == original_bytes
+    assert len(worker.calls) == 1
+    call = worker.calls[0]
+    assert call["thinking_enabled"] is False
+    assert call["seed"] == 17
+    assert call["instruction"] == prompt
+    assert (call["width"], call["height"]) != source.size
+
+
+def test_boogu_remove_worker_routes_one_physical_gpu_as_local_cuda_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _boogu_config(_config(tmp_path, monkeypatch))
+    storage = _pending_storage(config)
+    created: list[object] = []
+
+    class FakeSubprocessBackend:
+        def __init__(self, worker_config: object) -> None:
+            self.config = worker_config
+            self.started_with: Path | None = None
+            self.closed = False
+            created.append(self)
+
+        def start(self, *, stderr_log_path: Path) -> None:
+            self.started_with = stderr_log_path
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        boogu_remove_module,
+        "BooguSubprocessBackend",
+        FakeSubprocessBackend,
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
+
+    backend = create_boogu_background_removal_backend(config, storage)
+
+    assert len(created) == 1
+    worker = created[0]
+    assert isinstance(worker, FakeSubprocessBackend)
+    assert worker.config.cuda_visible_devices == "4"
+    assert worker.config.device == "cuda:0"
+    assert worker.started_with == storage.boogu_remove_worker_log_path()
+    backend.close()
+    assert worker.closed is True
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,6")
+    with pytest.raises(ValueError, match="one visible physical GPU"):
+        create_boogu_background_removal_backend(config, storage)
+
+
+def test_boogu_remove_keeps_existing_composite_and_judge_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _boogu_config(_config(tmp_path, monkeypatch), target_area=32 * 32)
+    storage = _pending_storage(config)
+    worker = _BooguWorker(color=(240, 1, 2))
+    backend = BooguBackgroundRemovalBackend(
+        worker,  # type: ignore[arg-type]
+        target_area=config.reference_edit.target_area,
+        alignment=config.reference_edit.alignment,
+    )
+
+    class CapturingJudge(_Judge):
+        def __init__(self) -> None:
+            super().__init__([_reject(), _accept()])
+            self.candidates: list[Image.Image] = []
+            self.sources: list[Image.Image] = []
+
+        def review(self, **kwargs: object) -> BackgroundRemovalReview:
+            candidate = kwargs["candidate_image"]
+            assert isinstance(candidate, Image.Image)
+            self.candidates.append(candidate.copy())
+            source = kwargs["source_image"]
+            assert isinstance(source, Image.Image)
+            self.sources.append(source.copy())
+            return super().review(**kwargs)
+
+    judge = CapturingJudge()
+    stats = remove_backgrounds(config, storage, backend=backend, judge=judge)
+
+    assert stats.ready_removed == 1
+    assert stats.candidates_generated == 2
+    assert [call["seed"] for call in worker.calls] == [0, 17]
+    assert all(call["thinking_enabled"] is False for call in worker.calls)
+    assert len(judge.candidates) == 2
+    source = judge.sources[-1]
+    state = _background(storage)
+    assert state.output_image_path is not None
+    with Image.open(storage.root / state.output_image_path) as loaded:
+        published = loaded.convert("RGB")
+    mask = _mask()
+    assert np.array_equal(np.asarray(published)[~mask], np.asarray(source)[~mask])
+    assert np.all(np.asarray(published)[mask] == np.array([240, 1, 2]))
+
+
+def test_boogu_remove_profiling_uses_dedicated_component_and_safe_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _boogu_config(_config(tmp_path, monkeypatch, seeds=(23,)))
+    storage = _pending_storage(config)
+    worker = _BooguWorker()
+    backend = BooguBackgroundRemovalBackend(
+        worker,  # type: ignore[arg-type]
+        target_area=config.reference_edit.target_area,
+        alignment=config.reference_edit.alignment,
+    )
+    profiler = V3Profiler(storage.root, git_commit="abc123")
+
+    with active_profiler(profiler):
+        stats = remove_backgrounds(config, storage, backend=backend, judge=_Judge())
+
+    assert stats.ready_removed == 1
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    event = next(item for item in events if item["kind"] == "model_call")
+    assert event["component"] == "boogu_background_remove"
+    assert event["operation"] == "background_remove"
+    assert event["metadata"] == {
+        "clip_uid": "clip-1",
+        "generation_height": worker.calls[0]["height"],
+        "generation_width": worker.calls[0]["width"],
+        "seed": 23,
+        "source_height": HEIGHT,
+        "source_width": WIDTH,
+        "thinking_enabled": False,
+    }
+
+
+def test_legacy_remove_profiling_keeps_object_remover_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, seeds=(0,))
+    storage = _pending_storage(config)
+    profiler = V3Profiler(storage.root, git_commit="abc123")
+
+    with active_profiler(profiler):
+        remove_backgrounds(config, storage, backend=_Backend(), judge=_Judge())
+
+    events = [
+        json.loads(line)
+        for line in profiler.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    event = next(item for item in events if item["kind"] == "model_call")
+    assert event["component"] == "qwen_image_edit_object_remover"
 
 
 def test_generation_mask_dilation_is_deterministic_and_contains_source() -> None:
@@ -810,6 +1059,50 @@ def test_default_remove_profile_is_validated_four_step_contract(
             num_inference_steps=40,
         ),
     ).validate()
+
+
+def test_boogu_remove_profile_is_strict_four_step_without_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _boogu_config(_config(tmp_path, monkeypatch))
+
+    assert config.remove.backend == BOOGU_REMOVE_BACKEND
+    assert config.remove.adapter_path is None
+    assert config.remove.num_inference_steps == 4
+    with pytest.raises(ValueError, match="requires num_inference_steps=4"):
+        replace(
+            config,
+            remove=replace(config.remove, num_inference_steps=5),
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    ("backend", "profile"),
+    [
+        (BOOGU_REMOVE_BACKEND, "object_remover_4step_v1"),
+        (config_module.REMOVE_BACKEND, "boogu_4step_v1"),
+    ],
+)
+def test_remove_backend_and_profile_must_not_contradict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    profile: str,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    if backend == BOOGU_REMOVE_BACKEND:
+        config = _boogu_config(config)
+
+    with pytest.raises(ValueError, match="inference_profile"):
+        replace(
+            config,
+            remove=replace(
+                config.remove,
+                backend=backend,
+                inference_profile=profile,
+            ),
+        ).validate()
 
 
 def test_enabled_remove_requires_object_remover_adapter(

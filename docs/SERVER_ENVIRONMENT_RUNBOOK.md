@@ -49,7 +49,7 @@ PRODUCTION
 
 PERSISTENT GPU WORKERS
   physical GPU 4
-    - Object Remover
+    - Boogu background-removal generator
   physical GPU 5
     - main temporal SAM3
   physical GPU 6
@@ -144,14 +144,14 @@ the public roots.
 
 ## 3. Production GPU Allocation
 
-Current validated allocation:
+Intended allocation for the next production canary:
 
 ```text
 physical GPU 0  Qwen3-VL DP replica 0, TP1
 physical GPU 1  Qwen3-VL DP replica 1, TP1
 physical GPU 2  Qwen3-VL DP replica 2, TP1
 physical GPU 3  Qwen3-VL DP replica 3, TP1
-physical GPU 4  Object Remover
+physical GPU 4  Boogu background-removal generator
 physical GPU 5  main temporal SAM3
 physical GPU 6  Boogu / reference-edit worker
 physical GPU 7  dedicated subject-attribute single-frame SAM3
@@ -171,9 +171,10 @@ Important ordinal rules:
   `sam3.device: cuda`; never put `cuda:5` in the worker-local SAM3 config;
 - dedicated attribute SAM3 uses physical GPU7 through the same isolation rule
   and also uses worker-local `cuda`;
-- Object Remover is assigned physical GPU4 by runtime GPU-worker configuration;
-- Boogu is assigned physical GPU6 and sees its isolated local CUDA device as
-  `cuda:0`;
+- Boogu background removal is assigned physical GPU4 by runtime GPU-worker
+  configuration and sees its isolated local CUDA device as `cuda:0`;
+- the separate Boogu reference-edit worker is assigned physical GPU6 and sees
+  its isolated local CUDA device as `cuda:0`;
 - Qwen is an external vLLM service on physical GPUs 0-3 and is not launched by
   `run_pipeline_v3.py`.
 
@@ -381,7 +382,8 @@ pair:
   background_final_guard_mode: qwen_v1
 
 remove:
-  inference_profile: object_remover_4step_v1
+  backend: boogu_image_0_1_edit_turbo
+  inference_profile: boogu_4step_v1
   num_inference_steps: 4
 
 reference_edit:
@@ -411,6 +413,15 @@ runtime:
 `runtime.gpu_workers.subject_attributes_segment` are sidecar runtime-capacity
 settings and are excluded from the frozen Visual fingerprint/model identifiers.
 The Git commit remains part of run identity.
+
+The intended background-removal generator is Boogu Image 0.1 Edit Turbo with
+four inference steps and thinking disabled on physical GPU4. It reuses the
+pinned `reference_edit` Boogu Python, code root, model path, model revision,
+1MP sizing, and alignment settings. Qwen3-VL-32B-Instruct remains the
+background-removal judge; it is not the removal image generator. Reference
+editing remains a separate Boogu worker on physical GPU6. This generator
+switch is not production-validated until a server canary passes, and it does
+not change the `prod-v1` production version.
 
 Same-parent cross-pair remains disabled for the frozen Visual path. Do not loosen
 Visual thresholds to increase export yield.

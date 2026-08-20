@@ -1009,13 +1009,23 @@ for line in sys.stdin:
         height=768,
         thinking_enabled=True,
     )
+    seeded = backend.edit(
+        source_rgb=Image.new("RGB", (160, 90)),
+        instruction="Remove an entity.",
+        width=1360,
+        height=768,
+        thinking_enabled=False,
+        seed=17,
+    )
     backend.close()
 
     assert first.effective_instruction == "Add a background."
     assert second.effective_instruction == "Complete the entity."
+    assert seeded.effective_instruction == "Remove an entity."
     events = [json.loads(line) for line in events_path.read_text().splitlines()]
     assert [event["type"] for event in events] == [
         "startup",
+        "edit",
         "edit",
         "edit",
         "shutdown",
@@ -1023,6 +1033,9 @@ for line in sys.stdin:
     assert events[0]["argv"][:2] == [str(worker.resolve()), "--serve"]
     assert events[0]["cuda"] == "3"
     assert events[1]["request_id"] != events[2]["request_id"]
+    assert "seed" not in events[1]
+    assert "seed" not in events[2]
+    assert events[3]["seed"] == 17
 
 
 @pytest.mark.parametrize(
@@ -1325,15 +1338,26 @@ def test_jsonl_worker_loads_pipeline_once_for_multiple_entities(
         {
             "schema_version": 1,
             "type": "edit",
-            "request_id": request_id,
+            "request_id": "entity_1",
             "input_image_path": str(input_path.resolve()),
-            "output_image_path": str((tmp_path / f"{request_id}.png").resolve()),
-            "instruction": f"Edit {request_id}.",
+            "output_image_path": str((tmp_path / "entity_1.png").resolve()),
+            "instruction": "Edit entity_1.",
             "thinking_enabled": False,
             "width": 32,
             "height": 32,
-        }
-        for request_id in ("entity_1", "entity_2")
+        },
+        {
+            "schema_version": 1,
+            "type": "edit",
+            "request_id": "entity_2",
+            "input_image_path": str(input_path.resolve()),
+            "output_image_path": str((tmp_path / "entity_2.png").resolve()),
+            "instruction": "Edit entity_2.",
+            "thinking_enabled": False,
+            "width": 32,
+            "height": 32,
+            "seed": 17,
+        },
     ]
     requests.append(
         {
@@ -1361,6 +1385,8 @@ def test_jsonl_worker_loads_pipeline_once_for_multiple_entities(
     responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert load_calls == 1
     assert len(inference_calls) == 2
+    assert [call["generator"].seed for call in inference_calls] == [0, 17]
+    assert [call["num_inference_steps"] for call in inference_calls] == [4, 4]
     assert [item["request_id"] for item in responses[1:3]] == [
         "entity_1",
         "entity_2",

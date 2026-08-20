@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from r2v_data_v2.v3.config import V3Config, load_config
+from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, V3Config, load_config
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.profiling import (
     QwenConcurrencyGate,
@@ -86,16 +86,27 @@ class _StageRuntime:
                 backend=backend,
             )
         if self.stage == "remove":
-            from r2v_data_v2.v3.qwen_image_edit_backend import (
-                QwenImageEditRemovalBackend,
-            )
+            if self.config.remove.backend == BOOGU_REMOVE_BACKEND:
+                from r2v_data_v2.v3.boogu_remove_backend import (
+                    create_boogu_background_removal_backend,
+                )
+
+                backend = create_boogu_background_removal_backend(
+                    self.config,
+                    self.storage,
+                )
+            else:
+                from r2v_data_v2.v3.qwen_image_edit_backend import (
+                    QwenImageEditRemovalBackend,
+                )
+
+                backend = QwenImageEditRemovalBackend(self.config.remove)
             from r2v_data_v2.v3.removal_judge import QwenBackgroundRemovalJudge
             from r2v_data_v2.v3.remove import remove_backgrounds
 
             service = self.config.qwen.background_remove_judge
             if service is None:
                 raise ValueError("qwen.background_remove_judge is required")
-            backend = QwenImageEditRemovalBackend(self.config.remove)
             judge = QwenBackgroundRemovalJudge(service)
             self._closers.extend((judge, backend))
             return lambda scoped: remove_backgrounds(

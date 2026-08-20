@@ -766,9 +766,21 @@ class RunStorage:
         destination.parent.mkdir(parents=True, exist_ok=True)
         return destination
 
+    def boogu_remove_worker_log_path(self) -> Path:
+        self._require_initialized()
+        destination = self.root / "logs" / "boogu_remove_worker.stderr.log"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        return destination
+
     def reference_edit_temporary_dir(self) -> Path:
         self._require_initialized()
         destination = self.root / ".tmp" / "reference_edit"
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def boogu_remove_temporary_dir(self) -> Path:
+        self._require_initialized()
+        destination = self.root / ".tmp" / "boogu_remove"
         destination.mkdir(parents=True, exist_ok=True)
         return destination
 
