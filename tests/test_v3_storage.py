@@ -1428,6 +1428,63 @@ def test_exporter_reads_only_background_output_image_path(
         / "background_1.png"
     )
     assert exported_background.is_file()
+    exported_sample = DatasetSample.model_validate_json(
+        (storage.config.resolved_export_root / "samples.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    background_reference = exported_sample.references[1]
+    assert background_reference.type == "background"
+    assert background_reference.entity_id is None
+    assert background_reference.scope == "scene"
+    assert background_reference.synthetic is True
+
+
+def test_exporter_does_not_publish_rejected_unbound_background(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _initialize_storage_with_complete_clip(tmp_path, monkeypatch)
+    clip = storage.read_clip("clip-1")
+    storage.write_references(
+        "clip-1",
+        clip.references.model_copy(
+            update={
+                "background": BackgroundReferenceState(
+                    status="rejected",
+                    reason="final background guard rejected",
+                )
+            }
+        ),
+    )
+    storage.write_pairing(
+        "clip-1",
+        PairingState(
+            status="ready",
+            retained_entity_ids=["e1"],
+            tokens={"e1": "<ref_subject_1>"},
+            background_token=None,
+        ),
+    )
+    storage.write_instruction("clip-1", _instruction_state())
+
+    dataset = DatasetExporter(storage.config, storage).export()
+
+    assert dataset.reference_count == 1
+    exported_sample = DatasetSample.model_validate_json(
+        (storage.config.resolved_export_root / "samples.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [reference.type for reference in exported_sample.references] == [
+        "entity"
+    ]
+    assert not (
+        storage.config.resolved_export_root
+        / "references"
+        / "clip-1"
+        / "background_1.png"
+    ).exists()
 
 
 def test_run_metadata_is_resumable_and_mismatch_fails_closed(

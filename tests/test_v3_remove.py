@@ -133,10 +133,12 @@ class _Judge:
             responses or []
         )
         self.calls = 0
+        self.candidate_modes: list[object] = []
         self.closed = False
 
     def review(self, **kwargs: object) -> BackgroundRemovalReview:
         self.calls += 1
+        self.candidate_modes.append(kwargs.get("candidate_mode"))
         try:
             response = next(self.responses)
         except StopIteration:
@@ -448,6 +450,7 @@ def test_boogu_remove_prompt_is_short_and_uses_only_entity_phrases() -> None:
 
 
 def test_boogu_remove_adapter_forwards_seed_disables_thinking_and_resizes_exactly(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker = _BooguWorker()
     backend = BooguBackgroundRemovalBackend(
@@ -458,6 +461,26 @@ def test_boogu_remove_adapter_forwards_seed_disables_thinking_and_resizes_exactl
     source = Image.new("RGB", (63, 35), (10, 20, 30))
     original_bytes = source.tobytes()
     prompt = build_boogu_background_removal_prompt(["person", "dog"])
+    resize_calls: list[tuple[tuple[int, int], object]] = []
+    original_resize = Image.Image.resize
+
+    def tracked_resize(
+        image: Image.Image,
+        size: tuple[int, int],
+        resample: object = None,
+        box: object = None,
+        reducing_gap: object = None,
+    ) -> Image.Image:
+        resize_calls.append((size, resample))
+        return original_resize(
+            image,
+            size,
+            resample=resample,
+            box=box,
+            reducing_gap=reducing_gap,
+        )
+
+    monkeypatch.setattr(Image.Image, "resize", tracked_resize)
 
     result = backend.remove(
         image=source,
@@ -477,6 +500,8 @@ def test_boogu_remove_adapter_forwards_seed_disables_thinking_and_resizes_exactl
     assert call["seed"] == 17
     assert call["instruction"] == prompt
     assert (call["width"], call["height"]) != source.size
+    assert (call["width"], call["height"]) == backend.generation_size(source)
+    assert resize_calls == [(source.size, Image.Resampling.LANCZOS)]
 
 
 def test_boogu_remove_worker_routes_one_physical_gpu_as_local_cuda_zero(
@@ -523,7 +548,7 @@ def test_boogu_remove_worker_routes_one_physical_gpu_as_local_cuda_zero(
         create_boogu_background_removal_backend(config, storage)
 
 
-def test_boogu_remove_keeps_existing_composite_and_judge_semantics(
+def test_boogu_remove_uses_authoritative_full_frame_candidate_without_composite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -552,6 +577,12 @@ def test_boogu_remove_keeps_existing_composite_and_judge_semantics(
             return super().review(**kwargs)
 
     judge = CapturingJudge()
+
+    def reject_composite(**kwargs: object) -> Image.Image:
+        del kwargs
+        raise AssertionError("Boogu full-frame mode must not composite")
+
+    monkeypatch.setattr(remove_module, "composite_candidate", reject_composite)
     stats = remove_backgrounds(config, storage, backend=backend, judge=judge)
 
     assert stats.ready_removed == 1
@@ -559,14 +590,18 @@ def test_boogu_remove_keeps_existing_composite_and_judge_semantics(
     assert [call["seed"] for call in worker.calls] == [0, 17]
     assert all(call["thinking_enabled"] is False for call in worker.calls)
     assert len(judge.candidates) == 2
-    source = judge.sources[-1]
+    assert judge.candidate_modes == ["full_frame", "full_frame"]
     state = _background(storage)
     assert state.output_image_path is not None
+    assert state.source_mask_path is not None
+    assert state.generation_mask_path is not None
+    assert state.removal_seed == 17
+    assert state.output_sha256 == hashlib.sha256(
+        (storage.root / state.output_image_path).read_bytes()
+    ).hexdigest()
     with Image.open(storage.root / state.output_image_path) as loaded:
         published = loaded.convert("RGB")
-    mask = _mask()
-    assert np.array_equal(np.asarray(published)[~mask], np.asarray(source)[~mask])
-    assert np.all(np.asarray(published)[mask] == np.array([240, 1, 2]))
+    assert np.all(np.asarray(published) == np.array([240, 1, 2]))
 
 
 def test_boogu_remove_profiling_uses_dedicated_component_and_safe_metadata(
@@ -875,11 +910,21 @@ def test_first_seed_accepts_and_publishes_strict_artifacts(
     config = _config(tmp_path, monkeypatch)
     storage = _pending_storage(config)
     backend = _Backend()
+    judge = _Judge([_accept()])
+    composite_calls = 0
+    original_composite = remove_module.composite_candidate
+
+    def tracked_composite(**kwargs: object) -> Image.Image:
+        nonlocal composite_calls
+        composite_calls += 1
+        return original_composite(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(remove_module, "composite_candidate", tracked_composite)
     stats = remove_backgrounds(
         config,
         storage,
         backend=backend,
-        judge=_Judge([_accept()]),
+        judge=judge,
     )
     state = _background(storage)
     assert stats.processed == stats.ready_removed == 1
@@ -888,6 +933,8 @@ def test_first_seed_accepts_and_publishes_strict_artifacts(
     assert state.status == "ready_removed"
     assert state.removal_seed == 0
     assert state.removal_backend == "qwen_image_edit_2511_object_remover"
+    assert judge.candidate_modes == ["masked_local"]
+    assert composite_calls == 2
     assert state.output_image_path == "clips/clip-1/selected/bg_removed.png"
     assert state.generation_mask_path is not None
     assert state.generation_mask_path.startswith(
@@ -903,6 +950,53 @@ def test_first_seed_accepts_and_publishes_strict_artifacts(
     ]
     assert len(accepted) == 1
     assert storage.read_clip("clip-1").references.entities[0].entity_id == "e1"
+
+
+@pytest.mark.parametrize(
+    ("wrong_size", "wrong_hash", "mode", "error"),
+    [
+        (True, False, "RGB", "dimensions are invalid"),
+        (False, False, "RGBA", "must be RGB"),
+        (False, True, "RGB", "hash does not match candidate bytes"),
+    ],
+)
+def test_publish_ready_full_frame_fails_closed_on_dimensions_or_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_size: bool,
+    wrong_hash: bool,
+    mode: str,
+    error: str,
+) -> None:
+    config = _boogu_config(_config(tmp_path, monkeypatch))
+    storage = _pending_storage(config)
+    state = _background(storage)
+    inputs = remove_module._prepare_inputs(config, storage, "clip-1", state)
+    size = (2, 2) if wrong_size else inputs.source_image.size
+    color = (7, 8, 9, 255) if mode == "RGBA" else (7, 8, 9)
+    candidate = Image.new(mode, size, color)
+    candidate_bytes = remove_module._png_bytes(candidate)
+    candidate_sha = hashlib.sha256(candidate_bytes).hexdigest()
+    if wrong_hash:
+        candidate_sha = "0" * 64
+
+    with pytest.raises(ValueError, match=error):
+        remove_module._publish_ready(
+            config,
+            storage,
+            clip_uid="clip-1",
+            original=state,
+            inputs=inputs,
+            candidate=candidate,
+            candidate_bytes=candidate_bytes,
+            candidate_sha256=candidate_sha,
+            seed=0,
+            attempts=[],
+            candidate_mode="full_frame",
+        )
+
+    assert _background(storage).status == "pending_remove"
+    assert not storage.selected_background_output_path("clip-1").exists()
 
 
 def test_first_reject_second_accept_preserves_seed_order(
@@ -1255,6 +1349,9 @@ def test_rejected_candidate_debug_saving_is_explicitly_gated(
     directory = storage.clip_dir("clip-1") / "debug" / "remove"
     assert (directory / "candidate_seed_0.png").is_file()
     assert (directory / "review_seed_0.json").is_file()
+    assert (directory / "source.png").is_file()
+    assert (directory / "source_mask.png").is_file()
+    assert (directory / "generation_mask.png").is_file()
 
 
 

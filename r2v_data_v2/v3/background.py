@@ -328,7 +328,10 @@ def _validate_ready_removed(
     frame: SampledFrame,
     source_mask: np.ndarray,
 ) -> None:
-    from r2v_data_v2.v3.remove import build_generation_mask
+    from r2v_data_v2.v3.remove import (
+        build_generation_mask,
+        removal_candidate_mode,
+    )
 
     if (
         state.output_image_path is None
@@ -405,14 +408,16 @@ def _validate_ready_removed(
         if opened.size != (frames.width, frames.height):
             raise ValueError("ready removed background output dimensions are invalid")
         output = np.asarray(opened.convert("RGB"))
-    if not np.array_equal(output[~generation_mask], source[~generation_mask]):
-        raise ValueError(
-            "ready removed background changed pixels outside generation mask"
-        )
-    if not np.any(output[generation_mask] != source[generation_mask]):
-        raise ValueError(
-            "ready removed background did not change the generation mask"
-        )
+    candidate_mode = removal_candidate_mode(state.removal_backend or "")
+    if candidate_mode == "masked_local":
+        if not np.array_equal(output[~generation_mask], source[~generation_mask]):
+            raise ValueError(
+                "ready removed background changed pixels outside generation mask"
+            )
+        if not np.any(output[generation_mask] != source[generation_mask]):
+            raise ValueError(
+                "ready removed background did not change the generation mask"
+            )
 
 
 def validate_background_reference(

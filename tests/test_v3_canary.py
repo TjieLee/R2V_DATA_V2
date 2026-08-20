@@ -393,18 +393,49 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
             json.dumps({"sample_count": 1, "reference_count": 2}),
             encoding="utf-8",
         )
+        (config.export_root / "samples.jsonl").write_text(
+            json.dumps(
+                {
+                    "references": [
+                        {"type": "entity"},
+                        {"type": "background"},
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("pipeline passed\n", encoding="utf-8")
         return PipelineExecution(
             returncode=0,
             output="{}\n",
-            result={"runtime": {"failed_tasks": []}},
+            result={
+                "runtime": {"failed_tasks": []},
+                "remove": {
+                    "candidates_generated": 3,
+                    "candidates_rejected": 2,
+                    "ready_removed": 1,
+                },
+            },
         )
 
     def successful_compactor(**kwargs: object) -> dict[str, object]:
         compact_calls.append(kwargs)
         output_root = Path(str(kwargs["output_root"]))
-        (output_root / "samples.jsonl").write_text("{}\n", encoding="utf-8")
+        (output_root / "samples.jsonl").write_text(
+            json.dumps(
+                {
+                    "references": [
+                        {"kind": "subject"},
+                        {"kind": "background"},
+                        {"kind": "attribute"},
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         (output_root / "references").mkdir()
         return {
             "total_samples": 1,
@@ -435,8 +466,15 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
     assert summary["elapsed_hms"] == "00:00:12"
     assert summary["visual_samples"] == 1
     assert summary["visual_references"] == 2
+    assert summary["visual_background_references"] == 1
     assert summary["canonical_samples"] == 1
+    assert summary["canonical_background_references"] == 1
     assert summary["canonical_attribute_references"] == 1
+    assert summary["samples_with_background"] == 1
+    assert summary["remove_candidates_generated"] == 3
+    assert summary["remove_candidates_accepted"] == 1
+    assert summary["remove_candidates_rejected"] == 2
+    assert summary["ready_removed"] == 1
     assert summary["failed_tasks"] == []
     summary_path = Path(str(summary["export_root"])) / "canary_summary.json"
     assert json.loads(summary_path.read_text(encoding="utf-8")) == summary

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from openai import BadRequestError, OpenAI
 from PIL import Image
@@ -33,6 +33,39 @@ no_new_salient_entity, background_only_in_repaired_region,
 background_continuity_ok, no_visible_artifacts, reason.
 verdict is accept if and only if every boolean is true. Return JSON only."""
 
+FULL_FRAME_SYSTEM_PROMPT = """You are the semantic quality guard for full-frame background removal.
+
+You receive exactly four images in order:
+1. the original source image;
+2. the resized full-frame candidate background;
+3. the original foreground source mask;
+4. the generation mask identifying the intended repaired region.
+
+Judge only visible facts. The candidate is a full-frame image edit, so minor
+registration, scale, resampling, interpolation, translation, and photometric differences are
+allowed outside the generation mask. Do not reject those minor global changes
+by themselves. Reject if any original foreground remains, is reconstructed, or
+is duplicated. Reject any new person, animal, vehicle, product, text, sign, or
+other salient entity. Reject disappearance or material alteration of unrelated
+salient entities that were supposed to remain. Reject material unrelated scene
+or layout changes, severe background hallucination, severe artifacts, ghosts,
+double exposure, obvious seams, broken structure, duplicated geometry, color
+or texture breaks, and lighting discontinuities.
+background_only_in_repaired_region means that the substantive content edit is
+limited to removing and reconstructing the requested foreground area; any
+differences elsewhere are only minor registration, resampling, or photometric
+differences and do not materially alter scene content. It does not require
+pixel-exact identity outside the generation mask. The result must remain a
+coherent background-only version of the source scene.
+
+Return one strict JSON object containing only:
+verdict, foreground_absent, foreground_not_reconstructed,
+no_new_salient_entity, background_only_in_repaired_region,
+background_continuity_ok, no_visible_artifacts, reason.
+verdict is accept if and only if every boolean is true. Return JSON only."""
+
+RemovalCandidateMode = Literal["masked_local", "full_frame"]
+
 
 class BackgroundRemovalJudge(Protocol):
     def review(
@@ -44,6 +77,7 @@ class BackgroundRemovalJudge(Protocol):
         generation_mask: Image.Image,
         removal_phrases: list[str],
         background_phrase: str,
+        candidate_mode: RemovalCandidateMode = "masked_local",
     ) -> BackgroundRemovalReview: ...
 
 
@@ -77,7 +111,10 @@ class QwenBackgroundRemovalJudge:
         generation_mask: Image.Image,
         removal_phrases: list[str],
         background_phrase: str,
+        candidate_mode: RemovalCandidateMode = "masked_local",
     ) -> list[dict[str, object]]:
+        if candidate_mode not in {"masked_local", "full_frame"}:
+            raise ValueError(f"unsupported removal candidate mode: {candidate_mode}")
         semantics = (
             "Foreground phrases: "
             + "; ".join(removal_phrases)
@@ -87,9 +124,14 @@ class QwenBackgroundRemovalJudge:
         content: list[dict[str, object]] = [
             {"type": "text", "text": semantics},
         ]
+        candidate_label = (
+            "Image 2: locally composited candidate"
+            if candidate_mode == "masked_local"
+            else "Image 2: resized full-frame candidate"
+        )
         for label, image in (
             ("Image 1: original source", source_image.convert("RGB")),
-            ("Image 2: locally composited candidate", candidate_image.convert("RGB")),
+            (candidate_label, candidate_image.convert("RGB")),
             ("Image 3: foreground source mask", source_mask.convert("L")),
             ("Image 4: generation mask", generation_mask.convert("L")),
         ):
@@ -101,7 +143,14 @@ class QwenBackgroundRemovalJudge:
                 }
             )
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    SYSTEM_PROMPT
+                    if candidate_mode == "masked_local"
+                    else FULL_FRAME_SYSTEM_PROMPT
+                ),
+            },
             {"role": "user", "content": content},
         ]
 
@@ -163,6 +212,7 @@ class QwenBackgroundRemovalJudge:
         generation_mask: Image.Image,
         removal_phrases: list[str],
         background_phrase: str,
+        candidate_mode: RemovalCandidateMode = "masked_local",
     ) -> BackgroundRemovalReview:
         if not removal_phrases or not all(
             isinstance(phrase, str) and phrase.strip()
@@ -179,6 +229,7 @@ class QwenBackgroundRemovalJudge:
                 generation_mask=generation_mask,
                 removal_phrases=removal_phrases,
                 background_phrase=background_phrase,
+                candidate_mode=candidate_mode,
             )
         )
         return BackgroundRemovalReview.model_validate_json(raw)

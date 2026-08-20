@@ -482,10 +482,17 @@ def _print_summary(summary: dict[str, object]) -> None:
         "elapsed_hms",
         "visual_samples",
         "visual_references",
+        "visual_background_references",
         "canonical_samples",
         "canonical_visual_references",
+        "canonical_background_references",
         "canonical_attribute_references",
+        "samples_with_background",
         "enriched_samples",
+        "remove_candidates_generated",
+        "remove_candidates_accepted",
+        "remove_candidates_rejected",
+        "ready_removed",
         "failed_tasks",
         "config",
         "run_root",
@@ -501,6 +508,52 @@ def _print_summary(summary: dict[str, object]) -> None:
             else value
         )
         print(f"{field_name}: {rendered}")
+
+
+def _background_counts(
+    samples_path: Path,
+    *,
+    kind_field: str,
+) -> tuple[int, int]:
+    if not samples_path.is_file():
+        return 0, 0
+    reference_count = 0
+    sample_count = 0
+    with samples_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            sample = json.loads(line)
+            if not isinstance(sample, dict):
+                raise TypeError("samples.jsonl line must contain an object")
+            references = sample.get("references", [])
+            if not isinstance(references, list):
+                raise TypeError("samples.jsonl references must contain an array")
+            backgrounds = sum(
+                isinstance(reference, dict)
+                and reference.get(kind_field) == "background"
+                for reference in references
+            )
+            reference_count += backgrounds
+            sample_count += backgrounds > 0
+    return reference_count, sample_count
+
+
+def _stage_count(
+    result: dict[str, object] | None,
+    *,
+    stage: str,
+    field: str,
+) -> int:
+    if not isinstance(result, dict):
+        return 0
+    stage_result = result.get(stage)
+    if not isinstance(stage_result, dict):
+        return 0
+    value = stage_result.get(field, 0)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return 0
+    return value
 
 
 def run_canary(
@@ -574,6 +627,16 @@ def run_canary(
         source_yaml=paths.source_yaml,
         runs_root=paths.canary_runs_root,
     )
+    visual_background_references, _ = _background_counts(
+        paths.shard_export_root / "samples.jsonl",
+        kind_field="type",
+    )
+    canonical_background_references, samples_with_background = (
+        _background_counts(
+            paths.export_root / "samples.jsonl",
+            kind_field="kind",
+        )
+    )
     elapsed_seconds = clock() - started
     summary: dict[str, object] = {
         "status": "PASS",
@@ -586,12 +649,35 @@ def run_canary(
         "elapsed_hms": _elapsed_hms(elapsed_seconds),
         "visual_samples": int(shard_dataset["sample_count"]),
         "visual_references": int(shard_dataset["reference_count"]),
+        "visual_background_references": visual_background_references,
         "canonical_samples": int(catalog["total_samples"]),
         "canonical_visual_references": int(catalog["total_visual_references"]),
+        "canonical_background_references": canonical_background_references,
         "canonical_attribute_references": int(
             catalog["total_attribute_references"]
         ),
+        "samples_with_background": samples_with_background,
         "enriched_samples": int(catalog["total_enriched_samples"]),
+        "remove_candidates_generated": _stage_count(
+            execution.result,
+            stage="remove",
+            field="candidates_generated",
+        ),
+        "remove_candidates_accepted": _stage_count(
+            execution.result,
+            stage="remove",
+            field="ready_removed",
+        ),
+        "remove_candidates_rejected": _stage_count(
+            execution.result,
+            stage="remove",
+            field="candidates_rejected",
+        ),
+        "ready_removed": _stage_count(
+            execution.result,
+            stage="remove",
+            field="ready_removed",
+        ),
         "failed_tasks": _failed_tasks(execution.result),
         "config": str(paths.shard_config),
         "run_root": str(paths.run_root),

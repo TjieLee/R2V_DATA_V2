@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.removal_judge import (
+    FULL_FRAME_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     QwenBackgroundRemovalJudge,
 )
@@ -81,7 +82,11 @@ def _judge(completions: _Completions) -> QwenBackgroundRemovalJudge:
     )
 
 
-def _review(judge: QwenBackgroundRemovalJudge):
+def _review(
+    judge: QwenBackgroundRemovalJudge,
+    *,
+    candidate_mode: str = "masked_local",
+):
     source = Image.new("RGB", (4, 3), (10, 20, 30))
     candidate = Image.new("RGB", (4, 3), (40, 50, 60))
     source_mask = Image.new("L", (4, 3), 0)
@@ -93,6 +98,7 @@ def _review(judge: QwenBackgroundRemovalJudge):
         generation_mask=generation_mask,
         removal_phrases=["person", "bicycle"],
         background_phrase="empty park path",
+        candidate_mode=candidate_mode,  # type: ignore[arg-type]
     )
 
 
@@ -207,6 +213,65 @@ def test_system_prompt_defines_four_images_and_fail_closed_criteria() -> None:
     assert "changes outside the generation mask" in normalized
     assert "ghosts, double exposure, seams" in normalized
     assert "accept if and only if every boolean is true" in normalized
+
+
+def test_legacy_mode_keeps_exact_existing_prompt_and_local_label() -> None:
+    completions = _Completions(_payload())
+
+    _review(_judge(completions))
+
+    messages = completions.calls[0]["messages"]
+    assert messages[0]["content"] == SYSTEM_PROMPT
+    labels = [
+        item["text"]
+        for item in messages[1]["content"]
+        if item["type"] == "text"
+    ]
+    assert "Image 2: locally composited candidate" in labels
+
+
+def test_full_frame_mode_uses_registration_tolerant_fail_closed_prompt() -> None:
+    completions = _Completions(_payload())
+
+    _review(_judge(completions), candidate_mode="full_frame")
+
+    messages = completions.calls[0]["messages"]
+    assert messages[0]["content"] == FULL_FRAME_SYSTEM_PROMPT
+    normalized = " ".join(FULL_FRAME_SYSTEM_PROMPT.split()).casefold()
+    for allowed in (
+        "registration",
+        "scale",
+        "resampling",
+        "translation",
+        "photometric",
+    ):
+        assert allowed in normalized
+    for rejection in (
+        "original foreground remains",
+        "is reconstructed",
+        "new person",
+        "disappearance or material alteration of unrelated salient entities",
+        "material unrelated scene or layout changes",
+        "severe background hallucination",
+        "severe artifacts",
+    ):
+        assert rejection in normalized
+    assert "reject changes outside the generation mask" not in normalized
+    labels = [
+        item["text"]
+        for item in messages[1]["content"]
+        if item["type"] == "text"
+    ]
+    assert "Image 2: resized full-frame candidate" in labels
+
+
+def test_unknown_candidate_mode_fails_before_model_call() -> None:
+    completions = _Completions(_payload())
+
+    with pytest.raises(ValueError, match="unsupported removal candidate mode"):
+        _review(_judge(completions), candidate_mode="other")
+
+    assert completions.calls == []
 
 
 def test_close_delegates_to_underlying_client() -> None:

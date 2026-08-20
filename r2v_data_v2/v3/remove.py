@@ -33,6 +33,7 @@ from r2v_data_v2.v3.reference_edit_boogu import resolve_boogu_1k_size
 from r2v_data_v2.v3.removal_judge import (
     BackgroundRemovalJudge,
     QwenBackgroundRemovalJudge,
+    RemovalCandidateMode,
 )
 from r2v_data_v2.v3.schemas import (
     BackgroundReferenceState,
@@ -151,6 +152,32 @@ def composite_candidate(
     ):
         raise RuntimeError("candidate modified pixels outside generation mask")
     return Image.fromarray(composite, mode="RGB")
+
+
+def removal_candidate_mode(removal_backend: str) -> RemovalCandidateMode:
+    if removal_backend == BOOGU_REMOVE_BACKEND:
+        return "full_frame"
+    return "masked_local"
+
+
+def prepare_candidate(
+    *,
+    mode: RemovalCandidateMode,
+    source_image: Image.Image,
+    edited_image: Image.Image,
+    generation_mask: np.ndarray,
+) -> Image.Image:
+    if mode == "masked_local":
+        return composite_candidate(
+            source_image=source_image,
+            edited_image=edited_image,
+            generation_mask=generation_mask,
+        )
+    if mode != "full_frame":
+        raise ValueError(f"unsupported removal candidate mode: {mode}")
+    if edited_image.size != source_image.size:
+        raise ValueError("edited image dimensions do not match source image")
+    return edited_image.convert("RGB").copy()
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -354,8 +381,28 @@ def _write_candidate_debug(
     seed: int,
     candidate: Image.Image,
     review: BackgroundRemovalReview | None,
+    inputs: _RemovalInputs,
 ) -> None:
     directory = storage.remove_debug_dir(clip_uid)
+    for name, image in (
+        ("source.png", inputs.source_image),
+        (
+            "source_mask.png",
+            Image.fromarray(inputs.source_mask.astype(np.uint8) * 255, mode="L"),
+        ),
+        (
+            "generation_mask.png",
+            Image.fromarray(
+                inputs.generation_mask.astype(np.uint8) * 255,
+                mode="L",
+            ),
+        ),
+    ):
+        _write_bytes_atomic(
+            directory / name,
+            _png_bytes(image),
+            prefix="tmp-remove-debug",
+        )
     candidate_path = directory / f"candidate_seed_{seed}.png"
     _write_bytes_atomic(
         candidate_path,
@@ -441,6 +488,7 @@ def _validate_output_png(
     path: Path,
     *,
     expected_size: tuple[int, int],
+    require_rgb: bool = False,
 ) -> Image.Image:
     with Image.open(path) as opened:
         opened.load()
@@ -448,6 +496,8 @@ def _validate_output_png(
             raise ValueError("removed background output must be a PNG")
         if opened.size != expected_size:
             raise ValueError("removed background output dimensions are invalid")
+        if require_rgb and opened.mode != "RGB":
+            raise ValueError("full-frame removed background output must be RGB")
         return opened.convert("RGB")
 
 
@@ -463,6 +513,7 @@ def _publish_ready(
     candidate_sha256: str,
     seed: int,
     attempts: list[BackgroundRemovalAttempt],
+    candidate_mode: RemovalCandidateMode,
 ) -> None:
     output = storage.selected_background_output_path(clip_uid)
     temporary_output = storage.remove_output_temporary_path(clip_uid)
@@ -482,14 +533,22 @@ def _publish_ready(
         validated_candidate = _validate_output_png(
             temporary_output,
             expected_size=inputs.source_image.size,
+            require_rgb=candidate_mode == "full_frame",
         )
-        recomposited = composite_candidate(
-            source_image=inputs.source_image,
-            edited_image=validated_candidate,
-            generation_mask=inputs.generation_mask,
-        )
-        if _png_bytes(recomposited) != candidate_bytes:
-            raise ValueError("published candidate failed exact local compositing")
+        if candidate_mode == "masked_local":
+            recomposited = composite_candidate(
+                source_image=inputs.source_image,
+                edited_image=validated_candidate,
+                generation_mask=inputs.generation_mask,
+            )
+            if _png_bytes(recomposited) != candidate_bytes:
+                raise ValueError("published candidate failed exact local compositing")
+        elif candidate_mode != "full_frame":
+            raise ValueError(
+                f"unsupported removal candidate mode: {candidate_mode}"
+            )
+        if _sha256_bytes(candidate_bytes) != candidate_sha256:
+            raise ValueError("published candidate hash does not match candidate bytes")
 
         if generation_path.is_file():
             if generation_path.read_bytes() != generation_bytes:
@@ -635,6 +694,7 @@ def remove_backgrounds(
                     clip_uid,
                     state,
                 )
+                candidate_mode = removal_candidate_mode(config.remove.backend)
                 generation_pixels = int(
                     np.count_nonzero(inputs.generation_mask)
                 )
@@ -733,7 +793,8 @@ def remove_backgrounds(
                                 "background removal backend did not return a PIL image"
                             )
                         counters["candidates_generated"] += 1
-                        candidate = composite_candidate(
+                        candidate = prepare_candidate(
+                            mode=candidate_mode,
                             source_image=inputs.source_image,
                             edited_image=edited,
                             generation_mask=inputs.generation_mask,
@@ -747,6 +808,7 @@ def remove_backgrounds(
                             generation_mask=generation_mask_image,
                             removal_phrases=inputs.removal_phrases,
                             background_phrase=inputs.background_phrase,
+                            candidate_mode=candidate_mode,
                         )
                         runtime = time.monotonic() - started
                         if review.verdict == "accept":
@@ -783,6 +845,7 @@ def remove_backgrounds(
                                 seed=seed,
                                 candidate=candidate,
                                 review=review,
+                                inputs=inputs,
                             )
                     except Exception as exc:
                         runtime = time.monotonic() - started
@@ -804,6 +867,7 @@ def remove_backgrounds(
                                 seed=seed,
                                 candidate=candidate,
                                 review=None,
+                                inputs=inputs,
                             )
 
                 if accepted is None:
@@ -858,6 +922,7 @@ def remove_backgrounds(
                     candidate_sha256=candidate_sha,
                     seed=seed,
                     attempts=[*prior_attempts, *attempts],
+                    candidate_mode=candidate_mode,
                 )
                 counters["processed"] += 1
                 counters["ready_removed"] += 1

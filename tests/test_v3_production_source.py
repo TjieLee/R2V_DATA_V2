@@ -1086,6 +1086,10 @@ def test_compactor_publishes_human_reviewable_visual_reference_tree(
         f"{expected_directory}/group_e3.png",
         f"{expected_directory}/background.png",
     ]
+    background_reference = production.references[-1]
+    assert background_reference.kind == "background"
+    assert background_reference.entity_id is None
+    assert background_reference.scope == "scene"
     assert all(
         sample_id not in reference.image_path for reference in production.references
     )
