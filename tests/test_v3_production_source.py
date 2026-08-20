@@ -495,6 +495,90 @@ def test_preparer_resumes_after_committed_trailing_blank_lines(
     assert selected["source_index"] == 1
 
 
+def test_preparer_leaves_partial_thousandth_record_unconsumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=999)
+    final_record = _record(999)
+    (fixture["clips"] / str(final_record["video_path"])).write_bytes(b"clip")
+    complete_line = (json.dumps(final_record) + "\n").encode("utf-8")
+    split = len(complete_line) // 2
+    with fixture["source"].open("ab") as handle:
+        handle.write(complete_line[:split])
+    arguments = {
+        "source_jsonl": fixture["source"],
+        "base_config": fixture["base_config"],
+        "clips_root": fixture["clips"],
+        "source_videos_root": fixture["videos"],
+        "state_root": fixture["state_root"],
+        "shard_size": 1000,
+        "path_probe_records": 1,
+    }
+
+    assert prepare_production_shards(**arguments) == []
+    cursor_path = fixture["state_root"] / "state" / "cursor.json"
+    cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+    assert cursor["next_source_index"] == 0
+    assert cursor["next_line_number"] == 1
+    assert cursor["next_byte_offset"] == 0
+    assert not list((fixture["state_root"] / "shards").glob("*.yaml"))
+
+    with fixture["source"].open("ab") as handle:
+        handle.write(complete_line[split:])
+    generated = prepare_production_shards(**arguments)
+
+    assert [path.name for path in generated] == [
+        "shard-000000000-000000999.yaml"
+    ]
+    committed = json.loads(cursor_path.read_text(encoding="utf-8"))
+    assert committed["next_source_index"] == 1000
+    assert committed["next_line_number"] == 1001
+    assert committed["next_byte_offset"] == fixture["source"].stat().st_size
+
+
+def test_preparer_seal_tail_stops_before_partial_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=2)
+    complete_offset = fixture["source"].stat().st_size
+    final_record = _record(2)
+    (fixture["clips"] / str(final_record["video_path"])).write_bytes(b"clip")
+    complete_line = (json.dumps(final_record) + "\n").encode("utf-8")
+    split = len(complete_line) // 2
+    with fixture["source"].open("ab") as handle:
+        handle.write(complete_line[:split])
+    arguments = {
+        "source_jsonl": fixture["source"],
+        "base_config": fixture["base_config"],
+        "clips_root": fixture["clips"],
+        "source_videos_root": fixture["videos"],
+        "state_root": fixture["state_root"],
+        "shard_size": 3,
+        "path_probe_records": 1,
+        "seal_tail": True,
+    }
+
+    generated = prepare_production_shards(**arguments)
+    cursor_path = fixture["state_root"] / "state" / "cursor.json"
+    cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+
+    assert [path.name for path in generated] == [
+        "shard-000000000-000000001.yaml"
+    ]
+    assert cursor["next_source_index"] == 2
+    assert cursor["next_line_number"] == 3
+    assert cursor["next_byte_offset"] == complete_offset
+
+    with fixture["source"].open("ab") as handle:
+        handle.write(complete_line[split:])
+    resumed = prepare_production_shards(**arguments)
+    assert [path.name for path in resumed] == [
+        "shard-000000002-000000002.yaml"
+    ]
+
+
 def test_preparer_rejects_source_truncation_and_committed_line_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1082,11 +1166,12 @@ def test_compactor_rejects_duplicate_enriched_sample_id(
             runs_root=runs_root,
         )
 
-def test_compactor_rejects_wrong_instruction_order_and_outside_source(
+
+def test_production_sample_accepts_out_of_order_and_repeated_image_labels(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     shard_id = "shard-000000000-000000999"
     _write_export_shard(shards, shard_id, sample_id="sample-a")
     runs_root = (
@@ -1102,13 +1187,78 @@ def test_compactor_rejects_wrong_instruction_order_and_outside_source(
         sample_id="sample-a",
         instruction="Use <Image 2> with <Image 1>.",
     )
-    with pytest.raises(ValueError, match="image ordering"):
-        compact_production_exports(
-            shards_root=shards,
-            source_jsonl=source,
-            source_yaml=source_yaml,
-            runs_root=runs_root,
-        )
+    compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+        runs_root=runs_root,
+    )
+    production = ProductionSample.model_validate_json(
+        (output / "samples.jsonl").read_text(encoding="utf-8")
+    )
+    assert production.r2v_instruction == "Use <Image 2> with <Image 1>."
+
+    payload = production.model_dump(mode="json")
+    payload["r2v_instruction"] = "Use <Image 2>, <Image 1>, then <Image 2>."
+    repeated = ProductionSample.model_validate(payload)
+    assert repeated.r2v_instruction.count("<Image 2>") == 2
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        "Use only <Image 1>.",
+        "Use <Image 1>, <Image 2>, and unknown <Image 3>.",
+    ),
+)
+def test_production_sample_rejects_missing_or_unknown_image_label(
+    instruction: str,
+) -> None:
+    payload = {
+        "sample_id": "sample-a",
+        "clip_uid": "sample-a",
+        "target_video": "/source/sample-a.mp4",
+        "t2v_caption": "A person walks.",
+        "r2v_instruction": instruction,
+        "references": [
+            {
+                "image_id": "image_1",
+                "image_index": 1,
+                "kind": "subject",
+                "entity_id": "e1",
+                "image_path": "shards/shard-a/references/e1.png",
+                "source_frame_index": 0,
+                "scope": "full",
+                "visible_region": "whole",
+                "synthetic": False,
+            },
+            {
+                "image_id": "image_2",
+                "image_index": 2,
+                "kind": "object",
+                "entity_id": "e2",
+                "image_path": "shards/shard-a/references/e2.png",
+                "source_frame_index": 1,
+                "scope": "full",
+                "visible_region": "whole",
+                "synthetic": False,
+            },
+        ],
+        "source": {
+            "parent_video_id": "parent",
+            "clip_suffix": "0",
+            "shard_id": "shard-a",
+        },
+    }
+    with pytest.raises(ValueError, match="image labels must match references"):
+        ProductionSample.model_validate(payload)
+
+
+def test_compactor_rejects_source_jsonl_outside_public_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, _, _, source_yaml = _compaction_roots(tmp_path, monkeypatch)
 
     outside = tmp_path / "outside.jsonl"
     outside.write_text("{}\n", encoding="utf-8")

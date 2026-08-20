@@ -200,6 +200,8 @@ def _probe_source_paths(
     source_videos: set[str] = set()
     with source_jsonl.open("rb") as handle:
         for line in handle:
+            if not line.endswith(b"\n"):
+                break
             if not line.strip():
                 continue
             examined += 1
@@ -535,6 +537,9 @@ def prepare_production_shards(
             line_start = handle.tell()
             line = handle.readline()
             if not line:
+                break
+            if not line.endswith(b"\n"):
+                handle.seek(line_start)
                 break
             line_number = next_line_number
             next_line_number += 1

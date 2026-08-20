@@ -94,12 +94,10 @@ class ProductionSample(SchemaModel):
         indexes = [reference.image_index for reference in self.references]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("production reference indexes must be contiguous")
-        instruction_indexes = [
+        instruction_indexes = {
             int(next(group for group in match.groups() if group is not None))
             for match in _IMAGE_LABEL.finditer(self.r2v_instruction)
-        ]
-        if instruction_indexes != indexes:
-            raise ValueError(
-                "production instruction image ordering must match references"
-            )
+        }
+        if instruction_indexes != set(indexes):
+            raise ValueError("production instruction image labels must match references")
         return self
