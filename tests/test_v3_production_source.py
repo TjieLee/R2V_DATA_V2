@@ -35,6 +35,10 @@ from tools.prepare_v3_production_shards import (
 )
 
 
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -803,10 +807,14 @@ def test_preparer_isolates_malformed_record_without_raw_payload(
     assert len(selection.read_text(encoding="utf-8").splitlines()) == 2
 
 
-def _sample(sample_id: str, image_path: str) -> DatasetSample:
+def _sample_target_path(sample_id: str) -> Path:
+    return config_module.ALLOWED_DATASET_ROOT / "clips" / "review" / f"{sample_id}.mp4"
+
+
+def _sample(sample_id: str, image_path: str, *, target_video: Path) -> DatasetSample:
     return DatasetSample(
         sample_id=sample_id,
-        target_video=f"/source/{sample_id}.mp4",
+        target_video=str(target_video),
         t2v_caption="A person walks.",
         r2v_instruction="Use <image 1> to show the person walking.",
         references=[
@@ -833,13 +841,26 @@ def _write_export_shard(
     *,
     sample_id: str,
     include_reference: bool = True,
+    target_relative: Path | None = None,
+    reference_color: tuple[int, int, int] = (10, 20, 30),
 ) -> Path:
     shard = shards_root / shard_id
     reference = shard / "references" / sample_id / "subject.png"
     reference.parent.mkdir(parents=True, exist_ok=True)
     if include_reference:
-        Image.new("RGB", (8, 8), (10, 20, 30)).save(reference)
-    sample = _sample(sample_id, f"references/{sample_id}/subject.png")
+        Image.new("RGB", (8, 8), reference_color).save(reference)
+    target = (
+        config_module.ALLOWED_DATASET_ROOT
+        / "clips"
+        / (target_relative or Path("review") / f"{sample_id}.mp4")
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"processed-shot")
+    sample = _sample(
+        sample_id,
+        f"references/{sample_id}/subject.png",
+        target_video=target,
+    )
     (shard / "samples.jsonl").write_text(
         sample.model_dump_json() + "\n",
         encoding="utf-8",
@@ -861,6 +882,78 @@ def _write_export_shard(
     return shard
 
 
+def _write_reviewable_export_shard(
+    shards_root: Path,
+    shard_id: str,
+    *,
+    sample_id: str,
+    target_relative: Path,
+) -> tuple[Path, list[Path]]:
+    shard = shards_root / shard_id
+    source_paths: list[Path] = []
+    references: list[dict[str, object]] = []
+    specifications = (
+        ("<ref_subject_1>", "entity", "e1", "full", "whole", "subject"),
+        ("<ref_object_1>", "entity", "e2", "full", "whole", "object"),
+        ("<ref_group_1>", "entity", "e3", "full", "whole", "group"),
+        ("<ref_bg_1>", "background", None, "scene", "central", "background"),
+    )
+    for index, (token, reference_type, entity_id, scope, region, name) in enumerate(
+        specifications,
+        1,
+    ):
+        source_path = shard / "references" / sample_id / f"{name}.png"
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (index, index + 10, index + 20)).save(source_path)
+        source_paths.append(source_path)
+        references.append(
+            {
+                "token": token,
+                "type": reference_type,
+                "entity_id": entity_id,
+                "scope": scope,
+                "visible_region": region,
+                "image_path": source_path.relative_to(shard).as_posix(),
+                "source_frame_index": index - 1,
+                "source_clip_uid": None,
+                "source_entity_id": None,
+                "synthetic": False,
+            }
+        )
+    target = config_module.ALLOWED_DATASET_ROOT / "clips" / target_relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"processed-shot")
+    sample = DatasetSample(
+        sample_id=sample_id,
+        target_video=str(target),
+        t2v_caption="People and an object appear in a scene.",
+        r2v_instruction=(
+            "Use <image 1>, <image 2>, <image 3>, and <image 4> as references."
+        ),
+        references=references,
+        source={"parent_video_id": "parent", "clip_suffix": "0"},
+    )
+    (shard / "samples.jsonl").write_text(
+        sample.model_dump_json() + "\n",
+        encoding="utf-8",
+    )
+    dataset = DatasetRecord(
+        dataset_version=shard_id,
+        created_at="2026-08-19T00:00:00+00:00",
+        git_commit="abc123",
+        config_hash="config-hash",
+        annotation_model="qwen",
+        background_remove_backend="backend",
+        sample_count=1,
+        reference_count=len(references),
+    )
+    (shard / "dataset.json").write_text(
+        dataset.model_dump_json(),
+        encoding="utf-8",
+    )
+    return target, source_paths
+
+
 def _compaction_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -875,6 +968,7 @@ def _compaction_roots(
     )
     shards = output / "shards"
     shards.mkdir(parents=True)
+    (dataset / "clips").mkdir()
     source = dataset / "jea" / "shots_f03_motion.jsonl"
     source.parent.mkdir(parents=True)
     source.write_text("{}\n", encoding="utf-8")
@@ -931,7 +1025,7 @@ def test_compactor_rewrites_reference_paths_without_copying_media(
     assert record["references"][0]["kind"] == "subject"
     assert record["references"][0]["attribute_id"] is None
     assert record["references"][0]["image_path"] == (
-        "shards/shard-000000000-000000999/references/sample-a/subject.png"
+        "references/review/sample-a/subject_e1.png"
     )
     assert catalog["total_samples"] == catalog["total_references"] == 1
     assert catalog["total_visual_references"] == 1
@@ -940,6 +1034,141 @@ def test_compactor_rewrites_reference_paths_without_copying_media(
         (output / "samples.jsonl").read_bytes()
     ).hexdigest()
     assert not list(output.rglob("*.mp4"))
+
+    source_reference = (
+        shards
+        / "shard-000000000-000000999"
+        / "references"
+        / "sample-a"
+        / "subject.png"
+    )
+    published_reference = output / record["references"][0]["image_path"]
+    assert source_reference.stat().st_ino == published_reference.stat().st_ino
+    published_inode = published_reference.stat().st_ino
+    compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+        created_at="2026-08-19T00:00:00+00:00",
+    )
+    assert published_reference.stat().st_ino == published_inode
+
+
+def test_compactor_publishes_human_reviewable_visual_reference_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    sample_id = "42038f3a-long-opaque-clip-uid"
+    target_relative = Path("01") / "丁宝桢" / "01 4K" / "v_b..._00041.mp4"
+    target, source_references = _write_reviewable_export_shard(
+        shards,
+        "shard-000000000-000000999",
+        sample_id=sample_id,
+        target_relative=target_relative,
+    )
+    source_hashes = [_file_sha256(path) for path in source_references]
+
+    catalog = compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+        created_at="2026-08-20T00:00:00+00:00",
+    )
+
+    production = ProductionSample.model_validate_json(
+        (output / "samples.jsonl").read_text(encoding="utf-8")
+    )
+    expected_directory = "references/01/丁宝桢/01 4K/v_b..._00041"
+    assert [reference.image_path for reference in production.references] == [
+        f"{expected_directory}/subject_e1.png",
+        f"{expected_directory}/object_e2.png",
+        f"{expected_directory}/group_e3.png",
+        f"{expected_directory}/background.png",
+    ]
+    assert all(
+        sample_id not in reference.image_path for reference in production.references
+    )
+    for source_reference, reference in zip(
+        source_references,
+        production.references,
+        strict=True,
+    ):
+        destination = output / reference.image_path
+        assert destination.resolve(strict=True).is_file()
+        assert source_reference.stat().st_ino == destination.stat().st_ino
+    assert [_file_sha256(path) for path in source_references] == source_hashes
+    assert production.target_video == str(target)
+    assert not list(output.rglob("*.mp4"))
+    assert catalog["total_samples"] == 1
+    assert catalog["total_visual_references"] == 4
+    assert catalog["total_attribute_references"] == 0
+    assert catalog["total_references"] == 4
+    assert catalog["samples_jsonl_sha256"] == _file_sha256(
+        output / "samples.jsonl"
+    )
+
+
+def test_compactor_rejects_canonical_reference_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    target_relative = Path("shared") / "shot.mp4"
+    _write_export_shard(
+        shards,
+        "shard-000000000-000000999",
+        sample_id="sample-a",
+        target_relative=target_relative,
+        reference_color=(1, 2, 3),
+    )
+    _write_export_shard(
+        shards,
+        "shard-000001000-000001999",
+        sample_id="sample-b",
+        target_relative=target_relative,
+        reference_color=(4, 5, 6),
+    )
+
+    with pytest.raises(FileExistsError, match="conflicting published reference"):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+        )
+
+
+@pytest.mark.parametrize("unsafe_target", ("outside", "dot_escape"))
+def test_compactor_rejects_target_video_outside_or_escaping_clips_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_target: str,
+) -> None:
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard = _write_export_shard(
+        shards,
+        "shard-000000000-000000999",
+        sample_id="sample-a",
+    )
+    clips_root = config_module.ALLOWED_DATASET_ROOT / "clips"
+    if unsafe_target == "outside":
+        target = config_module.ALLOWED_DATASET_ROOT / "outside.mp4"
+    else:
+        target = clips_root / "review" / ".." / "escaped.mp4"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"processed-shot")
+    samples_path = shard / "samples.jsonl"
+    payload = json.loads(samples_path.read_text(encoding="utf-8"))
+    payload["target_video"] = str(target)
+    samples_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    expected = "below clips_root" if unsafe_target == "outside" else "unsafe dot"
+    with pytest.raises(ValueError, match=expected):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+        )
 
 
 def test_compactor_detects_duplicate_sample_id(
@@ -1043,7 +1272,9 @@ def test_compactor_optionally_merges_valid_enriched_samples(
     )
     assert published.sample_id == "sample-a"
     assert production.r2v_instruction == "Use <Image 1>."
-    assert production.references[0].image_path.startswith("shards/")
+    assert production.references[0].image_path == (
+        "references/review/sample-a/subject_e1.png"
+    )
     assert catalog["total_enriched_samples"] == 1
 
 
@@ -1110,7 +1341,7 @@ def _write_enriched_with_attribute(
         clip_uid=sample_id,
         source_run_root=str(run_root),
         original_visual={
-            "target_video": f"/source/{sample_id}.mp4",
+            "target_video": str(_sample_target_path(sample_id)),
             "source": {"parent_video_id": "parent", "clip_suffix": "0"},
         },
         original_instruction="Use <image 1>.",
@@ -1181,9 +1412,22 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     assert attribute.owner_entity_id == "e1"
     assert attribute.attribute_type == "hair"
     assert attribute.image_path == (
-        f"attribute_references/{shard_id}/sample-a/a1.png"
+        "references/review/sample-a/attribute_e1_a1_hair.png"
     )
     assert (output / attribute.image_path).is_file()
+    source_attribute = (
+        runs_root
+        / shard_id
+        / "subject_attributes"
+        / "references"
+        / "sample-a"
+        / "a1.png"
+    )
+    published_attribute = output / attribute.image_path
+    assert source_attribute.stat().st_ino == published_attribute.stat().st_ino
+    with Image.open(published_attribute) as image:
+        assert image.format == "PNG"
+        assert image.mode == "RGBA"
     assert str(runs_root) not in (output / "samples.jsonl").read_text(
         encoding="utf-8"
     )
@@ -1192,6 +1436,7 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     assert catalog["total_visual_references"] == 1
     assert catalog["total_attribute_references"] == 1
 
+    published_inode = published_attribute.stat().st_ino
     compact_production_exports(
         shards_root=shards,
         source_jsonl=source,
@@ -1199,6 +1444,7 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
         runs_root=runs_root,
     )
     assert (output / attribute.image_path).is_file()
+    assert published_attribute.stat().st_ino == published_inode
 
 
 def test_compactor_rejects_orphan_enriched_and_missing_attribute(

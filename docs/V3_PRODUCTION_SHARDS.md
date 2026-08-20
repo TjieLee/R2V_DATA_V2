@@ -182,25 +182,43 @@ sidecar uses the enriched instruction and ordered visual-plus-attribute
 references. A sample without attributes is normalized into the same
 `r2v.v3.production_sample.1` schema and remains valid.
 
-Visual PNGs are not duplicated; canonical paths continue to point into:
+Every canonical reference for one processed shot is published into one directly
+browsable directory. The directory is the shot's `video_path` relative to the
+immutable `clips_root` in `source.yaml`, with only the final `.mp4` suffix
+removed. Unicode and spaces are preserved. For example:
 
 ```text
-shards/<shard-id>/references/...
+video:
+  01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00041.mp4
+
+references:
+  references/01/丁宝桢/01 4K/v_b597a0641cf76c22e880_00041/
+    subject_e1.png
+    object_e2.png
+    group_e3.png
+    background.png
+    attribute_e1_a1_hair.png
 ```
 
-Accepted RGBA attribute PNGs are the only additional published images. They are
-validated, hard-linked when possible (with a copy fallback), and stored at
-stable production-relative paths under:
+The canonical directory and filenames never contain the opaque `clip_uid`.
+`clip_uid` remains the stable machine identity in `ProductionSample`, and
+shard/internal run directories may continue to use it. The canonical filesystem
+intentionally uses human-readable video identity so reviewers never need to
+browse UID directories. Visual names are `subject_<entity_id>.png`,
+`object_<entity_id>.png`,
+`group_<entity_id>.png`, and `background.png`. Visual PNGs are hard-linked from
+their immutable shard exports, so the reviewable tree does not duplicate their
+bytes or modify the shard artifacts.
 
-```text
-attribute_references/<shard-id>/<clip-uid>/<attribute-id>.png
-```
-
-These references preserve `attribute_id`, `owner_entity_id`, and
-`attribute_type`. They never depend on a working `run_root` after publication.
-Target videos remain the processed public-dataset shot MP4 paths; videos are
-never copied. Original/full `source_video_path` values remain provenance and
-are never substituted as Visual inputs.
+Accepted RGBA attribute PNGs use
+`attribute_<owner_entity_id>_<attribute_id>_<attribute_type>.png` in that same
+directory. They are validated and hard-linked when possible, retaining the
+existing safe copy fallback. An existing destination is reused only when its
+SHA-256 matches; any path collision with different bytes fails closed. These
+references never depend on a working `run_root` after publication. Target
+videos remain the processed public-dataset shot MP4 paths and are never copied.
+Original/full `source_video_path` values remain provenance and are never
+substituted as Visual inputs.
 
 The optional top-level `enriched_samples.jsonl` remains an audit artifact when
 `--runs-root` is supplied. Per-shard sample JSONLs and enriched sidecars are not

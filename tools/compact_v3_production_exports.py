@@ -113,6 +113,7 @@ def _load_source_descriptor(
         "base_config_path",
         "base_config_sha256",
         "base_config_fingerprint",
+        "clips_root",
     )
     if any(not isinstance(value.get(name), str) for name in required_strings):
         raise ValueError("source.yaml is missing immutable production identity")
@@ -121,6 +122,19 @@ def _load_source_descriptor(
     if value["source_adapter"] != JEA_VIDEO_MOTION_ADAPTER:
         raise ValueError("source.yaml production adapter does not match")
     return value
+
+
+def _resolve_clips_root(source_descriptor: dict[str, object]) -> Path:
+    value = source_descriptor["clips_root"]
+    assert isinstance(value, str)
+    raw = Path(value).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("source.yaml clips_root must be absolute")
+    resolved = raw.resolve(strict=True)
+    dataset_root = config_module.ALLOWED_DATASET_ROOT.resolve(strict=False)
+    if not resolved.is_dir() or not _below(resolved, dataset_root):
+        raise ValueError("source.yaml clips_root must be below public dataset")
+    return resolved
 
 
 def _safe_artifact(root: Path, relative_path: str) -> Path:
@@ -182,29 +196,58 @@ def _safe_component(value: str, field_name: str) -> str:
     return value
 
 
-def _materialize_attribute_reference(
+def _canonical_reference_directory(*, target_video: str, clips_root: Path) -> Path:
+    if any(component in {".", ".."} for component in target_video.split("/")):
+        raise ValueError("target_video contains an unsafe dot path component")
+    raw = Path(target_video).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("target_video must be an absolute path")
+    resolved = raw.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError("target_video must be an existing file")
+    try:
+        relative = resolved.relative_to(clips_root)
+    except ValueError as exc:
+        raise ValueError("target_video must remain below clips_root") from exc
+    if resolved.suffix.lower() != ".mp4":
+        raise ValueError("target_video must be a processed MP4 shot")
+    return Path("references") / relative.with_suffix("")
+
+
+def _canonical_visual_reference_path(
+    *,
+    directory: Path,
+    reference: DatasetReference,
+) -> Path:
+    kind = _dataset_reference_kind(reference)
+    if kind == "background":
+        return directory / "background.png"
+    assert reference.entity_id is not None
+    entity_id = _safe_component(reference.entity_id, "entity_id")
+    return directory / f"{kind}_{entity_id}.png"
+
+
+def _materialize_reference(
     *,
     source: Path,
     output_root: Path,
-    shard_id: str,
-    clip_uid: str,
-    attribute_id: str,
+    relative_destination: Path,
+    require_rgba: bool,
+    allow_copy_fallback: bool,
 ) -> str:
-    _validate_attribute_png(source)
-    destination = (
-        output_root
-        / "attribute_references"
-        / _safe_component(shard_id, "shard_id")
-        / _safe_component(clip_uid, "clip_uid")
-        / f"{_safe_component(attribute_id, 'attribute_id')}.png"
-    )
+    if require_rgba:
+        _validate_attribute_png(source)
+    if relative_destination.is_absolute() or ".." in relative_destination.parts:
+        raise ValueError("canonical reference path must remain relative")
+    destination = output_root / relative_destination
     source_sha = _sha256_file(source)
     if destination.exists():
         if not destination.is_file() or _sha256_file(destination) != source_sha:
             raise FileExistsError(
-                f"conflicting published attribute reference: {destination}"
+                f"conflicting published reference: {destination}"
             )
-        _validate_attribute_png(destination)
+        if require_rgba:
+            _validate_attribute_png(destination)
         return destination.relative_to(output_root).as_posix()
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +256,10 @@ def _materialize_attribute_reference(
         try:
             os.link(source, temporary)
         except OSError as exc:
-            if exc.errno not in _ATTRIBUTE_LINK_FALLBACK_ERRNOS:
+            if (
+                not allow_copy_fallback
+                or exc.errno not in _ATTRIBUTE_LINK_FALLBACK_ERRNOS
+            ):
                 raise
             shutil.copy2(source, temporary)
         with temporary.open("rb") as handle:
@@ -223,12 +269,36 @@ def _materialize_attribute_reference(
         except FileExistsError:
             if not destination.is_file() or _sha256_file(destination) != source_sha:
                 raise FileExistsError(
-                    f"conflicting published attribute reference: {destination}"
+                    f"conflicting published reference: {destination}"
                 ) from None
-        _validate_attribute_png(destination)
+        if require_rgba:
+            _validate_attribute_png(destination)
     finally:
         temporary.unlink(missing_ok=True)
     return destination.relative_to(output_root).as_posix()
+
+
+def _materialize_attribute_reference(
+    *,
+    source: Path,
+    output_root: Path,
+    directory: Path,
+    owner_entity_id: str,
+    attribute_id: str,
+    attribute_type: str,
+) -> str:
+    filename = "attribute_{}_{}_{}.png".format(
+        _safe_component(owner_entity_id, "owner_entity_id"),
+        _safe_component(attribute_id, "attribute_id"),
+        _safe_component(attribute_type, "attribute_type"),
+    )
+    return _materialize_reference(
+        source=source,
+        output_root=output_root,
+        relative_destination=directory / filename,
+        require_rgba=True,
+        allow_copy_fallback=True,
+    )
 
 
 def _dataset_reference_kind(reference: DatasetReference) -> str:
@@ -296,6 +366,7 @@ def _enriched_production_sample(
     *,
     shard_id: str,
     reference_paths: list[str],
+    reference_directory: Path,
     run_root: Path,
     output_root: Path,
 ) -> ProductionSample:
@@ -356,9 +427,10 @@ def _enriched_production_sample(
             published_path = _materialize_attribute_reference(
                 source=source_image,
                 output_root=output_root,
-                shard_id=shard_id,
-                clip_uid=enriched.clip_uid,
+                directory=reference_directory,
+                owner_entity_id=record.owner_entity_id,
                 attribute_id=record.attribute_id,
+                attribute_type=record.attribute_type,
             )
             assert enriched_reference.source_frame_index is not None
             production_references.append(
@@ -476,6 +548,7 @@ def compact_production_exports(
     shards, output = _validate_roots(shards_root, output_root)
     source = _resolve_source_jsonl(source_jsonl)
     source_descriptor = _load_source_descriptor(source_yaml, source_jsonl=source)
+    clips_root = _resolve_clips_root(source_descriptor)
     resolved_runs = _validate_runs_root(runs_root) if runs_root is not None else None
 
     samples_destination = output / "samples.jsonl"
@@ -560,15 +633,28 @@ def compact_production_exports(
                                 raise ValueError(
                                     f"duplicate sample_id: {sample.sample_id}"
                                 ) from exc
+                            reference_directory = _canonical_reference_directory(
+                                target_video=sample.target_video,
+                                clips_root=clips_root,
+                            )
                             reference_paths: list[str] = []
                             for reference in sample.references:
-                                _safe_artifact(shard, reference.image_path)
+                                source_reference = _safe_artifact(
+                                    shard, reference.image_path
+                                )
                                 reference_paths.append(
-                                    (
-                                        Path("shards")
-                                        / shard_id
-                                        / reference.image_path
-                                    ).as_posix()
+                                    _materialize_reference(
+                                        source=source_reference,
+                                        output_root=output,
+                                        relative_destination=(
+                                            _canonical_visual_reference_path(
+                                                directory=reference_directory,
+                                                reference=reference,
+                                            )
+                                        ),
+                                        require_rgba=False,
+                                        allow_copy_fallback=False,
+                                    )
                                 )
                             enriched = enriched_by_id.pop(sample.sample_id, None)
                             if enriched is None:
@@ -584,6 +670,7 @@ def compact_production_exports(
                                     enriched,
                                     shard_id=shard_id,
                                     reference_paths=reference_paths,
+                                    reference_directory=reference_directory,
                                     run_root=run_root,
                                     output_root=output,
                                 )
