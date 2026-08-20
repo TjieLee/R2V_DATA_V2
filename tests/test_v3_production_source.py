@@ -1,24 +1,38 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+from PIL import Image
 
 import r2v_data_v2.v3.config as config_module
 from r2v_data_v2.manifest import parse_source_record
 from r2v_data_v2.v3.config import load_config
 from r2v_data_v2.v3.manifest import build_manifest
+from r2v_data_v2.v3.production_export import ProductionSample
 from r2v_data_v2.v3.production_source import (
     JeaVideoMotionAdapter,
     parse_jea_video_motion_v1,
 )
 from r2v_data_v2.v3.schemas import DatasetRecord, DatasetSample
 from r2v_data_v2.v3.storage import RunStorage
-from r2v_data_v2.v3.subject_attributes import EnrichedSample
+from r2v_data_v2.v3.subject_attributes import (
+    EnrichedSample,
+    OwnershipGeometry,
+    SubjectAttributeRecord,
+    SubjectAttributeReview,
+)
 from tools.compact_v3_production_exports import compact_production_exports
-from tools.prepare_v3_production_shards import prepare_production_shards
+from tools.prepare_v3_production_shards import (
+    main as prepare_main,
+    prepare_production_shards,
+    probe_production_setup,
+)
 
 
 def _roots(
@@ -78,6 +92,7 @@ def _production_fixture(
     records = [_record(index) for index in range(count)]
     for record in records:
         (clips / str(record["video_path"])).write_bytes(b"clip")
+        (videos / str(record["source_video_path"])).write_bytes(b"source-video")
     source = source_dir / "shots_f03_motion.jsonl"
     source.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
@@ -149,6 +164,10 @@ def test_production_adapter_uses_clip_path_independent_of_cwd(
     assert selected["video_path"] != str(fixture["videos"] / "movie-a.mp4")
     assert selected["caption_raw"] == "caption 0"
     assert selected["metadata"]["source_adapter"] == "jea_video_motion_v1"
+    assert selected["metadata"]["source_relative_video_path"] == "movie-a_0.mp4"
+    assert selected["metadata"]["source_relative_source_video_path"] == (
+        "movie-a.mp4"
+    )
 
 
 @pytest.mark.parametrize(
@@ -196,6 +215,105 @@ def test_production_adapter_rejects_absolute_and_symlink_escape(
     link.symlink_to(outside)
     with pytest.raises(ValueError, match="escapes"):
         adapter.parse(_record(9), source_index=0)
+
+
+def test_probe_only_validates_both_roots_without_creating_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=2)
+    result = probe_production_setup(
+        source_jsonl=fixture["source"],
+        base_config=fixture["base_config"],
+        clips_root=fixture["clips"],
+        source_videos_root=fixture["videos"],
+        path_probe_records=2,
+    )
+    assert result["clip_paths_verified"] == 2
+    assert result["unique_source_video_paths_verified"] == 1
+    assert not fixture["state_root"].exists()
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_v3_production_shards.py",
+            "--source-jsonl",
+            str(fixture["source"]),
+            "--base-config",
+            str(fixture["base_config"]),
+            "--clips-root",
+            str(fixture["clips"]),
+            "--source-videos-root",
+            str(fixture["videos"]),
+            "--state-root",
+            str(fixture["state_root"]),
+            "--path-probe-records",
+            "2",
+            "--probe-only",
+        ],
+    )
+    prepare_main()
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["probe_only"] is True
+    assert not fixture["state_root"].exists()
+
+
+def test_source_video_probe_failure_creates_no_source_yaml(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=1)
+    (fixture["videos"] / "movie-a.mp4").unlink()
+
+    with pytest.raises(ValueError, match="existing source video"):
+        prepare_production_shards(
+            source_jsonl=fixture["source"],
+            base_config=fixture["base_config"],
+            clips_root=fixture["clips"],
+            source_videos_root=fixture["videos"],
+            state_root=fixture["state_root"],
+            shard_size=1,
+            path_probe_records=1,
+        )
+
+    assert not (fixture["state_root"] / "source.yaml").exists()
+
+
+def test_preparer_max_shards_stops_at_exact_cursor_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=5)
+    arguments = {
+        "source_jsonl": fixture["source"],
+        "base_config": fixture["base_config"],
+        "clips_root": fixture["clips"],
+        "source_videos_root": fixture["videos"],
+        "state_root": fixture["state_root"],
+        "shard_size": 2,
+        "path_probe_records": 1,
+        "max_shards": 1,
+    }
+
+    first = prepare_production_shards(**arguments)
+    cursor_path = fixture["state_root"] / "state" / "cursor.json"
+    first_cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+    first_two_bytes = sum(
+        len(line)
+        for line in fixture["source"].read_bytes().splitlines(keepends=True)[:2]
+    )
+    second = prepare_production_shards(**arguments)
+
+    assert [path.name for path in first] == [
+        "shard-000000000-000000001.yaml"
+    ]
+    assert first_cursor["next_source_index"] == 2
+    assert first_cursor["next_byte_offset"] == first_two_bytes
+    assert [path.name for path in second] == [
+        "shard-000000002-000000003.yaml"
+    ]
 
 
 def test_legacy_source_parser_and_config_remain_unchanged(
@@ -296,6 +414,85 @@ def test_preparer_resumes_from_cursor_after_append(
         ).read_text(encoding="utf-8").splitlines()
     ]
     assert [record["source_index"] for record in records] == [2, 3]
+
+
+def test_preparer_freezes_base_config_bytes_and_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=2)
+    arguments = {
+        "source_jsonl": fixture["source"],
+        "base_config": fixture["base_config"],
+        "clips_root": fixture["clips"],
+        "source_videos_root": fixture["videos"],
+        "state_root": fixture["state_root"],
+        "shard_size": 2,
+        "path_probe_records": 1,
+    }
+    prepare_production_shards(**arguments)
+    source_yaml = fixture["state_root"] / "source.yaml"
+    descriptor = yaml.safe_load(source_yaml.read_text(encoding="utf-8"))
+    original_base = fixture["base_config"].read_bytes()
+    assert descriptor["base_config_sha256"] == hashlib.sha256(
+        original_base
+    ).hexdigest()
+    assert descriptor["base_config_fingerprint"] == load_config(
+        fixture["base_config"]
+    ).fingerprint()
+
+    fixture["base_config"].write_bytes(original_base + b"\n# byte mutation\n")
+    with pytest.raises(ValueError, match="base_config_sha256"):
+        prepare_production_shards(**arguments)
+
+    fixture["base_config"].write_bytes(original_base)
+    descriptor["base_config_fingerprint"] = "changed"
+    source_yaml.write_text(
+        yaml.safe_dump(descriptor, sort_keys=False),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="base_config_fingerprint"):
+        prepare_production_shards(**arguments)
+
+
+def test_preparer_resumes_after_committed_trailing_blank_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=1)
+    with fixture["source"].open("ab") as handle:
+        handle.write(b"\n  \n")
+    arguments = {
+        "source_jsonl": fixture["source"],
+        "base_config": fixture["base_config"],
+        "clips_root": fixture["clips"],
+        "source_videos_root": fixture["videos"],
+        "state_root": fixture["state_root"],
+        "shard_size": 2,
+        "path_probe_records": 1,
+        "seal_tail": True,
+    }
+    prepare_production_shards(**arguments)
+    cursor_path = fixture["state_root"] / "state" / "cursor.json"
+    cursor = json.loads(cursor_path.read_text(encoding="utf-8"))
+    assert cursor["next_byte_offset"] == fixture["source"].stat().st_size
+
+    appended = _record(1)
+    (fixture["clips"] / str(appended["video_path"])).write_bytes(b"clip")
+    with fixture["source"].open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(appended) + "\n")
+    generated = prepare_production_shards(**arguments)
+
+    assert [path.name for path in generated] == [
+        "shard-000000001-000000001.yaml"
+    ]
+    selection = (
+        fixture["state_root"]
+        / "selections"
+        / "shard-000000001-000000001.jsonl"
+    )
+    selected = json.loads(selection.read_text(encoding="utf-8"))
+    assert selected["source_index"] == 1
 
 
 def test_preparer_rejects_source_truncation_and_committed_line_mutation(
@@ -449,7 +646,7 @@ def _write_export_shard(
     reference = shard / "references" / sample_id / "subject.png"
     reference.parent.mkdir(parents=True, exist_ok=True)
     if include_reference:
-        reference.write_bytes(b"png")
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(reference)
     sample = _sample(sample_id, f"references/{sample_id}/subject.png")
     (shard / "samples.jsonl").write_text(
         sample.model_dump_json() + "\n",
@@ -475,8 +672,8 @@ def _write_export_shard(
 def _compaction_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Path, Path]:
-    writable, _, _ = _roots(tmp_path, monkeypatch)
+) -> tuple[Path, Path, Path, Path]:
+    writable, dataset, _ = _roots(tmp_path, monkeypatch)
     output = (
         writable
         / "r2v_v3_exports"
@@ -486,14 +683,43 @@ def _compaction_roots(
     )
     shards = output / "shards"
     shards.mkdir(parents=True)
-    return shards, output
+    source = dataset / "jea" / "shots_f03_motion.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text("{}\n", encoding="utf-8")
+    source_yaml = (
+        writable
+        / "r2v_v3_configs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+        / "source.yaml"
+    )
+    source_yaml.parent.mkdir(parents=True)
+    source_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "r2v.v3.production-source.1",
+                "source_adapter": "jea_video_motion_v1",
+                "source_jsonl": str(source),
+                "base_config_path": str(writable / "r2v_v3_configs" / "base.yaml"),
+                "base_config_sha256": "base-sha256",
+                "base_config_fingerprint": "base-fingerprint",
+                "clips_root": str(dataset / "clips"),
+                "source_videos_root": str(dataset / "videos"),
+                "shard_size": 1000,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return shards, output, source, source_yaml
 
 
 def test_compactor_rewrites_reference_paths_without_copying_media(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    shards, output = _compaction_roots(tmp_path, monkeypatch)
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     _write_export_shard(
         shards,
         "shard-000000000-000000999",
@@ -502,15 +728,25 @@ def test_compactor_rewrites_reference_paths_without_copying_media(
 
     catalog = compact_production_exports(
         shards_root=shards,
-        source_jsonl=tmp_path / "source.jsonl",
+        source_jsonl=source,
+        source_yaml=source_yaml,
         created_at="2026-08-19T00:00:00+00:00",
     )
 
     record = json.loads((output / "samples.jsonl").read_text(encoding="utf-8"))
+    assert record["schema_version"] == "r2v.v3.production_sample.1"
+    assert record["clip_uid"] == "sample-a"
+    assert record["references"][0]["kind"] == "subject"
+    assert record["references"][0]["attribute_id"] is None
     assert record["references"][0]["image_path"] == (
         "shards/shard-000000000-000000999/references/sample-a/subject.png"
     )
     assert catalog["total_samples"] == catalog["total_references"] == 1
+    assert catalog["total_visual_references"] == 1
+    assert catalog["total_attribute_references"] == 0
+    assert catalog["samples_jsonl_sha256"] == hashlib.sha256(
+        (output / "samples.jsonl").read_bytes()
+    ).hexdigest()
     assert not list(output.rglob("*.mp4"))
 
 
@@ -518,7 +754,7 @@ def test_compactor_detects_duplicate_sample_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    shards, _ = _compaction_roots(tmp_path, monkeypatch)
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     for shard_id in (
         "shard-000000000-000000999",
         "shard-000001000-000001999",
@@ -526,14 +762,18 @@ def test_compactor_detects_duplicate_sample_id(
         _write_export_shard(shards, shard_id, sample_id="duplicate")
 
     with pytest.raises(ValueError, match="duplicate sample_id"):
-        compact_production_exports(shards_root=shards)
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+        )
 
 
 def test_compactor_rejects_missing_reference_and_preserves_published_samples(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    shards, output = _compaction_roots(tmp_path, monkeypatch)
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     _write_export_shard(
         shards,
         "shard-000000000-000000999",
@@ -544,7 +784,11 @@ def test_compactor_rejects_missing_reference_and_preserves_published_samples(
     published.write_bytes(b"previous\n")
 
     with pytest.raises((FileNotFoundError, ValueError)):
-        compact_production_exports(shards_root=shards)
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+        )
 
     assert published.read_bytes() == b"previous\n"
 
@@ -553,7 +797,7 @@ def test_compactor_optionally_merges_valid_enriched_samples(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    shards, output = _compaction_roots(tmp_path, monkeypatch)
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     shard_id = "shard-000000000-000000999"
     _write_export_shard(shards, shard_id, sample_id="sample-a")
     writable = config_module.ALLOWED_WRITABLE_ROOT
@@ -594,11 +838,313 @@ def test_compactor_optionally_merges_valid_enriched_samples(
 
     catalog = compact_production_exports(
         shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
         runs_root=runs_root,
     )
 
     published = EnrichedSample.model_validate_json(
         (output / "enriched_samples.jsonl").read_text(encoding="utf-8")
     )
+    production = ProductionSample.model_validate_json(
+        (output / "samples.jsonl").read_text(encoding="utf-8")
+    )
     assert published.sample_id == "sample-a"
+    assert production.r2v_instruction == "Use <Image 1>."
+    assert production.references[0].image_path.startswith("shards/")
     assert catalog["total_enriched_samples"] == 1
+
+
+def _accepted_attribute(image_path: str) -> SubjectAttributeRecord:
+    return SubjectAttributeRecord(
+        attribute_id="a1",
+        owner_entity_id="e1",
+        attribute_type="hair",
+        phrase="long dark hair",
+        grounding_prompt="the person's long dark hair",
+        status="accepted",
+        image_path=image_path,
+        source_frame_index=1,
+        source_frame_slot=1,
+        owner_candidate_id="candidate_1",
+        same_frame_as_owner_reference=False,
+        sam3_prompt="long dark hair",
+        ownership_geometry=OwnershipGeometry(
+            passed=True,
+            reason="passed",
+            owner_overlap_ratio=1.0,
+            maximum_other_owner_overlap_ratio=0.0,
+            attribute_to_owner_area_ratio=0.2,
+            near_owner_region=True,
+            attribute_area_pixels=400,
+            attribute_long_side_pixels=200,
+            significant_component_count=1,
+            largest_component_ratio=1.0,
+            second_largest_component_ratio=0.0,
+        ),
+        review=SubjectAttributeReview(
+            attribute_id="a1",
+            matches_attribute=True,
+            owner_binding_correct=True,
+            recognizable=True,
+            characteristic_appearance_visible=True,
+            usable_as_attribute_condition=True,
+            reason="accepted",
+        ),
+        reason="accepted",
+    )
+
+
+def _write_enriched_with_attribute(
+    *,
+    runs_root: Path,
+    shard_id: str,
+    sample_id: str,
+    attribute_exists: bool = True,
+    instruction: str = "Use <Image 1> with <Image 2>.",
+) -> Path:
+    run_root = runs_root / shard_id
+    visual = run_root / "clips" / sample_id / "frames" / "00.jpg"
+    visual.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (1, 2, 3)).save(visual)
+    attribute_path = f"references/{sample_id}/a1.png"
+    attribute = run_root / "subject_attributes" / attribute_path
+    attribute.parent.mkdir(parents=True)
+    if attribute_exists:
+        Image.new("RGBA", (16, 8), (20, 30, 40, 180)).save(attribute)
+    accepted = _accepted_attribute(attribute_path)
+    enriched = EnrichedSample(
+        sample_id=sample_id,
+        clip_uid=sample_id,
+        source_run_root=str(run_root),
+        original_visual={
+            "target_video": f"/source/{sample_id}.mp4",
+            "source": {"parent_video_id": "parent", "clip_suffix": "0"},
+        },
+        original_instruction="Use <image 1>.",
+        enriched_instruction=instruction,
+        references=[
+            {
+                "image_id": "image_1",
+                "image_index": 1,
+                "kind": "subject",
+                "origin": "visual_run",
+                "entity_id": "e1",
+                "image_path": f"clips/{sample_id}/frames/00.jpg",
+                "source_frame_index": 0,
+            },
+            {
+                "image_id": "image_2",
+                "image_index": 2,
+                "kind": "attribute",
+                "origin": "attribute_enrichment",
+                "attribute_id": "a1",
+                "owner_entity_id": "e1",
+                "image_path": attribute_path,
+                "source_frame_index": 1,
+            },
+        ],
+        accepted_attributes=[accepted],
+    )
+    destination = run_root / "subject_attributes" / "enriched_samples.jsonl"
+    destination.write_text(enriched.model_dump_json() + "\n", encoding="utf-8")
+    return destination
+
+
+def test_compactor_publishes_canonical_attribute_with_owner_and_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard_id = "shard-000000000-000000999"
+    _write_export_shard(shards, shard_id, sample_id="sample-a")
+    runs_root = (
+        config_module.ALLOWED_WRITABLE_ROOT
+        / "r2v_v3_runs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+    )
+    _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="sample-a",
+    )
+
+    catalog = compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+        runs_root=runs_root,
+    )
+    production = ProductionSample.model_validate_json(
+        (output / "samples.jsonl").read_text(encoding="utf-8")
+    )
+
+    assert [reference.image_index for reference in production.references] == [1, 2]
+    attribute = production.references[1]
+    assert attribute.kind == "attribute"
+    assert attribute.entity_id is None
+    assert attribute.attribute_id == "a1"
+    assert attribute.owner_entity_id == "e1"
+    assert attribute.attribute_type == "hair"
+    assert attribute.image_path == (
+        f"attribute_references/{shard_id}/sample-a/a1.png"
+    )
+    assert (output / attribute.image_path).is_file()
+    assert str(runs_root) not in (output / "samples.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert len(list(output.rglob("subject.png"))) == 1
+    assert not list(output.rglob("*.mp4"))
+    assert catalog["total_visual_references"] == 1
+    assert catalog["total_attribute_references"] == 1
+
+    compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+        runs_root=runs_root,
+    )
+    assert (output / attribute.image_path).is_file()
+
+
+def test_compactor_rejects_orphan_enriched_and_missing_attribute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard_id = "shard-000000000-000000999"
+    _write_export_shard(shards, shard_id, sample_id="sample-a")
+    runs_root = (
+        config_module.ALLOWED_WRITABLE_ROOT
+        / "r2v_v3_runs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+    )
+    enriched_path = _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="orphan",
+    )
+    with pytest.raises(ValueError, match="orphan enriched sample_id"):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+            runs_root=runs_root,
+        )
+
+    enriched_path.unlink()
+    _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="sample-a",
+        attribute_exists=False,
+    )
+    with pytest.raises((FileNotFoundError, ValueError)):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+            runs_root=runs_root,
+        )
+
+
+def test_compactor_rejects_duplicate_enriched_sample_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard_id = "shard-000000000-000000999"
+    _write_export_shard(shards, shard_id, sample_id="sample-a")
+    runs_root = (
+        config_module.ALLOWED_WRITABLE_ROOT
+        / "r2v_v3_runs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+    )
+    enriched_path = _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="sample-a",
+    )
+    line = enriched_path.read_text(encoding="utf-8")
+    enriched_path.write_text(line + line, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate enriched sample_id"):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+            runs_root=runs_root,
+        )
+
+def test_compactor_rejects_wrong_instruction_order_and_outside_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard_id = "shard-000000000-000000999"
+    _write_export_shard(shards, shard_id, sample_id="sample-a")
+    runs_root = (
+        config_module.ALLOWED_WRITABLE_ROOT
+        / "r2v_v3_runs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+    )
+    _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="sample-a",
+        instruction="Use <Image 2> with <Image 1>.",
+    )
+    with pytest.raises(ValueError, match="image ordering"):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+            runs_root=runs_root,
+        )
+
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="below public dataset"):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=outside,
+            source_yaml=source_yaml,
+        )
+
+
+def test_compactor_publishes_samples_before_catalog_commit_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    _write_export_shard(
+        shards,
+        "shard-000000000-000000999",
+        sample_id="sample-a",
+    )
+    replacements: list[str] = []
+    original_replace = os.replace
+
+    def observe_replace(source_path: str | Path, destination: str | Path) -> None:
+        replacements.append(Path(destination).name)
+        original_replace(source_path, destination)
+
+    monkeypatch.setattr(os, "replace", observe_replace)
+    catalog = compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+    )
+
+    assert replacements[-2:] == ["samples.jsonl", "catalog.json"]
+    assert catalog["samples_jsonl_sha256"] == hashlib.sha256(
+        (output / "samples.jsonl").read_bytes()
+    ).hexdigest()

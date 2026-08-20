@@ -1,32 +1,44 @@
 # V3 JEA production shards
 
-This adapter prepares the growing JEA motion JSONL for the frozen Visual V3
-pipeline. It does not change the generic source parser, copy source videos, or
-change any model, threshold, prompt, schema, or scheduling behavior.
+This production adapter prepares the growing JEA motion JSONL for the frozen
+Visual V3 pipeline. It preserves the generic JSON/JSONL parser and
+`fixed_selection_v1` behavior. It never copies source videos or changes model,
+prompt, threshold, existing Visual schema, or pipeline scheduling behavior.
 
-## Production roots
+## Frozen production identity
 
-The source is:
+The production inputs are:
 
 ```text
+source JSONL:
 /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
+
+processed clip root:
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed
+
+full source-video root:
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808
 ```
 
-The authoritative path-discovery result is the generated file:
+The source dataset may grow indefinitely. A `prod-v1` state root nevertheless
+has one immutable identity recorded in:
 
 ```text
 /mnt/workspace/litengjie/data/r2v_v3_configs/production/jea_motion_v1/prod-v1/source.yaml
 ```
 
-`source.yaml` is created only after at least 100 non-empty source records have
-resolved to existing files below the explicitly supplied `clips_root`. It
-records the confirmed `clips_root`, `source_videos_root`, source JSONL, base
-config, adapter version, and shard size. It is immutable on later resumes.
+That file freezes the source JSONL, adapter version, both roots, shard size,
+base-config path, exact base YAML SHA-256, and loaded V3 config fingerprint.
+Every resume recomputes and checks the base-config identities and the other
+immutable fields. A changed value requires a new production version/root; do
+not mutate `prod-v1`.
 
-The development Mac used for this patch does not mount `/mnt/workspace`, so no
-repository document should guess whether the confirmed root is the processed
-directory itself or `clips_clean_cropped`. On the production server, try the
-two explicit candidates below. A failed probe creates no `source.yaml`:
+## Server-first canary workflow
+
+Start with a non-mutating path probe. It verifies at least 100 existing clip
+MP4s and a bounded sample of unique, existing full source-video MP4s. It prints
+one JSON result and creates no `source.yaml`, cursor, selection, shard config,
+or other production state.
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
@@ -34,75 +46,134 @@ source .venv/bin/activate
 
 BASE=/mnt/workspace/litengjie/data/r2v_v3_configs/e2e1000-s0-samfix-20260814-101818.yaml
 SOURCE=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
-SOURCE_VIDEOS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed
+CLIPS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed
+SOURCE_VIDEOS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808
+STATE=/mnt/workspace/litengjie/data/r2v_v3_configs/production/jea_motion_v1/prod-v1
 
 python tools/prepare_v3_production_shards.py \
   --source-jsonl "$SOURCE" \
   --base-config "$BASE" \
-  --clips-root /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed \
+  --clips-root "$CLIPS" \
   --source-videos-root "$SOURCE_VIDEOS" \
-  --path-probe-records 100
+  --state-root "$STATE" \
+  --path-probe-records 100 \
+  --probe-only
 ```
 
-If and only if that probe reports that fewer than 100 paths resolve, rerun with:
+Inspect the JSON probe result. Then generate exactly one immutable shard:
 
 ```bash
-  --clips-root /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
+python tools/prepare_v3_production_shards.py \
+  --source-jsonl "$SOURCE" \
+  --base-config "$BASE" \
+  --clips-root "$CLIPS" \
+  --source-videos-root "$SOURCE_VIDEOS" \
+  --state-root "$STATE" \
+  --path-probe-records 100 \
+  --max-shards 1
+
+sed -n '1,120p' "$STATE/source.yaml"
+find "$STATE/shards" -maxdepth 1 -type f -name '*.yaml' -print | sort
 ```
 
-After the first successful run, inspect the immutable result rather than
-inferring the root again:
+Run that one generated shard with the ordinary V3 command and no overwrite:
 
 ```bash
-sed -n '1,80p' \
-  /mnt/workspace/litengjie/data/r2v_v3_configs/production/jea_motion_v1/prod-v1/source.yaml
+SHARD_CONFIG="$STATE/shards/shard-000000000-000000999.yaml"
+.venv/bin/python run_pipeline_v3.py \
+  --config "$SHARD_CONFIG" \
+  --stages manifest,annotate,frames,segment,rank,background,remove,pair,reference_edit,reference_integrity,instruct,subject_attributes,export
 ```
 
-## Shard preparation and resume
+Compact only the completed shard export and inspect the canonical interface:
 
-The default shard size is 1000 source records. Only complete shards are sealed
-by default. Use `--seal-tail` when the current incomplete EOF tail should become
-an immutable shard. The cursor records byte offsets and the SHA-256 of the last
-committed line. Resume verifies that committed boundary and seeks directly to
-`next_byte_offset`; it does not scan from line zero.
+```bash
+EXPORT=/mnt/workspace/litengjie/data/r2v_v3_exports/production/jea_motion_v1/prod-v1
+RUNS=/mnt/workspace/litengjie/data/r2v_v3_runs/production/jea_motion_v1/prod-v1
 
-Malformed records are written without raw payloads to:
+.venv/bin/python tools/compact_v3_production_exports.py \
+  --shards-root "$EXPORT/shards" \
+  --source-jsonl "$SOURCE" \
+  --source-yaml "$STATE/source.yaml" \
+  --runs-root "$RUNS"
+
+sed -n '1,3p' "$EXPORT/samples.jsonl"
+sed -n '1,160p' "$EXPORT/catalog.json"
+```
+
+Only after the probe, one-shard run, compaction, and canonical sample inspection
+succeed should normal production resume without `--max-shards`.
+
+## Shards and cursor semantics
+
+The default shard size is 1000 source records. Complete shards are sealed by
+default; `--seal-tail` explicitly seals the current incomplete EOF tail.
+`--max-shards N` limits only the number of new shards sealed by one invocation
+and leaves the cursor exactly after the last sealed shard without consuming the
+following records.
+
+Selections and shard configs are immutable. The cursor stores the exact next
+unread byte offset and the SHA-256 plus start offset of the last committed
+non-empty source line. Resume validates that boundary line, tolerates already
+consumed blank lines after it, rejects truncation before the cursor, and seeks
+directly to the cursor. This is boundary-line and truncation protection; it is
+not a cryptographic verification of every historical byte in the entire source
+prefix.
+
+Malformed source rows are isolated without raw payloads in:
 
 ```text
 state/source_errors.jsonl
 ```
 
-Each generated shard YAML inherits all model, runtime, Visual, and attribute
-settings from the explicit base config. Only `dataset_json`, `run_root`,
-`export_root`, and the fixed-selection source fields are replaced.
+After `source.yaml` exists and its identity is validated, normal row parsing
+keeps `source_video_path` as provenance without a per-row source-video `stat`.
+Each selected record retains both unambiguous relative paths:
 
-To seal the current tail, repeat the confirmed command with:
+- `source_relative_video_path`: `video_path` relative to `clips_root`;
+- `source_relative_source_video_path`: `source_video_path` relative to
+  `source_videos_root`.
 
-```bash
-  --seal-tail
+## Canonical production export
+
+Per-shard V3 `DatasetSample` exports remain unchanged and are internal/audit
+artifacts. The production-facing downstream interface is one file with one
+schema on every line:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_exports/production/jea_motion_v1/prod-v1/samples.jsonl
 ```
 
-Run each generated YAML independently with the existing V3 pipeline command;
-the preparation layer does not modify `run_pipeline_v3` scheduling.
+The compactor streams one bounded shard at a time and uses SQLite for global
+sample and enriched-sample identity checks. A sample with a valid enriched
+sidecar uses the enriched instruction and ordered visual-plus-attribute
+references. A sample without attributes is normalized into the same
+`r2v.v3.production_sample.1` schema and remains valid.
 
-## Compact shard exports
+Visual PNGs are not duplicated; canonical paths continue to point into:
 
-After shard exports are complete:
-
-```bash
-python tools/compact_v3_production_exports.py \
-  --shards-root /mnt/workspace/litengjie/data/r2v_v3_exports/production/jea_motion_v1/prod-v1/shards \
-  --source-jsonl "$SOURCE"
+```text
+shards/<shard-id>/references/...
 ```
 
-This streams shard samples, validates every `dataset.json`, uses a temporary
-SQLite uniqueness index, verifies reference files, and publishes
-`samples.jsonl` plus `catalog.json` atomically per file. Reference paths are
-rewritten to `shards/<shard-id>/references/...`; neither references nor videos
-are copied.
+Accepted RGBA attribute PNGs are the only additional published images. They are
+validated, hard-linked when possible (with a copy fallback), and stored at
+stable production-relative paths under:
 
-To also validate and merge subject-attribute enriched samples, add:
-
-```bash
-  --runs-root /mnt/workspace/litengjie/data/r2v_v3_runs/production/jea_motion_v1/prod-v1
+```text
+attribute_references/<shard-id>/<clip-uid>/<attribute-id>.png
 ```
+
+These references preserve `attribute_id`, `owner_entity_id`, and
+`attribute_type`. They never depend on a working `run_root` after publication.
+Target videos remain the original public-dataset MP4 paths; videos are never
+copied.
+
+The optional top-level `enriched_samples.jsonl` remains an audit artifact when
+`--runs-root` is supplied. Per-shard sample JSONLs and enriched sidecars are not
+the downstream join interface.
+
+`samples.jsonl` is fully validated, fsynced, and atomically replaced. The
+catalog records its exact SHA-256, canonical schema version, counts, source
+ranges, shard commits/config hashes, adapter, and base-config identity. The
+catalog is replaced last and acts as the publication commit marker.

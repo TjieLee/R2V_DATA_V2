@@ -105,11 +105,9 @@ class JeaVideoMotionAdapter:
             or source_index < 0
         ):
             raise ValueError("source_index must be a non-negative integer")
-        video_path = self.resolve_clip_path(raw)
-        _, source_relative_video_path = _path_below_root(
-            raw.get("source_video_path"),
-            root=self.source_videos_root,
-            field_name="source_video_path",
+        video_path, source_relative_video_path = self.resolve_clip_path(raw)
+        _, source_relative_source_video_path = self.resolve_source_video_path(
+            raw,
             require_file=False,
         )
 
@@ -146,6 +144,9 @@ class JeaVideoMotionAdapter:
             {
                 "source_adapter": JEA_VIDEO_MOTION_ADAPTER,
                 "source_relative_video_path": source_relative_video_path,
+                "source_relative_source_video_path": (
+                    source_relative_source_video_path
+                ),
             }
         )
         return {
@@ -158,14 +159,26 @@ class JeaVideoMotionAdapter:
             "clip_suffix": identity.clip_suffix,
         }
 
-    def resolve_clip_path(self, raw: dict[str, Any]) -> Path:
-        video_path, _ = _path_below_root(
+    def resolve_clip_path(self, raw: dict[str, Any]) -> tuple[Path, str]:
+        return _path_below_root(
             raw.get("video_path"),
             root=self.clips_root,
             field_name="video_path",
             require_file=True,
         )
-        return video_path
+
+    def resolve_source_video_path(
+        self,
+        raw: dict[str, Any],
+        *,
+        require_file: bool,
+    ) -> tuple[Path, str]:
+        return _path_below_root(
+            raw.get("source_video_path"),
+            root=self.source_videos_root,
+            field_name="source_video_path",
+            require_file=require_file,
+        )
 
 
 def parse_jea_video_motion_v1(
