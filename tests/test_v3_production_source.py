@@ -57,11 +57,12 @@ def _record(
     *,
     parent: str = "movie-a",
     video_path: str | None = None,
+    source_video_path: str | None = None,
 ) -> dict[str, object]:
     return {
         "video_path": video_path or f"{parent}_{index}.mp4",
         "source_video_id": parent,
-        "source_video_path": f"{parent}.mp4",
+        "source_video_path": source_video_path or f"{parent}.mp4",
         "shot_index": index,
         "start_frame": index * 10,
         "end_frame": index * 10 + 9,
@@ -279,6 +280,113 @@ def test_source_video_probe_failure_creates_no_source_yaml(
         )
 
     assert not (fixture["state_root"] / "source.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "source_video_path",
+    (
+        "01/丁宝桢/01 4K.mkv",
+        "originals/movie-a.mp4",
+        "originals/movie-a.mov",
+        "originals/movie-a.customvideo",
+    ),
+)
+def test_source_video_probe_is_extension_agnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_video_path: str,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=1)
+    provenance = fixture["videos"] / source_video_path
+    provenance.parent.mkdir(parents=True, exist_ok=True)
+    provenance.write_bytes(b"source-video")
+    record_source_path = (
+        str(provenance) if provenance.suffix == ".mkv" else source_video_path
+    )
+    fixture["source"].write_text(
+        json.dumps(_record(0, source_video_path=record_source_path)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = probe_production_setup(
+        source_jsonl=fixture["source"],
+        base_config=fixture["base_config"],
+        clips_root=fixture["clips"],
+        source_videos_root=fixture["videos"],
+        path_probe_records=1,
+    )
+
+    assert result["clip_paths_verified"] == 1
+    assert result["unique_source_video_paths_verified"] == 1
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    (
+        "missing",
+        "directory",
+        "relative_escape",
+        "absolute_escape",
+        "symlink_escape",
+    ),
+)
+def test_source_video_probe_rejects_missing_and_escaped_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=1)
+    outside = fixture["dataset"] / "outside.customvideo"
+    outside.write_bytes(b"outside")
+    if failure_mode == "missing":
+        source_video_path = "missing.customvideo"
+    elif failure_mode == "directory":
+        directory = fixture["videos"] / "not-a-file.customvideo"
+        directory.mkdir()
+        source_video_path = directory.name
+    elif failure_mode == "relative_escape":
+        source_video_path = "../outside.customvideo"
+    elif failure_mode == "absolute_escape":
+        source_video_path = str(outside)
+    else:
+        link = fixture["videos"] / "linked.customvideo"
+        link.symlink_to(outside)
+        source_video_path = link.name
+    fixture["source"].write_text(
+        json.dumps(_record(0, source_video_path=source_video_path)) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="existing source video"):
+        probe_production_setup(
+            source_jsonl=fixture["source"],
+            base_config=fixture["base_config"],
+            clips_root=fixture["clips"],
+            source_videos_root=fixture["videos"],
+            path_probe_records=1,
+        )
+
+
+def test_processed_clip_probe_still_requires_mp4(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _production_fixture(tmp_path, monkeypatch, count=1)
+    processed = fixture["clips"] / "movie-a_0.mov"
+    processed.write_bytes(b"processed-shot")
+    fixture["source"].write_text(
+        json.dumps(_record(0, video_path=processed.name)) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="existing source video"):
+        probe_production_setup(
+            source_jsonl=fixture["source"],
+            base_config=fixture["base_config"],
+            clips_root=fixture["clips"],
+            source_videos_root=fixture["videos"],
+            path_probe_records=1,
+        )
 
 
 def test_preparer_max_shards_stops_at_exact_cursor_boundary(

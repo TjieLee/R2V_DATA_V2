@@ -218,14 +218,10 @@ def _probe_source_paths(
                     and isinstance(source_value, str)
                     and source_value not in source_videos
                 ):
-                    source_path, _ = adapter.resolve_source_video_path(
+                    adapter.resolve_source_video_path(
                         value,
                         require_file=True,
                     )
-                    if source_path.suffix.lower() != ".mp4":
-                        raise ValueError(
-                            "record.source_video_path must identify an MP4"
-                        )
                     source_videos.add(source_value)
             except Exception:  # noqa: BLE001 - path discovery skips malformed rows
                 if examined >= maximum_examined:

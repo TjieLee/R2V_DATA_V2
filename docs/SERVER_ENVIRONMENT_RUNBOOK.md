@@ -1,6 +1,6 @@
 # R2V V3 Server Environment Runbook
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 This file is the single source of truth for the Linux server environment used by
 the current integrated Visual V3 + subject-attribute pipeline. Update it whenever
@@ -15,7 +15,7 @@ Current integrated Visual + subject-attribute branch and validated code baseline
 
 ```text
 branch: feature/v3-subject-attributes-v1
-code baseline: c1c056675dac9cdce5e585cd3f934c4bb573fc96
+code baseline: 06051245ea4f58ca8b1df5aa117fab918f211533
 ```
 
 Frozen Visual baseline remains separate:
@@ -88,6 +88,15 @@ Qwen3-VL model:
 Qwen endpoint:
   http://127.0.0.1:8000/v1
 
+JEA production source JSONL:
+  /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
+
+JEA processed clips_root:
+  /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
+
+JEA original source_videos_root:
+  /mnt/workspace/public/dataset/jea-video/moive-183t-0808
+
 Boogu code:
   /mnt/workspace/litengjie/data/vendor/Boogu-Image
 
@@ -100,6 +109,14 @@ Boogu model:
 Object-Remover LoRA:
   /mnt/workspace/litengjie/data/models/Qwen-Image-Edit-2511-Object-Remover/Qwen-Image-Edit-2511-Object-Remover.safetensors
 ```
+
+For JEA production, `record.video_path` is the existing processed MP4 shot
+below `clips_root` and is the only one of these two fields used as V3 Visual
+frame/model input. `record.source_video_path` is original/full-video provenance
+only: it must be a safe existing regular file below `source_videos_root`, but
+its container and extension are unrestricted. For example,
+`01/丁宝桢/01 4K.mkv` is valid provenance. Never substitute
+`source_video_path` for `video_path` as Visual input.
 
 Writable roots:
 
@@ -229,7 +246,7 @@ git status --short
 Expected validated code baseline before documentation-only commits:
 
 ```text
-c1c056675dac9cdce5e585cd3f934c4bb573fc96
+06051245ea4f58ca8b1df5aa117fab918f211533
 ```
 
 If `git status --short` is non-empty before switching, stop. Do not stash,
@@ -285,7 +302,7 @@ endpoint:             http://127.0.0.1:8000/v1
 dtype:                BF16
 tensor parallel:      1
 data parallel:        4
-max model length:     32768
+max model length:     49152
 pipeline max inflight: 4
 ```
 
@@ -302,7 +319,7 @@ export OMP_NUM_THREADS=1
 vllm serve /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct \
   --tensor-parallel-size 1 \
   --data-parallel-size 4 \
-  --max-model-len 32768 \
+  --max-model-len 49152 \
   --allowed-local-media-path /mnt/workspace/public/dataset \
   --port 8000
 ```
@@ -556,6 +573,29 @@ A missing profiling file may simply mean the run was not launched with
 `--profile`; it is not alone proof of model failure.
 
 ## 12. Current Evidence Paths
+
+2026-08-20 new-data 10-clip functional canary:
+
+```text
+commit:                       06051245ea4f58ca8b1df5aa117fab918f211533
+source range:                  0-9
+input clips:                   10
+Visual exports:                3
+Visual references:             4
+eligible human owners:         2
+accepted attribute references: 2
+enriched samples:              2
+canonical samples:             3
+canonical total references:    6
+failed_tasks =                 []
+copied videos:                 0
+```
+
+The TP1 x DP4 BF16 service on physical GPUs 0-3 used
+`--max-model-len 49152`, the pipeline retained `runtime.qwen_max_inflight: 4`,
+and `OMP_NUM_THREADS=1`. The 49152 setting eliminated the previous 32768
+context-length infrastructure failure. This is bounded functional evidence;
+3 exports from 10 inputs must not be treated as a production yield estimate.
 
 Frozen Visual 1000-clip canary:
 

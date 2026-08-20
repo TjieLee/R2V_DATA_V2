@@ -13,12 +13,20 @@ The production inputs are:
 source JSONL:
 /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
 
-processed clip root:
-/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed
+clips_root:
+/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
 
-full source-video root:
+source_videos_root:
 /mnt/workspace/public/dataset/jea-video/moive-183t-0808
 ```
+
+`record.video_path` is the processed shot used as the V3 Visual frame/model
+input. It must be an existing MP4 below `clips_root`. In contrast,
+`record.source_video_path` is original/full-video provenance only. It must be a
+safe existing regular file below `source_videos_root`, but its container and
+extension are unrestricted. A provenance path such as
+`01/丁宝桢/01 4K.mkv` is valid and must never be substituted for `video_path` as
+the Visual input.
 
 The source dataset may grow indefinitely. A `prod-v1` state root nevertheless
 has one immutable identity recorded in:
@@ -36,9 +44,10 @@ not mutate `prod-v1`.
 ## Server-first canary workflow
 
 Start with a non-mutating path probe. It verifies at least 100 existing clip
-MP4s and a bounded sample of unique, existing full source-video MP4s. It prints
-one JSON result and creates no `source.yaml`, cursor, selection, shard config,
-or other production state.
+MP4s and a bounded sample of unique, safe existing full-source provenance
+files, independent of their filename extensions. It prints one JSON result and
+creates no `source.yaml`, cursor, selection, shard config, or other production
+state.
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
@@ -46,7 +55,7 @@ source .venv/bin/activate
 
 BASE=/mnt/workspace/litengjie/data/r2v_v3_configs/e2e1000-s0-samfix-20260814-101818.yaml
 SOURCE=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
-CLIPS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed
+CLIPS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
 SOURCE_VIDEOS=/mnt/workspace/public/dataset/jea-video/moive-183t-0808
 STATE=/mnt/workspace/litengjie/data/r2v_v3_configs/production/jea_motion_v1/prod-v1
 
@@ -103,6 +112,29 @@ sed -n '1,160p' "$EXPORT/catalog.json"
 
 Only after the probe, one-shard run, compaction, and canonical sample inspection
 succeed should normal production resume without `--max-shards`.
+
+## 2026-08-20 new-data functional canary
+
+The server canary at commit
+`06051245ea4f58ca8b1df5aa117fab918f211533` covered source indexes 0-9:
+
+```text
+input clips:                  10
+Visual exports:               3
+Visual references:            4
+eligible human owners:        2
+accepted attribute refs:      2
+enriched samples:             2
+canonical samples:            3
+canonical total references:   6
+failed_tasks =                []
+copied videos:                0
+```
+
+The Qwen TP1 x DP4 BF16 service used `max-model-len=49152`; this eliminated the
+previous 32768 context-length infrastructure failure. This bounded canary is
+functional evidence only. Its 3 exports from 10 inputs are not a production
+yield estimate.
 
 ## Shards and cursor semantics
 
@@ -166,8 +198,9 @@ attribute_references/<shard-id>/<clip-uid>/<attribute-id>.png
 
 These references preserve `attribute_id`, `owner_entity_id`, and
 `attribute_type`. They never depend on a working `run_root` after publication.
-Target videos remain the original public-dataset MP4 paths; videos are never
-copied.
+Target videos remain the processed public-dataset shot MP4 paths; videos are
+never copied. Original/full `source_video_path` values remain provenance and
+are never substituted as Visual inputs.
 
 The optional top-level `enriched_samples.jsonl` remains an audit artifact when
 `--runs-root` is supplied. Per-shard sample JSONLs and enriched sidecars are not
