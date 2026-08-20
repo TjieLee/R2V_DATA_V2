@@ -175,11 +175,51 @@ def test_load_final_background_rejects_traversal_and_outside_run(
 
 def test_final_background_prompt_stays_short_and_generic() -> None:
     words = re.findall(r"\b[A-Za-z]+(?:'[A-Za-z]+)?\b", SYSTEM_PROMPT)
-    assert len(words) <= 130
-    assert len(words) <= 160
+    assert len(words) <= 220
     lowered = SYSTEM_PROMPT.casefold()
     assert "forbidden foreground entities" not in lowered
     assert "forbidden list" not in lowered
+
+
+def test_final_background_prompt_rejects_non_diegetic_overlay_text() -> None:
+    lowered = " ".join(SYSTEM_PROMPT.casefold().split())
+
+    assert "subtitles" in lowered
+    assert "opening or ending credits" in lowered
+    assert "watermarks" in lowered
+    assert "channel or platform logos" in lowered
+    assert "ui overlays" in lowered
+    assert "no_obvious_artifacts=false" in lowered
+    assert "verdict=reject" in lowered
+
+
+def test_final_background_prompt_preserves_diegetic_scene_text() -> None:
+    lowered = " ".join(SYSTEM_PROMPT.casefold().split())
+
+    assert "text physically present in the depicted environment" in lowered
+    for example in (
+        "painted on a wall",
+        "plaques",
+        "shop signs",
+        "books",
+        "banners",
+    ):
+        assert example in lowered
+    assert "unless it dominates the image" in lowered
+
+
+def test_final_background_review_schema_is_unchanged() -> None:
+    schema = FinalBackgroundReview.model_json_schema()
+
+    assert schema["required"] == [
+        "verdict",
+        "background_matches_description",
+        "no_unexpected_foreground_subject",
+        "usable_background_information",
+        "no_obvious_artifacts",
+        "reason",
+    ]
+    assert set(schema["properties"]) == set(schema["required"])
 
 
 @pytest.mark.parametrize(

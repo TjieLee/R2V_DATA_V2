@@ -32,7 +32,19 @@ Small, partial, distant, dark, or edge-of-frame subjects still count.
 
 Do not reject plausible environmental elements merely because the description
 does not enumerate them. Reject fades, nearly black frames, severe obstruction,
-or wrong scenes. Judge visible facts only. Return strict JSON only."""
+or wrong scenes.
+
+Reject clearly visible non-diegetic screen-space overlays, including subtitles,
+opening or ending credits, watermarks, channel or platform logos, captions, UI
+overlays, and other text or graphics composited over the video frame. These are
+not reusable scene content. Treat them as no_obvious_artifacts=false and
+therefore verdict=reject.
+
+Do not reject text physically present in the depicted environment, such as
+writing painted on a wall, plaques, shop signs, books, or banners, unless it
+dominates the image or otherwise makes the background unusable.
+
+Judge visible facts only. Return strict JSON only."""
 
 TILE_NAMES = (
     "upper_left",
