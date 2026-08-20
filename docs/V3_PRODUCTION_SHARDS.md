@@ -41,7 +41,29 @@ Every resume recomputes and checks the base-config identities and the other
 immutable fields. A changed value requires a new production version/root; do
 not mutate `prod-v1`.
 
-## Server-first canary workflow
+## Quick functional canary
+
+For an isolated 20-clip functional check, run:
+
+```bash
+.venv/bin/python tools/run_v3_canary.py \
+  --count 20 \
+  --exclude-source-name 丁宝桢
+```
+
+The helper scans in source order for the first 20 consecutive valid shots from
+one non-excluded source video, prints the selected video and true global source
+range before model execution, runs the full profiled V3 pipeline, and compacts
+the successful result. It automatically creates a timestamped ASCII-safe
+`canary-e2e20-jea-...` config, run, and export root. The final export contains
+`canary_summary.json`, `samples.jsonl`, `catalog.json`, and the readable
+`references/` tree; the pipeline stream is also saved as `canary.log`.
+
+This helper never reads or advances the formal `prod-v1` cursor. Formal
+production continues to use `tools/prepare_v3_production_shards.py`; the canary
+and formal preparation tools must not share mutable cursor state.
+
+## Formal production shard workflow
 
 Start with a non-mutating path probe. It verifies at least 100 existing clip
 MP4s and a bounded sample of unique, safe existing full-source provenance
