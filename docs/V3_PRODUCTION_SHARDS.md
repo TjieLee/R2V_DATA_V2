@@ -261,6 +261,31 @@ The optional top-level `enriched_samples.jsonl` remains an audit artifact when
 `--runs-root` is supplied. Per-shard sample JSONLs and enriched sidecars are not
 the downstream join interface.
 
+### New subject-attribute GME prefilter
+
+The new, server-canary-pending attribute flow is:
+
+```text
+Qwen discovery
+  -> owner-Top3 frame-local SAM3 candidate
+  -> deterministic ownership/geometry
+  -> GME 2B relative-margin prefilter
+  -> existing batched Qwen final attribute review
+```
+
+GME uses `Alibaba-NLP/gme-Qwen2-VL-2B-Instruct` from the local model path with
+English queries and one persistent offline worker. The intended assignment is
+physical GPU7, colocated with the dedicated attribute SAM3 worker without
+intentional inference overlap. GME may advance from a poor geometry-valid crop
+to the next existing owner candidate frame, but it does not expand the Top3
+bound or use temporal tracking. A GME infrastructure failure fails open to the
+unchanged Qwen final review.
+
+The initial contract is only `relative_margin_v1` with `min_margin=0.0`; it is
+not calibrated beyond that relative comparison and has no absolute cosine
+threshold. The production canonical sample schema and reference layout remain
+unchanged.
+
 `samples.jsonl` is fully validated, fsynced, and atomically replaced. The
 catalog records its exact SHA-256, canonical schema version, counts, source
 ranges, shard commits/config hashes, adapter, and base-config identity. The

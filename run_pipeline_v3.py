@@ -7,6 +7,7 @@ import threading
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
+from r2v_data_v2.v3 import config as v3_config_module
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.background_final_guard import FinalBackgroundJudge
@@ -53,8 +54,13 @@ from r2v_data_v2.v3.runtime import (
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.segment import segment_clips
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage, evaluate_export_state
+from r2v_data_v2.v3.subject_attribute_gme import (
+    PersistentGmeAttributeScreener,
+    UnavailableGmeAttributeScreener,
+)
 from r2v_data_v2.v3.subject_attributes import (
     AttributeFrameSegmentationBackend,
+    AttributeGmeScreener,
     PersistentWorkerAttributeFrameSegmenter,
     QwenSubjectAttributeClient,
     SubjectAttributeDiscoveryClient,
@@ -141,6 +147,7 @@ def _streaming_stage_handler(
     subject_attribute_discovery_client: SubjectAttributeDiscoveryClient | None,
     subject_attribute_review_client: SubjectAttributeReviewClient | None,
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
+    attribute_gme_screener: AttributeGmeScreener | None,
 ) -> object:
     if process is not None:
         return process.request
@@ -245,6 +252,7 @@ def _streaming_stage_handler(
                 discovery_client=subject_attribute_discovery_client,
                 review_client=subject_attribute_review_client,
                 segmentation_backend=attribute_segmentation_backend,
+                gme_screener=attribute_gme_screener,
                 overwrite=overwrite,
             ).to_counts()
         else:
@@ -286,6 +294,7 @@ def _run_streaming_pipeline(
     subject_attribute_discovery_client: SubjectAttributeDiscoveryClient | None,
     subject_attribute_review_client: SubjectAttributeReviewClient | None,
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
+    attribute_gme_screener: AttributeGmeScreener | None,
     profile: bool,
 ) -> dict[str, object]:
     if "manifest" in ordered_stages:
@@ -365,6 +374,44 @@ def _run_streaming_pipeline(
             worker.start()
             processes[_SUBJECT_ATTRIBUTE_SEGMENT_WORKER] = worker
             stack.callback(worker.close)
+        attribute_inference_lock: threading.Lock | None = None
+        if config.subject_attribute_gme.enabled:
+            attribute_segment_gpu = (
+                config.runtime.gpu_workers.subject_attributes_segment
+                or config.runtime.gpu_workers.segment
+            )
+            if (
+                attribute_segment_gpu
+                == config.runtime.gpu_workers.subject_attributes_gme
+            ):
+                attribute_inference_lock = threading.Lock()
+        if (
+            "subject_attributes" in clip_stages
+            and config.subject_attribute_gme.enabled
+            and attribute_gme_screener is None
+        ):
+            gme_gpu = config.runtime.gpu_workers.subject_attributes_gme
+            assert gme_gpu is not None
+            owned_gme: PersistentGmeAttributeScreener | None = None
+            try:
+                owned_gme = PersistentGmeAttributeScreener.from_runtime(
+                    config.subject_attribute_gme,
+                    physical_gpu=gme_gpu,
+                    run_root=storage.root,
+                    allowed_root=v3_config_module.ALLOWED_WRITABLE_ROOT,
+                    inference_lock=attribute_inference_lock,
+                )
+                owned_gme.start()
+            except Exception as exc:  # noqa: BLE001 - fail open to Qwen
+                if owned_gme is not None:
+                    owned_gme.close()
+                attribute_gme_screener = UnavailableGmeAttributeScreener(
+                    config.subject_attribute_gme,
+                    exc,
+                )
+            else:
+                attribute_gme_screener = owned_gme
+                stack.callback(owned_gme.close)
         owned_attribute_qwen: QwenSubjectAttributeClient | None = None
         if "subject_attributes" in clip_stages:
             if (
@@ -397,6 +444,7 @@ def _run_streaming_pipeline(
                     PersistentWorkerAttributeFrameSegmenter(
                         storage,
                         segment_process,
+                        inference_lock=attribute_inference_lock,
                     )
                 )
         stages: list[StreamingStage] = []
@@ -438,6 +486,7 @@ def _run_streaming_pipeline(
                         attribute_segmentation_backend=(
                             attribute_segmentation_backend
                         ),
+                        attribute_gme_screener=attribute_gme_screener,
                     ),
                 )
             )
@@ -510,6 +559,7 @@ def run_pipeline_v3(
     subject_attribute_discovery_client: SubjectAttributeDiscoveryClient | None = None,
     subject_attribute_review_client: SubjectAttributeReviewClient | None = None,
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None = None,
+    attribute_gme_screener: AttributeGmeScreener | None = None,
     profile: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
@@ -588,6 +638,7 @@ def run_pipeline_v3(
                         attribute_segmentation_backend=(
                             attribute_segmentation_backend
                         ),
+                        attribute_gme_screener=attribute_gme_screener,
                         profile=profile,
                     )
             for stage in ordered_stages:

@@ -417,6 +417,15 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
                     "candidates_rejected": 2,
                     "ready_removed": 1,
                 },
+                "subject_attributes_summary": {
+                    "gme_calls": 5,
+                    "gme_candidates_screened": 4,
+                    "gme_candidates_passed": 3,
+                    "gme_candidates_rejected": 1,
+                    "gme_retried_next_frame": 1,
+                    "gme_failures": 1,
+                    "gme_model_call_time_seconds": 2.75,
+                },
             },
         )
 
@@ -475,6 +484,13 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
     assert summary["remove_candidates_accepted"] == 1
     assert summary["remove_candidates_rejected"] == 2
     assert summary["ready_removed"] == 1
+    assert summary["gme_calls"] == 5
+    assert summary["gme_candidates_screened"] == 4
+    assert summary["gme_candidates_passed"] == 3
+    assert summary["gme_candidates_rejected"] == 1
+    assert summary["gme_retried_next_frame"] == 1
+    assert summary["gme_failures"] == 1
+    assert summary["gme_model_call_time_seconds"] == 2.75
     assert summary["failed_tasks"] == []
     summary_path = Path(str(summary["export_root"])) / "canary_summary.json"
     assert json.loads(summary_path.read_text(encoding="utf-8")) == summary

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ from r2v_data_v2.v3.pair import (
     build_reference_crop,
     mask_component_diagnostics,
 )
-from r2v_data_v2.v3.profiling import profiled_openai_call
+from r2v_data_v2.v3.profiling import profile_model_call, profiled_openai_call
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend, mask_iou
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -39,6 +40,11 @@ from r2v_data_v2.v3.schemas import (
     render_annotation_plain_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
+from r2v_data_v2.v3.subject_attribute_gme import (
+    GmeRelativeMarginResult,
+    PersistentGmeAttributeScreener,
+    UnavailableGmeAttributeScreener,
+)
 
 ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION = "r2v.v3.subject_attributes.1"
 ATTRIBUTE_OWNER_SCHEMA_VERSION = "r2v.v3.subject_attribute_owner.1"
@@ -167,11 +173,62 @@ class OwnershipGeometry(_SchemaModel):
     significant_component_count: int = Field(ge=0)
     largest_component_ratio: float = Field(ge=0, le=1)
     second_largest_component_ratio: float = Field(ge=0, le=1)
+    bbox_fill_ratio: float = Field(default=0.0, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_reason(self) -> OwnershipGeometry:
         if not self.reason.strip():
             raise ValueError("ownership geometry reason must not be empty")
+        return self
+
+
+class GmeAttributeScreenAttempt(_SchemaModel):
+    owner_candidate_id: str
+    source_frame_slot: int = Field(ge=0, lt=10)
+    source_frame_index: int = Field(ge=0)
+    bbox_fill_ratio: float = Field(ge=0, le=1)
+    status: Literal["passed", "rejected", "failed"]
+    positive_score: float | None = None
+    negative_scores: dict[str, float] = Field(default_factory=dict)
+    max_negative_score: float | None = None
+    margin: float | None = None
+    passed: bool | None = None
+    reason: str
+
+    @model_validator(mode="after")
+    def validate_attempt(self) -> GmeAttributeScreenAttempt:
+        if not self.owner_candidate_id.strip() or not self.reason.strip():
+            raise ValueError("GME attempt provenance and reason must not be empty")
+        scores = (
+            self.positive_score,
+            self.max_negative_score,
+            self.margin,
+        )
+        if self.status == "failed":
+            if any(value is not None for value in scores) or self.negative_scores:
+                raise ValueError("failed GME attempt cannot publish scores")
+            if self.passed is not None:
+                raise ValueError("failed GME attempt cannot publish passed")
+            return self
+        if any(value is None for value in scores) or not self.negative_scores:
+            raise ValueError("completed GME attempt requires all scores")
+        numeric = [
+            *[float(value) for value in scores if value is not None],
+            *self.negative_scores.values(),
+        ]
+        if any(not math.isfinite(value) for value in numeric):
+            raise ValueError("GME attempt scores must be finite")
+        maximum = max(self.negative_scores.values())
+        assert self.max_negative_score is not None
+        assert self.positive_score is not None
+        assert self.margin is not None
+        if self.max_negative_score != maximum:
+            raise ValueError("GME maximum negative score is inconsistent")
+        if self.margin != self.positive_score - maximum:
+            raise ValueError("GME relative margin is inconsistent")
+        expected_passed = self.status == "passed"
+        if self.passed is not expected_passed:
+            raise ValueError("GME attempt status must match passed")
         return self
 
 
@@ -190,6 +247,8 @@ class SubjectAttributeRecord(_SchemaModel):
     sam3_prompt: str
     ownership_geometry: OwnershipGeometry | None = None
     review: SubjectAttributeReview | None = None
+    gme_attempts: list[GmeAttributeScreenAttempt] = Field(default_factory=list)
+    selected_gme_attempt_index: int | None = Field(default=None, ge=0)
     reason: str
 
     @model_validator(mode="after")
@@ -216,6 +275,12 @@ class SubjectAttributeRecord(_SchemaModel):
                 raise ValueError("attribute record review ID must match")
         elif self.image_path is not None:
             raise ValueError("rejected attribute must not publish an image")
+        if self.selected_gme_attempt_index is not None:
+            if self.selected_gme_attempt_index >= len(self.gme_attempts):
+                raise ValueError("selected GME attempt index is out of range")
+            selected = self.gme_attempts[self.selected_gme_attempt_index]
+            if selected.status not in {"passed", "failed"}:
+                raise ValueError("selected GME attempt must pass or fail open")
         return self
 
 
@@ -231,7 +296,31 @@ class OwnerEnrichmentMetrics(_SchemaModel):
     different_frame_accepted: int = Field(default=0, ge=0)
     qwen_model_call_time_seconds: float = Field(default=0.0, ge=0)
     sam3_model_call_time_seconds: float = Field(default=0.0, ge=0)
+    gme_calls: int = Field(default=0, ge=0)
+    gme_candidates_screened: int = Field(default=0, ge=0)
+    gme_candidates_passed: int = Field(default=0, ge=0)
+    gme_candidates_rejected: int = Field(default=0, ge=0)
+    gme_retried_next_frame: int = Field(default=0, ge=0)
+    gme_failures: int = Field(default=0, ge=0)
+    gme_model_call_time_seconds: float = Field(default=0.0, ge=0)
     failures: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_gme_counts(self) -> OwnerEnrichmentMetrics:
+        if self.gme_candidates_screened != (
+            self.gme_candidates_passed + self.gme_candidates_rejected
+        ):
+            raise ValueError("GME screened count must equal passed plus rejected")
+        if self.gme_calls != self.gme_candidates_screened + self.gme_failures:
+            raise ValueError("GME calls must equal screened plus failures")
+        for value in (
+            self.qwen_model_call_time_seconds,
+            self.sam3_model_call_time_seconds,
+            self.gme_model_call_time_seconds,
+        ):
+            if not math.isfinite(value):
+                raise ValueError("attribute model-call times must be finite")
+        return self
 
 
 class OwnerEnrichmentArtifact(_SchemaModel):
@@ -246,6 +335,7 @@ class OwnerEnrichmentArtifact(_SchemaModel):
     owner_grounding_prompt: str
     records: list[SubjectAttributeRecord]
     metrics: OwnerEnrichmentMetrics
+    gme_screen_mode: str | None = None
     failure_reason: str | None = None
 
     @model_validator(mode="after")
@@ -356,6 +446,19 @@ class PendingAttributeCandidate:
     source_image: Image.Image
     crop: Image.Image
     geometry: OwnershipGeometry
+    gme_attempts: tuple[GmeAttributeScreenAttempt, ...] = ()
+    selected_gme_attempt_index: int | None = None
+
+
+@dataclass
+class _GmeSelectionMetrics:
+    calls: int = 0
+    candidates_screened: int = 0
+    candidates_passed: int = 0
+    candidates_rejected: int = 0
+    retried_next_frame: int = 0
+    failures: int = 0
+    model_call_time_seconds: float = 0.0
 
 
 @dataclass
@@ -374,6 +477,13 @@ class EnrichmentTotals:
     different_frame_accepted: int = 0
     qwen_model_call_time_seconds: float = 0.0
     sam3_model_call_time_seconds: float = 0.0
+    gme_calls: int = 0
+    gme_candidates_screened: int = 0
+    gme_candidates_passed: int = 0
+    gme_candidates_rejected: int = 0
+    gme_retried_next_frame: int = 0
+    gme_failures: int = 0
+    gme_model_call_time_seconds: float = 0.0
     failures: int = 0
     failure_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -391,6 +501,13 @@ class EnrichmentTotals:
         self.different_frame_accepted += metrics.different_frame_accepted
         self.qwen_model_call_time_seconds += metrics.qwen_model_call_time_seconds
         self.sam3_model_call_time_seconds += metrics.sam3_model_call_time_seconds
+        self.gme_calls += metrics.gme_calls
+        self.gme_candidates_screened += metrics.gme_candidates_screened
+        self.gme_candidates_passed += metrics.gme_candidates_passed
+        self.gme_candidates_rejected += metrics.gme_candidates_rejected
+        self.gme_retried_next_frame += metrics.gme_retried_next_frame
+        self.gme_failures += metrics.gme_failures
+        self.gme_model_call_time_seconds += metrics.gme_model_call_time_seconds
         self.failures += metrics.failures
 
 
@@ -419,6 +536,13 @@ class ClipEnrichmentResult:
                 self.totals.qwen_model_call_time_seconds
             ),
             "sam3_model_call_time_seconds": self.totals.sam3_model_call_time_seconds,
+            "gme_calls": self.totals.gme_calls,
+            "gme_candidates_screened": self.totals.gme_candidates_screened,
+            "gme_candidates_passed": self.totals.gme_candidates_passed,
+            "gme_candidates_rejected": self.totals.gme_candidates_rejected,
+            "gme_retried_next_frame": self.totals.gme_retried_next_frame,
+            "gme_failures": self.totals.gme_failures,
+            "gme_model_call_time_seconds": self.totals.gme_model_call_time_seconds,
         }
 
 
@@ -439,6 +563,16 @@ class SubjectAttributeReviewClient(Protocol):
         owner: AnnotationEntity,
         candidates: list[PendingAttributeCandidate],
     ) -> SubjectAttributeReviewBatch: ...
+
+
+class AttributeGmeScreener(Protocol):
+    def screen(
+        self,
+        *,
+        crop: Image.Image,
+        phrase: str,
+        attribute_type: str,
+    ) -> GmeRelativeMarginResult: ...
 
 
 class AttributeFrameSegmentationBackend(Protocol):
@@ -505,9 +639,16 @@ class Sam3AttributeFrameSegmenter:
 class PersistentWorkerAttributeFrameSegmenter:
     """Translate frame-local probes onto the existing persistent SAM3 worker."""
 
-    def __init__(self, storage: RunStorage, client: AttributeProbeClient) -> None:
+    def __init__(
+        self,
+        storage: RunStorage,
+        client: AttributeProbeClient,
+        *,
+        inference_lock: threading.Lock | None = None,
+    ) -> None:
         self._storage = storage
         self._client = client
+        self._inference_lock = inference_lock
 
     def segment_frame(
         self,
@@ -530,12 +671,20 @@ class PersistentWorkerAttributeFrameSegmenter:
         )
         if expected != resolved:
             raise ValueError("attribute frame path does not match sampled provenance")
-        return self._client.attribute_probe(
-            clip_uid=clip_uid,
-            frame_slot=frame_slot,
-            source_frame_index=frame.source_frame_index,
-            grounding_prompt=grounding_prompt,
-        )
+        if self._inference_lock is None:
+            return self._client.attribute_probe(
+                clip_uid=clip_uid,
+                frame_slot=frame_slot,
+                source_frame_index=frame.source_frame_index,
+                grounding_prompt=grounding_prompt,
+            )
+        with self._inference_lock:
+            return self._client.attribute_probe(
+                clip_uid=clip_uid,
+                frame_slot=frame_slot,
+                source_frame_index=frame.source_frame_index,
+                grounding_prompt=grounding_prompt,
+            )
 
 
 DISCOVERY_SYSTEM_PROMPT = """Inspect one explicitly identified V3 subject in
@@ -544,7 +693,8 @@ clearly visible, visually distinctive, segmentable attributes that are
 unambiguously owned by that subject. Omit uncertain, tiny, generic, hidden, or
 weak items; zero attributes is valid. Prefer useful face or hair, distinctive
 clothing, headwear or glasses, then shoes, bag, or another clear wearable
-accessory. Do not enumerate every small item. grounding_prompt must include the
+accessory. Do not enumerate every small item. phrase and grounding_prompt must
+both be written in English. grounding_prompt must include the
 owner relation, for example 'the red jacket worn by the woman'. Return one JSON
 object whose top level contains exactly owner_entity_id, owner_is_human, and
 attributes. Do not return owner_phrase, owner_grounding_prompt, or any other
@@ -944,6 +1094,7 @@ def evaluate_ownership_geometry(
     width = attribute_bbox[2] - attribute_bbox[0]
     height = attribute_bbox[3] - attribute_bbox[1]
     long_side = max(width, height)
+    bbox_fill_ratio = attribute_area / (width * height)
     diagnostics = mask_component_diagnostics(attribute)
     owner_overlap = float(np.logical_and(attribute, owner).sum() / attribute_area)
     other_overlaps: list[float] = []
@@ -996,6 +1147,7 @@ def evaluate_ownership_geometry(
         significant_component_count=diagnostics.significant_component_count,
         largest_component_ratio=diagnostics.largest_component_ratio,
         second_largest_component_ratio=diagnostics.second_largest_component_ratio,
+        bbox_fill_ratio=bbox_fill_ratio,
     )
 
 
@@ -1122,6 +1274,8 @@ def _rejected_record(
     owner_candidate_id: str | None = None,
     same_frame: bool | None = None,
     review: SubjectAttributeReview | None = None,
+    gme_attempts: tuple[GmeAttributeScreenAttempt, ...] = (),
+    selected_gme_attempt_index: int | None = None,
 ) -> SubjectAttributeRecord:
     return SubjectAttributeRecord(
         attribute_id=attribute_id,
@@ -1138,6 +1292,8 @@ def _rejected_record(
         sam3_prompt=discovered.grounding_prompt,
         ownership_geometry=geometry,
         review=review,
+        gme_attempts=list(gme_attempts),
+        selected_gme_attempt_index=selected_gme_attempt_index,
         reason=reason,
     )
 
@@ -1155,6 +1311,8 @@ def _select_attribute_candidate(
     other_subject_ids: list[str],
     crop_padding_ratio: float,
     segmentation_backend: AttributeFrameSegmentationBackend,
+    gme_screener: AttributeGmeScreener | None = None,
+    gme_metrics: _GmeSelectionMetrics | None = None,
 ) -> PendingAttributeCandidate | SubjectAttributeRecord:
     owner_reference_is_local = owner_reference.source_clip_uid in {None, clip_uid}
     ordered = prefer_attribute_candidate_frames(
@@ -1167,7 +1325,13 @@ def _select_attribute_candidate(
         tuple[EntityReferenceCandidate, OwnershipGeometry]
     ] = []
     probe_failures: list[str] = []
-    for owner_candidate in ordered:
+    gme_rejections: list[
+        tuple[EntityReferenceCandidate, OwnershipGeometry]
+    ] = []
+    gme_attempts: list[GmeAttributeScreenAttempt] = []
+    active_gme_metrics = gme_metrics or _GmeSelectionMetrics()
+    for owner_candidate_index, owner_candidate in enumerate(ordered):
+        gme_rejected_on_frame = False
         frame_path = (storage.root / owner_candidate.image_path).resolve(strict=False)
         try:
             attribute_masks = segmentation_backend.segment_frame(
@@ -1236,6 +1400,85 @@ def _select_attribute_candidate(
                 attribute_mask,
                 crop_padding_ratio=crop_padding_ratio,
             )
+            selected_gme_attempt_index: int | None = None
+            if gme_screener is not None:
+                active_gme_metrics.calls += 1
+                gme_started = time.perf_counter()
+                try:
+                    model_name = str(
+                        getattr(
+                            getattr(gme_screener, "config", None),
+                            "model_name",
+                            "injected_gme",
+                        )
+                    )
+                    with profile_model_call(
+                        component="gme_subject_attribute_screen",
+                        operation="relative_margin_v1",
+                        retry_index=0,
+                        model=model_name,
+                        input_text_chars=(
+                            len(discovered.phrase)
+                            + len(discovered.grounding_prompt)
+                        ),
+                        input_image_count=1,
+                        metadata={
+                            "clip_uid": clip_uid,
+                            "owner_entity_id": owner.entity_id,
+                            "attribute_id": attribute_id,
+                            "attribute_type": discovered.attribute_type,
+                            "owner_candidate_id": owner_candidate.candidate_id,
+                            "source_frame_slot": owner_candidate.frame_slot,
+                        },
+                    ):
+                        gme_result = gme_screener.screen(
+                            crop=crop,
+                            phrase=discovered.phrase,
+                            attribute_type=discovered.attribute_type,
+                        )
+                except Exception as exc:  # noqa: BLE001 - fail open to Qwen
+                    active_gme_metrics.failures += 1
+                    gme_attempts.append(
+                        GmeAttributeScreenAttempt(
+                            owner_candidate_id=owner_candidate.candidate_id,
+                            source_frame_slot=owner_candidate.frame_slot,
+                            source_frame_index=owner_candidate.source_frame_index,
+                            bbox_fill_ratio=geometry.bbox_fill_ratio,
+                            status="failed",
+                            reason=f"gme_failed_open:{type(exc).__name__}:{exc}",
+                        )
+                    )
+                    selected_gme_attempt_index = len(gme_attempts) - 1
+                else:
+                    active_gme_metrics.candidates_screened += 1
+                    active_gme_metrics.candidates_passed += int(gme_result.passed)
+                    active_gme_metrics.candidates_rejected += int(
+                        not gme_result.passed
+                    )
+                    gme_attempts.append(
+                        GmeAttributeScreenAttempt(
+                            owner_candidate_id=owner_candidate.candidate_id,
+                            source_frame_slot=owner_candidate.frame_slot,
+                            source_frame_index=owner_candidate.source_frame_index,
+                            bbox_fill_ratio=geometry.bbox_fill_ratio,
+                            status="passed" if gme_result.passed else "rejected",
+                            positive_score=gme_result.positive_score,
+                            negative_scores=gme_result.negative_scores,
+                            max_negative_score=gme_result.max_negative_score,
+                            margin=gme_result.margin,
+                            passed=gme_result.passed,
+                            reason=gme_result.reason,
+                        )
+                    )
+                    if not gme_result.passed:
+                        gme_rejections.append((owner_candidate, geometry))
+                        gme_rejected_on_frame = True
+                        continue
+                    selected_gme_attempt_index = len(gme_attempts) - 1
+                finally:
+                    active_gme_metrics.model_call_time_seconds += (
+                        time.perf_counter() - gme_started
+                    )
             return PendingAttributeCandidate(
                 discovered=discovered,
                 attribute_id=attribute_id,
@@ -1245,7 +1488,29 @@ def _select_attribute_candidate(
                 source_image=source,
                 crop=crop,
                 geometry=geometry,
+                gme_attempts=tuple(gme_attempts),
+                selected_gme_attempt_index=selected_gme_attempt_index,
             )
+        if gme_rejected_on_frame and owner_candidate_index + 1 < len(ordered):
+            active_gme_metrics.retried_next_frame += 1
+    if gme_rejections:
+        owner_candidate, geometry = gme_rejections[0]
+        return _rejected_record(
+            discovered,
+            attribute_id=attribute_id,
+            owner_entity_id=owner.entity_id,
+            reason="gme_semantic_quality_reject",
+            geometry=geometry,
+            source_frame_index=owner_candidate.source_frame_index,
+            source_frame_slot=owner_candidate.frame_slot,
+            owner_candidate_id=owner_candidate.candidate_id,
+            same_frame=(
+                owner_reference_is_local
+                and owner_candidate.source_frame_index
+                == owner_reference.source_frame_index
+            ),
+            gme_attempts=tuple(gme_attempts),
+        )
     if geometry_rejections:
         owner_candidate, geometry = geometry_rejections[0]
         return _rejected_record(
@@ -1314,6 +1579,7 @@ def _load_cached_owner_artifact(
     sample_id: str,
     owner_entity_id: str,
     attribute_id_start: int,
+    expected_gme_screen_mode: str | None = None,
 ) -> OwnerEnrichmentArtifact | None:
     if not path.is_file():
         return None
@@ -1325,6 +1591,7 @@ def _load_cached_owner_artifact(
             artifact.sample_id != sample_id
             or artifact.owner_entity_id != owner_entity_id
             or artifact.attribute_id_start != attribute_id_start
+            or artifact.gme_screen_mode != expected_gme_screen_mode
         ):
             return None
         for record in artifact.records:
@@ -1362,8 +1629,14 @@ def _process_owner(
     discovery_client: SubjectAttributeDiscoveryClient,
     review_client: SubjectAttributeReviewClient,
     segmentation_backend: AttributeFrameSegmentationBackend,
+    gme_screener: AttributeGmeScreener | None = None,
 ) -> OwnerEnrichmentArtifact:
     metrics = OwnerEnrichmentMetrics(discovery_calls=1)
+    gme_screen_mode = (
+        getattr(getattr(config, "subject_attribute_gme", None), "screen_mode", None)
+        if gme_screener is not None
+        else None
+    )
     owner_reference = _published_reference(clip, owner.entity_id)
     source_images = {
         candidate.image_path: _source_image(storage, candidate)
@@ -1392,6 +1665,7 @@ def _process_owner(
                     "failures": 1,
                 }
             ),
+            gme_screen_mode=gme_screen_mode,
             failure_reason=f"discovery_failed:{type(exc).__name__}:{exc}",
         )
     qwen_seconds = time.perf_counter() - discovery_started
@@ -1407,6 +1681,7 @@ def _process_owner(
             metrics=metrics.model_copy(
                 update={"qwen_model_call_time_seconds": qwen_seconds}
             ),
+            gme_screen_mode=gme_screen_mode,
         )
     discovered_by_type = Counter(
         attribute.attribute_type for attribute in discovery.attributes
@@ -1422,10 +1697,12 @@ def _process_owner(
     pending: list[PendingAttributeCandidate] = []
     records_by_id: dict[str, SubjectAttributeRecord] = {}
     sam_seconds = 0.0
+    gme_metrics = _GmeSelectionMetrics()
     processing_failures = 0
     for offset, discovered in enumerate(discovery.attributes):
         attribute_id = f"a{attribute_id_start + offset}"
         sam_started = time.perf_counter()
+        gme_seconds_before = gme_metrics.model_call_time_seconds
         try:
             selected = _select_attribute_candidate(
                 discovered=discovered,
@@ -1439,6 +1716,8 @@ def _process_owner(
                 other_subject_ids=other_subject_ids,
                 crop_padding_ratio=config.pair.crop_padding_ratio,
                 segmentation_backend=segmentation_backend,
+                gme_screener=gme_screener,
+                gme_metrics=gme_metrics,
             )
         except Exception as exc:  # noqa: BLE001 - isolate one attribute
             processing_failures += 1
@@ -1448,7 +1727,11 @@ def _process_owner(
                 owner_entity_id=owner.entity_id,
                 reason=f"attribute_processing_failed:{type(exc).__name__}:{exc}",
             )
-        sam_seconds += time.perf_counter() - sam_started
+        selection_seconds = time.perf_counter() - sam_started
+        gme_seconds = (
+            gme_metrics.model_call_time_seconds - gme_seconds_before
+        )
+        sam_seconds += max(0.0, selection_seconds - gme_seconds)
         if isinstance(selected, SubjectAttributeRecord):
             records_by_id[attribute_id] = selected
         else:
@@ -1476,6 +1759,10 @@ def _process_owner(
                 source_frame_slot=candidate.owner_candidate.frame_slot,
                 owner_candidate_id=candidate.owner_candidate.candidate_id,
                 same_frame=same_frame,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=(
+                    candidate.selected_gme_attempt_index
+                ),
             )
         pending = retained_pending
 
@@ -1510,6 +1797,10 @@ def _process_owner(
                 source_frame_slot=candidate.owner_candidate.frame_slot,
                 owner_candidate_id=candidate.owner_candidate.candidate_id,
                 same_frame=same_frame,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=(
+                    candidate.selected_gme_attempt_index
+                ),
             )
             continue
         if not review.accepted:
@@ -1524,6 +1815,10 @@ def _process_owner(
                 owner_candidate_id=candidate.owner_candidate.candidate_id,
                 same_frame=same_frame,
                 review=review,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=(
+                    candidate.selected_gme_attempt_index
+                ),
             )
             continue
         relative_path = _save_attribute_crop(
@@ -1547,6 +1842,8 @@ def _process_owner(
             sam3_prompt=candidate.discovered.grounding_prompt,
             ownership_geometry=candidate.geometry,
             review=review,
+            gme_attempts=list(candidate.gme_attempts),
+            selected_gme_attempt_index=candidate.selected_gme_attempt_index,
             reason="accepted",
         )
 
@@ -1594,8 +1891,16 @@ def _process_owner(
             ),
             qwen_model_call_time_seconds=qwen_seconds,
             sam3_model_call_time_seconds=sam_seconds,
+            gme_calls=gme_metrics.calls,
+            gme_candidates_screened=gme_metrics.candidates_screened,
+            gme_candidates_passed=gme_metrics.candidates_passed,
+            gme_candidates_rejected=gme_metrics.candidates_rejected,
+            gme_retried_next_frame=gme_metrics.retried_next_frame,
+            gme_failures=gme_metrics.failures,
+            gme_model_call_time_seconds=gme_metrics.model_call_time_seconds,
             failures=failures,
         ),
+        gme_screen_mode=gme_screen_mode,
         failure_reason=review_failure,
     )
 
@@ -1893,6 +2198,7 @@ def process_subject_attribute_clip(
     discovery_client: SubjectAttributeDiscoveryClient,
     review_client: SubjectAttributeReviewClient,
     segmentation_backend: AttributeFrameSegmentationBackend,
+    gme_screener: AttributeGmeScreener | None = None,
     max_owners: int | None = None,
     overwrite: bool = False,
 ) -> ClipEnrichmentResult:
@@ -1974,6 +2280,19 @@ def process_subject_attribute_clip(
                 sample_id=clip.clip_uid,
                 owner_entity_id=owner.entity_id,
                 attribute_id_start=sample_attribute_start,
+                expected_gme_screen_mode=(
+                    getattr(
+                        getattr(config, "subject_attribute_gme", None),
+                        "screen_mode",
+                        None,
+                    )
+                    if getattr(
+                        getattr(config, "subject_attribute_gme", None),
+                        "enabled",
+                        False,
+                    )
+                    else None
+                ),
             )
         if cached is not None:
             artifact = cached
@@ -1992,6 +2311,7 @@ def process_subject_attribute_clip(
                     discovery_client=discovery_client,
                     review_client=review_client,
                     segmentation_backend=segmentation_backend,
+                    gme_screener=gme_screener,
                 )
             except Exception as exc:  # noqa: BLE001 - isolate one owner
                 totals.failures += 1
@@ -2051,6 +2371,7 @@ def _load_durable_owner_artifact(
         sample_id=sample_id,
         owner_entity_id=owner_entity_id,
         attribute_id_start=artifact.attribute_id_start,
+        expected_gme_screen_mode=artifact.gme_screen_mode,
     )
 
 
@@ -2158,6 +2479,12 @@ def reconcile_subject_attribute_outputs(
             sorted(totals.discovered_by_type.items())
         ),
         "sam3_attempts": totals.sam3_attempts,
+        "gme_calls": totals.gme_calls,
+        "gme_candidates_screened": totals.gme_candidates_screened,
+        "gme_candidates_passed": totals.gme_candidates_passed,
+        "gme_candidates_rejected": totals.gme_candidates_rejected,
+        "gme_retried_next_frame": totals.gme_retried_next_frame,
+        "gme_failures": totals.gme_failures,
         "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
         "recognizability_rejects": totals.recognizability_rejects,
         "accepted_attribute_references": totals.accepted_attributes,
@@ -2175,9 +2502,11 @@ def reconcile_subject_attribute_outputs(
         "invocation_wall_time_seconds": invocation_wall_time_seconds,
         "qwen_model_call_time_seconds": totals.qwen_model_call_time_seconds,
         "sam3_model_call_time_seconds": totals.sam3_model_call_time_seconds,
+        "gme_model_call_time_seconds": totals.gme_model_call_time_seconds,
         "model_call_time_seconds": (
             totals.qwen_model_call_time_seconds
             + totals.sam3_model_call_time_seconds
+            + totals.gme_model_call_time_seconds
         ),
         "gpu_peak_memory_bytes_before": gpu_peak_memory_bytes_before,
         "gpu_peak_memory_bytes_after": gpu_peak_memory_bytes_after,
@@ -2223,6 +2552,7 @@ def run_subject_attribute_enrichment(
     discovery_client: SubjectAttributeDiscoveryClient | None = None,
     review_client: SubjectAttributeReviewClient | None = None,
     segmentation_backend: AttributeFrameSegmentationBackend | None = None,
+    gme_screener: AttributeGmeScreener | None = None,
 ) -> dict[str, object]:
     if isinstance(max_owners, bool) or not isinstance(max_owners, int) or max_owners < 1:
         raise ValueError("max_owners must be a positive integer")
@@ -2263,6 +2593,29 @@ def run_subject_attribute_enrichment(
     assert discovery_client is not None
     assert review_client is not None
     assert segmentation_backend is not None
+    owned_gme: PersistentGmeAttributeScreener | None = None
+    if effective_config.subject_attribute_gme.enabled and gme_screener is None:
+        physical_gpu = (
+            effective_config.runtime.gpu_workers.subject_attributes_gme
+        )
+        assert physical_gpu is not None
+        try:
+            owned_gme = PersistentGmeAttributeScreener.from_runtime(
+                effective_config.subject_attribute_gme,
+                physical_gpu=physical_gpu,
+                run_root=storage.root,
+                allowed_root=v3_config_module.ALLOWED_WRITABLE_ROOT,
+            )
+            owned_gme.start()
+            gme_screener = owned_gme
+        except Exception as exc:  # noqa: BLE001 - fail open to Qwen
+            if owned_gme is not None:
+                owned_gme.close()
+                owned_gme = None
+            gme_screener = UnavailableGmeAttributeScreener(
+                effective_config.subject_attribute_gme,
+                exc,
+            )
 
     started = time.perf_counter()
     gpu_before = _gpu_peak_bytes()
@@ -2280,12 +2633,15 @@ def run_subject_attribute_enrichment(
                 discovery_client=discovery_client,
                 review_client=review_client,
                 segmentation_backend=segmentation_backend,
+                gme_screener=gme_screener,
                 max_owners=max_owners - processed_owners,
                 overwrite=False,
             )
             processed_owners += result.totals.eligible_human_owners
             skipped_existing_owners += result.totals.skipped_existing_owners
     finally:
+        if owned_gme is not None:
+            owned_gme.close()
         if owned_segmenter is not None:
             owned_segmenter.close()
         if owned_qwen is not None:
@@ -2304,10 +2660,12 @@ def run_subject_attribute_enrichment(
 
 __all__ = [
     "AttributeFrameSegmentationBackend",
+    "AttributeGmeScreener",
     "AttributeProbeClient",
     "ClipEnrichmentResult",
     "DiscoveredSubjectAttribute",
     "EnrichedSample",
+    "GmeAttributeScreenAttempt",
     "OwnerEligibility",
     "OwnershipGeometry",
     "PendingAttributeCandidate",

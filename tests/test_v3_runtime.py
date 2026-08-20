@@ -24,6 +24,7 @@ from r2v_data_v2.v3.config import (
     RuntimeGpuWorkersConfig,
     RuntimeStageWorkersConfig,
     SourceConfig,
+    SubjectAttributeGmeConfig,
     V3Config,
     load_config,
 )
@@ -146,6 +147,94 @@ def test_sidecar_gpu_assignment_does_not_change_visual_run_identity(
     assert config.model_identifiers() == changed.model_identifiers()
 
 
+def test_disabled_gme_config_remains_fingerprint_compatible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    changed = replace(
+        config,
+        subject_attribute_gme=replace(
+            config.subject_attribute_gme,
+            min_margin=0.25,
+            model_path=Path("/unused/disabled/model"),
+        ),
+        runtime=replace(
+            config.runtime,
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                subject_attributes_gme="7",
+            ),
+        ),
+    )
+
+    assert config.fingerprint() == changed.fingerprint()
+    assert config.model_identifiers() == changed.model_identifiers()
+
+
+def test_enabled_gme_paths_and_semantics_enter_attribute_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    writable = config.resolved_run_root.parents[1]
+    executable = writable / "venvs" / "gme" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    model_path = writable / "models" / "gme-Qwen2-VL-2B-Instruct"
+    model_path.mkdir(parents=True)
+    enabled = replace(
+        config,
+        subject_attribute_gme=SubjectAttributeGmeConfig(
+            enabled=True,
+            python_executable=executable,
+            model_path=model_path,
+        ),
+        runtime=replace(
+            config.runtime,
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                subject_attributes_gme="7",
+            ),
+        ),
+    )
+    enabled.validate()
+
+    identifiers = enabled.model_identifiers()
+    assert enabled.fingerprint() != config.fingerprint()
+    assert identifiers["subject_attribute_gme.model"] == (
+        "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct"
+    )
+    assert identifiers["subject_attribute_gme.screen_mode"] == "relative_margin_v1"
+    assert identifiers["subject_attribute_gme.min_margin"] == "0.0"
+    assert "subject_attributes_gme" not in identifiers["runtime.gpu_workers"]
+
+
+def test_enabled_gme_rejects_invalid_server_paths_before_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    invalid = replace(
+        config,
+        subject_attribute_gme=SubjectAttributeGmeConfig(
+            enabled=True,
+            python_executable=tmp_path / "missing-python",
+            model_path=tmp_path / "missing-model",
+        ),
+        runtime=replace(
+            config.runtime,
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                subject_attributes_gme="7",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must remain inside"):
+        invalid.validate()
+
+
 def test_streaming_rejects_same_parent_cross_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -227,6 +316,7 @@ def test_runtime_yaml_loads_nested_worker_configuration(
     assert loaded.runtime.gpu_workers == RuntimeGpuWorkersConfig(
         segment="5",
         subject_attributes_segment="7",
+        subject_attributes_gme=None,
         remove="4",
         reference_edit="6",
     )
@@ -373,6 +463,7 @@ def _exercise_streaming_segment_worker_routing(
             subject_attribute_discovery_client=object(),
             subject_attribute_review_client=object(),
             attribute_segmentation_backend=None,
+            attribute_gme_screener=None,
             profile=False,
         )
     if fail_scheduler:
@@ -438,6 +529,148 @@ def test_dedicated_attribute_segment_worker_closes_on_pipeline_error(
 
     assert len(processes) == 2
     assert all(process.closes == 1 for process in processes)
+
+
+def test_streaming_starts_one_persistent_gme_worker_and_shares_colocated_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    config = replace(
+        config,
+        subject_attribute_gme=replace(
+            config.subject_attribute_gme,
+            enabled=True,
+        ),
+        runtime=replace(
+            config.runtime,
+            mode="streaming_v1",
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                segment="5",
+                subject_attributes_segment="7",
+                subject_attributes_gme="7",
+            ),
+        ),
+    )
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+
+    class _Storage:
+        root = config.resolved_run_root
+
+        def iter_clips(self):
+            return [SimpleNamespace(clip_uid="clip-a")]
+
+        def update_stage_counts(self, *_args):
+            return None
+
+        def append_failure(self, **_kwargs):
+            return None
+
+    class _Process:
+        def __init__(self, worker_config):
+            self.config = worker_config
+
+        def start(self):
+            return None
+
+        def close(self):
+            return None
+
+        def attribute_probe(self, **_kwargs):
+            return ()
+
+    class _Gme:
+        instances: list[_Gme] = []
+
+        def __init__(self, inference_lock):
+            self.inference_lock = inference_lock
+            self.starts = 0
+            self.closes = 0
+            self.instances.append(self)
+
+        @classmethod
+        def from_runtime(cls, _config, **kwargs):
+            assert kwargs["physical_gpu"] == "7"
+            return cls(kwargs["inference_lock"])
+
+        def start(self):
+            self.starts += 1
+
+        def close(self):
+            self.closes += 1
+
+    observed: dict[str, object] = {}
+
+    def handler(
+        *, attribute_segmentation_backend, attribute_gme_screener, **_kwargs
+    ):
+        observed["segmenter"] = attribute_segmentation_backend
+        observed["gme"] = attribute_gme_screener
+        return lambda _clip_uid: {"processed": 1}
+
+    class _Scheduler:
+        def __init__(self, stages, **_kwargs):
+            self.stages = stages
+
+        def run(self, clip_uids):
+            counts = {
+                stage.name: stage.handler(clip_uids[0]) for stage in self.stages
+            }
+            return SimpleNamespace(
+                stage_counts=counts,
+                failed_tasks=[],
+                to_dict=lambda: {},
+            )
+
+    monkeypatch.setattr(pipeline_module, "PersistentStageProcess", _Process)
+    monkeypatch.setattr(pipeline_module, "PersistentGmeAttributeScreener", _Gme)
+    monkeypatch.setattr(pipeline_module, "_streaming_stage_handler", handler)
+    monkeypatch.setattr(pipeline_module, "StreamingDAGScheduler", _Scheduler)
+    monkeypatch.setattr(
+        pipeline_module,
+        "reconcile_subject_attribute_outputs",
+        lambda **_kwargs: {},
+    )
+
+    pipeline_module._run_streaming_pipeline(
+        config_path=config_path,
+        config=config,
+        storage=_Storage(),
+        ordered_stages=("subject_attributes",),
+        overwrite=False,
+        profiler=None,
+        results={},
+        annotation_client=None,
+        frame_decoder=None,
+        segmentation_backend=None,
+        instruction_client=None,
+        background_removal_backend=None,
+        background_removal_judge=None,
+        entity_reference_judge=None,
+        cross_pair_judge=None,
+        background_final_judge=None,
+        reference_completion_backend=None,
+        reference_completion_judge=None,
+        reference_edit_backend=None,
+        reference_edit_judge=None,
+        reference_edit_sam_reviewer=None,
+        reference_integrity_judge=None,
+        subject_attribute_discovery_client=object(),
+        subject_attribute_review_client=object(),
+        attribute_segmentation_backend=None,
+        attribute_gme_screener=None,
+        profile=False,
+    )
+
+    assert len(_Gme.instances) == 1
+    gme = _Gme.instances[0]
+    assert gme.starts == gme.closes == 1
+    assert observed["gme"] is gme
+    segmenter = observed["segmenter"]
+    assert segmenter._inference_lock is gme.inference_lock
+    assert gme.inference_lock is not None
 
 
 def test_dag_overlaps_different_clips_but_never_same_clip_writers() -> None:

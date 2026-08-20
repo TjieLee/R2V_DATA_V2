@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -493,6 +494,13 @@ def _print_summary(summary: dict[str, object]) -> None:
         "remove_candidates_accepted",
         "remove_candidates_rejected",
         "ready_removed",
+        "gme_calls",
+        "gme_candidates_screened",
+        "gme_candidates_passed",
+        "gme_candidates_rejected",
+        "gme_retried_next_frame",
+        "gme_failures",
+        "gme_model_call_time_seconds",
         "failed_tasks",
         "config",
         "run_root",
@@ -552,6 +560,26 @@ def _stage_count(
         return 0
     value = stage_result.get(field, 0)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return 0
+    return value
+
+
+def _subject_attribute_metric(
+    result: dict[str, object] | None,
+    field: str,
+) -> int | float:
+    if not isinstance(result, dict):
+        return 0
+    summary = result.get("subject_attributes_summary")
+    if not isinstance(summary, dict):
+        return 0
+    value = summary.get(field, 0)
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
         return 0
     return value
 
@@ -677,6 +705,31 @@ def run_canary(
             execution.result,
             stage="remove",
             field="ready_removed",
+        ),
+        "gme_calls": _subject_attribute_metric(execution.result, "gme_calls"),
+        "gme_candidates_screened": _subject_attribute_metric(
+            execution.result,
+            "gme_candidates_screened",
+        ),
+        "gme_candidates_passed": _subject_attribute_metric(
+            execution.result,
+            "gme_candidates_passed",
+        ),
+        "gme_candidates_rejected": _subject_attribute_metric(
+            execution.result,
+            "gme_candidates_rejected",
+        ),
+        "gme_retried_next_frame": _subject_attribute_metric(
+            execution.result,
+            "gme_retried_next_frame",
+        ),
+        "gme_failures": _subject_attribute_metric(
+            execution.result,
+            "gme_failures",
+        ),
+        "gme_model_call_time_seconds": _subject_attribute_metric(
+            execution.result,
+            "gme_model_call_time_seconds",
         ),
         "failed_tasks": _failed_tasks(execution.result),
         "config": str(paths.shard_config),

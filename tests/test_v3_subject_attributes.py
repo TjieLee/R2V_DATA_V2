@@ -1128,6 +1128,211 @@ def test_only_owner_candidate_frames_are_probed(tmp_path: Path) -> None:
     assert segmenter.calls == [2, 5]
 
 
+class _GmeScreener:
+    def __init__(self, outcomes: list[bool | Exception]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[tuple[str, str, int]] = []
+        self.config = SimpleNamespace(model_name="test-gme")
+
+    def screen(self, *, crop, phrase, attribute_type):
+        self.calls.append((phrase, attribute_type, int(np.asarray(crop)[..., 3].sum())))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        positive = 0.5 if outcome else 0.1
+        negative = 0.4 if outcome else 0.2
+        return subject_attributes.GmeRelativeMarginResult(
+            positive_score=positive,
+            negative_scores={"owner_body": negative},
+            max_negative_score=negative,
+            margin=positive - negative,
+            passed=outcome,
+            reason=(
+                "gme_relative_margin_pass"
+                if outcome
+                else "gme_semantic_quality_reject"
+            ),
+        )
+
+
+def _select_with_gme(
+    tmp_path: Path,
+    *,
+    candidates: list[EntityReferenceCandidate],
+    segmenter,
+    gme_screener,
+    masks: TrackedMasksArtifact | None = None,
+    other_subject_ids: list[str] | None = None,
+):
+    clip = _clip()
+    return subject_attributes._select_attribute_candidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="accessory",
+            phrase="silver necklace",
+            grounding_prompt="the silver necklace worn by person 1",
+        ),
+        attribute_id="a1",
+        clip_uid=clip.clip_uid,
+        owner=clip.annotation.entities[0],
+        owner_candidates=candidates,
+        owner_reference=_ready_reference("e1"),
+        masks=masks
+        or TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={},
+        ),
+        storage=_FakeStorage(tmp_path / "run"),
+        other_subject_ids=other_subject_ids or [],
+        crop_padding_ratio=0.08,
+        segmentation_backend=segmenter,
+        gme_screener=gme_screener,
+    )
+
+
+def test_gme_reject_retries_next_owner_candidate_and_pass_stops(
+    tmp_path: Path,
+) -> None:
+    _frames(tmp_path / "run")
+    candidates = [
+        _candidate("candidate_1", slot=1, source_frame_index=10),
+        _candidate("candidate_2", slot=2, source_frame_index=20),
+        _candidate("candidate_3", slot=3, source_frame_index=30),
+    ]
+    segmenter = _SegmentationBackend()
+    gme = _GmeScreener([False, True])
+    metrics = subject_attributes._GmeSelectionMetrics()
+    clip = _clip()
+
+    selected = subject_attributes._select_attribute_candidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="accessory",
+            phrase="silver necklace",
+            grounding_prompt="the silver necklace worn by person 1",
+        ),
+        attribute_id="a1",
+        clip_uid=clip.clip_uid,
+        owner=clip.annotation.entities[0],
+        owner_candidates=candidates,
+        owner_reference=_ready_reference("e1"),
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1", height=100, width=100, entities={}
+        ),
+        storage=_FakeStorage(tmp_path / "run"),
+        other_subject_ids=[],
+        crop_padding_ratio=0.08,
+        segmentation_backend=segmenter,
+        gme_screener=gme,
+        gme_metrics=metrics,
+    )
+
+    assert isinstance(selected, subject_attributes.PendingAttributeCandidate)
+    assert selected.owner_candidate.candidate_id == "candidate_2"
+    assert segmenter.calls == [1, 2]
+    assert len(gme.calls) == 2
+    assert [attempt.status for attempt in selected.gme_attempts] == [
+        "rejected",
+        "passed",
+    ]
+    assert selected.selected_gme_attempt_index == 1
+    assert metrics.retried_next_frame == 1
+
+
+def test_geometry_and_wrong_owner_rejections_happen_before_gme(
+    tmp_path: Path,
+) -> None:
+    _frames(tmp_path / "run")
+    candidate = _candidate("candidate_1", slot=1, source_frame_index=10)
+    outside = np.zeros((100, 100), dtype=bool)
+    outside[:5, :5] = True
+    gme = _GmeScreener([True])
+    geometry_rejected = _select_with_gme(
+        tmp_path,
+        candidates=[candidate],
+        segmenter=_SegmentationBackend(outside),
+        gme_screener=gme,
+    )
+    assert isinstance(geometry_rejected, SubjectAttributeRecord)
+    assert geometry_rejected.reason.startswith("ownership_geometry:")
+    assert gme.calls == []
+
+    owner_mask = np.zeros((100, 100), dtype=bool)
+    owner_mask[20:80, 10:50] = True
+    other_mask = np.zeros_like(owner_mask)
+    other_mask[20:80, 55:95] = True
+    wrong_attribute = np.zeros_like(owner_mask)
+    wrong_attribute[30:50, 65:85] = True
+    wrong_owner_gme = _GmeScreener([True])
+    wrong_owner = _select_with_gme(
+        tmp_path,
+        candidates=[
+            _candidate(
+                "candidate_1",
+                slot=1,
+                source_frame_index=10,
+                mask=owner_mask,
+            )
+        ],
+        segmenter=_SegmentationBackend(wrong_attribute),
+        gme_screener=wrong_owner_gme,
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={"e2": _tracked_subject(other_mask)},
+        ),
+        other_subject_ids=["e2"],
+    )
+    assert isinstance(wrong_owner, SubjectAttributeRecord)
+    assert "other_subject" in wrong_owner.reason
+    assert wrong_owner_gme.calls == []
+
+
+def test_bbox_fill_ratio_is_recorded_without_a_new_threshold() -> None:
+    owner = np.zeros((100, 100), dtype=bool)
+    owner[10:90, 10:90] = True
+    ring = np.zeros_like(owner)
+    ring[30:70, 30:70] = True
+    ring[35:65, 35:65] = False
+
+    geometry = evaluate_ownership_geometry(
+        ring,
+        owner,
+        {},
+        owner_padding_ratio=0.08,
+    )
+
+    assert geometry.passed is True
+    assert geometry.bbox_fill_ratio == pytest.approx(700 / 1600)
+    assert geometry.largest_component_ratio == 1.0
+
+
+def test_gme_crop_preserves_all_mask_components_without_repair(tmp_path: Path) -> None:
+    _frames(tmp_path / "run")
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[30:40, 30:40] = True
+    mask[60:63, 60:63] = True
+    gme = _GmeScreener([True])
+
+    selected = _select_with_gme(
+        tmp_path,
+        candidates=[_candidate("candidate_1", slot=1, source_frame_index=10)],
+        segmenter=_SegmentationBackend(mask),
+        gme_screener=gme,
+    )
+
+    assert isinstance(selected, subject_attributes.PendingAttributeCandidate)
+    assert gme.calls[0][2] // 255 == int(mask.sum())
+    assert selected.geometry.second_largest_component_ratio > 0
+
+
+def test_discovery_prompt_requires_english_attribute_text() -> None:
+    prompt = subject_attributes.DISCOVERY_SYSTEM_PROMPT
+    assert "phrase and grounding_prompt" in prompt
+    assert "written in English" in prompt
+
+
 def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
     _frames(tmp_path / "run")
     owner_mask = np.zeros((100, 100), dtype=bool)
@@ -1170,6 +1375,98 @@ def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Pat
         assert record.image_path is not None
         with Image.open(tmp_path / "output" / record.image_path) as opened:
             assert opened.mode == "RGBA"
+
+
+@pytest.mark.parametrize(
+    ("gme_outcome", "qwen_accepts", "expected_status", "expected_review_calls"),
+    [
+        (RuntimeError("worker unavailable"), True, "accepted", 1),
+        (True, False, "rejected", 1),
+        (True, True, "accepted", 1),
+        (False, True, "rejected", 0),
+    ],
+)
+def test_gme_prefilter_keeps_qwen_as_final_review_and_fails_open(
+    tmp_path: Path,
+    gme_outcome: bool | Exception,
+    qwen_accepts: bool,
+    expected_status: str,
+    expected_review_calls: int,
+) -> None:
+    _frames(tmp_path / "run")
+
+    class _OneAttributeDiscovery:
+        def discover(self, *, owner, owner_candidates, source_images):
+            return SubjectAttributeDiscovery(
+                owner_entity_id=owner.entity_id,
+                owner_is_human=True,
+                attributes=[
+                    DiscoveredSubjectAttribute(
+                        attribute_type="accessory",
+                        phrase="silver necklace",
+                        grounding_prompt="the silver necklace worn by person 1",
+                    )
+                ],
+            )
+
+    class _FinalReview:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def review(self, *, owner, candidates):
+            self.calls += 1
+            reviews = []
+            for candidate in candidates:
+                review = _accepted_review(candidate.attribute_id)
+                if not qwen_accepts:
+                    review = review.model_copy(
+                        update={
+                            "recognizable": False,
+                            "reason": "fragmentary",
+                        }
+                    )
+                reviews.append(review)
+            return SubjectAttributeReviewBatch(
+                owner_entity_id=owner.entity_id,
+                reviews=reviews,
+            )
+
+    review = _FinalReview()
+    clip = _clip()
+    artifact = subject_attributes._process_owner(
+        config=SimpleNamespace(pair=SimpleNamespace(crop_padding_ratio=0.08)),
+        storage=_FakeStorage(tmp_path / "run"),
+        output_root=tmp_path / "output",
+        clip=clip,
+        owner=clip.annotation.entities[0],
+        owner_candidates=[
+            _candidate("candidate_1", slot=1, source_frame_index=10)
+        ],
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1", height=100, width=100, entities={}
+        ),
+        attribute_id_start=1,
+        discovery_client=_OneAttributeDiscovery(),
+        review_client=review,
+        segmentation_backend=_SegmentationBackend(),
+        gme_screener=_GmeScreener([gme_outcome]),
+    )
+
+    record = artifact.records[0]
+    assert record.status == expected_status
+    assert review.calls == expected_review_calls
+    assert artifact.metrics.gme_calls == 1
+    if isinstance(gme_outcome, Exception):
+        assert artifact.metrics.gme_failures == 1
+        assert record.gme_attempts[0].status == "failed"
+        assert record.selected_gme_attempt_index == 0
+    elif not gme_outcome:
+        assert record.reason == "gme_semantic_quality_reject"
+        assert artifact.metrics.gme_candidates_rejected == 1
+    elif qwen_accepts:
+        assert record.review is not None and record.review.accepted
+    else:
+        assert record.reason == "recognizability:fragmentary"
 
 
 @pytest.mark.parametrize(

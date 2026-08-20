@@ -21,6 +21,8 @@ REMOVE_BACKEND = "qwen_image_edit_2511_object_remover"
 BOOGU_REMOVE_BACKEND = "boogu_image_0_1_edit_turbo"
 REFERENCE_EDIT_BACKEND = "boogu_image_0_1_edit_turbo"
 REFERENCE_EDIT_MODEL_REVISION = "hotfix-1k-20260708"
+SUBJECT_ATTRIBUTE_GME_BACKEND = "gme_qwen2_vl_2b_v1"
+SUBJECT_ATTRIBUTE_GME_MODEL_NAME = "Alibaba-NLP/gme-Qwen2-VL-2B-Instruct"
 DEFAULT_MAX_ANNOTATION_ENTITIES = 5
 DENSE_MAX_ANNOTATION_ENTITIES = 8
 
@@ -203,6 +205,22 @@ class ReferenceIntegrityConfig:
 
 
 @dataclass(frozen=True)
+class SubjectAttributeGmeConfig:
+    enabled: bool = False
+    backend: str = SUBJECT_ATTRIBUTE_GME_BACKEND
+    python_executable: Path = Path(
+        "/mnt/workspace/litengjie/data/venvs/gme/bin/python"
+    )
+    model_path: Path = Path(
+        "/mnt/workspace/litengjie/data/models/gme-Qwen2-VL-2B-Instruct"
+    )
+    model_name: str = SUBJECT_ATTRIBUTE_GME_MODEL_NAME
+    screen_mode: str = "relative_margin_v1"
+    min_margin: float = 0.0
+    timeout_seconds: int = 3600
+
+
+@dataclass(frozen=True)
 class RuntimeStageWorkersConfig:
     annotate: int = 2
     frames: int = 4
@@ -221,6 +239,7 @@ class RuntimeStageWorkersConfig:
 class RuntimeGpuWorkersConfig:
     segment: str | None = None
     subject_attributes_segment: str | None = None
+    subject_attributes_gme: str | None = None
     remove: str | None = None
     reference_edit: str | None = None
 
@@ -267,6 +286,9 @@ class V3Config:
     reference_edit: ReferenceEditConfig = field(default_factory=ReferenceEditConfig)
     reference_integrity: ReferenceIntegrityConfig = field(
         default_factory=ReferenceIntegrityConfig
+    )
+    subject_attribute_gme: SubjectAttributeGmeConfig = field(
+        default_factory=SubjectAttributeGmeConfig
     )
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
@@ -730,6 +752,64 @@ class V3Config:
                 "qwen.reference_integrity_judge is required when "
                 "reference_integrity.enabled is true"
             )
+        gme = self.subject_attribute_gme
+        if not isinstance(gme.enabled, bool):
+            raise TypeError("subject_attribute_gme.enabled must be a boolean")
+        if gme.backend != SUBJECT_ATTRIBUTE_GME_BACKEND:
+            raise ValueError(
+                "subject_attribute_gme.backend must be gme_qwen2_vl_2b_v1"
+            )
+        if gme.model_name != SUBJECT_ATTRIBUTE_GME_MODEL_NAME:
+            raise ValueError(
+                "subject_attribute_gme.model_name must select the GME Qwen2-VL 2B model"
+            )
+        if gme.screen_mode != "relative_margin_v1":
+            raise ValueError(
+                "subject_attribute_gme.screen_mode must be relative_margin_v1"
+            )
+        if (
+            not isinstance(gme.min_margin, float)
+            or not math.isfinite(gme.min_margin)
+        ):
+            raise ValueError("subject_attribute_gme.min_margin must be a finite float")
+        if (
+            not isinstance(gme.timeout_seconds, int)
+            or isinstance(gme.timeout_seconds, bool)
+            or gme.timeout_seconds < 1
+        ):
+            raise ValueError(
+                "subject_attribute_gme.timeout_seconds must be a positive integer"
+            )
+        for name, path in (
+            ("python_executable", gme.python_executable),
+            ("model_path", gme.model_path),
+        ):
+            if not isinstance(path, Path):
+                raise TypeError(f"subject_attribute_gme.{name} must be a pathlib.Path")
+        if gme.enabled:
+            for name, path in (
+                ("python_executable", gme.python_executable),
+                ("model_path", gme.model_path),
+            ):
+                if not _is_at_or_below(
+                    path.expanduser().resolve(strict=False),
+                    ALLOWED_WRITABLE_ROOT,
+                ):
+                    raise ValueError(
+                        f"subject_attribute_gme.{name} must remain inside "
+                        "/mnt/workspace/litengjie/data"
+                    )
+            if not gme.python_executable.expanduser().resolve().is_file():
+                raise ValueError(
+                    "enabled subject_attribute_gme.python_executable must exist"
+                )
+            if not gme.model_path.expanduser().resolve().is_dir():
+                raise ValueError("enabled subject_attribute_gme.model_path must exist")
+            if self.runtime.gpu_workers.subject_attributes_gme is None:
+                raise ValueError(
+                    "runtime.gpu_workers.subject_attributes_gme is required when "
+                    "subject_attribute_gme.enabled is true"
+                )
         if self.runtime.mode not in {"staged_legacy", "streaming_v1"}:
             raise ValueError("runtime.mode must be staged_legacy or streaming_v1")
         for name, value in (
@@ -916,7 +996,8 @@ class V3Config:
         visual_stage_workers.pop("subject_attributes", None)
         visual_gpu_workers = asdict(self.runtime.gpu_workers)
         visual_gpu_workers.pop("subject_attributes_segment", None)
-        return {
+        visual_gpu_workers.pop("subject_attributes_gme", None)
+        identifiers: dict[str, str | None] = {
             **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
             "remove.backend": self.remove.backend,
             "remove.inference_profile": self.remove.inference_profile,
@@ -967,6 +1048,23 @@ class V3Config:
                 visual_gpu_workers, sort_keys=True
             ),
         }
+        if self.subject_attribute_gme.enabled:
+            identifiers.update(
+                {
+                    "subject_attribute_gme.backend": self.subject_attribute_gme.backend,
+                    "subject_attribute_gme.model": self.subject_attribute_gme.model_name,
+                    "subject_attribute_gme.model_path": str(
+                        self.subject_attribute_gme.model_path
+                    ),
+                    "subject_attribute_gme.screen_mode": (
+                        self.subject_attribute_gme.screen_mode
+                    ),
+                    "subject_attribute_gme.min_margin": str(
+                        self.subject_attribute_gme.min_margin
+                    ),
+                }
+            )
+        return identifiers
 
     def fingerprint(self) -> str:
         value = _json_compatible(asdict(self))
@@ -978,6 +1076,10 @@ class V3Config:
             gpu_workers = runtime.get("gpu_workers")
             if isinstance(gpu_workers, dict):
                 gpu_workers.pop("subject_attributes_segment", None)
+                gpu_workers.pop("subject_attributes_gme", None)
+        gme = value.get("subject_attribute_gme")
+        if isinstance(gme, dict) and not gme.get("enabled"):
+            value.pop("subject_attribute_gme", None)
         source = value.get("source")
         if isinstance(source, dict) and source.get("selection_manifest") is None:
             source.pop("selection_manifest", None)
@@ -1142,6 +1244,10 @@ def load_config(path: str | Path) -> V3Config:
         raw.get("reference_edit"),
         "reference_edit",
     )
+    subject_attribute_gme_values = _mapping(
+        raw.get("subject_attribute_gme"),
+        "subject_attribute_gme",
+    )
     source_values = _mapping(raw.get("source"), "source")
     if "selection_manifest" in source_values:
         selection_manifest = source_values["selection_manifest"]
@@ -1190,6 +1296,11 @@ def load_config(path: str | Path) -> V3Config:
         if name in reference_edit_values:
             reference_edit_values[name] = Path(
                 str(reference_edit_values[name])
+            ).expanduser()
+    for name in ("python_executable", "model_path"):
+        if name in subject_attribute_gme_values:
+            subject_attribute_gme_values[name] = Path(
+                str(subject_attribute_gme_values[name])
             ).expanduser()
 
     config = V3Config(
@@ -1242,6 +1353,11 @@ def load_config(path: str | Path) -> V3Config:
             ReferenceIntegrityConfig,
             _mapping(raw.get("reference_integrity"), "reference_integrity"),
             "reference_integrity",
+        ),
+        subject_attribute_gme=_build(
+            SubjectAttributeGmeConfig,
+            subject_attribute_gme_values,
+            "subject_attribute_gme",
         ),
         runtime=_build(
             RuntimeConfig,

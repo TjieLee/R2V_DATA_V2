@@ -56,6 +56,7 @@ PERSISTENT GPU WORKERS
     - reference edit / Boogu worker path as configured
   physical GPU 7
     - subject-attribute single-frame SAM3
+    - GME 2B attribute prefilter (new; pending server canary)
 
 AUDIT ONLY
   main R2V .venv
@@ -87,6 +88,12 @@ Qwen3-VL model:
 
 Qwen endpoint:
   http://127.0.0.1:8000/v1
+
+GME attribute model:
+  /mnt/workspace/litengjie/data/models/gme-Qwen2-VL-2B-Instruct
+
+GME Python:
+  /mnt/workspace/litengjie/data/venvs/gme/bin/python
 
 JEA production source JSONL:
   /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
@@ -154,7 +161,7 @@ physical GPU 3  Qwen3-VL DP replica 3, TP1
 physical GPU 4  Boogu background-removal generator
 physical GPU 5  main temporal SAM3
 physical GPU 6  Boogu / reference-edit worker
-physical GPU 7  dedicated subject-attribute single-frame SAM3
+physical GPU 7  dedicated subject-attribute single-frame SAM3 + GME 2B
 ```
 
 Do not globally export `CUDA_VISIBLE_DEVICES` in the normal parent pipeline
@@ -171,6 +178,9 @@ Important ordinal rules:
   `sam3.device: cuda`; never put `cuda:5` in the worker-local SAM3 config;
 - dedicated attribute SAM3 uses physical GPU7 through the same isolation rule
   and also uses worker-local `cuda`;
+- GME uses a separate persistent offline worker on configured physical GPU7,
+  sees only worker-local `cuda:0`, and does not intentionally overlap the
+  colocated attribute SAM3 inference;
 - Boogu background removal is assigned physical GPU4 by runtime GPU-worker
   configuration and sees its isolated local CUDA device as `cuda:0`;
 - the separate Boogu reference-edit worker is assigned physical GPU6 and sees
@@ -405,14 +415,28 @@ runtime:
   gpu_workers:
     segment: "5"
     subject_attributes_segment: "7"
+    subject_attributes_gme: "7"
     remove: "4"
     reference_edit: "6"
+
+subject_attribute_gme:
+  enabled: true
+  backend: gme_qwen2_vl_2b_v1
+  python_executable: /mnt/workspace/litengjie/data/venvs/gme/bin/python
+  model_path: /mnt/workspace/litengjie/data/models/gme-Qwen2-VL-2B-Instruct
+  model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
+  screen_mode: relative_margin_v1
+  min_margin: 0.0
+  timeout_seconds: 3600
 ```
 
-`runtime.stage_workers.subject_attributes` and
-`runtime.gpu_workers.subject_attributes_segment` are sidecar runtime-capacity
-settings and are excluded from the frozen Visual fingerprint/model identifiers.
-The Git commit remains part of run identity.
+`runtime.stage_workers.subject_attributes`,
+`runtime.gpu_workers.subject_attributes_segment`, and the GME GPU assignment
+are sidecar runtime-capacity settings and are excluded from the frozen Visual
+fingerprint/model identifiers. When GME is enabled, its model path, model name,
+backend, screen mode, and relative margin do enter config/model identity so an
+older attribute cache cannot masquerade as screened output. The Git commit
+remains part of run identity.
 
 The intended background-removal generator is Boogu Image 0.1 Edit Turbo with
 four inference steps and thinking disabled on physical GPU4. It reuses the
@@ -443,6 +467,19 @@ attribute generative completion: not used
 Accepted attribute crops are source RGB plus mask exported as RGBA transparency.
 Every accepted record carries `owner_entity_id` and must pass deterministic
 ownership geometry plus strict batched Qwen recognizability/owner-binding review.
+
+The new attribute sequence is Qwen discovery -> owner-Top3 frame-local SAM3 ->
+deterministic geometry -> GME 2B relative-margin prefilter -> existing batched
+Qwen final review. GME uses
+`Alibaba-NLP/gme-Qwen2-VL-2B-Instruct`, local/offline English queries, and one
+persistent worker. It may reject a candidate attempt and advance to the next
+bounded owner candidate frame; an infrastructure failure fails open to the
+existing Qwen review. The Qwen review remains final and unchanged.
+
+This GME path is new and requires a server canary. Only
+`relative_margin_v1` with `min_margin=0.0` is specified; it is not calibrated
+beyond that conservative relative comparison, and no absolute cosine threshold
+is used.
 
 Attribute outputs are sidecars below `<run_root>/subject_attributes/`; they do
 not mutate the frozen Visual `ClipRecord` or frozen Visual export schema.
@@ -482,6 +519,8 @@ runtime.mode = streaming_v1
 runtime.qwen_max_inflight = 4
 runtime.gpu_workers.segment = "5"
 runtime.gpu_workers.subject_attributes_segment = "7"
+runtime.gpu_workers.subject_attributes_gme = "7"
+subject_attribute_gme.enabled = true
 runtime.gpu_workers.remove = "4"
 runtime.gpu_workers.reference_edit = "6"
 sam3.device = cuda
