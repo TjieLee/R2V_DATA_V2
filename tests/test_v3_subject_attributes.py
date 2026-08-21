@@ -24,7 +24,6 @@ from r2v_data_v2.v3.config import (
     SubjectAttributesConfig,
     V3Config,
 )
-from r2v_data_v2.v3.reference_edit_boogu import BooguCompletionReview
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.pair import EntityReferenceCandidate
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
@@ -2157,7 +2156,11 @@ def test_attribute_output_cannot_overlap_source_run_or_visual_export(
         )
 
 
-def _completion_review(*, accepted: bool) -> BooguCompletionReview:
+def _completion_review(
+    *,
+    accepted: bool,
+    segmentation_prompt: str = "attribute",
+) -> subject_attributes.SubjectAttributeCompletionReview:
     values = {
         "same_physical_entity": accepted,
         "identity_preserved": accepted,
@@ -2172,8 +2175,9 @@ def _completion_review(*, accepted: bool) -> BooguCompletionReview:
         "reference_usable": accepted,
         "certain": accepted,
     }
-    return BooguCompletionReview(
+    return subject_attributes.SubjectAttributeCompletionReview(
         verdict="accept" if accepted else "reject",
+        segmentation_prompt=segmentation_prompt,
         reason="usable" if accepted else "identity changed",
         **values,
     )
@@ -2185,6 +2189,8 @@ def _attempt_completion_with_masks(
     *,
     raw_alpha: np.ndarray | None = None,
     judge_accepts: bool = True,
+    phrase: str = "attribute",
+    segmentation_prompt: str = "attribute",
     config_updates: dict[str, object] | None = None,
 ) -> tuple[
     subject_attributes.PendingAttributeCandidate | None,
@@ -2199,7 +2205,7 @@ def _attempt_completion_with_masks(
     candidate = subject_attributes.PendingAttributeCandidate(
         discovered=DiscoveredSubjectAttribute(
             attribute_type="accessory",
-            phrase="attribute",
+            phrase=phrase,
             grounding_prompt="attribute worn by person 1",
         ),
         attribute_id="a1",
@@ -2211,23 +2217,30 @@ def _attempt_completion_with_masks(
         geometry=_geometry(),
     )
 
+    trace = SimpleNamespace(calls=0, sam_calls=0, sam_prompts=[], events=[])
+
     class Backend:
         def attribute_completion(self, *, output_path, **_kwargs):
+            trace.events.append("boogu")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             Image.new("RGB", (64, 64), (100, 120, 140)).save(output_path)
             return {"model_call_time_seconds": 0.1}
 
     class Segmenter:
-        def segment_generated_frame(self, **_kwargs):
+        def segment_generated_frame(self, **kwargs):
+            trace.events.append("sam")
+            trace.sam_calls += 1
+            trace.sam_prompts.append(kwargs["grounding_prompt"])
             return masks
 
     class Judge:
-        def __init__(self) -> None:
-            self.calls = 0
-
         def review(self, **_kwargs):
-            self.calls += 1
-            return _completion_review(accepted=judge_accepts)
+            trace.events.append("qwen_review")
+            trace.calls += 1
+            return _completion_review(
+                accepted=judge_accepts,
+                segmentation_prompt=segmentation_prompt,
+            )
 
     judge = Judge()
     updates = {
@@ -2252,7 +2265,7 @@ def _attempt_completion_with_masks(
         metrics=metrics,
         raw_usable=True,
     )
-    return completed, reason, metrics, judge
+    return completed, reason, metrics, trace
 
 
 def _rect_mask(
@@ -2276,7 +2289,27 @@ def test_completion_zero_sam_masks_rejects_missing_entity(tmp_path: Path) -> Non
     assert reason == "completion_postcheck:missing_entity"
     assert metrics.sam_zero_mask_rejects == 1
     assert metrics.sam_masks_returned_total == 0
-    assert judge.calls == 0
+    assert judge.calls == 1
+    assert judge.sam_calls == 1
+
+
+def test_completion_uses_one_qwen_segmentation_prompt_after_review(
+    tmp_path: Path,
+) -> None:
+    mask = _rect_mask(16, 48, 16, 48)
+    completed, reason, _, trace = _attempt_completion_with_masks(
+        tmp_path,
+        (mask,),
+        phrase="gray traditional robe with dark sash",
+        segmentation_prompt="gray traditional robe",
+    )
+
+    assert completed is not None
+    assert reason == "completion_identity_accepted"
+    assert trace.events == ["boogu", "qwen_review", "sam"]
+    assert trace.sam_calls == 1
+    assert trace.sam_prompts == ["gray traditional robe"]
+    assert "gray traditional robe with dark sash" not in trace.sam_prompts
 
 
 def test_completion_single_sam_mask_continues_normally(tmp_path: Path) -> None:
@@ -2355,7 +2388,7 @@ def test_completion_all_empty_sam_masks_rejects_missing_entity(tmp_path: Path) -
     assert reason == "completion_postcheck:missing_entity"
     assert metrics.sam_zero_mask_rejects == 1
     assert metrics.sam_masks_returned_total == 2
-    assert judge.calls == 0
+    assert judge.calls == 1
 
 
 @pytest.mark.parametrize(
@@ -2379,7 +2412,7 @@ def test_completion_rejects_invalid_sam_mask_payloads(
     assert reason == "completion_postcheck:invalid_sam_mask"
     assert metrics.postcheck_rejects == 1
     assert metrics.sam_masks_returned_total == 1
-    assert judge.calls == 0
+    assert judge.calls == 1
 
 
 def test_completion_multi_mask_union_still_gets_fragmentation_gate(
@@ -2398,7 +2431,7 @@ def test_completion_multi_mask_union_still_gets_fragmentation_gate(
     assert completed is None
     assert reason == "completion_postcheck:extra_entity_contours"
     assert metrics.sam_multi_mask == 1
-    assert judge.calls == 0
+    assert judge.calls == 1
 
 
 def test_completion_multi_mask_union_still_gets_area_growth_gate(
@@ -2419,7 +2452,7 @@ def test_completion_multi_mask_union_still_gets_area_growth_gate(
     assert completed is None
     assert reason == "completion_postcheck:mask_area_growth"
     assert metrics.sam_multi_mask == 1
-    assert judge.calls == 0
+    assert judge.calls == 1
 
 
 def test_completion_multi_mask_union_still_gets_bbox_growth_gate(
@@ -2443,10 +2476,10 @@ def test_completion_multi_mask_union_still_gets_bbox_growth_gate(
     assert completed is None
     assert reason == "completion_postcheck:bbox_area_growth"
     assert metrics.sam_multi_mask == 1
-    assert judge.calls == 0
+    assert judge.calls == 1
 
 
-def test_completion_multi_mask_union_still_requires_identity_review(
+def test_completion_qwen_reject_skips_sam(
     tmp_path: Path,
 ) -> None:
     first = _rect_mask(16, 48, 8, 24)
@@ -2459,9 +2492,11 @@ def test_completion_multi_mask_union_still_requires_identity_review(
 
     assert completed is None
     assert reason == "completion_qwen_review_reject"
-    assert metrics.sam_multi_mask == 1
+    assert metrics.sam_multi_mask == 0
     assert metrics.identity_review_rejects == 1
     assert judge.calls == 1
+    assert judge.sam_calls == 0
+    assert judge.events == ["boogu", "qwen_review"]
 
 
 @pytest.mark.parametrize("attribute_type", ["face", "upper_clothing"])
@@ -2898,7 +2933,9 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
     assert artifact.metrics.completion_fallback_to_raw == 1
     assert artifact.metrics.completion_selected_completed == 0
     assert backend.calls == 1
-    assert segmenter.generated_calls == int(failure_stage != "backend_failure")
+    assert segmenter.generated_calls == int(
+        failure_stage not in {"backend_failure", "identity_reject"}
+    )
     assert len(review.calls) == int(failure_stage == "final_review_reject") + 1
 
 

@@ -34,7 +34,6 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguReferenceEditBackend,
     BooguReferenceEditJudge,
     BooguSamReviewer,
-    QwenBooguReferenceEditJudge,
 )
 from r2v_data_v2.v3.reference_integrity import (
     ReferenceIntegrityJudge,
@@ -58,9 +57,11 @@ from r2v_data_v2.v3.segment import segment_clips
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage, evaluate_export_state
 from r2v_data_v2.v3.subject_attributes import (
     AttributeCompletionBackend,
+    AttributeCompletionJudge,
     AttributeFrameSegmentationBackend,
     AttributeGmeScreener,
     PersistentWorkerAttributeFrameSegmenter,
+    QwenSubjectAttributeCompletionJudge,
     QwenSubjectAttributeClient,
     SubjectAttributeDiscoveryClient,
     SubjectAttributeReviewClient,
@@ -148,7 +149,7 @@ def _streaming_stage_handler(
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
     attribute_gme_screener: AttributeGmeScreener | None,
     attribute_completion_backend: AttributeCompletionBackend | None,
-    attribute_completion_judge: BooguReferenceEditJudge | None,
+    attribute_completion_judge: AttributeCompletionJudge | None,
 ) -> object:
     if process is not None:
         return process.request
@@ -299,7 +300,7 @@ def _run_streaming_pipeline(
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
     attribute_gme_screener: AttributeGmeScreener | None,
     attribute_completion_backend: AttributeCompletionBackend | None = None,
-    attribute_completion_judge: BooguReferenceEditJudge | None = None,
+    attribute_completion_judge: AttributeCompletionJudge | None = None,
     profile: bool = False,
 ) -> dict[str, object]:
     if "manifest" in ordered_stages:
@@ -439,7 +440,7 @@ def _run_streaming_pipeline(
             stack.callback(worker.close)
         attribute_inference_lock: threading.Lock | None = None
         owned_attribute_qwen: QwenSubjectAttributeClient | None = None
-        owned_completion_judge: QwenBooguReferenceEditJudge | None = None
+        owned_completion_judge: QwenSubjectAttributeCompletionJudge | None = None
         if "subject_attributes" in clip_stages:
             if (
                 subject_attribute_discovery_client is None
@@ -489,7 +490,7 @@ def _run_streaming_pipeline(
                 if attribute_completion_judge is None:
                     service = config.qwen.candidate_judge
                     assert service is not None
-                    owned_completion_judge = QwenBooguReferenceEditJudge(
+                    owned_completion_judge = QwenSubjectAttributeCompletionJudge(
                         service,
                         completion_component="qwen_attribute_completion_review",
                     )
@@ -619,7 +620,7 @@ def run_pipeline_v3(
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     attribute_gme_screener: AttributeGmeScreener | None = None,
     attribute_completion_backend: AttributeCompletionBackend | None = None,
-    attribute_completion_judge: BooguReferenceEditJudge | None = None,
+    attribute_completion_judge: AttributeCompletionJudge | None = None,
     profile: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))

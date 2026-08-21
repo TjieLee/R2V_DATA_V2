@@ -17,7 +17,14 @@ from typing import Any, Literal, Protocol
 import numpy as np
 from openai import OpenAI
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
@@ -36,10 +43,13 @@ from r2v_data_v2.v3.pair import (
     build_reference_crop,
     mask_component_diagnostics,
 )
-from r2v_data_v2.v3.profiling import profile_model_call, profiled_openai_call
+from r2v_data_v2.v3.profiling import (
+    model_profile_context,
+    profile_model_call,
+    profiled_openai_call,
+)
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguCompletionReview,
-    BooguReferenceEditJudge,
     QwenBooguReferenceEditJudge,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend, mask_iou
@@ -181,6 +191,26 @@ class SubjectAttributeReviewBatch(_SchemaModel):
         if len(ids) != len(set(ids)):
             raise ValueError("attribute review IDs must be unique")
         return self
+
+
+class SubjectAttributeCompletionReview(BooguCompletionReview):
+    """Attribute-only completion verdict plus one SAM3 grounding prompt."""
+
+    segmentation_prompt: str = Field(min_length=1, max_length=120)
+
+    @field_validator("segmentation_prompt")
+    @classmethod
+    def validate_segmentation_prompt(cls, value: str) -> str:
+        prompt = " ".join(value.split())
+        if not prompt.isascii() or re.search(r"[A-Za-z]", prompt) is None:
+            raise ValueError("segmentation_prompt must be English")
+        if re.search(
+            r"\b(?:worn|held|carried|owned)\s+by\b|\bbelonging\s+to\b",
+            prompt,
+            flags=re.IGNORECASE,
+        ):
+            raise ValueError("segmentation_prompt must not contain owner relations")
+        return prompt
 
 
 class OwnershipGeometry(_SchemaModel):
@@ -883,6 +913,17 @@ class AttributeCompletionBackend(Protocol):
     ) -> dict[str, object]: ...
 
 
+class AttributeCompletionJudge(Protocol):
+    def review(
+        self,
+        *,
+        source_attribute: Image.Image,
+        generated_candidate: Image.Image,
+        attribute_type: str,
+        attribute_phrase: str,
+    ) -> SubjectAttributeCompletionReview: ...
+
+
 class AttributeProbeClient(Protocol):
     def attribute_probe(
         self,
@@ -1108,6 +1149,29 @@ shape is {"owner_entity_id":"e1","reviews":[{"attribute_id":"a1",
 "characteristic_appearance_visible":true,
 "usable_as_attribute_condition":true,"structure_complete":true,
 "completion_recommended":false,"reason":"..."}]}. Return JSON only."""
+
+
+ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT = """Review one generated subject
+attribute completion. Image 1 is the isolated raw/source attribute crop and
+Image 2 is the generated candidate. Apply the existing strict completion
+identity and quality standard: accept only if Image 2 preserves the same
+physical entity and every visible identity attribute, contains exactly one
+coherent target, plausibly completes missing structure, adds no duplicate or
+unrelated entity, has no severe structural artifact, remains stylistically
+coherent, and is a usable high-resolution attribute reference. For a face,
+preserve the same person's facial identity, orientation, and expression. For
+clothing, hair, headwear, or an accessory, preserve the same item or component,
+including its material, color, texture, shape, and structure. Judge visible
+facts only and fail closed when uncertain.
+
+Also return segmentation_prompt: a non-empty, concise English visual noun
+phrase for grounding only the target attribute in Image 2 with SAM3. Prefer a
+stable component or garment noun phrase and omit unnecessary fine-grained
+qualifiers that could reduce grounding recall. Do not include an owner relation
+such as 'worn by the man', 'held by the woman', or 'belonging to the person'.
+Return segmentation_prompt even with a reject verdict; it will be ignored when
+rejected. Return one strict JSON object matching the supplied schema and no
+other text."""
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -1341,6 +1405,82 @@ class QwenSubjectAttributeClient:
         close = getattr(self.client, "close", None)
         if callable(close):
             close()
+
+
+class QwenSubjectAttributeCompletionJudge(QwenBooguReferenceEditJudge):
+    """Subject-attribute completion review with a single SAM3 prompt output."""
+
+    def review(
+        self,
+        *,
+        source_attribute: Image.Image,
+        generated_candidate: Image.Image,
+        attribute_type: str,
+        attribute_phrase: str,
+    ) -> SubjectAttributeCompletionReview:
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Attribute type: {attribute_type}\n"
+                    f"Original attribute phrase: {attribute_phrase.strip()}"
+                ),
+            }
+        ]
+        for label, image in (
+            ("Image 1: isolated raw/source attribute crop", source_attribute),
+            ("Image 2: generated completion candidate", generated_candidate),
+        ):
+            content.extend(
+                (
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _png_data_url(
+                                _resize_qwen_input_image(image.convert("RGB"))
+                            )
+                        },
+                    },
+                )
+            )
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+        with model_profile_context(
+            retry_index=0,
+            metadata={"edit_operation": "complete_entity"},
+        ):
+            raw = self._request(messages, SubjectAttributeCompletionReview)
+        for attempt in range(self.repair_retries + 1):
+            try:
+                return SubjectAttributeCompletionReview.model_validate_json(raw)
+            except (TypeError, ValueError) as exc:
+                if attempt >= self.repair_retries:
+                    raise ValueError(
+                        f"invalid Qwen subject attribute completion review: {exc}"
+                    ) from exc
+                repair_messages = [
+                    *messages,
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair the JSON to match the schema exactly. "
+                            f"Validation error: {exc}"
+                        ),
+                    },
+                ]
+                with model_profile_context(
+                    retry_index=attempt + 1,
+                    metadata={"edit_operation": "complete_entity"},
+                ):
+                    raw = self._request(
+                        repair_messages,
+                        SubjectAttributeCompletionReview,
+                    )
+        raise AssertionError("unreachable")
 
 
 def evaluate_owner_eligibility(
@@ -1793,7 +1933,7 @@ def _attempt_attribute_completion(
     output_root: Path,
     completion_config: object,
     completion_backend: AttributeCompletionBackend,
-    completion_judge: BooguReferenceEditJudge,
+    completion_judge: AttributeCompletionJudge,
     segmentation_backend: AttributeFrameSegmentationBackend,
     metrics: _CompletionSelectionMetrics,
     raw_usable: bool,
@@ -1831,17 +1971,35 @@ def _attempt_attribute_completion(
         ):
             raise ValueError("completion model-call time is invalid")
         metrics.model_call_time_seconds += max(0.0, float(reported_seconds))
+        with Image.open(output_path) as opened:
+            opened.load()
+            completed_rgb = opened.convert("RGB")
+        failure_stage = "identity_review"
+        review_started = time.perf_counter()
+        metrics.review_calls += 1
+        review = completion_judge.review(
+            source_attribute=candidate.crop,
+            generated_candidate=completed_rgb,
+            attribute_type=candidate.discovered.attribute_type,
+            attribute_phrase=candidate.discovered.phrase,
+        )
+        review_seconds = time.perf_counter() - review_started
+        metrics.review_time_seconds += review_seconds
+        if (
+            not isinstance(review, SubjectAttributeCompletionReview)
+            or review.verdict != "accept"
+        ):
+            metrics.qwen_review_rejects += 1
+            metrics.identity_review_rejects += 1
+            return None, "completion_qwen_review_reject", False
         failure_stage = "sam3_resegmentation"
         sam_started = time.perf_counter()
         completed_masks = segmentation_backend.segment_generated_frame(
             frame_path=output_path,
-            grounding_prompt=candidate.discovered.phrase,
+            grounding_prompt=review.segmentation_prompt,
         )
         metrics.sam3_time_seconds += time.perf_counter() - sam_started
         metrics.sam_masks_returned_total += len(completed_masks)
-        with Image.open(output_path) as opened:
-            opened.load()
-            completed_rgb = opened.convert("RGB")
         try:
             completed_mask, nonempty_mask_count = _union_completed_attribute_masks(
                 completed_masks,
@@ -1913,23 +2071,6 @@ def _attempt_attribute_completion(
         if completed_bbox / raw_bbox > bbox_limit:
             metrics.postcheck_rejects += 1
             return None, "completion_postcheck:bbox_area_growth", False
-        failure_stage = "identity_review"
-        review_started = time.perf_counter()
-        metrics.review_calls += 1
-        review = completion_judge.review(
-            operation="complete_entity",
-            source_rgba=candidate.crop,
-            source_input_rgb=candidate.crop.convert("RGB"),
-            candidate_rgb=completed_rgb,
-            entity_phrase=candidate.discovered.phrase,
-            reference_type="subject",
-        )
-        review_seconds = time.perf_counter() - review_started
-        metrics.review_time_seconds += review_seconds
-        if not isinstance(review, BooguCompletionReview) or review.verdict != "accept":
-            metrics.qwen_review_rejects += 1
-            metrics.identity_review_rejects += 1
-            return None, "completion_qwen_review_reject", False
     except Exception as exc:  # noqa: BLE001 - route to raw fallback or rejection
         metrics.failures += 1
         if failure_stage == "backend":
@@ -2326,7 +2467,7 @@ def _process_owner(
     segmentation_backend: AttributeFrameSegmentationBackend,
     gme_screener: AttributeGmeScreener | None = None,
     completion_backend: AttributeCompletionBackend | None = None,
-    completion_judge: BooguReferenceEditJudge | None = None,
+    completion_judge: AttributeCompletionJudge | None = None,
 ) -> OwnerEnrichmentArtifact:
     metrics = OwnerEnrichmentMetrics(discovery_calls=1)
     gme_screen_mode = (
@@ -3193,7 +3334,7 @@ def process_subject_attribute_clip(
     segmentation_backend: AttributeFrameSegmentationBackend,
     gme_screener: AttributeGmeScreener | None = None,
     completion_backend: AttributeCompletionBackend | None = None,
-    completion_judge: BooguReferenceEditJudge | None = None,
+    completion_judge: AttributeCompletionJudge | None = None,
     max_owners: int | None = None,
     overwrite: bool = False,
 ) -> ClipEnrichmentResult:
@@ -3614,7 +3755,7 @@ def run_subject_attribute_enrichment(
     segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     gme_screener: AttributeGmeScreener | None = None,
     completion_backend: AttributeCompletionBackend | None = None,
-    completion_judge: BooguReferenceEditJudge | None = None,
+    completion_judge: AttributeCompletionJudge | None = None,
     allow_run_local_sidecar: bool = False,
 ) -> dict[str, object]:
     if max_owners is not None and (
@@ -3661,7 +3802,7 @@ def run_subject_attribute_enrichment(
     assert discovery_client is not None
     assert review_client is not None
     assert segmentation_backend is not None
-    owned_completion_judge: QwenBooguReferenceEditJudge | None = None
+    owned_completion_judge: QwenSubjectAttributeCompletionJudge | None = None
     if effective_config.subject_attributes.completion.enabled:
         if completion_backend is None:
             raise ValueError(
@@ -3671,7 +3812,7 @@ def run_subject_attribute_enrichment(
         if completion_judge is None:
             service = effective_config.qwen.candidate_judge
             assert service is not None
-            owned_completion_judge = QwenBooguReferenceEditJudge(
+            owned_completion_judge = QwenSubjectAttributeCompletionJudge(
                 service,
                 completion_component="qwen_attribute_completion_review",
             )
