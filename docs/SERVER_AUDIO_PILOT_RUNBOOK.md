@@ -1,3 +1,7 @@
+# Active JEA production path
+
+For full canonical JEA production, readable media-collection grouping, the isolated qwen-asr==0.0.6 environment, and Qwen3/final-renderer commands, use docs/H3_QWEN3_ASR.md. The Whisper commands below are legacy pilot procedures, not the active JEA production ASR path.
+
 # Server Audio Pilot Runbook
 
 This is the operational runbook for the server-side Audio/H3 pilot. Keep the
