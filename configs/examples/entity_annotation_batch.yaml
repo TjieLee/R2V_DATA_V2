@@ -1,0 +1,27 @@
+source_jsonl: /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
+clips_root: /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/clips_clean_cropped
+source_videos_root: /mnt/workspace/public/dataset/jea-video/moive-183t-0808
+output_root: /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_annotations
+
+shard_size: 10000
+
+annotation:
+  model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
+  api_key: EMPTY
+  temperature: 0.0
+  max_tokens: 4096
+  timeout_seconds: 3600
+  repair_retries: 1
+  entity_selection_mode: default
+  fps: 2.0
+
+workers:
+  - name: qwen_0
+    base_url: http://127.0.0.1:8001/v1
+    shard_start: 0
+    shard_end: 49
+
+  - name: qwen_1
+    base_url: http://127.0.0.1:8002/v1
+    shard_start: 50
+    shard_end: 99
