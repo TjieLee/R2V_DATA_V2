@@ -117,6 +117,11 @@ def _fixture(
                     "base_model_path": str(pretrained / "Qwen" / "edit"),
                     "adapter_path": str(writable / "models" / "remover"),
                 },
+                "reference_edit": {
+                    "python_executable": str(writable / "boogu" / "python"),
+                    "code_root": str(writable / "boogu" / "code"),
+                    "model_path": str(writable / "boogu" / "model"),
+                },
                 "runtime": {"mode": "streaming_v1"},
             },
             sort_keys=False,
@@ -329,6 +334,55 @@ def test_sam3_compile_flag_changes_only_isolated_canary_runtime(
         "subject_attribute_gme"
     )
     assert load_config(paths.shard_config).runtime.sam3_compile_enabled is True
+
+
+def test_canary_overrides_stale_qwen_remove_backend_with_boogu_gpu4(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        monkeypatch,
+        groups=[("movie-a", "目录/源视频.mkv", 2)],
+    )
+    base = yaml.safe_load(fixture["base_config"].read_text(encoding="utf-8"))
+    base["remove"].update(
+        {
+            "enabled": True,
+            "backend": "qwen_image_edit_2511_object_remover",
+            "inference_profile": "object_remover_4step_v1",
+        }
+    )
+    base["runtime"]["gpu_workers"] = {"remove": "0"}
+    reference_edit = dict(base["reference_edit"])
+    fixture["base_config"].write_text(
+        yaml.safe_dump(base, sort_keys=False),
+        encoding="utf-8",
+    )
+    selection = select_source_records(**_selection_arguments(fixture), count=2)
+    paths = build_canary_paths(
+        selection,
+        count=2,
+        now=datetime(2026, 8, 20, 15, 0, 1, tzinfo=timezone.utc),
+    )
+
+    prepare_canary_artifacts(
+        selection=selection,
+        paths=paths,
+        base_config=fixture["base_config"],
+        **_selection_arguments(fixture),
+    )
+
+    generated = load_config(paths.shard_config)
+    assert generated.remove.enabled is True
+    assert generated.remove.backend == "boogu_image_0_1_edit_turbo"
+    assert generated.remove.inference_profile == "boogu_4step_v1"
+    assert generated.runtime.gpu_workers.remove == "4"
+    assert {
+        "python_executable": str(generated.reference_edit.python_executable),
+        "code_root": str(generated.reference_edit.code_root),
+        "model_path": str(generated.reference_edit.model_path),
+    } == reference_edit
 
 
 def test_attribute_completion_flag_writes_isolated_completion_config(

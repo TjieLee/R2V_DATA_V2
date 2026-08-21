@@ -2266,16 +2266,19 @@ def _attempt_completion_direct(
 
     judge = Judge()
     metrics = subject_attributes._CompletionSelectionMetrics()
-    completed, reason, _ = subject_attributes._attempt_attribute_completion(
-        candidate,
-        clip_uid="42038d7dc619cfa7bebee437",
-        output_root=tmp_path,
-        completion_config=SubjectAttributeCompletionConfig(enabled=True),
-        completion_backend=Backend(),
-        completion_judge=judge,
-        metrics=metrics,
-        raw_usable=True,
+    completed, reason, _, completion_review = (
+        subject_attributes._attempt_attribute_completion(
+            candidate,
+            clip_uid="42038d7dc619cfa7bebee437",
+            output_root=tmp_path,
+            completion_config=SubjectAttributeCompletionConfig(enabled=True),
+            completion_backend=Backend(),
+            completion_judge=judge,
+            metrics=metrics,
+            raw_usable=True,
+        )
     )
+    trace.completion_review = completion_review
     return completed, reason, metrics, trace
 
 
@@ -2298,6 +2301,7 @@ def test_completion_uses_boogu_gray_robe_rgb_without_sam_resegmentation(
     assert trace.reviewed_image.mode == "RGB"
     assert np.array_equal(np.asarray(trace.reviewed_image), pixels)
     assert trace.events == ["boogu", "qwen_review"]
+    assert trace.completion_review == _completion_review(accepted=True)
     assert metrics.sam3_time_seconds == 0.0
     assert metrics.sam_zero_mask_rejects == 0
     assert metrics.sam_single_mask == 0
@@ -2372,21 +2376,24 @@ def test_repairable_attribute_uses_boogu_without_completion_sam(
         maximum_bbox_area_growth_ratio=4.0,
         face_maximum_bbox_area_growth_ratio=4.0,
     )
-    completed, reason, failed = subject_attributes._attempt_attribute_completion(
-        candidate,
-        clip_uid="clip-1",
-        output_root=tmp_path / "subject_attributes",
-        completion_config=config,
-        completion_backend=backend,
-        completion_judge=Judge(),
-        metrics=metrics,
-        raw_usable=True,
+    completed, reason, failed, completion_review = (
+        subject_attributes._attempt_attribute_completion(
+            candidate,
+            clip_uid="clip-1",
+            output_root=tmp_path / "subject_attributes",
+            completion_config=config,
+            completion_backend=backend,
+            completion_judge=Judge(),
+            metrics=metrics,
+            raw_usable=True,
+        )
     )
 
     assert completed is not None
     assert completed.completion_attempted is True
     assert reason == "completion_identity_accepted"
     assert failed is False
+    assert completion_review == _completion_review(accepted=True)
     assert backend.calls == 1
     assert completed.crop.mode == "RGB"
     assert metrics.sam3_time_seconds == 0.0
@@ -2427,7 +2434,7 @@ def test_alpha_coverage_does_not_control_completion_routing(
         def review(self, **_kwargs):
             return _completion_review(accepted=True)
 
-    completed, reason, _ = subject_attributes._attempt_attribute_completion(
+    completed, reason, _, _ = subject_attributes._attempt_attribute_completion(
         candidate,
         clip_uid="clip-1",
         output_root=tmp_path,
@@ -2475,22 +2482,25 @@ def test_completion_review_rejects_fail_closed(
             return _completion_review(accepted=False)
 
     metrics = subject_attributes._CompletionSelectionMetrics()
-    completed, reason, _ = subject_attributes._attempt_attribute_completion(
-        candidate,
-        clip_uid="clip-1",
-        output_root=tmp_path,
-        completion_config=replace(
-            SubjectAttributeCompletionConfig(enabled=True),
-            maximum_alpha_coverage_without_completion=1.0,
-        ),
-        completion_backend=Backend(),
-        completion_judge=Judge(),
-        metrics=metrics,
-        raw_usable=False,
+    completed, reason, _, completion_review = (
+        subject_attributes._attempt_attribute_completion(
+            candidate,
+            clip_uid="clip-1",
+            output_root=tmp_path,
+            completion_config=replace(
+                SubjectAttributeCompletionConfig(enabled=True),
+                maximum_alpha_coverage_without_completion=1.0,
+            ),
+            completion_backend=Backend(),
+            completion_judge=Judge(),
+            metrics=metrics,
+            raw_usable=False,
+        )
     )
     assert completed is None
     assert reason == "completion_qwen_review_reject"
     assert metrics.qwen_review_rejects == 1
+    assert completion_review == _completion_review(accepted=False)
 
 
 def _routing_review(attribute_id: str, kind: str) -> SubjectAttributeReview:
@@ -2535,21 +2545,6 @@ def _routing_review(attribute_id: str, kind: str) -> SubjectAttributeReview:
                 "reason": "unusable and not repairable",
             }
         )
-    if kind == "final_reject":
-        return accepted.model_copy(
-            update={
-                "recognizable": False,
-                "reason": "completed crop is unusable",
-            }
-        )
-    if kind == "final_incomplete":
-        return accepted.model_copy(
-            update={
-                "structure_complete": False,
-                "completion_recommended": True,
-                "reason": "completed robe is still structurally incomplete",
-            }
-        )
     if kind == "accepted_complete":
         return accepted
     raise AssertionError(f"unknown review kind: {kind}")
@@ -2591,18 +2586,12 @@ def _run_completion_routing_case(
         def review(self, *, owner, candidates):
             self.calls.append([candidate.attribute_id for candidate in candidates])
             self.crops.append([candidate.crop.copy() for candidate in candidates])
-            if len(self.calls) == 1:
-                kind = raw_kind
-            elif completion_stage == "final_review_reject":
-                kind = "final_reject"
-            elif completion_stage == "final_review_incomplete":
-                kind = "final_incomplete"
-            else:
-                kind = "accepted_complete"
+            if len(self.calls) != 1:
+                raise AssertionError("completed attributes must not be reviewed again")
             return SubjectAttributeReviewBatch(
                 owner_entity_id=owner.entity_id,
                 reviews=[
-                    _routing_review(candidate.attribute_id, kind)
+                    _routing_review(candidate.attribute_id, raw_kind)
                     for candidate in candidates
                 ],
             )
@@ -2706,8 +2695,6 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
     [
         "backend_failure",
         "identity_reject",
-        "final_review_reject",
-        "final_review_incomplete",
     ],
 )
 def test_raw_accepted_repair_failures_fallback_to_raw(
@@ -2726,13 +2713,20 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
     assert record.completion_attempted is True
     assert artifact.metrics.completion_fallback_to_raw == 1
     assert artifact.metrics.completion_selected_completed == 0
+    assert artifact.metrics.completion_review_calls == int(
+        failure_stage == "identity_reject"
+    )
     assert backend.calls == 1
     assert segmenter.generated_calls == 0
-    assert len(review.calls) == int(
-        failure_stage in {"final_review_reject", "final_review_incomplete"}
-    ) + 1
-    if failure_stage == "identity_reject":
-        assert review.calls == [["a1"]]
+    assert review.calls == [["a1"]]
+    assert record.completion_review == (
+        _completion_review(accepted=False)
+        if failure_stage == "identity_reject"
+        else None
+    )
+    assert record.image_path is not None
+    with Image.open(tmp_path / "output" / record.image_path) as published:
+        assert published.mode == "RGBA"
 
 
 def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
@@ -2745,25 +2739,35 @@ def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
     assert record.status == "accepted"
     assert record.final_selection == "completed"
     assert record.completion_outcome == "selected_completed"
-    assert artifact.metrics.review_calls == 2
+    assert artifact.metrics.review_calls == 1
     assert artifact.metrics.completion_selected_completed == 1
     assert artifact.metrics.completion_accepted == 1
-    assert artifact.metrics.repaired_attribute_final_review_accepted == 1
+    assert artifact.metrics.completion_review_calls == 1
+    assert artifact.metrics.completion_final_review_rejects == 0
+    assert artifact.metrics.repaired_attribute_final_review_accepted == 0
+    assert artifact.metrics.repaired_attribute_final_review_rejected == 0
+    assert artifact.metrics.completion_sam_zero_mask_rejects == 0
+    assert artifact.metrics.completion_sam_single_mask == 0
+    assert artifact.metrics.completion_sam_multi_mask == 0
+    assert artifact.metrics.completion_sam_masks_returned_total == 0
     assert artifact.metrics.completion_attempts_by_type == {"face": 1}
     assert artifact.metrics.completion_accepted_by_type == {"face": 1}
-    assert review.calls == [["a1"], ["a1"]]
+    assert review.calls == [["a1"]]
     assert backend.calls == 1
     assert segmenter.generated_calls == 0
     assert review.crops[0][0].mode == "RGBA"
-    assert review.crops[1][0].mode == "RGB"
+    assert record.completion_review == _completion_review(accepted=True)
     assert record.image_path is not None
     with Image.open(tmp_path / "output" / record.image_path) as published:
         published.load()
         assert published.mode == "RGB"
-        assert np.array_equal(np.asarray(published), np.asarray(review.crops[1][0]))
+        expected = np.full((100, 100, 3), 245, dtype=np.uint8)
+        expected[15:90, 20:80] = (170, 170, 170)
+        expected[58:68, 20:80] = (35, 35, 35)
+        assert np.array_equal(np.asarray(published), expected)
 
 
-def test_raw_and_repaired_reviews_are_owner_batched(tmp_path: Path) -> None:
+def test_raw_review_is_owner_batched_without_repaired_review(tmp_path: Path) -> None:
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_repair",
@@ -2774,42 +2778,19 @@ def test_raw_and_repaired_reviews_are_owner_batched(tmp_path: Path) -> None:
         "completed",
         "completed",
     ]
-    assert review.calls == [["a1", "a2"], ["a1", "a2"]]
-    assert artifact.metrics.review_calls == 2
+    assert review.calls == [["a1", "a2"]]
+    assert artifact.metrics.review_calls == 1
     assert backend.calls == 2
     assert segmenter.generated_calls == 0
 
 
-def test_repaired_review_incomplete_falls_back_to_usable_raw_without_sam(
-    tmp_path: Path,
-) -> None:
-    artifact, review, backend, segmenter = _run_completion_routing_case(
-        tmp_path,
-        raw_kind="accepted_repair",
-        completion_stage="final_review_incomplete",
-    )
-
-    record = artifact.records[0]
-    assert record.status == "accepted"
-    assert record.final_selection == "raw"
-    assert record.completion_attempted is True
-    assert artifact.metrics.completion_sam_zero_mask_rejects == 0
-    assert artifact.metrics.completion_sam_single_mask == 0
-    assert artifact.metrics.completion_sam_multi_mask == 0
-    assert artifact.metrics.completion_sam_masks_returned_total == 0
-    assert artifact.metrics.completion_final_review_rejects == 1
-    assert artifact.metrics.completion_fallback_to_raw == 1
-    assert review.calls == [["a1"], ["a1"]]
-    assert backend.calls == 1
-    assert segmenter.generated_calls == 0
-    assert record.image_path is not None
-    with Image.open(tmp_path / "output" / record.image_path) as published:
-        assert published.mode == "RGBA"
-
-
 @pytest.mark.parametrize(
     ("completion_stage", "expected_status"),
-    [("success", "accepted"), ("backend_failure", "rejected")],
+    [
+        ("success", "accepted"),
+        ("identity_reject", "rejected"),
+        ("backend_failure", "rejected"),
+    ],
 )
 def test_raw_unusable_repair_is_completed_or_rejected_fail_closed(
     tmp_path: Path,
@@ -2825,11 +2806,17 @@ def test_raw_unusable_repair_is_completed_or_rejected_fail_closed(
     record = artifact.records[0]
     assert record.status == expected_status
     assert artifact.metrics.completion_raw_unusable_attempts == 1
+    assert artifact.metrics.completion_review_calls == int(
+        completion_stage != "backend_failure"
+    )
     if expected_status == "accepted":
         assert record.final_selection == "completed"
+        assert record.completion_review == _completion_review(accepted=True)
     else:
         assert record.image_path is None
         assert artifact.metrics.completion_rejected == 1
+        if completion_stage == "identity_reject":
+            assert record.completion_review == _completion_review(accepted=False)
 
 
 @pytest.mark.parametrize(

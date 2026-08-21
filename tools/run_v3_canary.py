@@ -305,6 +305,15 @@ def _canary_config_bytes(
     qwen_stage_workers: int | None = None,
 ) -> bytes:
     value = dict(base)
+    remove = dict(value.get("remove") or {})
+    remove.update(
+        {
+            "enabled": True,
+            "backend": config_module.BOOGU_REMOVE_BACKEND,
+            "inference_profile": "boogu_4step_v1",
+        }
+    )
+    value["remove"] = remove
     source = dict(value.get("source") or {})
     source.update(
         {
@@ -320,6 +329,7 @@ def _canary_config_bytes(
     runtime["subject_attributes_deferred"] = defer_subject_attributes
     stage_workers = dict(runtime.get("stage_workers") or {})
     gpu_workers = dict(runtime.get("gpu_workers") or {})
+    gpu_workers["remove"] = "4"
     if dual_main_sam3:
         gpu_workers["segment_pool"] = ["5", "7"]
         stage_workers["segment"] = 2
