@@ -233,12 +233,19 @@ def select_source_records(
     )
 
 
-def _canary_tag(selection: CanarySelection, *, count: int, now: datetime) -> str:
+def _canary_tag(
+    selection: CanarySelection,
+    *,
+    count: int,
+    now: datetime,
+    sam3_compile: bool = False,
+) -> str:
     timestamp = now.astimezone(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return (
+    tag = (
         f"canary-e2e{count}-jea-{timestamp}-"
         f"s{selection.start_index:09d}-{selection.end_index:09d}"
     )
+    return f"{tag}-sam3compile" if sam3_compile else tag
 
 
 def build_canary_paths(
@@ -246,8 +253,14 @@ def build_canary_paths(
     *,
     count: int,
     now: datetime,
+    sam3_compile: bool = False,
 ) -> CanaryPaths:
-    tag = _canary_tag(selection, count=count, now=now)
+    tag = _canary_tag(
+        selection,
+        count=count,
+        now=now,
+        sam3_compile=sam3_compile,
+    )
     if _SAFE_TAG.fullmatch(tag) is None:
         raise ValueError("generated canary tag is not ASCII-safe")
     writable = config_module.ALLOWED_WRITABLE_ROOT.resolve(strict=False)
@@ -284,6 +297,7 @@ def _canary_config_bytes(
     *,
     source_jsonl: Path,
     paths: CanaryPaths,
+    sam3_compile: bool = False,
 ) -> bytes:
     value = dict(base)
     source = dict(value.get("source") or {})
@@ -296,12 +310,15 @@ def _canary_config_bytes(
             "allow_full_run": False,
         }
     )
+    runtime = dict(value.get("runtime") or {})
+    runtime["sam3_compile_enabled"] = sam3_compile
     value.update(
         {
             "dataset_json": str(source_jsonl),
             "run_root": str(paths.run_root),
             "export_root": str(paths.shard_export_root),
             "source": source,
+            "runtime": runtime,
         }
     )
     return yaml.safe_dump(value, sort_keys=False).encode("utf-8")
@@ -315,6 +332,7 @@ def prepare_canary_artifacts(
     clips_root: str | Path,
     source_videos_root: str | Path,
     base_config: str | Path,
+    sam3_compile: bool = False,
 ) -> None:
     source_path = _resolve_source_jsonl(source_jsonl)
     base_path = Path(base_config).expanduser().resolve(strict=True)
@@ -346,7 +364,12 @@ def prepare_canary_artifacts(
     )
     _write_immutable(
         paths.shard_config,
-        _canary_config_bytes(base, source_jsonl=source_path, paths=paths),
+        _canary_config_bytes(
+            base,
+            source_jsonl=source_path,
+            paths=paths,
+            sam3_compile=sam3_compile,
+        ),
     )
     load_config(paths.shard_config)
 
@@ -481,6 +504,17 @@ def _print_summary(summary: dict[str, object]) -> None:
         "input_clips",
         "elapsed_seconds",
         "elapsed_hms",
+        "sam3_compile_requested",
+        "sam3_compile_effective",
+        "sam3_compile_fallbacks",
+        "sam3_compile_failure_reason",
+        "sam3_predictor_startup_seconds",
+        "sam3_compile_warmup_seconds",
+        "sam3_segment_model_call_time_seconds",
+        "sam3_segment_clips",
+        "sam3_segment_entities",
+        "first_segment_clip_seconds",
+        "steady_state_segment_mean_seconds",
         "visual_samples",
         "visual_references",
         "visual_background_references",
@@ -564,6 +598,21 @@ def _stage_count(
     return value
 
 
+def _stage_metric(
+    result: dict[str, object] | None,
+    *,
+    stage: str,
+    field: str,
+    default: object,
+) -> object:
+    if not isinstance(result, dict):
+        return default
+    stage_result = result.get(stage)
+    if not isinstance(stage_result, dict):
+        return default
+    return stage_result.get(field, default)
+
+
 def _subject_attribute_metric(
     result: dict[str, object] | None,
     field: str,
@@ -597,6 +646,7 @@ def run_canary(
     pipeline_runner: PipelineRunner = run_pipeline_process,
     compactor: Compactor = compact_production_exports,
     clock: Callable[[], float] = time.monotonic,
+    sam3_compile: bool = False,
 ) -> dict[str, object]:
     selection = select_source_records(
         source_jsonl=source_jsonl,
@@ -610,6 +660,7 @@ def run_canary(
         selection,
         count=count,
         now=now or datetime.now(timezone.utc),
+        sam3_compile=sam3_compile,
     )
     prepare_canary_artifacts(
         selection=selection,
@@ -618,6 +669,7 @@ def run_canary(
         clips_root=clips_root,
         source_videos_root=source_videos_root,
         base_config=base_config,
+        sam3_compile=sam3_compile,
     )
     git_commit = _git_commit()
     _print_selection(selection=selection, paths=paths, git_commit=git_commit)
@@ -675,6 +727,72 @@ def run_canary(
         "input_clips": len(selection.records),
         "elapsed_seconds": round(elapsed_seconds, 3),
         "elapsed_hms": _elapsed_hms(elapsed_seconds),
+        "sam3_compile_requested": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_compile_requested",
+            default=sam3_compile,
+        ),
+        "sam3_compile_effective": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_compile_effective",
+            default=False,
+        ),
+        "sam3_compile_fallbacks": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_compile_fallbacks",
+            default=0,
+        ),
+        "sam3_compile_failure_reason": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_compile_failure_reason",
+            default=None,
+        ),
+        "sam3_predictor_startup_seconds": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_predictor_startup_seconds",
+            default=0.0,
+        ),
+        "sam3_compile_warmup_seconds": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_compile_warmup_seconds",
+            default=0.0,
+        ),
+        "sam3_segment_model_call_time_seconds": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_segment_model_call_time_seconds",
+            default=0.0,
+        ),
+        "sam3_segment_clips": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_segment_clips",
+            default=0,
+        ),
+        "sam3_segment_entities": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam3_segment_entities",
+            default=0,
+        ),
+        "first_segment_clip_seconds": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="first_segment_clip_seconds",
+            default=0.0,
+        ),
+        "steady_state_segment_mean_seconds": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="steady_state_segment_mean_seconds",
+            default=0.0,
+        ),
         "visual_samples": int(shard_dataset["sample_count"]),
         "visual_references": int(shard_dataset["reference_count"]),
         "visual_background_references": visual_background_references,
@@ -761,6 +879,7 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_SOURCE_VIDEOS_ROOT,
     )
     parser.add_argument("--base-config", type=Path, default=DEFAULT_BASE_CONFIG)
+    parser.add_argument("--sam3-compile", action="store_true")
     return parser
 
 
@@ -775,6 +894,7 @@ def main() -> None:
             count=args.count,
             exclude_source_names=args.exclude_source_name,
             source_video=args.source_video,
+            sam3_compile=args.sam3_compile,
         )
     except CanaryPipelineError as exc:
         raise SystemExit(exc.returncode if exc.returncode > 0 else 1) from exc

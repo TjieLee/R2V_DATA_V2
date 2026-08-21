@@ -111,7 +111,14 @@ def _merge_counts(
     values: Mapping[str, object],
 ) -> None:
     for name, value in values.items():
-        if isinstance(value, int) and not isinstance(value, bool):
+        if name in {"sam3_compile_requested", "sam3_compile_effective"}:
+            destination[name] = bool(destination.get(name, False)) or bool(value)
+        elif name == "sam3_compile_failure_reason":
+            if value is not None and destination.get(name) is None:
+                destination[name] = value
+            elif name not in destination:
+                destination[name] = None
+        elif isinstance(value, int) and not isinstance(value, bool):
             destination[name] = int(destination.get(name, 0)) + value
         elif isinstance(value, float):
             destination[name] = float(destination.get(name, 0.0)) + value
@@ -268,6 +275,24 @@ class StreamingDAGScheduler:
         finally:
             for executor in executors.values():
                 executor.shutdown(wait=True, cancel_futures=True)
+        segment_counts = stage_counts.get("segment")
+        if segment_counts is not None:
+            steady_seconds = segment_counts.get(
+                "sam3_steady_state_segment_seconds", 0.0
+            )
+            steady_clips = segment_counts.get("sam3_steady_state_segment_clips", 0)
+            if (
+                isinstance(steady_seconds, (int, float))
+                and not isinstance(steady_seconds, bool)
+                and isinstance(steady_clips, int)
+                and not isinstance(steady_clips, bool)
+                and steady_clips > 0
+            ):
+                segment_counts["steady_state_segment_mean_seconds"] = (
+                    float(steady_seconds) / steady_clips
+                )
+            else:
+                segment_counts["steady_state_segment_mean_seconds"] = 0.0
         return StreamingRuntimeResult(
             stage_counts=stage_counts,
             failed_tasks=sorted(
@@ -306,6 +331,7 @@ class StageWorkerConfig:
     timeout_seconds: int
     profile: bool
     stderr_log_path: Path
+    attribute_probe_only: bool = False
     worker_script: Path = field(
         default_factory=lambda: (
             Path(__file__).resolve().parents[2]
@@ -388,6 +414,8 @@ class PersistentStageProcess:
             command.append("--overwrite")
         if config.profile:
             command.append("--profile")
+        if config.attribute_probe_only:
+            command.append("--attribute-probe-only")
         try:
             self._process = subprocess.Popen(
                 command,
@@ -522,6 +550,7 @@ def runtime_worker_config(
         overwrite=overwrite,
         timeout_seconds=config.runtime.worker_timeout_seconds,
         profile=profile,
+        attribute_probe_only=assignment == "subject_attributes_segment",
         stderr_log_path=(
             config.resolved_run_root
             / "logs"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -90,6 +91,10 @@ class EntityTrackResult:
 
 
 class _TrackValidationError(ValueError):
+    pass
+
+
+class _Sam3CompileExecutionError(RuntimeError):
     pass
 
 
@@ -210,11 +215,29 @@ class Sam3SegmentationBackend:
         predictor: object | None = None,
         builder: Callable[..., object] | None = None,
         anchor_selector: MultiInstanceAnchorSelector | None = None,
+        compile_enabled: bool = False,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
+        if not isinstance(compile_enabled, bool):
+            raise TypeError("SAM3 compile_enabled must be a boolean")
         self.config = config
         self._predictor = predictor
         self._builder = builder
         self._anchor_selector = anchor_selector
+        self._compile_requested = compile_enabled
+        self._compile_effective = False
+        self._compile_fallbacks = 0
+        self._compile_failure_reason: str | None = None
+        self._compile_warmup_complete = False
+        self._predictor_startup_seconds = 0.0
+        self._compile_warmup_seconds = 0.0
+        self._segment_model_call_time_seconds = 0.0
+        self._segment_clips = 0
+        self._segment_entities = 0
+        self._first_segment_clip_seconds: float | None = None
+        self._steady_state_segment_seconds = 0.0
+        self._steady_state_segment_clips = 0
+        self._clock = clock
         self._anchor_counters = {
             "anchor_fast_path_hits": 0,
             "anchor_fallback_attempted": 0,
@@ -238,22 +261,91 @@ class Sam3SegmentationBackend:
     def recall_rescue_counters(self) -> dict[str, int]:
         return dict(self._recall_rescue_counters)
 
-    def _load_predictor(self) -> object:
-        if self._predictor is not None:
-            return self._predictor
-        if self.config.model_path is None:
-            raise ValueError("sam3.model_path must be configured before segment runs")
+    def performance_counters(self) -> dict[str, object]:
+        steady_mean = (
+            self._steady_state_segment_seconds / self._steady_state_segment_clips
+            if self._steady_state_segment_clips
+            else 0.0
+        )
+        return {
+            "sam3_compile_requested": self._compile_requested,
+            "sam3_compile_effective": self._compile_effective,
+            "sam3_compile_fallbacks": self._compile_fallbacks,
+            "sam3_compile_failure_reason": self._compile_failure_reason,
+            "sam3_predictor_startup_seconds": self._predictor_startup_seconds,
+            "sam3_compile_warmup_seconds": self._compile_warmup_seconds,
+            "sam3_segment_model_call_time_seconds": (
+                self._segment_model_call_time_seconds
+            ),
+            "sam3_segment_clips": self._segment_clips,
+            "sam3_segment_entities": self._segment_entities,
+            "first_segment_clip_seconds": (
+                self._first_segment_clip_seconds or 0.0
+            ),
+            "steady_state_segment_mean_seconds": steady_mean,
+            "sam3_steady_state_segment_seconds": (
+                self._steady_state_segment_seconds
+            ),
+            "sam3_steady_state_segment_clips": self._steady_state_segment_clips,
+        }
+
+    def record_segment_clip(self, *, duration_seconds: float, entities: int) -> None:
+        if (
+            not isinstance(duration_seconds, (int, float))
+            or isinstance(duration_seconds, bool)
+            or not math.isfinite(duration_seconds)
+            or duration_seconds < 0
+        ):
+            raise ValueError("SAM3 clip duration must be finite and non-negative")
+        if not isinstance(entities, int) or isinstance(entities, bool) or entities < 0:
+            raise ValueError("SAM3 clip entity count must be non-negative")
+        self._segment_clips += 1
+        self._segment_entities += entities
+        if self._first_segment_clip_seconds is None:
+            self._first_segment_clip_seconds = float(duration_seconds)
+        else:
+            self._steady_state_segment_seconds += float(duration_seconds)
+            self._steady_state_segment_clips += 1
+
+    @staticmethod
+    def _concise_compile_failure(exc: BaseException) -> str:
+        reason = f"{type(exc).__name__}:{exc}".replace("\n", " ").strip()
+        return reason[:240]
+
+    @staticmethod
+    def _shutdown_predictor(
+        predictor: object | None,
+        *,
+        suppress_errors: bool = False,
+    ) -> None:
+        shutdown = getattr(predictor, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:  # noqa: BLE001 - fallback may need to continue eager
+                if not suppress_errors:
+                    raise
+
+    def _record_compile_fallback(self, exc: BaseException) -> None:
+        if self._compile_fallbacks:
+            return
+        self._compile_fallbacks = 1
+        self._compile_effective = False
+        self._compile_failure_reason = self._concise_compile_failure(exc)
+
+    def _build_predictor(self, *, compile_enabled: bool) -> object:
+        assert self.config.model_path is not None
         model_path = self.config.model_path.expanduser().resolve()
-        if not model_path.is_file():
-            raise FileNotFoundError(
-                f"SAM3 model checkpoint does not exist: {model_path}"
-            )
         builder = self._builder
         if builder is None:
             from sam3.model_builder import build_sam3_video_predictor
 
             builder = build_sam3_video_predictor
         parameters = inspect.signature(builder).parameters
+        accepts_keywords = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
         arguments: dict[str, object] = {
             "checkpoint_path": str(model_path),
         }
@@ -264,8 +356,81 @@ class Sam3SegmentationBackend:
                 "installed SAM3 builder does not expose a device parameter; "
                 "only its verified default cuda device can be requested"
             )
-        self._predictor = builder(**arguments)
+        if compile_enabled:
+            if "compile" not in parameters and not accepts_keywords:
+                raise TypeError(
+                    "installed SAM3 builder does not expose official compile support"
+                )
+            arguments["compile"] = True
+        started = self._clock()
+        try:
+            return builder(**arguments)
+        finally:
+            self._predictor_startup_seconds += max(0.0, self._clock() - started)
+
+    def _load_predictor(self) -> object:
+        if self._predictor is not None:
+            return self._predictor
+        if self.config.model_path is None:
+            raise ValueError("sam3.model_path must be configured before segment runs")
+        model_path = self.config.model_path.expanduser().resolve()
+        if not model_path.is_file():
+            raise FileNotFoundError(
+                f"SAM3 model checkpoint does not exist: {model_path}"
+            )
+        try:
+            self._predictor = self._build_predictor(
+                compile_enabled=self._compile_requested,
+            )
+        except Exception as exc:
+            if not self._compile_requested:
+                raise
+            self._record_compile_fallback(exc)
+            self._predictor = self._build_predictor(compile_enabled=False)
         return self._predictor
+
+    def _fallback_to_eager(self, exc: BaseException) -> None:
+        self._record_compile_fallback(exc)
+        self._shutdown_predictor(self._predictor, suppress_errors=True)
+        self._predictor = None
+        self._compile_warmup_complete = False
+        self._predictor = self._build_predictor(compile_enabled=False)
+
+    def _propagation_responses(
+        self,
+        predictor: object,
+        request: dict[str, object],
+    ) -> Any:
+        compile_pending = (
+            self._compile_requested
+            and self._compile_fallbacks == 0
+            and not self._compile_warmup_complete
+        )
+        if not compile_pending:
+            yield from predictor.handle_stream_request(  # type: ignore[attr-defined]
+                request
+            )
+            return
+        started = self._clock()
+        try:
+            responses = iter(
+                predictor.handle_stream_request(request)  # type: ignore[attr-defined]
+            )
+            try:
+                first = next(responses)
+            except StopIteration:
+                first = None
+        except Exception as exc:
+            self._compile_warmup_seconds += max(0.0, self._clock() - started)
+            raise _Sam3CompileExecutionError(
+                self._concise_compile_failure(exc)
+            ) from exc
+        self._compile_warmup_seconds += max(0.0, self._clock() - started)
+        self._compile_warmup_complete = True
+        self._compile_effective = True
+        if first is not None:
+            yield first
+        yield from responses
 
     @staticmethod
     def _observations(
@@ -524,13 +689,12 @@ class Sam3SegmentationBackend:
             observations: list[BackendMaskObservation] = []
             non_owned_observations: list[BackendMaskObservation] = []
             identity_switch_detected = False
-            for response in predictor.handle_stream_request(  # type: ignore[attr-defined]
-                {
-                    "type": "propagate_in_video",
-                    "session_id": session_id,
-                    "propagation_direction": direction,
-                }
-            ):
+            request = {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": direction,
+            }
+            for response in self._propagation_responses(predictor, request):
                 slot = int(response["frame_index"])
                 if not 0 <= slot < frame_count:
                     raise ValueError(
@@ -585,7 +749,7 @@ class Sam3SegmentationBackend:
         finally:
             self._close_session(predictor, session_id)
 
-    def track(
+    def _track_once(
         self,
         *,
         frame_paths: list[Path],
@@ -711,12 +875,54 @@ class Sam3SegmentationBackend:
             group_tracks_verified=False,
         )
 
+    def track(
+        self,
+        *,
+        frame_paths: list[Path],
+        entity_id: str,
+        reference_type: str,
+        grounding_prompt: str,
+        entity_phrase: str | None = None,
+    ) -> EntityTrackResult:
+        started = self._clock()
+        startup_before = self._predictor_startup_seconds
+        anchor_before = dict(self._anchor_counters)
+        recall_before = dict(self._recall_rescue_counters)
+        try:
+            try:
+                return self._track_once(
+                    frame_paths=frame_paths,
+                    entity_id=entity_id,
+                    reference_type=reference_type,
+                    grounding_prompt=grounding_prompt,
+                    entity_phrase=entity_phrase,
+                )
+            except _Sam3CompileExecutionError as exc:
+                if not self._compile_requested or self._compile_fallbacks:
+                    raise
+                # The failed compiled attempt is not a semantic attempt. Restore
+                # diagnostics before rebuilding eager and replaying it exactly once.
+                self._anchor_counters = anchor_before
+                self._recall_rescue_counters = recall_before
+                self._fallback_to_eager(exc.__cause__ or exc)
+                return self._track_once(
+                    frame_paths=frame_paths,
+                    entity_id=entity_id,
+                    reference_type=reference_type,
+                    grounding_prompt=grounding_prompt,
+                    entity_phrase=entity_phrase,
+                )
+        finally:
+            elapsed = max(0.0, self._clock() - started)
+            startup_delta = self._predictor_startup_seconds - startup_before
+            self._segment_model_call_time_seconds += max(
+                0.0,
+                elapsed - startup_delta,
+            )
+
     def close(self) -> None:
         selector_close = getattr(self._anchor_selector, "close", None)
         if callable(selector_close):
             selector_close()
-        if self._predictor is None:
-            return
-        shutdown = getattr(self._predictor, "shutdown", None)
-        if callable(shutdown):
-            shutdown()
+        self._shutdown_predictor(self._predictor)
+        self._predictor = None

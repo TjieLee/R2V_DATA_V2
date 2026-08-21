@@ -293,6 +293,43 @@ def test_canary_artifacts_are_isolated_and_use_fixed_selection(
     assert config.export_root == paths.shard_export_root
 
 
+def test_sam3_compile_flag_changes_only_isolated_canary_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        monkeypatch,
+        groups=[("movie-a", "目录/源视频.mkv", 2)],
+    )
+    selection = select_source_records(**_selection_arguments(fixture), count=2)
+    base_before = fixture["base_config"].read_bytes()
+    base_value = yaml.safe_load(base_before)
+    paths = build_canary_paths(
+        selection,
+        count=2,
+        now=datetime(2026, 8, 20, 15, 0, 0, tzinfo=timezone.utc),
+        sam3_compile=True,
+    )
+
+    prepare_canary_artifacts(
+        selection=selection,
+        paths=paths,
+        base_config=fixture["base_config"],
+        sam3_compile=True,
+        **_selection_arguments(fixture),
+    )
+
+    assert paths.tag.endswith("-sam3compile")
+    assert fixture["base_config"].read_bytes() == base_before
+    generated = yaml.safe_load(paths.shard_config.read_text(encoding="utf-8"))
+    assert generated["runtime"]["sam3_compile_enabled"] is True
+    assert generated.get("subject_attribute_gme") == base_value.get(
+        "subject_attribute_gme"
+    )
+    assert load_config(paths.shard_config).runtime.sam3_compile_enabled is True
+
+
 def test_pipeline_failure_prevents_compaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -412,6 +449,19 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
             output="{}\n",
             result={
                 "runtime": {"failed_tasks": []},
+                "segment": {
+                    "sam3_compile_requested": True,
+                    "sam3_compile_effective": True,
+                    "sam3_compile_fallbacks": 0,
+                    "sam3_compile_failure_reason": None,
+                    "sam3_predictor_startup_seconds": 3.0,
+                    "sam3_compile_warmup_seconds": 4.0,
+                    "sam3_segment_model_call_time_seconds": 8.0,
+                    "sam3_segment_clips": 2,
+                    "sam3_segment_entities": 3,
+                    "first_segment_clip_seconds": 6.0,
+                    "steady_state_segment_mean_seconds": 2.0,
+                },
                 "remove": {
                     "candidates_generated": 3,
                     "candidates_rejected": 2,
@@ -473,6 +523,16 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
     assert summary["input_clips"] == 2
     assert summary["elapsed_seconds"] == 12.25
     assert summary["elapsed_hms"] == "00:00:12"
+    assert summary["sam3_compile_requested"] is True
+    assert summary["sam3_compile_effective"] is True
+    assert summary["sam3_compile_fallbacks"] == 0
+    assert summary["sam3_predictor_startup_seconds"] == 3.0
+    assert summary["sam3_compile_warmup_seconds"] == 4.0
+    assert summary["sam3_segment_model_call_time_seconds"] == 8.0
+    assert summary["sam3_segment_clips"] == 2
+    assert summary["sam3_segment_entities"] == 3
+    assert summary["first_segment_clip_seconds"] == 6.0
+    assert summary["steady_state_segment_mean_seconds"] == 2.0
     assert summary["visual_samples"] == 1
     assert summary["visual_references"] == 2
     assert summary["visual_background_references"] == 1

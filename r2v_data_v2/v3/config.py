@@ -250,6 +250,7 @@ class RuntimeConfig:
     qwen_max_inflight: int = 2
     cpu_workers: int = 8
     worker_timeout_seconds: int = 3600
+    sam3_compile_enabled: bool = False
     stage_workers: RuntimeStageWorkersConfig = field(
         default_factory=RuntimeStageWorkersConfig
     )
@@ -812,6 +813,8 @@ class V3Config:
                 )
         if self.runtime.mode not in {"staged_legacy", "streaming_v1"}:
             raise ValueError("runtime.mode must be staged_legacy or streaming_v1")
+        if not isinstance(self.runtime.sam3_compile_enabled, bool):
+            raise TypeError("runtime.sam3_compile_enabled must be a boolean")
         for name, value in (
             ("qwen_max_inflight", self.runtime.qwen_max_inflight),
             ("cpu_workers", self.runtime.cpu_workers),
@@ -1070,6 +1073,7 @@ class V3Config:
         value = _json_compatible(asdict(self))
         runtime = value.get("runtime")
         if isinstance(runtime, dict):
+            runtime.pop("sam3_compile_enabled", None)
             stage_workers = runtime.get("stage_workers")
             if isinstance(stage_workers, dict):
                 stage_workers.pop("subject_attributes", None)

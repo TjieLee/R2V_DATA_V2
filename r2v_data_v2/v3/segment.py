@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -64,8 +65,21 @@ class SegmentStats:
     partial_track_salvage_attempted: int = 0
     partial_track_salvage_ready: int = 0
     partial_track_salvage_insufficient: int = 0
+    sam3_compile_requested: bool = False
+    sam3_compile_effective: bool = False
+    sam3_compile_fallbacks: int = 0
+    sam3_compile_failure_reason: str | None = None
+    sam3_predictor_startup_seconds: float = 0.0
+    sam3_compile_warmup_seconds: float = 0.0
+    sam3_segment_model_call_time_seconds: float = 0.0
+    sam3_segment_clips: int = 0
+    sam3_segment_entities: int = 0
+    first_segment_clip_seconds: float = 0.0
+    steady_state_segment_mean_seconds: float = 0.0
+    sam3_steady_state_segment_seconds: float = 0.0
+    sam3_steady_state_segment_clips: int = 0
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -754,6 +768,10 @@ def _segment_clips_with_backend(
     overwrite: bool,
     backend: SegmentationBackend,
 ) -> SegmentStats:
+    performance_reader = getattr(backend, "performance_counters", None)
+    performance_before = (
+        dict(performance_reader()) if callable(performance_reader) else {}
+    )
     processed = skipped_existing = skipped_not_ready = failed = 0
     ready_count = not_found_count = entity_failed_count = 0
     partial_salvage_ready_count = partial_salvage_insufficient_count = 0
@@ -787,6 +805,7 @@ def _segment_clips_with_backend(
                 skipped_existing += 1
             continue
 
+        clip_started = time.perf_counter()
         rescue_path = _rescue_diagnostic_path(storage, clip.clip_uid)
         if rescue_enabled:
             rescue_path.unlink(missing_ok=True)
@@ -989,6 +1008,13 @@ def _segment_clips_with_backend(
                 reason=str(exc),
             )
             failed += 1
+        finally:
+            recorder = getattr(backend, "record_segment_clip", None)
+            if callable(recorder):
+                recorder(
+                    duration_seconds=max(0.0, time.perf_counter() - clip_started),
+                    entities=len(annotation.entities),
+                )
     if rescue_enabled:
         diagnostic_root = storage.root / "diagnostics" / "object_rescue"
         rebuild_jsonl(
@@ -1007,6 +1033,26 @@ def _segment_clips_with_backend(
         recall_counters.get("partial_track_salvage_insufficient", 0)
         + partial_salvage_insufficient_count
     )
+    performance_after = (
+        dict(performance_reader()) if callable(performance_reader) else {}
+    )
+
+    def numeric_delta(name: str) -> float:
+        after = performance_after.get(name, 0)
+        before = performance_before.get(name, 0)
+        if isinstance(after, (int, float)) and not isinstance(after, bool):
+            if isinstance(before, (int, float)) and not isinstance(before, bool):
+                return max(0.0, float(after) - float(before))
+        return 0.0
+
+    steady_seconds = numeric_delta("sam3_steady_state_segment_seconds")
+    steady_clips = int(numeric_delta("sam3_steady_state_segment_clips"))
+    clips_delta = int(numeric_delta("sam3_segment_clips"))
+    first_clip_seconds = 0.0
+    if int(performance_before.get("sam3_segment_clips", 0) or 0) == 0 and clips_delta:
+        value = performance_after.get("first_segment_clip_seconds", 0.0)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            first_clip_seconds = max(0.0, float(value))
     stats = SegmentStats(
         processed=processed,
         skipped_existing=skipped_existing,
@@ -1018,8 +1064,42 @@ def _segment_clips_with_backend(
         **rescue_counters,
         **anchor_counters,
         **recall_counters,
+        sam3_compile_requested=bool(
+            performance_after.get("sam3_compile_requested", False)
+        ),
+        sam3_compile_effective=bool(
+            performance_after.get("sam3_compile_effective", False)
+        ),
+        sam3_compile_fallbacks=int(numeric_delta("sam3_compile_fallbacks")),
+        sam3_compile_failure_reason=(
+            str(performance_after["sam3_compile_failure_reason"])
+            if performance_after.get("sam3_compile_failure_reason") is not None
+            else None
+        ),
+        sam3_predictor_startup_seconds=numeric_delta(
+            "sam3_predictor_startup_seconds"
+        ),
+        sam3_compile_warmup_seconds=numeric_delta("sam3_compile_warmup_seconds"),
+        sam3_segment_model_call_time_seconds=numeric_delta(
+            "sam3_segment_model_call_time_seconds"
+        ),
+        sam3_segment_clips=clips_delta,
+        sam3_segment_entities=int(numeric_delta("sam3_segment_entities")),
+        first_segment_clip_seconds=first_clip_seconds,
+        steady_state_segment_mean_seconds=(
+            steady_seconds / steady_clips if steady_clips else 0.0
+        ),
+        sam3_steady_state_segment_seconds=steady_seconds,
+        sam3_steady_state_segment_clips=steady_clips,
     )
-    storage.update_stage_counts("segment", stats.to_dict())
+    storage.update_stage_counts(
+        "segment",
+        {
+            name: value
+            for name, value in stats.to_dict().items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        },
+    )
     return stats
 
 
@@ -1064,5 +1144,10 @@ def build_sam3_segment_backend(config: V3Config) -> Sam3SegmentationBackend:
             )
         anchor_selector = QwenSam3AnchorSelector(service)
     if anchor_selector is None:
-        return Sam3SegmentationBackend(config.sam3)
-    return Sam3SegmentationBackend(config.sam3, anchor_selector=anchor_selector)
+        if not config.runtime.sam3_compile_enabled:
+            return Sam3SegmentationBackend(config.sam3)
+        return Sam3SegmentationBackend(config.sam3, compile_enabled=True)
+    arguments: dict[str, object] = {"anchor_selector": anchor_selector}
+    if config.runtime.sam3_compile_enabled:
+        arguments["compile_enabled"] = True
+    return Sam3SegmentationBackend(config.sam3, **arguments)

@@ -34,6 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--attribute-probe-only", action="store_true")
     return parser
 
 
@@ -74,10 +75,11 @@ class _StageRuntime:
 
             backend = build_sam3_segment_backend(self.config)
             self._segment_backend = backend
-            self._attribute_segmenter = Sam3AttributeFrameSegmenter(
-                self.config.sam3,
-                backend=backend,
-            )
+            if not self.config.runtime.sam3_compile_enabled:
+                self._attribute_segmenter = Sam3AttributeFrameSegmenter(
+                    self.config.sam3,
+                    backend=backend,
+                )
             self._closers.append(backend)
             return lambda scoped: segment_clips(
                 self.config,
@@ -223,8 +225,20 @@ class _StageRuntime:
         source_frame_index: int,
         grounding_prompt: str,
     ) -> list[dict[str, object]]:
-        if self.stage != "segment" or self._attribute_segmenter is None:
+        if self.stage != "segment":
             raise RuntimeError("attribute probes require the segment worker")
+        if self._attribute_segmenter is None:
+            from r2v_data_v2.v3.subject_attributes import (
+                Sam3AttributeFrameSegmenter,
+            )
+
+            # Never reuse a compile-requested temporal predictor for the
+            # frame-local sidecar. This lazy eager copy is needed only when a
+            # dedicated attribute worker was not configured.
+            self._attribute_segmenter = Sam3AttributeFrameSegmenter(
+                self.config.sam3,
+            )
+            self._closers.append(self._attribute_segmenter)
         frames = self.storage.read_frames(clip_uid)
         frame = next((item for item in frames.frames if item.slot == frame_slot), None)
         if frame is None or frame.source_frame_index != source_frame_index:
@@ -254,16 +268,33 @@ class _StageRuntime:
             raise first_error
 
 
-def _local_device_config(config: V3Config, stage: str) -> V3Config:
+def _local_device_config(
+    config: V3Config,
+    stage: str,
+    *,
+    attribute_probe_only: bool = False,
+) -> V3Config:
     if stage == "segment":
-        return replace(config, sam3=replace(config.sam3, device="cuda"))
+        runtime = config.runtime
+        if attribute_probe_only:
+            runtime = replace(runtime, sam3_compile_enabled=False)
+        return replace(
+            config,
+            sam3=replace(config.sam3, device="cuda"),
+            runtime=runtime,
+        )
     if stage == "remove":
         return replace(config, remove=replace(config.remove, device="cuda"))
     return replace(config, sam3=replace(config.sam3, device="cuda"))
 
 
 def serve(args: argparse.Namespace) -> int:
-    config = _local_device_config(load_config(args.config), args.stage)
+    attribute_probe_only = bool(getattr(args, "attribute_probe_only", False))
+    config = _local_device_config(
+        load_config(args.config),
+        args.stage,
+        attribute_probe_only=attribute_probe_only,
+    )
     storage = RunStorage(config)
     run = storage.read_run()
     profiler = V3Profiler(storage.root, git_commit=run.git_commit) if args.profile else None
@@ -307,6 +338,10 @@ def serve(args: argparse.Namespace) -> int:
                     request_type = payload.get("type")
                     if request_type not in {"run_clip", "attribute_probe"}:
                         raise ValueError("unsupported worker request type")
+                    if attribute_probe_only and request_type != "attribute_probe":
+                        raise ValueError(
+                            "dedicated attribute worker accepts only attribute probes"
+                        )
                     clip_uid = payload.get("clip_uid")
                     if not isinstance(clip_uid, str) or not clip_uid:
                         raise ValueError("worker clip_uid must be non-empty")

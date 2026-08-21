@@ -41,11 +41,12 @@ from r2v_data_v2.v3.runtime import (
     StreamingDAGScheduler,
     StreamingStage,
     streaming_model_stage_enabled,
+    runtime_worker_config,
 )
 from r2v_data_v2.v3.storage import _append_jsonl
 from r2v_data_v2.v3.subject_attributes import QwenSubjectAttributeClient
 from run_pipeline_v3 import STAGE_ORDER
-from tools.run_v3_streaming_stage_worker import _StageRuntime
+from tools.run_v3_streaming_stage_worker import _StageRuntime, _local_device_config
 
 
 def _config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> V3Config:
@@ -88,6 +89,7 @@ def test_runtime_defaults_preserve_legacy_staged_mode(
 
     assert config.runtime.mode == "staged_legacy"
     assert config.runtime.qwen_max_inflight == 2
+    assert config.runtime.sam3_compile_enabled is False
     assert config.runtime.stage_workers.segment == 1
     assert config.runtime.stage_workers.remove == 1
     assert config.runtime.stage_workers.reference_edit == 1
@@ -118,6 +120,154 @@ def test_runtime_selection_enters_config_fingerprint(
     )
 
     assert config.fingerprint() != changed.fingerprint()
+
+
+def test_sam3_compile_is_runtime_only_and_not_visual_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    changed = replace(
+        config,
+        runtime=replace(config.runtime, sam3_compile_enabled=True),
+    )
+    changed.validate()
+
+    assert config.fingerprint() == changed.fingerprint()
+    assert config.model_identifiers() == changed.model_identifiers()
+
+
+def test_sam3_compile_requires_strict_boolean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    invalid = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            sam3_compile_enabled="true",  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(TypeError, match="sam3_compile_enabled must be a boolean"):
+        invalid.validate()
+
+
+def test_dedicated_attribute_worker_forces_sam3_eager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    compiled = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            sam3_compile_enabled=True,
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                subject_attributes_segment="7",
+            ),
+        ),
+    )
+
+    main = _local_device_config(compiled, "segment")
+    attribute = _local_device_config(
+        compiled,
+        "segment",
+        attribute_probe_only=True,
+    )
+
+    assert main.runtime.sam3_compile_enabled is True
+    assert attribute.runtime.sam3_compile_enabled is False
+    config_path = tmp_path / "worker.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+    worker = runtime_worker_config(
+        compiled,
+        config_path=config_path,
+        stage="segment",
+        gpu_assignment="subject_attributes_segment",
+        overwrite=False,
+        profile=False,
+    )
+    assert worker.attribute_probe_only is True
+
+
+def test_compiled_main_worker_lazily_uses_separate_eager_attribute_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import r2v_data_v2.v3.segment as segment_module
+
+    config = _config(tmp_path, monkeypatch)
+    compiled = replace(
+        config,
+        runtime=replace(config.runtime, sam3_compile_enabled=True),
+    )
+    frame_path = tmp_path / "clip-a" / "frames" / "01.jpg"
+    frame_path.parent.mkdir(parents=True)
+    frame_path.write_bytes(b"frame")
+
+    class Backend:
+        def close(self) -> None:
+            pass
+
+    created: list[object | None] = []
+
+    class AttributeSegmenter:
+        def __init__(self, _config: object, *, backend: object | None = None) -> None:
+            created.append(backend)
+
+        def segment_frame(self, **_kwargs: object) -> tuple[np.ndarray, ...]:
+            return (np.ones((2, 2), dtype=bool),)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        segment_module,
+        "build_sam3_segment_backend",
+        lambda _config: Backend(),
+    )
+    monkeypatch.setattr(
+        subject_attributes,
+        "Sam3AttributeFrameSegmenter",
+        AttributeSegmenter,
+    )
+
+    class Storage:
+        def read_frames(self, _clip_uid: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                frames=[
+                    SimpleNamespace(
+                        slot=1,
+                        source_frame_index=9,
+                        image_path=Path("frames/01.jpg"),
+                    )
+                ]
+            )
+
+        def clip_dir(self, _clip_uid: str) -> Path:
+            return tmp_path / "clip-a"
+
+    runtime = _StageRuntime(
+        compiled,
+        Storage(),  # type: ignore[arg-type]
+        stage="segment",
+        overwrite=False,
+    )
+
+    assert created == []
+    masks = runtime.attribute_probe(
+        clip_uid="clip-a",
+        frame_slot=1,
+        source_frame_index=9,
+        grounding_prompt="hair",
+    )
+    runtime.close()
+
+    assert created == [None]
+    assert masks == [{"size": [2, 2], "counts": [0, 4]}]
 
 
 def test_sidecar_worker_count_does_not_change_visual_run_identity(
@@ -310,6 +460,7 @@ def test_runtime_yaml_loads_nested_worker_configuration(
     loaded = load_config(yaml_path)
 
     assert loaded.runtime.mode == "streaming_v1"
+    assert loaded.runtime.sam3_compile_enabled is False
     assert loaded.runtime.cpu_workers == 6
     assert loaded.runtime.stage_workers.frames == 3
     assert loaded.runtime.stage_workers.subject_attributes == 3

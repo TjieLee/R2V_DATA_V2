@@ -686,6 +686,37 @@ Do not compare the two 10-clip attribute runs as identical compute paths; model
 responses changed some downstream workload. The validated large performance
 change is TP4 -> TP1 x DP4. The GPU7 worker is retained for resource isolation.
 
+### Conservative main-SAM3 compile A/B
+
+`runtime.sam3_compile_enabled` is an opt-in runtime experiment and defaults to
+`false`. It applies only to the main temporal SAM3 worker. The dedicated
+subject-attribute SAM3 worker remains eager. The implementation uses SAM3's
+official video-predictor `compile=True` builder option; it does not wrap SAM3
+manually with `torch.compile`. Predictor construction or first compiled
+execution failure is recorded and automatically rebuilt eager without changing
+the Visual run identity.
+
+Run isolated matching 20-clip canaries:
+
+```bash
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv'
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --sam3-compile
+```
+
+Compare the two generated run roots with exact artifact checks:
+
+```bash
+.venv/bin/python tools/compare_v3_sam3_compile_runs.py \
+  --eager-run-root EAGER_RUN_ROOT \
+  --compile-run-root COMPILED_RUN_ROOT
+```
+
+The canary summary exposes compile request/effective/fallback state, startup and
+warmup timings, segment model-call time, and clip/entity counts. The comparison
+report exposes exact masks and IoU, status/reason, provenance, coverage,
+references, pairing, and retained entity sets. Do not call the runs equivalent
+unless `all_exact` is true.
+
 ## 13. Failure Signatures
 
 ### `existing run.json does not match the requested V3 run`
