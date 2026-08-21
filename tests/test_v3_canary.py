@@ -826,6 +826,10 @@ def test_print_summary_includes_completion_routing_metrics(
     summary = Summary(
         completion_selected_completed=2,
         completion_fallback_to_raw=1,
+        completion_sam_zero_mask_rejects=3,
+        completion_sam_single_mask=4,
+        completion_sam_multi_mask=5,
+        completion_sam_masks_returned_total=17,
         completion_attempts_by_type={"face": 2, "hair": 1},
         completion_accepted_by_type={"face": 1, "hair": 1},
     )
@@ -835,4 +839,8 @@ def test_print_summary_includes_completion_routing_metrics(
     output = capsys.readouterr().out
     assert "completion_selected_completed: 2" in output
     assert "completion_fallback_to_raw: 1" in output
+    assert "completion_sam_zero_mask_rejects: 3" in output
+    assert "completion_sam_single_mask: 4" in output
+    assert "completion_sam_multi_mask: 5" in output
+    assert "completion_sam_masks_returned_total: 17" in output
     assert 'completion_attempts_by_type: {"face": 2, "hair": 1}' in output

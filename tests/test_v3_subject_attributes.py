@@ -1683,6 +1683,8 @@ def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
             "completion_accepted": 1,
             "completion_raw_usable_attempts": 1,
             "completion_selected_completed": 1,
+            "completion_sam_multi_mask": 1,
+            "completion_sam_masks_returned_total": 2,
             "repaired_attribute_final_review_accepted": 1,
             "completion_attempts_by_type": {"hair": 1},
             "completion_accepted_by_type": {"hair": 1},
@@ -1720,6 +1722,8 @@ def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
     assert summary["attribute_record_count"] == 1
     assert summary["completion_attempts"] == 1
     assert summary["completion_selected_completed"] == 1
+    assert summary["completion_sam_multi_mask"] == 1
+    assert summary["completion_sam_masks_returned_total"] == 2
     assert subject_attributes._load_cached_owner_artifact(
         artifact_path,
         output_root=output_root,
@@ -2175,6 +2179,291 @@ def _completion_review(*, accepted: bool) -> BooguCompletionReview:
     )
 
 
+def _attempt_completion_with_masks(
+    tmp_path: Path,
+    masks: tuple[np.ndarray, ...],
+    *,
+    raw_alpha: np.ndarray | None = None,
+    judge_accepts: bool = True,
+    config_updates: dict[str, object] | None = None,
+) -> tuple[
+    subject_attributes.PendingAttributeCandidate | None,
+    str,
+    subject_attributes._CompletionSelectionMetrics,
+    object,
+]:
+    if raw_alpha is None:
+        raw_alpha = np.ones((64, 64), dtype=bool)
+    raw_pixels = np.full((64, 64, 4), 120, dtype=np.uint8)
+    raw_pixels[..., 3] = raw_alpha.astype(np.uint8) * 255
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="accessory",
+            phrase="attribute",
+            grounding_prompt="attribute worn by person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=raw_alpha,
+        source_image=Image.new("RGB", (64, 64), "gray"),
+        crop=Image.fromarray(raw_pixels, mode="RGBA"),
+        geometry=_geometry(),
+    )
+
+    class Backend:
+        def attribute_completion(self, *, output_path, **_kwargs):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (64, 64), (100, 120, 140)).save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Segmenter:
+        def segment_generated_frame(self, **_kwargs):
+            return masks
+
+    class Judge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            return _completion_review(accepted=judge_accepts)
+
+    judge = Judge()
+    updates = {
+        "minimum_sharpness_score": -1.0,
+        "maximum_area_growth_ratio": 10.0,
+        "maximum_bbox_area_growth_ratio": 10.0,
+    }
+    updates.update(config_updates or {})
+    config = replace(
+        SubjectAttributeCompletionConfig(enabled=True),
+        **updates,
+    )
+    metrics = subject_attributes._CompletionSelectionMetrics()
+    completed, reason, _ = subject_attributes._attempt_attribute_completion(
+        candidate,
+        clip_uid="clip-1",
+        output_root=tmp_path,
+        completion_config=config,
+        completion_backend=Backend(),
+        completion_judge=judge,
+        segmentation_backend=Segmenter(),
+        metrics=metrics,
+        raw_usable=True,
+    )
+    return completed, reason, metrics, judge
+
+
+def _rect_mask(
+    y1: int,
+    y2: int,
+    x1: int,
+    x2: int,
+) -> np.ndarray:
+    mask = np.zeros((64, 64), dtype=bool)
+    mask[y1:y2, x1:x2] = True
+    return mask
+
+
+def test_completion_zero_sam_masks_rejects_missing_entity(tmp_path: Path) -> None:
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (),
+    )
+
+    assert completed is None
+    assert reason == "completion_postcheck:missing_entity"
+    assert metrics.sam_zero_mask_rejects == 1
+    assert metrics.sam_masks_returned_total == 0
+    assert judge.calls == 0
+
+
+def test_completion_single_sam_mask_continues_normally(tmp_path: Path) -> None:
+    mask = _rect_mask(16, 48, 16, 48)
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (mask,),
+    )
+
+    assert completed is not None
+    assert reason == "completion_identity_accepted"
+    assert metrics.sam_single_mask == 1
+    assert metrics.sam_multi_mask == 0
+    assert metrics.sam_masks_returned_total == 1
+    assert judge.calls == 1
+
+
+def test_completion_disjoint_sam_masks_are_unioned(tmp_path: Path) -> None:
+    first = _rect_mask(16, 40, 8, 24)
+    second = _rect_mask(16, 40, 40, 56)
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (first, second),
+    )
+
+    assert completed is not None
+    assert reason == "completion_identity_accepted"
+    assert int((np.asarray(completed.crop)[..., 3] > 0).sum()) == int(
+        np.logical_or(first, second).sum()
+    )
+    assert metrics.sam_multi_mask == 1
+    assert metrics.sam_masks_returned_total == 2
+    assert judge.calls == 1
+
+
+def test_completion_overlapping_sam_masks_union_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    first = _rect_mask(12, 44, 12, 36)
+    second = _rect_mask(20, 52, 28, 52)
+    union = np.logical_or(first, second)
+    completed, _, metrics, _ = _attempt_completion_with_masks(
+        tmp_path,
+        (first, second),
+    )
+
+    assert completed is not None
+    assert int((np.asarray(completed.crop)[..., 3] > 0).sum()) == int(union.sum())
+    assert int(union.sum()) < int(first.sum() + second.sum())
+    assert metrics.sam_multi_mask == 1
+
+
+def test_completion_ignores_empty_masks_when_valid_mask_exists(tmp_path: Path) -> None:
+    valid = _rect_mask(16, 48, 16, 48)
+    empty = np.zeros((64, 64), dtype=np.uint8)
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (empty, valid, empty.copy()),
+    )
+
+    assert completed is not None
+    assert reason == "completion_identity_accepted"
+    assert metrics.sam_single_mask == 1
+    assert metrics.sam_masks_returned_total == 3
+    assert judge.calls == 1
+
+
+def test_completion_all_empty_sam_masks_rejects_missing_entity(tmp_path: Path) -> None:
+    empty = np.zeros((64, 64), dtype=bool)
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (empty, empty.copy()),
+    )
+
+    assert completed is None
+    assert reason == "completion_postcheck:missing_entity"
+    assert metrics.sam_zero_mask_rejects == 1
+    assert metrics.sam_masks_returned_total == 2
+    assert judge.calls == 0
+
+
+@pytest.mark.parametrize(
+    "invalid_mask",
+    [
+        np.zeros((64, 64, 1), dtype=bool),
+        np.zeros((32, 64), dtype=bool),
+        np.full((64, 64), 2, dtype=np.uint8),
+    ],
+)
+def test_completion_rejects_invalid_sam_mask_payloads(
+    tmp_path: Path,
+    invalid_mask: np.ndarray,
+) -> None:
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (invalid_mask,),
+    )
+
+    assert completed is None
+    assert reason == "completion_postcheck:invalid_sam_mask"
+    assert metrics.postcheck_rejects == 1
+    assert metrics.sam_masks_returned_total == 1
+    assert judge.calls == 0
+
+
+def test_completion_multi_mask_union_still_gets_fragmentation_gate(
+    tmp_path: Path,
+) -> None:
+    masks = (
+        _rect_mask(4, 12, 4, 12),
+        _rect_mask(28, 36, 28, 36),
+        _rect_mask(52, 60, 52, 60),
+    )
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        masks,
+    )
+
+    assert completed is None
+    assert reason == "completion_postcheck:extra_entity_contours"
+    assert metrics.sam_multi_mask == 1
+    assert judge.calls == 0
+
+
+def test_completion_multi_mask_union_still_gets_area_growth_gate(
+    tmp_path: Path,
+) -> None:
+    raw_alpha = _rect_mask(24, 40, 24, 40)
+    masks = (
+        _rect_mask(16, 32, 16, 48),
+        _rect_mask(32, 48, 16, 48),
+    )
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        masks,
+        raw_alpha=raw_alpha,
+        config_updates={"maximum_area_growth_ratio": 2.0},
+    )
+
+    assert completed is None
+    assert reason == "completion_postcheck:mask_area_growth"
+    assert metrics.sam_multi_mask == 1
+    assert judge.calls == 0
+
+
+def test_completion_multi_mask_union_still_gets_bbox_growth_gate(
+    tmp_path: Path,
+) -> None:
+    raw_alpha = _rect_mask(16, 48, 16, 48)
+    masks = (
+        _rect_mask(8, 24, 8, 24),
+        _rect_mask(40, 56, 40, 56),
+    )
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        masks,
+        raw_alpha=raw_alpha,
+        config_updates={
+            "maximum_area_growth_ratio": 10.0,
+            "maximum_bbox_area_growth_ratio": 1.5,
+        },
+    )
+
+    assert completed is None
+    assert reason == "completion_postcheck:bbox_area_growth"
+    assert metrics.sam_multi_mask == 1
+    assert judge.calls == 0
+
+
+def test_completion_multi_mask_union_still_requires_identity_review(
+    tmp_path: Path,
+) -> None:
+    first = _rect_mask(16, 48, 8, 24)
+    second = _rect_mask(16, 48, 40, 56)
+    completed, reason, metrics, judge = _attempt_completion_with_masks(
+        tmp_path,
+        (first, second),
+        judge_accepts=False,
+    )
+
+    assert completed is None
+    assert reason == "completion_qwen_review_reject"
+    assert metrics.sam_multi_mask == 1
+    assert metrics.identity_review_rejects == 1
+    assert judge.calls == 1
+
+
 @pytest.mark.parametrize("attribute_type", ["face", "upper_clothing"])
 def test_repairable_attribute_uses_boogu_then_sam3(
     tmp_path: Path,
@@ -2465,7 +2754,10 @@ def _run_completion_routing_case(
             self.calls.append([candidate.attribute_id for candidate in candidates])
             kind = raw_kind if len(self.calls) == 1 else (
                 "final_reject"
-                if completion_stage == "final_review_reject"
+                if completion_stage in {
+                    "final_review_reject",
+                    "multi_final_review_reject",
+                }
                 else "accepted_complete"
             )
             return SubjectAttributeReviewBatch(
@@ -2506,6 +2798,12 @@ def _run_completion_routing_case(
             self.generated_calls += 1
             if completion_stage == "postcheck_reject":
                 return ()
+            if completion_stage == "multi_final_review_reject":
+                first = np.zeros((100, 100), dtype=bool)
+                second = np.zeros((100, 100), dtype=bool)
+                first[30:70, 30:50] = True
+                second[30:70, 50:70] = True
+                return (first, second)
             mask = np.zeros((100, 100), dtype=bool)
             if "necklace" in kwargs["grounding_prompt"]:
                 mask[45:65, 25:75] = True
@@ -2638,6 +2936,26 @@ def test_raw_and_repaired_reviews_are_owner_batched(tmp_path: Path) -> None:
     assert review.calls == [["a1", "a2"], ["a1", "a2"]]
     assert artifact.metrics.review_calls == 2
     assert backend.calls == segmenter.generated_calls == 2
+
+
+def test_multi_mask_completion_still_requires_repaired_final_review(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+        completion_stage="multi_final_review_reject",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is True
+    assert artifact.metrics.completion_sam_multi_mask == 1
+    assert artifact.metrics.completion_final_review_rejects == 1
+    assert artifact.metrics.completion_fallback_to_raw == 1
+    assert review.calls == [["a1"], ["a1"]]
+    assert backend.calls == segmenter.generated_calls == 1
 
 
 @pytest.mark.parametrize(

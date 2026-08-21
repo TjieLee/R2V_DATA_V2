@@ -614,6 +614,10 @@ def _print_summary(summary: dict[str, object]) -> None:
         "completion_fallback_to_raw",
         "completion_backend_failures",
         "completion_postcheck_rejects",
+        "completion_sam_zero_mask_rejects",
+        "completion_sam_single_mask",
+        "completion_sam_multi_mask",
+        "completion_sam_masks_returned_total",
         "completion_identity_review_rejects",
         "completion_final_review_rejects",
         "repaired_attribute_final_review_accepted",
@@ -1123,6 +1127,22 @@ def run_canary(
         "completion_postcheck_rejects": _subject_attribute_metric(
             execution.result,
             "completion_postcheck_rejects",
+        ),
+        "completion_sam_zero_mask_rejects": _subject_attribute_metric(
+            execution.result,
+            "completion_sam_zero_mask_rejects",
+        ),
+        "completion_sam_single_mask": _subject_attribute_metric(
+            execution.result,
+            "completion_sam_single_mask",
+        ),
+        "completion_sam_multi_mask": _subject_attribute_metric(
+            execution.result,
+            "completion_sam_multi_mask",
+        ),
+        "completion_sam_masks_returned_total": _subject_attribute_metric(
+            execution.result,
+            "completion_sam_masks_returned_total",
         ),
         "completion_identity_review_rejects": _subject_attribute_metric(
             execution.result,

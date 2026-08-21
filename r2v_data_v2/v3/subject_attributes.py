@@ -342,6 +342,10 @@ class OwnerEnrichmentMetrics(_SchemaModel):
     completion_fallback_to_raw: int = Field(default=0, ge=0)
     completion_backend_failures: int = Field(default=0, ge=0)
     completion_postcheck_rejects: int = Field(default=0, ge=0)
+    completion_sam_zero_mask_rejects: int = Field(default=0, ge=0)
+    completion_sam_single_mask: int = Field(default=0, ge=0)
+    completion_sam_multi_mask: int = Field(default=0, ge=0)
+    completion_sam_masks_returned_total: int = Field(default=0, ge=0)
     completion_identity_review_rejects: int = Field(default=0, ge=0)
     completion_final_review_rejects: int = Field(default=0, ge=0)
     repaired_attribute_final_review_accepted: int = Field(default=0, ge=0)
@@ -367,6 +371,10 @@ class OwnerEnrichmentMetrics(_SchemaModel):
             + self.completion_fallback_to_raw
             + self.completion_backend_failures
             + self.completion_postcheck_rejects
+            + self.completion_sam_zero_mask_rejects
+            + self.completion_sam_single_mask
+            + self.completion_sam_multi_mask
+            + self.completion_sam_masks_returned_total
             + self.completion_identity_review_rejects
             + self.completion_final_review_rejects
             + self.repaired_attribute_final_review_accepted
@@ -410,6 +418,17 @@ class OwnerEnrichmentMetrics(_SchemaModel):
             raise ValueError("completion attempts by type must match attempts")
         if sum(self.completion_accepted_by_type.values()) != self.completion_accepted:
             raise ValueError("completion accepts by type must match accepts")
+        if (
+            self.completion_sam_zero_mask_rejects
+            + self.completion_sam_single_mask
+            + self.completion_sam_multi_mask
+            > self.completion_attempts
+        ):
+            raise ValueError("completion SAM outcomes must not exceed attempts")
+        if self.completion_sam_masks_returned_total < (
+            self.completion_sam_single_mask + 2 * self.completion_sam_multi_mask
+        ):
+            raise ValueError("completion SAM returned-mask total is inconsistent")
         for value in (
             self.qwen_model_call_time_seconds,
             self.sam3_model_call_time_seconds,
@@ -579,6 +598,10 @@ class _CompletionSelectionMetrics:
     fallback_to_raw: int = 0
     backend_failures: int = 0
     postcheck_rejects: int = 0
+    sam_zero_mask_rejects: int = 0
+    sam_single_mask: int = 0
+    sam_multi_mask: int = 0
+    sam_masks_returned_total: int = 0
     identity_review_rejects: int = 0
     final_review_rejects: int = 0
     repaired_final_review_accepted: int = 0
@@ -628,6 +651,10 @@ class EnrichmentTotals:
     completion_fallback_to_raw: int = 0
     completion_backend_failures: int = 0
     completion_postcheck_rejects: int = 0
+    completion_sam_zero_mask_rejects: int = 0
+    completion_sam_single_mask: int = 0
+    completion_sam_multi_mask: int = 0
+    completion_sam_masks_returned_total: int = 0
     completion_identity_review_rejects: int = 0
     completion_final_review_rejects: int = 0
     repaired_attribute_final_review_accepted: int = 0
@@ -684,6 +711,14 @@ class EnrichmentTotals:
         self.completion_fallback_to_raw += metrics.completion_fallback_to_raw
         self.completion_backend_failures += metrics.completion_backend_failures
         self.completion_postcheck_rejects += metrics.completion_postcheck_rejects
+        self.completion_sam_zero_mask_rejects += (
+            metrics.completion_sam_zero_mask_rejects
+        )
+        self.completion_sam_single_mask += metrics.completion_sam_single_mask
+        self.completion_sam_multi_mask += metrics.completion_sam_multi_mask
+        self.completion_sam_masks_returned_total += (
+            metrics.completion_sam_masks_returned_total
+        )
         self.completion_identity_review_rejects += (
             metrics.completion_identity_review_rejects
         )
@@ -765,6 +800,14 @@ class ClipEnrichmentResult:
             "completion_fallback_to_raw": self.totals.completion_fallback_to_raw,
             "completion_backend_failures": self.totals.completion_backend_failures,
             "completion_postcheck_rejects": self.totals.completion_postcheck_rejects,
+            "completion_sam_zero_mask_rejects": (
+                self.totals.completion_sam_zero_mask_rejects
+            ),
+            "completion_sam_single_mask": self.totals.completion_sam_single_mask,
+            "completion_sam_multi_mask": self.totals.completion_sam_multi_mask,
+            "completion_sam_masks_returned_total": (
+                self.totals.completion_sam_masks_returned_total
+            ),
             "completion_identity_review_rejects": (
                 self.totals.completion_identity_review_rejects
             ),
@@ -1701,6 +1744,38 @@ def _normalized_mask_geometry(mask: np.ndarray) -> tuple[float, float]:
     return float(binary.sum() / canvas_area), float(bbox_area / canvas_area)
 
 
+def _union_completed_attribute_masks(
+    masks: tuple[np.ndarray, ...],
+    *,
+    expected_shape: tuple[int, int],
+) -> tuple[np.ndarray | None, int]:
+    nonempty: list[np.ndarray] = []
+    for mask in masks:
+        array = np.asarray(mask)
+        if array.ndim != 2:
+            raise ValueError("completion SAM mask must be two-dimensional")
+        if array.shape != expected_shape:
+            raise ValueError("completion SAM mask dimensions do not match image")
+        if array.dtype.kind == "b":
+            binary = array.astype(bool, copy=True)
+        elif array.dtype.kind in {"i", "u", "f"}:
+            if array.dtype.kind == "f" and not np.isfinite(array).all():
+                raise ValueError("completion SAM mask must contain finite values")
+            if not np.isin(array, (0, 1)).all():
+                raise ValueError("completion SAM mask must be boolean-compatible")
+            binary = array.astype(bool, copy=True)
+        else:
+            raise ValueError("completion SAM mask must be boolean-compatible")
+        if binary.any():
+            nonempty.append(binary)
+    if not nonempty:
+        return None, 0
+    completed_mask = nonempty[0].copy()
+    for mask in nonempty[1:]:
+        np.logical_or(completed_mask, mask, out=completed_mask)
+    return completed_mask, len(nonempty)
+
+
 def _save_completion_input(path: Path, crop: Image.Image) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -1763,10 +1838,26 @@ def _attempt_attribute_completion(
             grounding_prompt=candidate.discovered.phrase,
         )
         metrics.sam3_time_seconds += time.perf_counter() - sam_started
-        if len(completed_masks) != 1:
+        metrics.sam_masks_returned_total += len(completed_masks)
+        with Image.open(output_path) as opened:
+            opened.load()
+            completed_rgb = opened.convert("RGB")
+        try:
+            completed_mask, nonempty_mask_count = _union_completed_attribute_masks(
+                completed_masks,
+                expected_shape=(completed_rgb.height, completed_rgb.width),
+            )
+        except ValueError:
             metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:extra_or_missing_entity", False
-        completed_mask = np.asarray(completed_masks[0], dtype=bool)
+            return None, "completion_postcheck:invalid_sam_mask", False
+        if completed_mask is None:
+            metrics.sam_zero_mask_rejects += 1
+            metrics.postcheck_rejects += 1
+            return None, "completion_postcheck:missing_entity", False
+        if nonempty_mask_count == 1:
+            metrics.sam_single_mask += 1
+        else:
+            metrics.sam_multi_mask += 1
         completed_rows, completed_columns = np.nonzero(completed_mask)
         completed_long_side = max(
             completed_columns.max() - completed_columns.min() + 1,
@@ -1778,9 +1869,6 @@ def _attempt_attribute_completion(
         ):
             metrics.postcheck_rejects += 1
             return None, "completion_postcheck:attribute_too_small", False
-        with Image.open(output_path) as opened:
-            opened.load()
-            completed_rgb = opened.convert("RGB")
         completed_crop, _ = build_reference_crop(
             completed_rgb,
             completed_mask,
@@ -2757,6 +2845,14 @@ def _process_owner(
             completion_postcheck_rejects=(
                 completion_metrics.postcheck_rejects
             ),
+            completion_sam_zero_mask_rejects=(
+                completion_metrics.sam_zero_mask_rejects
+            ),
+            completion_sam_single_mask=completion_metrics.sam_single_mask,
+            completion_sam_multi_mask=completion_metrics.sam_multi_mask,
+            completion_sam_masks_returned_total=(
+                completion_metrics.sam_masks_returned_total
+            ),
             completion_identity_review_rejects=(
                 completion_metrics.identity_review_rejects
             ),
@@ -3419,6 +3515,14 @@ def reconcile_subject_attribute_outputs(
         "completion_fallback_to_raw": totals.completion_fallback_to_raw,
         "completion_backend_failures": totals.completion_backend_failures,
         "completion_postcheck_rejects": totals.completion_postcheck_rejects,
+        "completion_sam_zero_mask_rejects": (
+            totals.completion_sam_zero_mask_rejects
+        ),
+        "completion_sam_single_mask": totals.completion_sam_single_mask,
+        "completion_sam_multi_mask": totals.completion_sam_multi_mask,
+        "completion_sam_masks_returned_total": (
+            totals.completion_sam_masks_returned_total
+        ),
         "completion_identity_review_rejects": (
             totals.completion_identity_review_rejects
         ),
