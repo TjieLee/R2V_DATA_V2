@@ -22,7 +22,6 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
-    field_validator,
     model_validator,
 )
 
@@ -194,23 +193,7 @@ class SubjectAttributeReviewBatch(_SchemaModel):
 
 
 class SubjectAttributeCompletionReview(BooguCompletionReview):
-    """Attribute-only completion verdict plus one SAM3 grounding prompt."""
-
-    segmentation_prompt: str = Field(min_length=1, max_length=120)
-
-    @field_validator("segmentation_prompt")
-    @classmethod
-    def validate_segmentation_prompt(cls, value: str) -> str:
-        prompt = " ".join(value.split())
-        if not prompt.isascii() or re.search(r"[A-Za-z]", prompt) is None:
-            raise ValueError("segmentation_prompt must be English")
-        if re.search(
-            r"\b(?:worn|held|carried|owned)\s+by\b|\bbelonging\s+to\b",
-            prompt,
-            flags=re.IGNORECASE,
-        ):
-            raise ValueError("segmentation_prompt must not contain owner relations")
-        return prompt
+    """Strict identity and quality verdict for an attribute completion."""
 
 
 class OwnershipGeometry(_SchemaModel):
@@ -1163,15 +1146,7 @@ preserve the same person's facial identity, orientation, and expression. For
 clothing, hair, headwear, or an accessory, preserve the same item or component,
 including its material, color, texture, shape, and structure. Judge visible
 facts only and fail closed when uncertain.
-
-Also return segmentation_prompt: a non-empty, concise English visual noun
-phrase for grounding only the target attribute in Image 2 with SAM3. Prefer a
-stable component or garment noun phrase and omit unnecessary fine-grained
-qualifiers that could reduce grounding recall. Do not include an owner relation
-such as 'worn by the man', 'held by the woman', or 'belonging to the person'.
-Return segmentation_prompt even with a reject verdict; it will be ignored when
-rejected. Return one strict JSON object matching the supplied schema and no
-other text."""
+Return one strict JSON object matching the supplied schema and no other text."""
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -1871,51 +1846,6 @@ def _masked_crop_quality_rejection(
     return None
 
 
-def _normalized_mask_geometry(mask: np.ndarray) -> tuple[float, float]:
-    binary = np.asarray(mask, dtype=bool)
-    if binary.ndim != 2 or not binary.any():
-        raise ValueError("completion mask must be non-empty and two-dimensional")
-    rows, columns = np.nonzero(binary)
-    height, width = binary.shape
-    bbox_area = (columns.max() - columns.min() + 1) * (
-        rows.max() - rows.min() + 1
-    )
-    canvas_area = height * width
-    return float(binary.sum() / canvas_area), float(bbox_area / canvas_area)
-
-
-def _union_completed_attribute_masks(
-    masks: tuple[np.ndarray, ...],
-    *,
-    expected_shape: tuple[int, int],
-) -> tuple[np.ndarray | None, int]:
-    nonempty: list[np.ndarray] = []
-    for mask in masks:
-        array = np.asarray(mask)
-        if array.ndim != 2:
-            raise ValueError("completion SAM mask must be two-dimensional")
-        if array.shape != expected_shape:
-            raise ValueError("completion SAM mask dimensions do not match image")
-        if array.dtype.kind == "b":
-            binary = array.astype(bool, copy=True)
-        elif array.dtype.kind in {"i", "u", "f"}:
-            if array.dtype.kind == "f" and not np.isfinite(array).all():
-                raise ValueError("completion SAM mask must contain finite values")
-            if not np.isin(array, (0, 1)).all():
-                raise ValueError("completion SAM mask must be boolean-compatible")
-            binary = array.astype(bool, copy=True)
-        else:
-            raise ValueError("completion SAM mask must be boolean-compatible")
-        if binary.any():
-            nonempty.append(binary)
-    if not nonempty:
-        return None, 0
-    completed_mask = nonempty[0].copy()
-    for mask in nonempty[1:]:
-        np.logical_or(completed_mask, mask, out=completed_mask)
-    return completed_mask, len(nonempty)
-
-
 def _save_completion_input(path: Path, crop: Image.Image) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -1934,7 +1864,6 @@ def _attempt_attribute_completion(
     completion_config: object,
     completion_backend: AttributeCompletionBackend,
     completion_judge: AttributeCompletionJudge,
-    segmentation_backend: AttributeFrameSegmentationBackend,
     metrics: _CompletionSelectionMetrics,
     raw_usable: bool,
 ) -> tuple[PendingAttributeCandidate | None, str, bool]:
@@ -1992,85 +1921,6 @@ def _attempt_attribute_completion(
             metrics.qwen_review_rejects += 1
             metrics.identity_review_rejects += 1
             return None, "completion_qwen_review_reject", False
-        failure_stage = "sam3_resegmentation"
-        sam_started = time.perf_counter()
-        completed_masks = segmentation_backend.segment_generated_frame(
-            frame_path=output_path,
-            grounding_prompt=review.segmentation_prompt,
-        )
-        metrics.sam3_time_seconds += time.perf_counter() - sam_started
-        metrics.sam_masks_returned_total += len(completed_masks)
-        try:
-            completed_mask, nonempty_mask_count = _union_completed_attribute_masks(
-                completed_masks,
-                expected_shape=(completed_rgb.height, completed_rgb.width),
-            )
-        except ValueError:
-            metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:invalid_sam_mask", False
-        if completed_mask is None:
-            metrics.sam_zero_mask_rejects += 1
-            metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:missing_entity", False
-        if nonempty_mask_count == 1:
-            metrics.sam_single_mask += 1
-        else:
-            metrics.sam_multi_mask += 1
-        completed_rows, completed_columns = np.nonzero(completed_mask)
-        completed_long_side = max(
-            completed_columns.max() - completed_columns.min() + 1,
-            completed_rows.max() - completed_rows.min() + 1,
-        )
-        if (
-            int(completed_mask.sum()) < MIN_ATTRIBUTE_AREA_PIXELS
-            or completed_long_side < MIN_ATTRIBUTE_LONG_SIDE_PIXELS
-        ):
-            metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:attribute_too_small", False
-        completed_crop, _ = build_reference_crop(
-            completed_rgb,
-            completed_mask,
-            crop_padding_ratio=0.0,
-        )
-        postcheck = _masked_crop_quality_rejection(
-            completed_crop,
-            config=completion_config,
-        )
-        if postcheck is not None:
-            metrics.postcheck_rejects += 1
-            return None, f"completion_postcheck:{postcheck}", False
-        components = mask_component_diagnostics(completed_mask)
-        if components.significant_component_count > int(
-            getattr(completion_config, "maximum_completed_significant_components")
-        ):
-            metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:extra_entity_contours", False
-        raw_crop_mask = np.asarray(candidate.crop.convert("RGBA"))[..., 3] > 0
-        raw_area, raw_bbox = _normalized_mask_geometry(raw_crop_mask)
-        completed_area, completed_bbox = _normalized_mask_geometry(completed_mask)
-        is_face = candidate.discovered.attribute_type == "face"
-        area_limit = float(
-            getattr(
-                completion_config,
-                "face_maximum_area_growth_ratio"
-                if is_face
-                else "maximum_area_growth_ratio",
-            )
-        )
-        bbox_limit = float(
-            getattr(
-                completion_config,
-                "face_maximum_bbox_area_growth_ratio"
-                if is_face
-                else "maximum_bbox_area_growth_ratio",
-            )
-        )
-        if completed_area / raw_area > area_limit:
-            metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:mask_area_growth", False
-        if completed_bbox / raw_bbox > bbox_limit:
-            metrics.postcheck_rejects += 1
-            return None, "completion_postcheck:bbox_area_growth", False
     except Exception as exc:  # noqa: BLE001 - route to raw fallback or rejection
         metrics.failures += 1
         if failure_stage == "backend":
@@ -2084,7 +1934,7 @@ def _attempt_attribute_completion(
             owner_candidate=candidate.owner_candidate,
             attribute_mask=candidate.attribute_mask,
             source_image=candidate.source_image,
-            crop=completed_crop,
+            crop=completed_rgb,
             geometry=candidate.geometry,
             gme_attempts=candidate.gme_attempts,
             selected_gme_attempt_index=candidate.selected_gme_attempt_index,
@@ -2391,13 +2241,24 @@ def _save_attribute_crop(
     return destination.relative_to(output_root).as_posix()
 
 
-def _validate_attribute_png(output_root: Path, relative_path: str) -> None:
+def _validate_attribute_png(
+    output_root: Path,
+    relative_path: str,
+    *,
+    final_selection: Literal["raw", "completed"] = "raw",
+) -> None:
     path = (output_root / relative_path).resolve(strict=False)
     path.relative_to(output_root.resolve(strict=False))
     with Image.open(path) as opened:
         opened.load()
-        if opened.format != "PNG" or opened.mode != "RGBA":
-            raise ValueError("accepted attribute artifact must be RGBA PNG")
+        if opened.format != "PNG":
+            raise ValueError("accepted attribute artifact must be PNG")
+        if final_selection == "completed":
+            if opened.mode != "RGB":
+                raise ValueError("completed attribute artifact must be RGB PNG")
+            return
+        if opened.mode != "RGBA":
+            raise ValueError("raw attribute artifact must be RGBA PNG")
         pixels = np.asarray(opened)
     alpha = pixels[..., 3]
     if not np.any(alpha == 255) or not np.isin(alpha, (0, 255)).all():
@@ -2433,7 +2294,15 @@ def _load_cached_owner_artifact(
         for record in artifact.records:
             if record.status == "accepted":
                 assert record.image_path is not None
-                _validate_attribute_png(output_root, record.image_path)
+                _validate_attribute_png(
+                    output_root,
+                    record.image_path,
+                    final_selection=(
+                        "completed"
+                        if record.final_selection == "completed"
+                        else "raw"
+                    ),
+                )
         return artifact
     except (OSError, ValueError):
         return None
@@ -2757,7 +2626,6 @@ def _process_owner(
                 completion_config=completion_config,
                 completion_backend=completion_backend,
                 completion_judge=completion_judge,
-                segmentation_backend=segmentation_backend,
                 metrics=completion_metrics,
                 raw_usable=review.accepted,
             )
