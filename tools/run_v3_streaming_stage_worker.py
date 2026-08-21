@@ -13,6 +13,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
 from PIL import Image
 
 from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, V3Config, load_config
