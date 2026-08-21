@@ -72,10 +72,7 @@ CLOTHING_ATTRIBUTE_TYPES = frozenset(
     {"upper_clothing", "lower_clothing", "dress_or_skirt"}
 )
 ATTRIBUTE_COMPLETION_PROMPT = (
-    "把图片中破损、缺失或不完整的区域补充完整，保持当前主体的身份、材质、"
-    "纹理、颜色和形状一致，不要引入新的实体、场景或无关内容。如果主体是人脸，"
-    "保持同一人的五官、朝向和表情特征；如果是服装、帽子、头发或配饰，保持同一件"
-    "物品或同一部分外观的款式、结构与细节。输出补全后的单一主体图像。"
+    "把图片中破损、缺失或不完整的区域补充完整。"
 )
 
 _IMAGE_PLACEHOLDER = re.compile(r"\{\{image_([1-9]\d*)\}\}")
@@ -142,6 +139,8 @@ class SubjectAttributeReview(_SchemaModel):
     recognizable: StrictBool
     characteristic_appearance_visible: StrictBool
     usable_as_attribute_condition: StrictBool
+    structure_complete: StrictBool
+    completion_recommended: StrictBool
     reason: str
 
     @property
@@ -160,6 +159,15 @@ class SubjectAttributeReview(_SchemaModel):
     def validate_reason(self) -> SubjectAttributeReview:
         if not self.reason.strip():
             raise ValueError("attribute review reason must not be empty")
+        if (
+            self.matches_attribute
+            and self.owner_binding_correct
+            and not self.structure_complete
+            and not self.completion_recommended
+        ):
+            raise ValueError(
+                "semantically correct incomplete structure must recommend completion"
+            )
         return self
 
 
@@ -263,6 +271,9 @@ class SubjectAttributeRecord(_SchemaModel):
     review: SubjectAttributeReview | None = None
     gme_attempts: list[GmeAttributeScreenAttempt] = Field(default_factory=list)
     selected_gme_attempt_index: int | None = Field(default=None, ge=0)
+    final_selection: Literal["raw", "completed"] | None = None
+    completion_attempted: bool = False
+    completion_outcome: str | None = None
     reason: str
 
     @model_validator(mode="after")
@@ -300,7 +311,7 @@ class SubjectAttributeRecord(_SchemaModel):
 
 class OwnerEnrichmentMetrics(_SchemaModel):
     discovery_calls: int = Field(default=0, ge=0, le=1)
-    review_calls: int = Field(default=0, ge=0, le=1)
+    review_calls: int = Field(default=0, ge=0, le=2)
     sam3_attempts: int = Field(default=0, ge=0, le=MAX_ATTRIBUTES_PER_OWNER)
     discovered_by_type: dict[str, int] = Field(default_factory=dict)
     deterministic_ownership_rejects: int = Field(default=0, ge=0)
@@ -322,6 +333,19 @@ class OwnerEnrichmentMetrics(_SchemaModel):
     completion_rejected: int = Field(default=0, ge=0)
     completion_failures: int = Field(default=0, ge=0)
     completion_qwen_review_rejects: int = Field(default=0, ge=0)
+    raw_attribute_review_accepted: int = Field(default=0, ge=0)
+    raw_attribute_review_repair_recommended: int = Field(default=0, ge=0)
+    raw_attribute_review_hard_rejected: int = Field(default=0, ge=0)
+    completion_raw_usable_attempts: int = Field(default=0, ge=0)
+    completion_raw_unusable_attempts: int = Field(default=0, ge=0)
+    completion_selected_completed: int = Field(default=0, ge=0)
+    completion_fallback_to_raw: int = Field(default=0, ge=0)
+    completion_backend_failures: int = Field(default=0, ge=0)
+    completion_postcheck_rejects: int = Field(default=0, ge=0)
+    completion_identity_review_rejects: int = Field(default=0, ge=0)
+    completion_final_review_rejects: int = Field(default=0, ge=0)
+    repaired_attribute_final_review_accepted: int = Field(default=0, ge=0)
+    repaired_attribute_final_review_rejected: int = Field(default=0, ge=0)
     completion_review_calls: int = Field(default=0, ge=0)
     completion_model_call_time_seconds: float = Field(default=0.0, ge=0)
     completion_attempts_by_type: dict[str, int] = Field(default_factory=dict)
@@ -336,16 +360,56 @@ class OwnerEnrichmentMetrics(_SchemaModel):
             raise ValueError("GME screened count must equal passed plus rejected")
         if self.gme_calls != self.gme_candidates_screened + self.gme_failures:
             raise ValueError("GME calls must equal screened plus failures")
-        if self.completion_attempts != (
-            self.completion_accepted
-            + self.completion_rejected
-            + self.completion_failures
-        ):
-            raise ValueError(
-                "completion attempts must equal accepted plus rejected plus failures"
-            )
-        if self.completion_qwen_review_rejects > self.completion_rejected:
-            raise ValueError("completion Qwen rejects must be completion rejects")
+        routing_metric_total = (
+            self.completion_raw_usable_attempts
+            + self.completion_raw_unusable_attempts
+            + self.completion_selected_completed
+            + self.completion_fallback_to_raw
+            + self.completion_backend_failures
+            + self.completion_postcheck_rejects
+            + self.completion_identity_review_rejects
+            + self.completion_final_review_rejects
+            + self.repaired_attribute_final_review_accepted
+            + self.repaired_attribute_final_review_rejected
+        )
+        if self.completion_attempts > 0 and routing_metric_total == 0:
+            if self.completion_attempts != (
+                self.completion_accepted
+                + self.completion_rejected
+                + self.completion_failures
+            ):
+                raise ValueError("legacy completion counters are inconsistent")
+        else:
+            if self.completion_attempts != (
+                self.completion_raw_usable_attempts
+                + self.completion_raw_unusable_attempts
+            ):
+                raise ValueError(
+                    "completion attempts must equal raw usable plus raw unusable attempts"
+                )
+            if self.completion_attempts != (
+                self.completion_selected_completed
+                + self.completion_fallback_to_raw
+                + self.completion_rejected
+            ):
+                raise ValueError(
+                    "each completion attempt must have one final selection"
+                )
+            if self.completion_accepted != self.completion_selected_completed:
+                raise ValueError("completion accepted must equal selected completed")
+            if (
+                self.completion_qwen_review_rejects
+                != self.completion_identity_review_rejects
+            ):
+                raise ValueError("completion Qwen reject counters must match")
+            if self.repaired_attribute_final_review_accepted != (
+                self.completion_selected_completed
+            ):
+                raise ValueError("repaired final accepts must equal selected completed")
+        if sum(self.completion_attempts_by_type.values()) != self.completion_attempts:
+            raise ValueError("completion attempts by type must match attempts")
+        if sum(self.completion_accepted_by_type.values()) != self.completion_accepted:
+            raise ValueError("completion accepts by type must match accepts")
         for value in (
             self.qwen_model_call_time_seconds,
             self.sam3_model_call_time_seconds,
@@ -506,6 +570,19 @@ class _CompletionSelectionMetrics:
     rejected: int = 0
     failures: int = 0
     qwen_review_rejects: int = 0
+    raw_review_accepted: int = 0
+    raw_review_repair_recommended: int = 0
+    raw_review_hard_rejected: int = 0
+    raw_usable_attempts: int = 0
+    raw_unusable_attempts: int = 0
+    selected_completed: int = 0
+    fallback_to_raw: int = 0
+    backend_failures: int = 0
+    postcheck_rejects: int = 0
+    identity_review_rejects: int = 0
+    final_review_rejects: int = 0
+    repaired_final_review_accepted: int = 0
+    repaired_final_review_rejected: int = 0
     review_calls: int = 0
     model_call_time_seconds: float = 0.0
     review_time_seconds: float = 0.0
@@ -542,6 +619,19 @@ class EnrichmentTotals:
     completion_rejected: int = 0
     completion_failures: int = 0
     completion_qwen_review_rejects: int = 0
+    raw_attribute_review_accepted: int = 0
+    raw_attribute_review_repair_recommended: int = 0
+    raw_attribute_review_hard_rejected: int = 0
+    completion_raw_usable_attempts: int = 0
+    completion_raw_unusable_attempts: int = 0
+    completion_selected_completed: int = 0
+    completion_fallback_to_raw: int = 0
+    completion_backend_failures: int = 0
+    completion_postcheck_rejects: int = 0
+    completion_identity_review_rejects: int = 0
+    completion_final_review_rejects: int = 0
+    repaired_attribute_final_review_accepted: int = 0
+    repaired_attribute_final_review_rejected: int = 0
     completion_review_calls: int = 0
     completion_model_call_time_seconds: float = 0.0
     completion_attempts_by_type: Counter[str] = field(default_factory=Counter)
@@ -576,6 +666,35 @@ class EnrichmentTotals:
         self.completion_failures += metrics.completion_failures
         self.completion_qwen_review_rejects += (
             metrics.completion_qwen_review_rejects
+        )
+        self.raw_attribute_review_accepted += metrics.raw_attribute_review_accepted
+        self.raw_attribute_review_repair_recommended += (
+            metrics.raw_attribute_review_repair_recommended
+        )
+        self.raw_attribute_review_hard_rejected += (
+            metrics.raw_attribute_review_hard_rejected
+        )
+        self.completion_raw_usable_attempts += (
+            metrics.completion_raw_usable_attempts
+        )
+        self.completion_raw_unusable_attempts += (
+            metrics.completion_raw_unusable_attempts
+        )
+        self.completion_selected_completed += metrics.completion_selected_completed
+        self.completion_fallback_to_raw += metrics.completion_fallback_to_raw
+        self.completion_backend_failures += metrics.completion_backend_failures
+        self.completion_postcheck_rejects += metrics.completion_postcheck_rejects
+        self.completion_identity_review_rejects += (
+            metrics.completion_identity_review_rejects
+        )
+        self.completion_final_review_rejects += (
+            metrics.completion_final_review_rejects
+        )
+        self.repaired_attribute_final_review_accepted += (
+            metrics.repaired_attribute_final_review_accepted
+        )
+        self.repaired_attribute_final_review_rejected += (
+            metrics.repaired_attribute_final_review_rejected
         )
         self.completion_review_calls += metrics.completion_review_calls
         self.completion_model_call_time_seconds += (
@@ -624,6 +743,39 @@ class ClipEnrichmentResult:
             "completion_failures": self.totals.completion_failures,
             "completion_qwen_review_rejects": (
                 self.totals.completion_qwen_review_rejects
+            ),
+            "raw_attribute_review_accepted": (
+                self.totals.raw_attribute_review_accepted
+            ),
+            "raw_attribute_review_repair_recommended": (
+                self.totals.raw_attribute_review_repair_recommended
+            ),
+            "raw_attribute_review_hard_rejected": (
+                self.totals.raw_attribute_review_hard_rejected
+            ),
+            "completion_raw_usable_attempts": (
+                self.totals.completion_raw_usable_attempts
+            ),
+            "completion_raw_unusable_attempts": (
+                self.totals.completion_raw_unusable_attempts
+            ),
+            "completion_selected_completed": (
+                self.totals.completion_selected_completed
+            ),
+            "completion_fallback_to_raw": self.totals.completion_fallback_to_raw,
+            "completion_backend_failures": self.totals.completion_backend_failures,
+            "completion_postcheck_rejects": self.totals.completion_postcheck_rejects,
+            "completion_identity_review_rejects": (
+                self.totals.completion_identity_review_rejects
+            ),
+            "completion_final_review_rejects": (
+                self.totals.completion_final_review_rejects
+            ),
+            "repaired_attribute_final_review_accepted": (
+                self.totals.repaired_attribute_final_review_accepted
+            ),
+            "repaired_attribute_final_review_rejected": (
+                self.totals.repaired_attribute_final_review_rejected
             ),
             "completion_model_call_time_seconds": (
                 self.totals.completion_model_call_time_seconds
@@ -889,17 +1041,30 @@ recognizable only because owner context or text identifies it. Do not require
 whole-object completeness. A partial face, hair, or clothing region is
 acceptable when the isolated crop still preserves clear component-level
 structure and characteristic appearance.
+A crop may still be recognizable and usable while being structurally
+incomplete. Judge structural completeness independently from the five existing
+usability booleans. structure_complete=true only when the target attribute
+region has no obvious large broken, missing, cut-out, erased, or structurally
+discontinuous area that should reasonably be reconstructed.
+completion_recommended=true when filling a visible missing or broken area would
+likely produce a materially better reference. If the semantic target and owner
+are correct and a clearly missing or broken region exists, set
+structure_complete=false and completion_recommended=true even when
+usable_as_attribute_condition=true. Do not use structural incompleteness to
+rescue a wrong target attribute or wrong-owner crop.
 Return one JSON object whose top level contains exactly owner_entity_id and
 reviews. reviews must be a JSON array preserving the supplied attribute order.
 Every review array item must contain exactly attribute_id,
 matches_attribute, owner_binding_correct, recognizable,
-characteristic_appearance_visible, usable_as_attribute_condition, and one
-concise reason. Copy each supplied attribute_id into its review item. Do not
+characteristic_appearance_visible, usable_as_attribute_condition,
+structure_complete, completion_recommended, and one concise reason. Copy each
+supplied attribute_id into its review item. Do not
 return an object keyed by a1, a2, a3, or any other attribute_id. The required
 shape is {"owner_entity_id":"e1","reviews":[{"attribute_id":"a1",
 "matches_attribute":true,"owner_binding_correct":true,"recognizable":true,
 "characteristic_appearance_visible":true,
-"usable_as_attribute_condition":true,"reason":"..."}]}. Return JSON only."""
+"usable_as_attribute_condition":true,"structure_complete":true,
+"completion_recommended":false,"reason":"..."}]}. Return JSON only."""
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -1422,6 +1587,8 @@ def _rejected_record(
     review: SubjectAttributeReview | None = None,
     gme_attempts: tuple[GmeAttributeScreenAttempt, ...] = (),
     selected_gme_attempt_index: int | None = None,
+    completion_attempted: bool = False,
+    completion_outcome: str | None = None,
 ) -> SubjectAttributeRecord:
     return SubjectAttributeRecord(
         attribute_id=attribute_id,
@@ -1440,7 +1607,55 @@ def _rejected_record(
         review=review,
         gme_attempts=list(gme_attempts),
         selected_gme_attempt_index=selected_gme_attempt_index,
+        completion_attempted=completion_attempted,
+        completion_outcome=completion_outcome,
         reason=reason,
+    )
+
+
+def _accepted_record(
+    candidate: PendingAttributeCandidate,
+    *,
+    output_root: Path,
+    sample_id: str,
+    owner_reference: EntityReferenceState,
+    review: SubjectAttributeReview,
+    final_selection: Literal["raw", "completed"],
+    completion_attempted: bool,
+    completion_outcome: str,
+) -> SubjectAttributeRecord:
+    relative_path = _save_attribute_crop(
+        output_root,
+        sample_id=sample_id,
+        attribute_id=candidate.attribute_id,
+        crop=candidate.crop,
+    )
+    same_frame = (
+        owner_reference.source_clip_uid in {None, sample_id}
+        and candidate.owner_candidate.source_frame_index
+        == owner_reference.source_frame_index
+    )
+    return SubjectAttributeRecord(
+        attribute_id=candidate.attribute_id,
+        owner_entity_id=candidate.owner_entity_id,
+        attribute_type=candidate.discovered.attribute_type,
+        phrase=candidate.discovered.phrase,
+        grounding_prompt=candidate.discovered.grounding_prompt,
+        status="accepted",
+        image_path=relative_path,
+        source_frame_index=candidate.owner_candidate.source_frame_index,
+        source_frame_slot=candidate.owner_candidate.frame_slot,
+        owner_candidate_id=candidate.owner_candidate.candidate_id,
+        same_frame_as_owner_reference=same_frame,
+        sam3_prompt=candidate.discovered.grounding_prompt,
+        ownership_geometry=candidate.geometry,
+        review=review,
+        gme_attempts=list(candidate.gme_attempts),
+        selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+        final_selection=final_selection,
+        completion_attempted=completion_attempted,
+        completion_outcome=completion_outcome,
+        reason="accepted",
     )
 
 
@@ -1453,9 +1668,6 @@ def _masked_crop_quality_rejection(
     mask = rgba[..., 3] > 0
     if not mask.any():
         return "empty_mask"
-    coverage = float(mask.mean())
-    if coverage < float(getattr(config, "minimum_alpha_coverage")):
-        return "blank_area_too_large"
     rgb = rgba[..., :3]
     luminance = (
         0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
@@ -1509,23 +1721,14 @@ def _attempt_attribute_completion(
     completion_judge: BooguReferenceEditJudge,
     segmentation_backend: AttributeFrameSegmentationBackend,
     metrics: _CompletionSelectionMetrics,
+    raw_usable: bool,
 ) -> tuple[PendingAttributeCandidate | None, str, bool]:
-    precheck = _masked_crop_quality_rejection(
-        candidate.crop,
-        config=completion_config,
-    )
-    if precheck is not None:
-        return None, f"completion_precheck:{precheck}", False
-    alpha_coverage = float(
-        (np.asarray(candidate.crop.convert("RGBA"))[..., 3] > 0).mean()
-    )
-    if alpha_coverage > float(
-        getattr(completion_config, "maximum_alpha_coverage_without_completion")
-    ):
-        return candidate, "completion_not_needed", False
-
     metrics.attempts += 1
     metrics.attempts_by_type[candidate.discovered.attribute_type] += 1
+    if raw_usable:
+        metrics.raw_usable_attempts += 1
+    else:
+        metrics.raw_unusable_attempts += 1
     candidate_root = (
         output_root
         / "completion_candidates"
@@ -1538,6 +1741,7 @@ def _attempt_attribute_completion(
     output_path = candidate_root / "generated" / "candidate.png"
     _save_completion_input(source_path, candidate.crop)
     started = time.perf_counter()
+    failure_stage = "backend"
     try:
         completion = completion_backend.attribute_completion(
             source_path=source_path,
@@ -1552,6 +1756,7 @@ def _attempt_attribute_completion(
         ):
             raise ValueError("completion model-call time is invalid")
         metrics.model_call_time_seconds += max(0.0, float(reported_seconds))
+        failure_stage = "sam3_resegmentation"
         sam_started = time.perf_counter()
         completed_masks = segmentation_backend.segment_generated_frame(
             frame_path=output_path,
@@ -1559,7 +1764,7 @@ def _attempt_attribute_completion(
         )
         metrics.sam3_time_seconds += time.perf_counter() - sam_started
         if len(completed_masks) != 1:
-            metrics.rejected += 1
+            metrics.postcheck_rejects += 1
             return None, "completion_postcheck:extra_or_missing_entity", False
         completed_mask = np.asarray(completed_masks[0], dtype=bool)
         completed_rows, completed_columns = np.nonzero(completed_mask)
@@ -1571,7 +1776,7 @@ def _attempt_attribute_completion(
             int(completed_mask.sum()) < MIN_ATTRIBUTE_AREA_PIXELS
             or completed_long_side < MIN_ATTRIBUTE_LONG_SIDE_PIXELS
         ):
-            metrics.rejected += 1
+            metrics.postcheck_rejects += 1
             return None, "completion_postcheck:attribute_too_small", False
         with Image.open(output_path) as opened:
             opened.load()
@@ -1586,13 +1791,13 @@ def _attempt_attribute_completion(
             config=completion_config,
         )
         if postcheck is not None:
-            metrics.rejected += 1
+            metrics.postcheck_rejects += 1
             return None, f"completion_postcheck:{postcheck}", False
         components = mask_component_diagnostics(completed_mask)
         if components.significant_component_count > int(
             getattr(completion_config, "maximum_completed_significant_components")
         ):
-            metrics.rejected += 1
+            metrics.postcheck_rejects += 1
             return None, "completion_postcheck:extra_entity_contours", False
         raw_crop_mask = np.asarray(candidate.crop.convert("RGBA"))[..., 3] > 0
         raw_area, raw_bbox = _normalized_mask_geometry(raw_crop_mask)
@@ -1615,11 +1820,12 @@ def _attempt_attribute_completion(
             )
         )
         if completed_area / raw_area > area_limit:
-            metrics.rejected += 1
+            metrics.postcheck_rejects += 1
             return None, "completion_postcheck:mask_area_growth", False
         if completed_bbox / raw_bbox > bbox_limit:
-            metrics.rejected += 1
+            metrics.postcheck_rejects += 1
             return None, "completion_postcheck:bbox_area_growth", False
+        failure_stage = "identity_review"
         review_started = time.perf_counter()
         metrics.review_calls += 1
         review = completion_judge.review(
@@ -1633,14 +1839,14 @@ def _attempt_attribute_completion(
         review_seconds = time.perf_counter() - review_started
         metrics.review_time_seconds += review_seconds
         if not isinstance(review, BooguCompletionReview) or review.verdict != "accept":
-            metrics.rejected += 1
             metrics.qwen_review_rejects += 1
+            metrics.identity_review_rejects += 1
             return None, "completion_qwen_review_reject", False
-    except Exception as exc:  # noqa: BLE001 - fail closed and try next frame
+    except Exception as exc:  # noqa: BLE001 - route to raw fallback or rejection
         metrics.failures += 1
+        if failure_stage == "backend":
+            metrics.backend_failures += 1
         return None, f"completion_failed:{type(exc).__name__}:{exc}", True
-    metrics.accepted += 1
-    metrics.accepted_by_type[candidate.discovered.attribute_type] += 1
     return (
         PendingAttributeCandidate(
             discovered=candidate.discovered,
@@ -1657,7 +1863,7 @@ def _attempt_attribute_completion(
             completion_model_call_time_seconds=max(0.0, float(reported_seconds)),
             completion_review_time_seconds=review_seconds,
         ),
-        "completion_accepted",
+        "completion_identity_accepted",
         False,
     )
 
@@ -1677,11 +1883,7 @@ def _select_attribute_candidate(
     segmentation_backend: AttributeFrameSegmentationBackend,
     gme_screener: AttributeGmeScreener | None = None,
     gme_metrics: _GmeSelectionMetrics | None = None,
-    output_root: Path | None = None,
     completion_config: object | None = None,
-    completion_backend: AttributeCompletionBackend | None = None,
-    completion_judge: BooguReferenceEditJudge | None = None,
-    completion_metrics: _CompletionSelectionMetrics | None = None,
 ) -> PendingAttributeCandidate | SubjectAttributeRecord:
     owner_reference_is_local = owner_reference.source_clip_uid in {None, clip_uid}
     ordered = prefer_attribute_candidate_frames(
@@ -1699,8 +1901,7 @@ def _select_attribute_candidate(
     ] = []
     gme_attempts: list[GmeAttributeScreenAttempt] = []
     active_gme_metrics = gme_metrics or _GmeSelectionMetrics()
-    active_completion_metrics = completion_metrics or _CompletionSelectionMetrics()
-    completion_rejections: list[
+    raw_quality_rejections: list[
         tuple[EntityReferenceCandidate, OwnershipGeometry, str]
     ] = []
     for owner_candidate_index, owner_candidate in enumerate(ordered):
@@ -1773,6 +1974,19 @@ def _select_attribute_candidate(
                 attribute_mask,
                 crop_padding_ratio=crop_padding_ratio,
             )
+            if bool(
+                completion_config is not None
+                and getattr(completion_config, "enabled", False)
+            ):
+                raw_rejection = _masked_crop_quality_rejection(
+                    crop,
+                    config=completion_config,
+                )
+                if raw_rejection is not None:
+                    raw_quality_rejections.append(
+                        (owner_candidate, geometry, raw_rejection)
+                    )
+                    continue
             selected_gme_attempt_index: int | None = None
             if gme_screener is not None:
                 active_gme_metrics.calls += 1
@@ -1864,37 +2078,6 @@ def _select_attribute_candidate(
                 gme_attempts=tuple(gme_attempts),
                 selected_gme_attempt_index=selected_gme_attempt_index,
             )
-            completion_enabled = bool(
-                completion_config is not None
-                and getattr(completion_config, "enabled", False)
-                and discovered.attribute_type
-                in getattr(completion_config, "eligible_types", ())
-            )
-            if completion_enabled:
-                if (
-                    output_root is None
-                    or completion_backend is None
-                    or completion_judge is None
-                ):
-                    raise ValueError(
-                        "enabled attribute completion requires backend and judge"
-                    )
-                completed, completion_reason, _ = _attempt_attribute_completion(
-                    pending,
-                    clip_uid=clip_uid,
-                    output_root=output_root,
-                    completion_config=completion_config,
-                    completion_backend=completion_backend,
-                    completion_judge=completion_judge,
-                    segmentation_backend=segmentation_backend,
-                    metrics=active_completion_metrics,
-                )
-                if completed is None:
-                    completion_rejections.append(
-                        (owner_candidate, geometry, completion_reason)
-                    )
-                    continue
-                pending = completed
             return pending
         if gme_rejected_on_frame and owner_candidate_index + 1 < len(ordered):
             active_gme_metrics.retried_next_frame += 1
@@ -1933,13 +2116,13 @@ def _select_attribute_candidate(
                 == owner_reference.source_frame_index
             ),
         )
-    if completion_rejections:
-        owner_candidate, geometry, reason = completion_rejections[0]
+    if raw_quality_rejections:
+        owner_candidate, geometry, reason = raw_quality_rejections[0]
         return _rejected_record(
             discovered,
             attribute_id=attribute_id,
             owner_entity_id=owner.entity_id,
-            reason=reason,
+            reason=f"completion_precheck:{reason}",
             geometry=geometry,
             source_frame_index=owner_candidate.source_frame_index,
             source_frame_slot=owner_candidate.frame_slot,
@@ -2142,8 +2325,6 @@ def _process_owner(
         attribute_id = f"a{attribute_id_start + offset}"
         sam_started = time.perf_counter()
         gme_seconds_before = gme_metrics.model_call_time_seconds
-        completion_model_before = completion_metrics.model_call_time_seconds
-        completion_review_before = completion_metrics.review_time_seconds
         try:
             selected = _select_attribute_candidate(
                 discovered=discovered,
@@ -2159,11 +2340,7 @@ def _process_owner(
                 segmentation_backend=segmentation_backend,
                 gme_screener=gme_screener,
                 gme_metrics=gme_metrics,
-                output_root=output_root,
                 completion_config=completion_config,
-                completion_backend=completion_backend,
-                completion_judge=completion_judge,
-                completion_metrics=completion_metrics,
             )
         except Exception as exc:  # noqa: BLE001 - isolate one attribute
             processing_failures += 1
@@ -2177,13 +2354,9 @@ def _process_owner(
         gme_seconds = (
             gme_metrics.model_call_time_seconds - gme_seconds_before
         )
-        completion_external_seconds = (
-            completion_metrics.model_call_time_seconds - completion_model_before
-            + completion_metrics.review_time_seconds - completion_review_before
-        )
         sam_seconds += max(
             0.0,
-            selection_seconds - gme_seconds - completion_external_seconds,
+            selection_seconds - gme_seconds,
         )
         if isinstance(selected, SubjectAttributeRecord):
             records_by_id[attribute_id] = selected
@@ -2220,20 +2393,28 @@ def _process_owner(
         pending = retained_pending
 
     review_calls = 0
+    review_failures = 0
     review_failure: str | None = None
-    reviews: dict[str, SubjectAttributeReview] = {}
+    raw_reviews: dict[str, SubjectAttributeReview] = {}
     if pending:
         review_calls = 1
         review_started = time.perf_counter()
         try:
             batch = review_client.review(owner=owner, candidates=pending)
-            reviews = {review.attribute_id: review for review in batch.reviews}
+            raw_reviews = {
+                review.attribute_id: review for review in batch.reviews
+            }
         except Exception as exc:  # noqa: BLE001 - fail closed for this owner batch
             review_failure = f"review_failed:{type(exc).__name__}:{exc}"
+            review_failures += 1
         qwen_seconds += time.perf_counter() - review_started
 
+    repaired_pending: list[PendingAttributeCandidate] = []
+    raw_by_attribute_id = {
+        candidate.attribute_id: candidate for candidate in pending
+    }
     for candidate in pending:
-        review = reviews.get(candidate.attribute_id)
+        review = raw_reviews.get(candidate.attribute_id)
         same_frame = (
             owner_reference.source_clip_uid in {None, clip.clip_uid}
             and candidate.owner_candidate.source_frame_index
@@ -2256,7 +2437,28 @@ def _process_owner(
                 ),
             )
             continue
-        if not review.accepted:
+        if review.accepted:
+            completion_metrics.raw_review_accepted += 1
+        repair_recommended = bool(
+            review.matches_attribute
+            and review.owner_binding_correct
+            and not review.structure_complete
+            and review.completion_recommended
+        )
+        if repair_recommended:
+            completion_metrics.raw_review_repair_recommended += 1
+        elif not review.accepted:
+            completion_metrics.raw_review_hard_rejected += 1
+
+        semantic_owner_correct = bool(
+            review.matches_attribute and review.owner_binding_correct
+        )
+        completion_eligible = bool(
+            completion_config.enabled
+            and candidate.discovered.attribute_type
+            in completion_config.eligible_types
+        )
+        if not semantic_owner_correct:
             records_by_id[candidate.attribute_id] = _rejected_record(
                 candidate.discovered,
                 attribute_id=candidate.attribute_id,
@@ -2274,31 +2476,190 @@ def _process_owner(
                 ),
             )
             continue
-        relative_path = _save_attribute_crop(
-            output_root,
-            sample_id=clip.clip_uid,
-            attribute_id=candidate.attribute_id,
-            crop=candidate.crop,
+        if not completion_eligible or not repair_recommended:
+            if review.accepted:
+                records_by_id[candidate.attribute_id] = _accepted_record(
+                    candidate,
+                    output_root=output_root,
+                    sample_id=clip.clip_uid,
+                    owner_reference=owner_reference,
+                    review=review,
+                    final_selection="raw",
+                    completion_attempted=False,
+                    completion_outcome="not_attempted",
+                )
+            else:
+                records_by_id[candidate.attribute_id] = _rejected_record(
+                    candidate.discovered,
+                    attribute_id=candidate.attribute_id,
+                    owner_entity_id=owner.entity_id,
+                    reason=f"recognizability:{review.reason}",
+                    geometry=candidate.geometry,
+                    source_frame_index=candidate.owner_candidate.source_frame_index,
+                    source_frame_slot=candidate.owner_candidate.frame_slot,
+                    owner_candidate_id=candidate.owner_candidate.candidate_id,
+                    same_frame=same_frame,
+                    review=review,
+                    gme_attempts=candidate.gme_attempts,
+                    selected_gme_attempt_index=(
+                        candidate.selected_gme_attempt_index
+                    ),
+                )
+            continue
+
+        if completion_backend is None or completion_judge is None:
+            completed = None
+            completion_reason = "completion_failed:backend_not_configured"
+            completion_metrics.attempts += 1
+            completion_metrics.attempts_by_type[
+                candidate.discovered.attribute_type
+            ] += 1
+            if review.accepted:
+                completion_metrics.raw_usable_attempts += 1
+            else:
+                completion_metrics.raw_unusable_attempts += 1
+            completion_metrics.failures += 1
+            completion_metrics.backend_failures += 1
+        else:
+            completed, completion_reason, _ = _attempt_attribute_completion(
+                candidate,
+                clip_uid=clip.clip_uid,
+                output_root=output_root,
+                completion_config=completion_config,
+                completion_backend=completion_backend,
+                completion_judge=completion_judge,
+                segmentation_backend=segmentation_backend,
+                metrics=completion_metrics,
+                raw_usable=review.accepted,
+            )
+        if completed is not None:
+            repaired_pending.append(completed)
+            continue
+        if review.accepted:
+            completion_metrics.fallback_to_raw += 1
+            records_by_id[candidate.attribute_id] = _accepted_record(
+                candidate,
+                output_root=output_root,
+                sample_id=clip.clip_uid,
+                owner_reference=owner_reference,
+                review=review,
+                final_selection="raw",
+                completion_attempted=True,
+                completion_outcome=completion_reason,
+            )
+        else:
+            completion_metrics.rejected += 1
+            records_by_id[candidate.attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=candidate.attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=completion_reason,
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=same_frame,
+                review=review,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+                completion_attempted=True,
+                completion_outcome=completion_reason,
+            )
+
+    repaired_reviews: dict[str, SubjectAttributeReview] = {}
+    repaired_review_failure: str | None = None
+    if repaired_pending:
+        review_calls += 1
+        review_started = time.perf_counter()
+        try:
+            batch = review_client.review(owner=owner, candidates=repaired_pending)
+            repaired_reviews = {
+                review.attribute_id: review for review in batch.reviews
+            }
+        except Exception as exc:  # noqa: BLE001 - fail closed for repaired batch
+            repaired_review_failure = (
+                f"completion_final_review_failed:{type(exc).__name__}:{exc}"
+            )
+            review_failures += 1
+            if review_failure is None:
+                review_failure = repaired_review_failure
+        qwen_seconds += time.perf_counter() - review_started
+
+    for candidate in repaired_pending:
+        raw_candidate = raw_by_attribute_id[candidate.attribute_id]
+        raw_review = raw_reviews[candidate.attribute_id]
+        repaired_review = repaired_reviews.get(candidate.attribute_id)
+        repaired_accepted = bool(
+            repaired_review is not None
+            and repaired_review.accepted
+            and repaired_review.structure_complete
         )
-        records_by_id[candidate.attribute_id] = SubjectAttributeRecord(
-            attribute_id=candidate.attribute_id,
-            owner_entity_id=owner.entity_id,
-            attribute_type=candidate.discovered.attribute_type,
-            phrase=candidate.discovered.phrase,
-            grounding_prompt=candidate.discovered.grounding_prompt,
-            status="accepted",
-            image_path=relative_path,
-            source_frame_index=candidate.owner_candidate.source_frame_index,
-            source_frame_slot=candidate.owner_candidate.frame_slot,
-            owner_candidate_id=candidate.owner_candidate.candidate_id,
-            same_frame_as_owner_reference=same_frame,
-            sam3_prompt=candidate.discovered.grounding_prompt,
-            ownership_geometry=candidate.geometry,
-            review=review,
-            gme_attempts=list(candidate.gme_attempts),
-            selected_gme_attempt_index=candidate.selected_gme_attempt_index,
-            reason="accepted",
-        )
+        if repaired_accepted:
+            assert repaired_review is not None
+            completion_metrics.accepted += 1
+            completion_metrics.selected_completed += 1
+            completion_metrics.repaired_final_review_accepted += 1
+            completion_metrics.accepted_by_type[
+                candidate.discovered.attribute_type
+            ] += 1
+            records_by_id[candidate.attribute_id] = _accepted_record(
+                candidate,
+                output_root=output_root,
+                sample_id=clip.clip_uid,
+                owner_reference=owner_reference,
+                review=repaired_review,
+                final_selection="completed",
+                completion_attempted=True,
+                completion_outcome="selected_completed",
+            )
+            continue
+
+        completion_metrics.final_review_rejects += 1
+        completion_metrics.repaired_final_review_rejected += 1
+        final_reason = repaired_review_failure or "completion_final_review_missing"
+        if repaired_review is not None:
+            final_reason = (
+                "completion_final_review_incomplete"
+                if repaired_review.accepted
+                else f"completion_final_review:{repaired_review.reason}"
+            )
+        if raw_review.accepted:
+            completion_metrics.fallback_to_raw += 1
+            records_by_id[candidate.attribute_id] = _accepted_record(
+                raw_candidate,
+                output_root=output_root,
+                sample_id=clip.clip_uid,
+                owner_reference=owner_reference,
+                review=raw_review,
+                final_selection="raw",
+                completion_attempted=True,
+                completion_outcome=final_reason,
+            )
+        else:
+            completion_metrics.rejected += 1
+            same_frame = (
+                owner_reference.source_clip_uid in {None, clip.clip_uid}
+                and raw_candidate.owner_candidate.source_frame_index
+                == owner_reference.source_frame_index
+            )
+            records_by_id[candidate.attribute_id] = _rejected_record(
+                raw_candidate.discovered,
+                attribute_id=candidate.attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=final_reason,
+                geometry=raw_candidate.geometry,
+                source_frame_index=raw_candidate.owner_candidate.source_frame_index,
+                source_frame_slot=raw_candidate.owner_candidate.frame_slot,
+                owner_candidate_id=raw_candidate.owner_candidate.candidate_id,
+                same_frame=same_frame,
+                review=repaired_review or raw_review,
+                gme_attempts=raw_candidate.gme_attempts,
+                selected_gme_attempt_index=(
+                    raw_candidate.selected_gme_attempt_index
+                ),
+                completion_attempted=True,
+                completion_outcome=final_reason,
+            )
 
     ordered_records = [
         records_by_id[f"a{attribute_id_start + offset}"]
@@ -2317,12 +2678,13 @@ def _process_owner(
             record.reason.startswith("recognizability:")
             or record.reason.startswith("review_failed:")
             or record.reason == "recognizability_review_missing"
+            or record.reason.startswith("completion_final_review")
         )
         for record in ordered_records
     )
     accepted = [record for record in ordered_records if record.status == "accepted"]
     failures = (
-        int(review_failure is not None)
+        review_failures
         + processing_failures
         + completion_metrics.failures
     )
@@ -2351,7 +2713,9 @@ def _process_owner(
             qwen_model_call_time_seconds=(
                 qwen_seconds + completion_metrics.review_time_seconds
             ),
-            sam3_model_call_time_seconds=sam_seconds,
+            sam3_model_call_time_seconds=(
+                sam_seconds + completion_metrics.sam3_time_seconds
+            ),
             gme_calls=gme_metrics.calls,
             gme_candidates_screened=gme_metrics.candidates_screened,
             gme_candidates_passed=gme_metrics.candidates_passed,
@@ -2365,6 +2729,45 @@ def _process_owner(
             completion_failures=completion_metrics.failures,
             completion_qwen_review_rejects=(
                 completion_metrics.qwen_review_rejects
+            ),
+            raw_attribute_review_accepted=(
+                completion_metrics.raw_review_accepted
+            ),
+            raw_attribute_review_repair_recommended=(
+                completion_metrics.raw_review_repair_recommended
+            ),
+            raw_attribute_review_hard_rejected=(
+                completion_metrics.raw_review_hard_rejected
+            ),
+            completion_raw_usable_attempts=(
+                completion_metrics.raw_usable_attempts
+            ),
+            completion_raw_unusable_attempts=(
+                completion_metrics.raw_unusable_attempts
+            ),
+            completion_selected_completed=(
+                completion_metrics.selected_completed
+            ),
+            completion_fallback_to_raw=(
+                completion_metrics.fallback_to_raw
+            ),
+            completion_backend_failures=(
+                completion_metrics.backend_failures
+            ),
+            completion_postcheck_rejects=(
+                completion_metrics.postcheck_rejects
+            ),
+            completion_identity_review_rejects=(
+                completion_metrics.identity_review_rejects
+            ),
+            completion_final_review_rejects=(
+                completion_metrics.final_review_rejects
+            ),
+            repaired_attribute_final_review_accepted=(
+                completion_metrics.repaired_final_review_accepted
+            ),
+            repaired_attribute_final_review_rejected=(
+                completion_metrics.repaired_final_review_rejected
             ),
             completion_review_calls=completion_metrics.review_calls,
             completion_model_call_time_seconds=(
@@ -2876,6 +3279,7 @@ def _load_durable_owner_artifact(
         owner_entity_id=owner_entity_id,
         attribute_id_start=artifact.attribute_id_start,
         expected_gme_screen_mode=artifact.gme_screen_mode,
+        expected_completion_mode=artifact.completion_mode,
     )
 
 
@@ -2999,6 +3403,33 @@ def reconcile_subject_attribute_outputs(
         "completion_failures": totals.completion_failures,
         "completion_qwen_review_rejects": (
             totals.completion_qwen_review_rejects
+        ),
+        "raw_attribute_review_accepted": totals.raw_attribute_review_accepted,
+        "raw_attribute_review_repair_recommended": (
+            totals.raw_attribute_review_repair_recommended
+        ),
+        "raw_attribute_review_hard_rejected": (
+            totals.raw_attribute_review_hard_rejected
+        ),
+        "completion_raw_usable_attempts": totals.completion_raw_usable_attempts,
+        "completion_raw_unusable_attempts": (
+            totals.completion_raw_unusable_attempts
+        ),
+        "completion_selected_completed": totals.completion_selected_completed,
+        "completion_fallback_to_raw": totals.completion_fallback_to_raw,
+        "completion_backend_failures": totals.completion_backend_failures,
+        "completion_postcheck_rejects": totals.completion_postcheck_rejects,
+        "completion_identity_review_rejects": (
+            totals.completion_identity_review_rejects
+        ),
+        "completion_final_review_rejects": (
+            totals.completion_final_review_rejects
+        ),
+        "repaired_attribute_final_review_accepted": (
+            totals.repaired_attribute_final_review_accepted
+        ),
+        "repaired_attribute_final_review_rejected": (
+            totals.repaired_attribute_final_review_rejected
         ),
         "completion_attempts_by_type": dict(
             sorted(totals.completion_attempts_by_type.items())

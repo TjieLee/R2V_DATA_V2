@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import r2v_data_v2.v3.config as config_module
+import tools.run_v3_canary as canary_module
 from r2v_data_v2.v3.config import load_config
 from tools.run_v3_canary import (
     CANARY_STAGES,
@@ -790,3 +791,48 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
     summary_path = Path(str(summary["export_root"])) / "canary_summary.json"
     assert json.loads(summary_path.read_text(encoding="utf-8")) == summary
     assert Path(str(summary["references_root"])).is_dir()
+
+
+def test_subject_attribute_metric_object_is_mapping_safe() -> None:
+    result = {
+        "subject_attributes_summary": {
+            "completion_attempts_by_type": {
+                "face": 2,
+                "hair": 1.5,
+                "bad_bool": True,
+                "bad_negative": -1,
+                3: 4,
+            }
+        }
+    }
+
+    assert canary_module._subject_attribute_metric_object(
+        result,
+        "completion_attempts_by_type",
+    ) == {"face": 2, "hair": 1.5}
+    assert canary_module._subject_attribute_metric_object(
+        {"subject_attributes_summary": {"completion_attempts_by_type": 4}},
+        "completion_attempts_by_type",
+    ) == {}
+
+
+def test_print_summary_includes_completion_routing_metrics(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Summary(dict[str, object]):
+        def __missing__(self, key: str) -> object:
+            return 0
+
+    summary = Summary(
+        completion_selected_completed=2,
+        completion_fallback_to_raw=1,
+        completion_attempts_by_type={"face": 2, "hair": 1},
+        completion_accepted_by_type={"face": 1, "hair": 1},
+    )
+
+    canary_module._print_summary(summary)
+
+    output = capsys.readouterr().out
+    assert "completion_selected_completed: 2" in output
+    assert "completion_fallback_to_raw: 1" in output
+    assert 'completion_attempts_by_type: {"face": 2, "hair": 1}' in output

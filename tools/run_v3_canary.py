@@ -600,6 +600,27 @@ def _print_summary(summary: dict[str, object]) -> None:
         "gme_retried_next_frame",
         "gme_failures",
         "gme_model_call_time_seconds",
+        "completion_attempts",
+        "completion_accepted",
+        "completion_rejected",
+        "completion_failures",
+        "completion_qwen_review_rejects",
+        "raw_attribute_review_accepted",
+        "raw_attribute_review_repair_recommended",
+        "raw_attribute_review_hard_rejected",
+        "completion_raw_usable_attempts",
+        "completion_raw_unusable_attempts",
+        "completion_selected_completed",
+        "completion_fallback_to_raw",
+        "completion_backend_failures",
+        "completion_postcheck_rejects",
+        "completion_identity_review_rejects",
+        "completion_final_review_rejects",
+        "repaired_attribute_final_review_accepted",
+        "repaired_attribute_final_review_rejected",
+        "completion_attempts_by_type",
+        "completion_accepted_by_type",
+        "completion_model_call_time_seconds",
         "failed_tasks",
         "config",
         "run_root",
@@ -611,7 +632,7 @@ def _print_summary(summary: dict[str, object]) -> None:
         value = summary[field_name]
         rendered = (
             json.dumps(value, ensure_ascii=False)
-            if isinstance(value, list)
+            if isinstance(value, (dict, list))
             else value
         )
         print(f"{field_name}: {rendered}")
@@ -696,6 +717,32 @@ def _subject_attribute_metric(
     ):
         return 0
     return value
+
+
+def _subject_attribute_metric_object(
+    result: dict[str, object] | None,
+    field: str,
+) -> dict[str, int | float]:
+    if not isinstance(result, dict):
+        return {}
+    summary = result.get("subject_attributes_summary")
+    if not isinstance(summary, dict):
+        return {}
+    value = summary.get(field, {})
+    if not isinstance(value, dict):
+        return {}
+    cleaned: dict[str, int | float] = {}
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(item, (int, float))
+            or isinstance(item, bool)
+            or not math.isfinite(item)
+            or item < 0
+        ):
+            continue
+        cleaned[key] = item
+    return cleaned
 
 
 def _profiling_summary(run_root: Path) -> dict[str, object]:
@@ -1040,6 +1087,66 @@ def run_canary(
         "completion_qwen_review_rejects": _subject_attribute_metric(
             execution.result,
             "completion_qwen_review_rejects",
+        ),
+        "raw_attribute_review_accepted": _subject_attribute_metric(
+            execution.result,
+            "raw_attribute_review_accepted",
+        ),
+        "raw_attribute_review_repair_recommended": _subject_attribute_metric(
+            execution.result,
+            "raw_attribute_review_repair_recommended",
+        ),
+        "raw_attribute_review_hard_rejected": _subject_attribute_metric(
+            execution.result,
+            "raw_attribute_review_hard_rejected",
+        ),
+        "completion_raw_usable_attempts": _subject_attribute_metric(
+            execution.result,
+            "completion_raw_usable_attempts",
+        ),
+        "completion_raw_unusable_attempts": _subject_attribute_metric(
+            execution.result,
+            "completion_raw_unusable_attempts",
+        ),
+        "completion_selected_completed": _subject_attribute_metric(
+            execution.result,
+            "completion_selected_completed",
+        ),
+        "completion_fallback_to_raw": _subject_attribute_metric(
+            execution.result,
+            "completion_fallback_to_raw",
+        ),
+        "completion_backend_failures": _subject_attribute_metric(
+            execution.result,
+            "completion_backend_failures",
+        ),
+        "completion_postcheck_rejects": _subject_attribute_metric(
+            execution.result,
+            "completion_postcheck_rejects",
+        ),
+        "completion_identity_review_rejects": _subject_attribute_metric(
+            execution.result,
+            "completion_identity_review_rejects",
+        ),
+        "completion_final_review_rejects": _subject_attribute_metric(
+            execution.result,
+            "completion_final_review_rejects",
+        ),
+        "repaired_attribute_final_review_accepted": _subject_attribute_metric(
+            execution.result,
+            "repaired_attribute_final_review_accepted",
+        ),
+        "repaired_attribute_final_review_rejected": _subject_attribute_metric(
+            execution.result,
+            "repaired_attribute_final_review_rejected",
+        ),
+        "completion_attempts_by_type": _subject_attribute_metric_object(
+            execution.result,
+            "completion_attempts_by_type",
+        ),
+        "completion_accepted_by_type": _subject_attribute_metric_object(
+            execution.result,
+            "completion_accepted_by_type",
         ),
         "completion_model_call_time_seconds": _subject_attribute_metric(
             execution.result,

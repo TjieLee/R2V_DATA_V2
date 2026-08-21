@@ -21,6 +21,7 @@ from r2v_data_v2.v3.config import (
     Sam3Config,
     SourceConfig,
     SubjectAttributeCompletionConfig,
+    SubjectAttributesConfig,
     V3Config,
 )
 from r2v_data_v2.v3.reference_edit_boogu import BooguCompletionReview
@@ -223,6 +224,8 @@ def _accepted_review(attribute_id: str) -> SubjectAttributeReview:
         recognizable=True,
         characteristic_appearance_visible=True,
         usable_as_attribute_condition=True,
+        structure_complete=True,
+        completion_recommended=False,
         reason="clear and useful",
     )
 
@@ -597,6 +600,24 @@ def test_recognizability_requires_every_review_boolean() -> None:
     assert _accepted_review("a1").accepted is True
     fragment = _accepted_review("a1").model_copy(update={"recognizable": False})
     assert fragment.accepted is False
+
+
+def test_incomplete_semantically_correct_review_must_recommend_completion() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="semantically correct incomplete structure must recommend completion",
+    ):
+        SubjectAttributeReview(
+            attribute_id="a1",
+            matches_attribute=True,
+            owner_binding_correct=True,
+            recognizable=True,
+            characteristic_appearance_visible=True,
+            usable_as_attribute_condition=True,
+            structure_complete=False,
+            completion_recommended=False,
+            reason="visible missing region",
+        )
 
 
 @pytest.mark.parametrize(
@@ -1335,6 +1356,14 @@ def test_discovery_prompt_requires_english_attribute_text() -> None:
     assert "written in English" in prompt
 
 
+def test_attribute_completion_prompt_is_exact_and_category_neutral() -> None:
+    assert subject_attributes.ATTRIBUTE_COMPLETION_PROMPT == (
+        "把图片中破损、缺失或不完整的区域补充完整。"
+    )
+    for prohibited in ("人脸", "人", "头发", "服装", "帽子", "配饰", "包", "鞋"):
+        assert prohibited not in subject_attributes.ATTRIBUTE_COMPLETION_PROMPT
+
+
 def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
     _frames(tmp_path / "run")
     owner_mask = np.zeros((100, 100), dtype=bool)
@@ -1622,6 +1651,75 @@ def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
         owner_entity_id="e1",
         attribute_id_start=1,
     ) == artifact
+
+    legacy_completion_metrics = artifact.metrics.model_copy(
+        update={
+            "completion_attempts": 1,
+            "completion_accepted": 1,
+            "completion_attempts_by_type": {"hair": 1},
+            "completion_accepted_by_type": {"hair": 1},
+        }
+    )
+    legacy_completion_artifact = artifact.model_copy(
+        update={
+            "completion_mode": "boogu_completion_v1",
+            "metrics": legacy_completion_metrics,
+        }
+    )
+    write_json_atomic(
+        artifact_path,
+        legacy_completion_artifact.model_dump(mode="json"),
+    )
+    assert subject_attributes._load_durable_owner_artifact(
+        artifact_path,
+        output_root=output_root,
+        sample_id="clip-1",
+        owner_entity_id="e1",
+    ) == legacy_completion_artifact
+
+    completion_metrics = artifact.metrics.model_copy(
+        update={
+            "completion_attempts": 1,
+            "completion_accepted": 1,
+            "completion_raw_usable_attempts": 1,
+            "completion_selected_completed": 1,
+            "repaired_attribute_final_review_accepted": 1,
+            "completion_attempts_by_type": {"hair": 1},
+            "completion_accepted_by_type": {"hair": 1},
+        }
+    )
+    completion_artifact = artifact.model_copy(
+        update={
+            "completion_mode": "boogu_completion_v1",
+            "metrics": completion_metrics,
+        }
+    )
+    write_json_atomic(
+        artifact_path,
+        completion_artifact.model_dump(mode="json"),
+    )
+    assert subject_attributes._load_durable_owner_artifact(
+        artifact_path,
+        output_root=output_root,
+        sample_id="clip-1",
+        owner_entity_id="e1",
+    ) == completion_artifact
+
+    storage = SimpleNamespace(
+        root=tmp_path / "run",
+        iter_clips=lambda: iter([_clip()]),
+        read_run=lambda: SimpleNamespace(git_commit="test-commit"),
+    )
+    summary = subject_attributes.reconcile_subject_attribute_outputs(
+        storage=storage,
+        output_root=output_root,
+        owner_limit=None,
+        invocation_wall_time_seconds=0.0,
+    )
+    assert summary["eligible_human_owner_count"] == 1
+    assert summary["attribute_record_count"] == 1
+    assert summary["completion_attempts"] == 1
+    assert summary["completion_selected_completed"] == 1
     assert subject_attributes._load_cached_owner_artifact(
         artifact_path,
         output_root=output_root,
@@ -2145,19 +2243,28 @@ def test_repairable_attribute_uses_boogu_then_sam3(
         completion_judge=Judge(),
         segmentation_backend=segmenter,
         metrics=metrics,
+        raw_usable=True,
     )
 
     assert completed is not None
     assert completed.completion_attempted is True
-    assert reason == "completion_accepted"
+    assert reason == "completion_identity_accepted"
     assert failed is False
     assert backend.calls == segmenter.calls == 1
-    assert metrics.attempts == metrics.accepted == 1
+    assert metrics.attempts == 1
+    assert metrics.accepted == 0
 
 
-def test_unrepairable_blank_attribute_never_calls_completion(tmp_path: Path) -> None:
-    crop = Image.new("RGBA", (64, 64), (255, 255, 255, 0))
-    crop.putpixel((32, 32), (255, 255, 255, 255))
+def test_alpha_coverage_does_not_control_completion_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject_attributes,
+        "_masked_crop_quality_rejection",
+        lambda *_args, **_kwargs: None,
+    )
+    crop = Image.new("RGBA", (64, 64), (100, 100, 100, 255))
     candidate = subject_attributes.PendingAttributeCandidate(
         discovered=DiscoveredSubjectAttribute(
             attribute_type="face",
@@ -2167,28 +2274,45 @@ def test_unrepairable_blank_attribute_never_calls_completion(tmp_path: Path) -> 
         attribute_id="a1",
         owner_entity_id="e1",
         owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
-        attribute_mask=np.ones((10, 10), dtype=bool),
+        attribute_mask=np.ones((64, 64), dtype=bool),
         source_image=Image.new("RGB", (100, 100), "white"),
         crop=crop,
         geometry=_geometry(),
     )
 
-    class Forbidden:
-        def attribute_completion(self, **_kwargs):
-            pytest.fail("unrepairable candidate reached Boogu")
+    captured: dict[str, object] = {}
+
+    class Backend:
+        def attribute_completion(self, *, output_path, **kwargs):
+            captured.update(kwargs)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (64, 64), "gray").save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Segmenter:
+        def segment_generated_frame(self, **_kwargs):
+            return (np.ones((64, 64), dtype=bool),)
+
+    class Judge:
+        def review(self, **_kwargs):
+            return _completion_review(accepted=True)
 
     completed, reason, _ = subject_attributes._attempt_attribute_completion(
         candidate,
         clip_uid="clip-1",
         output_root=tmp_path,
         completion_config=SubjectAttributeCompletionConfig(enabled=True),
-        completion_backend=Forbidden(),
-        completion_judge=SimpleNamespace(),
-        segmentation_backend=SimpleNamespace(),
+        completion_backend=Backend(),
+        completion_judge=Judge(),
+        segmentation_backend=Segmenter(),
         metrics=subject_attributes._CompletionSelectionMetrics(),
+        raw_usable=False,
     )
-    assert completed is None
-    assert reason == "completion_precheck:blank_area_too_large"
+    assert completed is not None
+    assert reason == "completion_identity_accepted"
+    assert captured["instruction"] == "把图片中破损、缺失或不完整的区域补充完整。"
+    for prohibited in ("人脸", "服装", "帽子", "头发", "配饰", "主体"):
+        assert prohibited not in str(captured["instruction"])
 
 
 def test_completion_review_rejects_fail_closed(
@@ -2244,7 +2368,318 @@ def test_completion_review_rejects_fail_closed(
         completion_judge=Judge(),
         segmentation_backend=Segmenter(),
         metrics=metrics,
+        raw_usable=False,
     )
     assert completed is None
     assert reason == "completion_qwen_review_reject"
     assert metrics.qwen_review_rejects == 1
+
+
+def _routing_review(attribute_id: str, kind: str) -> SubjectAttributeReview:
+    accepted = _accepted_review(attribute_id)
+    if kind == "accepted_repair":
+        return accepted.model_copy(
+            update={
+                "structure_complete": False,
+                "completion_recommended": True,
+                "reason": "usable but visibly incomplete",
+            }
+        )
+    if kind == "unusable_repair":
+        return accepted.model_copy(
+            update={
+                "recognizable": False,
+                "structure_complete": False,
+                "completion_recommended": True,
+                "reason": "correct repairable component",
+            }
+        )
+    if kind == "wrong_semantic":
+        return accepted.model_copy(
+            update={
+                "matches_attribute": False,
+                "structure_complete": False,
+                "reason": "wrong component",
+            }
+        )
+    if kind == "wrong_owner":
+        return accepted.model_copy(
+            update={
+                "owner_binding_correct": False,
+                "structure_complete": False,
+                "reason": "wrong owner",
+            }
+        )
+    if kind == "unusable_no_repair":
+        return accepted.model_copy(
+            update={
+                "recognizable": False,
+                "reason": "unusable and not repairable",
+            }
+        )
+    if kind == "final_reject":
+        return accepted.model_copy(
+            update={
+                "recognizable": False,
+                "reason": "completed crop is unusable",
+            }
+        )
+    if kind == "accepted_complete":
+        return accepted
+    raise AssertionError(f"unknown review kind: {kind}")
+
+
+def _run_completion_routing_case(
+    tmp_path: Path,
+    *,
+    raw_kind: str,
+    completion_stage: str = "success",
+    attribute_count: int = 1,
+) -> tuple[OwnerEnrichmentArtifact, object, object, object]:
+    _frames(tmp_path / "run")
+
+    class Discovery:
+        def discover(self, *, owner, **_kwargs):
+            return SubjectAttributeDiscovery(
+                owner_entity_id=owner.entity_id,
+                owner_is_human=True,
+                attributes=[
+                    DiscoveredSubjectAttribute(
+                        attribute_type=("face" if index == 0 else "accessory"),
+                        phrase=("face" if index == 0 else "necklace"),
+                        grounding_prompt=(
+                            "face of person 1"
+                            if index == 0
+                            else "necklace worn by person 1"
+                        ),
+                    )
+                    for index in range(attribute_count)
+                ],
+            )
+
+    class Review:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def review(self, *, owner, candidates):
+            self.calls.append([candidate.attribute_id for candidate in candidates])
+            kind = raw_kind if len(self.calls) == 1 else (
+                "final_reject"
+                if completion_stage == "final_review_reject"
+                else "accepted_complete"
+            )
+            return SubjectAttributeReviewBatch(
+                owner_entity_id=owner.entity_id,
+                reviews=[
+                    _routing_review(candidate.attribute_id, kind)
+                    for candidate in candidates
+                ],
+            )
+
+    class Backend:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def attribute_completion(self, *, output_path, **_kwargs):
+            self.calls += 1
+            if completion_stage == "backend_failure":
+                raise RuntimeError("backend unavailable")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (100, 100), (100, 120, 140)).save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Segmenter:
+        def __init__(self) -> None:
+            self.frame_calls = 0
+            self.generated_calls = 0
+
+        def segment_frame(self, **kwargs):
+            self.frame_calls += 1
+            mask = np.zeros((100, 100), dtype=bool)
+            if "necklace" in kwargs["grounding_prompt"]:
+                mask[45:65, 25:75] = True
+            else:
+                mask[30:70, 30:70] = True
+            return (mask,)
+
+        def segment_generated_frame(self, **kwargs):
+            self.generated_calls += 1
+            if completion_stage == "postcheck_reject":
+                return ()
+            mask = np.zeros((100, 100), dtype=bool)
+            if "necklace" in kwargs["grounding_prompt"]:
+                mask[45:65, 25:75] = True
+            else:
+                mask[30:70, 30:70] = True
+            return (mask,)
+
+    class Judge:
+        def review(self, **_kwargs):
+            return _completion_review(
+                accepted=completion_stage != "identity_reject"
+            )
+
+    review = Review()
+    backend = Backend()
+    segmenter = Segmenter()
+    clip = _clip()
+    artifact = subject_attributes._process_owner(
+        config=SimpleNamespace(
+            pair=SimpleNamespace(crop_padding_ratio=0.08),
+            subject_attributes=SubjectAttributesConfig(
+                completion=replace(
+                    SubjectAttributeCompletionConfig(enabled=True),
+                    minimum_sharpness_score=-1.0,
+                    maximum_area_growth_ratio=4.0,
+                    face_maximum_area_growth_ratio=4.0,
+                    maximum_bbox_area_growth_ratio=4.0,
+                    face_maximum_bbox_area_growth_ratio=4.0,
+                )
+            ),
+        ),
+        storage=_FakeStorage(tmp_path / "run"),
+        output_root=tmp_path / "output",
+        clip=clip,
+        owner=clip.annotation.entities[0],
+        owner_candidates=[
+            _candidate("candidate_1", slot=1, source_frame_index=10)
+        ],
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={},
+        ),
+        attribute_id_start=1,
+        discovery_client=Discovery(),
+        review_client=review,
+        segmentation_backend=segmenter,
+        completion_backend=backend,
+        completion_judge=Judge(),
+    )
+    return artifact, review, backend, segmenter
+
+
+def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_complete",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert backend.calls == segmenter.generated_calls == 0
+    assert review.calls == [["a1"]]
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "backend_failure",
+        "postcheck_reject",
+        "identity_reject",
+        "final_review_reject",
+    ],
+)
+def test_raw_accepted_repair_failures_fallback_to_raw(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+        completion_stage=failure_stage,
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is True
+    assert artifact.metrics.completion_fallback_to_raw == 1
+    assert artifact.metrics.completion_selected_completed == 0
+    assert backend.calls == 1
+    assert segmenter.generated_calls == int(failure_stage != "backend_failure")
+    assert len(review.calls) == int(failure_stage == "final_review_reject") + 1
+
+
+def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "completed"
+    assert record.completion_outcome == "selected_completed"
+    assert artifact.metrics.review_calls == 2
+    assert artifact.metrics.completion_selected_completed == 1
+    assert artifact.metrics.completion_accepted == 1
+    assert artifact.metrics.repaired_attribute_final_review_accepted == 1
+    assert artifact.metrics.completion_attempts_by_type == {"face": 1}
+    assert artifact.metrics.completion_accepted_by_type == {"face": 1}
+    assert review.calls == [["a1"], ["a1"]]
+    assert backend.calls == segmenter.generated_calls == 1
+
+
+def test_raw_and_repaired_reviews_are_owner_batched(tmp_path: Path) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+        attribute_count=2,
+    )
+
+    assert [record.final_selection for record in artifact.records] == [
+        "completed",
+        "completed",
+    ]
+    assert review.calls == [["a1", "a2"], ["a1", "a2"]]
+    assert artifact.metrics.review_calls == 2
+    assert backend.calls == segmenter.generated_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("completion_stage", "expected_status"),
+    [("success", "accepted"), ("backend_failure", "rejected")],
+)
+def test_raw_unusable_repair_is_completed_or_rejected_fail_closed(
+    tmp_path: Path,
+    completion_stage: str,
+    expected_status: str,
+) -> None:
+    artifact, _, _, _ = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="unusable_repair",
+        completion_stage=completion_stage,
+    )
+
+    record = artifact.records[0]
+    assert record.status == expected_status
+    assert artifact.metrics.completion_raw_unusable_attempts == 1
+    if expected_status == "accepted":
+        assert record.final_selection == "completed"
+    else:
+        assert record.image_path is None
+        assert artifact.metrics.completion_rejected == 1
+
+
+@pytest.mark.parametrize(
+    "raw_kind",
+    ["wrong_semantic", "wrong_owner", "unusable_no_repair"],
+)
+def test_hard_rejected_or_nonrepairable_raw_never_reaches_boogu(
+    tmp_path: Path,
+    raw_kind: str,
+) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind=raw_kind,
+    )
+
+    assert artifact.records[0].status == "rejected"
+    assert artifact.metrics.completion_attempts == 0
+    assert artifact.metrics.raw_attribute_review_hard_rejected == 1
+    assert backend.calls == segmenter.generated_calls == 0
+    assert review.calls == [["a1"]]

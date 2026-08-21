@@ -1316,6 +1316,8 @@ def _accepted_attribute(image_path: str) -> SubjectAttributeRecord:
             recognizable=True,
             characteristic_appearance_visible=True,
             usable_as_attribute_condition=True,
+            structure_complete=True,
+            completion_recommended=False,
             reason="accepted",
         ),
         reason="accepted",
