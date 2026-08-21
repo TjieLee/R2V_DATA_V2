@@ -178,7 +178,7 @@ def _validate_runs_root(path: str | Path) -> Path:
     return resolved
 
 
-def _validate_attribute_png(path: Path) -> None:
+def _validate_attribute_png(path: Path, *, final_selection: str | None) -> None:
     try:
         with Image.open(path) as image:
             image_format = image.format
@@ -186,8 +186,11 @@ def _validate_attribute_png(path: Path) -> None:
             image.verify()
     except Exception as exc:  # noqa: BLE001 - normalize decoder failures
         raise ValueError(f"attribute reference is not a decodable image: {path}") from exc
-    if image_format != "PNG" or image_mode != "RGBA":
-        raise ValueError(f"attribute reference must be an RGBA PNG: {path}")
+    expected_mode = "RGB" if final_selection == "completed" else "RGBA"
+    if image_format != "PNG" or image_mode != expected_mode:
+        raise ValueError(
+            f"attribute reference must be an {expected_mode} PNG: {path}"
+        )
 
 
 def _safe_component(value: str, field_name: str) -> str:
@@ -236,7 +239,7 @@ def _materialize_reference(
     allow_copy_fallback: bool,
 ) -> str:
     if require_rgba:
-        _validate_attribute_png(source)
+        _validate_attribute_png(source, final_selection=None)
     if relative_destination.is_absolute() or ".." in relative_destination.parts:
         raise ValueError("canonical reference path must remain relative")
     destination = output_root / relative_destination
@@ -247,7 +250,7 @@ def _materialize_reference(
                 f"conflicting published reference: {destination}"
             )
         if require_rgba:
-            _validate_attribute_png(destination)
+            _validate_attribute_png(destination, final_selection=None)
         return destination.relative_to(output_root).as_posix()
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -272,7 +275,7 @@ def _materialize_reference(
                     f"conflicting published reference: {destination}"
                 ) from None
         if require_rgba:
-            _validate_attribute_png(destination)
+            _validate_attribute_png(destination, final_selection=None)
     finally:
         temporary.unlink(missing_ok=True)
     return destination.relative_to(output_root).as_posix()
@@ -286,19 +289,26 @@ def _materialize_attribute_reference(
     owner_entity_id: str,
     attribute_id: str,
     attribute_type: str,
+    final_selection: str | None,
 ) -> str:
     filename = "attribute_{}_{}_{}.png".format(
         _safe_component(owner_entity_id, "owner_entity_id"),
         _safe_component(attribute_id, "attribute_id"),
         _safe_component(attribute_type, "attribute_type"),
     )
-    return _materialize_reference(
+    _validate_attribute_png(source, final_selection=final_selection)
+    published = _materialize_reference(
         source=source,
         output_root=output_root,
         relative_destination=directory / filename,
-        require_rgba=True,
+        require_rgba=False,
         allow_copy_fallback=True,
     )
+    _validate_attribute_png(
+        output_root / published,
+        final_selection=final_selection,
+    )
+    return published
 
 
 def _dataset_reference_kind(reference: DatasetReference) -> str:
@@ -431,6 +441,7 @@ def _enriched_production_sample(
                 owner_entity_id=record.owner_entity_id,
                 attribute_id=record.attribute_id,
                 attribute_type=record.attribute_type,
+                final_selection=record.final_selection,
             )
             assert enriched_reference.source_frame_index is not None
             production_references.append(
@@ -443,7 +454,7 @@ def _enriched_production_sample(
                     attribute_type=record.attribute_type,
                     image_path=published_path,
                     source_frame_index=enriched_reference.source_frame_index,
-                    synthetic=False,
+                    synthetic=record.final_selection == "completed",
                 )
             )
             continue

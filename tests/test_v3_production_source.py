@@ -24,6 +24,7 @@ from r2v_data_v2.v3.storage import RunStorage
 from r2v_data_v2.v3.subject_attributes import (
     EnrichedSample,
     OwnershipGeometry,
+    SubjectAttributeCompletionReview,
     SubjectAttributeRecord,
     SubjectAttributeReview,
 )
@@ -1282,7 +1283,12 @@ def test_compactor_optionally_merges_valid_enriched_samples(
     assert catalog["total_enriched_samples"] == 1
 
 
-def _accepted_attribute(image_path: str) -> SubjectAttributeRecord:
+def _accepted_attribute(
+    image_path: str,
+    *,
+    final_selection: str | None = "raw",
+) -> SubjectAttributeRecord:
+    completed = final_selection == "completed"
     return SubjectAttributeRecord(
         attribute_id="a1",
         owner_entity_id="e1",
@@ -1316,10 +1322,33 @@ def _accepted_attribute(image_path: str) -> SubjectAttributeRecord:
             recognizable=True,
             characteristic_appearance_visible=True,
             usable_as_attribute_condition=True,
-            structure_complete=True,
-            completion_recommended=False,
-            reason="accepted",
+            structure_complete=not completed,
+            completion_recommended=completed,
+            reason=("repair recommended" if completed else "accepted"),
         ),
+        completion_review=(
+            SubjectAttributeCompletionReview(
+                verdict="accept",
+                same_physical_entity=True,
+                identity_preserved=True,
+                original_visible_attributes_preserved=True,
+                exactly_one_entity=True,
+                missing_parts_plausibly_completed=True,
+                no_duplicate_entity=True,
+                no_unrelated_entity=True,
+                no_severe_structure_artifact=True,
+                style_coherent=True,
+                resolution_usable=True,
+                reference_usable=True,
+                certain=True,
+                reason="accepted",
+            )
+            if completed
+            else None
+        ),
+        final_selection=final_selection,
+        completion_attempted=completed,
+        completion_outcome=("selected_completed" if completed else "not_attempted"),
         reason="accepted",
     )
 
@@ -1330,6 +1359,8 @@ def _write_enriched_with_attribute(
     shard_id: str,
     sample_id: str,
     attribute_exists: bool = True,
+    final_selection: str | None = "raw",
+    image_mode: str | None = None,
     instruction: str = "Use <Image 1> with <Image 2>.",
 ) -> Path:
     run_root = runs_root / shard_id
@@ -1340,8 +1371,13 @@ def _write_enriched_with_attribute(
     attribute = run_root / "subject_attributes" / attribute_path
     attribute.parent.mkdir(parents=True)
     if attribute_exists:
-        Image.new("RGBA", (16, 8), (20, 30, 40, 180)).save(attribute)
-    accepted = _accepted_attribute(attribute_path)
+        mode = image_mode or ("RGB" if final_selection == "completed" else "RGBA")
+        color = (20, 30, 40) if mode == "RGB" else (20, 30, 40, 180)
+        Image.new(mode, (16, 8), color).save(attribute)
+    accepted = _accepted_attribute(
+        attribute_path,
+        final_selection=final_selection,
+    )
     enriched = EnrichedSample(
         sample_id=sample_id,
         clip_uid=sample_id,
@@ -1380,9 +1416,11 @@ def _write_enriched_with_attribute(
     return destination
 
 
+@pytest.mark.parametrize("final_selection", ["raw", None])
 def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    final_selection: str | None,
 ) -> None:
     shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     shard_id = "shard-000000000-000000999"
@@ -1398,6 +1436,7 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
         runs_root=runs_root,
         shard_id=shard_id,
         sample_id="sample-a",
+        final_selection=final_selection,
     )
 
     catalog = compact_production_exports(
@@ -1417,6 +1456,7 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     assert attribute.attribute_id == "a1"
     assert attribute.owner_entity_id == "e1"
     assert attribute.attribute_type == "hair"
+    assert attribute.synthetic is False
     assert attribute.image_path == (
         "references/review/sample-a/attribute_e1_a1_hair.png"
     )
@@ -1431,6 +1471,7 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     )
     published_attribute = output / attribute.image_path
     assert source_attribute.stat().st_ino == published_attribute.stat().st_ino
+    assert _file_sha256(source_attribute) == _file_sha256(published_attribute)
     with Image.open(published_attribute) as image:
         assert image.format == "PNG"
         assert image.mode == "RGBA"
@@ -1451,6 +1492,101 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     )
     assert (output / attribute.image_path).is_file()
     assert published_attribute.stat().st_ino == published_inode
+
+
+def test_compactor_publishes_completed_rgb_attribute_as_synthetic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard_id = "shard-000000000-000000999"
+    _write_export_shard(shards, shard_id, sample_id="sample-a")
+    runs_root = (
+        config_module.ALLOWED_WRITABLE_ROOT
+        / "r2v_v3_runs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+    )
+    _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="sample-a",
+        final_selection="completed",
+    )
+    source_attribute = (
+        runs_root
+        / shard_id
+        / "subject_attributes"
+        / "references"
+        / "sample-a"
+        / "a1.png"
+    )
+    source_sha = _file_sha256(source_attribute)
+
+    compact_production_exports(
+        shards_root=shards,
+        source_jsonl=source,
+        source_yaml=source_yaml,
+        runs_root=runs_root,
+    )
+    production = ProductionSample.model_validate_json(
+        (output / "samples.jsonl").read_text(encoding="utf-8")
+    )
+
+    attribute = production.references[1]
+    assert attribute.kind == "attribute"
+    assert attribute.attribute_id == "a1"
+    assert attribute.owner_entity_id == "e1"
+    assert attribute.attribute_type == "hair"
+    assert attribute.source_frame_index == 1
+    assert attribute.synthetic is True
+    published_attribute = output / attribute.image_path
+    assert _file_sha256(published_attribute) == source_sha
+    with Image.open(published_attribute) as image:
+        assert image.format == "PNG"
+        assert image.mode == "RGB"
+
+
+@pytest.mark.parametrize(
+    ("final_selection", "image_mode", "expected_mode"),
+    [
+        ("raw", "RGB", "RGBA"),
+        ("completed", "RGBA", "RGB"),
+    ],
+)
+def test_compactor_rejects_attribute_mode_mismatched_with_final_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_selection: str,
+    image_mode: str,
+    expected_mode: str,
+) -> None:
+    shards, _, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
+    shard_id = "shard-000000000-000000999"
+    _write_export_shard(shards, shard_id, sample_id="sample-a")
+    runs_root = (
+        config_module.ALLOWED_WRITABLE_ROOT
+        / "r2v_v3_runs"
+        / "production"
+        / "jea_motion_v1"
+        / "prod-v1"
+    )
+    _write_enriched_with_attribute(
+        runs_root=runs_root,
+        shard_id=shard_id,
+        sample_id="sample-a",
+        final_selection=final_selection,
+        image_mode=image_mode,
+    )
+
+    with pytest.raises(ValueError, match=rf"must be an {expected_mode} PNG"):
+        compact_production_exports(
+            shards_root=shards,
+            source_jsonl=source,
+            source_yaml=source_yaml,
+            runs_root=runs_root,
+        )
 
 
 def test_compactor_rejects_orphan_enriched_and_missing_attribute(
