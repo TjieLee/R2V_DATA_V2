@@ -50,6 +50,7 @@ def run_backfill(
             output_root=config.resolved_run_root / "subject_attributes",
             max_owners=max_owners,
             overwrite=overwrite,
+            allow_run_local_sidecar=True,
         )
 
 

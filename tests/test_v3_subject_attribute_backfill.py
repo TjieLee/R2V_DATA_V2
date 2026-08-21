@@ -40,6 +40,7 @@ def test_backfill_reuses_visual_run_and_existing_attribute_output(
     assert observed["output_root"] == run_root / "subject_attributes"
     assert observed["max_owners"] is None
     assert observed["overwrite"] is False
+    assert observed["allow_run_local_sidecar"] is True
     assert observed["visible_gpu"] == "7"
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "original"
     assert config.subject_attribute_gme.enabled is False

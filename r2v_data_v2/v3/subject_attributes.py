@@ -2101,7 +2101,11 @@ def _validate_output_root(
     run_root: Path,
     export_root: Path,
     output_root: Path,
+    *,
+    allow_run_local_sidecar: bool = False,
 ) -> None:
+    if not isinstance(allow_run_local_sidecar, bool):
+        raise TypeError("allow_run_local_sidecar must be a boolean")
     writable_root = v3_config_module.ALLOWED_WRITABLE_ROOT.resolve(strict=False)
     resolved_run = run_root.resolve(strict=False)
     resolved_export = export_root.resolve(strict=False)
@@ -2110,7 +2114,13 @@ def _validate_output_root(
         raise ValueError(
             "attribute output_root must be inside /mnt/workspace/litengjie/data"
         )
-    if (
+    if allow_run_local_sidecar:
+        if resolved_output != resolved_run / "subject_attributes":
+            raise ValueError(
+                "run-local attribute output_root must be exactly "
+                "<source_run_root>/subject_attributes"
+            )
+    elif (
         resolved_output == resolved_run
         or resolved_output in resolved_run.parents
         or resolved_run in resolved_output.parents
@@ -2553,6 +2563,7 @@ def run_subject_attribute_enrichment(
     review_client: SubjectAttributeReviewClient | None = None,
     segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     gme_screener: AttributeGmeScreener | None = None,
+    allow_run_local_sidecar: bool = False,
 ) -> dict[str, object]:
     if max_owners is not None and (
         isinstance(max_owners, bool)
@@ -2573,6 +2584,7 @@ def run_subject_attribute_enrichment(
         storage.root,
         effective_config.resolved_export_root,
         output_root,
+        allow_run_local_sidecar=allow_run_local_sidecar,
     )
     output_root.mkdir(parents=True, exist_ok=True)
     if overwrite:

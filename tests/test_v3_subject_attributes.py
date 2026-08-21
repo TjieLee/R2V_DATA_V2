@@ -1818,7 +1818,30 @@ def _source_run_config(
     return config
 
 
-def test_standalone_enrichment_reuses_clip_primitive_and_owner_limit(
+def test_standalone_enrichment_rejects_run_local_outputs_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _source_run_config(tmp_path, monkeypatch)
+    RunStorage(config).initialize(git_commit="visual-source")
+    forbidden_models = SimpleNamespace()
+
+    for output_root in (
+        config.resolved_run_root / "foo",
+        config.resolved_run_root / "subject_attributes",
+    ):
+        with pytest.raises(ValueError, match="separate from source run_root"):
+            subject_attributes.run_subject_attribute_enrichment(
+                config,
+                run_root=config.resolved_run_root,
+                output_root=output_root,
+                discovery_client=forbidden_models,
+                review_client=forbidden_models,
+                segmentation_backend=forbidden_models,
+            )
+
+
+def test_run_local_sidecar_reuses_owner_artifacts_and_reaches_enrichment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1827,7 +1850,7 @@ def test_standalone_enrichment_reuses_clip_primitive_and_owner_limit(
         _clip().model_copy(update={"clip_uid": "clip-a"}),
         _clip().model_copy(update={"clip_uid": "clip-b"}),
     ]
-    output_root = v3_config_module.ALLOWED_WRITABLE_ROOT / "attribute-enrichment"
+    output_root = config.resolved_run_root / "subject_attributes"
     for clip, attribute_type in zip(clips, ("hair", "face"), strict=True):
         artifact = OwnerEnrichmentArtifact(
             sample_id=clip.clip_uid,
@@ -1910,6 +1933,7 @@ def test_standalone_enrichment_reuses_clip_primitive_and_owner_limit(
         discovery_client=forbidden,
         review_client=forbidden,
         segmentation_backend=forbidden,
+        allow_run_local_sidecar=True,
     )
 
     records = [
@@ -1986,11 +2010,40 @@ def test_attribute_output_cannot_overlap_source_run_or_visual_export(
         export_root,
         tmp_path / "attribute-enrichment",
     )
-    with pytest.raises(ValueError, match="source run_root"):
+    for output_root in (run_root / "foo", run_root / "subject_attributes"):
+        with pytest.raises(ValueError, match="source run_root"):
+            subject_attributes._validate_output_root(
+                run_root,
+                export_root,
+                output_root,
+            )
+
+    subject_attributes._validate_output_root(
+        run_root,
+        export_root,
+        run_root / "subject_attributes",
+        allow_run_local_sidecar=True,
+    )
+    for output_root in (
+        run_root / "foo",
+        run_root,
+        export_root,
+        export_root / "subject_attributes",
+    ):
+        with pytest.raises(ValueError, match="must be exactly"):
+            subject_attributes._validate_output_root(
+                run_root,
+                export_root,
+                output_root,
+                allow_run_local_sidecar=True,
+            )
+
+    with pytest.raises(ValueError, match="Visual export_root"):
         subject_attributes._validate_output_root(
             run_root,
-            export_root,
-            run_root / "attributes",
+            run_root / "subject_attributes",
+            run_root / "subject_attributes",
+            allow_run_local_sidecar=True,
         )
     with pytest.raises(ValueError, match="Visual export_root"):
         subject_attributes._validate_output_root(
