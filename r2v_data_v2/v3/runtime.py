@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import json
 import os
+import queue
 import selectors
 import subprocess
 import sys
@@ -527,6 +528,83 @@ class PersistentStageProcess:
             self._stderr = None
 
 
+class PersistentStageProcessPool:
+    """Dispatch whole clips to the next available isolated stage worker."""
+
+    def __init__(
+        self,
+        workers: list[PersistentStageProcess],
+        *,
+        clock: Any = time.monotonic,
+    ) -> None:
+        if not workers:
+            raise ValueError("persistent stage process pool requires workers")
+        devices = [worker.config.cuda_visible_devices for worker in workers]
+        if len(devices) != len(set(devices)):
+            raise ValueError("persistent stage process pool GPUs must be unique")
+        self.workers = tuple(workers)
+        self._available: queue.Queue[PersistentStageProcess] = queue.Queue()
+        self._clock = clock
+        self._state_lock = threading.Lock()
+        self._requests_by_gpu = {device: 0 for device in devices}
+        self._service_seconds_by_gpu = {device: 0.0 for device in devices}
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            raise RuntimeError("persistent stage process pool is already started")
+        started: list[PersistentStageProcess] = []
+        try:
+            for worker in self.workers:
+                worker.start()
+                started.append(worker)
+                self._available.put(worker)
+        except Exception:
+            for worker in reversed(started):
+                worker.terminate()
+            raise
+        self._started = True
+
+    def request(self, clip_uid: str) -> dict[str, object]:
+        if not self._started:
+            raise RuntimeError("persistent stage process pool is not started")
+        worker = self._available.get()
+        device = worker.config.cuda_visible_devices
+        started = float(self._clock())
+        try:
+            return worker.request(clip_uid)
+        finally:
+            service_seconds = max(0.0, float(self._clock()) - started)
+            with self._state_lock:
+                self._requests_by_gpu[device] += 1
+                self._service_seconds_by_gpu[device] += service_seconds
+            self._available.put(worker)
+
+    def performance_counters(self) -> dict[str, object]:
+        with self._state_lock:
+            return {
+                "segment_worker_pool_size": len(self.workers),
+                "segment_worker_requests_by_gpu": dict(self._requests_by_gpu),
+                "segment_worker_service_seconds_by_gpu": dict(
+                    self._service_seconds_by_gpu
+                ),
+            }
+
+    def close(self) -> None:
+        if not self._started:
+            return
+        first_error: BaseException | None = None
+        for worker in reversed(self.workers):
+            try:
+                worker.close()
+            except Exception as exc:  # noqa: BLE001 - close every worker
+                if first_error is None:
+                    first_error = exc
+        self._started = False
+        if first_error is not None:
+            raise first_error
+
+
 def runtime_worker_config(
     config: V3Config,
     *,
@@ -556,4 +634,30 @@ def runtime_worker_config(
             / "logs"
             / f"streaming_{assignment}_worker.stderr.log"
         ),
+    )
+
+
+def runtime_segment_pool_worker_configs(
+    config: V3Config,
+    *,
+    config_path: str | Path,
+    overwrite: bool,
+    profile: bool,
+) -> tuple[StageWorkerConfig, ...]:
+    resolved_config = Path(config_path).expanduser().resolve(strict=True)
+    return tuple(
+        StageWorkerConfig(
+            stage="segment",
+            config_path=resolved_config,
+            cuda_visible_devices=visible,
+            overwrite=overwrite,
+            timeout_seconds=config.runtime.worker_timeout_seconds,
+            profile=profile,
+            stderr_log_path=(
+                config.resolved_run_root
+                / "logs"
+                / f"streaming_segment_gpu{visible}_worker.stderr.log"
+            ),
+        )
+        for visible in config.runtime.gpu_workers.segment_pool
     )

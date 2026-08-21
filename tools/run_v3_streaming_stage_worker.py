@@ -297,7 +297,15 @@ def serve(args: argparse.Namespace) -> int:
     )
     storage = RunStorage(config)
     run = storage.read_run()
-    profiler = V3Profiler(storage.root, git_commit=run.git_commit) if args.profile else None
+    profiler = (
+        V3Profiler(
+            storage.root,
+            git_commit=run.git_commit,
+            qwen_max_inflight=config.runtime.qwen_max_inflight,
+        )
+        if args.profile
+        else None
+    )
     gate = QwenConcurrencyGate(
         config.runtime.qwen_max_inflight,
         lock_directory=storage.root / "profiling" / "qwen_slots",

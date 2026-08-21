@@ -2547,14 +2547,18 @@ def run_subject_attribute_enrichment(
     *,
     run_root: Path,
     output_root: Path,
-    max_owners: int = 50,
+    max_owners: int | None = 50,
     overwrite: bool = False,
     discovery_client: SubjectAttributeDiscoveryClient | None = None,
     review_client: SubjectAttributeReviewClient | None = None,
     segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     gme_screener: AttributeGmeScreener | None = None,
 ) -> dict[str, object]:
-    if isinstance(max_owners, bool) or not isinstance(max_owners, int) or max_owners < 1:
+    if max_owners is not None and (
+        isinstance(max_owners, bool)
+        or not isinstance(max_owners, int)
+        or max_owners < 1
+    ):
         raise ValueError("max_owners must be a positive integer")
     requested_run_root = Path(run_root).expanduser().resolve(strict=False)
     if config.resolved_run_root != requested_run_root:
@@ -2623,7 +2627,7 @@ def run_subject_attribute_enrichment(
     skipped_existing_owners = 0
     try:
         for clip in storage.iter_clips():
-            if processed_owners >= max_owners:
+            if max_owners is not None and processed_owners >= max_owners:
                 break
             result = process_subject_attribute_clip(
                 effective_config,
@@ -2634,7 +2638,11 @@ def run_subject_attribute_enrichment(
                 review_client=review_client,
                 segmentation_backend=segmentation_backend,
                 gme_screener=gme_screener,
-                max_owners=max_owners - processed_owners,
+                max_owners=(
+                    max_owners - processed_owners
+                    if max_owners is not None
+                    else None
+                ),
                 overwrite=False,
             )
             processed_owners += result.totals.eligible_human_owners

@@ -183,6 +183,51 @@ def test_qwen_gate_slot_is_recorded_in_model_profile_metadata(tmp_path: Path) ->
     assert event["metadata"]["qwen_slot"] == 0
 
 
+def test_profiler_aggregates_qwen_gate_wait_inflight_and_slot_usage(
+    tmp_path: Path,
+) -> None:
+    profiler = V3Profiler(
+        tmp_path / "run",
+        git_commit="abc123",
+        qwen_max_inflight=6,
+    )
+    with active_profiler(profiler):
+        for wait, inflight, slot in (
+            (0.0, 1, 0),
+            (0.25, 4, 3),
+            (0.5, 3, 3),
+            (0.75, 5, 5),
+        ):
+            with profile_model_call(
+                component="qwen_annotation",
+                operation="initial",
+                retry_index=0,
+                metadata={
+                    "queue_wait_seconds": wait,
+                    "qwen_inflight": inflight,
+                    "qwen_slot": slot,
+                },
+            ):
+                pass
+
+    summary = profiler.write_summary()
+
+    assert summary["qwen_calls"] == 4
+    assert summary["qwen_gate_wait_seconds_total"] == 1.5
+    assert summary["qwen_gate_wait_seconds_mean"] == 0.375
+    assert summary["qwen_gate_wait_seconds_max"] == 0.75
+    assert summary["qwen_max_local_inflight_observed"] == 5
+    assert summary["qwen_slot_usage"] == {
+        "0": 1,
+        "1": 0,
+        "2": 0,
+        "3": 2,
+        "4": 0,
+        "5": 1,
+    }
+    assert summary["components"]["qwen_annotation"]["calls"] == 4
+
+
 class _Storage:
     roots: ClassVar[list[Path]] = []
 

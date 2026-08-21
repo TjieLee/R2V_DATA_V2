@@ -37,11 +37,13 @@ from r2v_data_v2.v3.profiling import (
 from r2v_data_v2.v3 import subject_attributes
 from r2v_data_v2.v3.runtime import (
     PersistentStageProcess,
+    PersistentStageProcessPool,
     StageWorkerConfig,
     StreamingDAGScheduler,
     StreamingStage,
     streaming_model_stage_enabled,
     runtime_worker_config,
+    runtime_segment_pool_worker_configs,
 )
 from r2v_data_v2.v3.storage import _append_jsonl
 from r2v_data_v2.v3.subject_attributes import QwenSubjectAttributeClient
@@ -95,6 +97,8 @@ def test_runtime_defaults_preserve_legacy_staged_mode(
     assert config.runtime.stage_workers.reference_edit == 1
     assert config.runtime.stage_workers.subject_attributes == 2
     assert config.runtime.gpu_workers.subject_attributes_segment is None
+    assert config.runtime.gpu_workers.segment_pool == ()
+    assert config.runtime.subject_attributes_deferred is False
     assert STAGE_ORDER.index("instruct") < STAGE_ORDER.index("subject_attributes")
     assert STAGE_ORDER.index("subject_attributes") < STAGE_ORDER.index("export")
 
@@ -135,6 +139,42 @@ def test_sam3_compile_is_runtime_only_and_not_visual_identity(
 
     assert config.fingerprint() == changed.fingerprint()
     assert config.model_identifiers() == changed.model_identifiers()
+
+
+def test_segment_pool_gpu_assignment_and_deferred_mode_are_runtime_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    first = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            subject_attributes_deferred=True,
+            stage_workers=replace(
+                config.runtime.stage_workers,
+                segment=2,
+            ),
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                segment_pool=("5", "7"),
+            ),
+        ),
+    )
+    second = replace(
+        first,
+        runtime=replace(
+            first.runtime,
+            subject_attributes_deferred=False,
+            gpu_workers=replace(first.runtime.gpu_workers, segment_pool=("5", "8")),
+        ),
+    )
+    first.validate()
+    second.validate()
+
+    assert first.runtime.sam3_compile_enabled is False
+    assert first.fingerprint() == second.fingerprint()
+    assert first.model_identifiers() == second.model_identifiers()
 
 
 def test_sam3_compile_requires_strict_boolean(
@@ -180,6 +220,7 @@ def test_dedicated_attribute_worker_forces_sam3_eager(
 
     assert main.runtime.sam3_compile_enabled is True
     assert attribute.runtime.sam3_compile_enabled is False
+    assert main.sam3.device == attribute.sam3.device == "cuda"
     config_path = tmp_path / "worker.yaml"
     config_path.write_text("unused: true\n", encoding="utf-8")
     worker = runtime_worker_config(
@@ -824,6 +865,76 @@ def test_streaming_starts_one_persistent_gme_worker_and_shares_colocated_lock(
     assert gme.inference_lock is not None
 
 
+def test_deferred_subject_attributes_start_no_attribute_or_gme_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    config = replace(
+        config,
+        subject_attribute_gme=replace(config.subject_attribute_gme, enabled=True),
+        runtime=replace(
+            config.runtime,
+            mode="streaming_v1",
+            subject_attributes_deferred=True,
+        ),
+    )
+    config.validate()
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+
+    class Storage:
+        root = config.resolved_run_root
+
+        def iter_clips(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(clip_uid="clip-a")]
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "PersistentStageProcess",
+        lambda *_args, **_kwargs: pytest.fail("attribute SAM3 worker started"),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "PersistentGmeAttributeScreener",
+        lambda *_args, **_kwargs: pytest.fail("GME worker started"),
+    )
+
+    result = pipeline_module._run_streaming_pipeline(
+        config_path=config_path,
+        config=config,
+        storage=Storage(),  # type: ignore[arg-type]
+        ordered_stages=("subject_attributes",),
+        overwrite=False,
+        profiler=None,
+        results={},
+        annotation_client=None,
+        frame_decoder=None,
+        segmentation_backend=None,
+        instruction_client=None,
+        background_removal_backend=None,
+        background_removal_judge=None,
+        entity_reference_judge=None,
+        cross_pair_judge=None,
+        background_final_judge=None,
+        reference_completion_backend=None,
+        reference_completion_judge=None,
+        reference_edit_backend=None,
+        reference_edit_judge=None,
+        reference_edit_sam_reviewer=None,
+        reference_integrity_judge=None,
+        subject_attribute_discovery_client=None,
+        subject_attribute_review_client=None,
+        attribute_segmentation_backend=None,
+        attribute_gme_screener=None,
+        profile=False,
+    )
+
+    assert result["subject_attributes"] == {"deferred": True}
+    assert result["deferred_stages"] == ["subject_attributes"]
+    assert result["completed_stages"] == []
+
+
 def test_dag_overlaps_different_clips_but_never_same_clip_writers() -> None:
     active_by_clip: dict[str, int] = {}
     maximum_by_clip: dict[str, int] = {}
@@ -1232,6 +1343,99 @@ for line in sys.stdin:
     assert len(masks) == 1
     assert np.array_equal(masks[0], np.array([[True, False], [False, False]]))
     assert worker.starts == 1
+
+
+def test_segment_pool_builds_two_isolated_cuda_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            stage_workers=replace(config.runtime.stage_workers, segment=2),
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                segment_pool=("5", "7"),
+            ),
+        ),
+    )
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+
+    workers = runtime_segment_pool_worker_configs(
+        config,
+        config_path=config_path,
+        overwrite=False,
+        profile=True,
+    )
+
+    assert len(workers) == 2
+    assert [worker.cuda_visible_devices for worker in workers] == ["5", "7"]
+    assert all(worker.stage == "segment" for worker in workers)
+    assert all(worker.attribute_probe_only is False for worker in workers)
+
+
+def test_segment_pool_dispatches_to_available_worker_without_overlap() -> None:
+    state_lock = threading.Lock()
+    active: dict[str, int] = {"5": 0, "7": 0}
+    maximum: dict[str, int] = {"5": 0, "7": 0}
+    requests: dict[str, list[str]] = {"5": [], "7": []}
+
+    class Worker:
+        def __init__(self, gpu: str, delay: float) -> None:
+            self.config = SimpleNamespace(cuda_visible_devices=gpu)
+            self.delay = delay
+            self.starts = 0
+            self.closes = 0
+
+        def start(self) -> None:
+            self.starts += 1
+
+        def terminate(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closes += 1
+
+        def request(self, clip_uid: str) -> dict[str, object]:
+            gpu = self.config.cuda_visible_devices
+            with state_lock:
+                active[gpu] += 1
+                maximum[gpu] = max(maximum[gpu], active[gpu])
+                requests[gpu].append(clip_uid)
+            try:
+                time.sleep(self.delay)
+                return {"processed": 1}
+            finally:
+                with state_lock:
+                    active[gpu] -= 1
+
+    slow = Worker("5", 0.12)
+    fast = Worker("7", 0.02)
+    pool = PersistentStageProcessPool([slow, fast])  # type: ignore[list-item]
+    pool.start()
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(pool.request, clip_uid)
+            for clip_uid in ("clip-a", "clip-b", "clip-c")
+        ]
+        assert [future.result() for future in futures] == [
+            {"processed": 1},
+            {"processed": 1},
+            {"processed": 1},
+        ]
+    counters = pool.performance_counters()
+    pool.close()
+
+    assert slow.starts == fast.starts == 1
+    assert slow.closes == fast.closes == 1
+    assert maximum == {"5": 1, "7": 1}
+    assert len(requests["5"]) == 1
+    assert len(requests["7"]) == 2
+    assert counters["segment_worker_pool_size"] == 2
+    assert counters["segment_worker_requests_by_gpu"] == {"5": 1, "7": 2}
 
 
 def test_main_segment_and_attribute_probe_share_one_request_lock(

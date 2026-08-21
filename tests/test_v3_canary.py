@@ -330,6 +330,140 @@ def test_sam3_compile_flag_changes_only_isolated_canary_runtime(
     assert load_config(paths.shard_config).runtime.sam3_compile_enabled is True
 
 
+def test_dual_sam3_and_qwen_overrides_change_only_isolated_canary_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        monkeypatch,
+        groups=[("movie-a", "目录/源视频.mkv", 2)],
+    )
+    selection = select_source_records(**_selection_arguments(fixture), count=2)
+    base_before = fixture["base_config"].read_bytes()
+    base_config = load_config(fixture["base_config"])
+    paths = build_canary_paths(
+        selection,
+        count=2,
+        now=datetime(2026, 8, 20, 15, 0, 3, tzinfo=timezone.utc),
+    )
+
+    prepare_canary_artifacts(
+        selection=selection,
+        paths=paths,
+        base_config=fixture["base_config"],
+        dual_main_sam3=True,
+        defer_subject_attributes=True,
+        qwen_max_inflight=8,
+        qwen_stage_workers=4,
+        **_selection_arguments(fixture),
+    )
+
+    generated = load_config(paths.shard_config)
+    assert fixture["base_config"].read_bytes() == base_before
+    assert generated.runtime.gpu_workers.segment_pool == ("5", "7")
+    assert generated.runtime.stage_workers.segment == 2
+    assert generated.runtime.sam3_compile_enabled is False
+    assert generated.runtime.subject_attributes_deferred is True
+    assert generated.runtime.qwen_max_inflight == 8
+    assert generated.runtime.stage_workers.annotate == 4
+    assert generated.runtime.stage_workers.pair == 4
+    assert generated.runtime.stage_workers.reference_integrity == 4
+    assert generated.runtime.stage_workers.instruct == 4
+    assert generated.runtime.stage_workers.subject_attributes == (
+        base_config.runtime.stage_workers.subject_attributes
+    )
+    for stage in ("frames", "rank", "background", "remove", "reference_edit"):
+        assert getattr(generated.runtime.stage_workers, stage) == getattr(
+            base_config.runtime.stage_workers, stage
+        )
+    assert generated.subject_attribute_gme == base_config.subject_attribute_gme
+
+    inline_paths = build_canary_paths(
+        selection,
+        count=2,
+        now=datetime(2026, 8, 20, 15, 0, 4, tzinfo=timezone.utc),
+    )
+    prepare_canary_artifacts(
+        selection=selection,
+        paths=inline_paths,
+        base_config=fixture["base_config"],
+        qwen_stage_workers=4,
+        **_selection_arguments(fixture),
+    )
+    inline = load_config(inline_paths.shard_config)
+    assert inline.runtime.stage_workers.subject_attributes == 4
+    assert inline.runtime.stage_workers.segment == 1
+    assert inline.runtime.gpu_workers.segment_pool == ()
+
+
+def test_dual_main_sam3_requires_deferred_attributes_before_source_access() -> None:
+    with pytest.raises(
+        ValueError,
+        match="--dual-main-sam3 requires --defer-subject-attributes",
+    ):
+        run_canary(dual_main_sam3=True)
+
+
+def test_deferred_canary_reports_zero_canonical_attributes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        monkeypatch,
+        groups=[("movie-a", "目录/源视频.mkv", 1)],
+    )
+
+    def pipeline(
+        command: list[str],
+        *,
+        log_path: Path,
+        **_kwargs: object,
+    ) -> PipelineExecution:
+        config = load_config(Path(command[command.index("--config") + 1]))
+        config.export_root.mkdir(parents=True)
+        (config.export_root / "dataset.json").write_text(
+            json.dumps({"sample_count": 1, "reference_count": 1}),
+            encoding="utf-8",
+        )
+        (config.export_root / "samples.jsonl").write_text("", encoding="utf-8")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("ok\n", encoding="utf-8")
+        return PipelineExecution(
+            returncode=0,
+            output="{}\n",
+            result={
+                "runtime": {"failed_tasks": []},
+                "subject_attributes": {"deferred": True},
+            },
+        )
+
+    def compact(**kwargs: object) -> dict[str, object]:
+        output = Path(str(kwargs["output_root"]))
+        (output / "samples.jsonl").write_text("", encoding="utf-8")
+        (output / "references").mkdir()
+        return {
+            "total_samples": 1,
+            "total_visual_references": 1,
+            "total_attribute_references": 0,
+            "total_enriched_samples": 0,
+        }
+
+    summary = run_canary(
+        **_selection_arguments(fixture),
+        base_config=fixture["base_config"],
+        count=1,
+        now=datetime(2026, 8, 20, 15, 0, 5, tzinfo=timezone.utc),
+        pipeline_runner=pipeline,
+        compactor=compact,
+        defer_subject_attributes=True,
+    )
+
+    assert summary["subject_attributes_deferred"] is True
+    assert summary["canonical_attribute_references"] == 0
+
+
 def test_pipeline_failure_prevents_compaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -444,6 +578,21 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
         )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("pipeline passed\n", encoding="utf-8")
+        profiling = config.resolved_run_root / "profiling"
+        profiling.mkdir(parents=True)
+        (profiling / "summary.json").write_text(
+            json.dumps(
+                {
+                    "qwen_calls": 9,
+                    "qwen_gate_wait_seconds_total": 1.8,
+                    "qwen_gate_wait_seconds_mean": 0.2,
+                    "qwen_gate_wait_seconds_max": 0.7,
+                    "qwen_max_local_inflight_observed": 4,
+                    "qwen_slot_usage": {"0": 3, "1": 2, "2": 2, "3": 2},
+                }
+            ),
+            encoding="utf-8",
+        )
         return PipelineExecution(
             returncode=0,
             output="{}\n",
@@ -461,6 +610,12 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
                     "sam3_segment_entities": 3,
                     "first_segment_clip_seconds": 6.0,
                     "steady_state_segment_mean_seconds": 2.0,
+                    "segment_worker_pool_size": 2,
+                    "segment_worker_requests_by_gpu": {"5": 1, "7": 1},
+                    "segment_worker_service_seconds_by_gpu": {
+                        "5": 7.0,
+                        "7": 6.0,
+                    },
                 },
                 "remove": {
                     "candidates_generated": 3,
@@ -533,6 +688,14 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
     assert summary["sam3_segment_entities"] == 3
     assert summary["first_segment_clip_seconds"] == 6.0
     assert summary["steady_state_segment_mean_seconds"] == 2.0
+    assert summary["segment_worker_pool_size"] == 2
+    assert summary["segment_worker_requests_by_gpu"] == {"5": 1, "7": 1}
+    assert summary["qwen_calls"] == 9
+    assert summary["qwen_gate_wait_seconds_total"] == 1.8
+    assert summary["qwen_gate_wait_seconds_mean"] == 0.2
+    assert summary["qwen_gate_wait_seconds_max"] == 0.7
+    assert summary["qwen_max_local_inflight_observed"] == 4
+    assert summary["qwen_slot_usage"] == {"0": 3, "1": 2, "2": 2, "3": 2}
     assert summary["visual_samples"] == 1
     assert summary["visual_references"] == 2
     assert summary["visual_background_references"] == 1

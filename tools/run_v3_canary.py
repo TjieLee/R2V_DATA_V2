@@ -298,6 +298,10 @@ def _canary_config_bytes(
     source_jsonl: Path,
     paths: CanaryPaths,
     sam3_compile: bool = False,
+    dual_main_sam3: bool = False,
+    defer_subject_attributes: bool = False,
+    qwen_max_inflight: int | None = None,
+    qwen_stage_workers: int | None = None,
 ) -> bytes:
     value = dict(base)
     source = dict(value.get("source") or {})
@@ -312,6 +316,28 @@ def _canary_config_bytes(
     )
     runtime = dict(value.get("runtime") or {})
     runtime["sam3_compile_enabled"] = sam3_compile
+    runtime["subject_attributes_deferred"] = defer_subject_attributes
+    stage_workers = dict(runtime.get("stage_workers") or {})
+    gpu_workers = dict(runtime.get("gpu_workers") or {})
+    if dual_main_sam3:
+        gpu_workers["segment_pool"] = ["5", "7"]
+        stage_workers["segment"] = 2
+        runtime["sam3_compile_enabled"] = False
+    if qwen_max_inflight is not None:
+        runtime["qwen_max_inflight"] = qwen_max_inflight
+    if qwen_stage_workers is not None:
+        qwen_stages = (
+            "annotate",
+            "pair",
+            "reference_integrity",
+            "instruct",
+        )
+        for stage in qwen_stages:
+            stage_workers[stage] = qwen_stage_workers
+        if not defer_subject_attributes:
+            stage_workers["subject_attributes"] = qwen_stage_workers
+    runtime["stage_workers"] = stage_workers
+    runtime["gpu_workers"] = gpu_workers
     value.update(
         {
             "dataset_json": str(source_jsonl),
@@ -333,6 +359,10 @@ def prepare_canary_artifacts(
     source_videos_root: str | Path,
     base_config: str | Path,
     sam3_compile: bool = False,
+    dual_main_sam3: bool = False,
+    defer_subject_attributes: bool = False,
+    qwen_max_inflight: int | None = None,
+    qwen_stage_workers: int | None = None,
 ) -> None:
     source_path = _resolve_source_jsonl(source_jsonl)
     base_path = Path(base_config).expanduser().resolve(strict=True)
@@ -369,6 +399,10 @@ def prepare_canary_artifacts(
             source_jsonl=source_path,
             paths=paths,
             sam3_compile=sam3_compile,
+            dual_main_sam3=dual_main_sam3,
+            defer_subject_attributes=defer_subject_attributes,
+            qwen_max_inflight=qwen_max_inflight,
+            qwen_stage_workers=qwen_stage_workers,
         ),
     )
     load_config(paths.shard_config)
@@ -502,6 +536,7 @@ def _print_summary(summary: dict[str, object]) -> None:
         "selected_source_video",
         "selected_source_indices",
         "input_clips",
+        "subject_attributes_deferred",
         "elapsed_seconds",
         "elapsed_hms",
         "sam3_compile_requested",
@@ -515,6 +550,15 @@ def _print_summary(summary: dict[str, object]) -> None:
         "sam3_segment_entities",
         "first_segment_clip_seconds",
         "steady_state_segment_mean_seconds",
+        "segment_worker_pool_size",
+        "segment_worker_requests_by_gpu",
+        "segment_worker_service_seconds_by_gpu",
+        "qwen_calls",
+        "qwen_gate_wait_seconds_total",
+        "qwen_gate_wait_seconds_mean",
+        "qwen_gate_wait_seconds_max",
+        "qwen_max_local_inflight_observed",
+        "qwen_slot_usage",
         "visual_samples",
         "visual_references",
         "visual_background_references",
@@ -633,6 +677,14 @@ def _subject_attribute_metric(
     return value
 
 
+def _profiling_summary(run_root: Path) -> dict[str, object]:
+    path = run_root / "profiling" / "summary.json"
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    return value if isinstance(value, dict) else {}
+
+
 def run_canary(
     *,
     source_jsonl: str | Path = DEFAULT_SOURCE_JSONL,
@@ -647,7 +699,25 @@ def run_canary(
     compactor: Compactor = compact_production_exports,
     clock: Callable[[], float] = time.monotonic,
     sam3_compile: bool = False,
+    dual_main_sam3: bool = False,
+    defer_subject_attributes: bool = False,
+    qwen_max_inflight: int | None = None,
+    qwen_stage_workers: int | None = None,
 ) -> dict[str, object]:
+    for name, value in (
+        ("qwen_max_inflight", qwen_max_inflight),
+        ("qwen_stage_workers", qwen_stage_workers),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer")
+    if dual_main_sam3 and not defer_subject_attributes:
+        raise ValueError(
+            "--dual-main-sam3 requires --defer-subject-attributes"
+        )
+    if dual_main_sam3 and sam3_compile:
+        raise ValueError("--dual-main-sam3 cannot be combined with --sam3-compile")
     selection = select_source_records(
         source_jsonl=source_jsonl,
         clips_root=clips_root,
@@ -670,6 +740,10 @@ def run_canary(
         source_videos_root=source_videos_root,
         base_config=base_config,
         sam3_compile=sam3_compile,
+        dual_main_sam3=dual_main_sam3,
+        defer_subject_attributes=defer_subject_attributes,
+        qwen_max_inflight=qwen_max_inflight,
+        qwen_stage_workers=qwen_stage_workers,
     )
     git_commit = _git_commit()
     _print_selection(selection=selection, paths=paths, git_commit=git_commit)
@@ -707,6 +781,12 @@ def run_canary(
         source_yaml=paths.source_yaml,
         runs_root=paths.canary_runs_root,
     )
+    canonical_attribute_references = int(catalog["total_attribute_references"])
+    if defer_subject_attributes and canonical_attribute_references != 0:
+        raise RuntimeError(
+            "deferred subject-attribute canary unexpectedly produced attributes"
+        )
+    profiling = _profiling_summary(paths.run_root)
     visual_background_references, _ = _background_counts(
         paths.shard_export_root / "samples.jsonl",
         kind_field="type",
@@ -725,6 +805,7 @@ def run_canary(
         "selected_source_video": str(selection.source_video),
         "selected_source_indices": f"{selection.start_index}-{selection.end_index}",
         "input_clips": len(selection.records),
+        "subject_attributes_deferred": defer_subject_attributes,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "elapsed_hms": _elapsed_hms(elapsed_seconds),
         "sam3_compile_requested": _stage_metric(
@@ -793,15 +874,45 @@ def run_canary(
             field="steady_state_segment_mean_seconds",
             default=0.0,
         ),
+        "segment_worker_pool_size": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="segment_worker_pool_size",
+            default=1,
+        ),
+        "segment_worker_requests_by_gpu": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="segment_worker_requests_by_gpu",
+            default={},
+        ),
+        "segment_worker_service_seconds_by_gpu": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="segment_worker_service_seconds_by_gpu",
+            default={},
+        ),
+        "qwen_calls": profiling.get("qwen_calls", 0),
+        "qwen_gate_wait_seconds_total": profiling.get(
+            "qwen_gate_wait_seconds_total", 0.0
+        ),
+        "qwen_gate_wait_seconds_mean": profiling.get(
+            "qwen_gate_wait_seconds_mean", 0.0
+        ),
+        "qwen_gate_wait_seconds_max": profiling.get(
+            "qwen_gate_wait_seconds_max", 0.0
+        ),
+        "qwen_max_local_inflight_observed": profiling.get(
+            "qwen_max_local_inflight_observed", 0
+        ),
+        "qwen_slot_usage": profiling.get("qwen_slot_usage", {}),
         "visual_samples": int(shard_dataset["sample_count"]),
         "visual_references": int(shard_dataset["reference_count"]),
         "visual_background_references": visual_background_references,
         "canonical_samples": int(catalog["total_samples"]),
         "canonical_visual_references": int(catalog["total_visual_references"]),
         "canonical_background_references": canonical_background_references,
-        "canonical_attribute_references": int(
-            catalog["total_attribute_references"]
-        ),
+        "canonical_attribute_references": canonical_attribute_references,
         "samples_with_background": samples_with_background,
         "enriched_samples": int(catalog["total_enriched_samples"]),
         "remove_candidates_generated": _stage_count(
@@ -880,6 +991,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--base-config", type=Path, default=DEFAULT_BASE_CONFIG)
     parser.add_argument("--sam3-compile", action="store_true")
+    parser.add_argument("--dual-main-sam3", action="store_true")
+    parser.add_argument("--defer-subject-attributes", action="store_true")
+    parser.add_argument("--qwen-max-inflight", type=int)
+    parser.add_argument("--qwen-stage-workers", type=int)
     return parser
 
 
@@ -895,6 +1010,10 @@ def main() -> None:
             exclude_source_names=args.exclude_source_name,
             source_video=args.source_video,
             sam3_compile=args.sam3_compile,
+            dual_main_sam3=args.dual_main_sam3,
+            defer_subject_attributes=args.defer_subject_attributes,
+            qwen_max_inflight=args.qwen_max_inflight,
+            qwen_stage_workers=args.qwen_stage_workers,
         )
     except CanaryPipelineError as exc:
         raise SystemExit(exc.returncode if exc.returncode > 0 else 1) from exc

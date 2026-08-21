@@ -238,6 +238,7 @@ class RuntimeStageWorkersConfig:
 @dataclass(frozen=True)
 class RuntimeGpuWorkersConfig:
     segment: str | None = None
+    segment_pool: tuple[str, ...] = ()
     subject_attributes_segment: str | None = None
     subject_attributes_gme: str | None = None
     remove: str | None = None
@@ -251,6 +252,7 @@ class RuntimeConfig:
     cpu_workers: int = 8
     worker_timeout_seconds: int = 3600
     sam3_compile_enabled: bool = False
+    subject_attributes_deferred: bool = False
     stage_workers: RuntimeStageWorkersConfig = field(
         default_factory=RuntimeStageWorkersConfig
     )
@@ -787,7 +789,7 @@ class V3Config:
         ):
             if not isinstance(path, Path):
                 raise TypeError(f"subject_attribute_gme.{name} must be a pathlib.Path")
-        if gme.enabled:
+        if gme.enabled and not self.runtime.subject_attributes_deferred:
             for name, path in (
                 ("python_executable", gme.python_executable),
                 ("model_path", gme.model_path),
@@ -815,6 +817,8 @@ class V3Config:
             raise ValueError("runtime.mode must be staged_legacy or streaming_v1")
         if not isinstance(self.runtime.sam3_compile_enabled, bool):
             raise TypeError("runtime.sam3_compile_enabled must be a boolean")
+        if not isinstance(self.runtime.subject_attributes_deferred, bool):
+            raise TypeError("runtime.subject_attributes_deferred must be a boolean")
         for name, value in (
             ("qwen_max_inflight", self.runtime.qwen_max_inflight),
             ("cpu_workers", self.runtime.cpu_workers),
@@ -827,13 +831,44 @@ class V3Config:
                 raise ValueError(
                     f"runtime.stage_workers.{name} must be a positive integer"
                 )
-        for stage in ("segment", "remove", "reference_edit"):
+        segment_pool = self.runtime.gpu_workers.segment_pool
+        if not isinstance(segment_pool, tuple):
+            raise TypeError("runtime.gpu_workers.segment_pool must be a list")
+        if len(segment_pool) != len(set(segment_pool)):
+            raise ValueError("runtime.gpu_workers.segment_pool must be unique")
+        for index, visible in enumerate(segment_pool):
+            if (
+                not isinstance(visible, str)
+                or not visible.isdigit()
+                or int(visible) < 0
+            ):
+                raise ValueError(
+                    "runtime.gpu_workers.segment_pool entries must be physical "
+                    f"CUDA indices; invalid entry at index {index}"
+                )
+        segment_workers = self.runtime.stage_workers.segment
+        if segment_pool:
+            if segment_workers < len(segment_pool):
+                raise ValueError(
+                    "runtime.stage_workers.segment must be at least the "
+                    "runtime.gpu_workers.segment_pool size"
+                )
+            if self.runtime.sam3_compile_enabled:
+                raise ValueError("segment_pool supports eager SAM3 only")
+        elif segment_workers != 1:
+            raise ValueError(
+                "runtime.stage_workers.segment must be 1 when segment_pool is "
+                "empty to avoid duplicate GPU model copies"
+            )
+        for stage in ("remove", "reference_edit"):
             if getattr(self.runtime.stage_workers, stage) != 1:
                 raise ValueError(
                     f"runtime.stage_workers.{stage} must be 1 to avoid duplicate "
                     "GPU model copies"
                 )
         for stage, visible in asdict(self.runtime.gpu_workers).items():
+            if stage == "segment_pool":
+                continue
             if visible is not None and (
                 not isinstance(visible, str)
                 or not visible.isdigit()
@@ -998,6 +1033,7 @@ class V3Config:
         visual_stage_workers = asdict(self.runtime.stage_workers)
         visual_stage_workers.pop("subject_attributes", None)
         visual_gpu_workers = asdict(self.runtime.gpu_workers)
+        visual_gpu_workers.pop("segment_pool", None)
         visual_gpu_workers.pop("subject_attributes_segment", None)
         visual_gpu_workers.pop("subject_attributes_gme", None)
         identifiers: dict[str, str | None] = {
@@ -1074,11 +1110,13 @@ class V3Config:
         runtime = value.get("runtime")
         if isinstance(runtime, dict):
             runtime.pop("sam3_compile_enabled", None)
+            runtime.pop("subject_attributes_deferred", None)
             stage_workers = runtime.get("stage_workers")
             if isinstance(stage_workers, dict):
                 stage_workers.pop("subject_attributes", None)
             gpu_workers = runtime.get("gpu_workers")
             if isinstance(gpu_workers, dict):
+                gpu_workers.pop("segment_pool", None)
                 gpu_workers.pop("subject_attributes_segment", None)
                 gpu_workers.pop("subject_attributes_gme", None)
         gme = value.get("subject_attribute_gme")
@@ -1266,9 +1304,18 @@ def load_config(path: str | Path) -> V3Config:
         _mapping(runtime_values.pop("stage_workers", None), "runtime.stage_workers"),
         "runtime.stage_workers",
     )
+    runtime_gpu_values = _mapping(
+        runtime_values.pop("gpu_workers", None),
+        "runtime.gpu_workers",
+    )
+    if "segment_pool" in runtime_gpu_values:
+        segment_pool = runtime_gpu_values["segment_pool"]
+        if not isinstance(segment_pool, list):
+            raise TypeError("runtime.gpu_workers.segment_pool must be a list")
+        runtime_gpu_values["segment_pool"] = tuple(segment_pool)
     runtime_gpu_workers = _build(
         RuntimeGpuWorkersConfig,
-        _mapping(runtime_values.pop("gpu_workers", None), "runtime.gpu_workers"),
+        runtime_gpu_values,
         "runtime.gpu_workers",
     )
     pair_values = _mapping(raw.get("pair"), "pair")

@@ -212,12 +212,20 @@ class V3Profiler:
         *,
         git_commit: str,
         clock: Any = time.monotonic,
+        qwen_max_inflight: int | None = None,
     ) -> None:
+        if qwen_max_inflight is not None and (
+            not isinstance(qwen_max_inflight, int)
+            or isinstance(qwen_max_inflight, bool)
+            or qwen_max_inflight < 1
+        ):
+            raise ValueError("qwen_max_inflight must be a positive integer")
         self.run_root = Path(run_root).expanduser().resolve(strict=False)
         self.directory = self.run_root / "profiling"
         self.events_path = self.directory / "events.jsonl"
         self.summary_path = self.directory / "summary.json"
         self.git_commit = git_commit
+        self.qwen_max_inflight = qwen_max_inflight
         self._clock = clock
         self._started = float(clock())
         self._thread_lock = threading.Lock()
@@ -382,6 +390,41 @@ class V3Profiler:
             }
         return summary
 
+    def _qwen_gate_summary(self) -> dict[str, object]:
+        waits: list[float] = []
+        inflight: list[int] = []
+        slot_usage = {
+            str(slot): 0 for slot in range(self.qwen_max_inflight or 0)
+        }
+        for event in self._events:
+            if event.get("kind") != "model_call":
+                continue
+            metadata = event.get("metadata")
+            if not isinstance(metadata, Mapping):
+                continue
+            wait = metadata.get("queue_wait_seconds")
+            observed_inflight = metadata.get("qwen_inflight")
+            slot = metadata.get("qwen_slot")
+            if isinstance(wait, (int, float)) and not isinstance(wait, bool):
+                waits.append(max(0.0, float(wait)))
+            if isinstance(observed_inflight, int) and not isinstance(
+                observed_inflight, bool
+            ):
+                inflight.append(observed_inflight)
+            if isinstance(slot, int) and not isinstance(slot, bool) and slot >= 0:
+                key = str(slot)
+                slot_usage[key] = slot_usage.get(key, 0) + 1
+        return {
+            "qwen_calls": len(waits),
+            "qwen_gate_wait_seconds_total": sum(waits),
+            "qwen_gate_wait_seconds_mean": (
+                sum(waits) / len(waits) if waits else 0.0
+            ),
+            "qwen_gate_wait_seconds_max": max(waits) if waits else 0.0,
+            "qwen_max_local_inflight_observed": max(inflight) if inflight else 0,
+            "qwen_slot_usage": slot_usage,
+        }
+
     def write_summary(self) -> dict[str, object]:
         elapsed = float(self._clock()) - self._started
         if not math.isfinite(elapsed) or elapsed < 0:
@@ -442,12 +485,14 @@ class V3Profiler:
             for stage, item in runtime_stages.items()
             if stage in {"segment", "remove", "reference_edit"}
         }
+        qwen_summary = self._qwen_gate_summary()
         summary: dict[str, object] = {
             "schema_version": 1,
             "git_commit": self.git_commit,
             "total_profiled_seconds": self._previous_profiled_seconds + elapsed,
             "stages": self._stage_summary(),
             "components": self._component_summary(),
+            **qwen_summary,
             "runtime": {
                 "stages": runtime_stages,
                 "critical_bottleneck": bottleneck,

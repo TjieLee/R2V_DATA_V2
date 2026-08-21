@@ -46,9 +46,11 @@ from r2v_data_v2.v3.remove import remove_backgrounds
 from r2v_data_v2.v3.runtime import (
     ClipScopedStorage,
     PersistentStageProcess,
+    PersistentStageProcessPool,
     StreamingDAGScheduler,
     StreamingStage,
     runtime_worker_config,
+    runtime_segment_pool_worker_configs,
     streaming_model_stage_enabled,
 )
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
@@ -128,7 +130,7 @@ def _streaming_stage_handler(
     storage: RunStorage,
     overwrite: bool,
     shared_write_lock: threading.Lock,
-    process: PersistentStageProcess | None,
+    process: PersistentStageProcess | PersistentStageProcessPool | None,
     annotation_client: AnnotationClient | None,
     frame_decoder: FrameDecoder | None,
     segmentation_backend: SegmentationBackend | None,
@@ -301,8 +303,18 @@ def _run_streaming_pipeline(
         with profile_stage("manifest") as stage_profile:
             results["manifest"] = build_manifest(config, storage).to_dict()
             stage_profile.set_counters(results["manifest"])
+    deferred_subject_attributes = (
+        config.runtime.subject_attributes_deferred
+        and "subject_attributes" in ordered_stages
+    )
+    if deferred_subject_attributes:
+        results["subject_attributes"] = {"deferred": True}
+        results["deferred_stages"] = ["subject_attributes"]
     clip_stages = [
-        stage for stage in ordered_stages if stage not in {"manifest", "export"}
+        stage
+        for stage in ordered_stages
+        if stage not in {"manifest", "export"}
+        and not (stage == "subject_attributes" and deferred_subject_attributes)
     ]
     clip_uids = [clip.clip_uid for clip in storage.iter_clips()]
     if clip_stages and not clip_uids:
@@ -310,7 +322,11 @@ def _run_streaming_pipeline(
             "streaming stages require manifest to create clip.json records first"
         )
     shared_write_lock = threading.Lock()
-    processes: dict[str, PersistentStageProcess] = {}
+    processes: dict[
+        str,
+        PersistentStageProcess | PersistentStageProcessPool,
+    ] = {}
+    segment_pool: PersistentStageProcessPool | None = None
     with ExitStack() as stack:
         if "reference_edit" in clip_stages and reference_edit_backend is not None:
             starter = getattr(reference_edit_backend, "start", None)
@@ -347,6 +363,21 @@ def _run_streaming_pipeline(
                 or injected is not None
                 or not streaming_model_stage_enabled(config, stage)
             ):
+                continue
+            if stage == "segment" and config.runtime.gpu_workers.segment_pool:
+                workers = [
+                    PersistentStageProcess(worker_config)
+                    for worker_config in runtime_segment_pool_worker_configs(
+                        config,
+                        config_path=config_path,
+                        overwrite=overwrite,
+                        profile=profile,
+                    )
+                ]
+                segment_pool = PersistentStageProcessPool(workers)
+                segment_pool.start()
+                processes[stage] = segment_pool
+                stack.callback(segment_pool.close)
                 continue
             worker = PersistentStageProcess(
                 runtime_worker_config(
@@ -440,6 +471,11 @@ def _run_streaming_pipeline(
                         "subject attributes require the persistent segment worker "
                         "or an injected attribute segmentation backend"
                     )
+                if isinstance(segment_process, PersistentStageProcessPool):
+                    raise ValueError(
+                        "segment_pool requires deferred subject attributes or a "
+                        "dedicated subject_attributes_segment worker"
+                    )
                 attribute_segmentation_backend = (
                     PersistentWorkerAttributeFrameSegmenter(
                         storage,
@@ -496,6 +532,10 @@ def _run_streaming_pipeline(
                 cpu_workers=config.runtime.cpu_workers,
                 profiler=profiler,
             ).run(clip_uids)
+            if segment_pool is not None and "segment" in runtime_result.stage_counts:
+                runtime_result.stage_counts["segment"].update(
+                    segment_pool.performance_counters()
+                )
             for stage in clip_stages:
                 counts = runtime_result.stage_counts[stage]
                 integer_counts = {
@@ -531,7 +571,11 @@ def _run_streaming_pipeline(
             dataset = DatasetExporter(config, storage).export(overwrite=overwrite)
             results["export"] = dataset.model_dump(mode="json")
             stage_profile.set_counters(results["export"])
-    results["completed_stages"] = list(ordered_stages)
+    results["completed_stages"] = [
+        stage
+        for stage in ordered_stages
+        if not (stage == "subject_attributes" and deferred_subject_attributes)
+    ]
     return results
 
 
@@ -583,7 +627,19 @@ def run_pipeline_v3(
         raise ValueError("subject_attributes is available only in streaming_v1")
     storage = RunStorage(config)
     run = storage.initialize(git_commit=git_commit or _git_commit())
-    profiler = V3Profiler(storage.root, git_commit=run.git_commit) if profile else None
+    profiler = (
+        V3Profiler(
+            storage.root,
+            git_commit=run.git_commit,
+            qwen_max_inflight=getattr(
+                getattr(config, "runtime", None),
+                "qwen_max_inflight",
+                None,
+            ),
+        )
+        if profile
+        else None
+    )
     results: dict[str, object] = {
         "run": {
             "run_id": run.run_id,

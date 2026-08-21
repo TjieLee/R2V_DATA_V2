@@ -717,6 +717,62 @@ report exposes exact masks and IoU, status/reason, provenance, coverage,
 references, pairing, and retained entity sets. Do not call the runs equivalent
 unless `all_exact` is true.
 
+### Dual eager SAM3 and Qwen saturation A/B
+
+Production defaults remain one eager main SAM3 worker, inline subject
+attributes, and the configured `runtime.qwen_max_inflight`. The following
+controls modify only the isolated canary config:
+
+- `--dual-main-sam3` starts independent main-SAM3 processes on physical GPUs
+  5 and 7 and sets `runtime.stage_workers.segment: 2`;
+- `--defer-subject-attributes` omits inline attribute work and leaves GPU7 free
+  for main SAM3;
+- `--qwen-max-inflight N` changes only the Qwen gate capacity;
+- `--qwen-stage-workers N` changes only annotate, pair,
+  reference-integrity, instruct, and, when not deferred, subject-attributes
+  workers.
+
+Dual main SAM3 requires deferred attributes and remains eager. Each process
+uses worker-local `sam3.device: cuda`; physical selection comes only from
+`CUDA_VISIBLE_DEVICES`. No predictor or session state is shared.
+
+20-clip tests using one identical source range:
+
+```bash
+# TEST A: single main SAM3, deferred attributes, Qwen inflight 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --defer-subject-attributes --qwen-max-inflight 4
+
+# TEST B: dual main SAM3, deferred attributes, Qwen inflight 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4
+
+# TEST C: dual main SAM3, deferred attributes, Qwen inflight 8 and stage workers 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 8 --qwen-stage-workers 4
+```
+
+Recommended 100-clip B/C comparison:
+
+```bash
+.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4
+.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 8 --qwen-stage-workers 4
+```
+
+After the Visual phase completes, run the resumable attribute backfill using
+the exact generated run config:
+
+```bash
+.venv/bin/python tools/run_v3_subject_attribute_backfill.py --config RUN_CONFIG.yaml
+```
+
+The backfill writes the existing `run_root/subject_attributes` sidecars and
+uses `runtime.gpu_workers.subject_attributes_segment` (GPU7). Do not overlap it
+with dual main SAM3. GME remains disabled unless that exact run config enables
+it. Run the existing production compactor after backfill.
+
+Profiling and canary summaries expose Qwen gate wait total/mean/max, maximum
+local inflight, and per-slot usage. Near-zero gate wait with idle Qwen GPUs
+means upstream stages are starving Qwen; meaningful wait at inflight 4 is the
+signal to compare 6 or 8. No speedup is claimed before the server A/B.
+
 ## 13. Failure Signatures
 
 ### `existing run.json does not match the requested V3 run`
