@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import inspect
+import io
 import json
 import os
 import queue
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
 import r2v_data_v2.v3.config as config_module
 import run_pipeline_v3 as pipeline_module
@@ -25,7 +27,9 @@ from r2v_data_v2.v3.config import (
     RuntimeGpuWorkersConfig,
     RuntimeStageWorkersConfig,
     SourceConfig,
+    SubjectAttributeCompletionConfig,
     SubjectAttributeGmeConfig,
+    SubjectAttributesConfig,
     V3Config,
     load_config,
 )
@@ -402,7 +406,7 @@ def test_enabled_gme_paths_and_semantics_enter_attribute_identity(
     assert "subject_attributes_gme" not in identifiers["runtime.gpu_workers"]
 
 
-def test_enabled_gme_rejects_invalid_server_paths_before_startup(
+def test_subject_attributes_do_not_validate_or_require_gme_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -423,8 +427,30 @@ def test_enabled_gme_rejects_invalid_server_paths_before_startup(
         ),
     )
 
-    with pytest.raises(ValueError, match="must remain inside"):
-        invalid.validate()
+    invalid.validate()
+
+
+def test_attribute_completion_sidecar_config_does_not_change_visual_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    enabled = replace(
+        config,
+        subject_attributes=SubjectAttributesConfig(
+            completion=SubjectAttributeCompletionConfig(enabled=True)
+        ),
+        runtime=replace(
+            config.runtime,
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                subject_attributes_completion="6",
+            ),
+        ),
+    )
+
+    assert enabled.fingerprint() == config.fingerprint()
+    assert enabled.model_identifiers() == config.model_identifiers()
 
 
 def test_streaming_rejects_same_parent_cross_pair(
@@ -755,7 +781,7 @@ def test_dedicated_attribute_segment_worker_closes_on_pipeline_error(
     assert all(process.closes == 1 for process in processes)
 
 
-def test_streaming_starts_one_persistent_gme_worker_and_shares_colocated_lock(
+def test_streaming_does_not_start_gme_worker_even_for_legacy_enabled_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -805,26 +831,6 @@ def test_streaming_starts_one_persistent_gme_worker_and_shares_colocated_lock(
         def attribute_probe(self, **_kwargs):
             return ()
 
-    class _Gme:
-        instances: list[_Gme] = []
-
-        def __init__(self, inference_lock):
-            self.inference_lock = inference_lock
-            self.starts = 0
-            self.closes = 0
-            self.instances.append(self)
-
-        @classmethod
-        def from_runtime(cls, _config, **kwargs):
-            assert kwargs["physical_gpu"] == "7"
-            return cls(kwargs["inference_lock"])
-
-        def start(self):
-            self.starts += 1
-
-        def close(self):
-            self.closes += 1
-
     observed: dict[str, object] = {}
 
     def handler(
@@ -849,7 +855,6 @@ def test_streaming_starts_one_persistent_gme_worker_and_shares_colocated_lock(
             )
 
     monkeypatch.setattr(pipeline_module, "PersistentStageProcess", _Process)
-    monkeypatch.setattr(pipeline_module, "PersistentGmeAttributeScreener", _Gme)
     monkeypatch.setattr(pipeline_module, "_streaming_stage_handler", handler)
     monkeypatch.setattr(pipeline_module, "StreamingDAGScheduler", _Scheduler)
     monkeypatch.setattr(
@@ -888,13 +893,9 @@ def test_streaming_starts_one_persistent_gme_worker_and_shares_colocated_lock(
         profile=False,
     )
 
-    assert len(_Gme.instances) == 1
-    gme = _Gme.instances[0]
-    assert gme.starts == gme.closes == 1
-    assert observed["gme"] is gme
+    assert observed["gme"] is None
     segmenter = observed["segmenter"]
-    assert segmenter._inference_lock is gme.inference_lock
-    assert gme.inference_lock is not None
+    assert segmenter._inference_lock is None
 
 
 def test_deferred_subject_attributes_start_no_attribute_or_gme_workers(
@@ -926,12 +927,6 @@ def test_deferred_subject_attributes_start_no_attribute_or_gme_workers(
         "PersistentStageProcess",
         lambda *_args, **_kwargs: pytest.fail("attribute SAM3 worker started"),
     )
-    monkeypatch.setattr(
-        pipeline_module,
-        "PersistentGmeAttributeScreener",
-        lambda *_args, **_kwargs: pytest.fail("GME worker started"),
-    )
-
     result = pipeline_module._run_streaming_pipeline(
         config_path=config_path,
         config=config,
@@ -1551,6 +1546,96 @@ def test_segment_pool_runs_two_attribute_probes_concurrently() -> None:
         "7": 1,
     }
     assert counters["sam_pool_max_concurrent_requests"] == 2
+
+
+def test_completion_resegmentation_uses_shared_segment_pool() -> None:
+    observed: list[str] = []
+
+    class Worker:
+        def __init__(self, gpu: str) -> None:
+            self.config = SimpleNamespace(cuda_visible_devices=gpu)
+
+        def start(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def attribute_completion_probe(self, **_kwargs):
+            observed.append(self.config.cuda_visible_devices)
+            return (np.ones((2, 2), dtype=bool),)
+
+    pool = PersistentStageProcessPool(  # type: ignore[list-item]
+        [Worker("5"), Worker("7")]
+    )
+    pool.start()
+    first = pool.attribute_completion_probe(
+        image_path=Path("/run/subject_attributes/completion_candidates/a.png"),
+        grounding_prompt="hair",
+    )
+    second = pool.attribute_completion_probe(
+        image_path=Path("/run/subject_attributes/completion_candidates/b.png"),
+        grounding_prompt="face",
+    )
+    counters = pool.performance_counters()
+    pool.close()
+
+    assert len(first) == len(second) == 1
+    assert sorted(observed) == ["5", "7"]
+    assert counters["sam_pool_attribute_probe_requests_by_gpu"] == {
+        "5": 1,
+        "7": 1,
+    }
+
+
+def test_attribute_completion_disables_thinking_and_instruction_rewrite(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "subject_attributes" / "completion_candidates"
+    source_path = sidecar / "clip" / "raw" / "source.png"
+    output_path = sidecar / "clip" / "generated" / "candidate.png"
+    source_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 48), "gray").save(source_path)
+    observed: dict[str, object] = {}
+
+    class Backend:
+        def edit(self, **kwargs):
+            observed.update(kwargs)
+            buffer = io.BytesIO()
+            Image.new("RGB", (kwargs["width"], kwargs["height"]), "gray").save(
+                buffer,
+                format="PNG",
+            )
+            return SimpleNamespace(png_bytes=buffer.getvalue())
+
+    runtime = object.__new__(_StageRuntime)
+    runtime.stage = "reference_edit"
+    runtime.storage = SimpleNamespace(root=tmp_path)
+    runtime._reference_edit_backend = Backend()
+    runtime.config = SimpleNamespace(
+        reference_edit=SimpleNamespace(
+            target_area=1024 * 1024,
+            alignment=16,
+            model_path=Path("/model/boogu"),
+        )
+    )
+
+    result = runtime.attribute_completion(
+        source_path=source_path,
+        output_path=output_path,
+        instruction="补全单一主体",
+        seed=17,
+    )
+
+    assert output_path.is_file()
+    assert observed["thinking_enabled"] is False
+    assert observed["instruction_rewrite_enabled"] is False
+    assert observed["seed"] == 17
+    assert result["thinking_enabled"] is False
+    assert result["instruction_rewrite_enabled"] is False
 
 
 def test_segment_pool_returns_worker_after_attribute_probe_exception() -> None:

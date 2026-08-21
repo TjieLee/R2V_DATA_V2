@@ -221,6 +221,38 @@ class SubjectAttributeGmeConfig:
 
 
 @dataclass(frozen=True)
+class SubjectAttributeCompletionConfig:
+    enabled: bool = False
+    eligible_types: tuple[str, ...] = (
+        "face",
+        "hair",
+        "headwear",
+        "accessory",
+        "upper_clothing",
+        "lower_clothing",
+        "dress_or_skirt",
+    )
+    seed: int = 0
+    minimum_alpha_coverage: float = 0.12
+    maximum_alpha_coverage_without_completion: float = 0.90
+    minimum_mean_luminance: float = 0.05
+    minimum_sharpness_score: float = 8.0
+    maximum_significant_components: int = 4
+    maximum_area_growth_ratio: float = 2.25
+    face_maximum_area_growth_ratio: float = 1.50
+    maximum_bbox_area_growth_ratio: float = 2.50
+    face_maximum_bbox_area_growth_ratio: float = 1.60
+    maximum_completed_significant_components: int = 2
+
+
+@dataclass(frozen=True)
+class SubjectAttributesConfig:
+    completion: SubjectAttributeCompletionConfig = field(
+        default_factory=SubjectAttributeCompletionConfig
+    )
+
+
+@dataclass(frozen=True)
 class RuntimeStageWorkersConfig:
     annotate: int = 2
     frames: int = 4
@@ -241,6 +273,7 @@ class RuntimeGpuWorkersConfig:
     segment_pool: tuple[str, ...] = ()
     subject_attributes_segment: str | None = None
     subject_attributes_gme: str | None = None
+    subject_attributes_completion: str | None = None
     remove: str | None = None
     reference_edit: str | None = None
 
@@ -292,6 +325,9 @@ class V3Config:
     )
     subject_attribute_gme: SubjectAttributeGmeConfig = field(
         default_factory=SubjectAttributeGmeConfig
+    )
+    subject_attributes: SubjectAttributesConfig = field(
+        default_factory=SubjectAttributesConfig
     )
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     instruction: InstructionConfig = field(default_factory=InstructionConfig)
@@ -789,29 +825,70 @@ class V3Config:
         ):
             if not isinstance(path, Path):
                 raise TypeError(f"subject_attribute_gme.{name} must be a pathlib.Path")
-        if gme.enabled and not self.runtime.subject_attributes_deferred:
-            for name, path in (
-                ("python_executable", gme.python_executable),
-                ("model_path", gme.model_path),
-            ):
-                if not _is_at_or_below(
-                    path.expanduser().resolve(strict=False),
-                    ALLOWED_WRITABLE_ROOT,
-                ):
-                    raise ValueError(
-                        f"subject_attribute_gme.{name} must remain inside "
-                        "/mnt/workspace/litengjie/data"
-                    )
-            if not gme.python_executable.expanduser().resolve().is_file():
+        completion = self.subject_attributes.completion
+        if not isinstance(completion.enabled, bool):
+            raise TypeError("subject_attributes.completion.enabled must be a boolean")
+        allowed_attribute_types = {
+            "face",
+            "hair",
+            "headwear",
+            "glasses",
+            "upper_clothing",
+            "lower_clothing",
+            "dress_or_skirt",
+            "shoes",
+            "bag",
+            "accessory",
+        }
+        if not completion.eligible_types or any(
+            kind not in allowed_attribute_types for kind in completion.eligible_types
+        ):
+            raise ValueError(
+                "subject_attributes.completion.eligible_types must contain only "
+                "supported attribute types"
+            )
+        if len(completion.eligible_types) != len(set(completion.eligible_types)):
+            raise ValueError(
+                "subject_attributes.completion.eligible_types must be unique"
+            )
+        if completion.enabled and self.qwen.candidate_judge is None:
+            raise ValueError(
+                "subject attribute completion requires qwen.candidate_judge"
+            )
+        if (
+            not isinstance(completion.seed, int)
+            or isinstance(completion.seed, bool)
+            or completion.seed < 0
+        ):
+            raise ValueError("subject_attributes.completion.seed must be non-negative")
+        for name in (
+            "minimum_alpha_coverage",
+            "maximum_alpha_coverage_without_completion",
+            "minimum_mean_luminance",
+        ):
+            value = getattr(completion, name)
+            if not isinstance(value, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"subject_attributes.completion.{name} must be in [0, 1]")
+        for name in (
+            "minimum_sharpness_score",
+            "maximum_area_growth_ratio",
+            "face_maximum_area_growth_ratio",
+            "maximum_bbox_area_growth_ratio",
+            "face_maximum_bbox_area_growth_ratio",
+        ):
+            value = getattr(completion, name)
+            if not isinstance(value, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(
-                    "enabled subject_attribute_gme.python_executable must exist"
+                    f"subject_attributes.completion.{name} must be a positive float"
                 )
-            if not gme.model_path.expanduser().resolve().is_dir():
-                raise ValueError("enabled subject_attribute_gme.model_path must exist")
-            if self.runtime.gpu_workers.subject_attributes_gme is None:
+        for name in (
+            "maximum_significant_components",
+            "maximum_completed_significant_components",
+        ):
+            value = getattr(completion, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(
-                    "runtime.gpu_workers.subject_attributes_gme is required when "
-                    "subject_attribute_gme.enabled is true"
+                    f"subject_attributes.completion.{name} must be a positive integer"
                 )
         if self.runtime.mode not in {"staged_legacy", "streaming_v1"}:
             raise ValueError("runtime.mode must be staged_legacy or streaming_v1")
@@ -888,7 +965,11 @@ class V3Config:
         boogu_remove_enabled = (
             self.remove.enabled and self.remove.backend == BOOGU_REMOVE_BACKEND
         )
-        if self.reference_edit.enabled or boogu_remove_enabled:
+        if (
+            self.reference_edit.enabled
+            or boogu_remove_enabled
+            or completion.enabled
+        ):
             for name, path in (
                 ("python_executable", self.reference_edit.python_executable),
                 ("code_root", self.reference_edit.code_root),
@@ -1036,6 +1117,7 @@ class V3Config:
         visual_gpu_workers.pop("segment_pool", None)
         visual_gpu_workers.pop("subject_attributes_segment", None)
         visual_gpu_workers.pop("subject_attributes_gme", None)
+        visual_gpu_workers.pop("subject_attributes_completion", None)
         identifiers: dict[str, str | None] = {
             **{f"qwen.{name}": service.model for name, service in self.qwen_services()},
             "remove.backend": self.remove.backend,
@@ -1119,9 +1201,12 @@ class V3Config:
                 gpu_workers.pop("segment_pool", None)
                 gpu_workers.pop("subject_attributes_segment", None)
                 gpu_workers.pop("subject_attributes_gme", None)
+                gpu_workers.pop("subject_attributes_completion", None)
         gme = value.get("subject_attribute_gme")
         if isinstance(gme, dict) and not gme.get("enabled"):
             value.pop("subject_attribute_gme", None)
+        # Subject attributes are a sidecar and must not change frozen Visual identity.
+        value.pop("subject_attributes", None)
         source = value.get("source")
         if isinstance(source, dict) and source.get("selection_manifest") is None:
             source.pop("selection_manifest", None)
@@ -1217,6 +1302,8 @@ def load_config(path: str | Path) -> V3Config:
         "remove",
         "reference_edit",
         "reference_integrity",
+        "subject_attribute_gme",
+        "subject_attributes",
         "runtime",
         "instruction",
         "debug",
@@ -1290,6 +1377,26 @@ def load_config(path: str | Path) -> V3Config:
         raw.get("subject_attribute_gme"),
         "subject_attribute_gme",
     )
+    subject_attributes_values = _mapping(
+        raw.get("subject_attributes"),
+        "subject_attributes",
+    )
+    subject_attribute_completion_values = _mapping(
+        subject_attributes_values.pop("completion", None),
+        "subject_attributes.completion",
+    )
+    if subject_attributes_values:
+        raise ValueError(
+            "unknown subject_attributes configuration keys: "
+            f"{sorted(subject_attributes_values)}"
+        )
+    if "eligible_types" in subject_attribute_completion_values:
+        eligible_types = subject_attribute_completion_values["eligible_types"]
+        if not isinstance(eligible_types, list):
+            raise TypeError(
+                "subject_attributes.completion.eligible_types must be a list"
+            )
+        subject_attribute_completion_values["eligible_types"] = tuple(eligible_types)
     source_values = _mapping(raw.get("source"), "source")
     if "selection_manifest" in source_values:
         selection_manifest = source_values["selection_manifest"]
@@ -1409,6 +1516,13 @@ def load_config(path: str | Path) -> V3Config:
             SubjectAttributeGmeConfig,
             subject_attribute_gme_values,
             "subject_attribute_gme",
+        ),
+        subject_attributes=SubjectAttributesConfig(
+            completion=_build(
+                SubjectAttributeCompletionConfig,
+                subject_attribute_completion_values,
+                "subject_attributes.completion",
+            )
         ),
         runtime=_build(
             RuntimeConfig,

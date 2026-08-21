@@ -364,6 +364,7 @@ class QwenBooguReferenceEditJudge:
         *,
         client: Any | None = None,
         repair_retries: int = 1,
+        completion_component: str = "qwen_boogu_completion_review",
     ) -> None:
         if repair_retries < 0:
             raise ValueError("repair_retries must be non-negative")
@@ -374,6 +375,10 @@ class QwenBooguReferenceEditJudge:
             timeout=config.timeout_seconds,
         )
         self.repair_retries = repair_retries
+        self.completion_component = _nonempty(
+            completion_component,
+            "completion_component",
+        )
 
     def review(
         self,
@@ -485,7 +490,7 @@ class QwenBooguReferenceEditJudge:
                     },
                 ),
                 component=(
-                    "qwen_boogu_completion_review"
+                    self.completion_component
                     if operation == "complete_entity"
                     else "qwen_boogu_background_review"
                 ),
@@ -505,7 +510,7 @@ class QwenBooguReferenceEditJudge:
                     response_format={"type": "json_object"},
                 ),
                 component=(
-                    "qwen_boogu_completion_review"
+                    self.completion_component
                     if operation == "complete_entity"
                     else "qwen_boogu_background_review"
                 ),

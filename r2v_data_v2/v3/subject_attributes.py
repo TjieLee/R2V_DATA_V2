@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from collections import Counter
@@ -20,9 +21,15 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
-from r2v_data_v2.v3.config import QwenServiceConfig, Sam3Config, V3Config
+from r2v_data_v2.v3.config import (
+    QwenServiceConfig,
+    Sam3Config,
+    SubjectAttributeCompletionConfig,
+    V3Config,
+)
 from r2v_data_v2.v3.mask_codec import decode_binary_mask
 from r2v_data_v2.v3.pair import (
+    _masked_sharpness_score,
     EntityReferenceCandidate,
     build_candidate_context_image,
     build_entity_reference_candidates,
@@ -30,6 +37,11 @@ from r2v_data_v2.v3.pair import (
     mask_component_diagnostics,
 )
 from r2v_data_v2.v3.profiling import profile_model_call, profiled_openai_call
+from r2v_data_v2.v3.reference_edit_boogu import (
+    BooguCompletionReview,
+    BooguReferenceEditJudge,
+    QwenBooguReferenceEditJudge,
+)
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend, mask_iou
 from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
@@ -40,11 +52,7 @@ from r2v_data_v2.v3.schemas import (
     render_annotation_plain_text,
 )
 from r2v_data_v2.v3.storage import RunStorage
-from r2v_data_v2.v3.subject_attribute_gme import (
-    GmeRelativeMarginResult,
-    PersistentGmeAttributeScreener,
-    UnavailableGmeAttributeScreener,
-)
+from r2v_data_v2.v3.subject_attribute_gme import GmeRelativeMarginResult
 
 ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION = "r2v.v3.subject_attributes.1"
 ATTRIBUTE_OWNER_SCHEMA_VERSION = "r2v.v3.subject_attribute_owner.1"
@@ -62,6 +70,12 @@ CLOTHING_STRIP_ASPECT_RATIO = 3.0
 ATTRIBUTE_DUPLICATE_MASK_IOU = 0.90
 CLOTHING_ATTRIBUTE_TYPES = frozenset(
     {"upper_clothing", "lower_clothing", "dress_or_skirt"}
+)
+ATTRIBUTE_COMPLETION_PROMPT = (
+    "把图片中破损、缺失或不完整的区域补充完整，保持当前主体的身份、材质、"
+    "纹理、颜色和形状一致，不要引入新的实体、场景或无关内容。如果主体是人脸，"
+    "保持同一人的五官、朝向和表情特征；如果是服装、帽子、头发或配饰，保持同一件"
+    "物品或同一部分外观的款式、结构与细节。输出补全后的单一主体图像。"
 )
 
 _IMAGE_PLACEHOLDER = re.compile(r"\{\{image_([1-9]\d*)\}\}")
@@ -303,6 +317,15 @@ class OwnerEnrichmentMetrics(_SchemaModel):
     gme_retried_next_frame: int = Field(default=0, ge=0)
     gme_failures: int = Field(default=0, ge=0)
     gme_model_call_time_seconds: float = Field(default=0.0, ge=0)
+    completion_attempts: int = Field(default=0, ge=0)
+    completion_accepted: int = Field(default=0, ge=0)
+    completion_rejected: int = Field(default=0, ge=0)
+    completion_failures: int = Field(default=0, ge=0)
+    completion_qwen_review_rejects: int = Field(default=0, ge=0)
+    completion_review_calls: int = Field(default=0, ge=0)
+    completion_model_call_time_seconds: float = Field(default=0.0, ge=0)
+    completion_attempts_by_type: dict[str, int] = Field(default_factory=dict)
+    completion_accepted_by_type: dict[str, int] = Field(default_factory=dict)
     failures: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
@@ -313,10 +336,21 @@ class OwnerEnrichmentMetrics(_SchemaModel):
             raise ValueError("GME screened count must equal passed plus rejected")
         if self.gme_calls != self.gme_candidates_screened + self.gme_failures:
             raise ValueError("GME calls must equal screened plus failures")
+        if self.completion_attempts != (
+            self.completion_accepted
+            + self.completion_rejected
+            + self.completion_failures
+        ):
+            raise ValueError(
+                "completion attempts must equal accepted plus rejected plus failures"
+            )
+        if self.completion_qwen_review_rejects > self.completion_rejected:
+            raise ValueError("completion Qwen rejects must be completion rejects")
         for value in (
             self.qwen_model_call_time_seconds,
             self.sam3_model_call_time_seconds,
             self.gme_model_call_time_seconds,
+            self.completion_model_call_time_seconds,
         ):
             if not math.isfinite(value):
                 raise ValueError("attribute model-call times must be finite")
@@ -336,6 +370,7 @@ class OwnerEnrichmentArtifact(_SchemaModel):
     records: list[SubjectAttributeRecord]
     metrics: OwnerEnrichmentMetrics
     gme_screen_mode: str | None = None
+    completion_mode: str | None = None
     failure_reason: str | None = None
 
     @model_validator(mode="after")
@@ -448,6 +483,9 @@ class PendingAttributeCandidate:
     geometry: OwnershipGeometry
     gme_attempts: tuple[GmeAttributeScreenAttempt, ...] = ()
     selected_gme_attempt_index: int | None = None
+    completion_attempted: bool = False
+    completion_model_call_time_seconds: float = 0.0
+    completion_review_time_seconds: float = 0.0
 
 
 @dataclass
@@ -459,6 +497,21 @@ class _GmeSelectionMetrics:
     retried_next_frame: int = 0
     failures: int = 0
     model_call_time_seconds: float = 0.0
+
+
+@dataclass
+class _CompletionSelectionMetrics:
+    attempts: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    failures: int = 0
+    qwen_review_rejects: int = 0
+    review_calls: int = 0
+    model_call_time_seconds: float = 0.0
+    review_time_seconds: float = 0.0
+    sam3_time_seconds: float = 0.0
+    attempts_by_type: Counter[str] = field(default_factory=Counter)
+    accepted_by_type: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass
@@ -484,6 +537,15 @@ class EnrichmentTotals:
     gme_retried_next_frame: int = 0
     gme_failures: int = 0
     gme_model_call_time_seconds: float = 0.0
+    completion_attempts: int = 0
+    completion_accepted: int = 0
+    completion_rejected: int = 0
+    completion_failures: int = 0
+    completion_qwen_review_rejects: int = 0
+    completion_review_calls: int = 0
+    completion_model_call_time_seconds: float = 0.0
+    completion_attempts_by_type: Counter[str] = field(default_factory=Counter)
+    completion_accepted_by_type: Counter[str] = field(default_factory=Counter)
     failures: int = 0
     failure_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -508,6 +570,19 @@ class EnrichmentTotals:
         self.gme_retried_next_frame += metrics.gme_retried_next_frame
         self.gme_failures += metrics.gme_failures
         self.gme_model_call_time_seconds += metrics.gme_model_call_time_seconds
+        self.completion_attempts += metrics.completion_attempts
+        self.completion_accepted += metrics.completion_accepted
+        self.completion_rejected += metrics.completion_rejected
+        self.completion_failures += metrics.completion_failures
+        self.completion_qwen_review_rejects += (
+            metrics.completion_qwen_review_rejects
+        )
+        self.completion_review_calls += metrics.completion_review_calls
+        self.completion_model_call_time_seconds += (
+            metrics.completion_model_call_time_seconds
+        )
+        self.completion_attempts_by_type.update(metrics.completion_attempts_by_type)
+        self.completion_accepted_by_type.update(metrics.completion_accepted_by_type)
         self.failures += metrics.failures
 
 
@@ -543,6 +618,16 @@ class ClipEnrichmentResult:
             "gme_retried_next_frame": self.totals.gme_retried_next_frame,
             "gme_failures": self.totals.gme_failures,
             "gme_model_call_time_seconds": self.totals.gme_model_call_time_seconds,
+            "completion_attempts": self.totals.completion_attempts,
+            "completion_accepted": self.totals.completion_accepted,
+            "completion_rejected": self.totals.completion_rejected,
+            "completion_failures": self.totals.completion_failures,
+            "completion_qwen_review_rejects": (
+                self.totals.completion_qwen_review_rejects
+            ),
+            "completion_model_call_time_seconds": (
+                self.totals.completion_model_call_time_seconds
+            ),
         }
 
 
@@ -584,6 +669,24 @@ class AttributeFrameSegmentationBackend(Protocol):
         grounding_prompt: str,
     ) -> tuple[np.ndarray, ...]: ...
 
+    def segment_generated_frame(
+        self,
+        *,
+        frame_path: Path,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]: ...
+
+
+class AttributeCompletionBackend(Protocol):
+    def attribute_completion(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        instruction: str,
+        seed: int,
+    ) -> dict[str, object]: ...
+
 
 class AttributeProbeClient(Protocol):
     def attribute_probe(
@@ -592,6 +695,13 @@ class AttributeProbeClient(Protocol):
         clip_uid: str,
         frame_slot: int,
         source_frame_index: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]: ...
+
+    def attribute_completion_probe(
+        self,
+        *,
+        image_path: Path,
         grounding_prompt: str,
     ) -> tuple[np.ndarray, ...]: ...
 
@@ -634,6 +744,18 @@ class Sam3AttributeFrameSegmenter:
 
     def close(self) -> None:
         self._backend.close()
+
+    def segment_generated_frame(
+        self,
+        *,
+        frame_path: Path,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        return self.segment_frame(
+            frame_path=frame_path,
+            frame_slot=0,
+            grounding_prompt=grounding_prompt,
+        )
 
 
 class PersistentWorkerAttributeFrameSegmenter:
@@ -683,6 +805,30 @@ class PersistentWorkerAttributeFrameSegmenter:
                 clip_uid=clip_uid,
                 frame_slot=frame_slot,
                 source_frame_index=frame.source_frame_index,
+                grounding_prompt=grounding_prompt,
+            )
+
+    def segment_generated_frame(
+        self,
+        *,
+        frame_path: Path,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        resolved = frame_path.expanduser().resolve()
+        relative = resolved.relative_to(self._storage.root)
+        if relative.parts[:2] != (
+            "subject_attributes",
+            "completion_candidates",
+        ):
+            raise ValueError("completion image must be a run-local attribute sidecar")
+        if self._inference_lock is None:
+            return self._client.attribute_completion_probe(
+                image_path=resolved,
+                grounding_prompt=grounding_prompt,
+            )
+        with self._inference_lock:
+            return self._client.attribute_completion_probe(
+                image_path=resolved,
                 grounding_prompt=grounding_prompt,
             )
 
@@ -1298,6 +1444,224 @@ def _rejected_record(
     )
 
 
+def _masked_crop_quality_rejection(
+    crop: Image.Image,
+    *,
+    config: object,
+) -> str | None:
+    rgba = np.asarray(crop.convert("RGBA"))
+    mask = rgba[..., 3] > 0
+    if not mask.any():
+        return "empty_mask"
+    coverage = float(mask.mean())
+    if coverage < float(getattr(config, "minimum_alpha_coverage")):
+        return "blank_area_too_large"
+    rgb = rgba[..., :3]
+    luminance = (
+        0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    ) / 255.0
+    if float(luminance[mask].mean()) < float(
+        getattr(config, "minimum_mean_luminance")
+    ):
+        return "near_silhouette"
+    if _masked_sharpness_score(rgb, mask) < float(
+        getattr(config, "minimum_sharpness_score")
+    ):
+        return "too_blurry"
+    components = mask_component_diagnostics(mask)
+    if components.significant_component_count > int(
+        getattr(config, "maximum_significant_components")
+    ):
+        return "too_fragmented"
+    return None
+
+
+def _normalized_mask_geometry(mask: np.ndarray) -> tuple[float, float]:
+    binary = np.asarray(mask, dtype=bool)
+    if binary.ndim != 2 or not binary.any():
+        raise ValueError("completion mask must be non-empty and two-dimensional")
+    rows, columns = np.nonzero(binary)
+    height, width = binary.shape
+    bbox_area = (columns.max() - columns.min() + 1) * (
+        rows.max() - rows.min() + 1
+    )
+    canvas_area = height * width
+    return float(binary.sum() / canvas_area), float(bbox_area / canvas_area)
+
+
+def _save_completion_input(path: Path, crop: Image.Image) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        crop.convert("RGB").save(temporary, format="PNG")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _attempt_attribute_completion(
+    candidate: PendingAttributeCandidate,
+    *,
+    clip_uid: str,
+    output_root: Path,
+    completion_config: object,
+    completion_backend: AttributeCompletionBackend,
+    completion_judge: BooguReferenceEditJudge,
+    segmentation_backend: AttributeFrameSegmentationBackend,
+    metrics: _CompletionSelectionMetrics,
+) -> tuple[PendingAttributeCandidate | None, str, bool]:
+    precheck = _masked_crop_quality_rejection(
+        candidate.crop,
+        config=completion_config,
+    )
+    if precheck is not None:
+        return None, f"completion_precheck:{precheck}", False
+    alpha_coverage = float(
+        (np.asarray(candidate.crop.convert("RGBA"))[..., 3] > 0).mean()
+    )
+    if alpha_coverage > float(
+        getattr(completion_config, "maximum_alpha_coverage_without_completion")
+    ):
+        return candidate, "completion_not_needed", False
+
+    metrics.attempts += 1
+    metrics.attempts_by_type[candidate.discovered.attribute_type] += 1
+    candidate_root = (
+        output_root
+        / "completion_candidates"
+        / clip_uid
+        / candidate.owner_entity_id
+        / candidate.attribute_id
+        / candidate.owner_candidate.candidate_id
+    )
+    source_path = candidate_root / "raw" / "source.png"
+    output_path = candidate_root / "generated" / "candidate.png"
+    _save_completion_input(source_path, candidate.crop)
+    started = time.perf_counter()
+    try:
+        completion = completion_backend.attribute_completion(
+            source_path=source_path,
+            output_path=output_path,
+            instruction=ATTRIBUTE_COMPLETION_PROMPT,
+            seed=int(getattr(completion_config, "seed")),
+        )
+        elapsed = time.perf_counter() - started
+        reported_seconds = completion.get("model_call_time_seconds", elapsed)
+        if not isinstance(reported_seconds, (int, float)) or not math.isfinite(
+            float(reported_seconds)
+        ):
+            raise ValueError("completion model-call time is invalid")
+        metrics.model_call_time_seconds += max(0.0, float(reported_seconds))
+        sam_started = time.perf_counter()
+        completed_masks = segmentation_backend.segment_generated_frame(
+            frame_path=output_path,
+            grounding_prompt=candidate.discovered.phrase,
+        )
+        metrics.sam3_time_seconds += time.perf_counter() - sam_started
+        if len(completed_masks) != 1:
+            metrics.rejected += 1
+            return None, "completion_postcheck:extra_or_missing_entity", False
+        completed_mask = np.asarray(completed_masks[0], dtype=bool)
+        completed_rows, completed_columns = np.nonzero(completed_mask)
+        completed_long_side = max(
+            completed_columns.max() - completed_columns.min() + 1,
+            completed_rows.max() - completed_rows.min() + 1,
+        )
+        if (
+            int(completed_mask.sum()) < MIN_ATTRIBUTE_AREA_PIXELS
+            or completed_long_side < MIN_ATTRIBUTE_LONG_SIDE_PIXELS
+        ):
+            metrics.rejected += 1
+            return None, "completion_postcheck:attribute_too_small", False
+        with Image.open(output_path) as opened:
+            opened.load()
+            completed_rgb = opened.convert("RGB")
+        completed_crop, _ = build_reference_crop(
+            completed_rgb,
+            completed_mask,
+            crop_padding_ratio=0.0,
+        )
+        postcheck = _masked_crop_quality_rejection(
+            completed_crop,
+            config=completion_config,
+        )
+        if postcheck is not None:
+            metrics.rejected += 1
+            return None, f"completion_postcheck:{postcheck}", False
+        components = mask_component_diagnostics(completed_mask)
+        if components.significant_component_count > int(
+            getattr(completion_config, "maximum_completed_significant_components")
+        ):
+            metrics.rejected += 1
+            return None, "completion_postcheck:extra_entity_contours", False
+        raw_crop_mask = np.asarray(candidate.crop.convert("RGBA"))[..., 3] > 0
+        raw_area, raw_bbox = _normalized_mask_geometry(raw_crop_mask)
+        completed_area, completed_bbox = _normalized_mask_geometry(completed_mask)
+        is_face = candidate.discovered.attribute_type == "face"
+        area_limit = float(
+            getattr(
+                completion_config,
+                "face_maximum_area_growth_ratio"
+                if is_face
+                else "maximum_area_growth_ratio",
+            )
+        )
+        bbox_limit = float(
+            getattr(
+                completion_config,
+                "face_maximum_bbox_area_growth_ratio"
+                if is_face
+                else "maximum_bbox_area_growth_ratio",
+            )
+        )
+        if completed_area / raw_area > area_limit:
+            metrics.rejected += 1
+            return None, "completion_postcheck:mask_area_growth", False
+        if completed_bbox / raw_bbox > bbox_limit:
+            metrics.rejected += 1
+            return None, "completion_postcheck:bbox_area_growth", False
+        review_started = time.perf_counter()
+        metrics.review_calls += 1
+        review = completion_judge.review(
+            operation="complete_entity",
+            source_rgba=candidate.crop,
+            source_input_rgb=candidate.crop.convert("RGB"),
+            candidate_rgb=completed_rgb,
+            entity_phrase=candidate.discovered.phrase,
+            reference_type="subject",
+        )
+        review_seconds = time.perf_counter() - review_started
+        metrics.review_time_seconds += review_seconds
+        if not isinstance(review, BooguCompletionReview) or review.verdict != "accept":
+            metrics.rejected += 1
+            metrics.qwen_review_rejects += 1
+            return None, "completion_qwen_review_reject", False
+    except Exception as exc:  # noqa: BLE001 - fail closed and try next frame
+        metrics.failures += 1
+        return None, f"completion_failed:{type(exc).__name__}:{exc}", True
+    metrics.accepted += 1
+    metrics.accepted_by_type[candidate.discovered.attribute_type] += 1
+    return (
+        PendingAttributeCandidate(
+            discovered=candidate.discovered,
+            attribute_id=candidate.attribute_id,
+            owner_entity_id=candidate.owner_entity_id,
+            owner_candidate=candidate.owner_candidate,
+            attribute_mask=candidate.attribute_mask,
+            source_image=candidate.source_image,
+            crop=completed_crop,
+            geometry=candidate.geometry,
+            gme_attempts=candidate.gme_attempts,
+            selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+            completion_attempted=True,
+            completion_model_call_time_seconds=max(0.0, float(reported_seconds)),
+            completion_review_time_seconds=review_seconds,
+        ),
+        "completion_accepted",
+        False,
+    )
+
+
 def _select_attribute_candidate(
     *,
     discovered: DiscoveredSubjectAttribute,
@@ -1313,6 +1677,11 @@ def _select_attribute_candidate(
     segmentation_backend: AttributeFrameSegmentationBackend,
     gme_screener: AttributeGmeScreener | None = None,
     gme_metrics: _GmeSelectionMetrics | None = None,
+    output_root: Path | None = None,
+    completion_config: object | None = None,
+    completion_backend: AttributeCompletionBackend | None = None,
+    completion_judge: BooguReferenceEditJudge | None = None,
+    completion_metrics: _CompletionSelectionMetrics | None = None,
 ) -> PendingAttributeCandidate | SubjectAttributeRecord:
     owner_reference_is_local = owner_reference.source_clip_uid in {None, clip_uid}
     ordered = prefer_attribute_candidate_frames(
@@ -1330,6 +1699,10 @@ def _select_attribute_candidate(
     ] = []
     gme_attempts: list[GmeAttributeScreenAttempt] = []
     active_gme_metrics = gme_metrics or _GmeSelectionMetrics()
+    active_completion_metrics = completion_metrics or _CompletionSelectionMetrics()
+    completion_rejections: list[
+        tuple[EntityReferenceCandidate, OwnershipGeometry, str]
+    ] = []
     for owner_candidate_index, owner_candidate in enumerate(ordered):
         gme_rejected_on_frame = False
         frame_path = (storage.root / owner_candidate.image_path).resolve(strict=False)
@@ -1479,7 +1852,7 @@ def _select_attribute_candidate(
                     active_gme_metrics.model_call_time_seconds += (
                         time.perf_counter() - gme_started
                     )
-            return PendingAttributeCandidate(
+            pending = PendingAttributeCandidate(
                 discovered=discovered,
                 attribute_id=attribute_id,
                 owner_entity_id=owner.entity_id,
@@ -1491,6 +1864,38 @@ def _select_attribute_candidate(
                 gme_attempts=tuple(gme_attempts),
                 selected_gme_attempt_index=selected_gme_attempt_index,
             )
+            completion_enabled = bool(
+                completion_config is not None
+                and getattr(completion_config, "enabled", False)
+                and discovered.attribute_type
+                in getattr(completion_config, "eligible_types", ())
+            )
+            if completion_enabled:
+                if (
+                    output_root is None
+                    or completion_backend is None
+                    or completion_judge is None
+                ):
+                    raise ValueError(
+                        "enabled attribute completion requires backend and judge"
+                    )
+                completed, completion_reason, _ = _attempt_attribute_completion(
+                    pending,
+                    clip_uid=clip_uid,
+                    output_root=output_root,
+                    completion_config=completion_config,
+                    completion_backend=completion_backend,
+                    completion_judge=completion_judge,
+                    segmentation_backend=segmentation_backend,
+                    metrics=active_completion_metrics,
+                )
+                if completed is None:
+                    completion_rejections.append(
+                        (owner_candidate, geometry, completion_reason)
+                    )
+                    continue
+                pending = completed
+            return pending
         if gme_rejected_on_frame and owner_candidate_index + 1 < len(ordered):
             active_gme_metrics.retried_next_frame += 1
     if gme_rejections:
@@ -1518,6 +1923,23 @@ def _select_attribute_candidate(
             attribute_id=attribute_id,
             owner_entity_id=owner.entity_id,
             reason=f"ownership_geometry:{geometry.reason}",
+            geometry=geometry,
+            source_frame_index=owner_candidate.source_frame_index,
+            source_frame_slot=owner_candidate.frame_slot,
+            owner_candidate_id=owner_candidate.candidate_id,
+            same_frame=(
+                owner_reference_is_local
+                and owner_candidate.source_frame_index
+                == owner_reference.source_frame_index
+            ),
+        )
+    if completion_rejections:
+        owner_candidate, geometry, reason = completion_rejections[0]
+        return _rejected_record(
+            discovered,
+            attribute_id=attribute_id,
+            owner_entity_id=owner.entity_id,
+            reason=reason,
             geometry=geometry,
             source_frame_index=owner_candidate.source_frame_index,
             source_frame_slot=owner_candidate.frame_slot,
@@ -1580,6 +2002,7 @@ def _load_cached_owner_artifact(
     owner_entity_id: str,
     attribute_id_start: int,
     expected_gme_screen_mode: str | None = None,
+    expected_completion_mode: str | None = None,
 ) -> OwnerEnrichmentArtifact | None:
     if not path.is_file():
         return None
@@ -1592,6 +2015,7 @@ def _load_cached_owner_artifact(
             or artifact.owner_entity_id != owner_entity_id
             or artifact.attribute_id_start != attribute_id_start
             or artifact.gme_screen_mode != expected_gme_screen_mode
+            or artifact.completion_mode != expected_completion_mode
         ):
             return None
         for record in artifact.records:
@@ -1630,11 +2054,23 @@ def _process_owner(
     review_client: SubjectAttributeReviewClient,
     segmentation_backend: AttributeFrameSegmentationBackend,
     gme_screener: AttributeGmeScreener | None = None,
+    completion_backend: AttributeCompletionBackend | None = None,
+    completion_judge: BooguReferenceEditJudge | None = None,
 ) -> OwnerEnrichmentArtifact:
     metrics = OwnerEnrichmentMetrics(discovery_calls=1)
     gme_screen_mode = (
         getattr(getattr(config, "subject_attribute_gme", None), "screen_mode", None)
         if gme_screener is not None
+        else None
+    )
+    completion_config = getattr(
+        getattr(config, "subject_attributes", None),
+        "completion",
+        SubjectAttributeCompletionConfig(),
+    )
+    completion_mode = (
+        "boogu_completion_v1"
+        if completion_config.enabled
         else None
     )
     owner_reference = _published_reference(clip, owner.entity_id)
@@ -1666,6 +2102,7 @@ def _process_owner(
                 }
             ),
             gme_screen_mode=gme_screen_mode,
+            completion_mode=completion_mode,
             failure_reason=f"discovery_failed:{type(exc).__name__}:{exc}",
         )
     qwen_seconds = time.perf_counter() - discovery_started
@@ -1682,6 +2119,7 @@ def _process_owner(
                 update={"qwen_model_call_time_seconds": qwen_seconds}
             ),
             gme_screen_mode=gme_screen_mode,
+            completion_mode=completion_mode,
         )
     discovered_by_type = Counter(
         attribute.attribute_type for attribute in discovery.attributes
@@ -1698,11 +2136,14 @@ def _process_owner(
     records_by_id: dict[str, SubjectAttributeRecord] = {}
     sam_seconds = 0.0
     gme_metrics = _GmeSelectionMetrics()
+    completion_metrics = _CompletionSelectionMetrics()
     processing_failures = 0
     for offset, discovered in enumerate(discovery.attributes):
         attribute_id = f"a{attribute_id_start + offset}"
         sam_started = time.perf_counter()
         gme_seconds_before = gme_metrics.model_call_time_seconds
+        completion_model_before = completion_metrics.model_call_time_seconds
+        completion_review_before = completion_metrics.review_time_seconds
         try:
             selected = _select_attribute_candidate(
                 discovered=discovered,
@@ -1718,6 +2159,11 @@ def _process_owner(
                 segmentation_backend=segmentation_backend,
                 gme_screener=gme_screener,
                 gme_metrics=gme_metrics,
+                output_root=output_root,
+                completion_config=completion_config,
+                completion_backend=completion_backend,
+                completion_judge=completion_judge,
+                completion_metrics=completion_metrics,
             )
         except Exception as exc:  # noqa: BLE001 - isolate one attribute
             processing_failures += 1
@@ -1731,7 +2177,14 @@ def _process_owner(
         gme_seconds = (
             gme_metrics.model_call_time_seconds - gme_seconds_before
         )
-        sam_seconds += max(0.0, selection_seconds - gme_seconds)
+        completion_external_seconds = (
+            completion_metrics.model_call_time_seconds - completion_model_before
+            + completion_metrics.review_time_seconds - completion_review_before
+        )
+        sam_seconds += max(
+            0.0,
+            selection_seconds - gme_seconds - completion_external_seconds,
+        )
         if isinstance(selected, SubjectAttributeRecord):
             records_by_id[attribute_id] = selected
         else:
@@ -1854,6 +2307,8 @@ def _process_owner(
     deterministic_rejects = sum(
         record.reason.startswith("ownership_geometry:")
         or record.reason == "attribute_mask_duplicate_conflict"
+        or record.reason.startswith("completion_precheck:")
+        or record.reason.startswith("completion_postcheck:")
         for record in ordered_records
     )
     recognizability_rejects = sum(
@@ -1866,7 +2321,11 @@ def _process_owner(
         for record in ordered_records
     )
     accepted = [record for record in ordered_records if record.status == "accepted"]
-    failures = int(review_failure is not None) + processing_failures
+    failures = (
+        int(review_failure is not None)
+        + processing_failures
+        + completion_metrics.failures
+    )
     return OwnerEnrichmentArtifact(
         sample_id=clip.clip_uid,
         owner_entity_id=owner.entity_id,
@@ -1889,7 +2348,9 @@ def _process_owner(
             different_frame_accepted=sum(
                 record.same_frame_as_owner_reference is False for record in accepted
             ),
-            qwen_model_call_time_seconds=qwen_seconds,
+            qwen_model_call_time_seconds=(
+                qwen_seconds + completion_metrics.review_time_seconds
+            ),
             sam3_model_call_time_seconds=sam_seconds,
             gme_calls=gme_metrics.calls,
             gme_candidates_screened=gme_metrics.candidates_screened,
@@ -1898,9 +2359,27 @@ def _process_owner(
             gme_retried_next_frame=gme_metrics.retried_next_frame,
             gme_failures=gme_metrics.failures,
             gme_model_call_time_seconds=gme_metrics.model_call_time_seconds,
+            completion_attempts=completion_metrics.attempts,
+            completion_accepted=completion_metrics.accepted,
+            completion_rejected=completion_metrics.rejected,
+            completion_failures=completion_metrics.failures,
+            completion_qwen_review_rejects=(
+                completion_metrics.qwen_review_rejects
+            ),
+            completion_review_calls=completion_metrics.review_calls,
+            completion_model_call_time_seconds=(
+                completion_metrics.model_call_time_seconds
+            ),
+            completion_attempts_by_type=dict(
+                sorted(completion_metrics.attempts_by_type.items())
+            ),
+            completion_accepted_by_type=dict(
+                sorted(completion_metrics.accepted_by_type.items())
+            ),
             failures=failures,
         ),
         gme_screen_mode=gme_screen_mode,
+        completion_mode=completion_mode,
         failure_reason=review_failure,
     )
 
@@ -2185,6 +2664,7 @@ def _clear_enrichment_artifacts(output_root: Path) -> None:
         if directory.is_dir():
             for path in directory.rglob(pattern):
                 path.unlink()
+    shutil.rmtree(output_root / "completion_candidates", ignore_errors=True)
 
 
 def _clear_clip_enrichment_artifacts(output_root: Path, clip_uid: str) -> None:
@@ -2197,6 +2677,10 @@ def _clear_clip_enrichment_artifacts(output_root: Path, clip_uid: str) -> None:
         for path in reference_directory.glob("*.png"):
             path.unlink()
     _clip_sample_path(output_root, sample_id=clip_uid).unlink(missing_ok=True)
+    shutil.rmtree(
+        output_root / "completion_candidates" / clip_uid,
+        ignore_errors=True,
+    )
 
 
 def process_subject_attribute_clip(
@@ -2209,9 +2693,16 @@ def process_subject_attribute_clip(
     review_client: SubjectAttributeReviewClient,
     segmentation_backend: AttributeFrameSegmentationBackend,
     gme_screener: AttributeGmeScreener | None = None,
+    completion_backend: AttributeCompletionBackend | None = None,
+    completion_judge: BooguReferenceEditJudge | None = None,
     max_owners: int | None = None,
     overwrite: bool = False,
 ) -> ClipEnrichmentResult:
+    completion_config = getattr(
+        getattr(config, "subject_attributes", None),
+        "completion",
+        SubjectAttributeCompletionConfig(),
+    )
     if max_owners is not None and (
         isinstance(max_owners, bool)
         or not isinstance(max_owners, int)
@@ -2296,11 +2787,12 @@ def process_subject_attribute_clip(
                         "screen_mode",
                         None,
                     )
-                    if getattr(
-                        getattr(config, "subject_attribute_gme", None),
-                        "enabled",
-                        False,
-                    )
+                    if gme_screener is not None
+                    else None
+                ),
+                expected_completion_mode=(
+                    "boogu_completion_v1"
+                    if completion_config.enabled
                     else None
                 ),
             )
@@ -2322,6 +2814,8 @@ def process_subject_attribute_clip(
                     review_client=review_client,
                     segmentation_backend=segmentation_backend,
                     gme_screener=gme_screener,
+                    completion_backend=completion_backend,
+                    completion_judge=completion_judge,
                 )
             except Exception as exc:  # noqa: BLE001 - isolate one owner
                 totals.failures += 1
@@ -2454,7 +2948,11 @@ def reconcile_subject_attribute_outputs(
 
     run = storage.read_run()
     owner_count = totals.eligible_human_owners
-    qwen_calls = totals.discovery_calls + totals.review_calls
+    qwen_calls = (
+        totals.discovery_calls
+        + totals.review_calls
+        + totals.completion_review_calls
+    )
     single_subject_example = next(
         (
             sample.sample_id
@@ -2495,6 +2993,19 @@ def reconcile_subject_attribute_outputs(
         "gme_candidates_rejected": totals.gme_candidates_rejected,
         "gme_retried_next_frame": totals.gme_retried_next_frame,
         "gme_failures": totals.gme_failures,
+        "completion_attempts": totals.completion_attempts,
+        "completion_accepted": totals.completion_accepted,
+        "completion_rejected": totals.completion_rejected,
+        "completion_failures": totals.completion_failures,
+        "completion_qwen_review_rejects": (
+            totals.completion_qwen_review_rejects
+        ),
+        "completion_attempts_by_type": dict(
+            sorted(totals.completion_attempts_by_type.items())
+        ),
+        "completion_accepted_by_type": dict(
+            sorted(totals.completion_accepted_by_type.items())
+        ),
         "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
         "recognizability_rejects": totals.recognizability_rejects,
         "accepted_attribute_references": totals.accepted_attributes,
@@ -2513,10 +3024,14 @@ def reconcile_subject_attribute_outputs(
         "qwen_model_call_time_seconds": totals.qwen_model_call_time_seconds,
         "sam3_model_call_time_seconds": totals.sam3_model_call_time_seconds,
         "gme_model_call_time_seconds": totals.gme_model_call_time_seconds,
+        "completion_model_call_time_seconds": (
+            totals.completion_model_call_time_seconds
+        ),
         "model_call_time_seconds": (
             totals.qwen_model_call_time_seconds
             + totals.sam3_model_call_time_seconds
             + totals.gme_model_call_time_seconds
+            + totals.completion_model_call_time_seconds
         ),
         "gpu_peak_memory_bytes_before": gpu_peak_memory_bytes_before,
         "gpu_peak_memory_bytes_after": gpu_peak_memory_bytes_after,
@@ -2563,6 +3078,8 @@ def run_subject_attribute_enrichment(
     review_client: SubjectAttributeReviewClient | None = None,
     segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     gme_screener: AttributeGmeScreener | None = None,
+    completion_backend: AttributeCompletionBackend | None = None,
+    completion_judge: BooguReferenceEditJudge | None = None,
     allow_run_local_sidecar: bool = False,
 ) -> dict[str, object]:
     if max_owners is not None and (
@@ -2609,29 +3126,21 @@ def run_subject_attribute_enrichment(
     assert discovery_client is not None
     assert review_client is not None
     assert segmentation_backend is not None
-    owned_gme: PersistentGmeAttributeScreener | None = None
-    if effective_config.subject_attribute_gme.enabled and gme_screener is None:
-        physical_gpu = (
-            effective_config.runtime.gpu_workers.subject_attributes_gme
-        )
-        assert physical_gpu is not None
-        try:
-            owned_gme = PersistentGmeAttributeScreener.from_runtime(
-                effective_config.subject_attribute_gme,
-                physical_gpu=physical_gpu,
-                run_root=storage.root,
-                allowed_root=v3_config_module.ALLOWED_WRITABLE_ROOT,
+    owned_completion_judge: QwenBooguReferenceEditJudge | None = None
+    if effective_config.subject_attributes.completion.enabled:
+        if completion_backend is None:
+            raise ValueError(
+                "standalone enabled attribute completion requires an injected "
+                "persistent Boogu backend"
             )
-            owned_gme.start()
-            gme_screener = owned_gme
-        except Exception as exc:  # noqa: BLE001 - fail open to Qwen
-            if owned_gme is not None:
-                owned_gme.close()
-                owned_gme = None
-            gme_screener = UnavailableGmeAttributeScreener(
-                effective_config.subject_attribute_gme,
-                exc,
+        if completion_judge is None:
+            service = effective_config.qwen.candidate_judge
+            assert service is not None
+            owned_completion_judge = QwenBooguReferenceEditJudge(
+                service,
+                completion_component="qwen_attribute_completion_review",
             )
+            completion_judge = owned_completion_judge
 
     started = time.perf_counter()
     gpu_before = _gpu_peak_bytes()
@@ -2650,6 +3159,8 @@ def run_subject_attribute_enrichment(
                 review_client=review_client,
                 segmentation_backend=segmentation_backend,
                 gme_screener=gme_screener,
+                completion_backend=completion_backend,
+                completion_judge=completion_judge,
                 max_owners=(
                     max_owners - processed_owners
                     if max_owners is not None
@@ -2660,8 +3171,8 @@ def run_subject_attribute_enrichment(
             processed_owners += result.totals.eligible_human_owners
             skipped_existing_owners += result.totals.skipped_existing_owners
     finally:
-        if owned_gme is not None:
-            owned_gme.close()
+        if owned_completion_judge is not None:
+            owned_completion_judge.close()
         if owned_segmenter is not None:
             owned_segmenter.close()
         if owned_qwen is not None:
@@ -2679,6 +3190,8 @@ def run_subject_attribute_enrichment(
 
 
 __all__ = [
+    "ATTRIBUTE_COMPLETION_PROMPT",
+    "AttributeCompletionBackend",
     "AttributeFrameSegmentationBackend",
     "AttributeGmeScreener",
     "AttributeProbeClient",

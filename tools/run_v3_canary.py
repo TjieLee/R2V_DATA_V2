@@ -300,6 +300,7 @@ def _canary_config_bytes(
     sam3_compile: bool = False,
     dual_main_sam3: bool = False,
     defer_subject_attributes: bool = False,
+    attribute_completion: bool = False,
     qwen_max_inflight: int | None = None,
     qwen_stage_workers: int | None = None,
 ) -> bytes:
@@ -338,6 +339,17 @@ def _canary_config_bytes(
             stage_workers["subject_attributes"] = qwen_stage_workers
     runtime["stage_workers"] = stage_workers
     runtime["gpu_workers"] = gpu_workers
+    if "subject_attribute_gme" in value:
+        gme = dict(value.get("subject_attribute_gme") or {})
+        gme["enabled"] = False
+        value["subject_attribute_gme"] = gme
+    if attribute_completion:
+        subject_attributes = dict(value.get("subject_attributes") or {})
+        completion = dict(subject_attributes.get("completion") or {})
+        completion["enabled"] = True
+        subject_attributes["completion"] = completion
+        value["subject_attributes"] = subject_attributes
+        gpu_workers.setdefault("subject_attributes_completion", "6")
     value.update(
         {
             "dataset_json": str(source_jsonl),
@@ -361,6 +373,7 @@ def prepare_canary_artifacts(
     sam3_compile: bool = False,
     dual_main_sam3: bool = False,
     defer_subject_attributes: bool = False,
+    attribute_completion: bool = False,
     qwen_max_inflight: int | None = None,
     qwen_stage_workers: int | None = None,
 ) -> None:
@@ -401,6 +414,7 @@ def prepare_canary_artifacts(
             sam3_compile=sam3_compile,
             dual_main_sam3=dual_main_sam3,
             defer_subject_attributes=defer_subject_attributes,
+            attribute_completion=attribute_completion,
             qwen_max_inflight=qwen_max_inflight,
             qwen_stage_workers=qwen_stage_workers,
         ),
@@ -708,6 +722,7 @@ def run_canary(
     sam3_compile: bool = False,
     dual_main_sam3: bool = False,
     defer_subject_attributes: bool = False,
+    attribute_completion: bool = False,
     qwen_max_inflight: int | None = None,
     qwen_stage_workers: int | None = None,
 ) -> dict[str, object]:
@@ -745,6 +760,7 @@ def run_canary(
         sam3_compile=sam3_compile,
         dual_main_sam3=dual_main_sam3,
         defer_subject_attributes=defer_subject_attributes,
+        attribute_completion=attribute_completion,
         qwen_max_inflight=qwen_max_inflight,
         qwen_stage_workers=qwen_stage_workers,
     )
@@ -1005,6 +1021,30 @@ def run_canary(
             execution.result,
             "gme_model_call_time_seconds",
         ),
+        "completion_attempts": _subject_attribute_metric(
+            execution.result,
+            "completion_attempts",
+        ),
+        "completion_accepted": _subject_attribute_metric(
+            execution.result,
+            "completion_accepted",
+        ),
+        "completion_rejected": _subject_attribute_metric(
+            execution.result,
+            "completion_rejected",
+        ),
+        "completion_failures": _subject_attribute_metric(
+            execution.result,
+            "completion_failures",
+        ),
+        "completion_qwen_review_rejects": _subject_attribute_metric(
+            execution.result,
+            "completion_qwen_review_rejects",
+        ),
+        "completion_model_call_time_seconds": _subject_attribute_metric(
+            execution.result,
+            "completion_model_call_time_seconds",
+        ),
         "failed_tasks": _failed_tasks(execution.result),
         "config": str(paths.shard_config),
         "run_root": str(paths.run_root),
@@ -1038,6 +1078,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sam3-compile", action="store_true")
     parser.add_argument("--dual-main-sam3", action="store_true")
     parser.add_argument("--defer-subject-attributes", action="store_true")
+    parser.add_argument("--attribute-completion", action="store_true")
     parser.add_argument("--qwen-max-inflight", type=int)
     parser.add_argument("--qwen-stage-workers", type=int)
     return parser
@@ -1057,6 +1098,7 @@ def main() -> None:
             sam3_compile=args.sam3_compile,
             dual_main_sam3=args.dual_main_sam3,
             defer_subject_attributes=args.defer_subject_attributes,
+            attribute_completion=args.attribute_completion,
             qwen_max_inflight=args.qwen_max_inflight,
             qwen_stage_workers=args.qwen_stage_workers,
         )

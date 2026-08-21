@@ -20,8 +20,10 @@ from r2v_data_v2.v3.config import (
     RemoveConfig,
     Sam3Config,
     SourceConfig,
+    SubjectAttributeCompletionConfig,
     V3Config,
 )
+from r2v_data_v2.v3.reference_edit_boogu import BooguCompletionReview
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
 from r2v_data_v2.v3.pair import EntityReferenceCandidate
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
@@ -2051,3 +2053,198 @@ def test_attribute_output_cannot_overlap_source_run_or_visual_export(
             export_root,
             export_root,
         )
+
+
+def _completion_review(*, accepted: bool) -> BooguCompletionReview:
+    values = {
+        "same_physical_entity": accepted,
+        "identity_preserved": accepted,
+        "original_visible_attributes_preserved": accepted,
+        "exactly_one_entity": accepted,
+        "missing_parts_plausibly_completed": accepted,
+        "no_duplicate_entity": accepted,
+        "no_unrelated_entity": accepted,
+        "no_severe_structure_artifact": accepted,
+        "style_coherent": accepted,
+        "resolution_usable": accepted,
+        "reference_usable": accepted,
+        "certain": accepted,
+    }
+    return BooguCompletionReview(
+        verdict="accept" if accepted else "reject",
+        reason="usable" if accepted else "identity changed",
+        **values,
+    )
+
+
+@pytest.mark.parametrize("attribute_type", ["face", "upper_clothing"])
+def test_repairable_attribute_uses_boogu_then_sam3(
+    tmp_path: Path,
+    attribute_type: str,
+) -> None:
+    raw_mask = np.zeros((100, 100), dtype=bool)
+    raw_mask[30:70, 30:70] = True
+    crop_pixels = np.full((64, 64, 4), 255, dtype=np.uint8)
+    crop_pixels[..., 3] = 0
+    crop_pixels[16:48, 16:48, :3] = np.indices((32, 32))[0, ..., None] * 7
+    crop_pixels[16:48, 16:48, 3] = 255
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type=attribute_type,
+            phrase="distinct component",
+            grounding_prompt="distinct component worn by person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=raw_mask,
+        source_image=Image.new("RGB", (100, 100), "white"),
+        crop=Image.fromarray(crop_pixels, mode="RGBA"),
+        geometry=_geometry(),
+    )
+
+    class Backend:
+        calls = 0
+
+        def attribute_completion(self, *, output_path, **_kwargs):
+            self.calls += 1
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(crop_pixels[..., :3], mode="RGB").save(output_path)
+            return {"model_call_time_seconds": 0.25}
+
+    class Segmenter:
+        calls = 0
+
+        def segment_generated_frame(self, **_kwargs):
+            self.calls += 1
+            mask = np.zeros((64, 64), dtype=bool)
+            mask[16:48, 16:48] = True
+            return (mask,)
+
+    class Judge:
+        def review(self, **_kwargs):
+            return _completion_review(accepted=True)
+
+    backend = Backend()
+    segmenter = Segmenter()
+    metrics = subject_attributes._CompletionSelectionMetrics()
+    config = replace(
+        SubjectAttributeCompletionConfig(enabled=True),
+        minimum_sharpness_score=-1.0,
+        maximum_area_growth_ratio=4.0,
+        face_maximum_area_growth_ratio=4.0,
+        maximum_bbox_area_growth_ratio=4.0,
+        face_maximum_bbox_area_growth_ratio=4.0,
+    )
+    completed, reason, failed = subject_attributes._attempt_attribute_completion(
+        candidate,
+        clip_uid="clip-1",
+        output_root=tmp_path / "subject_attributes",
+        completion_config=config,
+        completion_backend=backend,
+        completion_judge=Judge(),
+        segmentation_backend=segmenter,
+        metrics=metrics,
+    )
+
+    assert completed is not None
+    assert completed.completion_attempted is True
+    assert reason == "completion_accepted"
+    assert failed is False
+    assert backend.calls == segmenter.calls == 1
+    assert metrics.attempts == metrics.accepted == 1
+
+
+def test_unrepairable_blank_attribute_never_calls_completion(tmp_path: Path) -> None:
+    crop = Image.new("RGBA", (64, 64), (255, 255, 255, 0))
+    crop.putpixel((32, 32), (255, 255, 255, 255))
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="face",
+            phrase="face",
+            grounding_prompt="face of person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=np.ones((10, 10), dtype=bool),
+        source_image=Image.new("RGB", (100, 100), "white"),
+        crop=crop,
+        geometry=_geometry(),
+    )
+
+    class Forbidden:
+        def attribute_completion(self, **_kwargs):
+            pytest.fail("unrepairable candidate reached Boogu")
+
+    completed, reason, _ = subject_attributes._attempt_attribute_completion(
+        candidate,
+        clip_uid="clip-1",
+        output_root=tmp_path,
+        completion_config=SubjectAttributeCompletionConfig(enabled=True),
+        completion_backend=Forbidden(),
+        completion_judge=SimpleNamespace(),
+        segmentation_backend=SimpleNamespace(),
+        metrics=subject_attributes._CompletionSelectionMetrics(),
+    )
+    assert completed is None
+    assert reason == "completion_precheck:blank_area_too_large"
+
+
+def test_completion_review_rejects_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject_attributes,
+        "_masked_crop_quality_rejection",
+        lambda *_args, **_kwargs: None,
+    )
+    raw_mask = np.zeros((32, 32), dtype=bool)
+    raw_mask[8:24, 8:24] = True
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="hair",
+            phrase="hair",
+            grounding_prompt="hair of person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=raw_mask,
+        source_image=Image.new("RGB", (100, 100), "white"),
+        crop=Image.new("RGBA", (32, 32), (100, 100, 100, 255)),
+        geometry=_geometry(),
+    )
+
+    class Backend:
+        def attribute_completion(self, *, output_path, **_kwargs):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (32, 32), "gray").save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Segmenter:
+        def segment_generated_frame(self, **_kwargs):
+            return (raw_mask.copy(),)
+
+    class Judge:
+        def review(self, **_kwargs):
+            return _completion_review(accepted=False)
+
+    metrics = subject_attributes._CompletionSelectionMetrics()
+    completed, reason, _ = subject_attributes._attempt_attribute_completion(
+        candidate,
+        clip_uid="clip-1",
+        output_root=tmp_path,
+        completion_config=replace(
+            SubjectAttributeCompletionConfig(enabled=True),
+            maximum_alpha_coverage_without_completion=1.0,
+        ),
+        completion_backend=Backend(),
+        completion_judge=Judge(),
+        segmentation_backend=Segmenter(),
+        metrics=metrics,
+    )
+    assert completed is None
+    assert reason == "completion_qwen_review_reject"
+    assert metrics.qwen_review_rejects == 1

@@ -7,10 +7,13 @@ import json
 import os
 import sys
 import threading
+import time
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from r2v_data_v2.v3.config import BOOGU_REMOVE_BACKEND, V3Config, load_config
 from r2v_data_v2.v3.mask_codec import encode_binary_mask
@@ -18,6 +21,7 @@ from r2v_data_v2.v3.profiling import (
     QwenConcurrencyGate,
     V3Profiler,
     active_profiler,
+    profile_model_call,
     qwen_concurrency_gate,
 )
 from r2v_data_v2.v3.runtime import ClipScopedStorage
@@ -60,6 +64,7 @@ class _StageRuntime:
         self._closers: list[Any] = []
         self._segment_backend: Any | None = None
         self._attribute_segmenter: Any | None = None
+        self._reference_edit_backend: Any | None = None
         self._first_reference_edit_request = True
         self._handler = self._initialize()
 
@@ -131,9 +136,6 @@ class _StageRuntime:
             QwenScaleCollapseFallbackJudge,
         )
 
-        service = self.config.qwen.reference_edit_judge
-        if service is None:
-            raise ValueError("qwen.reference_edit_judge is required")
         physical_device = os.environ.get("CUDA_VISIBLE_DEVICES")
         if physical_device is None or not physical_device.isdigit():
             raise ValueError("reference_edit worker requires one visible physical GPU")
@@ -150,6 +152,19 @@ class _StageRuntime:
             )
         )
         backend.start(stderr_log_path=self.storage.reference_edit_worker_log_path())
+        self._reference_edit_backend = backend
+        if not self.config.reference_edit.enabled:
+            self._closers.append(backend)
+
+            def completion_only(_scoped: object) -> object:
+                raise RuntimeError(
+                    "completion-only Boogu worker does not accept run_clip"
+                )
+
+            return completion_only
+        service = self.config.qwen.reference_edit_judge
+        if service is None:
+            raise ValueError("qwen.reference_edit_judge is required")
         judge = QwenBooguReferenceEditJudge(service)
         segmenter = Sam3SegmentationBackend(self.config.sam3)
         sam_reviewer = Sam3BooguReferenceReviewer(
@@ -251,6 +266,96 @@ class _StageRuntime:
         )
         return [encode_binary_mask(mask).model_dump(mode="json") for mask in masks]
 
+    def attribute_completion_probe(
+        self,
+        *,
+        image_path: Path,
+        grounding_prompt: str,
+    ) -> list[dict[str, object]]:
+        if self.stage != "segment":
+            raise RuntimeError("attribute completion probes require segment worker")
+        if self._attribute_segmenter is None:
+            from r2v_data_v2.v3.subject_attributes import Sam3AttributeFrameSegmenter
+
+            self._attribute_segmenter = Sam3AttributeFrameSegmenter(self.config.sam3)
+            self._closers.append(self._attribute_segmenter)
+        resolved = image_path.expanduser().resolve()
+        relative = resolved.relative_to(self.storage.root)
+        if relative.parts[:2] != ("subject_attributes", "completion_candidates"):
+            raise ValueError("attribute completion image must be a run-local sidecar")
+        masks = self._attribute_segmenter.segment_frame(
+            frame_path=resolved,
+            frame_slot=0,
+            grounding_prompt=grounding_prompt,
+        )
+        return [encode_binary_mask(mask).model_dump(mode="json") for mask in masks]
+
+    def attribute_completion(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        instruction: str,
+        seed: int,
+    ) -> dict[str, object]:
+        if self.stage != "reference_edit" or self._reference_edit_backend is None:
+            raise RuntimeError("attribute completion requires reference_edit worker")
+        source_resolved = source_path.expanduser().resolve()
+        output_resolved = output_path.expanduser().resolve(strict=False)
+        sidecar_root = (
+            self.storage.root / "subject_attributes" / "completion_candidates"
+        ).resolve(strict=False)
+        source_resolved.relative_to(sidecar_root)
+        output_resolved.relative_to(sidecar_root)
+        with Image.open(source_resolved) as opened:
+            opened.load()
+            source = opened.convert("RGB")
+        from r2v_data_v2.v3.reference_edit_boogu import resolve_boogu_1k_size
+
+        width, height = resolve_boogu_1k_size(
+            *source.size,
+            target_area=self.config.reference_edit.target_area,
+            alignment=self.config.reference_edit.alignment,
+        )
+        started = time.perf_counter()
+        with profile_model_call(
+            component="boogu_attribute_completion",
+            operation="complete_attribute",
+            retry_index=0,
+            model=str(self.config.reference_edit.model_path),
+            input_text_chars=len(instruction),
+            input_image_count=1,
+            metadata={
+                "thinking_enabled": False,
+                "instruction_rewrite_enabled": False,
+            },
+        ):
+            result = self._reference_edit_backend.edit(
+                source_rgb=source,
+                instruction=instruction,
+                width=width,
+                height=height,
+                thinking_enabled=False,
+                instruction_rewrite_enabled=False,
+                seed=seed,
+            )
+        output_resolved.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_resolved.with_name(
+            f".{output_resolved.name}.tmp-{os.getpid()}"
+        )
+        try:
+            temporary.write_bytes(result.png_bytes)
+            temporary.replace(output_resolved)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "width": width,
+            "height": height,
+            "model_call_time_seconds": time.perf_counter() - started,
+            "thinking_enabled": False,
+            "instruction_rewrite_enabled": False,
+        }
+
     def close(self) -> None:
         first_error: BaseException | None = None
         for resource in self._closers:
@@ -344,16 +449,24 @@ def serve(args: argparse.Namespace) -> int:
                         )
                         return 0
                     request_type = payload.get("type")
-                    if request_type not in {"run_clip", "attribute_probe"}:
+                    if request_type not in {
+                        "run_clip",
+                        "attribute_probe",
+                        "attribute_completion_probe",
+                        "attribute_completion",
+                    }:
                         raise ValueError("unsupported worker request type")
-                    if attribute_probe_only and request_type != "attribute_probe":
+                    if attribute_probe_only and request_type not in {
+                        "attribute_probe",
+                        "attribute_completion_probe",
+                    }:
                         raise ValueError(
                             "dedicated attribute worker accepts only attribute probes"
                         )
-                    clip_uid = payload.get("clip_uid")
-                    if not isinstance(clip_uid, str) or not clip_uid:
-                        raise ValueError("worker clip_uid must be non-empty")
                     if request_type == "run_clip":
+                        clip_uid = payload.get("clip_uid")
+                        if not isinstance(clip_uid, str) or not clip_uid:
+                            raise ValueError("worker clip_uid must be non-empty")
                         counts = runtime.run_clip(clip_uid)
                         response = {
                             "schema_version": 1,
@@ -362,7 +475,10 @@ def serve(args: argparse.Namespace) -> int:
                             "status": "ok",
                             "counts": counts,
                         }
-                    else:
+                    elif request_type == "attribute_probe":
+                        clip_uid = payload.get("clip_uid")
+                        if not isinstance(clip_uid, str) or not clip_uid:
+                            raise ValueError("worker clip_uid must be non-empty")
                         frame_slot = payload.get("frame_slot")
                         source_frame_index = payload.get("source_frame_index")
                         grounding_prompt = payload.get("grounding_prompt")
@@ -401,6 +517,50 @@ def serve(args: argparse.Namespace) -> int:
                             "request_id": request_id,
                             "status": "ok",
                             "masks": masks,
+                        }
+                    elif request_type == "attribute_completion_probe":
+                        image_path = payload.get("image_path")
+                        grounding_prompt = payload.get("grounding_prompt")
+                        if not isinstance(image_path, str) or not image_path:
+                            raise ValueError("completion probe image_path is required")
+                        if not isinstance(grounding_prompt, str) or not grounding_prompt.strip():
+                            raise ValueError("completion probe prompt is required")
+                        masks = runtime.attribute_completion_probe(
+                            image_path=Path(image_path),
+                            grounding_prompt=grounding_prompt,
+                        )
+                        response = {
+                            "schema_version": 1,
+                            "type": "response",
+                            "request_id": request_id,
+                            "status": "ok",
+                            "masks": masks,
+                        }
+                    else:
+                        source_path = payload.get("source_path")
+                        output_path = payload.get("output_path")
+                        instruction = payload.get("instruction")
+                        seed = payload.get("seed")
+                        if not isinstance(source_path, str) or not source_path:
+                            raise ValueError("completion source_path is required")
+                        if not isinstance(output_path, str) or not output_path:
+                            raise ValueError("completion output_path is required")
+                        if not isinstance(instruction, str) or not instruction.strip():
+                            raise ValueError("completion instruction is required")
+                        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                            raise ValueError("completion seed must be non-negative")
+                        completion = runtime.attribute_completion(
+                            source_path=Path(source_path),
+                            output_path=Path(output_path),
+                            instruction=instruction,
+                            seed=seed,
+                        )
+                        response = {
+                            "schema_version": 1,
+                            "type": "response",
+                            "request_id": request_id,
+                            "status": "ok",
+                            "completion": completion,
                         }
                 except Exception as exc:  # noqa: BLE001 - process boundary response
                     response = {

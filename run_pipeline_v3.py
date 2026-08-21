@@ -7,7 +7,6 @@ import threading
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
-from r2v_data_v2.v3 import config as v3_config_module
 from r2v_data_v2.v3.annotation import AnnotationClient, annotate_clips
 from r2v_data_v2.v3.background import build_background_candidates
 from r2v_data_v2.v3.background_final_guard import FinalBackgroundJudge
@@ -35,6 +34,7 @@ from r2v_data_v2.v3.reference_edit_boogu import (
     BooguReferenceEditBackend,
     BooguReferenceEditJudge,
     BooguSamReviewer,
+    QwenBooguReferenceEditJudge,
 )
 from r2v_data_v2.v3.reference_integrity import (
     ReferenceIntegrityJudge,
@@ -56,11 +56,8 @@ from r2v_data_v2.v3.runtime import (
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
 from r2v_data_v2.v3.segment import segment_clips
 from r2v_data_v2.v3.storage import DatasetExporter, RunStorage, evaluate_export_state
-from r2v_data_v2.v3.subject_attribute_gme import (
-    PersistentGmeAttributeScreener,
-    UnavailableGmeAttributeScreener,
-)
 from r2v_data_v2.v3.subject_attributes import (
+    AttributeCompletionBackend,
     AttributeFrameSegmentationBackend,
     AttributeGmeScreener,
     PersistentWorkerAttributeFrameSegmenter,
@@ -150,6 +147,8 @@ def _streaming_stage_handler(
     subject_attribute_review_client: SubjectAttributeReviewClient | None,
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
     attribute_gme_screener: AttributeGmeScreener | None,
+    attribute_completion_backend: AttributeCompletionBackend | None,
+    attribute_completion_judge: BooguReferenceEditJudge | None,
 ) -> object:
     if process is not None:
         return process.request
@@ -255,6 +254,8 @@ def _streaming_stage_handler(
                 review_client=subject_attribute_review_client,
                 segmentation_backend=attribute_segmentation_backend,
                 gme_screener=attribute_gme_screener,
+                completion_backend=attribute_completion_backend,
+                completion_judge=attribute_completion_judge,
                 overwrite=overwrite,
             ).to_counts()
         else:
@@ -297,7 +298,9 @@ def _run_streaming_pipeline(
     subject_attribute_review_client: SubjectAttributeReviewClient | None,
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None,
     attribute_gme_screener: AttributeGmeScreener | None,
-    profile: bool,
+    attribute_completion_backend: AttributeCompletionBackend | None = None,
+    attribute_completion_judge: BooguReferenceEditJudge | None = None,
+    profile: bool = False,
 ) -> dict[str, object]:
     if "manifest" in ordered_stages:
         with profile_stage("manifest") as stage_profile:
@@ -339,6 +342,13 @@ def _run_streaming_pipeline(
         worker_stages = [
             stage for stage in clip_stages if stage in _STREAMING_GPU_STAGES
         ]
+        if (
+            "subject_attributes" in clip_stages
+            and config.subject_attributes.completion.enabled
+            and attribute_completion_backend is None
+            and "reference_edit" not in worker_stages
+        ):
+            worker_stages.append("reference_edit")
         dedicated_attribute_segment = (
             "subject_attributes" in clip_stages
             and attribute_segmentation_backend is None
@@ -362,7 +372,13 @@ def _run_streaming_pipeline(
             if (
                 stage not in _STREAMING_GPU_STAGES
                 or injected is not None
-                or not streaming_model_stage_enabled(config, stage)
+                or (
+                    not streaming_model_stage_enabled(config, stage)
+                    and not (
+                        stage == "reference_edit"
+                        and config.subject_attributes.completion.enabled
+                    )
+                )
             ):
                 continue
             if stage == "segment" and config.runtime.gpu_workers.segment_pool:
@@ -385,12 +401,27 @@ def _run_streaming_pipeline(
                     config,
                     config_path=config_path,
                     stage=stage,
+                    gpu_assignment=(
+                        "subject_attributes_completion"
+                        if (
+                            stage == "reference_edit"
+                            and not config.reference_edit.enabled
+                            and config.runtime.gpu_workers.subject_attributes_completion
+                            is not None
+                        )
+                        else None
+                    ),
                     overwrite=overwrite,
                     profile=profile,
                 )
             )
             worker.start()
-            processes[stage] = worker
+            process_key = (
+                "attribute_completion"
+                if stage == "reference_edit" and not config.reference_edit.enabled
+                else stage
+            )
+            processes[process_key] = worker
             stack.callback(worker.close)
         if dedicated_attribute_segment:
             worker = PersistentStageProcess(
@@ -407,44 +438,8 @@ def _run_streaming_pipeline(
             processes[_SUBJECT_ATTRIBUTE_SEGMENT_WORKER] = worker
             stack.callback(worker.close)
         attribute_inference_lock: threading.Lock | None = None
-        if config.subject_attribute_gme.enabled:
-            attribute_segment_gpu = (
-                config.runtime.gpu_workers.subject_attributes_segment
-                or config.runtime.gpu_workers.segment
-            )
-            if (
-                attribute_segment_gpu
-                == config.runtime.gpu_workers.subject_attributes_gme
-            ):
-                attribute_inference_lock = threading.Lock()
-        if (
-            "subject_attributes" in clip_stages
-            and config.subject_attribute_gme.enabled
-            and attribute_gme_screener is None
-        ):
-            gme_gpu = config.runtime.gpu_workers.subject_attributes_gme
-            assert gme_gpu is not None
-            owned_gme: PersistentGmeAttributeScreener | None = None
-            try:
-                owned_gme = PersistentGmeAttributeScreener.from_runtime(
-                    config.subject_attribute_gme,
-                    physical_gpu=gme_gpu,
-                    run_root=storage.root,
-                    allowed_root=v3_config_module.ALLOWED_WRITABLE_ROOT,
-                    inference_lock=attribute_inference_lock,
-                )
-                owned_gme.start()
-            except Exception as exc:  # noqa: BLE001 - fail open to Qwen
-                if owned_gme is not None:
-                    owned_gme.close()
-                attribute_gme_screener = UnavailableGmeAttributeScreener(
-                    config.subject_attribute_gme,
-                    exc,
-                )
-            else:
-                attribute_gme_screener = owned_gme
-                stack.callback(owned_gme.close)
         owned_attribute_qwen: QwenSubjectAttributeClient | None = None
+        owned_completion_judge: QwenBooguReferenceEditJudge | None = None
         if "subject_attributes" in clip_stages:
             if (
                 subject_attribute_discovery_client is None
@@ -479,6 +474,27 @@ def _run_streaming_pipeline(
                         inference_lock=attribute_inference_lock,
                     )
                 )
+            if config.subject_attributes.completion.enabled:
+                if attribute_completion_backend is None:
+                    completion_process = processes.get(
+                        "attribute_completion"
+                    ) or processes.get("reference_edit")
+                    if completion_process is None or isinstance(
+                        completion_process, PersistentStageProcessPool
+                    ):
+                        raise ValueError(
+                            "attribute completion requires persistent Boogu worker"
+                        )
+                    attribute_completion_backend = completion_process
+                if attribute_completion_judge is None:
+                    service = config.qwen.candidate_judge
+                    assert service is not None
+                    owned_completion_judge = QwenBooguReferenceEditJudge(
+                        service,
+                        completion_component="qwen_attribute_completion_review",
+                    )
+                    stack.callback(owned_completion_judge.close)
+                    attribute_completion_judge = owned_completion_judge
         stages: list[StreamingStage] = []
         for stage in clip_stages:
             workers = getattr(config.runtime.stage_workers, stage)
@@ -519,6 +535,8 @@ def _run_streaming_pipeline(
                             attribute_segmentation_backend
                         ),
                         attribute_gme_screener=attribute_gme_screener,
+                        attribute_completion_backend=attribute_completion_backend,
+                        attribute_completion_judge=attribute_completion_judge,
                     ),
                 )
             )
@@ -600,6 +618,8 @@ def run_pipeline_v3(
     subject_attribute_review_client: SubjectAttributeReviewClient | None = None,
     attribute_segmentation_backend: AttributeFrameSegmentationBackend | None = None,
     attribute_gme_screener: AttributeGmeScreener | None = None,
+    attribute_completion_backend: AttributeCompletionBackend | None = None,
+    attribute_completion_judge: BooguReferenceEditJudge | None = None,
     profile: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
@@ -691,6 +711,8 @@ def run_pipeline_v3(
                             attribute_segmentation_backend
                         ),
                         attribute_gme_screener=attribute_gme_screener,
+                        attribute_completion_backend=attribute_completion_backend,
+                        attribute_completion_judge=attribute_completion_judge,
                         profile=profile,
                     )
             for stage in ordered_stages:

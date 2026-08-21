@@ -330,6 +330,47 @@ def test_sam3_compile_flag_changes_only_isolated_canary_runtime(
     assert load_config(paths.shard_config).runtime.sam3_compile_enabled is True
 
 
+def test_attribute_completion_flag_writes_isolated_completion_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(
+        tmp_path,
+        monkeypatch,
+        groups=[("movie-a", "source.mkv", 2)],
+    )
+    base = yaml.safe_load(fixture["base_config"].read_text(encoding="utf-8"))
+    boogu_root = fixture["writable"] / "boogu"
+    base["reference_edit"] = {
+        "python_executable": str(boogu_root / "python"),
+        "code_root": str(boogu_root / "code"),
+        "model_path": str(boogu_root / "model"),
+    }
+    fixture["base_config"].write_text(
+        yaml.safe_dump(base, sort_keys=False),
+        encoding="utf-8",
+    )
+    selection = select_source_records(**_selection_arguments(fixture), count=2)
+    paths = build_canary_paths(
+        selection,
+        count=2,
+        now=datetime(2026, 8, 20, 15, 0, 2, tzinfo=timezone.utc),
+    )
+    prepare_canary_artifacts(
+        selection=selection,
+        paths=paths,
+        base_config=fixture["base_config"],
+        attribute_completion=True,
+        **_selection_arguments(fixture),
+    )
+
+    generated = load_config(paths.shard_config)
+    assert generated.subject_attributes.completion.enabled is True
+    assert generated.reference_edit.enabled is False
+    assert generated.runtime.gpu_workers.subject_attributes_completion == "6"
+    assert generated.subject_attribute_gme.enabled is False
+
+
 def test_dual_sam3_and_qwen_overrides_change_only_isolated_canary_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

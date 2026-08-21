@@ -493,6 +493,52 @@ class PersistentStageProcess:
             raise TypeError("segment worker omitted attribute probe masks")
         return tuple(decode_binary_mask(mask) for mask in masks)
 
+    def attribute_completion_probe(
+        self,
+        *,
+        image_path: Path,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        if self.config.stage != "segment":
+            raise RuntimeError("attribute completion probes require segment worker")
+        with self._request_lock:
+            response = self._exchange(
+                {
+                    "type": "attribute_completion_probe",
+                    "image_path": str(image_path),
+                    "grounding_prompt": grounding_prompt,
+                }
+            )
+        masks = response.get("masks")
+        if not isinstance(masks, list):
+            raise TypeError("segment worker omitted attribute completion masks")
+        return tuple(decode_binary_mask(mask) for mask in masks)
+
+    def attribute_completion(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        instruction: str,
+        seed: int,
+    ) -> dict[str, object]:
+        if self.config.stage != "reference_edit":
+            raise RuntimeError("attribute completion requires reference_edit worker")
+        with self._request_lock:
+            response = self._exchange(
+                {
+                    "type": "attribute_completion",
+                    "source_path": str(source_path),
+                    "output_path": str(output_path),
+                    "instruction": instruction,
+                    "seed": seed,
+                }
+            )
+        completion = response.get("completion")
+        if not isinstance(completion, dict):
+            raise TypeError("reference_edit worker omitted attribute completion")
+        return completion
+
     def close(self) -> None:
         process = self._process
         if process is None:
@@ -624,6 +670,20 @@ class PersistentStageProcessPool:
                 clip_uid=clip_uid,
                 frame_slot=frame_slot,
                 source_frame_index=source_frame_index,
+                grounding_prompt=grounding_prompt,
+            ),
+        )
+
+    def attribute_completion_probe(
+        self,
+        *,
+        image_path: Path,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        return self._dispatch(
+            "attribute",
+            lambda worker: worker.attribute_completion_probe(
+                image_path=image_path,
                 grounding_prompt=grounding_prompt,
             ),
         )
