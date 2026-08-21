@@ -353,8 +353,7 @@ def test_dual_sam3_and_qwen_overrides_change_only_isolated_canary_runtime(
         paths=paths,
         base_config=fixture["base_config"],
         dual_main_sam3=True,
-        defer_subject_attributes=True,
-        qwen_max_inflight=8,
+        qwen_max_inflight=4,
         qwen_stage_workers=4,
         **_selection_arguments(fixture),
     )
@@ -364,15 +363,13 @@ def test_dual_sam3_and_qwen_overrides_change_only_isolated_canary_runtime(
     assert generated.runtime.gpu_workers.segment_pool == ("5", "7")
     assert generated.runtime.stage_workers.segment == 2
     assert generated.runtime.sam3_compile_enabled is False
-    assert generated.runtime.subject_attributes_deferred is True
-    assert generated.runtime.qwen_max_inflight == 8
+    assert generated.runtime.subject_attributes_deferred is False
+    assert generated.runtime.qwen_max_inflight == 4
     assert generated.runtime.stage_workers.annotate == 4
     assert generated.runtime.stage_workers.pair == 4
     assert generated.runtime.stage_workers.reference_integrity == 4
     assert generated.runtime.stage_workers.instruct == 4
-    assert generated.runtime.stage_workers.subject_attributes == (
-        base_config.runtime.stage_workers.subject_attributes
-    )
+    assert generated.runtime.stage_workers.subject_attributes == 4
     for stage in ("frames", "rank", "background", "remove", "reference_edit"):
         assert getattr(generated.runtime.stage_workers, stage) == getattr(
             base_config.runtime.stage_workers, stage
@@ -397,12 +394,14 @@ def test_dual_sam3_and_qwen_overrides_change_only_isolated_canary_runtime(
     assert inline.runtime.gpu_workers.segment_pool == ()
 
 
-def test_dual_main_sam3_requires_deferred_attributes_before_source_access() -> None:
-    with pytest.raises(
-        ValueError,
-        match="--dual-main-sam3 requires --defer-subject-attributes",
-    ):
-        run_canary(dual_main_sam3=True)
+def test_dual_main_sam3_allows_inline_attributes_before_source_access(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        run_canary(
+            dual_main_sam3=True,
+            source_jsonl=tmp_path / "missing.jsonl",
+        )
 
 
 def test_deferred_canary_reports_zero_canonical_attributes(
@@ -616,6 +615,22 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
                         "5": 7.0,
                         "7": 6.0,
                     },
+                    "sam_pool_main_requests_by_gpu": {"5": 1, "7": 1},
+                    "sam_pool_attribute_probe_requests_by_gpu": {
+                        "5": 2,
+                        "7": 1,
+                    },
+                    "sam_pool_main_service_seconds_by_gpu": {
+                        "5": 7.0,
+                        "7": 6.0,
+                    },
+                    "sam_pool_attribute_service_seconds_by_gpu": {
+                        "5": 3.0,
+                        "7": 2.0,
+                    },
+                    "sam_pool_main_wait_seconds_total": 0.4,
+                    "sam_pool_attribute_wait_seconds_total": 0.7,
+                    "sam_pool_max_concurrent_requests": 2,
                 },
                 "remove": {
                     "candidates_generated": 3,
@@ -690,6 +705,22 @@ def test_successful_mocked_pipeline_compacts_and_writes_summary(
     assert summary["steady_state_segment_mean_seconds"] == 2.0
     assert summary["segment_worker_pool_size"] == 2
     assert summary["segment_worker_requests_by_gpu"] == {"5": 1, "7": 1}
+    assert summary["sam_pool_main_requests_by_gpu"] == {"5": 1, "7": 1}
+    assert summary["sam_pool_attribute_probe_requests_by_gpu"] == {
+        "5": 2,
+        "7": 1,
+    }
+    assert summary["sam_pool_main_service_seconds_by_gpu"] == {
+        "5": 7.0,
+        "7": 6.0,
+    }
+    assert summary["sam_pool_attribute_service_seconds_by_gpu"] == {
+        "5": 3.0,
+        "7": 2.0,
+    }
+    assert summary["sam_pool_main_wait_seconds_total"] == 0.4
+    assert summary["sam_pool_attribute_wait_seconds_total"] == 0.7
+    assert summary["sam_pool_max_concurrent_requests"] == 2
     assert summary["qwen_calls"] == 9
     assert summary["qwen_gate_wait_seconds_total"] == 1.8
     assert summary["qwen_gate_wait_seconds_mean"] == 0.2

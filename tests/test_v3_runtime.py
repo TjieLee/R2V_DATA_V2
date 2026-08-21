@@ -4,6 +4,7 @@ import fcntl
 import inspect
 import json
 import os
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -519,12 +520,14 @@ def _exercise_streaming_segment_worker_routing(
     monkeypatch: pytest.MonkeyPatch,
     *,
     dedicated_gpu: str | None,
+    segment_pool: tuple[str, ...] = (),
     fail_scheduler: bool = False,
 ) -> list[object]:
     config = _config(tmp_path, monkeypatch)
     gpu_workers = replace(
         config.runtime.gpu_workers,
         segment="5",
+        segment_pool=segment_pool,
         subject_attributes_segment=dedicated_gpu,
     )
     config = replace(
@@ -532,6 +535,10 @@ def _exercise_streaming_segment_worker_routing(
         runtime=replace(
             config.runtime,
             mode="streaming_v1",
+            stage_workers=replace(
+                config.runtime.stage_workers,
+                segment=max(1, len(segment_pool)),
+            ),
             gpu_workers=gpu_workers,
         ),
     )
@@ -570,6 +577,9 @@ def _exercise_streaming_segment_worker_routing(
 
         def close(self) -> None:
             self.closes += 1
+
+        def terminate(self) -> None:
+            return None
 
         def request(self, clip_uid: str) -> dict[str, int]:
             self.run_clip_requests.append(clip_uid)
@@ -706,6 +716,28 @@ def test_attribute_segment_worker_falls_back_to_main_segment_process(
     assert processes[0].run_clip_requests == ["clip-a"]
     assert processes[0].attribute_probe_requests == ["clip-a"]
     assert processes[0].starts == processes[0].closes == 1
+
+
+def test_dual_segment_pool_routes_inline_attributes_without_dedicated_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes = _exercise_streaming_segment_worker_routing(
+        tmp_path,
+        monkeypatch,
+        dedicated_gpu="7",
+        segment_pool=("5", "7"),
+    )
+
+    assert len(processes) == 2
+    assert [process.config.cuda_visible_devices for process in processes] == [
+        "5",
+        "7",
+    ]
+    assert all(process.config.attribute_probe_only is False for process in processes)
+    assert sum(len(process.run_clip_requests) for process in processes) == 1
+    assert sum(len(process.attribute_probe_requests) for process in processes) == 1
+    assert all(process.starts == process.closes == 1 for process in processes)
 
 
 def test_dedicated_attribute_segment_worker_closes_on_pipeline_error(
@@ -1381,12 +1413,14 @@ def test_segment_pool_dispatches_to_available_worker_without_overlap() -> None:
     state_lock = threading.Lock()
     active: dict[str, int] = {"5": 0, "7": 0}
     maximum: dict[str, int] = {"5": 0, "7": 0}
-    requests: dict[str, list[str]] = {"5": [], "7": []}
+    global_active = 0
+    global_maximum = 0
+    started: queue.Queue[tuple[str, str]] = queue.Queue()
+    release = {"5": threading.Event(), "7": threading.Event()}
 
     class Worker:
-        def __init__(self, gpu: str, delay: float) -> None:
+        def __init__(self, gpu: str) -> None:
             self.config = SimpleNamespace(cuda_visible_devices=gpu)
-            self.delay = delay
             self.starts = 0
             self.closes = 0
 
@@ -1399,43 +1433,169 @@ def test_segment_pool_dispatches_to_available_worker_without_overlap() -> None:
         def close(self) -> None:
             self.closes += 1
 
-        def request(self, clip_uid: str) -> dict[str, object]:
+        def _execute(self, request_kind: str) -> None:
+            nonlocal global_active, global_maximum
             gpu = self.config.cuda_visible_devices
             with state_lock:
                 active[gpu] += 1
                 maximum[gpu] = max(maximum[gpu], active[gpu])
-                requests[gpu].append(clip_uid)
+                global_active += 1
+                global_maximum = max(global_maximum, global_active)
+            started.put((gpu, request_kind))
             try:
-                time.sleep(self.delay)
-                return {"processed": 1}
+                assert release[gpu].wait(timeout=2)
             finally:
                 with state_lock:
                     active[gpu] -= 1
+                    global_active -= 1
 
-    slow = Worker("5", 0.12)
-    fast = Worker("7", 0.02)
-    pool = PersistentStageProcessPool([slow, fast])  # type: ignore[list-item]
+        def request(self, _clip_uid: str) -> dict[str, object]:
+            self._execute("main")
+            return {"processed": 1}
+
+        def attribute_probe(self, **_kwargs: object) -> tuple[np.ndarray, ...]:
+            self._execute("attribute")
+            return ()
+
+    gpu5 = Worker("5")
+    gpu7 = Worker("7")
+    pool = PersistentStageProcessPool([gpu5, gpu7])  # type: ignore[list-item]
     pool.start()
     with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [
-            executor.submit(pool.request, clip_uid)
-            for clip_uid in ("clip-a", "clip-b", "clip-c")
-        ]
-        assert [future.result() for future in futures] == [
-            {"processed": 1},
-            {"processed": 1},
-            {"processed": 1},
-        ]
+        main = executor.submit(pool.request, "clip-a")
+        attribute = executor.submit(
+            pool.attribute_probe,
+            clip_uid="clip-b",
+            frame_slot=1,
+            source_frame_index=10,
+            grounding_prompt="the red jacket",
+        )
+        initial = [started.get(timeout=1), started.get(timeout=1)]
+        assert {gpu for gpu, _kind in initial} == {"5", "7"}
+        assert {kind for _gpu, kind in initial} == {"main", "attribute"}
+
+        third = executor.submit(pool.request, "clip-c")
+        assert not third.done()
+        released_gpu = initial[0][0]
+        release[released_gpu].set()
+        assert started.get(timeout=1) == (released_gpu, "main")
+        release[initial[1][0]].set()
+
+        assert main.result() == {"processed": 1}
+        assert attribute.result() == ()
+        assert third.result() == {"processed": 1}
     counters = pool.performance_counters()
     pool.close()
 
-    assert slow.starts == fast.starts == 1
-    assert slow.closes == fast.closes == 1
+    assert gpu5.starts == gpu7.starts == 1
+    assert gpu5.closes == gpu7.closes == 1
     assert maximum == {"5": 1, "7": 1}
-    assert len(requests["5"]) == 1
-    assert len(requests["7"]) == 2
+    assert global_maximum == 2
     assert counters["segment_worker_pool_size"] == 2
-    assert counters["segment_worker_requests_by_gpu"] == {"5": 1, "7": 2}
+    assert sum(counters["segment_worker_requests_by_gpu"].values()) == 2
+    assert sum(counters["sam_pool_main_requests_by_gpu"].values()) == 2
+    assert sum(counters["sam_pool_attribute_probe_requests_by_gpu"].values()) == 1
+    assert sum(counters["sam_pool_main_service_seconds_by_gpu"].values()) > 0
+    assert sum(counters["sam_pool_attribute_service_seconds_by_gpu"].values()) > 0
+    assert counters["sam_pool_main_wait_seconds_total"] > 0
+    assert counters["sam_pool_attribute_wait_seconds_total"] >= 0
+    assert counters["sam_pool_max_concurrent_requests"] == 2
+
+
+def test_segment_pool_runs_two_attribute_probes_concurrently() -> None:
+    barrier = threading.Barrier(2)
+    observed: list[str] = []
+    state_lock = threading.Lock()
+
+    class Worker:
+        def __init__(self, gpu: str) -> None:
+            self.config = SimpleNamespace(cuda_visible_devices=gpu)
+
+        def start(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def attribute_probe(self, **_kwargs: object) -> tuple[np.ndarray, ...]:
+            with state_lock:
+                observed.append(self.config.cuda_visible_devices)
+            barrier.wait(timeout=2)
+            return ()
+
+    pool = PersistentStageProcessPool(  # type: ignore[list-item]
+        [Worker("5"), Worker("7")]
+    )
+    pool.start()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                pool.attribute_probe,
+                clip_uid=f"clip-{index}",
+                frame_slot=1,
+                source_frame_index=10,
+                grounding_prompt="the red jacket",
+            )
+            for index in range(2)
+        ]
+        assert [future.result() for future in futures] == [(), ()]
+    counters = pool.performance_counters()
+    pool.close()
+
+    assert sorted(observed) == ["5", "7"]
+    assert counters["sam_pool_attribute_probe_requests_by_gpu"] == {
+        "5": 1,
+        "7": 1,
+    }
+    assert counters["sam_pool_max_concurrent_requests"] == 2
+
+
+def test_segment_pool_returns_worker_after_attribute_probe_exception() -> None:
+    class Worker:
+        config = SimpleNamespace(cuda_visible_devices="5")
+
+        def __init__(self) -> None:
+            self.starts = 0
+            self.closes = 0
+            self.main_requests = 0
+
+        def start(self) -> None:
+            self.starts += 1
+
+        def terminate(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closes += 1
+
+        def request(self, _clip_uid: str) -> dict[str, object]:
+            self.main_requests += 1
+            return {"processed": 1}
+
+        def attribute_probe(self, **_kwargs: object) -> tuple[np.ndarray, ...]:
+            raise RuntimeError("probe failed")
+
+    worker = Worker()
+    pool = PersistentStageProcessPool([worker])  # type: ignore[list-item]
+    pool.start()
+    with pytest.raises(RuntimeError, match="probe failed"):
+        pool.attribute_probe(
+            clip_uid="clip-a",
+            frame_slot=1,
+            source_frame_index=10,
+            grounding_prompt="the red jacket",
+        )
+    assert pool.request("clip-b") == {"processed": 1}
+    counters = pool.performance_counters()
+    pool.close()
+
+    assert worker.starts == worker.closes == 1
+    assert worker.main_requests == 1
+    assert counters["sam_pool_attribute_probe_requests_by_gpu"] == {"5": 1}
+    assert counters["sam_pool_main_requests_by_gpu"] == {"5": 1}
 
 
 def test_main_segment_and_attribute_probe_share_one_request_lock(

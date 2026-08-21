@@ -343,6 +343,7 @@ def _run_streaming_pipeline(
             "subject_attributes" in clip_stages
             and attribute_segmentation_backend is None
             and config.runtime.gpu_workers.subject_attributes_segment is not None
+            and not config.runtime.gpu_workers.segment_pool
         )
         if (
             "subject_attributes" in clip_stages
@@ -470,11 +471,6 @@ def _run_streaming_pipeline(
                     raise ValueError(
                         "subject attributes require the persistent segment worker "
                         "or an injected attribute segmentation backend"
-                    )
-                if isinstance(segment_process, PersistentStageProcessPool):
-                    raise ValueError(
-                        "segment_pool requires deferred subject attributes or a "
-                        "dedicated subject_attributes_segment worker"
                     )
                 attribute_segmentation_backend = (
                     PersistentWorkerAttributeFrameSegmenter(

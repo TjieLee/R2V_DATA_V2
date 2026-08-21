@@ -529,7 +529,7 @@ class PersistentStageProcess:
 
 
 class PersistentStageProcessPool:
-    """Dispatch whole clips to the next available isolated stage worker."""
+    """Dispatch main and attribute SAM3 work to the next available worker."""
 
     def __init__(
         self,
@@ -548,6 +548,14 @@ class PersistentStageProcessPool:
         self._state_lock = threading.Lock()
         self._requests_by_gpu = {device: 0 for device in devices}
         self._service_seconds_by_gpu = {device: 0.0 for device in devices}
+        self._attribute_requests_by_gpu = {device: 0 for device in devices}
+        self._attribute_service_seconds_by_gpu = {
+            device: 0.0 for device in devices
+        }
+        self._main_wait_seconds_total = 0.0
+        self._attribute_wait_seconds_total = 0.0
+        self._concurrent_requests = 0
+        self._max_concurrent_requests = 0
         self._started = False
 
     def start(self) -> None:
@@ -565,20 +573,60 @@ class PersistentStageProcessPool:
             raise
         self._started = True
 
-    def request(self, clip_uid: str) -> dict[str, object]:
+    def _dispatch(
+        self,
+        request_kind: str,
+        operation: Callable[[PersistentStageProcess], Any],
+    ) -> Any:
         if not self._started:
             raise RuntimeError("persistent stage process pool is not started")
+        wait_started = float(self._clock())
         worker = self._available.get()
+        acquired = float(self._clock())
         device = worker.config.cuda_visible_devices
-        started = float(self._clock())
+        with self._state_lock:
+            self._concurrent_requests += 1
+            self._max_concurrent_requests = max(
+                self._max_concurrent_requests,
+                self._concurrent_requests,
+            )
         try:
-            return worker.request(clip_uid)
+            return operation(worker)
         finally:
-            service_seconds = max(0.0, float(self._clock()) - started)
+            service_seconds = max(0.0, float(self._clock()) - acquired)
+            wait_seconds = max(0.0, acquired - wait_started)
             with self._state_lock:
-                self._requests_by_gpu[device] += 1
-                self._service_seconds_by_gpu[device] += service_seconds
+                self._concurrent_requests -= 1
+                if request_kind == "main":
+                    self._requests_by_gpu[device] += 1
+                    self._service_seconds_by_gpu[device] += service_seconds
+                    self._main_wait_seconds_total += wait_seconds
+                else:
+                    self._attribute_requests_by_gpu[device] += 1
+                    self._attribute_service_seconds_by_gpu[device] += service_seconds
+                    self._attribute_wait_seconds_total += wait_seconds
             self._available.put(worker)
+
+    def request(self, clip_uid: str) -> dict[str, object]:
+        return self._dispatch("main", lambda worker: worker.request(clip_uid))
+
+    def attribute_probe(
+        self,
+        *,
+        clip_uid: str,
+        frame_slot: int,
+        source_frame_index: int,
+        grounding_prompt: str,
+    ) -> tuple[np.ndarray, ...]:
+        return self._dispatch(
+            "attribute",
+            lambda worker: worker.attribute_probe(
+                clip_uid=clip_uid,
+                frame_slot=frame_slot,
+                source_frame_index=source_frame_index,
+                grounding_prompt=grounding_prompt,
+            ),
+        )
 
     def performance_counters(self) -> dict[str, object]:
         with self._state_lock:
@@ -588,6 +636,21 @@ class PersistentStageProcessPool:
                 "segment_worker_service_seconds_by_gpu": dict(
                     self._service_seconds_by_gpu
                 ),
+                "sam_pool_main_requests_by_gpu": dict(self._requests_by_gpu),
+                "sam_pool_attribute_probe_requests_by_gpu": dict(
+                    self._attribute_requests_by_gpu
+                ),
+                "sam_pool_main_service_seconds_by_gpu": dict(
+                    self._service_seconds_by_gpu
+                ),
+                "sam_pool_attribute_service_seconds_by_gpu": dict(
+                    self._attribute_service_seconds_by_gpu
+                ),
+                "sam_pool_main_wait_seconds_total": self._main_wait_seconds_total,
+                "sam_pool_attribute_wait_seconds_total": (
+                    self._attribute_wait_seconds_total
+                ),
+                "sam_pool_max_concurrent_requests": self._max_concurrent_requests,
             }
 
     def close(self) -> None:

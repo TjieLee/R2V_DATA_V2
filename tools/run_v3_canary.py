@@ -553,6 +553,13 @@ def _print_summary(summary: dict[str, object]) -> None:
         "segment_worker_pool_size",
         "segment_worker_requests_by_gpu",
         "segment_worker_service_seconds_by_gpu",
+        "sam_pool_main_requests_by_gpu",
+        "sam_pool_attribute_probe_requests_by_gpu",
+        "sam_pool_main_service_seconds_by_gpu",
+        "sam_pool_attribute_service_seconds_by_gpu",
+        "sam_pool_main_wait_seconds_total",
+        "sam_pool_attribute_wait_seconds_total",
+        "sam_pool_max_concurrent_requests",
         "qwen_calls",
         "qwen_gate_wait_seconds_total",
         "qwen_gate_wait_seconds_mean",
@@ -712,10 +719,6 @@ def run_canary(
             not isinstance(value, int) or isinstance(value, bool) or value < 1
         ):
             raise ValueError(f"{name} must be a positive integer")
-    if dual_main_sam3 and not defer_subject_attributes:
-        raise ValueError(
-            "--dual-main-sam3 requires --defer-subject-attributes"
-        )
     if dual_main_sam3 and sam3_compile:
         raise ValueError("--dual-main-sam3 cannot be combined with --sam3-compile")
     selection = select_source_records(
@@ -891,6 +894,48 @@ def run_canary(
             stage="segment",
             field="segment_worker_service_seconds_by_gpu",
             default={},
+        ),
+        "sam_pool_main_requests_by_gpu": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_main_requests_by_gpu",
+            default={},
+        ),
+        "sam_pool_attribute_probe_requests_by_gpu": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_attribute_probe_requests_by_gpu",
+            default={},
+        ),
+        "sam_pool_main_service_seconds_by_gpu": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_main_service_seconds_by_gpu",
+            default={},
+        ),
+        "sam_pool_attribute_service_seconds_by_gpu": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_attribute_service_seconds_by_gpu",
+            default={},
+        ),
+        "sam_pool_main_wait_seconds_total": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_main_wait_seconds_total",
+            default=0.0,
+        ),
+        "sam_pool_attribute_wait_seconds_total": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_attribute_wait_seconds_total",
+            default=0.0,
+        ),
+        "sam_pool_max_concurrent_requests": _stage_metric(
+            execution.result,
+            stage="segment",
+            field="sam_pool_max_concurrent_requests",
+            default=0,
         ),
         "qwen_calls": profiling.get("qwen_calls", 0),
         "qwen_gate_wait_seconds_total": profiling.get(

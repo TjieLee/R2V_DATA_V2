@@ -724,40 +724,41 @@ attributes, and the configured `runtime.qwen_max_inflight`. The following
 controls modify only the isolated canary config:
 
 - `--dual-main-sam3` starts independent main-SAM3 processes on physical GPUs
-  5 and 7 and sets `runtime.stage_workers.segment: 2`;
-- `--defer-subject-attributes` omits inline attribute work and leaves GPU7 free
-  for main SAM3;
+  5 and 7, sets `runtime.stage_workers.segment: 2`, and shares both persistent
+  workers with inline subject-attribute probes;
+- `--defer-subject-attributes` remains an optional repair or operational mode;
 - `--qwen-max-inflight N` changes only the Qwen gate capacity;
 - `--qwen-stage-workers N` changes only annotate, pair,
   reference-integrity, instruct, and, when not deferred, subject-attributes
   workers.
 
-Dual main SAM3 requires deferred attributes and remains eager. Each process
-uses worker-local `sam3.device: cuda`; physical selection comes only from
-`CUDA_VISIBLE_DEVICES`. No predictor or session state is shared.
+Dual main SAM3 supports the full inline attribute path and remains eager. Each
+process uses worker-local `sam3.device: cuda`; physical selection comes only
+from `CUDA_VISIBLE_DEVICES`. The two processes share an available-worker queue
+for main temporal segmentation and single-frame attribute probes. No predictor
+or session state is shared, and neither model is reloaded between stages.
 
 20-clip tests using one identical source range:
 
 ```bash
-# TEST A: single main SAM3, deferred attributes, Qwen inflight 4
-.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --defer-subject-attributes --qwen-max-inflight 4
+# TEST A: single main SAM3, inline attributes, Qwen inflight 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --qwen-max-inflight 4 --qwen-stage-workers 4
 
-# TEST B: dual main SAM3, deferred attributes, Qwen inflight 4
-.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4
+# TEST B: recommended full E2E dual SAM3, inline attributes, Qwen inflight 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --qwen-max-inflight 4 --qwen-stage-workers 4
 
-# TEST C: dual main SAM3, deferred attributes, Qwen inflight 8 and stage workers 4
-.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 8 --qwen-stage-workers 4
+# TEST C: optional deferred-attribute diagnostic
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4 --qwen-stage-workers 4
 ```
 
-Recommended 100-clip B/C comparison:
+Recommended 100-clip full E2E run:
 
 ```bash
-.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4
-.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 8 --qwen-stage-workers 4
+.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --qwen-max-inflight 4 --qwen-stage-workers 4
 ```
 
-After the Visual phase completes, run the resumable attribute backfill using
-the exact generated run config:
+Deferred attributes and the resumable backfill remain fallback tools. After a
+deferred Visual phase, run backfill using the exact generated run config:
 
 ```bash
 .venv/bin/python tools/run_v3_subject_attribute_backfill.py --config RUN_CONFIG.yaml
@@ -769,9 +770,11 @@ with dual main SAM3. GME remains disabled unless that exact run config enables
 it. Run the existing production compactor after backfill.
 
 Profiling and canary summaries expose Qwen gate wait total/mean/max, maximum
-local inflight, and per-slot usage. Near-zero gate wait with idle Qwen GPUs
-means upstream stages are starving Qwen; meaningful wait at inflight 4 is the
-signal to compare 6 or 8. No speedup is claimed before the server A/B.
+local inflight, per-slot usage, and separate main/attribute SAM-pool request,
+service, and wait counters. The recommended full E2E canary keeps Qwen inflight
+at 4: the prior inflight-8 diagnostic observed maximum local inflight 4 and
+near-zero gate wait, so 8 is not the production recommendation. No speedup is
+claimed before the server run.
 
 ## 13. Failure Signatures
 
