@@ -1071,9 +1071,10 @@ owner relation, for example 'the red jacket worn by the woman'. Return one JSON
 object whose top level contains exactly owner_entity_id, owner_is_human, and
 attributes. Do not return owner_phrase, owner_grounding_prompt, or any other
 top-level field. attributes must be a JSON array. Each attribute has exactly
-attribute_type, phrase, and grounding_prompt. Allowed types are face, hair,
-headwear, glasses, upper_clothing, lower_clothing, dress_or_skirt, shoes, bag,
-and accessory. The required shape is {"owner_entity_id":"e1",
+attribute_type, phrase, and grounding_prompt. Each returned attribute_type must
+be unique. Allowed types are face, hair, headwear, glasses, upper_clothing,
+lower_clothing, dress_or_skirt, shoes, bag, and accessory. The required shape is
+{"owner_entity_id":"e1",
 "owner_is_human":true,"attributes":[{"attribute_type":"hair",
 "phrase":"black hair","grounding_prompt":"black hair worn by the woman"}]}.
 If the subject is an animal, non-human creature, or non-human
@@ -1185,6 +1186,26 @@ def _owner_candidate_provenance_key(
     )
 
 
+def _normalize_discovery_payload(raw: str) -> object:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("attributes"), list
+    ):
+        return payload
+    seen_types: set[str] = set()
+    attributes: list[object] = []
+    for attribute in payload["attributes"]:
+        attribute_type = (
+            attribute.get("attribute_type") if isinstance(attribute, dict) else None
+        )
+        if isinstance(attribute_type, str):
+            if attribute_type in seen_types:
+                continue
+            seen_types.add(attribute_type)
+        attributes.append(attribute)
+    return {**payload, "attributes": attributes}
+
+
 class QwenSubjectAttributeClient:
     def __init__(
         self,
@@ -1272,11 +1293,13 @@ class QwenSubjectAttributeClient:
                     },
                 )
             )
-        payload = SubjectAttributeDiscovery.model_validate_json(
-            self._request(
-                component="qwen_subject_attribute_discovery",
-                system_prompt=DISCOVERY_SYSTEM_PROMPT,
-                content=content,
+        payload = SubjectAttributeDiscovery.model_validate(
+            _normalize_discovery_payload(
+                self._request(
+                    component="qwen_subject_attribute_discovery",
+                    system_prompt=DISCOVERY_SYSTEM_PROMPT,
+                    content=content,
+                )
             )
         )
         if payload.owner_entity_id != owner.entity_id:

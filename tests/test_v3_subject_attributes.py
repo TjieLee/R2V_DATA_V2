@@ -368,6 +368,12 @@ def test_discovery_schema_enforces_owner_and_three_attribute_bound() -> None:
         ],
     )
     assert payload.attributes[0].attribute_type == "hair"
+    with pytest.raises(ValidationError, match="must not repeat"):
+        SubjectAttributeDiscovery(
+            owner_entity_id="e1",
+            owner_is_human=True,
+            attributes=[payload.attributes[0], payload.attributes[0]],
+        )
     with pytest.raises(ValidationError):
         SubjectAttributeDiscovery(
             owner_entity_id="owner-1",
@@ -420,7 +426,160 @@ def test_discovery_prompt_requires_exact_top_level_contract() -> None:
     )
     assert "Do not return owner_phrase, owner_grounding_prompt" in prompt
     assert "attributes must be a JSON array" in prompt
+    assert "Each returned attribute_type must be unique" in prompt
     assert "return owner_is_human=false and attributes=[]" in prompt
+
+
+def _discovery_client_with_raw_response(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> tuple[subject_attributes.QwenSubjectAttributeClient, list[dict[str, object]]]:
+    client = subject_attributes.QwenSubjectAttributeClient(
+        QwenServiceConfig(),
+        client=SimpleNamespace(),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_request(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return raw
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    return client, calls
+
+
+def _discover_from_client(
+    client: subject_attributes.QwenSubjectAttributeClient,
+) -> SubjectAttributeDiscovery:
+    candidate = _candidate("candidate_1", slot=1, source_frame_index=10)
+    return client.discover(
+        owner=_clip().annotation.entities[0],
+        owner_candidates=[candidate],
+        source_images={candidate.image_path: Image.new("RGB", (100, 100))},
+    )
+
+
+def test_discovery_duplicate_type_is_first_wins_in_original_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e1",
+                "owner_is_human": True,
+                "attributes": [
+                    {
+                        "attribute_type": "upper_clothing",
+                        "phrase": "gray robe",
+                        "grounding_prompt": "gray robe worn by the woman",
+                    },
+                    {
+                        "attribute_type": "upper_clothing",
+                        "phrase": "black vest",
+                        "grounding_prompt": "black vest worn by the woman",
+                    },
+                    {
+                        "attribute_type": "hair",
+                        "phrase": "dark hair",
+                        "grounding_prompt": "dark hair worn by the woman",
+                    },
+                ],
+            }
+        ),
+    )
+
+    payload = _discover_from_client(client)
+
+    assert [attribute.attribute_type for attribute in payload.attributes] == [
+        "upper_clothing",
+        "hair",
+    ]
+    assert [attribute.phrase for attribute in payload.attributes] == [
+        "gray robe",
+        "dark hair",
+    ]
+    assert [attribute.grounding_prompt for attribute in payload.attributes] == [
+        "gray robe worn by the woman",
+        "dark hair worn by the woman",
+    ]
+    assert len(calls) == 1
+
+
+def test_discovery_distinct_types_are_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_attributes = [
+        {
+            "attribute_type": "upper_clothing",
+            "phrase": "gray robe",
+            "grounding_prompt": "gray robe worn by the woman",
+        },
+        {
+            "attribute_type": "hair",
+            "phrase": "dark hair",
+            "grounding_prompt": "dark hair worn by the woman",
+        },
+    ]
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e1",
+                "owner_is_human": True,
+                "attributes": raw_attributes,
+            }
+        ),
+    )
+
+    payload = _discover_from_client(client)
+
+    assert [attribute.model_dump() for attribute in payload.attributes] == raw_attributes
+    assert len(calls) == 1
+
+
+def test_discovery_malformed_payload_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e1",
+                "owner_is_human": True,
+                "attributes": [
+                    {
+                        "attribute_type": "hair",
+                        "phrase": "",
+                        "grounding_prompt": "dark hair worn by the woman",
+                    }
+                ],
+            }
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        _discover_from_client(client)
+    assert len(calls) == 1
+
+
+def test_discovery_owner_id_mismatch_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e2",
+                "owner_is_human": True,
+                "attributes": [],
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="wrong owner_entity_id"):
+        _discover_from_client(client)
+    assert len(calls) == 1
 
 
 def test_different_owner_frame_is_preferred_and_same_frame_is_fallback() -> None:
