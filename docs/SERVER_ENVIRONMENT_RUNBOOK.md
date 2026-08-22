@@ -1,38 +1,23 @@
 # R2V V3 Server Environment Runbook
 
-Last updated: 2026-08-20
+Last updated: 2026-08-23
 
-This file is the single source of truth for the Linux server environment used by
-the current integrated Visual V3 + subject-attribute pipeline. Update it whenever
-a runtime, model path, service endpoint, GPU assignment, launch command, or
-isolation rule changes. Do not reconstruct these values from chat history.
-
-`CONFIRMED` means the value is backed by repository/server evidence. `UNVERIFIED`
-means it must be checked on the server before use. Do not replace an unverified
-value with a guess.
-
-Current integrated Visual + subject-attribute branch and validated code baseline:
+This file is the current Linux server runbook for the frozen Visual V3 +
+Subject Attribute/reference-image line. Do not reconstruct runtime allocation
+from older design documents or chat history.
 
 ```text
 branch: feature/v3-subject-attributes-v1
-code baseline: 06051245ea4f58ca8b1df5aa117fab918f211533
+Visual + Subject Attribute code freeze: 51fef9d44bb1372b4afad5fed9795d5c3d46bda7
+
+frozen Visual branch: feature/v3-runtime-integrity-v1
+frozen Visual HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
 ```
 
-Frozen Visual baseline remains separate:
-
-```text
-branch: feature/v3-runtime-integrity-v1
-frozen HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
-```
-
-Subject attributes are a sidecar extension and must not silently change the
-frozen Visual export/sample semantics or Visual thresholds. Documentation-only
-commits may move repository HEAD after the validated code baseline; record both
-when reproducing or freezing a run.
-
-For the detailed attribute contract and benchmark state, see
-`V3_SUBJECT_ATTRIBUTES_STATE.md`. Historical frozen Visual integrity evidence
-remains in `V3_RUNTIME_INTEGRITY_STATE.md`.
+Later docs-only commits may move branch `HEAD`; the code freeze remains
+`51fef9d...`. Production evidence and the final completion contract are in
+`V3_SUBJECT_ATTRIBUTES_STATE.md`; historical Visual integrity evidence is in
+`V3_RUNTIME_INTEGRITY_STATE.md`.
 
 ## 1. Runtime Layers
 
@@ -43,30 +28,26 @@ PRODUCTION
     - persistent isolated GPU workers
     - OpenAI-compatible Qwen client
   external service
-    - vLLM serving Qwen3-VL-32B-Instruct
-  separate runtime
-    - Boogu Image worker
+    - Qwen3-VL-32B-Instruct on GPUs 0-3, BF16, TP1 x DP4
+  separate Boogu runtime
+    - GPU4 background removal
+    - GPU6 reference_edit and Subject Attribute completion
 
-PERSISTENT GPU WORKERS
-  physical GPU 4
-    - Boogu background-removal generator
-  physical GPU 5
-    - main temporal SAM3
-  physical GPU 6
-    - reference edit / Boogu worker path as configured
-  physical GPU 7
-    - subject-attribute single-frame SAM3
-    - GME 2B attribute prefilter (new; pending server canary)
+PERSISTENT SAM3 WORKERS
+  physical GPUs 5 and 7
+    - shared two-process segment_pool
+    - main temporal segmentation
+    - Subject Attribute single-frame probes
 
-AUDIT ONLY
-  main R2V .venv
-    - optional embedding/audit utilities
-  isolated reference-filter venv
-    - SCRFD / MediaPipe pose tools
+DISABLED / OPTIONAL HISTORY
+  GME
+    - not part of production runtime
+  Object-Remover LoRA
+    - legacy asset, not the active removal backend
 ```
 
-Do not install SAM3 into the pose venv, run the production pipeline from the
-pose venv, or import the Boogu runtime into the main R2V process.
+Do not install SAM3 into an audit venv, run the production pipeline from an
+audit venv, or import the Boogu runtime into the main R2V process.
 
 ## 2. Confirmed Paths
 
@@ -89,11 +70,9 @@ Qwen3-VL model:
 Qwen endpoint:
   http://127.0.0.1:8000/v1
 
-GME attribute model:
-  /mnt/workspace/litengjie/data/models/gme-Qwen2-VL-2B-Instruct
-
-GME Python:
-  /mnt/workspace/litengjie/data/venvs/gme/bin/python
+Historical optional GME assets (not production preflight):
+  model: /mnt/workspace/litengjie/data/models/gme-Qwen2-VL-2B-Instruct
+  Python: /mnt/workspace/litengjie/data/venvs/gme/bin/python
 
 JEA production source JSONL:
   /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/shots_f03_motion.jsonl
@@ -113,7 +92,7 @@ Boogu Python:
 Boogu model:
   /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708
 
-Object-Remover LoRA:
+Legacy Object-Remover LoRA (not active production removal or mandatory preflight):
   /mnt/workspace/litengjie/data/models/Qwen-Image-Edit-2511-Object-Remover/Qwen-Image-Edit-2511-Object-Remover.safetensors
 ```
 
@@ -151,42 +130,30 @@ the public roots.
 
 ## 3. Production GPU Allocation
 
-Intended allocation for the next production canary:
+Current representative allocation:
 
 ```text
-physical GPU 0  Qwen3-VL DP replica 0, TP1
-physical GPU 1  Qwen3-VL DP replica 1, TP1
-physical GPU 2  Qwen3-VL DP replica 2, TP1
-physical GPU 3  Qwen3-VL DP replica 3, TP1
-physical GPU 4  Boogu background-removal generator
-physical GPU 5  main temporal SAM3
-physical GPU 6  Boogu / reference-edit worker
-physical GPU 7  dedicated subject-attribute single-frame SAM3 + GME 2B
+physical GPU 0-3  Qwen3-VL-32B-Instruct, TP1 x DP4, BF16
+physical GPU 4    Boogu background removal
+physical GPU 5    shared SAM3 worker pool member A
+physical GPU 6    Boogu reference_edit + Subject Attribute completion
+physical GPU 7    shared SAM3 worker pool member B
+GME               disabled
 ```
 
-Do not globally export `CUDA_VISIBLE_DEVICES` in the normal parent pipeline
-shell. The parent runtime assigns physical GPUs to isolated workers. Before
-launching the full pipeline, use:
+The SAM3 pool uses `segment_pool: ["5", "7"]`; both workers serve main
+temporal segmentation and Subject Attribute single-frame probes through the
+same available-worker queue. GPU7 is not a dedicated attribute-SAM/GME worker.
+
+Do not globally export `CUDA_VISIBLE_DEVICES` in the parent pipeline shell.
+The parent assigns physical GPUs to isolated workers, which use worker-local
+`cuda` / `cuda:0`. Before a full launch:
 
 ```bash
 unset CUDA_VISIBLE_DEVICES
 ```
 
-Important ordinal rules:
-
-- main SAM3 uses physical GPU5 through worker isolation and YAML
-  `sam3.device: cuda`; never put `cuda:5` in the worker-local SAM3 config;
-- dedicated attribute SAM3 uses physical GPU7 through the same isolation rule
-  and also uses worker-local `cuda`;
-- GME uses a separate persistent offline worker on configured physical GPU7,
-  sees only worker-local `cuda:0`, and does not intentionally overlap the
-  colocated attribute SAM3 inference;
-- Boogu background removal is assigned physical GPU4 by runtime GPU-worker
-  configuration and sees its isolated local CUDA device as `cuda:0`;
-- the separate Boogu reference-edit worker is assigned physical GPU6 and sees
-  its isolated local CUDA device as `cuda:0`;
-- Qwen is an external vLLM service on physical GPUs 0-3 and is not launched by
-  `run_pipeline_v3.py`.
+Qwen is an external service and is not launched by `run_pipeline_v3.py`.
 
 ## 4. Fresh Production Shell
 
@@ -213,8 +180,6 @@ export QWEN_BASE_URL=http://127.0.0.1:8000/v1
 export BOOGU_CODE_ROOT=/mnt/workspace/litengjie/data/vendor/Boogu-Image
 export BOOGU_PYTHON=/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python
 export BOOGU_MODEL_PATH=/mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708
-
-export REMOVER_LORA=/mnt/workspace/litengjie/data/models/Qwen-Image-Edit-2511-Object-Remover/Qwen-Image-Edit-2511-Object-Remover.safetensors
 
 export V3_CONFIG_ROOT=/mnt/workspace/litengjie/data/r2v_v3_configs
 export V3_RUN_ROOT=/mnt/workspace/litengjie/data/r2v_v3_runs
@@ -254,10 +219,11 @@ git branch --show-current
 git status --short
 ```
 
-Expected validated code baseline before documentation-only commits:
+Expected algorithm/code freeze (a later docs-only commit may be the checked-out
+branch `HEAD`):
 
 ```text
-06051245ea4f58ca8b1df5aa117fab918f211533
+51fef9d44bb1372b4afad5fed9795d5c3d46bda7
 ```
 
 If `git status --short` is non-empty before switching, stop. Do not stash,
@@ -273,7 +239,6 @@ test -d "$QWEN_MODEL_PATH" || echo 'ERROR: missing Qwen model'
 test -x "$BOOGU_PYTHON" || echo 'ERROR: missing Boogu Python'
 test -d "$BOOGU_CODE_ROOT" || echo 'ERROR: missing Boogu source'
 test -d "$BOOGU_MODEL_PATH" || echo 'ERROR: missing Boogu model'
-test -f "$REMOVER_LORA" || echo 'ERROR: missing Object-Remover LoRA'
 ```
 
 Verify SAM3 import origin:
@@ -369,122 +334,93 @@ for diagnosis.
 
 ## 7. Frozen Visual Contract + Sidecar Runtime Settings
 
-The frozen Visual semantics must remain unchanged by subject-attribute work:
+The frozen Visual semantics remain unchanged:
 
 ```yaml
 source:
   selection_mode: fixed_selection_v1
-
 sam3:
   device: cuda
   anchor_search_mode: progressive_v1
   object_rescue_mode: phrase_retry_v1
   not_found_rescue_mode: entity_phrase_retry_v1
   multi_instance_rescue_mode: qwen_anchor_select_v1
-
 coverage:
   required_visible_frames: 7
-
 pair:
   max_candidates_per_entity: 3
   crop_padding_ratio: 0.08
   reference_prefilter_mode: conservative_v1
   background_final_guard_mode: qwen_v1
-
 remove:
+  enabled: true
   backend: boogu_image_0_1_edit_turbo
   inference_profile: boogu_4step_v1
   num_inference_steps: 4
-
 reference_edit:
   scale_collapse_fallback_guard_mode: qwen_v1
-
 reference_integrity:
   enabled: true
   mode: targeted_qwen_v1
 ```
 
-Current integrated runtime-capacity settings:
+Current runtime-capacity settings:
 
 ```yaml
 runtime:
   mode: streaming_v1
   qwen_max_inflight: 4
   stage_workers:
+    segment: 2
     subject_attributes: 2
   gpu_workers:
-    segment: "5"
-    subject_attributes_segment: "7"
-    subject_attributes_gme: "7"
+    segment_pool: ["5", "7"]
     remove: "4"
     reference_edit: "6"
-
 subject_attribute_gme:
-  enabled: true
-  backend: gme_qwen2_vl_2b_v1
-  python_executable: /mnt/workspace/litengjie/data/venvs/gme/bin/python
-  model_path: /mnt/workspace/litengjie/data/models/gme-Qwen2-VL-2B-Instruct
-  model_name: Alibaba-NLP/gme-Qwen2-VL-2B-Instruct
-  screen_mode: relative_margin_v1
-  min_margin: 0.0
-  timeout_seconds: 3600
+  enabled: false
 ```
 
-`runtime.stage_workers.subject_attributes`,
-`runtime.gpu_workers.subject_attributes_segment`, and the GME GPU assignment
-are sidecar runtime-capacity settings and are excluded from the frozen Visual
-fingerprint/model identifiers. When GME is enabled, its model path, model name,
-backend, screen mode, and relative margin do enter config/model identity so an
-older attribute cache cannot masquerade as screened output. The Git commit
-remains part of run identity.
-
-The intended background-removal generator is Boogu Image 0.1 Edit Turbo with
-four inference steps and thinking disabled on physical GPU4. It reuses the
-pinned `reference_edit` Boogu Python, code root, model path, model revision,
-1MP sizing, and alignment settings. Qwen3-VL-32B-Instruct remains the
-background-removal judge; it is not the removal image generator. Reference
-editing remains a separate Boogu worker on physical GPU6. This generator
-switch is not production-validated until a server canary passes, and it does
-not change the `prod-v1` production version.
-
-Same-parent cross-pair remains disabled for the frozen Visual path. Do not loosen
-Visual thresholds to increase export yield.
+Boogu Image 0.1 Edit Turbo with `boogu_4step_v1` is the validated production
+background-removal generator on GPU4. Qwen remains the semantic judge where
+configured; it is not the removal image generator. Reference editing and
+Subject Attribute completion share the persistent Boogu capacity on GPU6.
+Same-parent cross-pair remains disabled for the frozen Visual path.
 
 ## 8. Subject-Attribute Runtime Contract
 
-Attribute enrichment is precision-first and fail-closed. Key production limits:
+Final production sequence:
 
 ```text
-maximum discovered attributes per owner: 3
-Qwen discovery calls: <= 1 per eligible human owner
-SAM3 attribute mode: single frame only
-candidate frames: owner's existing Top3 only
-attribute temporal tracking: disabled
-attribute 7/10 coverage rule: not used
-attribute generative completion: not used
+one Qwen discovery
+  -> owner Top3 frame-local SAM3
+  -> deterministic ownership / geometry
+  -> one owner-batched raw Qwen review
+  -> complete usable raw: RGBA publish
+  -> repair recommended:
+       Boogu completion
+       -> one Qwen SubjectAttributeCompletionReview
+       -> accept: native Boogu RGB publish
+       -> reject/failure: raw fallback if usable, otherwise reject
 ```
 
-Accepted attribute crops are source RGB plus mask exported as RGBA transparency.
-Every accepted record carries `owner_entity_id` and must pass deterministic
-ownership geometry plus strict batched Qwen recognizability/owner-binding review.
+Limits and exclusions:
 
-The new attribute sequence is Qwen discovery -> owner-Top3 frame-local SAM3 ->
-deterministic geometry -> GME 2B relative-margin prefilter -> existing batched
-Qwen final review. GME uses
-`Alibaba-NLP/gme-Qwen2-VL-2B-Instruct`, local/offline English queries, and one
-persistent worker. It may reject a candidate attempt and advance to the next
-bounded owner candidate frame; an infrastructure failure fails open to the
-existing Qwen review. The Qwen review remains final and unchanged.
+```text
+maximum attributes per owner: 3
+Qwen discovery calls: exactly one per attempted eligible owner
+candidate frames: existing owner Top3 only
+attribute temporal tracking: disabled
+attribute 7/10 coverage rule: not used
+GME: disabled
+completion SAM3: not used
+second repaired SubjectAttributeReview: not used
+```
 
-This GME path is new and requires a server canary. Only
-`relative_margin_v1` with `min_margin=0.0` is specified; it is not calibrated
-beyond that conservative relative comparison, and no absolute cosine threshold
-is used.
-
-Attribute outputs are sidecars below `<run_root>/subject_attributes/`; they do
-not mutate the frozen Visual `ClipRecord` or frozen Visual export schema.
-
-See `V3_SUBJECT_ATTRIBUTES_STATE.md` for the full contract and current evidence.
+Raw publication is PNG RGBA with `synthetic=false`. Completed publication is
+the native Boogu PNG RGB with an accepted persisted completion review and
+`synthetic=true`. See `V3_SUBJECT_ATTRIBUTES_STATE.md` for the frozen prompt,
+geometry constants, evidence, and compatibility metrics.
 
 ## 9. Full Stage Order and Launch
 
@@ -517,10 +453,8 @@ Before launch, verify at minimum:
 ```text
 runtime.mode = streaming_v1
 runtime.qwen_max_inflight = 4
-runtime.gpu_workers.segment = "5"
-runtime.gpu_workers.subject_attributes_segment = "7"
-runtime.gpu_workers.subject_attributes_gme = "7"
-subject_attribute_gme.enabled = true
+runtime.stage_workers.segment = 2
+runtime.gpu_workers.segment_pool = ["5", "7"]
 runtime.gpu_workers.remove = "4"
 runtime.gpu_workers.reference_edit = "6"
 sam3.device = cuda
@@ -576,9 +510,9 @@ artifacts are already valid and the fresh/current run identity matches:
   --profile
 ```
 
-If `subject_attributes_segment` is configured, this starts the dedicated GPU7
-segment worker for attribute probes. Without it, the code falls back to the main
-segment worker.
+With `segment_pool: ["5", "7"]`, Subject Attribute probes use the same
+available-worker queue as main temporal segmentation. There is no dedicated
+attribute-SAM/GME production worker.
 
 ## 11. Monitoring
 
@@ -595,8 +529,8 @@ tail -f "$LOG"
 Expected persistent-worker stderr logs include:
 
 ```text
-$RUN/logs/streaming_segment_worker.stderr.log
-$RUN/logs/streaming_subject_attributes_segment_worker.stderr.log
+$RUN/logs/streaming_segment_gpu5_worker.stderr.log
+$RUN/logs/streaming_segment_gpu7_worker.stderr.log
 $RUN/logs/streaming_remove_worker.stderr.log
 $RUN/logs/streaming_reference_edit_worker.stderr.log
 ```
@@ -623,6 +557,15 @@ A missing profiling file may simply mean the run was not launched with
 `--profile`; it is not alone proof of model failure.
 
 ## 12. Current Evidence Paths
+
+The final Subject Attribute/reference-image evidence is summarized in
+`V3_SUBJECT_ATTRIBUTES_STATE.md`: fixed random-200 E2E plus the fresh
+targeted-10 regression after `51fef9d...`. The targeted regression produced
+10/10 `clip.json` files, zero orphan/temp leftovers, zero runtime failures,
+and zero duplicate-discovery failures.
+
+Historical paths below remain useful for archaeology and frozen Visual
+comparison; they do not supersede the final state document.
 
 2026-08-20 new-data 10-clip functional canary:
 
@@ -676,7 +619,7 @@ TP1 x DP4 benchmark:
 /mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-dp4-889b45-20260819-221452
 ```
 
-Current dedicated-GPU7 benchmark:
+Historical dedicated-GPU7 attribute benchmark (superseded topology):
 
 ```text
 /mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-dp4-sam7-c1c056-20260819-223752
@@ -684,17 +627,18 @@ Current dedicated-GPU7 benchmark:
 
 Do not compare the two 10-clip attribute runs as identical compute paths; model
 responses changed some downstream workload. The validated large performance
-change is TP4 -> TP1 x DP4. The GPU7 worker is retained for resource isolation.
+change is TP4 -> TP1 x DP4. The dedicated-GPU7 topology was experimental; the
+current layout is the shared GPU5/GPU7 SAM3 pool described above.
 
 ### Conservative main-SAM3 compile A/B
 
-`runtime.sam3_compile_enabled` is an opt-in runtime experiment and defaults to
-`false`. It applies only to the main temporal SAM3 worker. The dedicated
-subject-attribute SAM3 worker remains eager. The implementation uses SAM3's
-official video-predictor `compile=True` builder option; it does not wrap SAM3
-manually with `torch.compile`. Predictor construction or first compiled
-execution failure is recorded and automatically rebuilt eager without changing
-the Visual run identity.
+`runtime.sam3_compile_enabled` is a historical opt-in experiment and defaults
+to `false`. The current two-process `segment_pool` is eager-only and rejects
+compile mode. The single-worker diagnostic uses SAM3's official
+video-predictor `compile=True` builder option; it does not wrap SAM3 manually
+with `torch.compile`. Predictor construction or first compiled execution
+failure is recorded and automatically rebuilt eager without changing the
+Visual run identity.
 
 Run isolated matching 20-clip canaries:
 
@@ -719,9 +663,9 @@ unless `all_exact` is true.
 
 ### Dual eager SAM3 and Qwen saturation A/B
 
-Production defaults remain one eager main SAM3 worker, inline subject
-attributes, and the configured `runtime.qwen_max_inflight`. The following
-controls modify only the isolated canary config:
+Current representative production uses the eager GPU5/GPU7 shared SAM3 pool,
+inline subject attributes, and `runtime.qwen_max_inflight: 4`. The following
+controls generate or modify an isolated canary config:
 
 - `--dual-main-sam3` starts independent main-SAM3 processes on physical GPUs
   5 and 7, sets `runtime.stage_workers.segment: 2`, and shares both persistent
@@ -745,16 +689,16 @@ or session state is shared, and neither model is reloaded between stages.
 .venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --qwen-max-inflight 4 --qwen-stage-workers 4
 
 # TEST B: recommended full E2E dual SAM3, inline attributes, Qwen inflight 4
-.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --qwen-max-inflight 4 --qwen-stage-workers 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --attribute-completion --dual-main-sam3 --qwen-max-inflight 4 --qwen-stage-workers 4
 
 # TEST C: optional deferred-attribute diagnostic
-.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4 --qwen-stage-workers 4
+.venv/bin/python tools/run_v3_canary.py --count 20 --source-video '01/丁宝桢/01 4K.mkv' --attribute-completion --dual-main-sam3 --defer-subject-attributes --qwen-max-inflight 4 --qwen-stage-workers 4
 ```
 
 Recommended 100-clip full E2E run:
 
 ```bash
-.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --dual-main-sam3 --qwen-max-inflight 4 --qwen-stage-workers 4
+.venv/bin/python tools/run_v3_canary.py --count 100 --source-video '01/丁宝桢/01 4K.mkv' --attribute-completion --dual-main-sam3 --qwen-max-inflight 4 --qwen-stage-workers 4
 ```
 
 Deferred attributes and the resumable backfill remain fallback tools. After a
@@ -764,17 +708,17 @@ deferred Visual phase, run backfill using the exact generated run config:
 .venv/bin/python tools/run_v3_subject_attribute_backfill.py --config RUN_CONFIG.yaml
 ```
 
-The backfill writes the existing `run_root/subject_attributes` sidecars and
-uses `runtime.gpu_workers.subject_attributes_segment` (GPU7). Do not overlap it
-with dual main SAM3. GME remains disabled unless that exact run config enables
-it. Run the existing production compactor after backfill.
+The backfill is a legacy compatibility path, not the representative full-run
+topology. It requires an explicit `runtime.gpu_workers.subject_attributes_segment`
+assignment and must not overlap the shared dual-SAM3 pool. Keep GME disabled.
+Run the existing production compactor after an intentional backfill.
 
 Profiling and canary summaries expose Qwen gate wait total/mean/max, maximum
 local inflight, per-slot usage, and separate main/attribute SAM-pool request,
 service, and wait counters. The recommended full E2E canary keeps Qwen inflight
 at 4: the prior inflight-8 diagnostic observed maximum local inflight 4 and
-near-zero gate wait, so 8 is not the production recommendation. No speedup is
-claimed before the server run.
+near-zero gate wait, so 8 is not the production recommendation. Do not claim a
+speedup for alternative settings without matched server evidence.
 
 ## 13. Failure Signatures
 
@@ -785,8 +729,9 @@ run root rather than weakening validation.
 
 ### SAM3 worker reports invalid device / CUDA ordinal
 
-For isolated GPU5/GPU7 workers, YAML must use `sam3.device: cuda`, not
-`cuda:5`/`cuda:7`. Physical selection comes from runtime GPU-worker assignment.
+For the shared GPU5/GPU7 pool, YAML must use `sam3.device: cuda`, not
+`cuda:5`/`cuda:7`. Physical selection comes from `segment_pool` and each
+worker's isolated `CUDA_VISIBLE_DEVICES`.
 
 ### Attribute probes unexpectedly block main temporal SAM3
 
@@ -794,13 +739,15 @@ Check:
 
 ```yaml
 runtime:
+  stage_workers:
+    segment: 2
   gpu_workers:
-    segment: "5"
-    subject_attributes_segment: "7"
+    segment_pool: ["5", "7"]
 ```
 
-Then inspect both persistent-worker logs. If the optional GPU7 assignment is
-absent, fallback to the main segment worker is expected behavior.
+Then inspect `streaming_segment_gpu5_worker.stderr.log` and
+`streaming_segment_gpu7_worker.stderr.log`. Both main temporal requests and
+attribute probes must use the same available-worker queue.
 
 ### Qwen queue wait grows sharply
 

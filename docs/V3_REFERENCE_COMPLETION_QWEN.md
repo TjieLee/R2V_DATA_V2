@@ -1,5 +1,11 @@
 # V3 Qwen Localized Entity Completion Benchmark
 
+> **Current Subject Attribute status (2026-08-23):** This is a historical,
+> offline entity-reference completion benchmark, not the current Subject
+> Attribute production completion flow. The current flow is documented in
+> `V3_SUBJECT_ATTRIBUTES_STATE.md` and uses Boogu plus one Qwen completion
+> review with no generated-image SAM3 resegmentation.
+
 ## Status And Scope
 
 This is an independent offline benchmark for localized completion with the

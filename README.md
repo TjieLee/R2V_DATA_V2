@@ -3,6 +3,15 @@
 A lightweight, sequential pipeline for constructing reference-conditioned video
 training samples from existing clips.
 
+> **Current V3 development:** This README primarily describes the older
+> lightweight V2/MVP flow. For current Visual/reference-image and Subject
+> Attribute behavior, read
+> `docs/VISUAL_ATTRIBUTE_DEVELOPMENT_HANDOFF.md`,
+> `docs/V3_SUBJECT_ATTRIBUTES_STATE.md`, `docs/V3_PRODUCTION_SHARDS.md`, and
+> `docs/SERVER_ENVIRONMENT_RUNBOOK.md`. Do not infer current V3
+> reference/background/attribute behavior solely from the legacy FLUX/V2
+> examples below.
+
 The MVP follows one direct path:
 
 ```text

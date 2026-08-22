@@ -1,296 +1,319 @@
 # V3 Subject Attributes State
 
-Last updated: 2026-08-19
+Last updated: 2026-08-23
 
-This file records the current validated state for subject-bound Visual attribute
-references. It is a sidecar extension to the frozen Visual V3 path. Do not
-reconstruct these values from chat history.
+This is the authoritative final state for Subject Attributes and production
+reference images on the frozen Visual V3 development line. Do not reconstruct
+the current contract from older design documents, benchmark notes, or chat
+history.
 
 ## Development Identity
 
 ```text
 branch: feature/v3-subject-attributes-v1
-validated code baseline: c1c056675dac9cdce5e585cd3f934c4bb573fc96
+final code freeze candidate: 51fef9d44bb1372b4afad5fed9795d5c3d46bda7
+
 frozen Visual branch: feature/v3-runtime-integrity-v1
 frozen Visual HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
+core Visual freeze baseline: 3cfb11fdd1fbe4a5bbad02a775097d8ab3097288
 ```
 
-The subject-attribute branch must not change the frozen Visual sample/export
-semantics or thresholds. Attribute outputs are sidecars and enriched samples;
-the frozen Visual export remains `r2v.v3.dataset.1` / `r2v.v3.sample.1`.
+Later documentation-only commits may move branch `HEAD`. The Subject
+Attribute/reference-image algorithm and code freeze remains
+`51fef9d44bb1372b4afad5fed9795d5c3d46bda7` unless a later document explicitly
+records a new correctness fix backed by production evidence.
 
-Documentation-only commits may move repository HEAD after the validated code
-baseline. Record both when freezing or reproducing a run.
+Subject Attributes remain a sidecar extension to the frozen Visual path. They
+must not change frozen Visual thresholds, sample identity, reference selection,
+or Annotation production semantics.
 
-## Attribute Contract
-
-Supported attribute types:
+## Final Production Flow
 
 ```text
-face
-hair
-headwear
-glasses
-upper_clothing
-lower_clothing
-dress_or_skirt
-shoes
-bag
-accessory
+eligible retained human owner
+  -> one Qwen SubjectAttributeDiscovery
+  -> owner Top3 existing Visual candidate frames
+  -> single-frame SAM3 attribute probes
+  -> deterministic ownership / geometry checks
+  -> one owner-batched raw SubjectAttributeReview
+  -> complete and usable: publish raw RGBA
+  -> semantic + owner correct and repair recommended:
+       Boogu completion
+       -> one Qwen SubjectAttributeCompletionReview
+       -> accept: directly publish native Boogu RGB PNG
+       -> reject or failure:
+            raw usable: fallback to raw RGBA
+            raw unusable: reject
 ```
 
-Every attribute is bound to one subject through `owner_entity_id`.
+There is no completion SAM3 resegmentation and no second repaired
+`SubjectAttributeReview`.
 
-The production policy is precision-first and fail-closed:
-
-- only eligible retained human subjects with a ready main reference are
-  considered;
-- discovery makes at most one Qwen call per eligible owner;
-- at most three attributes are discovered per owner;
-- each attribute probes only the owner's existing Top3 candidate frames;
-- attribute SAM3 is single-frame prompt segmentation only;
-- there is no 10-frame attribute tracking, no 7/10 attribute coverage rule, and
-  no temporal propagation;
-- prefer a source frame different from the owner's final main-reference frame;
-  same-frame publication is only a fallback;
-- wrong-owner rejection uses deterministic geometry and other subjects' usable
-  SAM masks when available;
-- all geometry-passing crops are reviewed once in a batched Qwen review per
-  owner/context group;
-- publication requires every review flag to pass: attribute match, owner
-  binding, recognizability, characteristic appearance visibility, and usability
-  as an attribute condition;
-- accepted crops are raw source RGB plus the accepted mask, exported as RGBA
-  transparency;
-- no background fill, Object Remover, Boogu completion, or other generative
-  completion is used for attribute references.
-
-Current deterministic size/shape gates include the type-specific hair and
-headwear minimum long-side requirements plus the clothing area/aspect and
-near-duplicate-mask guards. These gates must not be loosened merely to recover
-attribute yield.
-
-Zero accepted attributes for an owner is valid. Missing attribute references are
-preferred over low-quality or wrong-owner references.
-
-## Sidecar Outputs
-
-Streaming attribute artifacts live below:
+The frozen completion prompt is exactly:
 
 ```text
-<run_root>/subject_attributes/
-  owners/<clip_uid>/<entity_id>.json
-  references/<clip_uid>/*.png
-  samples/<clip_uid>.json
-  attributes.jsonl
-  enriched_samples.jsonl
-  summary.json
+把图片中破损、缺失或不完整的区域补充完整。
 ```
 
-The durable owner/sample artifacts are reconciled atomically into the JSONL
-sidecars. The frozen Visual `ClipRecord` and frozen Visual export are not mutated
-by attribute enrichment.
+## Final Contracts
 
-Enriched instructions append owner-aware attribute conditions only for accepted
-references, for example:
+- Only eligible retained human owners with ready Visual evidence are processed.
+- Discovery returns at most three attribute types per owner.
+- `attribute_type` uniqueness remains a strict
+  `SubjectAttributeDiscovery` schema contract.
+- Duplicate `attribute_type` values in Qwen raw JSON are normalized
+  deterministically before strict validation: original order, first occurrence
+  wins.
+- Duplicate normalization does not rewrite `phrase`, `grounding_prompt`, infer a
+  type, or add a second Qwen call.
+- Exactly one discovery Qwen call is allowed; duplicate types do not trigger a
+  repair or retry call.
+- Other malformed discovery payloads fail closed, and an
+  `owner_entity_id` mismatch remains a rejection.
+- GME is disabled and abandoned for production.
+- Wrong semantic target, wrong owner, or a hard deterministic geometry failure
+  rejects without completion.
+- A completed record requires `completion_review.verdict == accept`; the
+  completion review is persisted.
+- `final_selection` is `raw` or `completed`.
+
+Production image publication is:
+
+| Selection | PNG mode | Bytes | `synthetic` |
+| --- | --- | --- | --- |
+| raw or legacy `None` | RGBA with binary transparency | source attribute bytes | `false` |
+| completed | RGB | native Boogu generated bytes | `true` |
+
+The production compactor validates the mode from `final_selection`, does not
+convert the image, hardlinks or safely copies the original bytes, and validates
+the destination again.
+
+## Mechanisms Not In The Final Completion Path
+
+The following historical mechanisms are not part of Subject Attribute
+completion:
+
+- `segmentation_prompt`
+- completion SAM3
+- SAM mask union
+- completion bbox-growth masks
+- alpha restoration
+- generated-image foreground extraction
+- repaired final `SubjectAttributeReview`
+
+Compatibility metrics may remain in the schema, but the final path keeps these
+at zero:
 
 ```text
-<Image 1>, with hairstyle shown in <Image 2>, wearing clothing shown in <Image 3> ...
+completion_sam_zero_mask_rejects
+completion_sam_single_mask
+completion_sam_multi_mask
+completion_sam_masks_returned_total
+completion_final_review_rejects
+repaired_attribute_final_review_accepted
+repaired_attribute_final_review_rejected
 ```
 
-Rejected attributes are omitted.
-
-## Integrated Streaming Runtime
-
-Current full streaming stage order:
+## Frozen Deterministic Geometry
 
 ```text
-manifest
--> annotate
--> frames
--> segment
--> rank
--> background
--> remove
--> pair
--> reference_edit
--> reference_integrity
--> instruct
--> subject_attributes
--> export
+MIN_ATTRIBUTE_AREA_PIXELS = 16
+MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 4
+hair minimum long side = 192
+headwear minimum long side = 128
+maximum attribute / owner area ratio = 0.85
+wrong-owner overlap rejection = 0.50
+clothing owner-like area ratio = 0.78
+clothing strip aspect ratio = 3.0
+duplicate mask IoU = 0.90
 ```
 
-`subject_attributes` is supported only in `runtime.mode: streaming_v1` for the
-integrated full-pipeline path.
-
-Attribute Qwen requests reuse the existing global `QwenConcurrencyGate`; there
-is no private attribute Qwen executor/semaphore. The current gate uses
-acquire-any-slot behavior across the shared file-lock slots to avoid waiting on a
-busy preselected slot while another global Qwen slot is free.
-
-Main temporal SAM3 and attribute SAM3 use the same checkpoint and segmentation
-semantics but may run in separate persistent processes:
-
-```yaml
-runtime:
-  gpu_workers:
-    segment: "5"
-    subject_attributes_segment: "7"
-```
-
-With `subject_attributes_segment` configured, GPU5 receives main temporal
-`run_clip` work and GPU7 receives attribute `attribute_probe` work. Without the
-optional setting, attribute probes fall back to the main segment worker exactly
-as before.
-
-The subject-attribute stage worker count and optional dedicated attribute SAM GPU
-assignment are sidecar runtime-capacity settings and are excluded from the
-frozen Visual config fingerprint/model identifiers. The Git commit still remains
-part of run identity, so code changes require a fresh run root.
-
-## Current Production Runtime Baseline
-
-Validated runtime configuration:
+Fragmentation rejects when any condition is true:
 
 ```text
-Qwen model: /mnt/workspace/public/pretrained/Qwen/Qwen3-VL-32B-Instruct
-Qwen endpoint: http://127.0.0.1:8000/v1
-Qwen dtype: BF16
-Qwen tensor parallel: 1
-Qwen data parallel: 4
-Qwen max model length: 32768
+largest_component_ratio < 0.70
+OR second_largest_component_ratio > 0.20
+OR significant_component_count > 3
+```
+
+Do not replace this contract with a blind "keep largest component" rule.
+
+## Runtime Allocation
+
+```text
+GPU 0-3
+  Qwen3-VL-32B-Instruct, TP1 x DP4
+
+GPU 4
+  Boogu background removal
+
+GPU 5 + GPU 7
+  shared two-process SAM3 pool
+  - main temporal segmentation
+  - Subject Attribute single-frame probes
+
+GPU 6
+  Boogu reference_edit + Subject Attribute completion
+
+GME
+  disabled
+```
+
+Qwen runtime:
+
+```text
+endpoint: http://127.0.0.1:8000/v1
+dtype: BF16
+parallelism: TP1 x DP4
+max model length: 49152
 runtime.qwen_max_inflight: 4
-runtime.stage_workers.subject_attributes: 2
 ```
 
-Validated GPU allocation:
+## Durable And Integration Outputs
+
+Subject Attribute sidecars remain below `<run_root>/subject_attributes/` and
+are reconciled from durable owner/sample JSON artifacts. Accepted attributes
+join the canonical `r2v.v3.production_sample.1` record without mutating the
+frozen Visual `ClipRecord`.
+
+Canonical attribute provenance includes:
 
 ```text
-GPU 0-3  Qwen3-VL-32B-Instruct, TP1 x DP4
-GPU 4    Object Remover
-GPU 5    main temporal SAM3
-GPU 6    Boogu
-GPU 7    dedicated subject-attribute single-frame SAM3
+attribute_id
+owner_entity_id
+attribute_type
+source_frame_index
+synthetic
 ```
 
-For SAM3 worker isolation, the parent pipeline must not globally remap CUDA.
-The worker exposes its assigned physical GPU and uses worker-local `cuda`; e.g.
-physical GPU5 or GPU7 appears as local CUDA device 0 inside that worker.
+## Final Validation Evidence
 
-## Performance Evidence
-
-### Integrated TP4 baseline
-
-Run:
+### A. Difficult four-clip clothing canary
 
 ```text
-/mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-b0790e-20260819-211823
+run: canary-e2e4-jea-20260821-140636-s000000000-000000003
+clip: 42038d7dc619cfa7bebee437
+owner: e1
+attribute: a3
+type: upper_clothing
 ```
 
-Observed on 10 clips:
+Observed result:
+
+- the raw review requested repair;
+- Boogu completion was accepted;
+- `final_selection=completed` and
+  `completion_outcome=selected_completed`;
+- every completion-SAM counter remained zero;
+- the final artifact was RGB at 1120 x 928;
+- the production compactor published identical bytes;
+- source and published SHA-256 were both
+  `708102fb4abfbbe8cdfef479438a4adb128d30c0c704c7403d7abf0cbbd16139`;
+- production published `synthetic=true`.
+
+Compaction replay produced 2 canonical samples, 4 Visual references, 4
+attribute references, and 8 total references.
+
+The final diagnosis was not that SAM needed a shorter phrase. The Boogu output
+was good and completion SAM segmentation damaged it. Completion SAM was
+therefore removed entirely.
+
+### B. Fixed random 200 E2E
 
 ```text
-full profile/wall: about 889 s
-Qwen aggregate model service: about 1601 s
-Qwen queue wait: about 1547 s
-attribute accepted references: 17
+run: e2e200-random-seed20260821-20260821-143232
+code: 8d0c8ad1ac8d7910221c5a52c1d1756868b0b924
+random seed: 20260821
+input: 200 fixed random clips
+wall time: 76m48s
 ```
 
-This exposed Qwen serving as the dominant shared-capacity bottleneck.
-
-### TP1 x DP4 benchmark
-
-Run:
+Visual/runtime results:
 
 ```text
-/mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-dp4-889b45-20260819-221452
+annotation processed: 198
+annotation failed: 2
+rank passed: 127
+background processed: 127
+remove processed: 79
+remove ready_removed: 70
+pair ready: 118
+reference_integrity processed: 115
+instruct processed: 114
+Visual export sample_count: 114
+Visual export reference_count: 220
 ```
 
-Observed on the same selected population:
+Subject Attribute results:
 
 ```text
-full profile: 325.7 s
-shell real time: 327.3 s
-attribute accepted references: 19
-attribute Qwen blocking time: 72.9 s
-attribute SAM3 blocking time: 266.8 s
+eligible human owners: 152
+discovery calls: 162
+raw review calls: 113
+accepted attribute references: 161
+enriched samples: 101
 ```
 
-Compared with the TP4 integrated run, end-to-end wall time improved by about
-2.7x. TP1 x DP4 is therefore the production Qwen serving baseline. Do not return
-to TP4 merely because one tensor-parallel rank shows lower instantaneous GPU
-utilization.
-
-### Dedicated GPU7 attribute SAM benchmark
-
-Run:
+Completion results:
 
 ```text
-/mnt/workspace/litengjie/data/r2v_v3_runs/stream-attr10-dp4-sam7-c1c056-20260819-223752
+attempts: 140
+selected_completed: 106
+completion_accepted: 106
+Qwen completion review rejects: 34
+fallback_to_raw: 33
+raw unusable attempts: 6
+completion rejected: 1
+backend failures: 0
+postcheck rejects: 0
+all completion_sam_*: 0
+completion_final_review_rejects: 0
+repaired_attribute_final_review_*: 0
 ```
 
-Observed:
+`106 / 140` is completion-selection acceptance among attempted completion
+candidates. It is not overall dataset yield.
+
+This run exposed 10 duplicate-`attribute_type` owner discovery failures and one
+streaming atomic-state failure where `clip.json` disappeared while an orphan
+rename artifact remained. Both issues were addressed by `51fef9d...`.
+
+### C. Fresh targeted regression after `51fef9d...`
+
+The targeted set contained the 9 clips covering all 10 duplicate-type owner
+failures plus `c9f89d5bfe8e5f8e09ed69c5`, the atomic-write case.
 
 ```text
-shell real time: 368.9 s
-eligible human owners: 12
-SAM3 attempts: 35
-attribute accepted references: 18
-attribute Qwen blocking time: 85.0 s
-attribute SAM3 blocking time: 79.5 s
-failures: 0
+clip.json present: 10 / 10
+orphan or temporary leftovers: 0
+runtime failures: 0
+duplicate discovery failures: 0
 ```
 
-The dedicated GPU7 worker reduced attribute SAM blocking substantially compared
-with the shared-GPU5 run, but the 10-clip end-to-end wall time did not improve
-because the two full-pipeline executions followed different model-dependent
-paths and workloads. Keep the dedicated worker for resource isolation; do not
-claim a separate end-to-end throughput gain from this small canary.
+### Implementation validation record
 
-## Current Decision
-
-Stop further performance tuning for now.
-
-Production baseline:
+The `51fef9d...` implementation environment reported:
 
 ```text
-code: c1c056675dac9cdce5e585cd3f934c4bb573fc96
-Qwen: BF16, TP1 x DP4, max_model_len=32768
-runtime.qwen_max_inflight: 4
-GPU5: main temporal SAM3
-GPU7: dedicated attribute SAM3
-subject_attributes workers: 2
+changed-point tests: 86 passed
+focused candidate: 130 passed, 2 Windows pipe/select failures
+focused baseline: the same Windows failures
+full candidate: 1803 passed, 96 failed
+full baseline: 1798 passed, 96 failed
+new failing set: none
+new tests passed: 5
+git diff --check: passed
 ```
 
-Do not introduce FP8, TP2 x DP2, additional attribute concurrency, relaxed
-quality gates, or scheduler changes without a new explicit benchmark/review.
-Future performance work should be driven by larger production evidence rather
-than 10-clip timing noise.
+A full Linux pytest was not run at `51fef9d...`; do not claim otherwise. The
+last known all-green Linux full pytest was at
+`8d0c8ad1ac8d7910221c5a52c1d1756868b0b924`: 1894 passed, 1 warning.
 
-## Known Non-Blocking Resume Edge Cases
+## Freeze Decision
 
-Two edge cases remain worth tracking before an eventual final freeze:
+Subject Attribute/reference-image development is frozen at
+`51fef9d44bb1372b4afad5fed9795d5c3d46bda7`.
 
-1. If upstream work is rerun so a previously eligible clip becomes
-   export-ineligible, old durable attribute sidecars can remain unless attribute
-   overwrite/reconciliation explicitly invalidates them.
-2. An owner exception that occurs outside durable owner-artifact creation may be
-   counted by the current invocation/runtime failure path but underrepresented
-   when `summary.json` is later rebuilt solely from durable owner artifacts.
-
-These are unusual resume/reconciliation cases, not failures observed in the
-fresh production canaries above. Do not weaken publication gates as a workaround.
-
-## Validation at Current Baseline
-
-Reported validation for `c1c0566`:
-
-```text
-focused tests: 77 passed
-full pytest: 1729 passed, 1 warning
-git diff --check: PASS
-working tree after push: clean
-```
-
-Ruff was not installed in the project `.venv`, so no Ruff result is claimed for
-this baseline.
+No further threshold, performance, or architecture tuning is planned before
+Audio/H3 integration unless new real production evidence exposes a correctness
+bug.
