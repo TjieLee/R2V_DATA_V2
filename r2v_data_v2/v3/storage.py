@@ -1118,10 +1118,64 @@ class DatasetExporter:
                 lines = [path.read_text(encoding="utf-8")]
             for line in lines:
                 if line.strip():
-                    samples.append(EnrichedSample.model_validate_json(line))
+                    payload = self._normalize_legacy_enriched_sample_payload(
+                        json.loads(line)
+                    )
+                    samples.append(EnrichedSample.model_validate(payload))
         if len({sample.sample_id for sample in samples}) != len(samples):
             raise ValueError("subject attribute sidecar repeats a sample_id")
         return samples
+
+    @staticmethod
+    def _normalize_legacy_enriched_sample_payload(payload: object) -> object:
+        if not isinstance(payload, dict):
+            return payload
+        accepted = payload.get("accepted_attributes")
+        references = payload.get("references")
+        if not isinstance(accepted, list) or not isinstance(references, list):
+            return payload
+
+        provenance_by_id: dict[str, tuple[object, object]] = {}
+        for record in accepted:
+            if not isinstance(record, dict):
+                continue
+            attribute_id = record.get("attribute_id")
+            if not isinstance(attribute_id, str):
+                continue
+            if attribute_id in provenance_by_id:
+                raise ValueError(
+                    "legacy enriched sidecar repeats an accepted attribute_id"
+                )
+            provenance_by_id[attribute_id] = (
+                record.get("attribute_type"),
+                record.get("owner_entity_id"),
+            )
+
+        normalized_references: list[object] = []
+        for reference in references:
+            if not isinstance(reference, dict) or reference.get("kind") != "attribute":
+                normalized_references.append(reference)
+                continue
+            attribute_id = reference.get("attribute_id")
+            provenance = provenance_by_id.get(attribute_id)
+            if provenance is None:
+                raise ValueError(
+                    "legacy enriched attribute has no accepted record"
+                )
+            attribute_type, owner_entity_id = provenance
+            if reference.get("owner_entity_id") != owner_entity_id:
+                raise ValueError("legacy enriched attribute owner conflicts with record")
+            if "attribute_type" in reference:
+                if reference["attribute_type"] != attribute_type:
+                    raise ValueError(
+                        "legacy enriched attribute type conflicts with record"
+                    )
+                normalized_references.append(reference)
+                continue
+            normalized_references.append(
+                {**reference, "attribute_type": attribute_type}
+            )
+        return {**payload, "references": normalized_references}
 
     def _export_enriched_samples(
         self,

@@ -1632,9 +1632,11 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     assert str(config.resolved_run_root) not in dataset_text
 
 
-def test_direct_export_materializes_raw_and_completed_attribute_sidecar(
+@pytest.mark.parametrize("conflicting_attribute_type", [False, True])
+def test_direct_export_normalizes_legacy_attribute_type_and_rejects_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    conflicting_attribute_type: bool,
 ) -> None:
     config = _config(tmp_path, monkeypatch)
     storage = RunStorage(config)
@@ -1711,7 +1713,7 @@ def test_direct_export_materializes_raw_and_completed_attribute_sidecar(
     }
     raw_record = SubjectAttributeRecord(
         attribute_id="a1",
-        attribute_type="face",
+        attribute_type="glasses",
         image_path="references/clip-1/a1.png",
         review=review("a1"),
         final_selection="raw",
@@ -1757,7 +1759,7 @@ def test_direct_export_materializes_raw_and_completed_attribute_sidecar(
                 origin="attribute_enrichment",
                 attribute_id="a1",
                 owner_entity_id="e1",
-                attribute_type="face",
+                attribute_type="glasses",
                 image_path=raw_record.image_path or "",
                 source_frame_index=10,
             ),
@@ -1775,15 +1777,30 @@ def test_direct_export_materializes_raw_and_completed_attribute_sidecar(
         ],
         accepted_attributes=[raw_record, completed_record],
     )
+    legacy_payload = enriched.model_dump(mode="json")
+    attribute_references = [
+        reference
+        for reference in legacy_payload["references"]
+        if reference["kind"] == "attribute"
+    ]
+    for reference in attribute_references:
+        reference.pop("attribute_type")
+    if conflicting_attribute_type:
+        attribute_references[0]["attribute_type"] = "face"
     (sidecar_root / "enriched_samples.jsonl").write_text(
-        enriched.model_dump_json() + "\n",
+        json.dumps(legacy_payload) + "\n",
         encoding="utf-8",
     )
+
+    if conflicting_attribute_type:
+        with pytest.raises(ValueError, match="attribute type conflicts"):
+            DatasetExporter(config, storage).export()
+        return
 
     DatasetExporter(config, storage).export()
 
     export_root = config.resolved_export_root
-    raw_export = export_root / "references/clip-1/attribute_e1_a1_face.png"
+    raw_export = export_root / "references/clip-1/attribute_e1_a1_glasses.png"
     completed_export = (
         export_root
         / "references/clip-1/attribute_e1_a2_upper_clothing.png"
@@ -1799,7 +1816,7 @@ def test_direct_export_materializes_raw_and_completed_attribute_sidecar(
     )
     assert [reference.image_index for reference in exported.references] == [1, 2, 3]
     assert exported.references[0].image_path == "references/clip-1/subject_1.png"
-    assert exported.references[1].model_dump()["attribute_type"] == "face"
+    assert exported.references[1].model_dump()["attribute_type"] == "glasses"
     assert exported.references[2].model_dump()["attribute_type"] == (
         "upper_clothing"
     )
