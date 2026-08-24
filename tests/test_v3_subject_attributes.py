@@ -1514,12 +1514,30 @@ def test_discovery_prompt_requires_english_attribute_text() -> None:
     assert "written in English" in prompt
 
 
-def test_attribute_completion_prompt_is_exact_and_category_neutral() -> None:
-    assert subject_attributes.ATTRIBUTE_COMPLETION_PROMPT == (
-        "把图片中破损、缺失或不完整的区域补充完整。"
+@pytest.mark.parametrize(
+    ("attribute_type", "entity_name"),
+    [
+        ("face", "人脸"),
+        ("headwear", "帽子"),
+        ("accessory", "配饰"),
+        ("upper_clothing", "衣服"),
+        ("lower_clothing", "下装"),
+        ("dress_or_skirt", "裙子"),
+    ],
+)
+def test_attribute_completion_prompt_is_short_and_type_specific(
+    attribute_type: str,
+    entity_name: str,
+) -> None:
+    assert subject_attributes.attribute_completion_prompt(attribute_type) == (
+        f"补全成完整的{entity_name}，去除掉破碎的部分，不添加其他内容"
     )
-    for prohibited in ("人脸", "人", "头发", "服装", "帽子", "配饰", "包", "鞋"):
-        assert prohibited not in subject_attributes.ATTRIBUTE_COMPLETION_PROMPT
+
+
+def test_hair_and_glasses_are_not_completion_eligible() -> None:
+    eligible = SubjectAttributeCompletionConfig().eligible_types
+    assert "hair" not in eligible
+    assert "glasses" not in eligible
 
 
 def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
@@ -2425,7 +2443,7 @@ def _attempt_completion_direct(
 
     judge = Judge()
     metrics = subject_attributes._CompletionSelectionMetrics()
-    completed, reason, _, completion_review = (
+    completed, reason, _, completion_review, completion_seed = (
         subject_attributes._attempt_attribute_completion(
             candidate,
             clip_uid="42038d7dc619cfa7bebee437",
@@ -2438,6 +2456,7 @@ def _attempt_completion_direct(
         )
     )
     trace.completion_review = completion_review
+    trace.completion_seed = completion_seed
     return completed, reason, metrics, trace
 
 
@@ -2535,7 +2554,7 @@ def test_repairable_attribute_uses_boogu_without_completion_sam(
         maximum_bbox_area_growth_ratio=4.0,
         face_maximum_bbox_area_growth_ratio=4.0,
     )
-    completed, reason, failed, completion_review = (
+    completed, reason, failed, completion_review, completion_seed = (
         subject_attributes._attempt_attribute_completion(
             candidate,
             clip_uid="clip-1",
@@ -2553,6 +2572,7 @@ def test_repairable_attribute_uses_boogu_without_completion_sam(
     assert reason == "completion_identity_accepted"
     assert failed is False
     assert completion_review == _completion_review(accepted=True)
+    assert isinstance(completion_seed, int)
     assert backend.calls == 1
     assert completed.crop.mode == "RGB"
     assert metrics.sam3_time_seconds == 0.0
@@ -2593,7 +2613,7 @@ def test_alpha_coverage_does_not_control_completion_routing(
         def review(self, **_kwargs):
             return _completion_review(accepted=True)
 
-    completed, reason, _, _ = subject_attributes._attempt_attribute_completion(
+    completed, reason, _, _, _ = subject_attributes._attempt_attribute_completion(
         candidate,
         clip_uid="clip-1",
         output_root=tmp_path,
@@ -2605,9 +2625,9 @@ def test_alpha_coverage_does_not_control_completion_routing(
     )
     assert completed is not None
     assert reason == "completion_identity_accepted"
-    assert captured["instruction"] == "把图片中破损、缺失或不完整的区域补充完整。"
-    for prohibited in ("人脸", "服装", "帽子", "头发", "配饰", "主体"):
-        assert prohibited not in str(captured["instruction"])
+    assert captured["instruction"] == (
+        "补全成完整的人脸，去除掉破碎的部分，不添加其他内容"
+    )
 
 
 def test_completion_review_rejects_fail_closed(
@@ -2617,9 +2637,9 @@ def test_completion_review_rejects_fail_closed(
     raw_mask[8:24, 8:24] = True
     candidate = subject_attributes.PendingAttributeCandidate(
         discovered=DiscoveredSubjectAttribute(
-            attribute_type="hair",
-            phrase="hair",
-            grounding_prompt="hair of person 1",
+            attribute_type="face",
+            phrase="face",
+            grounding_prompt="face of person 1",
         ),
         attribute_id="a1",
         owner_entity_id="e1",
@@ -2641,7 +2661,7 @@ def test_completion_review_rejects_fail_closed(
             return _completion_review(accepted=False)
 
     metrics = subject_attributes._CompletionSelectionMetrics()
-    completed, reason, _, completion_review = (
+    completed, reason, _, completion_review, _ = (
         subject_attributes._attempt_attribute_completion(
             candidate,
             clip_uid="clip-1",
@@ -2715,6 +2735,7 @@ def _run_completion_routing_case(
     raw_kind: str,
     completion_stage: str = "success",
     attribute_count: int = 1,
+    first_attribute_type: str = "face",
 ) -> tuple[OwnerEnrichmentArtifact, object, object, object]:
     _frames(tmp_path / "run")
 
@@ -2725,10 +2746,14 @@ def _run_completion_routing_case(
                 owner_is_human=True,
                 attributes=[
                     DiscoveredSubjectAttribute(
-                        attribute_type=("face" if index == 0 else "accessory"),
-                        phrase=("face" if index == 0 else "necklace"),
+                        attribute_type=(
+                            first_attribute_type if index == 0 else "accessory"
+                        ),
+                        phrase=(
+                            first_attribute_type if index == 0 else "necklace"
+                        ),
                         grounding_prompt=(
-                            "face of person 1"
+                            f"{first_attribute_type} of person 1"
                             if index == 0
                             else "necklace worn by person 1"
                         ),
@@ -2849,6 +2874,46 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
     assert review.calls == [["a1"]]
 
 
+def test_hair_repair_recommendation_never_calls_boogu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject_attributes,
+        "HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS",
+        4,
+    )
+    artifact, _, backend, _ = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+        first_attribute_type="hair",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert record.image_path is not None
+    assert (tmp_path / "output" / record.image_path).is_file()
+    assert backend.calls == 0
+
+
+def test_glasses_publish_raw_without_boogu(tmp_path: Path) -> None:
+    artifact, _, backend, _ = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_complete",
+        first_attribute_type="glasses",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert record.image_path is not None
+    assert (tmp_path / "output" / record.image_path).is_file()
+    assert backend.calls == 0
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     [
@@ -2859,7 +2924,9 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
 def test_raw_accepted_repair_failures_fallback_to_raw(
     tmp_path: Path,
     failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(subject_attributes, "new_boogu_seed", lambda: 2718)
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_repair",
@@ -2870,6 +2937,7 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
     assert record.status == "accepted"
     assert record.final_selection == "raw"
     assert record.completion_attempted is True
+    assert record.completion_seed == 2718
     assert artifact.metrics.completion_fallback_to_raw == 1
     assert artifact.metrics.completion_selected_completed == 0
     assert artifact.metrics.completion_review_calls == int(
@@ -2888,7 +2956,11 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
         assert published.mode == "RGBA"
 
 
-def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
+def test_raw_accepted_repair_success_selects_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject_attributes, "new_boogu_seed", lambda: 314159)
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_repair",
@@ -2898,6 +2970,7 @@ def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
     assert record.status == "accepted"
     assert record.final_selection == "completed"
     assert record.completion_outcome == "selected_completed"
+    assert record.completion_seed == 314159
     assert artifact.metrics.review_calls == 1
     assert artifact.metrics.completion_selected_completed == 1
     assert artifact.metrics.completion_accepted == 1

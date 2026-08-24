@@ -225,7 +225,6 @@ class SubjectAttributeCompletionConfig:
     enabled: bool = False
     eligible_types: tuple[str, ...] = (
         "face",
-        "hair",
         "headwear",
         "accessory",
         "upper_clothing",

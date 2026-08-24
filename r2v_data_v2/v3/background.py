@@ -49,6 +49,24 @@ class BackgroundCandidate:
     union_mask: np.ndarray
     area_pixels: int
     area_ratio: float
+    sharpness_score: float
+
+
+def background_sharpness_score(image: Image.Image) -> float:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    padded = np.pad(gray, 1, mode="edge")
+    laplacian = (
+        padded[:-2, 1:-1]
+        + padded[2:, 1:-1]
+        + padded[1:-1, :-2]
+        + padded[1:-1, 2:]
+        - 4.0 * padded[1:-1, 1:-1]
+    )
+    score = float(np.var(laplacian)) if laplacian.size > 1 else 0.0
+    if not math.isfinite(score) or score < 0:
+        raise ValueError("background sharpness score must be finite and non-negative")
+    return score
 
 
 def validate_background_inputs(
@@ -146,6 +164,8 @@ def build_union_foreground_mask(
 def select_background_source_frame(
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
+    *,
+    storage: RunStorage,
 ) -> BackgroundCandidate | None:
     candidates: list[BackgroundCandidate] = []
     total_pixels = frames.height * frames.width
@@ -153,6 +173,16 @@ def select_background_source_frame(
         union_mask = build_union_foreground_mask(masks, frame.slot)
         if union_mask is None:
             continue
+        image_path = (storage.clip_dir(frames.clip_uid) / frame.image_path).resolve(
+            strict=False
+        )
+        try:
+            image_path.relative_to(storage.clip_dir(frames.clip_uid).resolve())
+        except ValueError as exc:
+            raise ValueError("background source frame must remain inside clip") from exc
+        with Image.open(image_path) as opened:
+            opened.load()
+            sharpness_score = background_sharpness_score(opened)
         area_pixels = int(np.count_nonzero(union_mask))
         candidates.append(
             BackgroundCandidate(
@@ -160,6 +190,7 @@ def select_background_source_frame(
                 union_mask=union_mask,
                 area_pixels=area_pixels,
                 area_ratio=area_pixels / total_pixels,
+                sharpness_score=sharpness_score,
             )
         )
     if not candidates:
@@ -168,6 +199,7 @@ def select_background_source_frame(
         candidates,
         key=lambda candidate: (
             candidate.area_pixels,
+            -candidate.sharpness_score,
             _PRIORITY_INDEX[candidate.frame.slot],
         ),
     )
@@ -583,7 +615,11 @@ def build_background_candidates(
                         state,
                     )
                 else:
-                    candidate = select_background_source_frame(frames, masks)
+                    candidate = select_background_source_frame(
+                        frames,
+                        masks,
+                        storage=storage,
+                    )
                     if candidate is None:
                         state = BackgroundReferenceState(
                             status="rejected",

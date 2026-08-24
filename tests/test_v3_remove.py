@@ -583,11 +583,17 @@ def test_boogu_remove_uses_authoritative_full_frame_candidate_without_composite(
         raise AssertionError("Boogu full-frame mode must not composite")
 
     monkeypatch.setattr(remove_module, "composite_candidate", reject_composite)
+    generated_seeds = iter((101, 202))
+    monkeypatch.setattr(
+        remove_module,
+        "new_boogu_seed",
+        lambda: next(generated_seeds),
+    )
     stats = remove_backgrounds(config, storage, backend=backend, judge=judge)
 
     assert stats.ready_removed == 1
     assert stats.candidates_generated == 2
-    assert [call["seed"] for call in worker.calls] == [0, 17]
+    assert [call["seed"] for call in worker.calls] == [101, 202]
     assert all(call["thinking_enabled"] is False for call in worker.calls)
     assert len(judge.candidates) == 2
     assert judge.candidate_modes == ["full_frame", "full_frame"]
@@ -595,7 +601,8 @@ def test_boogu_remove_uses_authoritative_full_frame_candidate_without_composite(
     assert state.output_image_path is not None
     assert state.source_mask_path is not None
     assert state.generation_mask_path is not None
-    assert state.removal_seed == 17
+    assert state.removal_seed == 202
+    assert [attempt.seed for attempt in state.removal_attempts] == [101, 202]
     assert state.output_sha256 == hashlib.sha256(
         (storage.root / state.output_image_path).read_bytes()
     ).hexdigest()
@@ -617,6 +624,7 @@ def test_boogu_remove_profiling_uses_dedicated_component_and_safe_metadata(
         alignment=config.reference_edit.alignment,
     )
     profiler = V3Profiler(storage.root, git_commit="abc123")
+    monkeypatch.setattr(remove_module, "new_boogu_seed", lambda: 303)
 
     with active_profiler(profiler):
         stats = remove_backgrounds(config, storage, backend=backend, judge=_Judge())
@@ -633,7 +641,7 @@ def test_boogu_remove_profiling_uses_dedicated_component_and_safe_metadata(
         "clip_uid": "clip-1",
         "generation_height": worker.calls[0]["height"],
         "generation_width": worker.calls[0]["width"],
-        "seed": 23,
+        "seed": 303,
         "source_height": HEIGHT,
         "source_width": WIDTH,
         "thinking_enabled": False,

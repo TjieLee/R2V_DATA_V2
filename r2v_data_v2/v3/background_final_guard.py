@@ -22,9 +22,10 @@ SYSTEM_PROMPT = """You judge whether an image is a reusable background reference
 You receive the full candidate, four spatial tiles, and the expected background
 description.
 
-Accept only if the scene matches the expected background, no unexpected
-foreground subject is visible, the image contains useful background information,
-and there are no obvious artifacts.
+Accept only if the scene matches, lacks unexpected foreground and artifacts, and
+provides sharp, meaningful, recognizable environmental information.
+Set usable_background_information=false for severe blur or views dominated by
+sky, ceiling, plain wall, floor, or other informationless regions.
 
 A foreground subject is a discrete person, animal, vehicle, equipment, product,
 or similar instance that is not naturally part of the described environment.

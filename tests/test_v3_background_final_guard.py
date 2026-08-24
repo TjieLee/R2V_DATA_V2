@@ -179,6 +179,11 @@ def test_final_background_prompt_stays_short_and_generic() -> None:
     lowered = SYSTEM_PROMPT.casefold()
     assert "forbidden foreground entities" not in lowered
     assert "forbidden list" not in lowered
+    assert "usable_background_information=false" in lowered
+    assert "sharp" in lowered
+    assert "recognizable" in lowered
+    assert "severe blur" in lowered
+    assert "informationless" in lowered
 
 
 def test_final_background_prompt_rejects_non_diegetic_overlay_text() -> None:

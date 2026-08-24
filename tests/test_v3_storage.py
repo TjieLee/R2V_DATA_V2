@@ -53,6 +53,14 @@ from r2v_data_v2.v3.storage import (
     RunStorage,
     evaluate_export_state,
 )
+from r2v_data_v2.v3.subject_attributes import (
+    EnrichedReference,
+    EnrichedSample,
+    OwnershipGeometry,
+    SubjectAttributeCompletionReview,
+    SubjectAttributeRecord,
+    SubjectAttributeReview,
+)
 from run_pipeline_v3 import run_pipeline_v3
 
 
@@ -1622,6 +1630,187 @@ def test_compact_export_contains_only_accepted_training_artifacts(
     )
     assert "127.0.0.1" not in dataset_text
     assert str(config.resolved_run_root) not in dataset_text
+
+
+def test_direct_export_materializes_raw_and_completed_attribute_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="abc123")
+    _create_exportable_clip(storage, include_background=False)
+    sidecar_root = storage.root / "subject_attributes"
+    source_reference_root = sidecar_root / "references" / "clip-1"
+    source_reference_root.mkdir(parents=True)
+    raw_path = source_reference_root / "a1.png"
+    completed_path = source_reference_root / "a2.png"
+    Image.new("RGBA", (18, 14), (40, 80, 120, 255)).save(raw_path, format="PNG")
+    Image.new("RGB", (20, 16), (130, 90, 50)).save(
+        completed_path,
+        format="PNG",
+    )
+    raw_bytes = raw_path.read_bytes()
+    completed_bytes = completed_path.read_bytes()
+    geometry = OwnershipGeometry(
+        passed=True,
+        reason="passed",
+        owner_overlap_ratio=0.9,
+        maximum_other_owner_overlap_ratio=0.0,
+        attribute_to_owner_area_ratio=0.3,
+        near_owner_region=True,
+        attribute_area_pixels=200,
+        attribute_long_side_pixels=20,
+        significant_component_count=1,
+        largest_component_ratio=1.0,
+        second_largest_component_ratio=0.0,
+        bbox_fill_ratio=1.0,
+    )
+
+    def review(attribute_id: str) -> SubjectAttributeReview:
+        return SubjectAttributeReview(
+            attribute_id=attribute_id,
+            matches_attribute=True,
+            owner_binding_correct=True,
+            recognizable=True,
+            characteristic_appearance_visible=True,
+            usable_as_attribute_condition=True,
+            structure_complete=True,
+            completion_recommended=False,
+            reason="usable",
+        )
+
+    completion_review = SubjectAttributeCompletionReview(
+        verdict="accept",
+        same_physical_entity=True,
+        identity_preserved=True,
+        original_visible_attributes_preserved=True,
+        exactly_one_entity=True,
+        missing_parts_plausibly_completed=True,
+        no_duplicate_entity=True,
+        no_unrelated_entity=True,
+        no_severe_structure_artifact=True,
+        style_coherent=True,
+        resolution_usable=True,
+        reference_usable=True,
+        certain=True,
+        reason="usable completion",
+    )
+    common = {
+        "owner_entity_id": "e1",
+        "phrase": "component",
+        "grounding_prompt": "component of person 1",
+        "status": "accepted",
+        "source_frame_index": 10,
+        "source_frame_slot": 1,
+        "owner_candidate_id": "candidate_2",
+        "same_frame_as_owner_reference": False,
+        "sam3_prompt": "component of person 1",
+        "ownership_geometry": geometry,
+        "reason": "accepted",
+    }
+    raw_record = SubjectAttributeRecord(
+        attribute_id="a1",
+        attribute_type="face",
+        image_path="references/clip-1/a1.png",
+        review=review("a1"),
+        final_selection="raw",
+        completion_attempted=False,
+        completion_outcome="not_attempted",
+        **common,
+    )
+    completed_record = SubjectAttributeRecord(
+        attribute_id="a2",
+        attribute_type="upper_clothing",
+        image_path="references/clip-1/a2.png",
+        review=review("a2"),
+        completion_review=completion_review,
+        final_selection="completed",
+        completion_attempted=True,
+        completion_seed=777,
+        completion_outcome="selected_completed",
+        **common,
+    )
+    enriched = EnrichedSample(
+        sample_id="clip-1",
+        clip_uid="clip-1",
+        source_run_root=str(storage.root),
+        original_visual={"target_video": "clip.mp4"},
+        original_instruction="Use <Image 1>.",
+        enriched_instruction=(
+            "Use <Image 1> with <Image 2> and <Image 3>."
+        ),
+        references=[
+            EnrichedReference(
+                image_id="image_1",
+                image_index=1,
+                kind="subject",
+                origin="visual_run",
+                entity_id="e1",
+                image_path="clips/clip-1/selected/e1.png",
+                source_frame_index=2,
+            ),
+            EnrichedReference(
+                image_id="image_2",
+                image_index=2,
+                kind="attribute",
+                origin="attribute_enrichment",
+                attribute_id="a1",
+                owner_entity_id="e1",
+                attribute_type="face",
+                image_path=raw_record.image_path or "",
+                source_frame_index=10,
+            ),
+            EnrichedReference(
+                image_id="image_3",
+                image_index=3,
+                kind="attribute",
+                origin="attribute_enrichment",
+                attribute_id="a2",
+                owner_entity_id="e1",
+                attribute_type="upper_clothing",
+                image_path=completed_record.image_path or "",
+                source_frame_index=10,
+            ),
+        ],
+        accepted_attributes=[raw_record, completed_record],
+    )
+    (sidecar_root / "enriched_samples.jsonl").write_text(
+        enriched.model_dump_json() + "\n",
+        encoding="utf-8",
+    )
+
+    DatasetExporter(config, storage).export()
+
+    export_root = config.resolved_export_root
+    raw_export = export_root / "references/clip-1/attribute_e1_a1_face.png"
+    completed_export = (
+        export_root
+        / "references/clip-1/attribute_e1_a2_upper_clothing.png"
+    )
+    assert raw_export.read_bytes() == raw_bytes
+    assert completed_export.read_bytes() == completed_bytes
+    with Image.open(raw_export) as image:
+        assert image.mode == "RGBA"
+    with Image.open(completed_export) as image:
+        assert image.mode == "RGB"
+    exported = EnrichedSample.model_validate_json(
+        (export_root / "enriched_samples.jsonl").read_text(encoding="utf-8")
+    )
+    assert [reference.image_index for reference in exported.references] == [1, 2, 3]
+    assert exported.references[0].image_path == "references/clip-1/subject_1.png"
+    assert exported.references[1].model_dump()["attribute_type"] == "face"
+    assert exported.references[2].model_dump()["attribute_type"] == (
+        "upper_clothing"
+    )
+    assert exported.references[1].owner_entity_id == "e1"
+    assert exported.references[1].attribute_id == "a1"
+    assert exported.references[1].source_frame_index == 10
+    frozen = DatasetSample.model_validate_json(
+        (export_root / "samples.jsonl").read_text(encoding="utf-8")
+    )
+    assert frozen.r2v_instruction == _instruction_state().r2v_instruction
+    assert len(frozen.references) == 1
 
 
 @pytest.mark.parametrize("include_background", [False, True])

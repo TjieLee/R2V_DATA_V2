@@ -418,9 +418,11 @@ def test_white_rgb_input_preserves_opaque_pixels_and_whitens_alpha(
 
 def test_background_uses_thinking_false_and_no_source_restoration(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_root, canonical, canonical_bytes = _environment(tmp_path)
     backend = _Backend()
+    monkeypatch.setattr(boogu_module, "new_boogu_seed", lambda: 4242)
 
     result = run_boogu_reference_edit(
         run_root=run_root,
@@ -437,7 +439,9 @@ def test_background_uses_thinking_false_and_no_source_restoration(
     assert result.status == "accepted"
     assert backend.calls[0]["thinking_enabled"] is False
     assert backend.calls[0]["instruction_rewrite_enabled"] is False
+    assert backend.calls[0]["seed"] == 4242
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["generation_seed"] == 4242
     assert metadata["thinking_enabled"] is False
     assert metadata["instruction_rewrite_enabled"] is False
     assert metadata["rewritten_instruction"] is None
@@ -516,6 +520,50 @@ def test_small_composition_change_passes_geometry_gate(tmp_path: Path) -> None:
     assert result.status == "accepted"
     metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
     assert metadata["geometry_gate_passed"] is True
+
+
+def test_reference_edit_generates_one_fresh_seed_per_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeds = iter((111, 222))
+    monkeypatch.setattr(boogu_module, "new_boogu_seed", lambda: next(seeds))
+    first_root, _, _ = _environment(tmp_path / "first")
+    second_root, _, _ = _environment(tmp_path / "second")
+    first_backend = _Backend()
+    second_backend = _Backend()
+
+    first = run_boogu_reference_edit(
+        run_root=first_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete it.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=first_backend,
+        judge=_Judge(),
+    )
+    second = run_boogu_reference_edit(
+        run_root=second_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="add_entity_background",
+        instruction="Add a studio.",
+        entity_phrase="green object",
+        reference_type="object",
+        backend=second_backend,
+        judge=_Judge(),
+    )
+
+    assert first_backend.calls[0]["seed"] == 111
+    assert second_backend.calls[0]["seed"] == 222
+    assert json.loads(first.metadata_path.read_text(encoding="utf-8"))[
+        "generation_seed"
+    ] == 111
+    assert json.loads(second.metadata_path.read_text(encoding="utf-8"))[
+        "generation_seed"
+    ] == 222
 
 
 @pytest.mark.parametrize(

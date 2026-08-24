@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PIL import Image
 
@@ -41,6 +42,9 @@ from r2v_data_v2.v3.schemas import (
     TrackedMasksArtifact,
     render_annotation_plain_text,
 )
+
+if TYPE_CHECKING:
+    from r2v_data_v2.v3.subject_attributes import EnrichedSample
 
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _EXPORT_TOKEN = re.compile(r"<ref_(subject|object|group|bg)_(\d+)>")
@@ -904,6 +908,12 @@ class DatasetExporter:
                 reference_count += len(sample.references)
             sample_records = [_model_dict(sample) for sample in samples]
             _write_jsonl_atomic(temporary / "samples.jsonl", sample_records)
+            enriched_samples = self._export_enriched_samples(temporary, samples)
+            if enriched_samples:
+                _write_jsonl_atomic(
+                    temporary / "enriched_samples.jsonl",
+                    [_model_dict(sample) for sample in enriched_samples],
+                )
             dataset = DatasetRecord(
                 dataset_version=_safe_component(
                     self.destination.name,
@@ -918,7 +928,7 @@ class DatasetExporter:
                 reference_count=reference_count,
             )
             write_json_atomic(temporary / "dataset.json", _model_dict(dataset))
-            self._validate_export_tree(temporary, samples)
+            self._validate_export_tree(temporary, samples, enriched_samples)
             self._publish(temporary, overwrite=overwrite)
             return dataset
         except Exception:
@@ -1090,6 +1100,157 @@ class DatasetExporter:
             raise FileNotFoundError(f"reference image is missing: {resolved}")
         return resolved
 
+    def _load_enriched_samples(self) -> list[EnrichedSample]:
+        from r2v_data_v2.v3.subject_attributes import EnrichedSample
+
+        sidecar_root = self.storage.root / "subject_attributes"
+        reconciled = sidecar_root / "enriched_samples.jsonl"
+        paths = (
+            [reconciled]
+            if reconciled.is_file()
+            else sorted((sidecar_root / "samples").glob("*.json"))
+        )
+        samples: list[EnrichedSample] = []
+        for path in paths:
+            if path == reconciled:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            else:
+                lines = [path.read_text(encoding="utf-8")]
+            for line in lines:
+                if line.strip():
+                    samples.append(EnrichedSample.model_validate_json(line))
+        if len({sample.sample_id for sample in samples}) != len(samples):
+            raise ValueError("subject attribute sidecar repeats a sample_id")
+        return samples
+
+    def _export_enriched_samples(
+        self,
+        temporary: Path,
+        samples: list[DatasetSample],
+    ) -> list[EnrichedSample]:
+        from r2v_data_v2.v3.subject_attributes import (
+            EnrichedReference,
+            EnrichedSample,
+            _validate_attribute_png,
+        )
+
+        frozen_by_id = {sample.sample_id: sample for sample in samples}
+        sidecar_root = self.storage.root / "subject_attributes"
+        exported: list[EnrichedSample] = []
+        for source_sample in self._load_enriched_samples():
+            if not isinstance(source_sample, EnrichedSample):
+                raise TypeError("invalid enriched sample")
+            frozen = frozen_by_id.get(source_sample.sample_id)
+            if frozen is None or not source_sample.accepted_attributes:
+                continue
+            frozen_entities = {
+                reference.entity_id: reference
+                for reference in frozen.references
+                if reference.type == "entity"
+            }
+            frozen_background = next(
+                (
+                    reference
+                    for reference in frozen.references
+                    if reference.type == "background"
+                ),
+                None,
+            )
+            records = {
+                record.attribute_id: record
+                for record in source_sample.accepted_attributes
+            }
+            exported_references: list[EnrichedReference] = []
+            exported_records = []
+            exported_attribute_paths: dict[str, str] = {}
+            for reference in source_sample.references:
+                if reference.kind != "attribute":
+                    frozen_reference = (
+                        frozen_background
+                        if reference.kind == "background"
+                        else frozen_entities.get(reference.entity_id)
+                    )
+                    if frozen_reference is None:
+                        raise ValueError(
+                            "enriched visual reference is missing from frozen export"
+                        )
+                    exported_references.append(
+                        reference.model_copy(
+                            update={"image_path": frozen_reference.image_path}
+                        )
+                    )
+                    continue
+                assert reference.attribute_id is not None
+                assert reference.owner_entity_id is not None
+                assert reference.attribute_type is not None
+                record = records.get(reference.attribute_id)
+                if (
+                    record is None
+                    or record.owner_entity_id != reference.owner_entity_id
+                    or record.attribute_type != reference.attribute_type
+                    or record.source_frame_index != reference.source_frame_index
+                    or record.image_path != reference.image_path
+                ):
+                    raise ValueError(
+                        "enriched attribute reference provenance is inconsistent"
+                    )
+                _validate_attribute_png(
+                    sidecar_root,
+                    reference.image_path,
+                    final_selection=(
+                        "completed"
+                        if record.final_selection == "completed"
+                        else "raw"
+                    ),
+                )
+                relative_path = Path("references") / source_sample.clip_uid / (
+                    "attribute_"
+                    f"{_safe_component(reference.owner_entity_id, 'owner_entity_id')}_"
+                    f"{_safe_component(reference.attribute_id, 'attribute_id')}_"
+                    f"{_safe_component(reference.attribute_type, 'attribute_type')}.png"
+                )
+                source_path = (sidecar_root / reference.image_path).resolve(
+                    strict=False
+                )
+                try:
+                    source_path.relative_to(sidecar_root.resolve())
+                except ValueError as exc:
+                    raise ValueError(
+                        "attribute image must remain inside subject_attributes"
+                    ) from exc
+                self._materialize_unchanged(source_path, temporary / relative_path)
+                export_path = relative_path.as_posix()
+                exported_attribute_paths[reference.attribute_id] = export_path
+                exported_references.append(
+                    reference.model_copy(update={"image_path": export_path})
+                )
+            for record in source_sample.accepted_attributes:
+                export_path = exported_attribute_paths.get(record.attribute_id)
+                if export_path is None:
+                    raise ValueError("accepted attribute has no enriched reference")
+                exported_records.append(
+                    record.model_copy(update={"image_path": export_path})
+                )
+            exported.append(
+                source_sample.model_copy(
+                    update={
+                        "references": exported_references,
+                        "accepted_attributes": exported_records,
+                    }
+                )
+            )
+        return exported
+
+    @staticmethod
+    def _materialize_unchanged(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+        if destination.read_bytes() != source.read_bytes():
+            raise RuntimeError("attribute materialization changed image bytes")
+
     @staticmethod
     def _filename_for_token(token: str) -> str:
         match = _EXPORT_TOKEN.fullmatch(token)
@@ -1117,18 +1278,27 @@ class DatasetExporter:
         self,
         root: Path,
         samples: list[DatasetSample],
+        enriched_samples: list[EnrichedSample],
     ) -> None:
-        if {path.name for path in root.iterdir()} != {
+        expected_top_level = {
             "dataset.json",
             "samples.jsonl",
             "references",
-        }:
+        }
+        if enriched_samples:
+            expected_top_level.add("enriched_samples.jsonl")
+        if {path.name for path in root.iterdir()} != expected_top_level:
             raise ValueError("dataset root contains unexpected top-level artifacts")
         expected = {
             reference.image_path
             for sample in samples
             for reference in sample.references
         }
+        expected.update(
+            reference.image_path
+            for sample in enriched_samples
+            for reference in sample.references
+        )
         actual = {
             path.relative_to(root).as_posix()
             for path in (root / "references").rglob("*")

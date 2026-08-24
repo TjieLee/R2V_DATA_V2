@@ -35,6 +35,7 @@ from pydantic import (
 )
 
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
@@ -1417,6 +1418,7 @@ def run_boogu_reference_edit(
     thinking_enabled = operation == "complete_entity"
 
     output: BooguEditOutput | None = None
+    generation_seed: int | None = None
     output_sha256: str | None = None
     qwen_review: BooguQwenReview | None = None
     qwen_review_skipped_reason: str | None = None
@@ -1428,6 +1430,7 @@ def run_boogu_reference_edit(
         if source_gate_reason is not None:
             rejection_reason = "tiny_source_entity"
             raise _TinySourceRejected
+        generation_seed = new_boogu_seed()
         with profile_model_call(
             component=(
                 "boogu_complete_entity"
@@ -1444,6 +1447,7 @@ def run_boogu_reference_edit(
                 "height": height,
                 "thinking_enabled": thinking_enabled,
                 "instruction_rewrite_enabled": instruction_rewrite_enabled,
+                "generation_seed": generation_seed,
             },
         ):
             output = backend.edit(
@@ -1453,6 +1457,7 @@ def run_boogu_reference_edit(
                 height=height,
                 thinking_enabled=thinking_enabled,
                 instruction_rewrite_enabled=instruction_rewrite_enabled,
+                seed=generation_seed,
             )
         if output.original_instruction != instruction:
             raise RuntimeError("backend changed original instruction metadata")
@@ -1586,6 +1591,7 @@ def run_boogu_reference_edit(
         ),
         "thinking_enabled": thinking_enabled,
         "instruction_rewrite_enabled": instruction_rewrite_enabled,
+        "generation_seed": generation_seed,
         "output_sha256": output_sha256,
         "canonical_source_sha256": canonical_sha256,
         "source_image_path": source_evidence_path.relative_to(root).as_posix(),

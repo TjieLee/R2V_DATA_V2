@@ -314,6 +314,86 @@ def _read_mask(storage: RunStorage, state: BackgroundReferenceState) -> np.ndarr
         return np.asarray(image.convert("L"))
 
 
+def _write_sharp_frame(storage: RunStorage, *, slot: int) -> None:
+    pixels = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    pixels[:, ::2] = 255
+    Image.fromarray(pixels, mode="RGB").save(
+        storage.frame_path("clip-1", slot),
+        format="JPEG",
+        quality=100,
+        subsampling=0,
+    )
+
+
+def test_background_selection_prefers_sharper_frame_for_equal_foreground_area(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    slot_masks = [_empty_mask() for _ in range(10)]
+    slot_masks[9] = _mask((0, 0))
+    masks = _tracked_masks("clip-1", [slot_masks])
+    storage = _storage_with_clip(config, masks)
+    _write_sharp_frame(storage, slot=0)
+
+    candidate = background_module.select_background_source_frame(
+        storage.read_frames("clip-1"),
+        masks,
+        storage=storage,
+    )
+
+    assert candidate is not None
+    assert candidate.frame.slot == 0
+    assert candidate.sharpness_score > 0
+
+
+def test_background_selection_keeps_foreground_area_as_primary_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    slot_masks = [_empty_mask() for _ in range(10)]
+    slot_masks[5] = _mask((0, 0))
+    masks = _tracked_masks(
+        "clip-1",
+        [slot_masks],
+        invalid_slots=[{1, 2, 3, 4, 6, 7, 8, 9}],
+    )
+    storage = _storage_with_clip(config, masks)
+    _write_sharp_frame(storage, slot=5)
+
+    candidate = background_module.select_background_source_frame(
+        storage.read_frames("clip-1"),
+        masks,
+        storage=storage,
+    )
+
+    assert candidate is not None
+    assert candidate.frame.slot == 0
+    assert candidate.area_pixels == 0
+
+
+def test_background_selection_preserves_slot_priority_for_equal_sharpness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    slot_masks = [_empty_mask() for _ in range(10)]
+    slot_masks[9] = _mask((0, 0))
+    masks = _tracked_masks("clip-1", [slot_masks])
+    storage = _storage_with_clip(config, masks)
+
+    candidate = background_module.select_background_source_frame(
+        storage.read_frames("clip-1"),
+        masks,
+        storage=storage,
+    )
+
+    assert candidate is not None
+    assert candidate.frame.slot == 5
+    assert candidate.sharpness_score == 0.0
+
+
 def test_disabled_background_writes_none_without_frame_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

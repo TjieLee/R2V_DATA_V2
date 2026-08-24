@@ -27,6 +27,7 @@ from pydantic import (
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     Sam3Config,
@@ -80,9 +81,14 @@ ATTRIBUTE_DUPLICATE_MASK_IOU = 0.90
 CLOTHING_ATTRIBUTE_TYPES = frozenset(
     {"upper_clothing", "lower_clothing", "dress_or_skirt"}
 )
-ATTRIBUTE_COMPLETION_PROMPT = (
-    "把图片中破损、缺失或不完整的区域补充完整。"
-)
+_ATTRIBUTE_COMPLETION_ENTITY_NAME = {
+    "face": "人脸",
+    "headwear": "帽子",
+    "accessory": "配饰",
+    "upper_clothing": "衣服",
+    "lower_clothing": "下装",
+    "dress_or_skirt": "裙子",
+}
 
 _IMAGE_PLACEHOLDER = re.compile(r"\{\{image_([1-9]\d*)\}\}")
 _ANGLE_IMAGE_LABEL = re.compile(r"<Image ([1-9]\d*)>")
@@ -287,6 +293,7 @@ class SubjectAttributeRecord(_SchemaModel):
     selected_gme_attempt_index: int | None = Field(default=None, ge=0)
     final_selection: Literal["raw", "completed"] | None = None
     completion_attempted: bool = False
+    completion_seed: int | None = Field(default=None, ge=0)
     completion_outcome: str | None = None
     reason: str
 
@@ -324,6 +331,8 @@ class SubjectAttributeRecord(_SchemaModel):
                 raise ValueError("raw attribute requires an accepted review")
         elif self.image_path is not None:
             raise ValueError("rejected attribute must not publish an image")
+        if not self.completion_attempted and self.completion_seed is not None:
+            raise ValueError("unattempted completion cannot publish a seed")
         if self.selected_gme_attempt_index is not None:
             if self.selected_gme_attempt_index >= len(self.gme_attempts):
                 raise ValueError("selected GME attempt index is out of range")
@@ -509,6 +518,7 @@ class EnrichedReference(_SchemaModel):
     entity_id: str | None = None
     attribute_id: str | None = None
     owner_entity_id: str | None = None
+    attribute_type: AttributeType | None = None
     image_path: str
     source_frame_index: int | None = Field(default=None, ge=0)
 
@@ -521,10 +531,15 @@ class EnrichedReference(_SchemaModel):
                 self.origin != "attribute_enrichment"
                 or self.attribute_id is None
                 or self.owner_entity_id is None
+                or self.attribute_type is None
                 or self.entity_id is not None
             ):
                 raise ValueError("attribute reference requires owner-bound provenance")
-        elif self.attribute_id is not None or self.owner_entity_id is not None:
+        elif (
+            self.attribute_id is not None
+            or self.owner_entity_id is not None
+            or self.attribute_type is not None
+        ):
             raise ValueError("visual references cannot publish attribute provenance")
         elif self.kind == "background":
             if self.entity_id is not None:
@@ -1777,6 +1792,7 @@ def _rejected_record(
     gme_attempts: tuple[GmeAttributeScreenAttempt, ...] = (),
     selected_gme_attempt_index: int | None = None,
     completion_attempted: bool = False,
+    completion_seed: int | None = None,
     completion_outcome: str | None = None,
 ) -> SubjectAttributeRecord:
     return SubjectAttributeRecord(
@@ -1798,6 +1814,7 @@ def _rejected_record(
         gme_attempts=list(gme_attempts),
         selected_gme_attempt_index=selected_gme_attempt_index,
         completion_attempted=completion_attempted,
+        completion_seed=completion_seed,
         completion_outcome=completion_outcome,
         reason=reason,
     )
@@ -1814,6 +1831,7 @@ def _accepted_record(
     final_selection: Literal["raw", "completed"],
     completion_attempted: bool,
     completion_outcome: str,
+    completion_seed: int | None = None,
 ) -> SubjectAttributeRecord:
     relative_path = _save_attribute_crop(
         output_root,
@@ -1846,6 +1864,7 @@ def _accepted_record(
         selected_gme_attempt_index=candidate.selected_gme_attempt_index,
         final_selection=final_selection,
         completion_attempted=completion_attempted,
+        completion_seed=completion_seed,
         completion_outcome=completion_outcome,
         reason="accepted",
     )
@@ -1890,6 +1909,16 @@ def _save_completion_input(path: Path, crop: Image.Image) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def attribute_completion_prompt(attribute_type: AttributeType) -> str:
+    try:
+        entity_name = _ATTRIBUTE_COMPLETION_ENTITY_NAME[attribute_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"attribute type is not eligible for completion: {attribute_type}"
+        ) from exc
+    return f"补全成完整的{entity_name}，去除掉破碎的部分，不添加其他内容"
+
+
 def _attempt_attribute_completion(
     candidate: PendingAttributeCandidate,
     *,
@@ -1905,6 +1934,7 @@ def _attempt_attribute_completion(
     str,
     bool,
     SubjectAttributeCompletionReview | None,
+    int | None,
 ]:
     metrics.attempts += 1
     metrics.attempts_by_type[candidate.discovered.attribute_type] += 1
@@ -1923,14 +1953,19 @@ def _attempt_attribute_completion(
     source_path = candidate_root / "raw" / "source.png"
     output_path = candidate_root / "generated" / "candidate.png"
     _save_completion_input(source_path, candidate.crop)
+    completion_seed: int | None = None
     started = time.perf_counter()
     failure_stage = "backend"
     try:
+        instruction = attribute_completion_prompt(
+            candidate.discovered.attribute_type
+        )
+        completion_seed = new_boogu_seed()
         completion = completion_backend.attribute_completion(
             source_path=source_path,
             output_path=output_path,
-            instruction=ATTRIBUTE_COMPLETION_PROMPT,
-            seed=int(getattr(completion_config, "seed")),
+            instruction=instruction,
+            seed=completion_seed,
         )
         elapsed = time.perf_counter() - started
         reported_seconds = completion.get("model_call_time_seconds", elapsed)
@@ -1959,12 +1994,24 @@ def _attempt_attribute_completion(
         ):
             metrics.qwen_review_rejects += 1
             metrics.identity_review_rejects += 1
-            return None, "completion_qwen_review_reject", False, review
+            return (
+                None,
+                "completion_qwen_review_reject",
+                False,
+                review,
+                completion_seed,
+            )
     except Exception as exc:  # noqa: BLE001 - route to raw fallback or rejection
         metrics.failures += 1
         if failure_stage == "backend":
             metrics.backend_failures += 1
-        return None, f"completion_failed:{type(exc).__name__}:{exc}", True, None
+        return (
+            None,
+            f"completion_failed:{type(exc).__name__}:{exc}",
+            True,
+            None,
+            completion_seed,
+        )
     return (
         PendingAttributeCandidate(
             discovered=candidate.discovered,
@@ -1984,6 +2031,7 @@ def _attempt_attribute_completion(
         "completion_identity_accepted",
         False,
         review,
+        completion_seed,
     )
 
 
@@ -2644,6 +2692,7 @@ def _process_owner(
         if completion_backend is None or completion_judge is None:
             completed = None
             completion_review = None
+            completion_seed = None
             completion_reason = "completion_failed:backend_not_configured"
             completion_metrics.attempts += 1
             completion_metrics.attempts_by_type[
@@ -2661,6 +2710,7 @@ def _process_owner(
                 completion_reason,
                 _,
                 completion_review,
+                completion_seed,
             ) = _attempt_attribute_completion(
                 candidate,
                 clip_uid=clip.clip_uid,
@@ -2687,6 +2737,7 @@ def _process_owner(
                 completion_review=completion_review,
                 final_selection="completed",
                 completion_attempted=True,
+                completion_seed=completion_seed,
                 completion_outcome="selected_completed",
             )
             continue
@@ -2701,6 +2752,7 @@ def _process_owner(
                 completion_review=completion_review,
                 final_selection="raw",
                 completion_attempted=True,
+                completion_seed=completion_seed,
                 completion_outcome=completion_reason,
             )
         else:
@@ -2720,6 +2772,7 @@ def _process_owner(
                 gme_attempts=candidate.gme_attempts,
                 selected_gme_attempt_index=candidate.selected_gme_attempt_index,
                 completion_attempted=True,
+                completion_seed=completion_seed,
                 completion_outcome=completion_reason,
             )
 
@@ -2931,6 +2984,7 @@ def _render_enriched_instruction(
                     origin="attribute_enrichment",
                     attribute_id=attribute.attribute_id,
                     owner_entity_id=entity_id,
+                    attribute_type=attribute.attribute_type,
                     image_path=attribute.image_path,
                     source_frame_index=attribute.source_frame_index,
                 )
@@ -3699,7 +3753,6 @@ def run_subject_attribute_enrichment(
 
 
 __all__ = [
-    "ATTRIBUTE_COMPLETION_PROMPT",
     "AttributeCompletionBackend",
     "AttributeFrameSegmentationBackend",
     "AttributeGmeScreener",
@@ -3718,6 +3771,7 @@ __all__ = [
     "SubjectAttributeRecord",
     "SubjectAttributeReview",
     "SubjectAttributeReviewBatch",
+    "attribute_completion_prompt",
     "evaluate_owner_eligibility",
     "evaluate_ownership_geometry",
     "prefer_attribute_candidate_frames",
