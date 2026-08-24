@@ -1405,6 +1405,7 @@ def _write_enriched_with_attribute(
                 "origin": "attribute_enrichment",
                 "attribute_id": "a1",
                 "owner_entity_id": "e1",
+                "attribute_type": accepted.attribute_type,
                 "image_path": attribute_path,
                 "source_frame_index": 1,
             },

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import math
@@ -27,6 +28,7 @@ from pydantic import (
 
 import r2v_data_v2.v3.config as v3_config_module
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     Sam3Config,
@@ -56,6 +58,9 @@ from r2v_data_v2.v3.schemas import (
     AnnotationEntity,
     ClipRecord,
     EntityReferenceState,
+    ReferenceDefaultVariant,
+    ReferenceVariantState,
+    ReferenceVariantsState,
     RunRecord,
     TrackedMasksArtifact,
     render_annotation_plain_text,
@@ -80,9 +85,14 @@ ATTRIBUTE_DUPLICATE_MASK_IOU = 0.90
 CLOTHING_ATTRIBUTE_TYPES = frozenset(
     {"upper_clothing", "lower_clothing", "dress_or_skirt"}
 )
-ATTRIBUTE_COMPLETION_PROMPT = (
-    "把图片中破损、缺失或不完整的区域补充完整。"
-)
+_ATTRIBUTE_COMPLETION_ENTITY_NAME = {
+    "face": "人脸",
+    "headwear": "帽子",
+    "accessory": "配饰",
+    "upper_clothing": "衣服",
+    "lower_clothing": "下装",
+    "dress_or_skirt": "裙子",
+}
 
 _IMAGE_PLACEHOLDER = re.compile(r"\{\{image_([1-9]\d*)\}\}")
 _ANGLE_IMAGE_LABEL = re.compile(r"<Image ([1-9]\d*)>")
@@ -196,6 +206,74 @@ class SubjectAttributeCompletionReview(BooguCompletionReview):
     """Strict identity and quality verdict for an attribute completion."""
 
 
+class SubjectAttributeBackgroundReview(_SchemaModel):
+    same_attribute_appearance: StrictBool
+    shape_color_texture_preserved: StrictBool
+    target_is_clear_and_dominant: StrictBool
+    no_duplicate_or_unrelated_entity: StrictBool
+    background_does_not_occlude_target: StrictBool
+    no_halo_or_seam: StrictBool
+    no_severe_artifact: StrictBool
+    usable_as_attribute_condition: StrictBool
+    certain: StrictBool
+    reason: str
+    verdict: Literal["accept", "reject"]
+
+    @model_validator(mode="after")
+    def validate_review(self) -> SubjectAttributeBackgroundReview:
+        if not self.reason.strip():
+            raise ValueError("attribute background review reason must not be empty")
+        passed = all(
+            (
+                self.same_attribute_appearance,
+                self.shape_color_texture_preserved,
+                self.target_is_clear_and_dominant,
+                self.no_duplicate_or_unrelated_entity,
+                self.background_does_not_occlude_target,
+                self.no_halo_or_seam,
+                self.no_severe_artifact,
+                self.usable_as_attribute_condition,
+                self.certain,
+            )
+        )
+        if self.verdict != ("accept" if passed else "reject"):
+            raise ValueError("attribute background verdict must match strict checks")
+        return self
+
+
+class SubjectAttributeBboxReview(_SchemaModel):
+    correct_attribute: StrictBool
+    owner_binding_correct: StrictBool
+    target_is_dominant_and_identifiable: StrictBool
+    no_large_competing_attribute_or_entity: StrictBool
+    context_is_limited_and_supportive: StrictBool
+    no_severe_blur_or_artifact: StrictBool
+    usable_as_attribute_condition: StrictBool
+    certain: StrictBool
+    reason: str
+    verdict: Literal["accept", "reject"]
+
+    @model_validator(mode="after")
+    def validate_review(self) -> SubjectAttributeBboxReview:
+        if not self.reason.strip():
+            raise ValueError("attribute bbox review reason must not be empty")
+        passed = all(
+            (
+                self.correct_attribute,
+                self.owner_binding_correct,
+                self.target_is_dominant_and_identifiable,
+                self.no_large_competing_attribute_or_entity,
+                self.context_is_limited_and_supportive,
+                self.no_severe_blur_or_artifact,
+                self.usable_as_attribute_condition,
+                self.certain,
+            )
+        )
+        if self.verdict != ("accept" if passed else "reject"):
+            raise ValueError("attribute bbox verdict must match strict checks")
+        return self
+
+
 class OwnershipGeometry(_SchemaModel):
     passed: bool
     reason: str
@@ -287,7 +365,13 @@ class SubjectAttributeRecord(_SchemaModel):
     selected_gme_attempt_index: int | None = Field(default=None, ge=0)
     final_selection: Literal["raw", "completed"] | None = None
     completion_attempted: bool = False
+    completion_seed: int | None = Field(default=None, ge=0)
     completion_outcome: str | None = None
+    variants: ReferenceVariantsState | None = None
+    default_variant: ReferenceDefaultVariant | None = None
+    default_image_path: str | None = None
+    default_reason: str | None = None
+    accepted_base_image_path: str | None = None
     reason: str
 
     @model_validator(mode="after")
@@ -324,6 +408,36 @@ class SubjectAttributeRecord(_SchemaModel):
                 raise ValueError("raw attribute requires an accepted review")
         elif self.image_path is not None:
             raise ValueError("rejected attribute must not publish an image")
+        if not self.completion_attempted and self.completion_seed is not None:
+            raise ValueError("unattempted completion cannot publish a seed")
+        defaults = (
+            self.default_variant,
+            self.default_image_path,
+            self.default_reason,
+            self.accepted_base_image_path,
+        )
+        if self.variants is None:
+            if any(value is not None for value in defaults):
+                raise ValueError("attribute variant defaults require variants")
+        else:
+            if self.status != "accepted" or any(value is None for value in defaults):
+                raise ValueError(
+                    "accepted attribute variants require complete default provenance"
+                )
+            if self.image_path != self.default_image_path:
+                raise ValueError("attribute image_path must remain the selected default")
+            if self.default_variant != "accepted_base":
+                assert self.default_variant is not None
+                selected = getattr(self.variants, self.default_variant)
+                if (
+                    selected.status != "accepted"
+                    or selected.image_path != self.default_image_path
+                ):
+                    raise ValueError(
+                        "attribute default variant must be accepted and path-matched"
+                    )
+            elif self.default_image_path != self.accepted_base_image_path:
+                raise ValueError("accepted-base default must preserve its base image")
         if self.selected_gme_attempt_index is not None:
             if self.selected_gme_attempt_index >= len(self.gme_attempts):
                 raise ValueError("selected GME attempt index is out of range")
@@ -378,6 +492,14 @@ class OwnerEnrichmentMetrics(_SchemaModel):
     completion_model_call_time_seconds: float = Field(default=0.0, ge=0)
     completion_attempts_by_type: dict[str, int] = Field(default_factory=dict)
     completion_accepted_by_type: dict[str, int] = Field(default_factory=dict)
+    attribute_bbox_variants_materialized: int = Field(default=0, ge=0)
+    attribute_bbox_reviews_attempted: int = Field(default=0, ge=0)
+    attribute_bbox_reviews_skipped_background_accepted: int = Field(
+        default=0,
+        ge=0,
+    )
+    attribute_background_variants_attempted: int = Field(default=0, ge=0)
+    attribute_background_variants_accepted: int = Field(default=0, ge=0)
     failures: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
@@ -449,6 +571,17 @@ class OwnerEnrichmentMetrics(_SchemaModel):
             self.completion_sam_single_mask + 2 * self.completion_sam_multi_mask
         ):
             raise ValueError("completion SAM returned-mask total is inconsistent")
+        if (
+            self.attribute_background_variants_accepted
+            > self.attribute_background_variants_attempted
+        ):
+            raise ValueError("accepted attribute backgrounds exceed attempts")
+        if (
+            self.attribute_bbox_reviews_attempted
+            + self.attribute_bbox_reviews_skipped_background_accepted
+            > self.attribute_bbox_variants_materialized
+        ):
+            raise ValueError("attribute bbox review outcomes exceed materialized variants")
         for value in (
             self.qwen_model_call_time_seconds,
             self.sam3_model_call_time_seconds,
@@ -509,6 +642,7 @@ class EnrichedReference(_SchemaModel):
     entity_id: str | None = None
     attribute_id: str | None = None
     owner_entity_id: str | None = None
+    attribute_type: AttributeType | None = None
     image_path: str
     source_frame_index: int | None = Field(default=None, ge=0)
 
@@ -521,10 +655,15 @@ class EnrichedReference(_SchemaModel):
                 self.origin != "attribute_enrichment"
                 or self.attribute_id is None
                 or self.owner_entity_id is None
+                or self.attribute_type is None
                 or self.entity_id is not None
             ):
                 raise ValueError("attribute reference requires owner-bound provenance")
-        elif self.attribute_id is not None or self.owner_entity_id is not None:
+        elif (
+            self.attribute_id is not None
+            or self.owner_entity_id is not None
+            or self.attribute_type is not None
+        ):
             raise ValueError("visual references cannot publish attribute provenance")
         elif self.kind == "background":
             if self.entity_id is not None:
@@ -589,6 +728,7 @@ class PendingAttributeCandidate:
     completion_attempted: bool = False
     completion_model_call_time_seconds: float = 0.0
     completion_review_time_seconds: float = 0.0
+    raw_crop: Image.Image | None = None
 
 
 @dataclass
@@ -632,6 +772,15 @@ class _CompletionSelectionMetrics:
     sam3_time_seconds: float = 0.0
     attempts_by_type: Counter[str] = field(default_factory=Counter)
     accepted_by_type: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass
+class _AttributeVariantMetrics:
+    bbox_variants_materialized: int = 0
+    bbox_reviews_attempted: int = 0
+    bbox_reviews_skipped_background_accepted: int = 0
+    background_variants_attempted: int = 0
+    background_variants_accepted: int = 0
 
 
 @dataclass
@@ -683,6 +832,11 @@ class EnrichmentTotals:
     completion_model_call_time_seconds: float = 0.0
     completion_attempts_by_type: Counter[str] = field(default_factory=Counter)
     completion_accepted_by_type: Counter[str] = field(default_factory=Counter)
+    attribute_bbox_variants_materialized: int = 0
+    attribute_bbox_reviews_attempted: int = 0
+    attribute_bbox_reviews_skipped_background_accepted: int = 0
+    attribute_background_variants_attempted: int = 0
+    attribute_background_variants_accepted: int = 0
     failures: int = 0
     failure_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -757,6 +911,21 @@ class EnrichmentTotals:
         )
         self.completion_attempts_by_type.update(metrics.completion_attempts_by_type)
         self.completion_accepted_by_type.update(metrics.completion_accepted_by_type)
+        self.attribute_bbox_variants_materialized += (
+            metrics.attribute_bbox_variants_materialized
+        )
+        self.attribute_bbox_reviews_attempted += (
+            metrics.attribute_bbox_reviews_attempted
+        )
+        self.attribute_bbox_reviews_skipped_background_accepted += (
+            metrics.attribute_bbox_reviews_skipped_background_accepted
+        )
+        self.attribute_background_variants_attempted += (
+            metrics.attribute_background_variants_attempted
+        )
+        self.attribute_background_variants_accepted += (
+            metrics.attribute_background_variants_accepted
+        )
         self.failures += metrics.failures
 
 
@@ -902,6 +1071,15 @@ class AttributeCompletionBackend(Protocol):
         seed: int,
     ) -> dict[str, object]: ...
 
+    def attribute_background(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        instruction: str,
+        seed: int,
+    ) -> dict[str, object]: ...
+
 
 class AttributeCompletionJudge(Protocol):
     def review(
@@ -912,6 +1090,26 @@ class AttributeCompletionJudge(Protocol):
         attribute_type: str,
         attribute_phrase: str,
     ) -> SubjectAttributeCompletionReview: ...
+
+
+class AttributeVariantJudge(Protocol):
+    def review_attribute_background(
+        self,
+        *,
+        accepted_base: Image.Image,
+        generated_candidate: Image.Image,
+        attribute_type: str,
+        attribute_phrase: str,
+    ) -> SubjectAttributeBackgroundReview: ...
+
+    def review_attribute_bbox(
+        self,
+        *,
+        bbox_candidate: Image.Image,
+        owner_context: Image.Image,
+        attribute_type: str,
+        attribute_phrase: str,
+    ) -> SubjectAttributeBboxReview: ...
 
 
 class AttributeProbeClient(Protocol):
@@ -1071,9 +1269,10 @@ owner relation, for example 'the red jacket worn by the woman'. Return one JSON
 object whose top level contains exactly owner_entity_id, owner_is_human, and
 attributes. Do not return owner_phrase, owner_grounding_prompt, or any other
 top-level field. attributes must be a JSON array. Each attribute has exactly
-attribute_type, phrase, and grounding_prompt. Allowed types are face, hair,
-headwear, glasses, upper_clothing, lower_clothing, dress_or_skirt, shoes, bag,
-and accessory. The required shape is {"owner_entity_id":"e1",
+attribute_type, phrase, and grounding_prompt. Each returned attribute_type must
+be unique. Allowed types are face, hair, headwear, glasses, upper_clothing,
+lower_clothing, dress_or_skirt, shoes, bag, and accessory. The required shape is
+{"owner_entity_id":"e1",
 "owner_is_human":true,"attributes":[{"attribute_type":"hair",
 "phrase":"black hair","grounding_prompt":"black hair worn by the woman"}]}.
 If the subject is an animal, non-human creature, or non-human
@@ -1095,8 +1294,13 @@ person.
 recognizable requires sufficient component structure, not merely a guessable
 category. Hair needs a coherent hairstyle region or silhouette; reject fringe,
 arcs, isolated strands, or contour-only regions. Face needs enough facial
-structure to function independently; reject isolated patches. Upper or lower
-clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
+structure to function independently and must show a front or near-front face
+with roughly at least 50% of the frontal facial structure visible. Reject a
+strong three-quarter or near-side face below that standard, a side profile,
+the back of a head, an excessively turned face, or isolated facial patches.
+Apply this frontal requirement only when attribute_type is face; do not apply
+it to hair, headwear, glasses, clothing, shoes, bags, or accessories. Upper or
+lower clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
 cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags, and
 accessories need enough of the item to identify its structure independently.
 usable_as_attribute_condition=true only when the isolated crop provides clean,
@@ -1155,6 +1359,21 @@ including its material, color, texture, shape, and structure. Judge visible
 facts only and fail closed when uncertain.
 Return one strict JSON object matching the supplied schema and no other text."""
 
+ATTRIBUTE_BACKGROUND_PROMPT = """Add a simple, natural supporting background behind this single attribute reference.
+Preserve the target attribute exactly: do not change its shape, color, texture, material, identity, or visible details.
+Keep the target clear, dominant, and unobstructed. Do not add another person, object, duplicate attribute, or distracting foreground content.
+Blend the boundary cleanly with no halo or seam. Output one polished attribute reference with a supportive background."""
+
+ATTRIBUTE_BACKGROUND_REVIEW_SYSTEM_PROMPT = """Review a generated-background variant of one accepted attribute reference.
+Image 1 is the accepted base attribute. Image 2 is the generated-background candidate.
+Accept only when Image 2 preserves the same physical attribute and its shape, color, texture, material, and identity-bearing appearance; keeps the target clear, dominant, and unobstructed; adds no duplicate attribute, person, object, or unrelated salient entity; has no halo, seam, severe artifact, or identity-changing edit; and remains useful as an attribute conditioning reference. The background must be merely supportive. Fail closed when uncertain.
+Return exactly the strict JSON schema with reason before verdict and no extra fields."""
+
+ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT = """Review one RGB source bbox for a subject-bound attribute.
+The bbox may contain limited owner body, skin, garment context, or local background. Do not reject that limited context by itself.
+Accept only when the named attribute and intended owner binding are correct, the attribute is dominant and clearly identifiable, no other large competing attribute or entity is present, the context remains limited and supportive, there is no severe blur or artifact, and the bbox is independently useful as an attribute conditioning reference. Fail closed when uncertain.
+Return exactly the strict JSON schema with reason before verdict and no extra fields."""
+
 
 def _png_data_url(image: Image.Image) -> str:
     buffer = io.BytesIO()
@@ -1183,6 +1402,26 @@ def _owner_candidate_provenance_key(
         candidate.frame_slot,
         candidate.image_path,
     )
+
+
+def _normalize_discovery_payload(raw: str) -> object:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("attributes"), list
+    ):
+        return payload
+    seen_types: set[str] = set()
+    attributes: list[object] = []
+    for attribute in payload["attributes"]:
+        attribute_type = (
+            attribute.get("attribute_type") if isinstance(attribute, dict) else None
+        )
+        if isinstance(attribute_type, str):
+            if attribute_type in seen_types:
+                continue
+            seen_types.add(attribute_type)
+        attributes.append(attribute)
+    return {**payload, "attributes": attributes}
 
 
 class QwenSubjectAttributeClient:
@@ -1272,11 +1511,13 @@ class QwenSubjectAttributeClient:
                     },
                 )
             )
-        payload = SubjectAttributeDiscovery.model_validate_json(
-            self._request(
-                component="qwen_subject_attribute_discovery",
-                system_prompt=DISCOVERY_SYSTEM_PROMPT,
-                content=content,
+        payload = SubjectAttributeDiscovery.model_validate(
+            _normalize_discovery_payload(
+                self._request(
+                    component="qwen_subject_attribute_discovery",
+                    system_prompt=DISCOVERY_SYSTEM_PROMPT,
+                    content=content,
+                )
             )
         )
         if payload.owner_entity_id != owner.entity_id:
@@ -1382,6 +1623,84 @@ class QwenSubjectAttributeClient:
         if [review.attribute_id for review in payload.reviews] != expected_ids:
             raise ValueError("attribute review IDs must match proposed attributes")
         return payload
+
+    def review_attribute_background(
+        self,
+        *,
+        accepted_base: Image.Image,
+        generated_candidate: Image.Image,
+        attribute_type: str,
+        attribute_phrase: str,
+    ) -> SubjectAttributeBackgroundReview:
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Attribute type: {attribute_type}\n"
+                    f"Attribute phrase: {attribute_phrase.strip()}"
+                ),
+            }
+        ]
+        for label, image in (
+            ("Image 1: accepted base attribute", accepted_base),
+            ("Image 2: generated-background candidate", generated_candidate),
+        ):
+            content.extend(
+                (
+                    {"type": "text", "text": label},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _png_data_url(_resize_qwen_input_image(image))
+                        },
+                    },
+                )
+            )
+        return SubjectAttributeBackgroundReview.model_validate_json(
+            self._request(
+                component="qwen_attribute_background_review",
+                system_prompt=ATTRIBUTE_BACKGROUND_REVIEW_SYSTEM_PROMPT,
+                content=content,
+            )
+        )
+
+    def review_attribute_bbox(
+        self,
+        *,
+        bbox_candidate: Image.Image,
+        owner_context: Image.Image,
+        attribute_type: str,
+        attribute_phrase: str,
+    ) -> SubjectAttributeBboxReview:
+        content: list[dict[str, object]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Attribute type: {attribute_type}\n"
+                    f"Attribute phrase: {attribute_phrase.strip()}\n"
+                    "Image 1 is ownership-only context. Image 2 is the bbox target."
+                ),
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": _png_data_url(_resize_qwen_input_image(owner_context))
+                },
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": _png_data_url(_resize_qwen_input_image(bbox_candidate))
+                },
+            },
+        ]
+        return SubjectAttributeBboxReview.model_validate_json(
+            self._request(
+                component="qwen_attribute_bbox_review",
+                system_prompt=ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT,
+                content=content,
+            )
+        )
 
     def close(self) -> None:
         close = getattr(self.client, "close", None)
@@ -1754,6 +2073,7 @@ def _rejected_record(
     gme_attempts: tuple[GmeAttributeScreenAttempt, ...] = (),
     selected_gme_attempt_index: int | None = None,
     completion_attempted: bool = False,
+    completion_seed: int | None = None,
     completion_outcome: str | None = None,
 ) -> SubjectAttributeRecord:
     return SubjectAttributeRecord(
@@ -1775,6 +2095,7 @@ def _rejected_record(
         gme_attempts=list(gme_attempts),
         selected_gme_attempt_index=selected_gme_attempt_index,
         completion_attempted=completion_attempted,
+        completion_seed=completion_seed,
         completion_outcome=completion_outcome,
         reason=reason,
     )
@@ -1791,6 +2112,8 @@ def _accepted_record(
     final_selection: Literal["raw", "completed"],
     completion_attempted: bool,
     completion_outcome: str,
+    completion_seed: int | None = None,
+    crop_padding_ratio: float,
 ) -> SubjectAttributeRecord:
     relative_path = _save_attribute_crop(
         output_root,
@@ -1802,6 +2125,59 @@ def _accepted_record(
         owner_reference.source_clip_uid in {None, sample_id}
         and candidate.owner_candidate.source_frame_index
         == owner_reference.source_frame_index
+    )
+    raw_crop = candidate.raw_crop if candidate.raw_crop is not None else candidate.crop
+    alpha_path = relative_path
+    if final_selection == "completed":
+        alpha_path = _save_attribute_variant(
+            output_root,
+            sample_id=sample_id,
+            attribute_id=candidate.attribute_id,
+            variant="alpha",
+            image=raw_crop.convert("RGBA"),
+        )
+    bbox_path = _save_attribute_variant(
+        output_root,
+        sample_id=sample_id,
+        attribute_id=candidate.attribute_id,
+        variant="bbox",
+        image=_attribute_bbox_crop(
+            candidate.source_image,
+            candidate.attribute_mask,
+            crop_padding_ratio=crop_padding_ratio,
+        ),
+    )
+    variants = ReferenceVariantsState(
+        alpha=ReferenceVariantState(
+            image_path=alpha_path,
+            status="accepted" if review.accepted else "rejected",
+            reviewed=True,
+            review_status="accepted" if review.accepted else "rejected",
+            reason=review.reason,
+            synthetic=False,
+            source_frame_index=candidate.owner_candidate.source_frame_index,
+        ),
+        bbox=ReferenceVariantState(
+            image_path=bbox_path,
+            status="available",
+            reviewed=False,
+            review_status="not_reviewed",
+            reason="source_attribute_bbox_materialized",
+            synthetic=False,
+            source_frame_index=candidate.owner_candidate.source_frame_index,
+        ),
+        generated_background=ReferenceVariantState(
+            image_path=None,
+            status="unavailable",
+            reviewed=False,
+            review_status="not_generated",
+            reason="attribute_background_not_attempted",
+            synthetic=True,
+            source_frame_index=candidate.owner_candidate.source_frame_index,
+        ),
+    )
+    default_variant: ReferenceDefaultVariant = (
+        "alpha" if final_selection == "raw" else "accepted_base"
     )
     return SubjectAttributeRecord(
         attribute_id=candidate.attribute_id,
@@ -1823,9 +2199,226 @@ def _accepted_record(
         selected_gme_attempt_index=candidate.selected_gme_attempt_index,
         final_selection=final_selection,
         completion_attempted=completion_attempted,
+        completion_seed=completion_seed,
         completion_outcome=completion_outcome,
+        variants=variants,
+        default_variant=default_variant,
+        default_image_path=relative_path,
+        default_reason=(
+            "raw_attribute_review_accepted"
+            if final_selection == "raw"
+            else "attribute_completion_review_accepted"
+        ),
+        accepted_base_image_path=relative_path,
         reason="accepted",
     )
+
+
+def _with_attribute_variants(
+    record: SubjectAttributeRecord,
+    candidate: PendingAttributeCandidate,
+    *,
+    output_root: Path,
+    sample_id: str,
+    backend: AttributeCompletionBackend | None,
+    judge: AttributeVariantJudge | None,
+    metrics: _AttributeVariantMetrics,
+) -> SubjectAttributeRecord:
+    if record.status != "accepted" or record.variants is None:
+        return record
+    metrics.bbox_variants_materialized += 1
+    variants = record.variants
+    base_path = (output_root / (record.accepted_base_image_path or "")).resolve(
+        strict=False
+    )
+    base_path.relative_to(output_root.resolve(strict=False))
+    with Image.open(base_path) as opened:
+        opened.load()
+        accepted_base = opened.copy()
+    generated_path = (
+        output_root
+        / "variants"
+        / sample_id
+        / record.attribute_id
+        / "generated_background.png"
+    )
+    metadata_path = generated_path.with_suffix(".json")
+    background_method = getattr(backend, "attribute_background", None)
+    background_review: SubjectAttributeBackgroundReview | None = None
+    background_error: str | None = None
+    generation_seed: int | None = None
+    if callable(background_method) and judge is not None:
+        metrics.background_variants_attempted += 1
+        generation_seed = new_boogu_seed()
+        try:
+            generated_path.parent.mkdir(parents=True, exist_ok=True)
+            generation = background_method(
+                source_path=base_path,
+                output_path=generated_path,
+                instruction=ATTRIBUTE_BACKGROUND_PROMPT,
+                seed=generation_seed,
+            )
+            with Image.open(generated_path) as opened:
+                opened.load()
+                generated = opened.convert("RGB")
+            background_review = judge.review_attribute_background(
+                accepted_base=accepted_base,
+                generated_candidate=generated,
+                attribute_type=record.attribute_type,
+                attribute_phrase=record.phrase,
+            )
+            write_json_atomic(
+                metadata_path,
+                {
+                    "schema_version": 1,
+                    "operation": "attribute_add_background",
+                    "sample_id": sample_id,
+                    "attribute_id": record.attribute_id,
+                    "owner_entity_id": record.owner_entity_id,
+                    "attribute_type": record.attribute_type,
+                    "source_path": record.accepted_base_image_path,
+                    "source_sha256": hashlib.sha256(base_path.read_bytes()).hexdigest(),
+                    "candidate_path": generated_path.relative_to(output_root).as_posix(),
+                    "candidate_sha256": hashlib.sha256(
+                        generated_path.read_bytes()
+                    ).hexdigest(),
+                    "instruction": ATTRIBUTE_BACKGROUND_PROMPT,
+                    "instruction_rewrite_enabled": False,
+                    "thinking_enabled": False,
+                    "seed": generation_seed,
+                    "generation": generation,
+                    "review": background_review.model_dump(mode="json"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - default remains accepted base
+            background_error = f"{type(exc).__name__}:{exc}"
+    else:
+        background_error = "attribute_background_backend_or_judge_unavailable"
+
+    if background_review is not None and background_review.verdict == "accept":
+        metrics.background_variants_accepted += 1
+        metrics.bbox_reviews_skipped_background_accepted += 1
+        updated_variants = variants.model_copy(
+            update={
+                "bbox": variants.bbox.model_copy(
+                    update={
+                        "status": "review_skipped",
+                        "review_status": "skipped_due_to_background_accept",
+                        "reason": "background_variant_accepted_before_bbox_review",
+                    }
+                ),
+                "generated_background": ReferenceVariantState(
+                    image_path=generated_path.relative_to(output_root).as_posix(),
+                    status="accepted",
+                    reviewed=True,
+                    review_status="accepted",
+                    reason=background_review.reason,
+                    synthetic=True,
+                    metadata_path=metadata_path.relative_to(output_root).as_posix(),
+                    source_frame_index=record.source_frame_index,
+                ),
+            }
+        )
+        return SubjectAttributeRecord.model_validate(
+            record.model_copy(
+                update={
+                    "image_path": generated_path.relative_to(output_root).as_posix(),
+                    "variants": updated_variants,
+                    "default_variant": "generated_background",
+                    "default_image_path": generated_path.relative_to(
+                        output_root
+                    ).as_posix(),
+                    "default_reason": "attribute_background_review_accepted",
+                }
+            ).model_dump(mode="json")
+        )
+
+    generated_variant = ReferenceVariantState(
+        image_path=(
+            generated_path.relative_to(output_root).as_posix()
+            if generated_path.is_file()
+            else None
+        ),
+        status="rejected" if generated_path.is_file() else "generation_failed",
+        reviewed=background_review is not None,
+        review_status=(
+            background_review.verdict
+            if background_review is not None
+            else "generation_failed"
+        ),
+        reason=(
+            background_review.reason
+            if background_review is not None
+            else background_error or "attribute_background_failed"
+        ),
+        synthetic=True,
+        metadata_path=(
+            metadata_path.relative_to(output_root).as_posix()
+            if metadata_path.is_file()
+            else None
+        ),
+        source_frame_index=record.source_frame_index,
+    )
+    bbox_variant = variants.bbox
+    default_variant = record.default_variant
+    default_image_path = record.default_image_path
+    default_reason = record.default_reason
+    if judge is not None and bbox_variant.image_path is not None:
+        metrics.bbox_reviews_attempted += 1
+        bbox_path = (output_root / bbox_variant.image_path).resolve(strict=False)
+        bbox_path.relative_to(output_root.resolve(strict=False))
+        with Image.open(bbox_path) as opened:
+            opened.load()
+            bbox_image = opened.convert("RGB")
+        owner_context = build_candidate_context_image(
+            candidate.source_image,
+            candidate.owner_candidate.mask,
+        )
+        try:
+            bbox_review = judge.review_attribute_bbox(
+                bbox_candidate=bbox_image,
+                owner_context=owner_context,
+                attribute_type=record.attribute_type,
+                attribute_phrase=record.phrase,
+            )
+        except Exception as exc:  # noqa: BLE001 - accepted base remains valid
+            bbox_variant = bbox_variant.model_copy(
+                update={
+                    "status": "rejected",
+                    "reviewed": True,
+                    "review_status": "judge_failed",
+                    "reason": f"{type(exc).__name__}:{exc}",
+                }
+            )
+        else:
+            bbox_accepted = bbox_review.verdict == "accept"
+            bbox_variant = bbox_variant.model_copy(
+                update={
+                    "status": "accepted" if bbox_accepted else "rejected",
+                    "reviewed": True,
+                    "review_status": bbox_review.verdict,
+                    "reason": bbox_review.reason,
+                }
+            )
+            if bbox_accepted:
+                default_variant = "bbox"
+                default_image_path = bbox_variant.image_path
+                default_reason = "attribute_bbox_review_accepted"
+    updated = record.model_copy(
+        update={
+            "image_path": default_image_path,
+            "variants": variants.model_copy(
+                update={
+                    "bbox": bbox_variant,
+                    "generated_background": generated_variant,
+                }
+            ),
+            "default_variant": default_variant,
+            "default_image_path": default_image_path,
+            "default_reason": default_reason,
+        }
+    )
+    return SubjectAttributeRecord.model_validate(updated.model_dump(mode="json"))
 
 
 def _masked_crop_quality_rejection(
@@ -1867,6 +2460,16 @@ def _save_completion_input(path: Path, crop: Image.Image) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def attribute_completion_prompt(attribute_type: AttributeType) -> str:
+    try:
+        entity_name = _ATTRIBUTE_COMPLETION_ENTITY_NAME[attribute_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"attribute type is not eligible for completion: {attribute_type}"
+        ) from exc
+    return f"补全成完整的{entity_name}，去除掉破碎的部分，不添加其他内容"
+
+
 def _attempt_attribute_completion(
     candidate: PendingAttributeCandidate,
     *,
@@ -1882,6 +2485,7 @@ def _attempt_attribute_completion(
     str,
     bool,
     SubjectAttributeCompletionReview | None,
+    int | None,
 ]:
     metrics.attempts += 1
     metrics.attempts_by_type[candidate.discovered.attribute_type] += 1
@@ -1900,14 +2504,19 @@ def _attempt_attribute_completion(
     source_path = candidate_root / "raw" / "source.png"
     output_path = candidate_root / "generated" / "candidate.png"
     _save_completion_input(source_path, candidate.crop)
+    completion_seed: int | None = None
     started = time.perf_counter()
     failure_stage = "backend"
     try:
+        instruction = attribute_completion_prompt(
+            candidate.discovered.attribute_type
+        )
+        completion_seed = new_boogu_seed()
         completion = completion_backend.attribute_completion(
             source_path=source_path,
             output_path=output_path,
-            instruction=ATTRIBUTE_COMPLETION_PROMPT,
-            seed=int(getattr(completion_config, "seed")),
+            instruction=instruction,
+            seed=completion_seed,
         )
         elapsed = time.perf_counter() - started
         reported_seconds = completion.get("model_call_time_seconds", elapsed)
@@ -1936,12 +2545,24 @@ def _attempt_attribute_completion(
         ):
             metrics.qwen_review_rejects += 1
             metrics.identity_review_rejects += 1
-            return None, "completion_qwen_review_reject", False, review
+            return (
+                None,
+                "completion_qwen_review_reject",
+                False,
+                review,
+                completion_seed,
+            )
     except Exception as exc:  # noqa: BLE001 - route to raw fallback or rejection
         metrics.failures += 1
         if failure_stage == "backend":
             metrics.backend_failures += 1
-        return None, f"completion_failed:{type(exc).__name__}:{exc}", True, None
+        return (
+            None,
+            f"completion_failed:{type(exc).__name__}:{exc}",
+            True,
+            None,
+            completion_seed,
+        )
     return (
         PendingAttributeCandidate(
             discovered=candidate.discovered,
@@ -1957,10 +2578,16 @@ def _attempt_attribute_completion(
             completion_attempted=True,
             completion_model_call_time_seconds=max(0.0, float(reported_seconds)),
             completion_review_time_seconds=review_seconds,
+            raw_crop=(
+                candidate.raw_crop
+                if candidate.raw_crop is not None
+                else candidate.crop
+            ),
         ),
         "completion_identity_accepted",
         False,
         review,
+        completion_seed,
     )
 
 
@@ -2173,6 +2800,7 @@ def _select_attribute_candidate(
                 geometry=geometry,
                 gme_attempts=tuple(gme_attempts),
                 selected_gme_attempt_index=selected_gme_attempt_index,
+                raw_crop=crop,
             )
             return pending
         if gme_rejected_on_frame and owner_candidate_index + 1 < len(ordered):
@@ -2258,11 +2886,57 @@ def _save_attribute_crop(
     return destination.relative_to(output_root).as_posix()
 
 
+def _save_attribute_variant(
+    output_root: Path,
+    *,
+    sample_id: str,
+    attribute_id: str,
+    variant: Literal["alpha", "bbox", "generated_background"],
+    image: Image.Image,
+) -> str:
+    destination = (
+        output_root
+        / "variants"
+        / sample_id
+        / attribute_id
+        / f"{variant}.png"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        image.save(temporary, format="PNG")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination.relative_to(output_root).as_posix()
+
+
+def _attribute_bbox_crop(
+    source_image: Image.Image,
+    attribute_mask: np.ndarray,
+    *,
+    crop_padding_ratio: float,
+) -> Image.Image:
+    mask = np.asarray(attribute_mask, dtype=bool)
+    if mask.ndim != 2 or not mask.any():
+        raise ValueError("attribute bbox requires a non-empty 2D mask")
+    x1, y1, x2, y2 = _bbox(mask)
+    padding = math.ceil(max(x2 - x1, y2 - y1) * crop_padding_ratio)
+    bbox = (
+        max(0, x1 - padding),
+        max(0, y1 - padding),
+        min(source_image.width, x2 + padding),
+        min(source_image.height, y2 + padding),
+    )
+    return source_image.convert("RGB").crop(bbox)
+
+
 def _validate_attribute_png(
     output_root: Path,
     relative_path: str,
     *,
     final_selection: Literal["raw", "completed"] = "raw",
+    expected_mode: Literal["RGB", "RGBA"] | None = None,
 ) -> None:
     path = (output_root / relative_path).resolve(strict=False)
     path.relative_to(output_root.resolve(strict=False))
@@ -2270,9 +2944,14 @@ def _validate_attribute_png(
         opened.load()
         if opened.format != "PNG":
             raise ValueError("accepted attribute artifact must be PNG")
-        if final_selection == "completed":
+        mode = expected_mode or (
+            "RGB" if final_selection == "completed" else "RGBA"
+        )
+        if mode == "RGB":
             if opened.mode != "RGB":
-                raise ValueError("completed attribute artifact must be RGB PNG")
+                if expected_mode is None and final_selection == "completed":
+                    raise ValueError("completed attribute artifact must be RGB PNG")
+                raise ValueError("selected attribute artifact must be RGB PNG")
             return
         if opened.mode != "RGBA":
             raise ValueError("raw attribute artifact must be RGBA PNG")
@@ -2319,7 +2998,41 @@ def _load_cached_owner_artifact(
                         if record.final_selection == "completed"
                         else "raw"
                     ),
+                    expected_mode=(
+                        "RGB"
+                        if record.default_variant
+                        in {"bbox", "generated_background"}
+                        else None
+                    ),
                 )
+                if record.variants is not None:
+                    for variant_name, variant in (
+                        ("alpha", record.variants.alpha),
+                        ("bbox", record.variants.bbox),
+                        (
+                            "generated_background",
+                            record.variants.generated_background,
+                        ),
+                    ):
+                        if variant.image_path is None:
+                            continue
+                        _validate_attribute_png(
+                            output_root,
+                            variant.image_path,
+                            expected_mode=(
+                                "RGBA" if variant_name == "alpha" else "RGB"
+                            ),
+                        )
+                    assert record.accepted_base_image_path is not None
+                    _validate_attribute_png(
+                        output_root,
+                        record.accepted_base_image_path,
+                        final_selection=(
+                            "completed"
+                            if record.final_selection == "completed"
+                            else "raw"
+                        ),
+                    )
         return artifact
     except (OSError, ValueError):
         return None
@@ -2511,6 +3224,7 @@ def _process_owner(
     review_failures = 0
     review_failure: str | None = None
     raw_reviews: dict[str, SubjectAttributeReview] = {}
+    accepted_candidate_by_id: dict[str, PendingAttributeCandidate] = {}
     if pending:
         review_calls = 1
         review_started = time.perf_counter()
@@ -2589,6 +3303,7 @@ def _process_owner(
             continue
         if not completion_eligible or not repair_recommended:
             if review.accepted:
+                accepted_candidate_by_id[candidate.attribute_id] = candidate
                 records_by_id[candidate.attribute_id] = _accepted_record(
                     candidate,
                     output_root=output_root,
@@ -2598,6 +3313,7 @@ def _process_owner(
                     final_selection="raw",
                     completion_attempted=False,
                     completion_outcome="not_attempted",
+                    crop_padding_ratio=config.pair.crop_padding_ratio,
                 )
             else:
                 records_by_id[candidate.attribute_id] = _rejected_record(
@@ -2621,6 +3337,7 @@ def _process_owner(
         if completion_backend is None or completion_judge is None:
             completed = None
             completion_review = None
+            completion_seed = None
             completion_reason = "completion_failed:backend_not_configured"
             completion_metrics.attempts += 1
             completion_metrics.attempts_by_type[
@@ -2638,6 +3355,7 @@ def _process_owner(
                 completion_reason,
                 _,
                 completion_review,
+                completion_seed,
             ) = _attempt_attribute_completion(
                 candidate,
                 clip_uid=clip.clip_uid,
@@ -2655,6 +3373,7 @@ def _process_owner(
             completion_metrics.accepted_by_type[
                 candidate.discovered.attribute_type
             ] += 1
+            accepted_candidate_by_id[candidate.attribute_id] = completed
             records_by_id[candidate.attribute_id] = _accepted_record(
                 completed,
                 output_root=output_root,
@@ -2664,11 +3383,14 @@ def _process_owner(
                 completion_review=completion_review,
                 final_selection="completed",
                 completion_attempted=True,
+                completion_seed=completion_seed,
                 completion_outcome="selected_completed",
+                crop_padding_ratio=config.pair.crop_padding_ratio,
             )
             continue
         if review.accepted:
             completion_metrics.fallback_to_raw += 1
+            accepted_candidate_by_id[candidate.attribute_id] = candidate
             records_by_id[candidate.attribute_id] = _accepted_record(
                 candidate,
                 output_root=output_root,
@@ -2678,7 +3400,9 @@ def _process_owner(
                 completion_review=completion_review,
                 final_selection="raw",
                 completion_attempted=True,
+                completion_seed=completion_seed,
                 completion_outcome=completion_reason,
+                crop_padding_ratio=config.pair.crop_padding_ratio,
             )
         else:
             completion_metrics.rejected += 1
@@ -2697,8 +3421,27 @@ def _process_owner(
                 gme_attempts=candidate.gme_attempts,
                 selected_gme_attempt_index=candidate.selected_gme_attempt_index,
                 completion_attempted=True,
+                completion_seed=completion_seed,
                 completion_outcome=completion_reason,
             )
+
+    variant_metrics = _AttributeVariantMetrics()
+    variant_judge = (
+        review_client
+        if callable(getattr(review_client, "review_attribute_background", None))
+        and callable(getattr(review_client, "review_attribute_bbox", None))
+        else None
+    )
+    for attribute_id, candidate in accepted_candidate_by_id.items():
+        records_by_id[attribute_id] = _with_attribute_variants(
+            records_by_id[attribute_id],
+            candidate,
+            output_root=output_root,
+            sample_id=clip.clip_uid,
+            backend=completion_backend,
+            judge=variant_judge,
+            metrics=variant_metrics,
+        )
 
     ordered_records = [
         records_by_id[f"a{attribute_id_start + offset}"]
@@ -2826,6 +3569,19 @@ def _process_owner(
             completion_accepted_by_type=dict(
                 sorted(completion_metrics.accepted_by_type.items())
             ),
+            attribute_bbox_variants_materialized=(
+                variant_metrics.bbox_variants_materialized
+            ),
+            attribute_bbox_reviews_attempted=variant_metrics.bbox_reviews_attempted,
+            attribute_bbox_reviews_skipped_background_accepted=(
+                variant_metrics.bbox_reviews_skipped_background_accepted
+            ),
+            attribute_background_variants_attempted=(
+                variant_metrics.background_variants_attempted
+            ),
+            attribute_background_variants_accepted=(
+                variant_metrics.background_variants_accepted
+            ),
             failures=failures,
         ),
         gme_screen_mode=gme_screen_mode,
@@ -2908,6 +3664,7 @@ def _render_enriched_instruction(
                     origin="attribute_enrichment",
                     attribute_id=attribute.attribute_id,
                     owner_entity_id=entity_id,
+                    attribute_type=attribute.attribute_type,
                     image_path=attribute.image_path,
                     source_frame_index=attribute.source_frame_index,
                 )
@@ -3492,6 +4249,19 @@ def reconcile_subject_attribute_outputs(
         "completion_accepted_by_type": dict(
             sorted(totals.completion_accepted_by_type.items())
         ),
+        "attribute_bbox_variants_materialized": (
+            totals.attribute_bbox_variants_materialized
+        ),
+        "attribute_bbox_reviews_attempted": totals.attribute_bbox_reviews_attempted,
+        "attribute_bbox_reviews_skipped_background_accepted": (
+            totals.attribute_bbox_reviews_skipped_background_accepted
+        ),
+        "attribute_background_variants_attempted": (
+            totals.attribute_background_variants_attempted
+        ),
+        "attribute_background_variants_accepted": (
+            totals.attribute_background_variants_accepted
+        ),
         "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
         "recognizability_rejects": totals.recognizability_rejects,
         "accepted_attribute_references": totals.accepted_attributes,
@@ -3676,7 +4446,6 @@ def run_subject_attribute_enrichment(
 
 
 __all__ = [
-    "ATTRIBUTE_COMPLETION_PROMPT",
     "AttributeCompletionBackend",
     "AttributeFrameSegmentationBackend",
     "AttributeGmeScreener",
@@ -3695,6 +4464,7 @@ __all__ = [
     "SubjectAttributeRecord",
     "SubjectAttributeReview",
     "SubjectAttributeReviewBatch",
+    "attribute_completion_prompt",
     "evaluate_owner_eligibility",
     "evaluate_ownership_geometry",
     "prefer_attribute_candidate_frames",

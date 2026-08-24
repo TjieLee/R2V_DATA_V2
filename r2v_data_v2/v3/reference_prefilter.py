@@ -106,7 +106,7 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
     if len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("reference prefilter candidate IDs must be unique")
 
-    if entity.reference_type != "subject":
+    if entity.reference_type not in {"subject", "object"}:
         decisions = tuple(
             ReferencePrefilterDecision(
                 candidate_id=candidate.candidate_id,
@@ -116,7 +116,7 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
                 laplacian_ratio=None,
                 tenengrad_ratio=None,
                 relative_blur_v2_applicable=False,
-                relative_blur_v2_inapplicable_reason="subject_only",
+                relative_blur_v2_inapplicable_reason="subject_or_object_only",
             )
             for candidate in original
         )
@@ -157,7 +157,7 @@ def prefilter_entity_reference_candidates[CandidateT: CandidateLike](
         laplacian_ratio = _safe_ratio(laplacian, max_laplacian)
         tenengrad_ratio = _safe_ratio(tenengrad, max_tenengrad)
         flagged_by: list[str] = []
-        if _subject_near_silhouette(metrics):
+        if entity.reference_type == "subject" and _subject_near_silhouette(metrics):
             flagged_by.append(NEAR_SILHOUETTE_RULE)
         if relative_blur_applicable and _subject_relative_blur_v2(
             metrics,

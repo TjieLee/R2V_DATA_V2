@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
 
 def write_json_atomic(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
     try:
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
@@ -16,9 +19,8 @@ def write_json_atomic(path: Path, value: dict[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(path)
-    except Exception:
+    finally:
         temporary.unlink(missing_ok=True)
-        raise
 
 
 def _load_json_objects(paths: Iterable[Path]) -> list[dict[str, object]]:

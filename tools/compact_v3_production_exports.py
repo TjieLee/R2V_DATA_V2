@@ -178,7 +178,12 @@ def _validate_runs_root(path: str | Path) -> Path:
     return resolved
 
 
-def _validate_attribute_png(path: Path, *, final_selection: str | None) -> None:
+def _validate_attribute_png(
+    path: Path,
+    *,
+    final_selection: str | None,
+    default_variant: str | None = None,
+) -> None:
     try:
         with Image.open(path) as image:
             image_format = image.format
@@ -186,7 +191,12 @@ def _validate_attribute_png(path: Path, *, final_selection: str | None) -> None:
             image.verify()
     except Exception as exc:  # noqa: BLE001 - normalize decoder failures
         raise ValueError(f"attribute reference is not a decodable image: {path}") from exc
-    expected_mode = "RGB" if final_selection == "completed" else "RGBA"
+    expected_mode = (
+        "RGB"
+        if default_variant in {"bbox", "generated_background"}
+        or final_selection == "completed"
+        else "RGBA"
+    )
     if image_format != "PNG" or image_mode != expected_mode:
         raise ValueError(
             f"attribute reference must be an {expected_mode} PNG: {path}"
@@ -290,13 +300,18 @@ def _materialize_attribute_reference(
     attribute_id: str,
     attribute_type: str,
     final_selection: str | None,
+    default_variant: str | None = None,
 ) -> str:
     filename = "attribute_{}_{}_{}.png".format(
         _safe_component(owner_entity_id, "owner_entity_id"),
         _safe_component(attribute_id, "attribute_id"),
         _safe_component(attribute_type, "attribute_type"),
     )
-    _validate_attribute_png(source, final_selection=final_selection)
+    _validate_attribute_png(
+        source,
+        final_selection=final_selection,
+        default_variant=default_variant,
+    )
     published = _materialize_reference(
         source=source,
         output_root=output_root,
@@ -307,6 +322,7 @@ def _materialize_attribute_reference(
     _validate_attribute_png(
         output_root / published,
         final_selection=final_selection,
+        default_variant=default_variant,
     )
     return published
 
@@ -442,6 +458,7 @@ def _enriched_production_sample(
                 attribute_id=record.attribute_id,
                 attribute_type=record.attribute_type,
                 final_selection=record.final_selection,
+                default_variant=record.default_variant,
             )
             assert enriched_reference.source_frame_index is not None
             production_references.append(
@@ -454,7 +471,13 @@ def _enriched_production_sample(
                     attribute_type=record.attribute_type,
                     image_path=published_path,
                     source_frame_index=enriched_reference.source_frame_index,
-                    synthetic=record.final_selection == "completed",
+                    synthetic=(
+                        record.default_variant == "generated_background"
+                        or (
+                            record.default_variant in {None, "accepted_base"}
+                            and record.final_selection == "completed"
+                        )
+                    ),
                 )
             )
             continue

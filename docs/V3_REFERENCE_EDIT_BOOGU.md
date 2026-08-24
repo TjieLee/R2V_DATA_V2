@@ -75,6 +75,29 @@ the normal acceptance path. The only SAM failure exception is
 candidate may publish with `sam_warning: target_not_found`. Completion
 `not_found` and every other SAM failure remain hard rejections.
 
+## Subject Attribute Completion Reuse
+
+Subject Attribute completion reuses the same persistent Boogu infrastructure
+and GPU6 capacity, but it is not the normal entity `reference_edit` validation
+path.
+
+Its frozen generic prompt is:
+
+```text
+把图片中破损、缺失或不完整的区域补充完整。
+```
+
+Normal `reference_edit` may use generated-candidate SAM3 masks for review-only
+diagnostics as documented above. Subject Attribute completion does not run
+generated-image SAM3 resegmentation and does not apply the normal
+`reference_edit` SAM diagnostics or geometry gates to the completed image.
+Acceptance is determined by `SubjectAttributeCompletionReview`; an accepted
+candidate publishes the native Boogu RGB output.
+
+Do not apply normal entity-reference SAM diagnostics, completion masks, alpha
+restoration, or geometry gates to Subject Attribute completion unless a future
+explicit design changes this contract.
+
 ## Artifacts
 
 ```text

@@ -786,6 +786,19 @@ def test_replay_constructs_production_judge_and_saves_raw_only_on_request(
     assert "private raw response" in raw_output.read_text(encoding="utf-8")
 
 
+def test_baseline_and_compact_prompts_share_human_frontal_policy() -> None:
+    for prompt in (SYSTEM_PROMPT, COMPACT_SYSTEM_PROMPT):
+        normalized = " ".join(prompt.lower().split())
+        assert "front or near-front face" in normalized
+        assert (
+            "roughly at least 50% of the frontal facial identity region visible"
+            in normalized
+        )
+        assert "side-profile human" in normalized
+        assert "rear human" in normalized
+        assert "head or face is completely hidden" in normalized
+
+
 def test_replay_paired_card_mode_uses_three_images_and_stays_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

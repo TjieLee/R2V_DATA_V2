@@ -49,6 +49,72 @@ class BackgroundCandidate:
     union_mask: np.ndarray
     area_pixels: int
     area_ratio: float
+    sharpness_score: float
+
+
+def background_sharpness_score(
+    image: Image.Image,
+    evaluation_mask: np.ndarray | None = None,
+) -> float:
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float64)
+    gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    padded = np.pad(gray, 1, mode="edge")
+    laplacian = (
+        padded[:-2, 1:-1]
+        + padded[2:, 1:-1]
+        + padded[1:-1, :-2]
+        + padded[1:-1, 2:]
+        - 4.0 * padded[1:-1, 1:-1]
+    )
+    values = laplacian
+    if evaluation_mask is not None:
+        if (
+            evaluation_mask.ndim != 2
+            or evaluation_mask.shape != laplacian.shape
+            or evaluation_mask.dtype != np.bool_
+        ):
+            raise ValueError(
+                "background sharpness mask must be a matching boolean mask"
+            )
+        values = laplacian[evaluation_mask]
+    if values.size <= 1:
+        raise ValueError("background sharpness region is too small")
+    score = float(np.var(values))
+    if not math.isfinite(score) or score < 0:
+        raise ValueError("background sharpness score must be finite and non-negative")
+    return score
+
+
+def _dilate_foreground_mask(mask: np.ndarray, *, dilation_pixels: int) -> np.ndarray:
+    if mask.ndim != 2 or mask.dtype != np.bool_ or mask.size == 0:
+        raise ValueError("foreground mask must be a non-empty boolean array")
+    if (
+        not isinstance(dilation_pixels, int)
+        or isinstance(dilation_pixels, bool)
+        or dilation_pixels < 0
+    ):
+        raise ValueError("dilation_pixels must be a non-negative integer")
+    if dilation_pixels == 0:
+        return mask.copy()
+    radius = dilation_pixels
+    padded = np.pad(
+        mask.astype(np.uint8),
+        ((radius, radius), (radius, radius)),
+        mode="constant",
+        constant_values=0,
+    )
+    integral = np.pad(padded, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
+    diameter = 2 * radius + 1
+    window_sums = (
+        integral[diameter:, diameter:]
+        - integral[:-diameter, diameter:]
+        - integral[diameter:, :-diameter]
+        + integral[:-diameter, :-diameter]
+    )
+    result = window_sums > 0
+    if result.shape != mask.shape or not np.all(result[mask]):
+        raise RuntimeError("background foreground dilation violated its contract")
+    return result
 
 
 def validate_background_inputs(
@@ -146,6 +212,10 @@ def build_union_foreground_mask(
 def select_background_source_frame(
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
+    *,
+    storage: RunStorage,
+    max_foreground_area_ratio: float,
+    exclusion_dilation_pixels: int,
 ) -> BackgroundCandidate | None:
     candidates: list[BackgroundCandidate] = []
     total_pixels = frames.height * frames.width
@@ -154,12 +224,35 @@ def select_background_source_frame(
         if union_mask is None:
             continue
         area_pixels = int(np.count_nonzero(union_mask))
+        area_ratio = area_pixels / total_pixels
+        if area_pixels == 0 or area_ratio > max_foreground_area_ratio:
+            continue
+        usable_background_mask = ~_dilate_foreground_mask(
+            union_mask,
+            dilation_pixels=exclusion_dilation_pixels,
+        )
+        if int(np.count_nonzero(usable_background_mask)) <= 1:
+            continue
+        image_path = (storage.clip_dir(frames.clip_uid) / frame.image_path).resolve(
+            strict=False
+        )
+        try:
+            image_path.relative_to(storage.clip_dir(frames.clip_uid).resolve())
+        except ValueError as exc:
+            raise ValueError("background source frame must remain inside clip") from exc
+        with Image.open(image_path) as opened:
+            opened.load()
+            sharpness_score = background_sharpness_score(
+                opened,
+                usable_background_mask,
+            )
         candidates.append(
             BackgroundCandidate(
                 frame=frame,
                 union_mask=union_mask,
                 area_pixels=area_pixels,
-                area_ratio=area_pixels / total_pixels,
+                area_ratio=area_ratio,
+                sharpness_score=sharpness_score,
             )
         )
     if not candidates:
@@ -167,7 +260,8 @@ def select_background_source_frame(
     return min(
         candidates,
         key=lambda candidate: (
-            candidate.area_pixels,
+            -candidate.sharpness_score,
+            candidate.area_ratio,
             _PRIORITY_INDEX[candidate.frame.slot],
         ),
     )
@@ -187,11 +281,7 @@ def build_background_reference_state(
         "source_foreground_area_ratio": candidate.area_ratio,
     }
     if candidate.area_pixels == 0:
-        return BackgroundReferenceState(
-            status="clean_raw",
-            output_image_path=candidate.frame.image_path,
-            **common,
-        )
+        raise ValueError("fresh background candidates require tracked foreground")
     if source_mask_path is None:
         raise ValueError("non-empty background candidates require a source mask")
     if candidate.area_ratio <= max_pending_remove_area_ratio:
@@ -583,24 +673,21 @@ def build_background_candidates(
                         state,
                     )
                 else:
-                    candidate = select_background_source_frame(frames, masks)
+                    candidate = select_background_source_frame(
+                        frames,
+                        masks,
+                        storage=storage,
+                        max_foreground_area_ratio=(
+                            config.background.max_pending_remove_area_ratio
+                        ),
+                        exclusion_dilation_pixels=(
+                            config.remove.generation_mask_dilation_pixels
+                        ),
+                    )
                     if candidate is None:
                         state = BackgroundReferenceState(
                             status="rejected",
                             reason="no_valid_background_source_frame",
-                        )
-                        _publish_state(
-                            storage,
-                            clip.clip_uid,
-                            list(clip.references.entities),
-                            state,
-                        )
-                    elif candidate.area_pixels == 0:
-                        state = build_background_reference_state(
-                            candidate=candidate,
-                            max_pending_remove_area_ratio=(
-                                config.background.max_pending_remove_area_ratio
-                            ),
                         )
                         _publish_state(
                             storage,

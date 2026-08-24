@@ -35,6 +35,7 @@ from pydantic import (
 )
 
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.config import QwenServiceConfig
 from r2v_data_v2.v3.profiling import (
     get_model_profile_context,
@@ -341,7 +342,12 @@ Accept only if Image 2 contains exactly the same single target entity, preserves
 its identity, appearance, scale, and layout, introduces no duplicate or salient
 entity, and does not extend or complete the target unexpectedly. Reject if the
 subject becomes smaller, moves toward a corner, or leaves large meaningless
-empty space. The background must be coherent, improve the reference's
+empty space. Set no_halo_or_seam=false for a newly generated wide softened rim,
+ghost rim, drop-shadow-like halo, blurred human or object outline, soft boundary
+that visibly disagrees with the source target, or obvious blending shadow or
+ghosting between the target and new background. Compare the source target with
+the generated candidate; do not reject natural scene depth of field by itself.
+The background must be coherent, improve the reference's
 naturalness, clarity, or usefulness, and make Image 2 clearly preferable to
 Image 1. A technically clean but implausible or unhelpful background must be
 rejected. Judge visible facts only and return one strict JSON object matching
@@ -1417,6 +1423,7 @@ def run_boogu_reference_edit(
     thinking_enabled = operation == "complete_entity"
 
     output: BooguEditOutput | None = None
+    generation_seed: int | None = None
     output_sha256: str | None = None
     qwen_review: BooguQwenReview | None = None
     qwen_review_skipped_reason: str | None = None
@@ -1428,6 +1435,7 @@ def run_boogu_reference_edit(
         if source_gate_reason is not None:
             rejection_reason = "tiny_source_entity"
             raise _TinySourceRejected
+        generation_seed = new_boogu_seed()
         with profile_model_call(
             component=(
                 "boogu_complete_entity"
@@ -1444,6 +1452,7 @@ def run_boogu_reference_edit(
                 "height": height,
                 "thinking_enabled": thinking_enabled,
                 "instruction_rewrite_enabled": instruction_rewrite_enabled,
+                "generation_seed": generation_seed,
             },
         ):
             output = backend.edit(
@@ -1453,6 +1462,7 @@ def run_boogu_reference_edit(
                 height=height,
                 thinking_enabled=thinking_enabled,
                 instruction_rewrite_enabled=instruction_rewrite_enabled,
+                seed=generation_seed,
             )
         if output.original_instruction != instruction:
             raise RuntimeError("backend changed original instruction metadata")
@@ -1586,6 +1596,7 @@ def run_boogu_reference_edit(
         ),
         "thinking_enabled": thinking_enabled,
         "instruction_rewrite_enabled": instruction_rewrite_enabled,
+        "generation_seed": generation_seed,
         "output_sha256": output_sha256,
         "canonical_source_sha256": canonical_sha256,
         "source_image_path": source_evidence_path.relative_to(root).as_posix(),

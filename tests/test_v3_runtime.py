@@ -1638,6 +1638,53 @@ def test_attribute_completion_disables_thinking_and_instruction_rewrite(
     assert result["instruction_rewrite_enabled"] is False
 
 
+def test_attribute_background_reuses_boogu_without_thinking_or_rewrite(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "subject_attributes"
+    source_path = sidecar / "references" / "clip" / "a1.png"
+    output_path = sidecar / "variants" / "clip" / "a1" / "background.png"
+    source_path.parent.mkdir(parents=True)
+    Image.new("RGBA", (64, 48), (80, 90, 100, 255)).save(source_path)
+    observed: dict[str, object] = {}
+
+    class Backend:
+        def edit(self, **kwargs):
+            observed.update(kwargs)
+            buffer = io.BytesIO()
+            Image.new("RGB", (kwargs["width"], kwargs["height"]), "gray").save(
+                buffer,
+                format="PNG",
+            )
+            return SimpleNamespace(png_bytes=buffer.getvalue())
+
+    runtime = object.__new__(_StageRuntime)
+    runtime.stage = "reference_edit"
+    runtime.storage = SimpleNamespace(root=tmp_path)
+    runtime._reference_edit_backend = Backend()
+    runtime.config = SimpleNamespace(
+        reference_edit=SimpleNamespace(
+            target_area=1024 * 1024,
+            alignment=16,
+            model_path=Path("/model/boogu"),
+        )
+    )
+
+    result = runtime.attribute_background(
+        source_path=source_path,
+        output_path=output_path,
+        instruction="add a simple supporting background",
+        seed=23,
+    )
+
+    assert output_path.is_file()
+    assert observed["thinking_enabled"] is False
+    assert observed["instruction_rewrite_enabled"] is False
+    assert observed["seed"] == 23
+    assert result["thinking_enabled"] is False
+    assert result["instruction_rewrite_enabled"] is False
+
+
 def test_segment_pool_returns_worker_after_attribute_probe_exception() -> None:
     class Worker:
         config = SimpleNamespace(cuda_visible_devices="5")

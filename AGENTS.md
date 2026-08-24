@@ -2,6 +2,16 @@
 
 This file is the repository-level handoff and operating contract for Codex, ChatGPT, and other coding agents. Read it before inspecting, editing, testing, or proposing server commands.
 
+> **Branch-specific V3 override — `feature/v3-subject-attributes-v1`:** The
+> current Visual/Subject Attribute code freeze is
+> `51fef9d44bb1372b4afad5fed9795d5c3d46bda7`. Read
+> `docs/V3_SUBJECT_ATTRIBUTES_STATE.md` and
+> `docs/VISUAL_ATTRIBUTE_DEVELOPMENT_HANDOFF.md` before changing V3
+> references. The older V2/main flow below is legacy context and does not
+> override current V3 state documents. Annotation production remains frozen;
+> Audio/H3 is a separate branch. Do not infer current V3 removal or completion
+> behavior from the old V2 FLUX or Qwen Image Edit text in this file.
+
 ## 1. Repository identity
 
 - Current repository: `TjieLee/R2V_DATA_V2`

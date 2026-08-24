@@ -49,8 +49,13 @@ exact proposed reference content.
 Classify viewpoint as front, three_quarter, side, rear, or not_applicable.
 Subjects must use a directional viewpoint; objects and groups must use
 not_applicable. Back visibility is not identity visibility, and clothing alone
-is not identity evidence. Reject rear-only subjects. A side-view subject is
-usable only when the face or other explicit identity features remain visible.
+is not identity evidence. Reject rear-only subjects. A human subject must show
+a front or near-front face with roughly at least 50% of the frontal facial
+identity region visible. A three-quarter human view is usable only when it
+still meets that near-front standard. Reject a strong three-quarter or
+near-side human view below that standard, a side-profile human, a rear human,
+or a human whose head or face is completely hidden. Do not invent a numeric
+ratio; make this a semantic judgment from visible evidence.
 
 independent_reference_value means the isolated visual content is independently
 useful as a generation condition. Reject wall patches, scenery fragments,
@@ -159,7 +164,7 @@ blacklist.
 Hard rejection rules
 Reject poor image quality; an invisible primary identity region; severe
 fragmentation, wrong content, or a mask that does not match the target; a
-rear-only subject; a side subject without visible identity; content with no
+rear-only subject; content with no
 independent reference value; any candidate requiring substantial invention; a
 major truncation; completeness severely_incomplete or fragmented; or content
 that is not a discrete foreground instance. A back, clothing, or torso
@@ -190,10 +195,16 @@ only minor truncation, while major truncation rejects.
 
 Subject and viewpoint rules
 Subjects use front, three_quarter, side, or rear. Objects and groups use
-not_applicable. Reject a rear subject. A side subject is usable only when the
-face or another explicit identity feature is visible. For objects and groups,
-primary_identity_region_visible means the main recognizable region is present.
-major_structure_visible means most coherent structure remains.
+not_applicable. Reject a rear subject. A human subject must show a front or
+near-front face with roughly at least 50% of the frontal facial identity region
+visible. A
+three-quarter human view is usable only when it still meets that near-front
+standard. Reject a strong three-quarter or near-side human view below that
+standard, a side-profile human, a rear human, or a human whose head or face is
+completely hidden. Do not invent a numeric ratio; judge visible evidence
+semantically. For objects and groups, primary_identity_region_visible means the
+main recognizable region is present. major_structure_visible means most
+coherent structure remains.
 
 Detached fragments
 Detached fragments are non-trivial same-target pieces separated from the main

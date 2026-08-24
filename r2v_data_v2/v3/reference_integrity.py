@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import math
 import re
 from collections import deque
@@ -85,21 +86,19 @@ white clothing or objects, white backgrounds, highlights, teeth, sclera, and
 paper are not artifacts merely because they are white. Judge unnatural
 source-to-reference alteration, not raw white-pixel presence.
 For a subject, require enough stable identity-bearing appearance for the stated
-scope, but do not require a visible face in every valid back view, masked person,
-character, or animal. For a human subject, when the highlighted source context
-visibly contains the person's head or head region, the final reference must
-preserve a recognizable head region together with stable person appearance. A
-visible face is not required. Accept a person viewed from behind with the head
-present, a helmeted or masked person with the head present, and a side-profile
-person with the head and upper body present. Reject a chef reference containing
-only coat and arms when the source shows the head, a person reference cropped
-completely below the neck, or a clothing-only fragment labeled as a subject.
-Set preserves_primary_identity_region to false for these human head-region
+scope. A human subject must preserve a front or near-front face with roughly at
+least 50% of the frontal facial identity region visible. A three-quarter human
+view may pass only when it still meets that near-front standard. Reject a strong
+three-quarter or near-side human view below that standard, a side-profile human,
+a rear human, or a human whose head or face is completely hidden. Do not invent
+a numeric ratio; make this a semantic judgment from visible evidence. Set
+preserves_primary_identity_region to false for these human frontal-identity
 failures. For a non-human subject or object, evaluate that field using its
-existing identity-bearing region without imposing human anatomy.
+existing identity-bearing region without imposing human anatomy or a human-face
+requirement.
 Reject a torso, arms, legs, or clothing fragment when the source contains
 substantially more useful identity evidence and the final image loses it. Apply
-this human head-region rule only to human subjects; do not introduce a face
+this human frontal-identity rule only to human subjects; do not introduce a face
 requirement or new rejection behavior for non-human subjects or objects. For an
 object, require its recognizable structural core. Reject major missing surfaces,
 large unnatural holes, disconnected remnants, identity-changing completion
@@ -140,6 +139,7 @@ Do not emit trailing whitespace, markdown, or explanation."""
 SourceBboxFallbackTrigger = Literal[
     "artifact_review_reject",
     "topology_alpha_hole_upgrade",
+    "variant_bbox_review",
 ]
 
 _OBJECT_CREATURE_TERMS = (
@@ -669,6 +669,12 @@ class QwenSourceBboxFallbackJudge:
                 "alpha topology found a meaningful enclosed transparent hole. "
                 "Accept Image 3 only if the raw source bbox is clearly preferable."
             )
+        elif trigger == "variant_bbox_review":
+            trigger_context = (
+                "Image 2 is the accepted alpha reference. Image 3 is a materialized "
+                "raw source bbox candidate. Accept it only if the target remains "
+                "dominant and independently usable."
+            )
         else:
             trigger_context = "Image 2 is the current failed reference."
         messages: list[dict[str, object]] = [
@@ -1085,8 +1091,10 @@ def _source_bbox_reference(
         reference.model_copy(
             update={
                 "image_path": image_path,
-                "source_clip_uid": clip_uid,
-                "source_entity_id": reference.entity_id,
+                "source_clip_uid": reference.source_clip_uid or clip_uid,
+                "source_entity_id": (
+                    reference.source_entity_id or reference.entity_id
+                ),
                 "synthetic": False,
                 "generation_metadata_path": None,
                 "generation_source_sha256": None,
@@ -1117,16 +1125,51 @@ def _reference_edit_after_source_bbox(
         if item.status == "rejected":
             raise ValueError("rejected reference edit cannot publish bbox fallback")
         found = True
+        updates: dict[str, object] = {
+            "status": "fallback",
+            "output_image_path": output_image_path,
+            "background_fallback": "none",
+            "fallback_policy": "source_bbox_fallback",
+            "source_bbox_fallback_metadata_path": metadata_path,
+            "reason": "source_bbox_fallback_v1",
+        }
+        if item.variants is not None:
+            variant_updates: dict[str, object] = {
+                "bbox": item.variants.bbox.model_copy(
+                    update={
+                        "image_path": output_image_path,
+                        "status": "accepted",
+                        "reviewed": True,
+                        "review_status": "accepted",
+                        "reason": "source_bbox_fallback_v1",
+                        "metadata_path": metadata_path,
+                    }
+                )
+            }
+            if item.default_variant == "generated_background":
+                variant_updates["generated_background"] = (
+                    item.variants.generated_background.model_copy(
+                        update={
+                            "status": "rejected",
+                            "reviewed": True,
+                            "review_status": "rejected_by_final_integrity",
+                            "reason": "final_integrity_replaced_generated_background",
+                        }
+                    )
+                )
+            updates.update(
+                {
+                    "variants": item.variants.model_copy(
+                        update=variant_updates
+                    ),
+                    "default_variant": "bbox",
+                    "default_image_path": output_image_path,
+                    "default_reason": "final_integrity_bbox_review_accepted",
+                }
+            )
         updated.append(
             item.model_copy(
-                update={
-                    "status": "fallback",
-                    "output_image_path": output_image_path,
-                    "background_fallback": "none",
-                    "fallback_policy": "source_bbox_fallback",
-                    "source_bbox_fallback_metadata_path": metadata_path,
-                    "reason": "source_bbox_fallback_v1",
-                }
+                update=updates
             )
         )
     if not found:
@@ -1145,24 +1188,19 @@ class _SourceBboxEvaluation:
     judge_failure: SourceBboxFallbackJudgeFailure | None = None
 
 
-def _evaluate_source_bbox(
+def _materialize_source_bbox(
     *,
     storage: RunStorage,
     clip_uid: str,
     entity_id: str,
     source_evidence: _SourceEvidence,
-    source_context: Image.Image,
     current_reference: Image.Image,
     current_reference_path: Path,
     reference: EntityReferenceState,
-    reference_type: str,
-    phrase: str,
-    grounding_prompt: str,
-    original_review: ReferenceIntegrityReview,
-    diagnostics: ReferenceTopologyDiagnostics,
+    original_review: ReferenceIntegrityReview | None,
+    diagnostics: ReferenceTopologyDiagnostics | None,
     crop_padding_ratio: float,
     trigger: SourceBboxFallbackTrigger,
-    judge: SourceBboxFallbackJudge,
 ) -> _SourceBboxEvaluation:
     candidate, bbox_xyxy = _source_bbox_candidate(
         source_evidence,
@@ -1185,6 +1223,8 @@ def _evaluate_source_bbox(
     metadata: dict[str, object] = {
         "mode": "source_bbox_fallback_v1",
         "trigger": f"{trigger}_v1",
+        "status": "materialized",
+        "review_status": "not_reviewed",
         "synthetic": False,
         "raw_source_pixels_only": True,
         "clip_uid": clip_uid,
@@ -1208,7 +1248,11 @@ def _evaluate_source_bbox(
         "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
         "original_reference_path": reference.image_path,
         "original_reference_sha256": current_reference_sha256,
-        "original_integrity_review": original_review.model_dump(mode="json"),
+        "original_integrity_review": (
+            original_review.model_dump(mode="json")
+            if original_review is not None
+            else None
+        ),
     }
     if trigger == "artifact_review_reject":
         metadata.update(
@@ -1217,7 +1261,9 @@ def _evaluate_source_bbox(
                 "failed_reference_sha256": current_reference_sha256,
             }
         )
-    else:
+    elif trigger == "topology_alpha_hole_upgrade":
+        if diagnostics is None:
+            raise ValueError("topology bbox upgrade requires topology diagnostics")
         metadata["topology_evidence"] = {
             "alpha_available": diagnostics.alpha_available,
             "enclosed_transparent_hole_count": (
@@ -1226,6 +1272,33 @@ def _evaluate_source_bbox(
             "largest_enclosed_hole_area": diagnostics.largest_enclosed_hole_area,
             "enclosed_hole_bbox_ratio": diagnostics.enclosed_hole_bbox_ratio,
         }
+    write_json_atomic(metadata_path, metadata)
+    return _SourceBboxEvaluation(
+        candidate_relative=candidate_relative,
+        metadata_relative=metadata_relative,
+        bbox_xyxy=bbox_xyxy,
+    )
+
+
+def _review_materialized_source_bbox(
+    evaluation: _SourceBboxEvaluation,
+    *,
+    storage: RunStorage,
+    source_context: Image.Image,
+    current_reference: Image.Image,
+    reference: EntityReferenceState,
+    reference_type: str,
+    phrase: str,
+    grounding_prompt: str,
+    trigger: SourceBboxFallbackTrigger,
+    judge: SourceBboxFallbackJudge,
+) -> _SourceBboxEvaluation:
+    candidate_path = _resolve_run_artifact(storage, evaluation.candidate_relative)
+    metadata_path = _resolve_run_artifact(storage, evaluation.metadata_relative)
+    with Image.open(candidate_path) as opened:
+        opened.load()
+        candidate = opened.convert("RGB")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     try:
         attempt = judge.review(
             source_context=source_context,
@@ -1241,20 +1314,22 @@ def _evaluate_source_bbox(
         metadata.update(
             {
                 "status": "judge_failed",
+                "review_status": "judge_failed",
                 "reason": str(exc),
                 "raw_response": exc.raw_response,
             }
         )
         write_json_atomic(metadata_path, metadata)
         return _SourceBboxEvaluation(
-            candidate_relative=candidate_relative,
-            metadata_relative=metadata_relative,
-            bbox_xyxy=bbox_xyxy,
+            candidate_relative=evaluation.candidate_relative,
+            metadata_relative=evaluation.metadata_relative,
+            bbox_xyxy=evaluation.bbox_xyxy,
             judge_failure=exc,
         )
     metadata.update(
         {
             "status": "accepted" if attempt.review.verdict == "accept" else "rejected",
+            "review_status": attempt.review.verdict,
             "review": attempt.review.model_dump(mode="json"),
             "raw_response": attempt.raw_response,
             "finish_reason": attempt.finish_reason,
@@ -1262,10 +1337,56 @@ def _evaluate_source_bbox(
     )
     write_json_atomic(metadata_path, metadata)
     return _SourceBboxEvaluation(
-        candidate_relative=candidate_relative,
-        metadata_relative=metadata_relative,
-        bbox_xyxy=bbox_xyxy,
+        candidate_relative=evaluation.candidate_relative,
+        metadata_relative=evaluation.metadata_relative,
+        bbox_xyxy=evaluation.bbox_xyxy,
         attempt=attempt,
+    )
+
+
+def _evaluate_source_bbox(
+    *,
+    storage: RunStorage,
+    clip_uid: str,
+    entity_id: str,
+    source_evidence: _SourceEvidence,
+    source_context: Image.Image,
+    current_reference: Image.Image,
+    current_reference_path: Path,
+    reference: EntityReferenceState,
+    reference_type: str,
+    phrase: str,
+    grounding_prompt: str,
+    original_review: ReferenceIntegrityReview | None,
+    diagnostics: ReferenceTopologyDiagnostics | None,
+    crop_padding_ratio: float,
+    trigger: SourceBboxFallbackTrigger,
+    judge: SourceBboxFallbackJudge,
+) -> _SourceBboxEvaluation:
+    materialized = _materialize_source_bbox(
+        storage=storage,
+        clip_uid=clip_uid,
+        entity_id=entity_id,
+        source_evidence=source_evidence,
+        current_reference=current_reference,
+        current_reference_path=current_reference_path,
+        reference=reference,
+        original_review=original_review,
+        diagnostics=diagnostics,
+        crop_padding_ratio=crop_padding_ratio,
+        trigger=trigger,
+    )
+    return _review_materialized_source_bbox(
+        materialized,
+        storage=storage,
+        source_context=source_context,
+        current_reference=current_reference,
+        reference=reference,
+        reference_type=reference_type,
+        phrase=phrase,
+        grounding_prompt=grounding_prompt,
+        trigger=trigger,
+        judge=judge,
     )
 
 

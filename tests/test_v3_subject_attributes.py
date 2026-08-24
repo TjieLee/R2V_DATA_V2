@@ -368,6 +368,12 @@ def test_discovery_schema_enforces_owner_and_three_attribute_bound() -> None:
         ],
     )
     assert payload.attributes[0].attribute_type == "hair"
+    with pytest.raises(ValidationError, match="must not repeat"):
+        SubjectAttributeDiscovery(
+            owner_entity_id="e1",
+            owner_is_human=True,
+            attributes=[payload.attributes[0], payload.attributes[0]],
+        )
     with pytest.raises(ValidationError):
         SubjectAttributeDiscovery(
             owner_entity_id="owner-1",
@@ -420,7 +426,160 @@ def test_discovery_prompt_requires_exact_top_level_contract() -> None:
     )
     assert "Do not return owner_phrase, owner_grounding_prompt" in prompt
     assert "attributes must be a JSON array" in prompt
+    assert "Each returned attribute_type must be unique" in prompt
     assert "return owner_is_human=false and attributes=[]" in prompt
+
+
+def _discovery_client_with_raw_response(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> tuple[subject_attributes.QwenSubjectAttributeClient, list[dict[str, object]]]:
+    client = subject_attributes.QwenSubjectAttributeClient(
+        QwenServiceConfig(),
+        client=SimpleNamespace(),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_request(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return raw
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    return client, calls
+
+
+def _discover_from_client(
+    client: subject_attributes.QwenSubjectAttributeClient,
+) -> SubjectAttributeDiscovery:
+    candidate = _candidate("candidate_1", slot=1, source_frame_index=10)
+    return client.discover(
+        owner=_clip().annotation.entities[0],
+        owner_candidates=[candidate],
+        source_images={candidate.image_path: Image.new("RGB", (100, 100))},
+    )
+
+
+def test_discovery_duplicate_type_is_first_wins_in_original_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e1",
+                "owner_is_human": True,
+                "attributes": [
+                    {
+                        "attribute_type": "upper_clothing",
+                        "phrase": "gray robe",
+                        "grounding_prompt": "gray robe worn by the woman",
+                    },
+                    {
+                        "attribute_type": "upper_clothing",
+                        "phrase": "black vest",
+                        "grounding_prompt": "black vest worn by the woman",
+                    },
+                    {
+                        "attribute_type": "hair",
+                        "phrase": "dark hair",
+                        "grounding_prompt": "dark hair worn by the woman",
+                    },
+                ],
+            }
+        ),
+    )
+
+    payload = _discover_from_client(client)
+
+    assert [attribute.attribute_type for attribute in payload.attributes] == [
+        "upper_clothing",
+        "hair",
+    ]
+    assert [attribute.phrase for attribute in payload.attributes] == [
+        "gray robe",
+        "dark hair",
+    ]
+    assert [attribute.grounding_prompt for attribute in payload.attributes] == [
+        "gray robe worn by the woman",
+        "dark hair worn by the woman",
+    ]
+    assert len(calls) == 1
+
+
+def test_discovery_distinct_types_are_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_attributes = [
+        {
+            "attribute_type": "upper_clothing",
+            "phrase": "gray robe",
+            "grounding_prompt": "gray robe worn by the woman",
+        },
+        {
+            "attribute_type": "hair",
+            "phrase": "dark hair",
+            "grounding_prompt": "dark hair worn by the woman",
+        },
+    ]
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e1",
+                "owner_is_human": True,
+                "attributes": raw_attributes,
+            }
+        ),
+    )
+
+    payload = _discover_from_client(client)
+
+    assert [attribute.model_dump() for attribute in payload.attributes] == raw_attributes
+    assert len(calls) == 1
+
+
+def test_discovery_malformed_payload_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e1",
+                "owner_is_human": True,
+                "attributes": [
+                    {
+                        "attribute_type": "hair",
+                        "phrase": "",
+                        "grounding_prompt": "dark hair worn by the woman",
+                    }
+                ],
+            }
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        _discover_from_client(client)
+    assert len(calls) == 1
+
+
+def test_discovery_owner_id_mismatch_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, calls = _discovery_client_with_raw_response(
+        monkeypatch,
+        json.dumps(
+            {
+                "owner_entity_id": "e2",
+                "owner_is_human": True,
+                "attributes": [],
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="wrong owner_entity_id"):
+        _discover_from_client(client)
+    assert len(calls) == 1
 
 
 def test_different_owner_frame_is_preferred_and_same_frame_is_fallback() -> None:
@@ -675,6 +834,10 @@ def test_review_prompt_requires_canonical_batch_shape() -> None:
     assert "recognizable requires sufficient component structure" in prompt
     assert "Hair needs a coherent hairstyle region or silhouette" in prompt
     assert "Face needs enough facial structure to function independently" in prompt
+    assert "at least 50% of the frontal facial structure visible" in prompt
+    assert "side profile" in prompt
+    assert "only when attribute_type is face" in prompt
+    assert "do not apply it to hair, headwear, glasses, clothing" in prompt
     assert "clothing needs coherent garment structure" in prompt
     assert "beyond the main subject reference" in prompt
     assert "pose-dominated cutout" in prompt
@@ -1355,12 +1518,30 @@ def test_discovery_prompt_requires_english_attribute_text() -> None:
     assert "written in English" in prompt
 
 
-def test_attribute_completion_prompt_is_exact_and_category_neutral() -> None:
-    assert subject_attributes.ATTRIBUTE_COMPLETION_PROMPT == (
-        "把图片中破损、缺失或不完整的区域补充完整。"
+@pytest.mark.parametrize(
+    ("attribute_type", "entity_name"),
+    [
+        ("face", "人脸"),
+        ("headwear", "帽子"),
+        ("accessory", "配饰"),
+        ("upper_clothing", "衣服"),
+        ("lower_clothing", "下装"),
+        ("dress_or_skirt", "裙子"),
+    ],
+)
+def test_attribute_completion_prompt_is_short_and_type_specific(
+    attribute_type: str,
+    entity_name: str,
+) -> None:
+    assert subject_attributes.attribute_completion_prompt(attribute_type) == (
+        f"补全成完整的{entity_name}，去除掉破碎的部分，不添加其他内容"
     )
-    for prohibited in ("人脸", "人", "头发", "服装", "帽子", "配饰", "包", "鞋"):
-        assert prohibited not in subject_attributes.ATTRIBUTE_COMPLETION_PROMPT
+
+
+def test_hair_and_glasses_are_not_completion_eligible() -> None:
+    eligible = SubjectAttributeCompletionConfig().eligible_types
+    assert "hair" not in eligible
+    assert "glasses" not in eligible
 
 
 def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
@@ -2266,7 +2447,7 @@ def _attempt_completion_direct(
 
     judge = Judge()
     metrics = subject_attributes._CompletionSelectionMetrics()
-    completed, reason, _, completion_review = (
+    completed, reason, _, completion_review, completion_seed = (
         subject_attributes._attempt_attribute_completion(
             candidate,
             clip_uid="42038d7dc619cfa7bebee437",
@@ -2279,6 +2460,7 @@ def _attempt_completion_direct(
         )
     )
     trace.completion_review = completion_review
+    trace.completion_seed = completion_seed
     return completed, reason, metrics, trace
 
 
@@ -2376,7 +2558,7 @@ def test_repairable_attribute_uses_boogu_without_completion_sam(
         maximum_bbox_area_growth_ratio=4.0,
         face_maximum_bbox_area_growth_ratio=4.0,
     )
-    completed, reason, failed, completion_review = (
+    completed, reason, failed, completion_review, completion_seed = (
         subject_attributes._attempt_attribute_completion(
             candidate,
             clip_uid="clip-1",
@@ -2394,6 +2576,7 @@ def test_repairable_attribute_uses_boogu_without_completion_sam(
     assert reason == "completion_identity_accepted"
     assert failed is False
     assert completion_review == _completion_review(accepted=True)
+    assert isinstance(completion_seed, int)
     assert backend.calls == 1
     assert completed.crop.mode == "RGB"
     assert metrics.sam3_time_seconds == 0.0
@@ -2434,7 +2617,7 @@ def test_alpha_coverage_does_not_control_completion_routing(
         def review(self, **_kwargs):
             return _completion_review(accepted=True)
 
-    completed, reason, _, _ = subject_attributes._attempt_attribute_completion(
+    completed, reason, _, _, _ = subject_attributes._attempt_attribute_completion(
         candidate,
         clip_uid="clip-1",
         output_root=tmp_path,
@@ -2446,9 +2629,9 @@ def test_alpha_coverage_does_not_control_completion_routing(
     )
     assert completed is not None
     assert reason == "completion_identity_accepted"
-    assert captured["instruction"] == "把图片中破损、缺失或不完整的区域补充完整。"
-    for prohibited in ("人脸", "服装", "帽子", "头发", "配饰", "主体"):
-        assert prohibited not in str(captured["instruction"])
+    assert captured["instruction"] == (
+        "补全成完整的人脸，去除掉破碎的部分，不添加其他内容"
+    )
 
 
 def test_completion_review_rejects_fail_closed(
@@ -2458,9 +2641,9 @@ def test_completion_review_rejects_fail_closed(
     raw_mask[8:24, 8:24] = True
     candidate = subject_attributes.PendingAttributeCandidate(
         discovered=DiscoveredSubjectAttribute(
-            attribute_type="hair",
-            phrase="hair",
-            grounding_prompt="hair of person 1",
+            attribute_type="face",
+            phrase="face",
+            grounding_prompt="face of person 1",
         ),
         attribute_id="a1",
         owner_entity_id="e1",
@@ -2482,7 +2665,7 @@ def test_completion_review_rejects_fail_closed(
             return _completion_review(accepted=False)
 
     metrics = subject_attributes._CompletionSelectionMetrics()
-    completed, reason, _, completion_review = (
+    completed, reason, _, completion_review, _ = (
         subject_attributes._attempt_attribute_completion(
             candidate,
             clip_uid="clip-1",
@@ -2556,6 +2739,7 @@ def _run_completion_routing_case(
     raw_kind: str,
     completion_stage: str = "success",
     attribute_count: int = 1,
+    first_attribute_type: str = "face",
 ) -> tuple[OwnerEnrichmentArtifact, object, object, object]:
     _frames(tmp_path / "run")
 
@@ -2566,10 +2750,14 @@ def _run_completion_routing_case(
                 owner_is_human=True,
                 attributes=[
                     DiscoveredSubjectAttribute(
-                        attribute_type=("face" if index == 0 else "accessory"),
-                        phrase=("face" if index == 0 else "necklace"),
+                        attribute_type=(
+                            first_attribute_type if index == 0 else "accessory"
+                        ),
+                        phrase=(
+                            first_attribute_type if index == 0 else "necklace"
+                        ),
                         grounding_prompt=(
-                            "face of person 1"
+                            f"{first_attribute_type} of person 1"
                             if index == 0
                             else "necklace worn by person 1"
                         ),
@@ -2690,6 +2878,46 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
     assert review.calls == [["a1"]]
 
 
+def test_hair_repair_recommendation_never_calls_boogu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject_attributes,
+        "HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS",
+        4,
+    )
+    artifact, _, backend, _ = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+        first_attribute_type="hair",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert record.image_path is not None
+    assert (tmp_path / "output" / record.image_path).is_file()
+    assert backend.calls == 0
+
+
+def test_glasses_publish_raw_without_boogu(tmp_path: Path) -> None:
+    artifact, _, backend, _ = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_complete",
+        first_attribute_type="glasses",
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert record.image_path is not None
+    assert (tmp_path / "output" / record.image_path).is_file()
+    assert backend.calls == 0
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     [
@@ -2700,7 +2928,9 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
 def test_raw_accepted_repair_failures_fallback_to_raw(
     tmp_path: Path,
     failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(subject_attributes, "new_boogu_seed", lambda: 2718)
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_repair",
@@ -2711,6 +2941,7 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
     assert record.status == "accepted"
     assert record.final_selection == "raw"
     assert record.completion_attempted is True
+    assert record.completion_seed == 2718
     assert artifact.metrics.completion_fallback_to_raw == 1
     assert artifact.metrics.completion_selected_completed == 0
     assert artifact.metrics.completion_review_calls == int(
@@ -2729,7 +2960,11 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
         assert published.mode == "RGBA"
 
 
-def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
+def test_raw_accepted_repair_success_selects_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject_attributes, "new_boogu_seed", lambda: 314159)
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_repair",
@@ -2739,6 +2974,7 @@ def test_raw_accepted_repair_success_selects_completed(tmp_path: Path) -> None:
     assert record.status == "accepted"
     assert record.final_selection == "completed"
     assert record.completion_outcome == "selected_completed"
+    assert record.completion_seed == 314159
     assert artifact.metrics.review_calls == 1
     assert artifact.metrics.completion_selected_completed == 1
     assert artifact.metrics.completion_accepted == 1
@@ -2837,3 +3073,194 @@ def test_hard_rejected_or_nonrepairable_raw_never_reaches_boogu(
     assert artifact.metrics.raw_attribute_review_hard_rejected == 1
     assert backend.calls == segmenter.generated_calls == 0
     assert review.calls == [["a1"]]
+
+
+def _attribute_variant_review(*, accepted: bool, background: bool):
+    if background:
+        fields = (
+            "same_attribute_appearance",
+            "shape_color_texture_preserved",
+            "target_is_clear_and_dominant",
+            "no_duplicate_or_unrelated_entity",
+            "background_does_not_occlude_target",
+            "no_halo_or_seam",
+            "no_severe_artifact",
+            "usable_as_attribute_condition",
+            "certain",
+        )
+        return subject_attributes.SubjectAttributeBackgroundReview(
+            **{field: accepted for field in fields},
+            verdict="accept" if accepted else "reject",
+            reason="usable" if accepted else "not usable",
+        )
+    fields = (
+        "correct_attribute",
+        "owner_binding_correct",
+        "target_is_dominant_and_identifiable",
+        "no_large_competing_attribute_or_entity",
+        "context_is_limited_and_supportive",
+        "no_severe_blur_or_artifact",
+        "usable_as_attribute_condition",
+        "certain",
+    )
+    return subject_attributes.SubjectAttributeBboxReview(
+        **{field: accepted for field in fields},
+        verdict="accept" if accepted else "reject",
+        reason="usable" if accepted else "not usable",
+    )
+
+
+def _run_attribute_variant_case(
+    tmp_path: Path,
+    *,
+    background_accepts: bool,
+    bbox_accepts: bool,
+    completed_base: bool = False,
+):
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[30:70, 25:75] = True
+    raw_crop = Image.new("RGBA", (54, 44), (120, 120, 120, 255))
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="upper_clothing",
+            phrase="gray robe",
+            grounding_prompt="gray robe worn by person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=mask,
+        source_image=Image.new("RGB", (100, 100), (240, 240, 240)),
+        crop=(
+            Image.new("RGB", (64, 64), (140, 140, 140))
+            if completed_base
+            else raw_crop
+        ),
+        raw_crop=raw_crop,
+        geometry=_geometry(),
+    )
+    raw_review = (
+        _routing_review("a1", "unusable_repair")
+        if completed_base
+        else _accepted_review("a1")
+    )
+    record = subject_attributes._accepted_record(
+        candidate,
+        output_root=tmp_path,
+        sample_id="clip-1",
+        owner_reference=_ready_reference("e1"),
+        review=raw_review,
+        completion_review=(
+            _completion_review(accepted=True) if completed_base else None
+        ),
+        final_selection="completed" if completed_base else "raw",
+        completion_attempted=completed_base,
+        completion_outcome=(
+            "selected_completed" if completed_base else "not_attempted"
+        ),
+        completion_seed=17 if completed_base else None,
+        crop_padding_ratio=0.08,
+    )
+
+    class Backend:
+        calls = 0
+
+        def attribute_background(self, *, output_path, **_kwargs):
+            self.calls += 1
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (64, 64), (200, 210, 220)).save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Judge:
+        background_calls = 0
+        bbox_calls = 0
+
+        def review_attribute_background(self, **_kwargs):
+            self.background_calls += 1
+            return _attribute_variant_review(
+                accepted=background_accepts,
+                background=True,
+            )
+
+        def review_attribute_bbox(self, **_kwargs):
+            self.bbox_calls += 1
+            return _attribute_variant_review(
+                accepted=bbox_accepts,
+                background=False,
+            )
+
+    backend = Backend()
+    judge = Judge()
+    metrics = subject_attributes._AttributeVariantMetrics()
+    selected = subject_attributes._with_attribute_variants(
+        record,
+        candidate,
+        output_root=tmp_path,
+        sample_id="clip-1",
+        backend=backend,
+        judge=judge,
+        metrics=metrics,
+    )
+    return selected, backend, judge, metrics
+
+
+def test_attribute_background_accept_skips_bbox_review_and_keeps_bbox(
+    tmp_path: Path,
+) -> None:
+    record, backend, judge, metrics = _run_attribute_variant_case(
+        tmp_path,
+        background_accepts=True,
+        bbox_accepts=False,
+    )
+
+    assert backend.calls == 1
+    assert judge.background_calls == 1
+    assert judge.bbox_calls == 0
+    assert record.default_variant == "generated_background"
+    assert record.variants is not None
+    assert record.variants.bbox.status == "review_skipped"
+    assert (tmp_path / record.variants.bbox.image_path).is_file()
+    assert metrics.bbox_variants_materialized == 1
+    assert metrics.bbox_reviews_attempted == 0
+    assert metrics.bbox_reviews_skipped_background_accepted == 1
+
+
+@pytest.mark.parametrize(
+    ("bbox_accepts", "expected_default"),
+    [(True, "bbox"), (False, "alpha")],
+)
+def test_attribute_background_reject_reviews_bbox_then_selects_default(
+    tmp_path: Path,
+    bbox_accepts: bool,
+    expected_default: str,
+) -> None:
+    record, _, judge, metrics = _run_attribute_variant_case(
+        tmp_path,
+        background_accepts=False,
+        bbox_accepts=bbox_accepts,
+    )
+
+    assert judge.background_calls == 1
+    assert judge.bbox_calls == 1
+    assert record.default_variant == expected_default
+    assert metrics.bbox_reviews_attempted == 1
+
+
+def test_completed_attribute_variant_fallback_preserves_accepted_base(
+    tmp_path: Path,
+) -> None:
+    record, _, judge, _ = _run_attribute_variant_case(
+        tmp_path,
+        background_accepts=False,
+        bbox_accepts=False,
+        completed_base=True,
+    )
+
+    assert judge.bbox_calls == 1
+    assert record.final_selection == "completed"
+    assert record.default_variant == "accepted_base"
+    assert record.image_path == record.accepted_base_image_path
+    assert record.variants is not None
+    assert record.variants.alpha.status == "rejected"
+    with Image.open(tmp_path / record.image_path) as opened:
+        assert opened.mode == "RGB"

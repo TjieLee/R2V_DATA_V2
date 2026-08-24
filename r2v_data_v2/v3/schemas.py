@@ -1060,6 +1060,60 @@ ReferenceEditOperation = Literal[
     "complete_entity",
     "add_entity_background",
 ]
+ReferenceVariantName = Literal["alpha", "bbox", "generated_background"]
+ReferenceDefaultVariant = Literal[
+    "alpha",
+    "bbox",
+    "generated_background",
+    "accepted_base",
+]
+ReferenceVariantStatus = Literal[
+    "available",
+    "accepted",
+    "rejected",
+    "generation_failed",
+    "review_skipped",
+    "unavailable",
+]
+
+
+class ReferenceVariantState(SchemaModel):
+    image_path: Optional[str] = None
+    status: ReferenceVariantStatus
+    reviewed: StrictBool
+    review_status: str
+    reason: Optional[str] = None
+    synthetic: StrictBool
+    metadata_path: Optional[str] = None
+    source_frame_index: Optional[int] = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_variant(self) -> ReferenceVariantState:
+        if not self.review_status.strip():
+            raise ValueError("reference variant review_status must not be empty")
+        if self.status in {"available", "accepted", "rejected", "review_skipped"}:
+            if self.image_path is None or not self.image_path.strip():
+                raise ValueError("materialized reference variant requires image_path")
+        elif self.image_path is not None:
+            raise ValueError("unavailable reference variant cannot publish image_path")
+        if self.status == "accepted" and not self.reviewed:
+            raise ValueError("accepted reference variant must be reviewed")
+        if self.status == "review_skipped" and self.reviewed:
+            raise ValueError("review-skipped reference variant cannot be reviewed")
+        if self.reason is not None and not self.reason.strip():
+            raise ValueError("reference variant reason must not be empty")
+        return self
+
+
+class ReferenceVariantsState(SchemaModel):
+    alpha: ReferenceVariantState
+    bbox: ReferenceVariantState
+    generated_background: ReferenceVariantState
+
+
+# Read-only compatibility for sidecars written by ef68d03. New artifacts never
+# emit or use this field for routing.
+LegacyReferenceFormAssignment = Literal["alpha", "bbox", "generated_background"]
 ReferenceEditFallbackPolicy = Literal[
     "not_used",
     "keep_source",
@@ -1075,6 +1129,14 @@ class ReferenceEditEntityState(SchemaModel):
     status: Literal["accepted", "fallback", "rejected", "not_required"]
     source_reference: EntityReferenceState
     source_image_path: str
+    reference_form: Optional[LegacyReferenceFormAssignment] = Field(
+        default=None,
+        exclude=True,
+    )
+    variants: Optional[ReferenceVariantsState] = None
+    default_variant: Optional[ReferenceDefaultVariant] = None
+    default_image_path: Optional[str] = None
+    default_reason: Optional[str] = None
     output_image_path: Optional[str] = None
     operation: Optional[ReferenceEditOperation] = None
     metadata_path: Optional[str] = None
@@ -1099,6 +1161,31 @@ class ReferenceEditEntityState(SchemaModel):
             raise ValueError(
                 "reference edit source evidence must be a ready real reference"
             )
+        if self.reference_form is not None and self.route not in {
+            "complete",
+            "local_usable",
+        }:
+            raise ValueError(
+                "reference form assignment requires complete or local_usable route"
+            )
+        defaults = (
+            self.default_variant,
+            self.default_image_path,
+            self.default_reason,
+        )
+        if self.variants is None:
+            if any(value is not None for value in defaults):
+                raise ValueError("reference variant defaults require variants")
+        else:
+            if any(value is None for value in defaults):
+                raise ValueError("reference variants require complete default provenance")
+            assert self.default_variant is not None
+            assert self.default_image_path is not None
+            selected = getattr(self.variants, self.default_variant, None)
+            if selected is None or selected.image_path != self.default_image_path:
+                raise ValueError("reference variant default must match its image path")
+            if selected.status != "accepted":
+                raise ValueError("reference variant default must be accepted")
         allowed_sequences = {
             (),
             ("complete_entity",),

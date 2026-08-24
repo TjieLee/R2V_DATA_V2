@@ -158,20 +158,25 @@ previous 32768 context-length infrastructure failure. This bounded canary is
 functional evidence only. Its 3 exports from 10 inputs are not a production
 yield estimate.
 
-## Pending Boogu background-removal canary
+## Validated Boogu Background Removal
 
-The intended production removal configuration now selects
-`boogu_image_0_1_edit_turbo` with `boogu_4step_v1`, four inference steps, and
-thinking disabled. The persistent removal worker is isolated to physical GPU4
-and reuses the pinned Boogu runtime/model settings under `reference_edit`.
-Qwen3-VL-32B-Instruct remains the full-resolution background-removal judge and
-is not the image generator. The separate reference-edit Boogu worker remains
-on physical GPU6.
+Boogu background removal is the validated intended production backend. Canary
+tooling explicitly overrides stale base configs with:
 
-This switch is not production-validated until a server canary passes. It does
-not create or rename the `prod-v1` production version, and it does not change
-the existing removal masks, local compositing, semantic judge, final guard,
-retry, or fail-closed contracts.
+```yaml
+remove:
+  enabled: true
+  backend: boogu_image_0_1_edit_turbo
+  inference_profile: boogu_4step_v1
+runtime:
+  gpu_workers:
+    remove: "4"
+```
+
+The worker uses the pinned Boogu runtime/model and physical GPU4. Qwen remains
+the semantic judge where configured; Qwen-Image-Edit is not the active
+background image generator. The separate Boogu reference-edit worker remains
+on physical GPU6. This does not change `prod-v1` shard/cursor semantics.
 
 ## Shards and cursor semantics
 
@@ -247,44 +252,41 @@ browse UID directories. Visual names are `subject_<entity_id>.png`,
 their immutable shard exports, so the reviewable tree does not duplicate their
 bytes or modify the shard artifacts.
 
-Accepted RGBA attribute PNGs use
+Canonical attribute PNGs keep the filename
 `attribute_<owner_entity_id>_<attribute_id>_<attribute_type>.png` in that same
-directory. They are validated and hard-linked when possible, retaining the
-existing safe copy fallback. An existing destination is reused only when its
-SHA-256 matches; any path collision with different bytes fails closed. These
-references never depend on a working `run_root` after publication. Target
-videos remain the processed public-dataset shot MP4 paths and are never copied.
-Original/full `source_video_path` values remain provenance and are never
-substituted as Visual inputs.
+directory. Raw or legacy-`None` selections must be RGBA and publish with
+`synthetic=false`. Completed selections must be RGB, require an accepted
+`completion_review`, and publish with `synthetic=true`.
+
+The compactor validates image mode from `final_selection`, does not convert the
+image, hardlinks when possible with the existing safe copy fallback, and
+validates the destination again. Publication therefore preserves the original
+bytes. An existing destination is reused only when its SHA-256 matches; any
+path collision with different bytes fails closed. These references never
+depend on a working `run_root` after publication. Target videos remain the
+processed public-dataset shot MP4 paths and are never copied. Original/full
+`source_video_path` values remain provenance and are never substituted as
+Visual inputs.
 
 The optional top-level `enriched_samples.jsonl` remains an audit artifact when
 `--runs-root` is supplied. Per-shard sample JSONLs and enriched sidecars are not
 the downstream join interface.
 
-### New subject-attribute GME prefilter
+### Final Subject Attribute Production State
 
-The new, server-canary-pending attribute flow is:
+The GME experiment is not part of the production Subject Attribute path and
+remains disabled. The final discovery, frame-local SAM3, deterministic
+geometry, raw review, optional Boogu completion, and direct publication flow
+is authoritative in `V3_SUBJECT_ATTRIBUTES_STATE.md`.
 
-```text
-Qwen discovery
-  -> owner-Top3 frame-local SAM3 candidate
-  -> deterministic ownership/geometry
-  -> GME 2B relative-margin prefilter
-  -> existing batched Qwen final attribute review
-```
+### Validated Reference-Image Evidence
 
-GME uses `Alibaba-NLP/gme-Qwen2-VL-2B-Instruct` from the local model path with
-English queries and one persistent offline worker. The intended assignment is
-physical GPU7, colocated with the dedicated attribute SAM3 worker without
-intentional inference overlap. GME may advance from a poor geometry-valid crop
-to the next existing owner candidate frame, but it does not expand the Top3
-bound or use temporal tracking. A GME infrastructure failure fails open to the
-unchanged Qwen final review.
-
-The initial contract is only `relative_margin_v1` with `min_margin=0.0`; it is
-not calibrated beyond that relative comparison and has no absolute cosine
-threshold. The production canonical sample schema and reference layout remain
-unchanged.
+The fixed random-200 E2E exercised the final direct completion/publication
+design and exposed duplicate discovery plus atomic-state issues. The fresh
+targeted-10 regression after `51fef9d...` cleared both issues: 10/10
+`clip.json` files, zero orphan/temp leftovers, zero runtime failures, and zero
+duplicate-discovery failures. See `V3_SUBJECT_ATTRIBUTES_STATE.md` for exact
+metrics and the explicit non-yield interpretation.
 
 `samples.jsonl` is fully validated, fsynced, and atomically replaced. The
 catalog records its exact SHA-256, canonical schema version, counts, source

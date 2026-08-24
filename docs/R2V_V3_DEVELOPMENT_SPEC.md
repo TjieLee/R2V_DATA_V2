@@ -1,11 +1,25 @@
 # R2V V3 Development Specification
 
-Status: **approved development specification**  
+Status: **approved original development specification (historical baseline)**
 Audience: Codex and repository contributors  
 Repository: `TjieLee/R2V_DATA_V2`  
 Implementation target: a V3 pipeline developed alongside the existing V2 pipeline
 
-This document is normative. Read `AGENTS.md` first, then follow this specification for V3 work. Where this document explicitly changes an older V2 behavior, this document takes precedence for V3 only.
+> **Current V3 notice (2026-08-23):** This is the original approved V3
+> development specification. Validated production work superseded some initial
+> implementation choices, so this file must not be used alone as current
+> operational truth. Current state is defined by
+> `V3_RUNTIME_INTEGRITY_STATE.md`, `V3_SUBJECT_ATTRIBUTES_STATE.md`,
+> `V3_PRODUCTION_SHARDS.md`, `SERVER_ENVIRONMENT_RUNBOOK.md`,
+> `ANNOTATION_ENTITY_PRODUCTION.md`, and
+> `VISUAL_ATTRIBUTE_DEVELOPMENT_HANDOFF.md`. In particular, original
+> Qwen-Image-Edit background-removal text and original stage order are
+> historical initial-design material wherever they conflict with those
+> current-state documents.
+
+Read `AGENTS.md` first. Use this specification for original design intent and
+archaeology; where it conflicts with the current-state documents above, the
+current-state documents take precedence.
 
 ---
 

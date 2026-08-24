@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 
 from r2v_data_v2.reconciliation import write_json_atomic
+from r2v_data_v2.v3.boogu_seed import new_boogu_seed
 from r2v_data_v2.v3.background import (
     build_union_foreground_mask,
     validate_background_inputs,
@@ -758,7 +759,14 @@ def remove_backgrounds(
                 )
                 attempts: list[BackgroundRemovalAttempt] = []
                 accepted: tuple[Image.Image, bytes, str, int] | None = None
-                for retry_index, seed in enumerate(config.remove.candidate_seeds):
+                for retry_index, configured_seed in enumerate(
+                    config.remove.candidate_seeds
+                ):
+                    seed = (
+                        new_boogu_seed()
+                        if config.remove.backend == BOOGU_REMOVE_BACKEND
+                        else configured_seed
+                    )
                     started = time.monotonic()
                     candidate: Image.Image | None = None
                     candidate_sha: str | None = None

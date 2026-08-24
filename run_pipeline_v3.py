@@ -345,8 +345,12 @@ def _run_streaming_pipeline(
         ]
         if (
             "subject_attributes" in clip_stages
-            and config.subject_attributes.completion.enabled
             and attribute_completion_backend is None
+            and (
+                config.runtime.gpu_workers.reference_edit is not None
+                or config.runtime.gpu_workers.subject_attributes_completion
+                is not None
+            )
             and "reference_edit" not in worker_stages
         ):
             worker_stages.append("reference_edit")
@@ -377,7 +381,7 @@ def _run_streaming_pipeline(
                     not streaming_model_stage_enabled(config, stage)
                     and not (
                         stage == "reference_edit"
-                        and config.subject_attributes.completion.enabled
+                        and "subject_attributes" in clip_stages
                     )
                 )
             ):
@@ -475,18 +479,21 @@ def _run_streaming_pipeline(
                         inference_lock=attribute_inference_lock,
                     )
                 )
-            if config.subject_attributes.completion.enabled:
-                if attribute_completion_backend is None:
-                    completion_process = processes.get(
-                        "attribute_completion"
-                    ) or processes.get("reference_edit")
-                    if completion_process is None or isinstance(
-                        completion_process, PersistentStageProcessPool
-                    ):
-                        raise ValueError(
-                            "attribute completion requires persistent Boogu worker"
-                        )
+            if attribute_completion_backend is None:
+                completion_process = processes.get(
+                    "attribute_completion"
+                ) or processes.get("reference_edit")
+                if isinstance(completion_process, PersistentStageProcessPool):
+                    raise ValueError(
+                        "attribute variants require persistent Boogu worker"
+                    )
+                if completion_process is not None:
                     attribute_completion_backend = completion_process
+                elif config.subject_attributes.completion.enabled:
+                    raise ValueError(
+                        "attribute completion requires persistent Boogu worker"
+                    )
+            if config.subject_attributes.completion.enabled:
                 if attribute_completion_judge is None:
                     service = config.qwen.candidate_judge
                     assert service is not None
