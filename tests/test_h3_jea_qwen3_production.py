@@ -28,9 +28,7 @@ from r2v_data_v2.h3.visual_production_source import (
 )
 from r2v_data_v2.v3.subject_attributes import (
     EnrichedSample,
-    OwnershipGeometry,
     SubjectAttributeRecord,
-    SubjectAttributeReview,
 )
 
 
@@ -51,6 +49,141 @@ def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     )
 
 
+def _attribute_record(
+    *,
+    image_path: str,
+    default_variant: str | None = None,
+    final_selection: str = "raw",
+) -> SubjectAttributeRecord:
+    completed = final_selection == "completed"
+    payload: dict[str, object] = {
+        "attribute_id": "a1",
+        "owner_entity_id": "e1",
+        "attribute_type": "hair",
+        "phrase": "dark hair",
+        "grounding_prompt": "the person's dark hair",
+        "status": "accepted",
+        "image_path": image_path,
+        "source_frame_index": 6,
+        "source_frame_slot": 6,
+        "owner_candidate_id": "candidate_1",
+        "same_frame_as_owner_reference": False,
+        "sam3_prompt": "dark hair",
+        "ownership_geometry": {
+            "passed": True,
+            "reason": "passed",
+            "owner_overlap_ratio": 1.0,
+            "maximum_other_owner_overlap_ratio": 0.0,
+            "attribute_to_owner_area_ratio": 0.2,
+            "near_owner_region": True,
+            "attribute_area_pixels": 100,
+            "attribute_long_side_pixels": 20,
+            "significant_component_count": 1,
+            "largest_component_ratio": 1.0,
+            "second_largest_component_ratio": 0.0,
+        },
+        "review": {
+            "attribute_id": "a1",
+            "matches_attribute": True,
+            "owner_binding_correct": True,
+            "recognizable": True,
+            "characteristic_appearance_visible": True,
+            "usable_as_attribute_condition": True,
+            "structure_complete": True,
+            "completion_recommended": False,
+            "reason": "accepted",
+        },
+        "final_selection": final_selection,
+        "completion_attempted": completed,
+        "completion_outcome": (
+            "selected_completed" if completed else "not_attempted"
+        ),
+        "reason": "accepted",
+    }
+    if completed:
+        payload["completion_seed"] = 17
+        payload["completion_review"] = {
+            "verdict": "accept",
+            "same_physical_entity": True,
+            "identity_preserved": True,
+            "original_visible_attributes_preserved": True,
+            "exactly_one_entity": True,
+            "missing_parts_plausibly_completed": True,
+            "no_duplicate_entity": True,
+            "no_unrelated_entity": True,
+            "no_severe_structure_artifact": True,
+            "style_coherent": True,
+            "resolution_usable": True,
+            "reference_usable": True,
+            "certain": True,
+            "reason": "accepted",
+        }
+    if default_variant is not None:
+        alpha_path = (
+            image_path
+            if default_variant == "alpha"
+            else "references/ordinary/hair-alpha.png"
+        )
+        bbox_path = (
+            image_path
+            if default_variant == "bbox"
+            else "references/ordinary/hair-bbox.png"
+        )
+        generated_path = (
+            image_path
+            if default_variant == "generated_background"
+            else "references/ordinary/hair-generated.png"
+        )
+
+        def variant(
+            *,
+            name: str,
+            path: str,
+            synthetic: bool,
+        ) -> dict[str, object]:
+            selected = default_variant == name
+            return {
+                "image_path": path,
+                "status": "accepted" if selected else "available",
+                "reviewed": selected,
+                "review_status": "accepted" if selected else "not_reviewed",
+                "reason": "selected default" if selected else "available",
+                "synthetic": synthetic,
+                "source_frame_index": 6,
+            }
+
+        payload.update(
+            {
+                "variants": {
+                    "alpha": variant(
+                        name="alpha",
+                        path=alpha_path,
+                        synthetic=False,
+                    ),
+                    "bbox": variant(
+                        name="bbox",
+                        path=bbox_path,
+                        synthetic=False,
+                    ),
+                    "generated_background": variant(
+                        name="generated_background",
+                        path=generated_path,
+                        synthetic=True,
+                    ),
+                },
+                "default_variant": default_variant,
+                "default_image_path": image_path,
+                "default_reason": "Visual-selected default",
+                "accepted_base_image_path": (
+                    image_path
+                    if default_variant in {"alpha", "accepted_base"}
+                    else "references/ordinary/hair-accepted-base.png"
+                ),
+            }
+        )
+    return SubjectAttributeRecord.model_validate(payload)
+
+
 def _sample(
     tmp_path: Path,
     *,
@@ -60,6 +193,7 @@ def _sample(
     source_relative_path: str,
     parent_video_id: str = "legacy-parent",
     with_attribute: bool = False,
+    with_latest_reference_fields: bool = False,
 ) -> tuple[dict[str, object], Path, Path]:
     production = tmp_path / "visual-production"
     runs = tmp_path / "visual-runs"
@@ -127,6 +261,109 @@ def _sample(
             },
         },
     }
+    if with_latest_reference_fields:
+        references[0]["entity_id"] = "e1"
+        selected_path = f"clips/{clip_uid}/selected/subject.png"
+        ready_reference = {
+            "entity_id": "e1",
+            "status": "ready",
+            "reference_scope": "full",
+            "visible_region": "whole",
+            "whole_entity_recognizable": True,
+            "identity_features_visible": True,
+            "scope_reason": "complete subject",
+            "image_path": selected_path,
+            "source_frame_index": 0,
+            "synthetic": False,
+        }
+        clip.update(
+            {
+                "annotation": {
+                    "status": "ready",
+                    "t2v_caption": "A person stands in view.",
+                    "entities": [
+                        {
+                            "entity_id": "e1",
+                            "reference_type": "subject",
+                            "phrase": "A person",
+                            "grounding_prompt": "a person",
+                        }
+                    ],
+                },
+                "coverage": {
+                    "passed": True,
+                    "qualifying_entity_ids": ["e1"],
+                    "required_visible_frames": 7,
+                    "entity_visibility_summary": {
+                        "e1": {
+                            "status": "ready",
+                            "visible_frame_slots": list(range(7)),
+                            "visible_frame_count": 7,
+                            "coverage_ratio": 0.7,
+                            "qualifies": True,
+                            "per_frame_area_ratio": [0.1] * 7 + [0.0] * 3,
+                            "per_frame_confidence": [0.9] * 7 + [None] * 3,
+                        }
+                    },
+                },
+                "references": {
+                    "entities": [ready_reference],
+                    "background": None,
+                },
+                "pairing": {
+                    "status": "ready",
+                    "retained_entity_ids": ["e1"],
+                    "tokens": {"e1": "<ref_subject_1>"},
+                    "background_token": None,
+                },
+                "reference_edit": {
+                    "status": "ready",
+                    "entities": [
+                        {
+                            "entity_id": "e1",
+                            "route": "complete",
+                            "status": "not_required",
+                            "source_reference": ready_reference,
+                            "source_image_path": selected_path,
+                            "variants": {
+                                "alpha": {
+                                    "image_path": selected_path,
+                                    "status": "accepted",
+                                    "reviewed": True,
+                                    "review_status": "accepted",
+                                    "reason": "raw accepted",
+                                    "synthetic": False,
+                                    "source_frame_index": 0,
+                                },
+                                "bbox": {
+                                    "image_path": (
+                                        f"clips/{clip_uid}/selected/subject-bbox.png"
+                                    ),
+                                    "status": "available",
+                                    "reviewed": False,
+                                    "review_status": "not_reviewed",
+                                    "reason": "available",
+                                    "synthetic": False,
+                                    "source_frame_index": 0,
+                                },
+                                "generated_background": {
+                                    "status": "unavailable",
+                                    "reviewed": False,
+                                    "review_status": "not_generated",
+                                    "reason": "not generated",
+                                    "synthetic": True,
+                                    "source_frame_index": 0,
+                                },
+                            },
+                            "default_variant": "alpha",
+                            "default_image_path": selected_path,
+                            "default_reason": "raw reference accepted",
+                            "output_image_path": selected_path,
+                        }
+                    ],
+                },
+            }
+        )
     clip_path = runs / shard_id / "clips" / clip_uid / "clip.json"
     clip_path.parent.mkdir(parents=True, exist_ok=True)
     clip_path.write_text(json.dumps(clip, ensure_ascii=False), encoding="utf-8")
@@ -154,6 +391,9 @@ def _dataset_inventory(
     tmp_path: Path,
     *,
     with_enriched: bool = False,
+    attribute_default_variant: str | None = None,
+    attribute_final_selection: str = "raw",
+    legacy_enriched: bool = False,
 ) -> object:
     export_root = tmp_path / "visual-export"
     run_root = tmp_path / "single-visual-run"
@@ -230,45 +470,10 @@ def _dataset_inventory(
         attribute = run_root / "subject_attributes" / attribute_path
         attribute.parent.mkdir(parents=True)
         attribute.write_bytes(b"hair")
-        record = SubjectAttributeRecord(
-            attribute_id="a1",
-            owner_entity_id="e1",
-            attribute_type="hair",
-            phrase="dark hair",
-            grounding_prompt="the person's dark hair",
-            status="accepted",
+        record = _attribute_record(
             image_path=attribute_path,
-            source_frame_index=6,
-            source_frame_slot=6,
-            owner_candidate_id="candidate_1",
-            same_frame_as_owner_reference=False,
-            sam3_prompt="dark hair",
-            ownership_geometry=OwnershipGeometry(
-                passed=True,
-                reason="passed",
-                owner_overlap_ratio=1.0,
-                maximum_other_owner_overlap_ratio=0.0,
-                attribute_to_owner_area_ratio=0.2,
-                near_owner_region=True,
-                attribute_area_pixels=100,
-                attribute_long_side_pixels=20,
-                significant_component_count=1,
-                largest_component_ratio=1.0,
-                second_largest_component_ratio=0.0,
-            ),
-            review=SubjectAttributeReview(
-                attribute_id="a1",
-                matches_attribute=True,
-                owner_binding_correct=True,
-                recognizable=True,
-                characteristic_appearance_visible=True,
-                usable_as_attribute_condition=True,
-                structure_complete=True,
-                completion_recommended=False,
-                reason="accepted",
-            ),
-            final_selection="raw",
-            reason="accepted",
+            default_variant=attribute_default_variant,
+            final_selection=attribute_final_selection,
         )
         enriched = EnrichedSample(
             sample_id="ordinary",
@@ -300,6 +505,7 @@ def _dataset_inventory(
                     "origin": "attribute_enrichment",
                     "attribute_id": "a1",
                     "owner_entity_id": "e1",
+                    "attribute_type": "hair",
                     "image_path": attribute_path,
                     "source_frame_index": 6,
                 },
@@ -332,9 +538,21 @@ def _dataset_inventory(
             ],
             accepted_attributes=[record],
         )
+        enriched_payload = enriched.model_dump(mode="json")
+        if legacy_enriched:
+            enriched_payload["references"][1].pop("attribute_type")
+            for field in (
+                "completion_seed",
+                "variants",
+                "default_variant",
+                "default_image_path",
+                "default_reason",
+                "accepted_base_image_path",
+            ):
+                enriched_payload["accepted_attributes"][0].pop(field)
         _jsonl(
             run_root / "subject_attributes" / "enriched_samples.jsonl",
-            [enriched.model_dump(mode="json")],
+            [enriched_payload],
         )
     return load_visual_production_inventory(
         visual_production_root=export_root,
@@ -365,6 +583,32 @@ def test_canonical_source_loads_multiple_shards(tmp_path: Path) -> None:
     assert inventory.visual_input_schema == "r2v.v3.production_sample.1"
     assert inventory.visual_input_mode == "compacted_production"
     assert [item.identity.clip_uid for item in inventory.clips] == ["clip-a", "clip-b"]
+
+
+def test_audio_loader_reads_latest_variant_aware_clip_record(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "clip-latest",
+                "shard_id": "shard-latest",
+                "clip_relative_path": "节目/集合/ep-latest_0.mp4",
+                "source_relative_path": "节目/集合/ep-latest.mkv",
+                "with_latest_reference_fields": True,
+            }
+        ],
+    )
+
+    reference_edit = inventory.clips[0].clip.reference_edit
+    assert reference_edit is not None
+    latest = reference_edit.entities[0]
+    assert latest.default_variant == "alpha"
+    assert latest.default_image_path == latest.source_image_path
+    assert latest.variants is not None
+    assert latest.variants.alpha.status == "accepted"
+    assert latest.variants.bbox.status == "available"
 
 
 def test_dataset_sample_single_run_normalizes_references_and_identity(
@@ -417,6 +661,62 @@ def test_dataset_sample_enriched_sidecar_preserves_attribute_provenance(
     assert attribute.image_path == "references/ordinary/hair.png"
     assert Path(attribute.artifact_path).read_bytes() == b"hair"
     assert [reference.entity_id for reference in clip.subject_references] == ["e1"]
+
+
+def test_legacy_enriched_attribute_without_variant_fields_still_loads(
+    tmp_path: Path,
+) -> None:
+    inventory = _dataset_inventory(
+        tmp_path,
+        with_enriched=True,
+        attribute_final_selection="completed",
+        legacy_enriched=True,
+    )
+    sidecar = json.loads(
+        (
+            tmp_path
+            / "single-visual-run/subject_attributes/enriched_samples.jsonl"
+        ).read_text(encoding="utf-8")
+    )
+    legacy_record = sidecar["accepted_attributes"][0]
+    assert "variants" not in legacy_record
+    assert "default_variant" not in legacy_record
+    assert "default_image_path" not in legacy_record
+
+    attribute = inventory.clips[0].sample.references[1]
+    assert attribute.image_path == legacy_record["image_path"]
+    assert attribute.synthetic is True
+
+
+@pytest.mark.parametrize(
+    ("default_variant", "final_selection", "expected_synthetic"),
+    [
+        ("generated_background", "raw", True),
+        ("bbox", "raw", False),
+        ("accepted_base", "completed", True),
+        ("alpha", "raw", False),
+        ("accepted_base", "raw", False),
+    ],
+)
+def test_variant_aware_attribute_uses_visual_selected_image_and_synthetic_rule(
+    tmp_path: Path,
+    default_variant: str,
+    final_selection: str,
+    expected_synthetic: bool,
+) -> None:
+    inventory = _dataset_inventory(
+        tmp_path,
+        with_enriched=True,
+        attribute_default_variant=default_variant,
+        attribute_final_selection=final_selection,
+    )
+
+    attribute = inventory.clips[0].sample.references[1]
+    assert attribute.image_path == "references/ordinary/hair.png"
+    assert Path(attribute.artifact_path).read_bytes() == b"hair"
+    assert attribute.synthetic is expected_synthetic
+    assert "default_variant" not in attribute.model_dump()
+    assert "variants" not in attribute.model_dump()
 
 
 def test_dataset_sample_dry_run_reports_detected_input_layout(tmp_path: Path) -> None:

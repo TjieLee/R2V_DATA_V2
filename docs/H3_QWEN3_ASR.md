@@ -11,6 +11,13 @@ export VISUAL_RUNS_ROOT=/mnt/workspace/litengjie/data/r2v_v3_runs/production/jea
 export AUDIO_PRODUCTION_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs/production/jea_motion_v1/prod-v1
 ```
 
+This Audio integration is synchronized with Visual head
+`71276f976ed178242abe4db3e66e3fecce357832`. Ordinary V3 input supports both
+legacy enriched sidecars and the latest variant-aware sidecars. H3 consumes
+only the Visual-selected default attribute image at
+`SubjectAttributeRecord.image_path`; choosing among alpha, bbox, generated
+background, and accepted-base variants remains owned by Visual.
+
 Only `$VISUAL_PRODUCTION_ROOT/samples.jsonl` selects canonical Visual samples.
 The loader detects one of two supported layouts from its first non-empty row:
 

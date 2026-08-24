@@ -195,7 +195,26 @@ def _load_enriched_samples(run_root: Path) -> dict[str, EnrichedSample]:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
-            enriched = EnrichedSample.model_validate_json(line)
+            raw = json.loads(line)
+            if not isinstance(raw, dict):
+                raise TypeError(
+                    f"enriched sample at {path}:{line_number} is not an object"
+                )
+            attribute_types = {
+                record.get("attribute_id"): record.get("attribute_type")
+                for record in raw.get("accepted_attributes", [])
+                if isinstance(record, dict)
+            }
+            for reference in raw.get("references", []):
+                if (
+                    isinstance(reference, dict)
+                    and reference.get("kind") == "attribute"
+                    and reference.get("attribute_type") is None
+                ):
+                    reference["attribute_type"] = attribute_types.get(
+                        reference.get("attribute_id")
+                    )
+            enriched = EnrichedSample.model_validate(raw)
             if Path(enriched.source_run_root).expanduser().resolve(strict=False) != run_root:
                 raise ValueError(
                     f"enriched source_run_root mismatch at {path}:{line_number}"
@@ -274,7 +293,13 @@ def _normalize_enriched_sample(
                     image_path=record.image_path,
                     artifact_path=str(artifact),
                     source_frame_index=record.source_frame_index,
-                    synthetic=record.final_selection == "completed",
+                    synthetic=(
+                        record.default_variant == "generated_background"
+                        or (
+                            record.default_variant in {None, "accepted_base"}
+                            and record.final_selection == "completed"
+                        )
+                    ),
                 )
             )
             continue
