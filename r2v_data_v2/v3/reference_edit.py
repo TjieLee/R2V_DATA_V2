@@ -31,7 +31,8 @@ from r2v_data_v2.v3.reference_geometry import (
 from r2v_data_v2.v3.reference_integrity import (
     QwenSourceBboxFallbackJudge,
     SourceBboxFallbackJudge,
-    _evaluate_source_bbox,
+    _materialize_source_bbox,
+    _review_materialized_source_bbox,
     _source_bbox_reference,
     _source_context,
     _source_evidence,
@@ -49,9 +50,11 @@ from r2v_data_v2.v3.schemas import (
     EntityReferenceState,
     PairingState,
     ReferenceCompleteness,
+    ReferenceDefaultVariant,
     ReferenceEditEntityState,
     ReferenceEditState,
-    ReferenceFormAssignment,
+    ReferenceVariantState,
+    ReferenceVariantsState,
     ReferencesState,
 )
 from r2v_data_v2.v3.storage import RunStorage
@@ -79,16 +82,11 @@ class ReferenceEditStats:
     scale_collapse_guard_accepted: int = 0
     scale_collapse_guard_rejected: int = 0
     scale_collapse_guard_failed_open: int = 0
-    reference_form_assigned_alpha: int = 0
-    reference_form_assigned_bbox: int = 0
-    reference_form_assigned_generated_background: int = 0
-    reference_form_published_alpha: int = 0
-    reference_form_published_bbox: int = 0
-    reference_form_published_generated_background: int = 0
-    bbox_to_alpha: int = 0
-    generated_background_to_alpha: int = 0
-    boogu_background_candidates_attempted: int = 0
-    boogu_background_candidates_accepted: int = 0
+    bbox_variants_materialized: int = 0
+    bbox_reviews_attempted: int = 0
+    bbox_reviews_skipped_background_accepted: int = 0
+    background_variants_attempted: int = 0
+    background_variants_accepted: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -121,32 +119,18 @@ _SCALE_COLLAPSE_GUARD_COUNTER_FIELDS = (
     "scale_collapse_guard_rejected",
     "scale_collapse_guard_failed_open",
 )
-_REFERENCE_FORM_COUNTER_FIELDS = (
-    "reference_form_assigned_alpha",
-    "reference_form_assigned_bbox",
-    "reference_form_assigned_generated_background",
-    "reference_form_published_alpha",
-    "reference_form_published_bbox",
-    "reference_form_published_generated_background",
-    "bbox_to_alpha",
-    "generated_background_to_alpha",
-    "boogu_background_candidates_attempted",
-    "boogu_background_candidates_accepted",
+_REFERENCE_VARIANT_COUNTER_FIELDS = (
+    "bbox_variants_materialized",
+    "bbox_reviews_attempted",
+    "bbox_reviews_skipped_background_accepted",
+    "background_variants_attempted",
+    "background_variants_accepted",
 )
 _CLIP_COUNTER_FIELDS = (
     *_ENTITY_COUNTER_FIELDS,
     *_SCALE_COLLAPSE_GUARD_COUNTER_FIELDS,
-    *_REFERENCE_FORM_COUNTER_FIELDS,
+    *_REFERENCE_VARIANT_COUNTER_FIELDS,
 )
-
-
-def reference_form_for_entity(
-    clip_uid: str,
-    entity_id: str,
-) -> ReferenceFormAssignment:
-    identity = f"{clip_uid}:{entity_id}".encode("utf-8")
-    bucket = int.from_bytes(hashlib.sha256(identity).digest(), "big") % 3
-    return ("alpha", "bbox", "generated_background")[bucket]
 
 
 def _route(
@@ -218,7 +202,6 @@ def _write_source_selection_metadata(
     source_gate_reason: str | None,
     reason: str,
     operation_metadata_path: Path | None = None,
-    reference_form: ReferenceFormAssignment | None = None,
 ) -> Path:
     if reference.image_path is None:
         raise ValueError("source selection requires a reference image")
@@ -233,7 +216,6 @@ def _write_source_selection_metadata(
         "entity_id": reference.entity_id,
         "final_selection": "source",
         "final_selection_reason": reason,
-        "reference_form_assignment": reference_form,
         "final_reference_path": reference.image_path,
         "final_reference_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
         "selected_operation_metadata_path": (
@@ -248,6 +230,54 @@ def _write_source_selection_metadata(
     }
     write_json_atomic(final_metadata_path, payload)
     return final_metadata_path
+
+
+def _variant(
+    *,
+    image_path: str | None,
+    status: str,
+    reviewed: bool,
+    review_status: str,
+    reason: str,
+    synthetic: bool,
+    metadata_path: str | None = None,
+    source_frame_index: int | None = None,
+) -> ReferenceVariantState:
+    return ReferenceVariantState(
+        image_path=image_path,
+        status=status,
+        reviewed=reviewed,
+        review_status=review_status,
+        reason=reason,
+        synthetic=synthetic,
+        metadata_path=metadata_path,
+        source_frame_index=source_frame_index,
+    )
+
+
+def _variant_state(
+    *,
+    alpha: ReferenceVariantState,
+    bbox: ReferenceVariantState,
+    generated_background: ReferenceVariantState,
+) -> ReferenceVariantsState:
+    return ReferenceVariantsState(
+        alpha=alpha,
+        bbox=bbox,
+        generated_background=generated_background,
+    )
+
+
+def _mark_bbox_review_skipped(storage: RunStorage, metadata_path: str) -> None:
+    path = _resolve_artifact(storage, metadata_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "status": "review_skipped",
+            "review_status": "skipped_due_to_background_accept",
+        }
+    )
+    write_json_atomic(path, payload)
 
 
 def _tokens_for_retained(
@@ -653,19 +683,46 @@ def reference_edit_clips(
                         )
                         clip_entity_counters["entities_fallback"] += 1
                         continue
-                    reference_form: ReferenceFormAssignment | None = None
-                    if (
-                        config.reference_integrity.enabled
-                        and entity.reference_type in {"subject", "object"}
+                    normal_variant_route = bool(
+                        entity.reference_type in {"subject", "object"}
                         and route in {"complete", "local_usable"}
-                    ):
-                        reference_form = reference_form_for_entity(
-                            clip.clip_uid,
-                            reference.entity_id,
-                        )
-                        clip_entity_counters[
-                            f"reference_form_assigned_{reference_form}"
-                        ] += 1
+                    )
+                    bbox_evaluation = None
+                    bbox_materialization_error: str | None = None
+                    source_context: Image.Image | None = None
+                    current_reference: Image.Image | None = None
+                    if normal_variant_route:
+                        try:
+                            evidence = _source_evidence(
+                                storage,
+                                clip_uid=clip.clip_uid,
+                                reference=reference,
+                            )
+                            source_context = _source_context(evidence)
+                            with Image.open(
+                                _resolve_artifact(storage, reference.image_path)
+                            ) as opened:
+                                opened.load()
+                                current_reference = opened.copy()
+                            bbox_evaluation = _materialize_source_bbox(
+                                storage=storage,
+                                clip_uid=clip.clip_uid,
+                                entity_id=reference.entity_id,
+                                source_evidence=evidence,
+                                current_reference=current_reference,
+                                current_reference_path=_resolve_artifact(
+                                    storage,
+                                    reference.image_path,
+                                ),
+                                reference=reference,
+                                original_review=None,
+                                diagnostics=None,
+                                crop_padding_ratio=config.pair.crop_padding_ratio,
+                                trigger="variant_bbox_review",
+                            )
+                            clip_entity_counters["bbox_variants_materialized"] += 1
+                        except Exception as exc:  # noqa: BLE001 - alpha remains valid
+                            bbox_materialization_error = f"{type(exc).__name__}:{exc}"
                     operations = _operations(route)
                     if not operations:
                         raise RuntimeError(
@@ -684,9 +741,7 @@ def reference_edit_clips(
                     )
                     for operation in operations:
                         if operation == "add_entity_background":
-                            clip_entity_counters[
-                                "boogu_background_candidates_attempted"
-                            ] += 1
+                            clip_entity_counters["background_variants_attempted"] += 1
                         result = run_boogu_reference_edit(
                             run_root=storage.root,
                             clip_uid=clip.clip_uid,
@@ -723,9 +778,7 @@ def reference_edit_clips(
                             operation == "add_entity_background"
                             and result.status == "accepted"
                         ):
-                            clip_entity_counters[
-                                "boogu_background_candidates_accepted"
-                            ] += 1
+                            clip_entity_counters["background_variants_accepted"] += 1
                         if result.status != "accepted":
                             break
                         if operation == "complete_entity":
@@ -757,194 +810,370 @@ def reference_edit_clips(
                                     "operation": rejected_result.operation,
                                 },
                             )
-                    if reference_form == "alpha":
-                        operation_result = results[attempted_operations[-1]]
-                        final_metadata_path = _write_source_selection_metadata(
-                            storage,
-                            clip_uid=clip.clip_uid,
-                            reference=reference,
-                            geometry=source_geometry,
-                            source_gate_reason=None,
-                            reason="deterministic_distribution_route:alpha",
-                            operation_metadata_path=operation_result.metadata_path,
-                            reference_form=reference_form,
+                    if normal_variant_route:
+                        alpha_variant = _variant(
+                            image_path=reference.image_path,
+                            status="accepted",
+                            reviewed=True,
+                            review_status="accepted_pair_reference",
+                            reason="pair_accepted_source_alpha",
+                            synthetic=False,
+                            source_frame_index=reference.source_frame_index,
                         )
-                        final_references.append(reference)
+                        bbox_variant = _variant(
+                            image_path=(
+                                bbox_evaluation.candidate_relative
+                                if bbox_evaluation is not None
+                                else None
+                            ),
+                            status=(
+                                "available"
+                                if bbox_evaluation is not None
+                                else "unavailable"
+                            ),
+                            reviewed=False,
+                            review_status=(
+                                "not_reviewed"
+                                if bbox_evaluation is not None
+                                else "materialization_failed"
+                            ),
+                            reason=(
+                                "source_bbox_materialized"
+                                if bbox_evaluation is not None
+                                else bbox_materialization_error
+                                or "source_bbox_unavailable"
+                            ),
+                            synthetic=False,
+                            metadata_path=(
+                                bbox_evaluation.metadata_relative
+                                if bbox_evaluation is not None
+                                else None
+                            ),
+                            source_frame_index=reference.source_frame_index,
+                        )
+                        background_metadata_relative = (
+                            storage.relative_artifact_path(
+                                background_result.metadata_path
+                            )
+                            if background_result is not None
+                            else None
+                        )
+                        background_candidate_relative = (
+                            storage.relative_artifact_path(
+                                background_result.candidate_path
+                            )
+                            if background_result is not None
+                            and background_result.candidate_path is not None
+                            else None
+                        )
+                        if (
+                            background_result is not None
+                            and background_result.status == "accepted"
+                            and background_result.candidate_path is not None
+                        ):
+                            if bbox_evaluation is not None:
+                                _mark_bbox_review_skipped(
+                                    storage,
+                                    bbox_evaluation.metadata_relative,
+                                )
+                                bbox_variant = bbox_variant.model_copy(
+                                    update={
+                                        "status": "review_skipped",
+                                        "review_status": (
+                                            "skipped_due_to_background_accept"
+                                        ),
+                                        "reason": (
+                                            "background_variant_accepted_before_bbox_review"
+                                        ),
+                                    }
+                                )
+                                clip_entity_counters[
+                                    "bbox_reviews_skipped_background_accepted"
+                                ] += 1
+                            publication = publish_boogu_final_reference(
+                                run_root=storage.root,
+                                clip_uid=clip.clip_uid,
+                                entity_id=reference.entity_id,
+                                candidate_path=background_result.candidate_path,
+                                selected_metadata_path=background_result.metadata_path,
+                                background_metadata_path=background_result.metadata_path,
+                                final_selection="background_candidate",
+                                final_selection_reason=(
+                                    "accepted_background_variant_preferred"
+                                ),
+                            )
+                            selected_reference = _accepted_reference(
+                                storage,
+                                reference,
+                                clip_uid=clip.clip_uid,
+                                output_path=publication.final_reference_path,
+                                metadata_path=publication.final_metadata_path,
+                                preserve_local_scope=route == "local_usable",
+                            )
+                            generated_variant = _variant(
+                                image_path=selected_reference.image_path,
+                                status="accepted",
+                                reviewed=True,
+                                review_status="accepted",
+                                reason="background_variant_accepted",
+                                synthetic=True,
+                                metadata_path=background_metadata_relative,
+                                source_frame_index=reference.source_frame_index,
+                            )
+                            default_variant: ReferenceDefaultVariant = (
+                                "generated_background"
+                            )
+                            default_reason = "generated_background_review_accepted"
+                            state_status = "accepted"
+                            fallback_policy = "not_used"
+                            state_reason = None
+                            state_metadata = selected_reference.generation_metadata_path
+                        else:
+                            background_reason = (
+                                rejection_reason
+                                or "background_variant_unavailable"
+                            )
+                            generated_variant = _variant(
+                                image_path=background_candidate_relative,
+                                status=(
+                                    "rejected"
+                                    if background_candidate_relative is not None
+                                    else "generation_failed"
+                                ),
+                                reviewed=background_candidate_relative is not None,
+                                review_status=(
+                                    "rejected"
+                                    if background_candidate_relative is not None
+                                    else "generation_failed"
+                                ),
+                                reason=background_reason,
+                                synthetic=True,
+                                metadata_path=background_metadata_relative,
+                                source_frame_index=reference.source_frame_index,
+                            )
+                            guard_rejected = False
+                            if (
+                                rejected_result is not None
+                                and rejected_result.operation
+                                == "add_entity_background"
+                                and background_reason == "entity_scale_collapsed"
+                                and config.reference_edit.scale_collapse_fallback_guard_mode
+                                == "qwen_v1"
+                            ):
+                                clip_entity_counters[
+                                    "scale_collapse_guard_attempted"
+                                ] += 1
+                                guard_attempt: (
+                                    ScaleCollapseFallbackReviewAttempt | None
+                                ) = None
+                                guard_error: (
+                                    ScaleCollapseFallbackJudgeFailure | None
+                                ) = None
+                                try:
+                                    guard_attempt = get_scale_collapse_judge().review(
+                                        image=load_source_reference_image(
+                                            storage,
+                                            reference.image_path,
+                                        ),
+                                        reference_type=entity.reference_type,
+                                        entity_phrase=entity.phrase,
+                                    )
+                                except ScaleCollapseFallbackJudgeFailure as exc:
+                                    guard_error = exc
+                                    clip_entity_counters[
+                                        "scale_collapse_guard_failed_open"
+                                    ] += 1
+                                else:
+                                    guard_rejected = (
+                                        guard_attempt.review.verdict == "reject"
+                                    )
+                                    clip_entity_counters[
+                                        "scale_collapse_guard_rejected"
+                                        if guard_rejected
+                                        else "scale_collapse_guard_accepted"
+                                    ] += 1
+                                _write_scale_collapse_guard_diagnostic(
+                                    config,
+                                    storage,
+                                    clip_uid=clip.clip_uid,
+                                    entity=entity,
+                                    attempt=guard_attempt,
+                                    error=guard_error,
+                                    final_action=(
+                                        "reject_entity"
+                                        if guard_rejected
+                                        else "keep_source"
+                                    ),
+                                )
+                            if guard_rejected:
+                                guard_reason = (
+                                    "scale_collapse_source_guard_rejected"
+                                )
+                                final_references.append(
+                                    _rejected_reference(reference, guard_reason)
+                                )
+                                edit_states.append(
+                                    ReferenceEditEntityState(
+                                        entity_id=reference.entity_id,
+                                        route=route,
+                                        status="rejected",
+                                        source_reference=reference,
+                                        source_image_path=reference.image_path,
+                                        operation="add_entity_background",
+                                        metadata_path=background_metadata_relative,
+                                        operations=attempted_operations,
+                                        background_metadata_path=(
+                                            background_metadata_relative
+                                        ),
+                                        fallback_policy="reject_entity",
+                                        reason=guard_reason,
+                                    )
+                                )
+                                clip_entity_counters["entities_rejected"] += 1
+                                continue
+                            selected_reference = reference
+                            default_variant = "alpha"
+                            default_reason = "background_and_bbox_unavailable"
+                            state_status = "fallback"
+                            fallback_policy = "keep_source"
+                            state_reason = background_reason
+                            state_metadata = background_metadata_relative
+                            if (
+                                bbox_evaluation is not None
+                                and source_context is not None
+                                and current_reference is not None
+                            ):
+                                clip_entity_counters["bbox_reviews_attempted"] += 1
+                                reviewed_bbox = None
+                                try:
+                                    reviewed_bbox = _review_materialized_source_bbox(
+                                        bbox_evaluation,
+                                        storage=storage,
+                                        source_context=source_context,
+                                        current_reference=current_reference,
+                                        reference=reference,
+                                        reference_type=entity.reference_type,
+                                        phrase=entity.phrase,
+                                        grounding_prompt=entity.grounding_prompt,
+                                        trigger="variant_bbox_review",
+                                        judge=get_bbox_route_judge(),
+                                    )
+                                except Exception as exc:  # noqa: BLE001 - alpha fallback
+                                    bbox_variant = bbox_variant.model_copy(
+                                        update={
+                                            "status": "rejected",
+                                            "reviewed": True,
+                                            "review_status": "judge_failed",
+                                            "reason": f"{type(exc).__name__}:{exc}",
+                                        }
+                                    )
+                                else:
+                                    if reviewed_bbox.judge_failure is not None:
+                                        bbox_variant = bbox_variant.model_copy(
+                                            update={
+                                                "status": "rejected",
+                                                "reviewed": True,
+                                                "review_status": "judge_failed",
+                                                "reason": str(
+                                                    reviewed_bbox.judge_failure
+                                                ),
+                                            }
+                                        )
+                                        reviewed_bbox = None
+                                if reviewed_bbox is not None:
+                                    bbox_attempt = reviewed_bbox.attempt
+                                    assert bbox_attempt is not None
+                                    bbox_accepted = (
+                                        bbox_attempt.review.verdict == "accept"
+                                    )
+                                    bbox_variant = bbox_variant.model_copy(
+                                        update={
+                                            "status": (
+                                                "accepted"
+                                                if bbox_accepted
+                                                else "rejected"
+                                            ),
+                                            "reviewed": True,
+                                            "review_status": (
+                                                bbox_attempt.review.verdict
+                                            ),
+                                            "reason": bbox_attempt.review.reason,
+                                        }
+                                    )
+                                    if bbox_accepted:
+                                        selected_reference = _source_bbox_reference(
+                                            reference,
+                                            clip_uid=clip.clip_uid,
+                                            image_path=(
+                                                reviewed_bbox.candidate_relative
+                                            ),
+                                            bbox_xyxy=reviewed_bbox.bbox_xyxy,
+                                            metadata_path=(
+                                                reviewed_bbox.metadata_relative
+                                            ),
+                                        )
+                                        default_variant = "bbox"
+                                        default_reason = "bbox_review_accepted"
+                                        fallback_policy = "source_bbox_fallback"
+                                        state_reason = "bbox_variant_selected"
+                                        state_metadata = (
+                                            reviewed_bbox.metadata_relative
+                                        )
+                            if default_variant == "alpha":
+                                final_metadata_path = _write_source_selection_metadata(
+                                    storage,
+                                    clip_uid=clip.clip_uid,
+                                    reference=reference,
+                                    geometry=source_geometry,
+                                    source_gate_reason=None,
+                                    reason=state_reason or default_reason,
+                                    operation_metadata_path=(
+                                        background_result.metadata_path
+                                        if background_result is not None
+                                        else None
+                                    ),
+                                )
+                                state_metadata = storage.relative_artifact_path(
+                                    final_metadata_path
+                                )
+                        final_references.append(selected_reference)
                         edit_states.append(
                             ReferenceEditEntityState(
                                 entity_id=reference.entity_id,
                                 route=route,
-                                status="fallback",
+                                status=state_status,
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
-                                output_image_path=reference.image_path,
-                                reference_form=reference_form,
-                                operation=operation_result.operation,
-                                metadata_path=storage.relative_artifact_path(
-                                    final_metadata_path
+                                output_image_path=selected_reference.image_path,
+                                variants=_variant_state(
+                                    alpha=alpha_variant,
+                                    bbox=bbox_variant,
+                                    generated_background=generated_variant,
                                 ),
+                                default_variant=default_variant,
+                                default_image_path=selected_reference.image_path,
+                                default_reason=default_reason,
+                                operation=attempted_operations[-1],
+                                metadata_path=state_metadata,
                                 operations=attempted_operations,
                                 background_metadata_path=(
-                                    storage.relative_artifact_path(
-                                        background_result.metadata_path
-                                    )
-                                    if background_result is not None
+                                    background_metadata_relative
+                                ),
+                                fallback_policy=fallback_policy,
+                                source_bbox_fallback_metadata_path=(
+                                    bbox_evaluation.metadata_relative
+                                    if default_variant == "bbox"
+                                    and bbox_evaluation is not None
                                     else None
                                 ),
-                                fallback_policy="keep_source",
-                                reason="deterministic_distribution_route:alpha",
+                                reason=state_reason,
                             )
                         )
-                        clip_entity_counters["entities_fallback"] += 1
-                        clip_entity_counters["reference_form_published_alpha"] += 1
-                        continue
-                    if reference_form == "bbox":
-                        operation_result = results[attempted_operations[-1]]
-                        bbox_reason = "distribution_bbox_route_rejected"
-                        bbox_reference: EntityReferenceState | None = None
-                        bbox_metadata_relative: str | None = None
-                        try:
-                            if reference.source_clip_uid not in {
-                                None,
-                                clip.clip_uid,
-                            } or reference.source_entity_id not in {
-                                None,
-                                reference.entity_id,
-                            }:
-                                raise ValueError(
-                                    "distribution bbox requires self-source provenance"
-                                )
-                            evidence = _source_evidence(
-                                storage,
-                                clip_uid=clip.clip_uid,
-                                reference=reference,
-                            )
-                            context = _source_context(evidence)
-                            with Image.open(geometry_source_image_path) as opened:
-                                opened.load()
-                                current_reference = opened.copy()
-                            bbox_evaluation = _evaluate_source_bbox(
-                                storage=storage,
-                                clip_uid=clip.clip_uid,
-                                entity_id=reference.entity_id,
-                                source_evidence=evidence,
-                                source_context=context,
-                                current_reference=current_reference,
-                                current_reference_path=geometry_source_image_path,
-                                reference=reference,
-                                reference_type=entity.reference_type,
-                                phrase=entity.phrase,
-                                grounding_prompt=entity.grounding_prompt,
-                                original_review=None,
-                                diagnostics=None,
-                                crop_padding_ratio=config.pair.crop_padding_ratio,
-                                trigger="distribution_bbox_route",
-                                judge=get_bbox_route_judge(),
-                            )
-                            bbox_metadata_relative = (
-                                bbox_evaluation.metadata_relative
-                            )
-                            if bbox_evaluation.judge_failure is not None:
-                                bbox_reason = (
-                                    "distribution_bbox_route_judge_failed:"
-                                    f"{bbox_evaluation.judge_failure}"
-                                )
-                            else:
-                                bbox_attempt = bbox_evaluation.attempt
-                                assert bbox_attempt is not None
-                                if bbox_attempt.review.verdict == "accept":
-                                    bbox_reference = _source_bbox_reference(
-                                        reference,
-                                        clip_uid=clip.clip_uid,
-                                        image_path=(
-                                            bbox_evaluation.candidate_relative
-                                        ),
-                                        bbox_xyxy=bbox_evaluation.bbox_xyxy,
-                                        metadata_path=(
-                                            bbox_evaluation.metadata_relative
-                                        ),
-                                    )
-                                    bbox_reason = "distribution_bbox_route_selected"
-                                else:
-                                    bbox_reason = (
-                                        "distribution_bbox_route_rejected:"
-                                        f"{bbox_attempt.review.reason}"
-                                    )
-                        except Exception as exc:  # noqa: BLE001 - safe alpha fallback
-                            bbox_reason = f"distribution_bbox_route_failed:{exc}"
-                        if bbox_reference is not None:
-                            final_references.append(bbox_reference)
-                            edit_states.append(
-                                ReferenceEditEntityState(
-                                    entity_id=reference.entity_id,
-                                    route=route,
-                                    status="fallback",
-                                    source_reference=reference,
-                                    source_image_path=reference.image_path,
-                                    output_image_path=bbox_reference.image_path,
-                                    reference_form=reference_form,
-                                    operation=operation_result.operation,
-                                    metadata_path=bbox_metadata_relative,
-                                    operations=attempted_operations,
-                                    background_metadata_path=(
-                                        storage.relative_artifact_path(
-                                            background_result.metadata_path
-                                        )
-                                        if background_result is not None
-                                        else None
-                                    ),
-                                    fallback_policy="source_bbox_fallback",
-                                    source_bbox_fallback_metadata_path=(
-                                        bbox_metadata_relative
-                                    ),
-                                    reason=bbox_reason,
-                                )
-                            )
-                            clip_entity_counters[
-                                "reference_form_published_bbox"
-                            ] += 1
-                        else:
-                            final_metadata_path = _write_source_selection_metadata(
-                                storage,
-                                clip_uid=clip.clip_uid,
-                                reference=reference,
-                                geometry=source_geometry,
-                                source_gate_reason=None,
-                                reason=bbox_reason,
-                                operation_metadata_path=(
-                                    operation_result.metadata_path
-                                ),
-                                reference_form=reference_form,
-                            )
-                            final_references.append(reference)
-                            edit_states.append(
-                                ReferenceEditEntityState(
-                                    entity_id=reference.entity_id,
-                                    route=route,
-                                    status="fallback",
-                                    source_reference=reference,
-                                    source_image_path=reference.image_path,
-                                    output_image_path=reference.image_path,
-                                    reference_form=reference_form,
-                                    operation=operation_result.operation,
-                                    metadata_path=storage.relative_artifact_path(
-                                        final_metadata_path
-                                    ),
-                                    operations=attempted_operations,
-                                    background_metadata_path=(
-                                        storage.relative_artifact_path(
-                                            background_result.metadata_path
-                                        )
-                                        if background_result is not None
-                                        else None
-                                    ),
-                                    fallback_policy="keep_source",
-                                    reason=bbox_reason,
-                                )
-                            )
-                            clip_entity_counters["reference_form_published_alpha"] += 1
-                            clip_entity_counters["bbox_to_alpha"] += 1
-                        clip_entity_counters["entities_fallback"] += 1
+                        clip_entity_counters[
+                            "entities_accepted"
+                            if state_status == "accepted"
+                            else "entities_fallback"
+                        ] += 1
                         continue
                     if len(results) == len(operations) and all(
                         result.status == "accepted" for result in results.values()
@@ -992,7 +1221,6 @@ def reference_edit_clips(
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
                                 output_image_path=accepted.image_path,
-                                reference_form=reference_form,
                                 operation=operations[-1],
                                 metadata_path=accepted.generation_metadata_path,
                                 operations=attempted_operations,
@@ -1013,10 +1241,6 @@ def reference_edit_clips(
                             )
                         )
                         clip_entity_counters["entities_accepted"] += 1
-                        if reference_form == "generated_background":
-                            clip_entity_counters[
-                                "reference_form_published_generated_background"
-                            ] += 1
                         continue
 
                     assert rejected_result is not None
@@ -1126,7 +1350,6 @@ def reference_edit_clips(
                         guard_rejected = False
                         if (
                             rejected_result.operation == "add_entity_background"
-                            and reference_form is None
                             and rejection_reason == "entity_scale_collapsed"
                             and config.reference_edit.scale_collapse_fallback_guard_mode
                             == "qwen_v1"
@@ -1215,7 +1438,6 @@ def reference_edit_clips(
                             source_gate_reason=None,
                             reason=rejection_reason,
                             operation_metadata_path=rejected_result.metadata_path,
-                            reference_form=reference_form,
                         )
                         final_references.append(reference)
                         edit_states.append(
@@ -1226,7 +1448,6 @@ def reference_edit_clips(
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
                                 output_image_path=reference.image_path,
-                                reference_form=reference_form,
                                 operation=rejected_result.operation,
                                 metadata_path=storage.relative_artifact_path(
                                     final_metadata_path
@@ -1251,13 +1472,6 @@ def reference_edit_clips(
                             )
                         )
                         clip_entity_counters["entities_fallback"] += 1
-                        if reference_form == "generated_background":
-                            clip_entity_counters[
-                                "reference_form_published_alpha"
-                            ] += 1
-                            clip_entity_counters[
-                                "generated_background_to_alpha"
-                            ] += 1
                     else:
                         final_references.append(
                             _rejected_reference(
@@ -1376,28 +1590,13 @@ def reference_edit_clips(
         + stats.scale_collapse_guard_failed_open
     ):
         raise RuntimeError("scale-collapse guard outcomes must match attempts")
-    assigned = (
-        stats.reference_form_assigned_alpha
-        + stats.reference_form_assigned_bbox
-        + stats.reference_form_assigned_generated_background
-    )
-    published = (
-        stats.reference_form_published_alpha
-        + stats.reference_form_published_bbox
-        + stats.reference_form_published_generated_background
-    )
-    if assigned != published:
-        raise RuntimeError("reference form assignments must match publications")
-    if (
-        stats.bbox_to_alpha > stats.reference_form_assigned_bbox
-        or stats.generated_background_to_alpha
-        > stats.reference_form_assigned_generated_background
-    ):
-        raise RuntimeError("reference form fallback counts exceed assignments")
-    if (
-        stats.boogu_background_candidates_accepted
-        > stats.boogu_background_candidates_attempted
-    ):
+    if stats.background_variants_accepted > stats.background_variants_attempted:
         raise RuntimeError("accepted Boogu background candidates exceed attempts")
+    if (
+        stats.bbox_reviews_skipped_background_accepted
+        > stats.bbox_variants_materialized
+        or stats.bbox_reviews_attempted > stats.bbox_variants_materialized
+    ):
+        raise RuntimeError("bbox variant review counts exceed materialized variants")
     storage.update_stage_counts("reference_edit", stats.to_dict())
     return stats

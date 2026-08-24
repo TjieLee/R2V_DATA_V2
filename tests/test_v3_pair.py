@@ -56,7 +56,6 @@ from r2v_data_v2.v3.reference_edit import (
     BACKGROUND_PROMPT,
     COMPLETION_PROMPT_TEMPLATE,
     reference_edit_clips,
-    reference_form_for_entity,
 )
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguBackgroundReview,
@@ -200,7 +199,7 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _enable_reference_form_routing(config: V3Config) -> V3Config:
+def _enable_variant_reviews(config: V3Config) -> V3Config:
     model = config.qwen.reference_edit_judge
     assert model is not None
     routed = replace(
@@ -4576,121 +4575,24 @@ def _write_touching_local_reference(
     return path
 
 
-def test_reference_form_assignment_is_stable_and_balanced() -> None:
-    assert reference_form_for_entity("clip-1", "e1") == "bbox"
-    assert reference_form_for_entity("clip-1", "e1") == "bbox"
-    counts = {"alpha": 0, "bbox": 0, "generated_background": 0}
-    for index in range(3000):
-        counts[reference_form_for_entity(f"clip-{index}", "e1")] += 1
-
-    assert sum(counts.values()) == 3000
-    assert all(900 <= count <= 1100 for count in counts.values())
+def test_reference_edit_has_no_hash_or_modulo_form_assignment() -> None:
+    assert not hasattr(reference_edit_module, "reference_form_for_entity")
+    fields = reference_edit_module.ReferenceEditStats.__dataclass_fields__
+    assert not any(name.startswith("reference_form_assigned") for name in fields)
+    assert "bbox_to_alpha" not in fields
+    assert "generated_background_to_alpha" not in fields
 
 
-def test_alpha_form_keeps_source_but_preserves_boogu_candidate(
+def test_background_accept_keeps_all_variants_and_skips_bbox_qwen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _enable_reference_form_routing(
+    config = _enable_variant_reviews(
         _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     )
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge())
-    source = storage.read_clip("clip-1").references.entities[0]
-    monkeypatch.setattr(
-        reference_edit_module,
-        "reference_form_for_entity",
-        lambda clip_uid, entity_id: "alpha",
-    )
-
-    stats = reference_edit_clips(
-        config,
-        storage,
-        backend=_ReferenceEditBackend(),
-        judge=_ReferenceEditJudge(),
-        sam_reviewer=_ReferenceEditSamReviewer(),
-    )
-
-    clip = storage.read_clip("clip-1")
-    edit = clip.reference_edit.entities[0]
-    assert clip.references.entities == [source]
-    assert edit.reference_form == "alpha"
-    assert edit.fallback_policy == "keep_source"
-    assert edit.reason == "deterministic_distribution_route:alpha"
-    assert (
-        storage.reference_edit_dir("clip-1")
-        / "e1"
-        / "background_candidate_1k.png"
-    ).is_file()
-    assert edit.background_metadata_path is not None
-    assert stats.reference_form_assigned_alpha == 1
-    assert stats.reference_form_published_alpha == 1
-    assert stats.boogu_background_candidates_attempted == 1
-    assert stats.boogu_background_candidates_accepted == 1
-
-
-@pytest.mark.parametrize(
-    ("background_accept", "expected_synthetic", "expected_fallbacks"),
-    [(True, True, 0), (False, False, 1)],
-)
-def test_generated_background_form_selects_candidate_or_alpha_fallback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    background_accept: bool,
-    expected_synthetic: bool,
-    expected_fallbacks: int,
-) -> None:
-    config = _enable_reference_form_routing(
-        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
-    )
-    storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
-    monkeypatch.setattr(
-        reference_edit_module,
-        "reference_form_for_entity",
-        lambda clip_uid, entity_id: "generated_background",
-    )
-
-    stats = reference_edit_clips(
-        config,
-        storage,
-        backend=_ReferenceEditBackend(),
-        judge=_ReferenceEditJudge(accept=background_accept),
-        sam_reviewer=_ReferenceEditSamReviewer(),
-    )
-
-    clip = storage.read_clip("clip-1")
-    reference = clip.references.entities[0]
-    edit = clip.reference_edit.entities[0]
-    assert reference.synthetic is expected_synthetic
-    assert edit.reference_form == "generated_background"
-    assert stats.reference_form_assigned_generated_background == 1
-    assert stats.generated_background_to_alpha == expected_fallbacks
-    assert len(clip.references.entities) == 1
-
-
-@pytest.mark.parametrize(
-    ("accept", "fail", "expected_bbox"),
-    [(True, False, True), (False, False, False), (True, True, False)],
-)
-def test_bbox_form_reuses_source_bbox_judge_and_falls_back_to_alpha(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    accept: bool,
-    fail: bool,
-    expected_bbox: bool,
-) -> None:
-    config = _enable_reference_form_routing(
-        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
-    )
-    storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
-    monkeypatch.setattr(
-        reference_edit_module,
-        "reference_form_for_entity",
-        lambda clip_uid, entity_id: "bbox",
-    )
-    bbox_judge = _ReferenceFormBboxJudge(accept=accept, fail=fail)
+    bbox_judge = _ReferenceFormBboxJudge()
 
     stats = reference_edit_clips(
         config,
@@ -4702,37 +4604,72 @@ def test_bbox_form_reuses_source_bbox_judge_and_falls_back_to_alpha(
     )
 
     clip = storage.read_clip("clip-1")
+    edit = clip.reference_edit.entities[0]
+    assert edit.variants is not None
+    assert edit.default_variant == "generated_background"
+    assert edit.variants.alpha.status == "accepted"
+    assert edit.variants.bbox.status == "review_skipped"
+    assert edit.variants.bbox.review_status == "skipped_due_to_background_accept"
+    assert edit.variants.generated_background.status == "accepted"
+    assert (storage.root / edit.variants.bbox.image_path).is_file()
+    assert bbox_judge.calls == []
+    assert len(clip.references.entities) == 1
+    assert clip.references.entities[0].synthetic is True
+    assert stats.bbox_variants_materialized == 1
+    assert stats.bbox_reviews_attempted == 0
+    assert stats.bbox_reviews_skipped_background_accepted == 1
+    assert stats.background_variants_attempted == 1
+    assert stats.background_variants_accepted == 1
+
+
+@pytest.mark.parametrize(
+    ("bbox_accept", "bbox_fail", "expected_default"),
+    [(True, False, "bbox"), (False, False, "alpha"), (True, True, "alpha")],
+)
+def test_background_reject_reviews_bbox_then_falls_back_by_quality(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bbox_accept: bool,
+    bbox_fail: bool,
+    expected_default: str,
+) -> None:
+    config = _enable_variant_reviews(
+        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    bbox_judge = _ReferenceFormBboxJudge(accept=bbox_accept, fail=bbox_fail)
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(accept=False),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        bbox_route_judge=bbox_judge,
+    )
+
+    clip = storage.read_clip("clip-1")
     reference = clip.references.entities[0]
     edit = clip.reference_edit.entities[0]
-    assert reference.source_bbox_fallback is expected_bbox
+    assert edit.variants is not None
+    assert edit.default_variant == expected_default
+    assert edit.variants.generated_background.status == "rejected"
+    assert edit.variants.bbox.status == (
+        "accepted" if expected_default == "bbox" else "rejected"
+    )
+    assert bbox_judge.calls[0]["trigger"] == "variant_bbox_review"
+    assert reference.source_bbox_fallback is (expected_default == "bbox")
     assert reference.synthetic is False
-    assert edit.reference_form == "bbox"
-    assert bbox_judge.calls[0]["trigger"] == "distribution_bbox_route"
     assert len(clip.references.entities) == 1
-    assert stats.reference_form_assigned_bbox == 1
-    assert stats.reference_form_published_bbox == int(expected_bbox)
-    assert stats.bbox_to_alpha == int(not expected_bbox)
-    if expected_bbox:
-        assert edit.fallback_policy == "source_bbox_fallback"
-        assert reference.source_bbox_metadata_path is not None
-        metadata = json.loads(
-            (storage.root / reference.source_bbox_metadata_path).read_text(
-                encoding="utf-8"
-            )
-        )
-        assert metadata["trigger"] == "distribution_bbox_route_v1"
-        assert metadata["source_frame_index"] == reference.source_frame_index
-        with Image.open(storage.root / reference.image_path) as opened:
-            assert opened.mode == "RGB"
-    else:
-        assert edit.fallback_policy == "keep_source"
+    assert stats.bbox_reviews_attempted == 1
 
 
-def test_group_references_do_not_receive_form_assignment(
+def test_group_references_do_not_receive_variant_bundle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _enable_reference_form_routing(
+    config = _enable_variant_reviews(
         _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     )
     group_storage = _storage(config, entity_types=("group",))
@@ -4745,18 +4682,14 @@ def test_group_references_do_not_receive_form_assignment(
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
     assert (
-        group_storage.read_clip("clip-1")
-        .reference_edit.entities[0]
-        .reference_form
+        group_storage.read_clip("clip-1").reference_edit.entities[0].variants
         is None
     )
     assert (
         group_storage.read_clip("clip-1").references.entities[0].synthetic is True
     )
-    assert stats.boogu_background_candidates_attempted == 1
-    assert stats.reference_form_assigned_alpha == 0
-    assert stats.reference_form_assigned_bbox == 0
-    assert stats.reference_form_assigned_generated_background == 0
+    assert stats.background_variants_attempted == 1
+    assert stats.bbox_variants_materialized == 0
 
 
 def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
@@ -4843,6 +4776,26 @@ def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
     sample = json.loads(
         (config.resolved_export_root / "samples.jsonl").read_text(encoding="utf-8")
     )
+    variant_records = [
+        json.loads(line)
+        for line in (
+            config.resolved_export_root / "reference_variants.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(variant_records) == 2
+    assert {record["entity_id"] for record in variant_records} == {"e1", "e2"}
+    assert all(
+        record["default_variant"] == "generated_background"
+        for record in variant_records
+    )
+    assert all(
+        (config.resolved_export_root / variant["image_path"]).is_file()
+        for record in variant_records
+        for variant in record["variants"].values()
+        if variant["image_path"] is not None
+    )
+    assert len(sample["references"]) == 2
     for exported, reference in zip(sample["references"], clip.references.entities):
         assert (config.resolved_export_root / exported["image_path"]).read_bytes() == (
             (storage.root / reference.image_path).read_bytes()
@@ -4968,7 +4921,7 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _enable_reference_form_routing(
+    config = _enable_variant_reviews(
         _config(
             tmp_path,
             monkeypatch,
@@ -5040,9 +4993,8 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     )
     state = storage.read_clip("clip-1").reference_edit.entities[0]
     assert state.reference_form is None
-    assert stats.reference_form_assigned_alpha == 0
-    assert stats.reference_form_assigned_bbox == 0
-    assert stats.reference_form_assigned_generated_background == 0
+    assert state.variants is None
+    assert stats.bbox_variants_materialized == 0
     assert state.operations == ["complete_entity", "add_entity_background"]
     assert state.background_fallback == "none"
     assert (

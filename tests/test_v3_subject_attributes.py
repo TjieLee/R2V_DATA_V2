@@ -3073,3 +3073,194 @@ def test_hard_rejected_or_nonrepairable_raw_never_reaches_boogu(
     assert artifact.metrics.raw_attribute_review_hard_rejected == 1
     assert backend.calls == segmenter.generated_calls == 0
     assert review.calls == [["a1"]]
+
+
+def _attribute_variant_review(*, accepted: bool, background: bool):
+    if background:
+        fields = (
+            "same_attribute_appearance",
+            "shape_color_texture_preserved",
+            "target_is_clear_and_dominant",
+            "no_duplicate_or_unrelated_entity",
+            "background_does_not_occlude_target",
+            "no_halo_or_seam",
+            "no_severe_artifact",
+            "usable_as_attribute_condition",
+            "certain",
+        )
+        return subject_attributes.SubjectAttributeBackgroundReview(
+            **{field: accepted for field in fields},
+            verdict="accept" if accepted else "reject",
+            reason="usable" if accepted else "not usable",
+        )
+    fields = (
+        "correct_attribute",
+        "owner_binding_correct",
+        "target_is_dominant_and_identifiable",
+        "no_large_competing_attribute_or_entity",
+        "context_is_limited_and_supportive",
+        "no_severe_blur_or_artifact",
+        "usable_as_attribute_condition",
+        "certain",
+    )
+    return subject_attributes.SubjectAttributeBboxReview(
+        **{field: accepted for field in fields},
+        verdict="accept" if accepted else "reject",
+        reason="usable" if accepted else "not usable",
+    )
+
+
+def _run_attribute_variant_case(
+    tmp_path: Path,
+    *,
+    background_accepts: bool,
+    bbox_accepts: bool,
+    completed_base: bool = False,
+):
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[30:70, 25:75] = True
+    raw_crop = Image.new("RGBA", (54, 44), (120, 120, 120, 255))
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="upper_clothing",
+            phrase="gray robe",
+            grounding_prompt="gray robe worn by person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=mask,
+        source_image=Image.new("RGB", (100, 100), (240, 240, 240)),
+        crop=(
+            Image.new("RGB", (64, 64), (140, 140, 140))
+            if completed_base
+            else raw_crop
+        ),
+        raw_crop=raw_crop,
+        geometry=_geometry(),
+    )
+    raw_review = (
+        _routing_review("a1", "unusable_repair")
+        if completed_base
+        else _accepted_review("a1")
+    )
+    record = subject_attributes._accepted_record(
+        candidate,
+        output_root=tmp_path,
+        sample_id="clip-1",
+        owner_reference=_ready_reference("e1"),
+        review=raw_review,
+        completion_review=(
+            _completion_review(accepted=True) if completed_base else None
+        ),
+        final_selection="completed" if completed_base else "raw",
+        completion_attempted=completed_base,
+        completion_outcome=(
+            "selected_completed" if completed_base else "not_attempted"
+        ),
+        completion_seed=17 if completed_base else None,
+        crop_padding_ratio=0.08,
+    )
+
+    class Backend:
+        calls = 0
+
+        def attribute_background(self, *, output_path, **_kwargs):
+            self.calls += 1
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (64, 64), (200, 210, 220)).save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Judge:
+        background_calls = 0
+        bbox_calls = 0
+
+        def review_attribute_background(self, **_kwargs):
+            self.background_calls += 1
+            return _attribute_variant_review(
+                accepted=background_accepts,
+                background=True,
+            )
+
+        def review_attribute_bbox(self, **_kwargs):
+            self.bbox_calls += 1
+            return _attribute_variant_review(
+                accepted=bbox_accepts,
+                background=False,
+            )
+
+    backend = Backend()
+    judge = Judge()
+    metrics = subject_attributes._AttributeVariantMetrics()
+    selected = subject_attributes._with_attribute_variants(
+        record,
+        candidate,
+        output_root=tmp_path,
+        sample_id="clip-1",
+        backend=backend,
+        judge=judge,
+        metrics=metrics,
+    )
+    return selected, backend, judge, metrics
+
+
+def test_attribute_background_accept_skips_bbox_review_and_keeps_bbox(
+    tmp_path: Path,
+) -> None:
+    record, backend, judge, metrics = _run_attribute_variant_case(
+        tmp_path,
+        background_accepts=True,
+        bbox_accepts=False,
+    )
+
+    assert backend.calls == 1
+    assert judge.background_calls == 1
+    assert judge.bbox_calls == 0
+    assert record.default_variant == "generated_background"
+    assert record.variants is not None
+    assert record.variants.bbox.status == "review_skipped"
+    assert (tmp_path / record.variants.bbox.image_path).is_file()
+    assert metrics.bbox_variants_materialized == 1
+    assert metrics.bbox_reviews_attempted == 0
+    assert metrics.bbox_reviews_skipped_background_accepted == 1
+
+
+@pytest.mark.parametrize(
+    ("bbox_accepts", "expected_default"),
+    [(True, "bbox"), (False, "alpha")],
+)
+def test_attribute_background_reject_reviews_bbox_then_selects_default(
+    tmp_path: Path,
+    bbox_accepts: bool,
+    expected_default: str,
+) -> None:
+    record, _, judge, metrics = _run_attribute_variant_case(
+        tmp_path,
+        background_accepts=False,
+        bbox_accepts=bbox_accepts,
+    )
+
+    assert judge.background_calls == 1
+    assert judge.bbox_calls == 1
+    assert record.default_variant == expected_default
+    assert metrics.bbox_reviews_attempted == 1
+
+
+def test_completed_attribute_variant_fallback_preserves_accepted_base(
+    tmp_path: Path,
+) -> None:
+    record, _, judge, _ = _run_attribute_variant_case(
+        tmp_path,
+        background_accepts=False,
+        bbox_accepts=False,
+        completed_base=True,
+    )
+
+    assert judge.bbox_calls == 1
+    assert record.final_selection == "completed"
+    assert record.default_variant == "accepted_base"
+    assert record.image_path == record.accepted_base_image_path
+    assert record.variants is not None
+    assert record.variants.alpha.status == "rejected"
+    with Image.open(tmp_path / record.image_path) as opened:
+        assert opened.mode == "RGB"

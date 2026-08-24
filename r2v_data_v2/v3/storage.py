@@ -21,6 +21,7 @@ from r2v_data_v2.v3.config import (
     DENSE_MAX_ANNOTATION_ENTITIES,
     V3Config,
 )
+from r2v_data_v2.v3.reference_variants import ReferenceVariantsManifestRecord
 from r2v_data_v2.v3.schemas import (
     AnnotationState,
     BackgroundReferenceState,
@@ -34,8 +35,11 @@ from r2v_data_v2.v3.schemas import (
     FailureRecord,
     InstructionState,
     PairingState,
+    ReferenceDefaultVariant,
     ReferenceEditState,
     ReferenceIntegrityState,
+    ReferenceVariantState,
+    ReferenceVariantsState,
     ReferencesState,
     RunRecord,
     SampledFramesArtifact,
@@ -899,20 +903,33 @@ class DatasetExporter:
             references_root = temporary / "references"
             references_root.mkdir(parents=True)
             samples: list[DatasetSample] = []
+            variant_records: list[ReferenceVariantsManifestRecord] = []
             reference_count = 0
             for clip in evaluated_clips:
                 if not clip.export.accepted:
                     continue
                 sample = self._export_clip(clip, temporary)
                 samples.append(sample)
+                variant_records.extend(
+                    self._export_entity_variant_records(clip, sample, temporary)
+                )
                 reference_count += len(sample.references)
             sample_records = [_model_dict(sample) for sample in samples]
             _write_jsonl_atomic(temporary / "samples.jsonl", sample_records)
-            enriched_samples = self._export_enriched_samples(temporary, samples)
+            enriched_samples, attribute_variant_records = self._export_enriched_samples(
+                temporary,
+                samples,
+            )
+            variant_records.extend(attribute_variant_records)
             if enriched_samples:
                 _write_jsonl_atomic(
                     temporary / "enriched_samples.jsonl",
                     [_model_dict(sample) for sample in enriched_samples],
+                )
+            if variant_records:
+                _write_jsonl_atomic(
+                    temporary / "reference_variants.jsonl",
+                    [_model_dict(record) for record in variant_records],
                 )
             dataset = DatasetRecord(
                 dataset_version=_safe_component(
@@ -928,7 +945,12 @@ class DatasetExporter:
                 reference_count=reference_count,
             )
             write_json_atomic(temporary / "dataset.json", _model_dict(dataset))
-            self._validate_export_tree(temporary, samples, enriched_samples)
+            self._validate_export_tree(
+                temporary,
+                samples,
+                enriched_samples,
+                variant_records,
+            )
             self._publish(temporary, overwrite=overwrite)
             return dataset
         except Exception:
@@ -1036,6 +1058,269 @@ class DatasetExporter:
                 "clip_suffix": clip.source.clip_suffix,
             },
         )
+
+    def _legacy_entity_variants(
+        self,
+        clip: ClipRecord,
+        *,
+        entity_id: str,
+    ) -> tuple[
+        ReferenceVariantsState,
+        ReferenceDefaultVariant,
+        str,
+        str,
+    ]:
+        from r2v_data_v2.v3.reference_integrity import (
+            _materialize_source_bbox,
+            _source_evidence,
+        )
+
+        if clip.reference_edit is None:
+            raise ValueError("legacy variant replay requires reference edit state")
+        edit = next(
+            item for item in clip.reference_edit.entities if item.entity_id == entity_id
+        )
+        current = next(
+            item
+            for item in clip.references.entities
+            if item.entity_id == entity_id and item.status == "ready"
+        )
+        source = edit.source_reference
+        if source.image_path is None:
+            raise ValueError("legacy alpha variant is missing")
+        bbox_path = self.storage.selected_path(
+            clip.clip_uid,
+            f"source_bbox_fallback_{entity_id}.png",
+        )
+        bbox_metadata = bbox_path.with_suffix(".json")
+        if not bbox_path.is_file():
+            evidence = _source_evidence(
+                self.storage,
+                clip_uid=clip.clip_uid,
+                reference=source,
+            )
+            source_path = self._resolve_run_artifact(source.image_path)
+            with Image.open(source_path) as opened:
+                opened.load()
+                source_image = opened.copy()
+            evaluation = _materialize_source_bbox(
+                storage=self.storage,
+                clip_uid=clip.clip_uid,
+                entity_id=entity_id,
+                source_evidence=evidence,
+                current_reference=source_image,
+                current_reference_path=source_path,
+                reference=source,
+                original_review=None,
+                diagnostics=None,
+                crop_padding_ratio=self.config.pair.crop_padding_ratio,
+                trigger="variant_bbox_review",
+            )
+            bbox_path = self.storage.root / evaluation.candidate_relative
+            bbox_metadata = self.storage.root / evaluation.metadata_relative
+        background_path: Path | None = None
+        background_status = "unavailable"
+        background_reason = "legacy_background_variant_unavailable"
+        background_reviewed = False
+        if edit.background_metadata_path is not None:
+            metadata_path = self._resolve_run_artifact(edit.background_metadata_path)
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            candidate_name = payload.get("candidate_path")
+            if isinstance(candidate_name, str) and candidate_name:
+                candidate = metadata_path.parent / candidate_name
+                if candidate.is_file():
+                    background_path = candidate
+                    background_status = (
+                        "accepted" if payload.get("status") == "accepted" else "rejected"
+                    )
+                    background_reviewed = (
+                        background_status == "accepted"
+                        or payload.get("qwen_review") is not None
+                    )
+                    background_reason = str(
+                        payload.get("qwen_review_skipped_reason")
+                        or payload.get("status")
+                        or "legacy_background_candidate"
+                    )
+        default_variant: ReferenceDefaultVariant
+        if current.synthetic:
+            default_variant = "generated_background"
+            background_path = self._resolve_run_artifact(current.image_path)
+            background_status = "accepted"
+            background_reviewed = True
+            background_reason = "legacy_generated_background_default"
+        elif current.source_bbox_fallback:
+            default_variant = "bbox"
+        else:
+            default_variant = "alpha"
+        bbox_reviewed = current.source_bbox_fallback
+        bbox_status = "accepted" if bbox_reviewed else "review_skipped"
+        variants = ReferenceVariantsState(
+            alpha=ReferenceVariantState(
+                image_path=source.image_path,
+                status="accepted",
+                reviewed=True,
+                review_status="accepted_pair_reference",
+                reason="legacy_pair_accepted_source_alpha",
+                synthetic=False,
+                source_frame_index=source.source_frame_index,
+            ),
+            bbox=ReferenceVariantState(
+                image_path=self.storage.relative_artifact_path(bbox_path),
+                status=bbox_status,
+                reviewed=bbox_reviewed,
+                review_status=(
+                    "accepted"
+                    if bbox_reviewed
+                    else "skipped_during_legacy_replay"
+                ),
+                reason=(
+                    "legacy_bbox_default"
+                    if bbox_reviewed
+                    else "legacy_replay_materialized_without_qwen"
+                ),
+                synthetic=False,
+                metadata_path=self.storage.relative_artifact_path(bbox_metadata),
+                source_frame_index=source.source_frame_index,
+            ),
+            generated_background=ReferenceVariantState(
+                image_path=(
+                    self.storage.relative_artifact_path(background_path)
+                    if background_path is not None
+                    else None
+                ),
+                status=background_status,
+                reviewed=background_reviewed,
+                review_status=(
+                    "accepted"
+                    if background_status == "accepted"
+                    else "rejected"
+                    if background_status == "rejected"
+                    else "unavailable"
+                ),
+                reason=background_reason,
+                synthetic=True,
+                metadata_path=edit.background_metadata_path,
+                source_frame_index=source.source_frame_index,
+            ),
+        )
+        return (
+            variants,
+            default_variant,
+            current.image_path or "",
+            "legacy_run_default_preserved",
+        )
+
+    def _export_variant_bundle(
+        self,
+        variants: ReferenceVariantsState,
+        *,
+        source_root: Path,
+        temporary: Path,
+        sample_id: str,
+        name_prefix: str,
+        default_source_path: str,
+        default_export_path: str,
+        byte_preserving: bool,
+    ) -> ReferenceVariantsState:
+        updates: dict[str, ReferenceVariantState] = {}
+        for variant_name in ("alpha", "bbox", "generated_background"):
+            variant = getattr(variants, variant_name)
+            if variant.image_path is None:
+                updates[variant_name] = variant.model_copy(
+                    update={"metadata_path": None}
+                )
+                continue
+            source = (source_root / variant.image_path).resolve(strict=False)
+            source.relative_to(source_root.resolve(strict=False))
+            if not source.is_file():
+                raise FileNotFoundError(f"reference variant is missing: {source}")
+            if variant.image_path == default_source_path:
+                export_path = default_export_path
+            else:
+                relative = (
+                    Path("references")
+                    / sample_id
+                    / "variants"
+                    / f"{name_prefix}_{variant_name}.png"
+                )
+                if byte_preserving:
+                    self._materialize_unchanged(source, temporary / relative)
+                else:
+                    self._copy_png(source, temporary / relative, background=False)
+                export_path = relative.as_posix()
+            updates[variant_name] = variant.model_copy(
+                update={
+                    "image_path": export_path,
+                    "metadata_path": None,
+                }
+            )
+        return ReferenceVariantsState.model_validate(
+            variants.model_copy(update=updates).model_dump(mode="json")
+        )
+
+    def _export_entity_variant_records(
+        self,
+        clip: ClipRecord,
+        sample: DatasetSample,
+        temporary: Path,
+    ) -> list[ReferenceVariantsManifestRecord]:
+        if clip.annotation is None or clip.reference_edit is None:
+            return []
+        kinds = {
+            entity.entity_id: entity.reference_type
+            for entity in clip.annotation.entities
+        }
+        edits = {item.entity_id: item for item in clip.reference_edit.entities}
+        defaults = {
+            reference.entity_id: reference
+            for reference in sample.references
+            if reference.type == "entity"
+        }
+        records: list[ReferenceVariantsManifestRecord] = []
+        for entity_id in clip.pairing.retained_entity_ids if clip.pairing else []:
+            kind = kinds.get(entity_id)
+            if kind not in {"subject", "object"} or entity_id not in edits:
+                continue
+            edit = edits[entity_id]
+            if edit.route not in {"complete", "local_usable"}:
+                continue
+            if edit.variants is None:
+                variants, default_variant, default_path, default_reason = (
+                    self._legacy_entity_variants(clip, entity_id=entity_id)
+                )
+            else:
+                assert edit.default_variant is not None
+                assert edit.default_image_path is not None
+                assert edit.default_reason is not None
+                variants = edit.variants
+                default_variant = edit.default_variant
+                default_path = edit.default_image_path
+                default_reason = edit.default_reason
+            default_export = defaults[entity_id].image_path
+            exported_variants = self._export_variant_bundle(
+                variants,
+                source_root=self.storage.root,
+                temporary=temporary,
+                sample_id=clip.clip_uid,
+                name_prefix=f"{kind}_{entity_id}",
+                default_source_path=default_path,
+                default_export_path=default_export,
+                byte_preserving=True,
+            )
+            records.append(
+                ReferenceVariantsManifestRecord(
+                    sample_id=clip.clip_uid,
+                    clip_uid=clip.clip_uid,
+                    kind=kind,
+                    entity_id=entity_id,
+                    default_variant=default_variant,
+                    default_image_path=default_export,
+                    default_reason=default_reason,
+                    variants=exported_variants,
+                )
+            )
+        return records
 
     def _export_background(
         self,
@@ -1181,7 +1466,7 @@ class DatasetExporter:
         self,
         temporary: Path,
         samples: list[DatasetSample],
-    ) -> list[EnrichedSample]:
+    ) -> tuple[list[EnrichedSample], list[ReferenceVariantsManifestRecord]]:
         from r2v_data_v2.v3.subject_attributes import (
             EnrichedReference,
             EnrichedSample,
@@ -1191,6 +1476,7 @@ class DatasetExporter:
         frozen_by_id = {sample.sample_id: sample for sample in samples}
         sidecar_root = self.storage.root / "subject_attributes"
         exported: list[EnrichedSample] = []
+        variant_records: list[ReferenceVariantsManifestRecord] = []
         for source_sample in self._load_enriched_samples():
             if not isinstance(source_sample, EnrichedSample):
                 raise TypeError("invalid enriched sample")
@@ -1256,6 +1542,12 @@ class DatasetExporter:
                         if record.final_selection == "completed"
                         else "raw"
                     ),
+                    expected_mode=(
+                        "RGB"
+                        if record.default_variant
+                        in {"bbox", "generated_background"}
+                        else None
+                    ),
                 )
                 relative_path = Path("references") / source_sample.clip_uid / (
                     "attribute_"
@@ -1282,18 +1574,88 @@ class DatasetExporter:
                 export_path = exported_attribute_paths.get(record.attribute_id)
                 if export_path is None:
                     raise ValueError("accepted attribute has no enriched reference")
+                record_updates: dict[str, object] = {"image_path": export_path}
+                if record.variants is not None:
+                    assert record.default_variant is not None
+                    assert record.default_image_path is not None
+                    assert record.default_reason is not None
+                    exported_variants = self._export_variant_bundle(
+                        record.variants,
+                        source_root=sidecar_root,
+                        temporary=temporary,
+                        sample_id=source_sample.clip_uid,
+                        name_prefix=(
+                            f"attribute_{record.owner_entity_id}_{record.attribute_id}"
+                        ),
+                        default_source_path=record.default_image_path,
+                        default_export_path=export_path,
+                        byte_preserving=True,
+                    )
+                    accepted_base_export = export_path
+                    if record.accepted_base_image_path == record.variants.alpha.image_path:
+                        assert exported_variants.alpha.image_path is not None
+                        accepted_base_export = exported_variants.alpha.image_path
+                    elif (
+                        record.accepted_base_image_path is not None
+                        and record.accepted_base_image_path != record.image_path
+                    ):
+                        base_source = (
+                            sidecar_root / record.accepted_base_image_path
+                        ).resolve(strict=False)
+                        base_source.relative_to(sidecar_root.resolve(strict=False))
+                        base_relative = (
+                            Path("references")
+                            / source_sample.clip_uid
+                            / "variants"
+                            / (
+                                "attribute_"
+                                f"{record.owner_entity_id}_{record.attribute_id}_"
+                                "accepted_base.png"
+                            )
+                        )
+                        self._materialize_unchanged(
+                            base_source,
+                            temporary / base_relative,
+                        )
+                        accepted_base_export = base_relative.as_posix()
+                    record_updates.update(
+                        {
+                            "variants": exported_variants,
+                            "default_image_path": export_path,
+                            "accepted_base_image_path": accepted_base_export,
+                        }
+                    )
+                    variant_records.append(
+                        ReferenceVariantsManifestRecord(
+                            sample_id=source_sample.sample_id,
+                            clip_uid=source_sample.clip_uid,
+                            kind="attribute",
+                            attribute_id=record.attribute_id,
+                            owner_entity_id=record.owner_entity_id,
+                            attribute_type=record.attribute_type,
+                            default_variant=record.default_variant,
+                            default_image_path=export_path,
+                            default_reason=record.default_reason,
+                            accepted_base_image_path=accepted_base_export,
+                            variants=exported_variants,
+                        )
+                    )
                 exported_records.append(
-                    record.model_copy(update={"image_path": export_path})
+                    type(record).model_validate(
+                        record.model_copy(update=record_updates).model_dump(mode="json")
+                    )
                 )
             exported.append(
-                source_sample.model_copy(
-                    update={
-                        "references": exported_references,
-                        "accepted_attributes": exported_records,
-                    }
+                EnrichedSample.model_validate(
+                    source_sample.model_copy(
+                        update={
+                            "references": exported_references,
+                            "accepted_attributes": exported_records,
+                        }
+                    ).model_dump(mode="json")
                 )
             )
-        return exported
+        return exported, variant_records
 
     @staticmethod
     def _materialize_unchanged(source: Path, destination: Path) -> None:
@@ -1333,6 +1695,7 @@ class DatasetExporter:
         root: Path,
         samples: list[DatasetSample],
         enriched_samples: list[EnrichedSample],
+        variant_records: list[ReferenceVariantsManifestRecord],
     ) -> None:
         expected_top_level = {
             "dataset.json",
@@ -1341,6 +1704,8 @@ class DatasetExporter:
         }
         if enriched_samples:
             expected_top_level.add("enriched_samples.jsonl")
+        if variant_records:
+            expected_top_level.add("reference_variants.jsonl")
         if {path.name for path in root.iterdir()} != expected_top_level:
             raise ValueError("dataset root contains unexpected top-level artifacts")
         expected = {
@@ -1352,6 +1717,22 @@ class DatasetExporter:
             reference.image_path
             for sample in enriched_samples
             for reference in sample.references
+        )
+        expected.update(
+            variant.image_path
+            for record in variant_records
+            for variant in (
+                record.variants.alpha,
+                record.variants.bbox,
+                record.variants.generated_background,
+            )
+            if variant.image_path is not None
+        )
+        expected.update(
+            record.accepted_base_image_path
+            for sample in enriched_samples
+            for record in sample.accepted_attributes
+            if record.accepted_base_image_path is not None
         )
         actual = {
             path.relative_to(root).as_posix()

@@ -302,14 +302,55 @@ class _StageRuntime:
         instruction: str,
         seed: int,
     ) -> dict[str, object]:
+        return self._attribute_edit(
+            source_path=source_path,
+            output_path=output_path,
+            instruction=instruction,
+            seed=seed,
+            sidecar_directory="completion_candidates",
+            component="boogu_attribute_completion",
+            operation="complete_attribute",
+        )
+
+    def attribute_background(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        instruction: str,
+        seed: int,
+    ) -> dict[str, object]:
+        return self._attribute_edit(
+            source_path=source_path,
+            output_path=output_path,
+            instruction=instruction,
+            seed=seed,
+            sidecar_directory="variants",
+            component="boogu_attribute_background",
+            operation="add_attribute_background",
+        )
+
+    def _attribute_edit(
+        self,
+        *,
+        source_path: Path,
+        output_path: Path,
+        instruction: str,
+        seed: int,
+        sidecar_directory: str,
+        component: str,
+        operation: str,
+    ) -> dict[str, object]:
         if self.stage != "reference_edit" or self._reference_edit_backend is None:
-            raise RuntimeError("attribute completion requires reference_edit worker")
+            raise RuntimeError("attribute edit requires reference_edit worker")
         source_resolved = source_path.expanduser().resolve()
         output_resolved = output_path.expanduser().resolve(strict=False)
         sidecar_root = (
-            self.storage.root / "subject_attributes" / "completion_candidates"
+            self.storage.root / "subject_attributes" / sidecar_directory
         ).resolve(strict=False)
-        source_resolved.relative_to(sidecar_root)
+        source_resolved.relative_to(
+            (self.storage.root / "subject_attributes").resolve(strict=False)
+        )
         output_resolved.relative_to(sidecar_root)
         with Image.open(source_resolved) as opened:
             opened.load()
@@ -323,8 +364,8 @@ class _StageRuntime:
         )
         started = time.perf_counter()
         with profile_model_call(
-            component="boogu_attribute_completion",
-            operation="complete_attribute",
+            component=component,
+            operation=operation,
             retry_index=0,
             model=str(self.config.reference_edit.model_path),
             input_text_chars=len(instruction),
@@ -458,6 +499,7 @@ def serve(args: argparse.Namespace) -> int:
                         "attribute_probe",
                         "attribute_completion_probe",
                         "attribute_completion",
+                        "attribute_background",
                     }:
                         raise ValueError("unsupported worker request type")
                     if attribute_probe_only and request_type not in {
@@ -553,18 +595,28 @@ def serve(args: argparse.Namespace) -> int:
                             raise ValueError("completion instruction is required")
                         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
                             raise ValueError("completion seed must be non-negative")
-                        completion = runtime.attribute_completion(
-                            source_path=Path(source_path),
-                            output_path=Path(output_path),
-                            instruction=instruction,
-                            seed=seed,
-                        )
+                        if request_type == "attribute_background":
+                            edit_result = runtime.attribute_background(
+                                source_path=Path(source_path),
+                                output_path=Path(output_path),
+                                instruction=instruction,
+                                seed=seed,
+                            )
+                            result_key = "background"
+                        else:
+                            edit_result = runtime.attribute_completion(
+                                source_path=Path(source_path),
+                                output_path=Path(output_path),
+                                instruction=instruction,
+                                seed=seed,
+                            )
+                            result_key = "completion"
                         response = {
                             "schema_version": 1,
                             "type": "response",
                             "request_id": request_id,
                             "status": "ok",
-                            "completion": completion,
+                            result_key: edit_result,
                         }
                 except Exception as exc:  # noqa: BLE001 - process boundary response
                     response = {

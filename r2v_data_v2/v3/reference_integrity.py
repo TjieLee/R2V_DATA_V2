@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import math
 import re
 from collections import deque
@@ -138,7 +139,7 @@ Do not emit trailing whitespace, markdown, or explanation."""
 SourceBboxFallbackTrigger = Literal[
     "artifact_review_reject",
     "topology_alpha_hole_upgrade",
-    "distribution_bbox_route",
+    "variant_bbox_review",
 ]
 
 _OBJECT_CREATURE_TERMS = (
@@ -668,11 +669,11 @@ class QwenSourceBboxFallbackJudge:
                 "alpha topology found a meaningful enclosed transparent hole. "
                 "Accept Image 3 only if the raw source bbox is clearly preferable."
             )
-        elif trigger == "distribution_bbox_route":
+        elif trigger == "variant_bbox_review":
             trigger_context = (
-                "Image 2 is the accepted alpha reference. Deterministic reference "
-                "form routing selected a raw source bbox. Accept Image 3 only if "
-                "the target remains dominant and independently usable."
+                "Image 2 is the accepted alpha reference. Image 3 is a materialized "
+                "raw source bbox candidate. Accept it only if the target remains "
+                "dominant and independently usable."
             )
         else:
             trigger_context = "Image 2 is the current failed reference."
@@ -1090,8 +1091,10 @@ def _source_bbox_reference(
         reference.model_copy(
             update={
                 "image_path": image_path,
-                "source_clip_uid": clip_uid,
-                "source_entity_id": reference.entity_id,
+                "source_clip_uid": reference.source_clip_uid or clip_uid,
+                "source_entity_id": (
+                    reference.source_entity_id or reference.entity_id
+                ),
                 "synthetic": False,
                 "generation_metadata_path": None,
                 "generation_source_sha256": None,
@@ -1122,16 +1125,51 @@ def _reference_edit_after_source_bbox(
         if item.status == "rejected":
             raise ValueError("rejected reference edit cannot publish bbox fallback")
         found = True
+        updates: dict[str, object] = {
+            "status": "fallback",
+            "output_image_path": output_image_path,
+            "background_fallback": "none",
+            "fallback_policy": "source_bbox_fallback",
+            "source_bbox_fallback_metadata_path": metadata_path,
+            "reason": "source_bbox_fallback_v1",
+        }
+        if item.variants is not None:
+            variant_updates: dict[str, object] = {
+                "bbox": item.variants.bbox.model_copy(
+                    update={
+                        "image_path": output_image_path,
+                        "status": "accepted",
+                        "reviewed": True,
+                        "review_status": "accepted",
+                        "reason": "source_bbox_fallback_v1",
+                        "metadata_path": metadata_path,
+                    }
+                )
+            }
+            if item.default_variant == "generated_background":
+                variant_updates["generated_background"] = (
+                    item.variants.generated_background.model_copy(
+                        update={
+                            "status": "rejected",
+                            "reviewed": True,
+                            "review_status": "rejected_by_final_integrity",
+                            "reason": "final_integrity_replaced_generated_background",
+                        }
+                    )
+                )
+            updates.update(
+                {
+                    "variants": item.variants.model_copy(
+                        update=variant_updates
+                    ),
+                    "default_variant": "bbox",
+                    "default_image_path": output_image_path,
+                    "default_reason": "final_integrity_bbox_review_accepted",
+                }
+            )
         updated.append(
             item.model_copy(
-                update={
-                    "status": "fallback",
-                    "output_image_path": output_image_path,
-                    "background_fallback": "none",
-                    "fallback_policy": "source_bbox_fallback",
-                    "source_bbox_fallback_metadata_path": metadata_path,
-                    "reason": "source_bbox_fallback_v1",
-                }
+                update=updates
             )
         )
     if not found:
@@ -1150,24 +1188,19 @@ class _SourceBboxEvaluation:
     judge_failure: SourceBboxFallbackJudgeFailure | None = None
 
 
-def _evaluate_source_bbox(
+def _materialize_source_bbox(
     *,
     storage: RunStorage,
     clip_uid: str,
     entity_id: str,
     source_evidence: _SourceEvidence,
-    source_context: Image.Image,
     current_reference: Image.Image,
     current_reference_path: Path,
     reference: EntityReferenceState,
-    reference_type: str,
-    phrase: str,
-    grounding_prompt: str,
     original_review: ReferenceIntegrityReview | None,
     diagnostics: ReferenceTopologyDiagnostics | None,
     crop_padding_ratio: float,
     trigger: SourceBboxFallbackTrigger,
-    judge: SourceBboxFallbackJudge,
 ) -> _SourceBboxEvaluation:
     candidate, bbox_xyxy = _source_bbox_candidate(
         source_evidence,
@@ -1190,6 +1223,8 @@ def _evaluate_source_bbox(
     metadata: dict[str, object] = {
         "mode": "source_bbox_fallback_v1",
         "trigger": f"{trigger}_v1",
+        "status": "materialized",
+        "review_status": "not_reviewed",
         "synthetic": False,
         "raw_source_pixels_only": True,
         "clip_uid": clip_uid,
@@ -1237,8 +1272,33 @@ def _evaluate_source_bbox(
             "largest_enclosed_hole_area": diagnostics.largest_enclosed_hole_area,
             "enclosed_hole_bbox_ratio": diagnostics.enclosed_hole_bbox_ratio,
         }
-    else:
-        metadata["reference_form_assignment"] = "bbox"
+    write_json_atomic(metadata_path, metadata)
+    return _SourceBboxEvaluation(
+        candidate_relative=candidate_relative,
+        metadata_relative=metadata_relative,
+        bbox_xyxy=bbox_xyxy,
+    )
+
+
+def _review_materialized_source_bbox(
+    evaluation: _SourceBboxEvaluation,
+    *,
+    storage: RunStorage,
+    source_context: Image.Image,
+    current_reference: Image.Image,
+    reference: EntityReferenceState,
+    reference_type: str,
+    phrase: str,
+    grounding_prompt: str,
+    trigger: SourceBboxFallbackTrigger,
+    judge: SourceBboxFallbackJudge,
+) -> _SourceBboxEvaluation:
+    candidate_path = _resolve_run_artifact(storage, evaluation.candidate_relative)
+    metadata_path = _resolve_run_artifact(storage, evaluation.metadata_relative)
+    with Image.open(candidate_path) as opened:
+        opened.load()
+        candidate = opened.convert("RGB")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     try:
         attempt = judge.review(
             source_context=source_context,
@@ -1254,20 +1314,22 @@ def _evaluate_source_bbox(
         metadata.update(
             {
                 "status": "judge_failed",
+                "review_status": "judge_failed",
                 "reason": str(exc),
                 "raw_response": exc.raw_response,
             }
         )
         write_json_atomic(metadata_path, metadata)
         return _SourceBboxEvaluation(
-            candidate_relative=candidate_relative,
-            metadata_relative=metadata_relative,
-            bbox_xyxy=bbox_xyxy,
+            candidate_relative=evaluation.candidate_relative,
+            metadata_relative=evaluation.metadata_relative,
+            bbox_xyxy=evaluation.bbox_xyxy,
             judge_failure=exc,
         )
     metadata.update(
         {
             "status": "accepted" if attempt.review.verdict == "accept" else "rejected",
+            "review_status": attempt.review.verdict,
             "review": attempt.review.model_dump(mode="json"),
             "raw_response": attempt.raw_response,
             "finish_reason": attempt.finish_reason,
@@ -1275,10 +1337,56 @@ def _evaluate_source_bbox(
     )
     write_json_atomic(metadata_path, metadata)
     return _SourceBboxEvaluation(
-        candidate_relative=candidate_relative,
-        metadata_relative=metadata_relative,
-        bbox_xyxy=bbox_xyxy,
+        candidate_relative=evaluation.candidate_relative,
+        metadata_relative=evaluation.metadata_relative,
+        bbox_xyxy=evaluation.bbox_xyxy,
         attempt=attempt,
+    )
+
+
+def _evaluate_source_bbox(
+    *,
+    storage: RunStorage,
+    clip_uid: str,
+    entity_id: str,
+    source_evidence: _SourceEvidence,
+    source_context: Image.Image,
+    current_reference: Image.Image,
+    current_reference_path: Path,
+    reference: EntityReferenceState,
+    reference_type: str,
+    phrase: str,
+    grounding_prompt: str,
+    original_review: ReferenceIntegrityReview | None,
+    diagnostics: ReferenceTopologyDiagnostics | None,
+    crop_padding_ratio: float,
+    trigger: SourceBboxFallbackTrigger,
+    judge: SourceBboxFallbackJudge,
+) -> _SourceBboxEvaluation:
+    materialized = _materialize_source_bbox(
+        storage=storage,
+        clip_uid=clip_uid,
+        entity_id=entity_id,
+        source_evidence=source_evidence,
+        current_reference=current_reference,
+        current_reference_path=current_reference_path,
+        reference=reference,
+        original_review=original_review,
+        diagnostics=diagnostics,
+        crop_padding_ratio=crop_padding_ratio,
+        trigger=trigger,
+    )
+    return _review_materialized_source_bbox(
+        materialized,
+        storage=storage,
+        source_context=source_context,
+        current_reference=current_reference,
+        reference=reference,
+        reference_type=reference_type,
+        phrase=phrase,
+        grounding_prompt=grounding_prompt,
+        trigger=trigger,
+        judge=judge,
     )
 
 

@@ -1920,7 +1920,7 @@ def test_qwen_source_bbox_reviewer_describes_topology_upgrade_honestly(
     assert "current failed reference" not in text
 
 
-def test_qwen_source_bbox_reviewer_describes_distribution_route_honestly(
+def test_qwen_source_bbox_reviewer_describes_variant_review_honestly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1945,12 +1945,12 @@ def test_qwen_source_bbox_reviewer_describes_distribution_route_honestly(
         phrase="a person",
         grounding_prompt="person near center",
         reference_scope="full",
-        trigger="distribution_bbox_route",
+        trigger="variant_bbox_review",
     )
 
     text = str(completions.calls[0]["messages"][1]["content"][0]["text"]).lower()
     assert "accepted alpha reference" in text
-    assert "deterministic reference form routing" in text
+    assert "materialized raw source bbox candidate" in text
     assert "target remains dominant" in text
 
 
