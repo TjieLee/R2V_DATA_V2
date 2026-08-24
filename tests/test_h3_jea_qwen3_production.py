@@ -26,6 +26,12 @@ from r2v_data_v2.h3.visual_production_source import (
     derive_readable_clip_identity,
     load_visual_production_inventory,
 )
+from r2v_data_v2.v3.subject_attributes import (
+    EnrichedSample,
+    OwnershipGeometry,
+    SubjectAttributeRecord,
+    SubjectAttributeReview,
+)
 
 
 class _StageResult:
@@ -144,6 +150,198 @@ def _inventory(
     )
 
 
+def _dataset_inventory(
+    tmp_path: Path,
+    *,
+    with_enriched: bool = False,
+) -> object:
+    export_root = tmp_path / "visual-export"
+    run_root = tmp_path / "single-visual-run"
+    target = tmp_path / "processed" / "ordinary.mp4"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"processed-mp4")
+    references = []
+    reference_specs = [
+        ("subject", "<ref_subject_1>", "entity", "e1", "full", "whole"),
+        ("object", "<ref_object_1>", "entity", "e2", "full", "whole"),
+        ("group", "<ref_group_1>", "entity", "e3", "local", "central"),
+        ("background", "<ref_bg_1>", "background", None, "scene", "whole"),
+    ]
+    for index, (kind, token, ref_type, entity_id, scope, visible_region) in enumerate(
+        reference_specs, start=1
+    ):
+        image_path = f"references/ordinary/{kind}.png"
+        artifact = export_root / image_path
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(kind.encode())
+        references.append(
+            {
+                "token": token,
+                "type": ref_type,
+                "entity_id": entity_id,
+                "scope": scope,
+                "visible_region": visible_region,
+                "image_path": image_path,
+                "source_frame_index": index,
+                "synthetic": False,
+            }
+        )
+    sample = {
+        "schema_version": "r2v.v3.sample.1",
+        "sample_id": "ordinary",
+        "target_video": str(target),
+        "t2v_caption": "A person stands beside an object and a group.",
+        "r2v_instruction": "Use "
+        + ", ".join(f"<Image {index}>" for index in range(1, 5)),
+        "references": references,
+        "source": {"parent_video_id": "parent", "clip_suffix": "00216"},
+    }
+    _jsonl(export_root / "samples.jsonl", [sample])
+    clip = {
+        "schema_version": "r2v.v3.clip.2",
+        "clip_uid": "ordinary",
+        "source": {
+            "video_path": str(target),
+            "parent_video_id": "parent",
+            "clip_suffix": "00216",
+            "source_index": 0,
+            "caption_raw": "",
+            "metadata": {
+                "source_relative_video_path": (
+                    "01/法证先锋/法证先锋1/法证先锋1_22/clip_00216.mp4"
+                ),
+                "source_relative_source_video_path": (
+                    "01/法证先锋/法证先锋1/法证先锋1_22/source.mp4"
+                ),
+            },
+        },
+    }
+    clip_path = run_root / "clips" / "ordinary" / "clip.json"
+    clip_path.parent.mkdir(parents=True)
+    clip_path.write_text(json.dumps(clip, ensure_ascii=False), encoding="utf-8")
+    if with_enriched:
+        for kind in ("subject", "object", "group", "background"):
+            visual_reference = (
+                run_root / f"clips/ordinary/selected/{kind}.png"
+            )
+            visual_reference.parent.mkdir(parents=True, exist_ok=True)
+            visual_reference.write_bytes(f"enriched-{kind}".encode())
+        attribute_path = "references/ordinary/hair.png"
+        attribute = run_root / "subject_attributes" / attribute_path
+        attribute.parent.mkdir(parents=True)
+        attribute.write_bytes(b"hair")
+        record = SubjectAttributeRecord(
+            attribute_id="a1",
+            owner_entity_id="e1",
+            attribute_type="hair",
+            phrase="dark hair",
+            grounding_prompt="the person's dark hair",
+            status="accepted",
+            image_path=attribute_path,
+            source_frame_index=6,
+            source_frame_slot=6,
+            owner_candidate_id="candidate_1",
+            same_frame_as_owner_reference=False,
+            sam3_prompt="dark hair",
+            ownership_geometry=OwnershipGeometry(
+                passed=True,
+                reason="passed",
+                owner_overlap_ratio=1.0,
+                maximum_other_owner_overlap_ratio=0.0,
+                attribute_to_owner_area_ratio=0.2,
+                near_owner_region=True,
+                attribute_area_pixels=100,
+                attribute_long_side_pixels=20,
+                significant_component_count=1,
+                largest_component_ratio=1.0,
+                second_largest_component_ratio=0.0,
+            ),
+            review=SubjectAttributeReview(
+                attribute_id="a1",
+                matches_attribute=True,
+                owner_binding_correct=True,
+                recognizable=True,
+                characteristic_appearance_visible=True,
+                usable_as_attribute_condition=True,
+                structure_complete=True,
+                completion_recommended=False,
+                reason="accepted",
+            ),
+            final_selection="raw",
+            reason="accepted",
+        )
+        enriched = EnrichedSample(
+            sample_id="ordinary",
+            clip_uid="ordinary",
+            source_run_root=str(run_root),
+            original_visual={
+                "target_video": str(target),
+                "source": sample["source"],
+            },
+            original_instruction=sample["r2v_instruction"],
+            enriched_instruction=(
+                "Use <Image 1> with <Image 2>, <Image 3>, <Image 4>, and "
+                "<Image 5>."
+            ),
+            references=[
+                {
+                    "image_id": "image_1",
+                    "image_index": 1,
+                    "kind": "subject",
+                    "origin": "visual_run",
+                    "entity_id": "e1",
+                    "image_path": "clips/ordinary/selected/subject.png",
+                    "source_frame_index": 1,
+                },
+                {
+                    "image_id": "image_2",
+                    "image_index": 2,
+                    "kind": "attribute",
+                    "origin": "attribute_enrichment",
+                    "attribute_id": "a1",
+                    "owner_entity_id": "e1",
+                    "image_path": attribute_path,
+                    "source_frame_index": 6,
+                },
+                {
+                    "image_id": "image_3",
+                    "image_index": 3,
+                    "kind": "object",
+                    "origin": "visual_run",
+                    "entity_id": "e2",
+                    "image_path": "clips/ordinary/selected/object.png",
+                    "source_frame_index": 2,
+                },
+                {
+                    "image_id": "image_4",
+                    "image_index": 4,
+                    "kind": "group",
+                    "origin": "visual_run",
+                    "entity_id": "e3",
+                    "image_path": "clips/ordinary/selected/group.png",
+                    "source_frame_index": 3,
+                },
+                {
+                    "image_id": "image_5",
+                    "image_index": 5,
+                    "kind": "background",
+                    "origin": "visual_run",
+                    "image_path": "clips/ordinary/selected/background.png",
+                    "source_frame_index": 4,
+                },
+            ],
+            accepted_attributes=[record],
+        )
+        _jsonl(
+            run_root / "subject_attributes" / "enriched_samples.jsonl",
+            [enriched.model_dump(mode="json")],
+        )
+    return load_visual_production_inventory(
+        visual_production_root=export_root,
+        visual_runs_root=run_root,
+    )
+
+
 def test_canonical_source_loads_multiple_shards(tmp_path: Path) -> None:
     inventory = _inventory(
         tmp_path,
@@ -164,7 +362,81 @@ def test_canonical_source_loads_multiple_shards(tmp_path: Path) -> None:
     )
     assert inventory.canonical_sample_count == 2
     assert inventory.shard_count == 2
+    assert inventory.visual_input_schema == "r2v.v3.production_sample.1"
+    assert inventory.visual_input_mode == "compacted_production"
     assert [item.identity.clip_uid for item in inventory.clips] == ["clip-a", "clip-b"]
+
+
+def test_dataset_sample_single_run_normalizes_references_and_identity(
+    tmp_path: Path,
+) -> None:
+    inventory = _dataset_inventory(tmp_path)
+
+    assert inventory.visual_input_schema == "r2v.v3.sample.1"
+    assert inventory.visual_input_mode == "single_run_export"
+    assert inventory.shard_count == 1
+    clip = inventory.clips[0]
+    assert clip.identity.clip_uid == "ordinary"
+    assert clip.sample.clip_uid == "ordinary"
+    assert clip.identity.shard_id == "single-visual-run"
+    assert Path(clip.clip_record_path) == (
+        tmp_path / "single-visual-run/clips/ordinary/clip.json"
+    )
+    assert [reference.kind for reference in clip.sample.references] == [
+        "subject",
+        "object",
+        "group",
+        "background",
+    ]
+    assert [reference.kind for reference in clip.subject_references] == ["subject"]
+    assert clip.sample.r2v_instruction.startswith("Use <Image 1>")
+    assert clip.identity.media_collection_relpath == (
+        "01/法证先锋/法证先锋1/法证先锋1_22"
+    )
+    assert clip.identity.clip_display_path.endswith("clip_00216")
+    assert all(Path(item.artifact_path).is_file() for item in clip.sample.references)
+
+
+def test_dataset_sample_enriched_sidecar_preserves_attribute_provenance(
+    tmp_path: Path,
+) -> None:
+    inventory = _dataset_inventory(tmp_path, with_enriched=True)
+    clip = inventory.clips[0]
+
+    assert clip.sample.r2v_instruction.startswith("Use <Image 1> with <Image 2>")
+    assert [reference.kind for reference in clip.sample.references] == [
+        "subject",
+        "attribute",
+        "object",
+        "group",
+        "background",
+    ]
+    attribute = clip.sample.references[1]
+    assert attribute.attribute_id == "a1"
+    assert attribute.owner_entity_id == "e1"
+    assert attribute.attribute_type == "hair"
+    assert attribute.source_frame_index == 6
+    assert attribute.image_path == "references/ordinary/hair.png"
+    assert Path(attribute.artifact_path).read_bytes() == b"hair"
+    assert [reference.entity_id for reference in clip.subject_references] == ["e1"]
+
+
+def test_dataset_sample_dry_run_reports_detected_input_layout(tmp_path: Path) -> None:
+    inventory = _dataset_inventory(tmp_path)
+    result = jea_cli.main(
+        [
+            "--visual-production-root",
+            inventory.visual_production_root,
+            "--visual-runs-root",
+            inventory.visual_runs_root,
+            "--audio-production-root",
+            str(tmp_path / "audio-production"),
+            "--dry-run",
+        ]
+    )
+
+    assert result["visual_input_schema"] == "r2v.v3.sample.1"
+    assert result["visual_input_mode"] == "single_run_export"
 
 
 def test_canonical_samples_jsonl_is_the_allowlist(tmp_path: Path) -> None:
@@ -251,10 +523,9 @@ def _occurrences(inventory: object) -> list[JEAOccurrenceEmbedding]:
                 entity_id="entity_1",
                 subject_index=1,
                 identity=clip.identity,
-                visual_reference_path=str(
-                    Path(inventory.visual_production_root)
-                    / clip.subject_references[0].image_path
-                ),
+            visual_reference_path=str(
+                clip.subject_references[0].artifact_path
+            ),
                 primary_voice_reference_path=str(
                     primary_voice_path(
                         Path("primary_voice"), clip.identity, entity_id="entity_1"
@@ -428,29 +699,35 @@ def test_multi_subject_matching_maximizes_complete_face_assignment(
     ]
 
 
-def test_two_shard_cli_wires_all_seven_stages_without_models(
+@pytest.mark.parametrize("input_layout", ["compacted", "single_run"])
+def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    input_layout: str,
 ) -> None:
-    inventory = _inventory(
-        tmp_path,
-        [
-            {
-                "clip_uid": "clip-a",
-                "shard_id": "shard-a",
-                "clip_relative_path": "show/collection/a_0.mp4",
-                "source_relative_path": "show/collection/a.mkv",
-            },
-            {
-                "clip_uid": "clip-b",
-                "shard_id": "shard-b",
-                "clip_relative_path": "show/collection/b_0.mp4",
-                "source_relative_path": "show/collection/b.mkv",
-            },
-        ],
-    )
-    for shard in ("shard-a", "shard-b"):
-        (Path(inventory.visual_runs_root) / shard / "run.json").write_text("{}")
+    if input_layout == "compacted":
+        inventory = _inventory(
+            tmp_path,
+            [
+                {
+                    "clip_uid": "clip-a",
+                    "shard_id": "shard-a",
+                    "clip_relative_path": "show/collection/a_0.mp4",
+                    "source_relative_path": "show/collection/a.mkv",
+                },
+                {
+                    "clip_uid": "clip-b",
+                    "shard_id": "shard-b",
+                    "clip_relative_path": "show/collection/b_0.mp4",
+                    "source_relative_path": "show/collection/b.mkv",
+                },
+            ],
+        )
+    else:
+        inventory = _dataset_inventory(tmp_path)
+    run_roots = {Path(clip.clip_record_path).parents[2] for clip in inventory.clips}
+    for run_root in run_roots:
+        (run_root / "run.json").write_text("{}")
     output = tmp_path / "audio-production"
     calls: list[str] = []
 

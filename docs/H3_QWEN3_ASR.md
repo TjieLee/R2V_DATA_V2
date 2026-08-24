@@ -12,8 +12,24 @@ export AUDIO_PRODUCTION_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs/produc
 ```
 
 Only `$VISUAL_PRODUCTION_ROOT/samples.jsonl` selects canonical Visual samples.
-The Audio path does not scan shard exports or every clip directory. For each
-canonical row it reads exactly:
+The loader detects one of two supported layouts from its first non-empty row:
+
+- `r2v.v3.production_sample.1` is compacted production. In this mode
+  `VISUAL_RUNS_ROOT` is the parent runs root and each clip record is
+  `$VISUAL_RUNS_ROOT/<shard_id>/clips/<clip_uid>/clip.json`.
+- `r2v.v3.sample.1` is an ordinary completed single-run export. In this mode
+  `VISUAL_PRODUCTION_ROOT` is that export root, `VISUAL_RUNS_ROOT` is the exact
+  matching V3 run root, and each clip record is
+  `$VISUAL_RUNS_ROOT/clips/<sample_id>/clip.json`.
+
+The argument name `--visual-production-root` remains stable for compatibility.
+The Audio path does not scan shard exports or every clip directory. In ordinary
+export mode, an optional `subject_attributes/enriched_samples.jsonl` is loaded
+once: matching clips preserve its enriched instruction and ordered attribute
+references, while clips without a matching record retain the original export
+instruction and references. Visual artifacts stay read-only.
+
+For compacted production each canonical row reads exactly:
 
 ```text
 $VISUAL_RUNS_ROOT/<shard_id>/clips/<clip_uid>/clip.json
@@ -109,9 +125,10 @@ network access. Dots3 is paused and is not used by this path.
 
 ## Commands
 
-Dry-run enumerates the canonical count, subject occurrence count, exact media
-collections, per-collection clip counts, shard count, output root, and selected
-Qwen model. It has no limit or quota option.
+Dry-run enumerates the detected `visual_input_schema` and `visual_input_mode`,
+canonical count, subject occurrence count, exact media collections,
+per-collection clip counts, shard count, output root, and selected Qwen model.
+It has no limit or quota option.
 
 ```bash
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2

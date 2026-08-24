@@ -14,6 +14,8 @@ from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRSegment,
 )
 from r2v_data_v2.h3.visual_production_source import (
+    NormalizedVisualReference,
+    NormalizedVisualSample,
     ReadableClipIdentity,
     VisualProductionClip,
     VisualProductionInventory,
@@ -95,12 +97,27 @@ def _visual_clip(tmp_path: Path, clip_uid: str, clip_name: str) -> VisualProduct
             },
         }
     )
+    references = [
+        NormalizedVisualReference(
+            **reference.model_dump(mode="python"),
+            artifact_path=str(tmp_path / reference.image_path),
+        )
+        for reference in sample.references
+    ]
+    normalized = NormalizedVisualSample(
+        sample_id=sample.sample_id,
+        clip_uid=sample.clip_uid,
+        target_video=sample.target_video,
+        t2v_caption=sample.t2v_caption,
+        r2v_instruction=sample.r2v_instruction,
+        references=references,
+    )
     return VisualProductionClip(
         identity=identity,
-        sample=sample,
+        sample=normalized,
         clip=clip,
         clip_record_path=str(tmp_path / identity.shard_id / clip_uid / "clip.json"),
-        subject_references=[sample.references[0]],
+        subject_references=[references[0]],
     )
 
 
@@ -112,6 +129,8 @@ def _visual_inventory(tmp_path: Path) -> VisualProductionInventory:
     return VisualProductionInventory(
         visual_production_root=str(tmp_path),
         visual_runs_root=str(tmp_path / "runs"),
+        visual_input_schema="r2v.v3.production_sample.1",
+        visual_input_mode="compacted_production",
         canonical_sample_count=2,
         eligible_clip_count=2,
         eligible_subject_occurrence_count=2,

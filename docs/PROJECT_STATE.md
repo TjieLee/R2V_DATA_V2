@@ -1,7 +1,10 @@
 # JEA Qwen3 Audio production integration
 
 The active readable JEA Audio production path now runs all seven explicit stages
-from canonical Visual `samples.jsonl`: Audio binding, frozen primary voice,
+from canonical Visual `samples.jsonl`. It accepts both compacted
+`r2v.v3.production_sample.1` inputs and ordinary completed single-run
+`r2v.v3.sample.1` exports without changing downstream Audio semantics: Audio
+binding, frozen primary voice,
 InsightFace/ECAPA embeddings, frozen PairPolicy, DiariZen, isolated local
 Qwen/Qwen3-ASR-1.7B, and final H3 rendering. Cross donors remain restricted to
 the full media collection path. See `docs/H3_QWEN3_ASR.md`. Legacy Whisper

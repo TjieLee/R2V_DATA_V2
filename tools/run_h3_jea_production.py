@@ -129,6 +129,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     plan: dict[str, object] = {
         "visual_production_root": visual.visual_production_root,
         "visual_runs_root": visual.visual_runs_root,
+        "visual_input_schema": visual.visual_input_schema,
+        "visual_input_mode": visual.visual_input_mode,
         "audio_production_root": str(paths.root),
         "canonical_sample_count": visual.canonical_sample_count,
         "eligible_subject_occurrence_count": visual.eligible_subject_occurrence_count,

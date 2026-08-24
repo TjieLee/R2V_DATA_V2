@@ -315,10 +315,7 @@ def run_jea_embedding_stage(
                 if _sha256_file(voice_path) != voice_asset.sha256:
                     raise ValueError("primary voice artifact hash changed")
                 voice_count += 1
-                reference_path = (
-                    Path(visual_inventory.visual_production_root)
-                    / reference.image_path
-                ).resolve(strict=True)
+                reference_path = Path(reference.artifact_path).resolve(strict=True)
                 face = materialize_face_embedding(
                     backend=face_backend,
                     entity_occurrence_id=occurrence_id,

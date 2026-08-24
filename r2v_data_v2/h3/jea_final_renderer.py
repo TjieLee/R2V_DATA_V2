@@ -14,8 +14,10 @@ from r2v_data_v2.h3.diarization_binding import BoundDiarizationSegment
 from r2v_data_v2.h3.jea_audio_production import JEACrossPair, JEAInPair
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.visual_production_source import VisualProductionInventory
-from r2v_data_v2.v3.production_export import ProductionReference
+from r2v_data_v2.h3.visual_production_source import (
+    NormalizedVisualReference,
+    VisualProductionInventory,
+)
 
 FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.2"
 
@@ -35,8 +37,10 @@ class FinalVisualReference(SchemaModel):
     synthetic: bool
 
     @classmethod
-    def from_production(cls, value: ProductionReference) -> FinalVisualReference:
-        return cls.model_validate(value.model_dump(mode="json"))
+    def from_visual(cls, value: NormalizedVisualReference) -> FinalVisualReference:
+        return cls.model_validate(
+            value.model_dump(mode="json", exclude={"artifact_path"})
+        )
 
 
 class FinalSubjectVoice(SchemaModel):
@@ -246,7 +250,7 @@ def render_jea_final_samples(
     for pair in sorted(in_pairs, key=lambda item: item.target_clip_display_path):
         visual = visual_by_clip[pair.target_clip_uid]
         references = [
-            FinalVisualReference.from_production(item)
+            FinalVisualReference.from_visual(item)
             for item in visual.sample.references
         ]
         common = {
