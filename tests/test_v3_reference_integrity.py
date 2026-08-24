@@ -1920,6 +1920,40 @@ def test_qwen_source_bbox_reviewer_describes_topology_upgrade_honestly(
     assert "current failed reference" not in text
 
 
+def test_qwen_source_bbox_reviewer_describes_distribution_route_honestly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _bbox_review(accept=True)
+    completions = FakeIntegrityCompletions(
+        [(expected.model_dump_json(), "stop")]
+    )
+    service = _config(tmp_path, monkeypatch).qwen.reference_integrity_judge
+    assert service is not None
+    judge = QwenSourceBboxFallbackJudge(
+        service,
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+        ),
+    )
+
+    judge.review(
+        source_context=Image.new("RGB", (12, 10)),
+        failed_reference=Image.new("RGBA", (8, 8)),
+        source_bbox_candidate=Image.new("RGB", (9, 7)),
+        reference_type="subject",
+        phrase="a person",
+        grounding_prompt="person near center",
+        reference_scope="full",
+        trigger="distribution_bbox_route",
+    )
+
+    text = str(completions.calls[0]["messages"][1]["content"][0]["text"]).lower()
+    assert "accepted alpha reference" in text
+    assert "deterministic reference form routing" in text
+    assert "target remains dominant" in text
+
+
 def test_large_enclosed_alpha_hole_is_review_suspicion_not_rejection() -> None:
     rgba = np.zeros((80, 80, 4), dtype=np.uint8)
     rgba[8:72, 8:72, :3] = 80

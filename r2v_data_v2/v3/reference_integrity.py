@@ -138,6 +138,7 @@ Do not emit trailing whitespace, markdown, or explanation."""
 SourceBboxFallbackTrigger = Literal[
     "artifact_review_reject",
     "topology_alpha_hole_upgrade",
+    "distribution_bbox_route",
 ]
 
 _OBJECT_CREATURE_TERMS = (
@@ -667,6 +668,12 @@ class QwenSourceBboxFallbackJudge:
                 "alpha topology found a meaningful enclosed transparent hole. "
                 "Accept Image 3 only if the raw source bbox is clearly preferable."
             )
+        elif trigger == "distribution_bbox_route":
+            trigger_context = (
+                "Image 2 is the accepted alpha reference. Deterministic reference "
+                "form routing selected a raw source bbox. Accept Image 3 only if "
+                "the target remains dominant and independently usable."
+            )
         else:
             trigger_context = "Image 2 is the current failed reference."
         messages: list[dict[str, object]] = [
@@ -1156,8 +1163,8 @@ def _evaluate_source_bbox(
     reference_type: str,
     phrase: str,
     grounding_prompt: str,
-    original_review: ReferenceIntegrityReview,
-    diagnostics: ReferenceTopologyDiagnostics,
+    original_review: ReferenceIntegrityReview | None,
+    diagnostics: ReferenceTopologyDiagnostics | None,
     crop_padding_ratio: float,
     trigger: SourceBboxFallbackTrigger,
     judge: SourceBboxFallbackJudge,
@@ -1206,7 +1213,11 @@ def _evaluate_source_bbox(
         "candidate_sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
         "original_reference_path": reference.image_path,
         "original_reference_sha256": current_reference_sha256,
-        "original_integrity_review": original_review.model_dump(mode="json"),
+        "original_integrity_review": (
+            original_review.model_dump(mode="json")
+            if original_review is not None
+            else None
+        ),
     }
     if trigger == "artifact_review_reject":
         metadata.update(
@@ -1215,7 +1226,9 @@ def _evaluate_source_bbox(
                 "failed_reference_sha256": current_reference_sha256,
             }
         )
-    else:
+    elif trigger == "topology_alpha_hole_upgrade":
+        if diagnostics is None:
+            raise ValueError("topology bbox upgrade requires topology diagnostics")
         metadata["topology_evidence"] = {
             "alpha_available": diagnostics.alpha_available,
             "enclosed_transparent_hole_count": (
@@ -1224,6 +1237,8 @@ def _evaluate_source_bbox(
             "largest_enclosed_hole_area": diagnostics.largest_enclosed_hole_area,
             "enclosed_hole_bbox_ratio": diagnostics.enclosed_hole_bbox_ratio,
         }
+    else:
+        metadata["reference_form_assignment"] = "bbox"
     try:
         attempt = judge.review(
             source_context=source_context,

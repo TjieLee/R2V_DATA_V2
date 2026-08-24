@@ -28,6 +28,14 @@ from r2v_data_v2.v3.reference_geometry import (
     source_geometry_metadata,
     tiny_content_reason,
 )
+from r2v_data_v2.v3.reference_integrity import (
+    QwenSourceBboxFallbackJudge,
+    SourceBboxFallbackJudge,
+    _evaluate_source_bbox,
+    _source_bbox_reference,
+    _source_context,
+    _source_evidence,
+)
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 from r2v_data_v2.v3.scale_collapse_fallback_guard import (
     QwenScaleCollapseFallbackJudge,
@@ -43,6 +51,7 @@ from r2v_data_v2.v3.schemas import (
     ReferenceCompleteness,
     ReferenceEditEntityState,
     ReferenceEditState,
+    ReferenceFormAssignment,
     ReferencesState,
 )
 from r2v_data_v2.v3.storage import RunStorage
@@ -70,6 +79,16 @@ class ReferenceEditStats:
     scale_collapse_guard_accepted: int = 0
     scale_collapse_guard_rejected: int = 0
     scale_collapse_guard_failed_open: int = 0
+    reference_form_assigned_alpha: int = 0
+    reference_form_assigned_bbox: int = 0
+    reference_form_assigned_generated_background: int = 0
+    reference_form_published_alpha: int = 0
+    reference_form_published_bbox: int = 0
+    reference_form_published_generated_background: int = 0
+    bbox_to_alpha: int = 0
+    generated_background_to_alpha: int = 0
+    boogu_background_candidates_attempted: int = 0
+    boogu_background_candidates_accepted: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -102,10 +121,32 @@ _SCALE_COLLAPSE_GUARD_COUNTER_FIELDS = (
     "scale_collapse_guard_rejected",
     "scale_collapse_guard_failed_open",
 )
+_REFERENCE_FORM_COUNTER_FIELDS = (
+    "reference_form_assigned_alpha",
+    "reference_form_assigned_bbox",
+    "reference_form_assigned_generated_background",
+    "reference_form_published_alpha",
+    "reference_form_published_bbox",
+    "reference_form_published_generated_background",
+    "bbox_to_alpha",
+    "generated_background_to_alpha",
+    "boogu_background_candidates_attempted",
+    "boogu_background_candidates_accepted",
+)
 _CLIP_COUNTER_FIELDS = (
     *_ENTITY_COUNTER_FIELDS,
     *_SCALE_COLLAPSE_GUARD_COUNTER_FIELDS,
+    *_REFERENCE_FORM_COUNTER_FIELDS,
 )
+
+
+def reference_form_for_entity(
+    clip_uid: str,
+    entity_id: str,
+) -> ReferenceFormAssignment:
+    identity = f"{clip_uid}:{entity_id}".encode("utf-8")
+    bucket = int.from_bytes(hashlib.sha256(identity).digest(), "big") % 3
+    return ("alpha", "bbox", "generated_background")[bucket]
 
 
 def _route(
@@ -177,6 +218,7 @@ def _write_source_selection_metadata(
     source_gate_reason: str | None,
     reason: str,
     operation_metadata_path: Path | None = None,
+    reference_form: ReferenceFormAssignment | None = None,
 ) -> Path:
     if reference.image_path is None:
         raise ValueError("source selection requires a reference image")
@@ -191,6 +233,7 @@ def _write_source_selection_metadata(
         "entity_id": reference.entity_id,
         "final_selection": "source",
         "final_selection_reason": reason,
+        "reference_form_assignment": reference_form,
         "final_reference_path": reference.image_path,
         "final_reference_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
         "selected_operation_metadata_path": (
@@ -394,6 +437,7 @@ def reference_edit_clips(
     backend: BooguReferenceEditBackend | None = None,
     judge: BooguReferenceEditJudge | None = None,
     sam_reviewer: BooguSamReviewer | None = None,
+    bbox_route_judge: SourceBboxFallbackJudge | None = None,
     scale_collapse_judge: ScaleCollapseFallbackJudge | None = None,
     manage_backend_lifecycle: bool = True,
 ) -> ReferenceEditStats:
@@ -407,13 +451,26 @@ def reference_edit_clips(
     active_backend = backend
     active_judge = judge
     active_sam = sam_reviewer
+    active_bbox_route_judge = bbox_route_judge
     active_scale_collapse_judge = scale_collapse_judge
     owned_backend: BooguSubprocessBackend | None = None
     owned_judge: QwenBooguReferenceEditJudge | None = None
     owned_segmenter: Sam3SegmentationBackend | None = None
+    owned_bbox_route_judge: QwenSourceBboxFallbackJudge | None = None
     owned_scale_collapse_judge: QwenScaleCollapseFallbackJudge | None = None
     started_backend: object | None = None
     runtime_ready = False
+
+    def get_bbox_route_judge() -> SourceBboxFallbackJudge:
+        nonlocal active_bbox_route_judge
+        nonlocal owned_bbox_route_judge
+        if active_bbox_route_judge is None:
+            judge_config = config.qwen.reference_integrity_judge
+            if judge_config is None:
+                raise ValueError("qwen.reference_integrity_judge is not configured")
+            owned_bbox_route_judge = QwenSourceBboxFallbackJudge(judge_config)
+            active_bbox_route_judge = owned_bbox_route_judge
+        return active_bbox_route_judge
 
     def get_scale_collapse_judge() -> ScaleCollapseFallbackJudge:
         nonlocal active_scale_collapse_judge
@@ -560,6 +617,7 @@ def reference_edit_clips(
                     clip_entity_counters["entities_eligible"] += 1
                     if reference.image_path is None:
                         raise ValueError("ready reference has no image_path")
+                    entity = entities[reference.entity_id]
                     source_geometry = _reference_content_geometry(storage, reference)
                     source_gate_reason = _source_gate_reason(config, source_geometry)
                     route = _route(
@@ -595,6 +653,19 @@ def reference_edit_clips(
                         )
                         clip_entity_counters["entities_fallback"] += 1
                         continue
+                    reference_form: ReferenceFormAssignment | None = None
+                    if (
+                        config.reference_integrity.enabled
+                        and entity.reference_type in {"subject", "object"}
+                        and route in {"complete", "local_usable"}
+                    ):
+                        reference_form = reference_form_for_entity(
+                            clip.clip_uid,
+                            reference.entity_id,
+                        )
+                        clip_entity_counters[
+                            f"reference_form_assigned_{reference_form}"
+                        ] += 1
                     operations = _operations(route)
                     if not operations:
                         raise RuntimeError(
@@ -605,7 +676,6 @@ def reference_edit_clips(
                         operation_judge,
                         operation_sam,
                     ) = initialize_runtime()
-                    entity = entities[reference.entity_id]
                     results: dict[str, BooguReferenceEditResult] = {}
                     source_image_path: Path | None = None
                     geometry_source_image_path = _resolve_artifact(
@@ -613,6 +683,10 @@ def reference_edit_clips(
                         reference.image_path,
                     )
                     for operation in operations:
+                        if operation == "add_entity_background":
+                            clip_entity_counters[
+                                "boogu_background_candidates_attempted"
+                            ] += 1
                         result = run_boogu_reference_edit(
                             run_root=storage.root,
                             clip_uid=clip.clip_uid,
@@ -645,6 +719,13 @@ def reference_edit_clips(
                             overwrite=overwrite,
                         )
                         results[operation] = result
+                        if (
+                            operation == "add_entity_background"
+                            and result.status == "accepted"
+                        ):
+                            clip_entity_counters[
+                                "boogu_background_candidates_accepted"
+                            ] += 1
                         if result.status != "accepted":
                             break
                         if operation == "complete_entity":
@@ -657,6 +738,214 @@ def reference_edit_clips(
                     attempted_operations = list(results)
                     completion_result = results.get("complete_entity")
                     background_result = results.get("add_entity_background")
+                    rejected_result: BooguReferenceEditResult | None = None
+                    rejection_reason: str | None = None
+                    last_result = results[attempted_operations[-1]]
+                    if last_result.status != "accepted":
+                        rejected_result = last_result
+                        rejection_reason = _rejection_reason(rejected_result)
+                        if rejection_reason.startswith(
+                            "boogu_reference_edit_failed:"
+                        ):
+                            clip_entity_counters["entities_failed"] += 1
+                            storage.append_failure(
+                                stage="reference_edit",
+                                clip_uid=clip.clip_uid,
+                                reason=rejection_reason,
+                                details={
+                                    "entity_id": reference.entity_id,
+                                    "operation": rejected_result.operation,
+                                },
+                            )
+                    if reference_form == "alpha":
+                        operation_result = results[attempted_operations[-1]]
+                        final_metadata_path = _write_source_selection_metadata(
+                            storage,
+                            clip_uid=clip.clip_uid,
+                            reference=reference,
+                            geometry=source_geometry,
+                            source_gate_reason=None,
+                            reason="deterministic_distribution_route:alpha",
+                            operation_metadata_path=operation_result.metadata_path,
+                            reference_form=reference_form,
+                        )
+                        final_references.append(reference)
+                        edit_states.append(
+                            ReferenceEditEntityState(
+                                entity_id=reference.entity_id,
+                                route=route,
+                                status="fallback",
+                                source_reference=reference,
+                                source_image_path=reference.image_path,
+                                output_image_path=reference.image_path,
+                                reference_form=reference_form,
+                                operation=operation_result.operation,
+                                metadata_path=storage.relative_artifact_path(
+                                    final_metadata_path
+                                ),
+                                operations=attempted_operations,
+                                background_metadata_path=(
+                                    storage.relative_artifact_path(
+                                        background_result.metadata_path
+                                    )
+                                    if background_result is not None
+                                    else None
+                                ),
+                                fallback_policy="keep_source",
+                                reason="deterministic_distribution_route:alpha",
+                            )
+                        )
+                        clip_entity_counters["entities_fallback"] += 1
+                        clip_entity_counters["reference_form_published_alpha"] += 1
+                        continue
+                    if reference_form == "bbox":
+                        operation_result = results[attempted_operations[-1]]
+                        bbox_reason = "distribution_bbox_route_rejected"
+                        bbox_reference: EntityReferenceState | None = None
+                        bbox_metadata_relative: str | None = None
+                        try:
+                            if reference.source_clip_uid not in {
+                                None,
+                                clip.clip_uid,
+                            } or reference.source_entity_id not in {
+                                None,
+                                reference.entity_id,
+                            }:
+                                raise ValueError(
+                                    "distribution bbox requires self-source provenance"
+                                )
+                            evidence = _source_evidence(
+                                storage,
+                                clip_uid=clip.clip_uid,
+                                reference=reference,
+                            )
+                            context = _source_context(evidence)
+                            with Image.open(geometry_source_image_path) as opened:
+                                opened.load()
+                                current_reference = opened.copy()
+                            bbox_evaluation = _evaluate_source_bbox(
+                                storage=storage,
+                                clip_uid=clip.clip_uid,
+                                entity_id=reference.entity_id,
+                                source_evidence=evidence,
+                                source_context=context,
+                                current_reference=current_reference,
+                                current_reference_path=geometry_source_image_path,
+                                reference=reference,
+                                reference_type=entity.reference_type,
+                                phrase=entity.phrase,
+                                grounding_prompt=entity.grounding_prompt,
+                                original_review=None,
+                                diagnostics=None,
+                                crop_padding_ratio=config.pair.crop_padding_ratio,
+                                trigger="distribution_bbox_route",
+                                judge=get_bbox_route_judge(),
+                            )
+                            bbox_metadata_relative = (
+                                bbox_evaluation.metadata_relative
+                            )
+                            if bbox_evaluation.judge_failure is not None:
+                                bbox_reason = (
+                                    "distribution_bbox_route_judge_failed:"
+                                    f"{bbox_evaluation.judge_failure}"
+                                )
+                            else:
+                                bbox_attempt = bbox_evaluation.attempt
+                                assert bbox_attempt is not None
+                                if bbox_attempt.review.verdict == "accept":
+                                    bbox_reference = _source_bbox_reference(
+                                        reference,
+                                        clip_uid=clip.clip_uid,
+                                        image_path=(
+                                            bbox_evaluation.candidate_relative
+                                        ),
+                                        bbox_xyxy=bbox_evaluation.bbox_xyxy,
+                                        metadata_path=(
+                                            bbox_evaluation.metadata_relative
+                                        ),
+                                    )
+                                    bbox_reason = "distribution_bbox_route_selected"
+                                else:
+                                    bbox_reason = (
+                                        "distribution_bbox_route_rejected:"
+                                        f"{bbox_attempt.review.reason}"
+                                    )
+                        except Exception as exc:  # noqa: BLE001 - safe alpha fallback
+                            bbox_reason = f"distribution_bbox_route_failed:{exc}"
+                        if bbox_reference is not None:
+                            final_references.append(bbox_reference)
+                            edit_states.append(
+                                ReferenceEditEntityState(
+                                    entity_id=reference.entity_id,
+                                    route=route,
+                                    status="fallback",
+                                    source_reference=reference,
+                                    source_image_path=reference.image_path,
+                                    output_image_path=bbox_reference.image_path,
+                                    reference_form=reference_form,
+                                    operation=operation_result.operation,
+                                    metadata_path=bbox_metadata_relative,
+                                    operations=attempted_operations,
+                                    background_metadata_path=(
+                                        storage.relative_artifact_path(
+                                            background_result.metadata_path
+                                        )
+                                        if background_result is not None
+                                        else None
+                                    ),
+                                    fallback_policy="source_bbox_fallback",
+                                    source_bbox_fallback_metadata_path=(
+                                        bbox_metadata_relative
+                                    ),
+                                    reason=bbox_reason,
+                                )
+                            )
+                            clip_entity_counters[
+                                "reference_form_published_bbox"
+                            ] += 1
+                        else:
+                            final_metadata_path = _write_source_selection_metadata(
+                                storage,
+                                clip_uid=clip.clip_uid,
+                                reference=reference,
+                                geometry=source_geometry,
+                                source_gate_reason=None,
+                                reason=bbox_reason,
+                                operation_metadata_path=(
+                                    operation_result.metadata_path
+                                ),
+                                reference_form=reference_form,
+                            )
+                            final_references.append(reference)
+                            edit_states.append(
+                                ReferenceEditEntityState(
+                                    entity_id=reference.entity_id,
+                                    route=route,
+                                    status="fallback",
+                                    source_reference=reference,
+                                    source_image_path=reference.image_path,
+                                    output_image_path=reference.image_path,
+                                    reference_form=reference_form,
+                                    operation=operation_result.operation,
+                                    metadata_path=storage.relative_artifact_path(
+                                        final_metadata_path
+                                    ),
+                                    operations=attempted_operations,
+                                    background_metadata_path=(
+                                        storage.relative_artifact_path(
+                                            background_result.metadata_path
+                                        )
+                                        if background_result is not None
+                                        else None
+                                    ),
+                                    fallback_policy="keep_source",
+                                    reason=bbox_reason,
+                                )
+                            )
+                            clip_entity_counters["reference_form_published_alpha"] += 1
+                            clip_entity_counters["bbox_to_alpha"] += 1
+                        clip_entity_counters["entities_fallback"] += 1
+                        continue
                     if len(results) == len(operations) and all(
                         result.status == "accepted" for result in results.values()
                     ):
@@ -703,6 +992,7 @@ def reference_edit_clips(
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
                                 output_image_path=accepted.image_path,
+                                reference_form=reference_form,
                                 operation=operations[-1],
                                 metadata_path=accepted.generation_metadata_path,
                                 operations=attempted_operations,
@@ -723,21 +1013,14 @@ def reference_edit_clips(
                             )
                         )
                         clip_entity_counters["entities_accepted"] += 1
+                        if reference_form == "generated_background":
+                            clip_entity_counters[
+                                "reference_form_published_generated_background"
+                            ] += 1
                         continue
 
-                    rejected_result = results[attempted_operations[-1]]
-                    rejection_reason = _rejection_reason(rejected_result)
-                    if rejection_reason.startswith("boogu_reference_edit_failed:"):
-                        clip_entity_counters["entities_failed"] += 1
-                        storage.append_failure(
-                            stage="reference_edit",
-                            clip_uid=clip.clip_uid,
-                            reason=rejection_reason,
-                            details={
-                                "entity_id": reference.entity_id,
-                                "operation": rejected_result.operation,
-                            },
-                        )
+                    assert rejected_result is not None
+                    assert rejection_reason is not None
                     if (
                         route == "repairable"
                         and completion_result is not None
@@ -843,6 +1126,7 @@ def reference_edit_clips(
                         guard_rejected = False
                         if (
                             rejected_result.operation == "add_entity_background"
+                            and reference_form is None
                             and rejection_reason == "entity_scale_collapsed"
                             and config.reference_edit.scale_collapse_fallback_guard_mode
                             == "qwen_v1"
@@ -931,6 +1215,7 @@ def reference_edit_clips(
                             source_gate_reason=None,
                             reason=rejection_reason,
                             operation_metadata_path=rejected_result.metadata_path,
+                            reference_form=reference_form,
                         )
                         final_references.append(reference)
                         edit_states.append(
@@ -941,6 +1226,7 @@ def reference_edit_clips(
                                 source_reference=reference,
                                 source_image_path=reference.image_path,
                                 output_image_path=reference.image_path,
+                                reference_form=reference_form,
                                 operation=rejected_result.operation,
                                 metadata_path=storage.relative_artifact_path(
                                     final_metadata_path
@@ -965,6 +1251,13 @@ def reference_edit_clips(
                             )
                         )
                         clip_entity_counters["entities_fallback"] += 1
+                        if reference_form == "generated_background":
+                            clip_entity_counters[
+                                "reference_form_published_alpha"
+                            ] += 1
+                            clip_entity_counters[
+                                "generated_background_to_alpha"
+                            ] += 1
                     else:
                         final_references.append(
                             _rejected_reference(
@@ -1071,6 +1364,8 @@ def reference_edit_clips(
             owned_segmenter.close()
         if owned_scale_collapse_judge is not None:
             owned_scale_collapse_judge.close()
+        if owned_bbox_route_judge is not None:
+            owned_bbox_route_judge.close()
         if close_error is not None:
             raise close_error
 
@@ -1081,5 +1376,28 @@ def reference_edit_clips(
         + stats.scale_collapse_guard_failed_open
     ):
         raise RuntimeError("scale-collapse guard outcomes must match attempts")
+    assigned = (
+        stats.reference_form_assigned_alpha
+        + stats.reference_form_assigned_bbox
+        + stats.reference_form_assigned_generated_background
+    )
+    published = (
+        stats.reference_form_published_alpha
+        + stats.reference_form_published_bbox
+        + stats.reference_form_published_generated_background
+    )
+    if assigned != published:
+        raise RuntimeError("reference form assignments must match publications")
+    if (
+        stats.bbox_to_alpha > stats.reference_form_assigned_bbox
+        or stats.generated_background_to_alpha
+        > stats.reference_form_assigned_generated_background
+    ):
+        raise RuntimeError("reference form fallback counts exceed assignments")
+    if (
+        stats.boogu_background_candidates_accepted
+        > stats.boogu_background_candidates_attempted
+    ):
+        raise RuntimeError("accepted Boogu background candidates exceed attempts")
     storage.update_stage_counts("reference_edit", stats.to_dict())
     return stats

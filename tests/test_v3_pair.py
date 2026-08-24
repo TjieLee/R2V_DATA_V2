@@ -27,6 +27,7 @@ from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     QwenServicesConfig,
     ReferenceEditConfig,
+    ReferenceIntegrityConfig,
     ReferenceScopeConfig,
     RemoveConfig,
     SourceConfig,
@@ -55,6 +56,7 @@ from r2v_data_v2.v3.reference_edit import (
     BACKGROUND_PROMPT,
     COMPLETION_PROMPT_TEMPLATE,
     reference_edit_clips,
+    reference_form_for_entity,
 )
 from r2v_data_v2.v3.reference_edit_boogu import (
     BooguBackgroundReview,
@@ -65,6 +67,10 @@ from r2v_data_v2.v3.reference_edit_boogu import (
 from r2v_data_v2.v3.reference_judge import (
     EntityReferenceDecisionAttempt,
     subject_has_nontrivial_detached_component,
+)
+from r2v_data_v2.v3.reference_integrity import (
+    SourceBboxFallbackJudgeFailure,
+    SourceBboxFallbackReviewAttempt,
 )
 from r2v_data_v2.v3.reference_prefilter import (
     NEAR_SILHOUETTE_RULE,
@@ -97,6 +103,7 @@ from r2v_data_v2.v3.schemas import (
     RawCrossPairDecision,
     RawEntityReferenceDecision,
     ReferencesState,
+    SourceBboxFallbackReview,
     SampledFrame,
     SampledFramesArtifact,
     TrackedEntityMasks,
@@ -191,6 +198,18 @@ def _config(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _enable_reference_form_routing(config: V3Config) -> V3Config:
+    model = config.qwen.reference_edit_judge
+    assert model is not None
+    routed = replace(
+        config,
+        qwen=replace(config.qwen, reference_integrity_judge=model),
+        reference_integrity=ReferenceIntegrityConfig(enabled=True),
+    )
+    routed.validate()
+    return routed
 
 
 def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
@@ -4487,6 +4506,41 @@ class _ScaleCollapseFallbackJudge:
         )
 
 
+class _ReferenceFormBboxJudge:
+    def __init__(self, *, accept: bool = True, fail: bool = False) -> None:
+        self.accept = accept
+        self.fail = fail
+        self.calls: list[dict[str, object]] = []
+
+    def review(self, **kwargs: object) -> SourceBboxFallbackReviewAttempt:
+        self.calls.append(kwargs)
+        if self.fail:
+            raise SourceBboxFallbackJudgeFailure("bbox judge unavailable")
+        flags = {
+            field: self.accept
+            for field in (
+                "same_target_entity",
+                "target_remains_dominant",
+                "extra_non_target_content_is_minor",
+                "no_competing_salient_entity",
+                "no_severe_reference_artifact",
+                "bbox_is_preferable_to_failed_reference",
+                "usable_as_independent_reference",
+                "certain",
+            )
+        }
+        review = SourceBboxFallbackReview(
+            verdict="accept" if self.accept else "reject",
+            reason="usable raw bbox" if self.accept else "target not dominant",
+            **flags,
+        )
+        return SourceBboxFallbackReviewAttempt(
+            review=review,
+            raw_response=review.model_dump_json(),
+            finish_reason="stop",
+        )
+
+
 class _MultipleInstanceSamReviewer:
     def review(self, **kwargs: object) -> BooguSamReview:
         del kwargs
@@ -4520,6 +4574,189 @@ def _write_touching_local_reference(
     pixels[8:64, 12:52, 3] = 255
     Image.fromarray(pixels, mode="RGBA").save(path, format="PNG")
     return path
+
+
+def test_reference_form_assignment_is_stable_and_balanced() -> None:
+    assert reference_form_for_entity("clip-1", "e1") == "bbox"
+    assert reference_form_for_entity("clip-1", "e1") == "bbox"
+    counts = {"alpha": 0, "bbox": 0, "generated_background": 0}
+    for index in range(3000):
+        counts[reference_form_for_entity(f"clip-{index}", "e1")] += 1
+
+    assert sum(counts.values()) == 3000
+    assert all(900 <= count <= 1100 for count in counts.values())
+
+
+def test_alpha_form_keeps_source_but_preserves_boogu_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _enable_reference_form_routing(
+        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    source = storage.read_clip("clip-1").references.entities[0]
+    monkeypatch.setattr(
+        reference_edit_module,
+        "reference_form_for_entity",
+        lambda clip_uid, entity_id: "alpha",
+    )
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    edit = clip.reference_edit.entities[0]
+    assert clip.references.entities == [source]
+    assert edit.reference_form == "alpha"
+    assert edit.fallback_policy == "keep_source"
+    assert edit.reason == "deterministic_distribution_route:alpha"
+    assert (
+        storage.reference_edit_dir("clip-1")
+        / "e1"
+        / "background_candidate_1k.png"
+    ).is_file()
+    assert edit.background_metadata_path is not None
+    assert stats.reference_form_assigned_alpha == 1
+    assert stats.reference_form_published_alpha == 1
+    assert stats.boogu_background_candidates_attempted == 1
+    assert stats.boogu_background_candidates_accepted == 1
+
+
+@pytest.mark.parametrize(
+    ("background_accept", "expected_synthetic", "expected_fallbacks"),
+    [(True, True, 0), (False, False, 1)],
+)
+def test_generated_background_form_selects_candidate_or_alpha_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background_accept: bool,
+    expected_synthetic: bool,
+    expected_fallbacks: int,
+) -> None:
+    config = _enable_reference_form_routing(
+        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    monkeypatch.setattr(
+        reference_edit_module,
+        "reference_form_for_entity",
+        lambda clip_uid, entity_id: "generated_background",
+    )
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(accept=background_accept),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    edit = clip.reference_edit.entities[0]
+    assert reference.synthetic is expected_synthetic
+    assert edit.reference_form == "generated_background"
+    assert stats.reference_form_assigned_generated_background == 1
+    assert stats.generated_background_to_alpha == expected_fallbacks
+    assert len(clip.references.entities) == 1
+
+
+@pytest.mark.parametrize(
+    ("accept", "fail", "expected_bbox"),
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_bbox_form_reuses_source_bbox_judge_and_falls_back_to_alpha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    accept: bool,
+    fail: bool,
+    expected_bbox: bool,
+) -> None:
+    config = _enable_reference_form_routing(
+        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge())
+    monkeypatch.setattr(
+        reference_edit_module,
+        "reference_form_for_entity",
+        lambda clip_uid, entity_id: "bbox",
+    )
+    bbox_judge = _ReferenceFormBboxJudge(accept=accept, fail=fail)
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+        bbox_route_judge=bbox_judge,
+    )
+
+    clip = storage.read_clip("clip-1")
+    reference = clip.references.entities[0]
+    edit = clip.reference_edit.entities[0]
+    assert reference.source_bbox_fallback is expected_bbox
+    assert reference.synthetic is False
+    assert edit.reference_form == "bbox"
+    assert bbox_judge.calls[0]["trigger"] == "distribution_bbox_route"
+    assert len(clip.references.entities) == 1
+    assert stats.reference_form_assigned_bbox == 1
+    assert stats.reference_form_published_bbox == int(expected_bbox)
+    assert stats.bbox_to_alpha == int(not expected_bbox)
+    if expected_bbox:
+        assert edit.fallback_policy == "source_bbox_fallback"
+        assert reference.source_bbox_metadata_path is not None
+        metadata = json.loads(
+            (storage.root / reference.source_bbox_metadata_path).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert metadata["trigger"] == "distribution_bbox_route_v1"
+        assert metadata["source_frame_index"] == reference.source_frame_index
+        with Image.open(storage.root / reference.image_path) as opened:
+            assert opened.mode == "RGB"
+    else:
+        assert edit.fallback_policy == "keep_source"
+
+
+def test_group_references_do_not_receive_form_assignment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _enable_reference_form_routing(
+        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    )
+    group_storage = _storage(config, entity_types=("group",))
+    pair_clips(config, group_storage, judge=_Judge())
+    stats = reference_edit_clips(
+        config,
+        group_storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+    assert (
+        group_storage.read_clip("clip-1")
+        .reference_edit.entities[0]
+        .reference_form
+        is None
+    )
+    assert (
+        group_storage.read_clip("clip-1").references.entities[0].synthetic is True
+    )
+    assert stats.boogu_background_candidates_attempted == 1
+    assert stats.reference_form_assigned_alpha == 0
+    assert stats.reference_form_assigned_bbox == 0
+    assert stats.reference_form_assigned_generated_background == 0
 
 
 def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
@@ -4731,10 +4968,12 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(
-        tmp_path,
-        monkeypatch,
-        reference_edit_enabled=True,
+    config = _enable_reference_form_routing(
+        _config(
+            tmp_path,
+            monkeypatch,
+            reference_edit_enabled=True,
+        )
     )
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
@@ -4800,6 +5039,10 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
         background_path.read_bytes()
     )
     state = storage.read_clip("clip-1").reference_edit.entities[0]
+    assert state.reference_form is None
+    assert stats.reference_form_assigned_alpha == 0
+    assert stats.reference_form_assigned_bbox == 0
+    assert stats.reference_form_assigned_generated_background == 0
     assert state.operations == ["complete_entity", "add_entity_background"]
     assert state.background_fallback == "none"
     assert (

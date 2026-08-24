@@ -1060,6 +1060,7 @@ ReferenceEditOperation = Literal[
     "complete_entity",
     "add_entity_background",
 ]
+ReferenceFormAssignment = Literal["alpha", "bbox", "generated_background"]
 ReferenceEditFallbackPolicy = Literal[
     "not_used",
     "keep_source",
@@ -1075,6 +1076,7 @@ class ReferenceEditEntityState(SchemaModel):
     status: Literal["accepted", "fallback", "rejected", "not_required"]
     source_reference: EntityReferenceState
     source_image_path: str
+    reference_form: Optional[ReferenceFormAssignment] = None
     output_image_path: Optional[str] = None
     operation: Optional[ReferenceEditOperation] = None
     metadata_path: Optional[str] = None
@@ -1098,6 +1100,13 @@ class ReferenceEditEntityState(SchemaModel):
         ):
             raise ValueError(
                 "reference edit source evidence must be a ready real reference"
+            )
+        if self.reference_form is not None and self.route not in {
+            "complete",
+            "local_usable",
+        }:
+            raise ValueError(
+                "reference form assignment requires complete or local_usable route"
             )
         allowed_sequences = {
             (),
