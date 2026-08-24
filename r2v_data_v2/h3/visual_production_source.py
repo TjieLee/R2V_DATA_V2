@@ -352,14 +352,14 @@ def derive_readable_clip_identity(
         source_relative_source_video_path,
         field_name="source_relative_source_video_path",
     )
-    media_collection = source_video_path.parent
-    if str(media_collection) in {"", "."}:
-        raise ValueError("source video must belong to a media collection directory")
+    if len(video_path.parts) < 2:
+        raise ValueError("source video path must contain a category and collection")
+    media_collection = PurePosixPath(*video_path.parts[:2])
     return ReadableClipIdentity(
         clip_uid=clip_uid,
         clip_display_path=video_path.with_suffix("").as_posix(),
         media_collection_relpath=media_collection.as_posix(),
-        media_collection_name=media_collection.name,
+        media_collection_name=video_path.parts[1],
         episode_name=source_video_path.stem,
         clip_name=video_path.stem,
         shard_id=shard_id,

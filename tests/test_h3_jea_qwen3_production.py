@@ -390,9 +390,7 @@ def test_dataset_sample_single_run_normalizes_references_and_identity(
     ]
     assert [reference.kind for reference in clip.subject_references] == ["subject"]
     assert clip.sample.r2v_instruction.startswith("Use <Image 1>")
-    assert clip.identity.media_collection_relpath == (
-        "01/法证先锋/法证先锋1/法证先锋1_22"
-    )
+    assert clip.identity.media_collection_relpath == "01/法证先锋"
     assert clip.identity.clip_display_path.endswith("clip_00216")
     assert all(Path(item.artifact_path).is_file() for item in clip.sample.references)
 
@@ -475,7 +473,50 @@ def test_readable_identity_derivation_preserves_unicode_and_spaces() -> None:
     assert identity.clip_display_path == "栏目 A/电影 集/第一集_0003"
 
 
-@pytest.mark.parametrize("value", ["../escape.mp4", "/absolute.mp4", "a\\b.mp4"])
+@pytest.mark.parametrize(
+    ("video_path", "expected_collection"),
+    [
+        (
+            "01/爱情公寓/01.爱情公寓1 4K（2009）/ep01/v_a.mp4",
+            "01/爱情公寓",
+        ),
+        (
+            "01/爱情公寓/04.爱情公寓4 4K（2014）/ep02/v_b.mp4",
+            "01/爱情公寓",
+        ),
+        (
+            "01/法证先锋/法证先锋1/法证先锋1_22/v_a.mp4",
+            "01/法证先锋",
+        ),
+        (
+            "01/法证先锋/法证先锋3/法证先锋3_10/v_b.mp4",
+            "01/法证先锋",
+        ),
+        (
+            "02/忠犬八公物语/season/episode/v_a.mp4",
+            "02/忠犬八公物语",
+        ),
+    ],
+)
+def test_readable_identity_groups_by_dataset_category_and_work(
+    video_path: str,
+    expected_collection: str,
+) -> None:
+    identity = derive_readable_clip_identity(
+        clip_uid="opaque",
+        shard_id="shard-1",
+        source_relative_video_path=video_path,
+        source_relative_source_video_path="legacy/source/episode.mkv",
+    )
+
+    assert identity.media_collection_relpath == expected_collection
+    assert identity.media_collection_name == expected_collection.split("/")[1]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["../escape.mp4", "/absolute.mp4", "a\\b.mp4", "single.mp4"],
+)
 def test_readable_identity_rejects_unsafe_relative_paths(value: str) -> None:
     with pytest.raises(ValueError):
         derive_readable_clip_identity(
@@ -545,14 +586,18 @@ def test_cross_pairs_only_use_exact_full_media_collection(tmp_path: Path) -> Non
             {
                 "clip_uid": "target",
                 "shard_id": "s1",
-                "clip_relative_path": "show-a/shared/target_0.mp4",
-                "source_relative_path": "show-a/shared/target.mkv",
+                "clip_relative_path": (
+                    "01/爱情公寓/爱情公寓1/ep01/target_0.mp4"
+                ),
+                "source_relative_path": "01/爱情公寓/爱情公寓1/ep01.mkv",
             },
             {
                 "clip_uid": "wrong",
                 "shard_id": "s2",
-                "clip_relative_path": "show-b/shared/wrong_0.mp4",
-                "source_relative_path": "show-b/shared/wrong.mkv",
+                "clip_relative_path": (
+                    "01/法证先锋/法证先锋1/ep01/wrong_0.mp4"
+                ),
+                "source_relative_path": "01/法证先锋/法证先锋1/ep01.mkv",
             },
         ],
     )
@@ -607,13 +652,13 @@ def test_pair_policy_keeps_frozen_thresholds_and_no_extra_gates(tmp_path: Path) 
             {
                 "clip_uid": "a",
                 "shard_id": "s1",
-                "clip_relative_path": "c/a_0.mp4",
+                "clip_relative_path": "c/collection/a_0.mp4",
                 "source_relative_path": "c/a.mkv",
             },
             {
                 "clip_uid": "b",
                 "shard_id": "s2",
-                "clip_relative_path": "c/b_0.mp4",
+                "clip_relative_path": "c/collection/b_0.mp4",
                 "source_relative_path": "c/b.mkv",
             },
         ],
