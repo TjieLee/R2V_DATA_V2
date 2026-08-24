@@ -48,11 +48,14 @@ Original source MKV files are never target media.
 Readable paths are derived from `clip.source.metadata`:
 
 ```python
-media_collection_relpath = Path(source_relative_source_video_path).parent.as_posix()
-media_collection_name = Path(media_collection_relpath).name
-episode_name = Path(source_relative_source_video_path).stem
-clip_name = Path(source_relative_video_path).stem
-clip_display_path = Path(source_relative_video_path).with_suffix("").as_posix()
+from pathlib import PurePosixPath
+
+video_path = PurePosixPath(source_relative_video_path)
+media_collection_relpath = PurePosixPath(*video_path.parts[:2]).as_posix()
+media_collection_name = video_path.parts[1]
+episode_name = PurePosixPath(source_relative_source_video_path).stem
+clip_name = video_path.stem
+clip_display_path = video_path.with_suffix("").as_posix()
 ```
 
 Unicode and spaces are preserved. Absolute paths, backslashes, and `..` are
@@ -109,6 +112,22 @@ uv pip install --python "$QWEN3_ASR_ENV/bin/python" \
   "qwen-asr==0.0.6" "pydantic>=2,<3" numpy pillow
 ```
 
+`qwen-asr` pins its own Python dependencies, but the server must provide a
+CUDA-compatible PyTorch runtime in this isolated environment. Do not infer a
+Torch or CUDA version; verify the installed runtime before production:
+
+```bash
+"$QWEN3_ASR_ENV/bin/python" - <<'PY'
+import torch
+import soundfile
+from qwen_asr import Qwen3ASRModel
+print("torch:", torch.__version__)
+print("cuda runtime:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+assert torch.cuda.is_available()
+PY
+```
+
 Runtime is local-files-only. The backend loads
 `Qwen/Qwen3-ASR-1.7B` once per process with `max_new_tokens=256` and calls the
 official API with the exact DiariZen segment waveform and source sample rate:
@@ -148,8 +167,8 @@ python tools/run_h3_jea_production.py \
   --dry-run
 ```
 
-Run each stage explicitly. The first six commands use the normal repository
-environment. Only Qwen3 ASR uses the isolated Qwen Python:
+Run each stage explicitly. All stages except `qwen3-asr` use the normal
+repository environment. Only Qwen3 ASR uses the isolated Qwen Python:
 
 ```bash
 export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python

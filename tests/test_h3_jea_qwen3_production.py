@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,8 @@ from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRBackend,
     Qwen3ASRConfiguration,
     Qwen3ASRSegment,
+    load_official_diarizen_waveform,
+    run_qwen3_asr,
 )
 from r2v_data_v2.h3.visual_production_source import (
     ReadableClipIdentity,
@@ -1205,6 +1208,101 @@ class _FakeQwenModel:
         return [SimpleNamespace(text=" raw transcript ", language="zh")]
 
 
+def test_diarizen_waveform_loader_uses_soundfile_first_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, bool]] = []
+    stereo = np.asarray(
+        [[0.1, 0.9], [0.2, 0.8], [0.3, 0.7]],
+        dtype=np.float32,
+    )
+
+    def read(path: str, *, dtype: str, always_2d: bool):
+        calls.append((path, dtype, always_2d))
+        return stereo, 48000
+
+    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(read=read))
+    source = tmp_path / "diarizen.flac"
+    waveform, sample_rate = load_official_diarizen_waveform(source)
+
+    assert calls == [(str(source), "float32", True)]
+    np.testing.assert_array_equal(waveform, stereo[:, 0])
+    assert waveform.dtype == np.float32
+    assert waveform.flags.c_contiguous
+    assert sample_rate == 48000
+
+
+@pytest.mark.parametrize("shape", [(0, 1), (3, 0)])
+def test_diarizen_waveform_loader_requires_samples_and_channels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, int],
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "soundfile",
+        SimpleNamespace(
+            read=lambda *_args, **_kwargs: (
+                np.empty(shape, dtype=np.float32),
+                16000,
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="no samples or channels"):
+        load_official_diarizen_waveform(tmp_path / "empty.flac")
+
+
+def test_qwen3_backend_import_error_names_required_runtimes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "torch", None)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"usable PyTorch runtime and qwen-asr==0\.0\.6",
+    ):
+        Qwen3ASRBackend(
+            Qwen3ASRConfiguration(local_model_path="/local/qwen3")
+        )
+
+
+def test_qwen3_backend_rejects_unavailable_requested_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, *args: object, **kwargs: object):
+            model_calls.append((args, kwargs))
+            return _FakeQwenModel()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            bfloat16=object(),
+            cuda=SimpleNamespace(is_available=lambda: False),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "qwen_asr",
+        SimpleNamespace(Qwen3ASRModel=_Model),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"torch\.cuda\.is_available\(\) is false",
+    ):
+        Qwen3ASRBackend(
+            Qwen3ASRConfiguration(local_model_path="/local/qwen3")
+        )
+    assert model_calls == []
+
+
 def test_qwen3_backend_uses_official_api_and_exact_waveform() -> None:
     model = _FakeQwenModel()
     factory_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -1277,3 +1375,129 @@ def test_qwen3_empty_and_failed_schemas_publish_no_confidence() -> None:
         assert "confidence" not in payload
         assert "language_probability" not in payload
         assert payload["text"] is None
+
+
+def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "clip-fail",
+                "shard_id": "shard-fail",
+                "clip_relative_path": "show/collection/fail_0.mp4",
+                "source_relative_path": "show/collection/fail.mkv",
+            }
+        ],
+    )
+    diarization = tmp_path / "diarization"
+    diarization.mkdir()
+    source_audio = tmp_path / "source.flac"
+    inventory_payload = {
+        "mode": "production",
+        "source_pairs_path": str(tmp_path / "pairs.jsonl"),
+        "source_pairs_sha256": "a" * 64,
+        "inventory_fingerprint": "b" * 64,
+        "source_target_count": 1,
+        "selected_target_count": 1,
+        "selection_mode": "complete_in_pair_target_inventory_v1",
+        "bounded_selection_applied": False,
+        "targets": [
+            {
+                "target_clip_uid": "clip-fail",
+                "target_video_path": inventory.clips[0].sample.target_video,
+                "source_audio_path": str(source_audio),
+                "source_audio_sha256": "c" * 64,
+                "source_sample_rate_hz": 16000,
+                "source_channels": 1,
+                "source_frame_count": 16000,
+                "target_audio_binding_path": str(tmp_path / "audio_binding.json"),
+                "visual_references": [],
+            }
+        ],
+    }
+    (diarization / "inventory.json").write_text(
+        json.dumps(inventory_payload),
+        encoding="utf-8",
+    )
+    raw_segments = []
+    bound_segments = []
+    for index, (start, end) in enumerate(((0.0, 0.5), (0.5, 1.0)), start=1):
+        segment_id = f"segment_{index:04d}"
+        start_sample = round(start * 16000)
+        end_sample = round(end * 16000)
+        raw_segments.append(
+            {
+                "target_clip_uid": "clip-fail",
+                "segment_id": segment_id,
+                "speaker_cluster_id": "speaker_1",
+                "backend_speaker_label": "speaker_1",
+                "backend_reported_start_time": start,
+                "backend_reported_end_time": end,
+                "backend_reported_start_sample": start_sample,
+                "backend_reported_end_sample": end_sample,
+                "start_time": start,
+                "end_time": end,
+                "source_start_sample": start_sample,
+                "source_end_sample": end_sample,
+                "source_audio_path": str(source_audio),
+                "source_audio_sha256": "c" * 64,
+                "source_sample_rate_hz": 16000,
+                "backend": "fake-diarizen",
+                "model_identifier": "fake/diarizen",
+                "model_fingerprint": "d" * 64,
+                "backend_configuration_fingerprint": "e" * 64,
+                "boundary_reconciliation": {
+                    "adjusted": False,
+                    "end_clamped": False,
+                    "end_overrun_samples": 0,
+                    "end_overrun_seconds": 0.0,
+                },
+            }
+        )
+        bound_segments.append(
+            {
+                "target_clip_uid": "clip-fail",
+                "segment_id": segment_id,
+                "speaker_cluster_id": "speaker_1",
+                "start_time": start,
+                "end_time": end,
+                "source_start_sample": start_sample,
+                "source_end_sample": end_sample,
+                "cluster_binding_status": "unbound",
+                "direct_anchor_samples": 0,
+                "direct_anchor_seconds": 0.0,
+                "identity_scope": "unresolved",
+            }
+        )
+    _jsonl(diarization / "raw_segments.jsonl", raw_segments)
+    _jsonl(diarization / "bound_segments.jsonl", bound_segments)
+
+    backend = Qwen3ASRBackend(
+        Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+        model_factory=lambda *_args, **_kwargs: _FakeQwenModel(),
+    )
+    loader_calls = 0
+
+    def failed_loader(_path: Path) -> tuple[np.ndarray, int]:
+        nonlocal loader_calls
+        loader_calls += 1
+        raise OSError("audio infrastructure unavailable")
+
+    output = tmp_path / "asr"
+    with pytest.raises(
+        RuntimeError,
+        match="Qwen3 ASR failed for every diarization segment",
+    ):
+        run_qwen3_asr(
+            visual_inventory=inventory,
+            diarization_root=diarization,
+            output_root=output,
+            backend=backend,
+            audio_loader=failed_loader,
+        )
+
+    assert loader_calls == 2
+    assert not output.exists()
+    assert list(tmp_path.glob(".asr.tmp-*")) == []

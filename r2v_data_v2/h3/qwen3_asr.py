@@ -175,10 +175,19 @@ class Qwen3ASRBackend:
             try:
                 import torch
                 from qwen_asr import Qwen3ASRModel
-            except ImportError as exc:
+            except (ImportError, OSError) as exc:
                 raise RuntimeError(
-                    "qwen-asr==0.0.6 is required in the isolated QWEN3_ASR_ENV"
+                    "A usable PyTorch runtime and qwen-asr==0.0.6 are required "
+                    "in the isolated QWEN3_ASR_ENV"
                 ) from exc
+            if (
+                configuration.device.partition(":")[0].lower() == "cuda"
+                and not torch.cuda.is_available()
+            ):
+                raise RuntimeError(
+                    "Qwen3 ASR requested a CUDA device, but "
+                    "torch.cuda.is_available() is false"
+                )
             dtype = getattr(torch, configuration.dtype)
             model_factory = Qwen3ASRModel.from_pretrained
         else:
@@ -216,15 +225,19 @@ AudioLoader = Callable[[Path], tuple[np.ndarray, int]]
 
 def load_official_diarizen_waveform(path: Path) -> tuple[np.ndarray, int]:
     try:
-        import torchaudio
+        import soundfile as sf
     except ImportError as exc:
         raise RuntimeError(
-            "torchaudio is required in the DiariZen/Qwen3 environment"
+            "soundfile is required in the DiariZen/Qwen3 environment"
         ) from exc
-    waveform, sample_rate = torchaudio.load(str(path))
-    if waveform.ndim != 2 or waveform.shape[0] < 1:
-        raise ValueError("DiariZen source audio has no channel")
-    return waveform[0].detach().cpu().numpy(), int(sample_rate)
+    waveform, sample_rate = sf.read(
+        str(path),
+        dtype="float32",
+        always_2d=True,
+    )
+    if waveform.ndim != 2 or waveform.shape[0] < 1 or waveform.shape[1] < 1:
+        raise ValueError("DiariZen source audio has no samples or channels")
+    return np.ascontiguousarray(waveform[:, 0]), int(sample_rate)
 
 
 def _read_rows(path: Path) -> list[dict[str, object]]:
@@ -402,6 +415,8 @@ def run_qwen3_asr(
             )
         )
         status_counts = Counter(item.status for item in rows)
+        if rows and status_counts["failed"] == len(rows):
+            raise RuntimeError("Qwen3 ASR failed for every diarization segment")
         language_counts = Counter(
             item.language
             for item in rows
