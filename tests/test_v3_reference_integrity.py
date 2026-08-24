@@ -772,9 +772,9 @@ def test_integrity_schema_requires_final_semantic_and_artifact_gates(
 @pytest.mark.parametrize(
     "description",
     (
-        "person viewed from behind with the head present",
-        "helmeted or masked person with the head present",
-        "side-profile person with the head and upper body present",
+        "front-view person with clear facial identity",
+        "near-front helmeted person with facial identity visible",
+        "three-quarter person with most frontal facial identity visible",
         "normal portrait with a recognizable head region",
     ),
 )
@@ -828,21 +828,19 @@ def test_integrity_prompt_forbids_sub_entity_reinterpretation() -> None:
         assert contract in prompt
 
 
-def test_integrity_prompt_requires_human_head_region_without_requiring_face() -> None:
+def test_integrity_prompt_requires_near_frontal_human_identity() -> None:
     prompt = " ".join(SYSTEM_PROMPT.lower().split())
 
     for contract in (
-        "the final reference must preserve a recognizable head region",
-        "a visible face is not required",
-        "person viewed from behind with the head present",
-        "helmeted or masked person with the head present",
-        "side-profile person with the head and upper body present",
-        "chef reference containing only coat and arms",
-        "person reference cropped completely below the neck",
-        "clothing-only fragment labeled as a subject",
+        "front or near-front face",
+        "roughly at least 50% of the frontal facial identity region visible",
+        "three-quarter human view may pass only",
+        "side-profile human",
+        "rear human",
+        "head or face is completely hidden",
         "set preserves_primary_identity_region to false",
-        "without imposing human anatomy",
-        "apply this human head-region rule only to human subjects",
+        "without imposing human anatomy or a human-face requirement",
+        "apply this human frontal-identity rule only to human subjects",
     ):
         assert contract in prompt
 

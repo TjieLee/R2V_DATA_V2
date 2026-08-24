@@ -143,7 +143,7 @@ class PairConfig:
 class BackgroundConfig:
     enabled: bool = True
     raw_foreground_area_ratio: float = 0.0
-    max_pending_remove_area_ratio: float = 0.50
+    max_pending_remove_area_ratio: float = 0.60
 
 
 @dataclass(frozen=True)

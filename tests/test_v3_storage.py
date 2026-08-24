@@ -496,7 +496,7 @@ def test_v3_config_loads_32b_defaults_without_model_access(
     assert loaded.frames.count == 10
     assert loaded.coverage.required_visible_frames == 7
     assert loaded.background.raw_foreground_area_ratio == 0.0
-    assert loaded.background.max_pending_remove_area_ratio == 0.50
+    assert loaded.background.max_pending_remove_area_ratio == 0.60
     assert loaded.remove.fallback_to_raw is False
 
 

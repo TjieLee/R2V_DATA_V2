@@ -1111,8 +1111,13 @@ person.
 recognizable requires sufficient component structure, not merely a guessable
 category. Hair needs a coherent hairstyle region or silhouette; reject fringe,
 arcs, isolated strands, or contour-only regions. Face needs enough facial
-structure to function independently; reject isolated patches. Upper or lower
-clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
+structure to function independently and must show a front or near-front face
+with roughly at least 50% of the frontal facial structure visible. Reject a
+strong three-quarter or near-side face below that standard, a side profile,
+the back of a head, an excessively turned face, or isolated facial patches.
+Apply this frontal requirement only when attribute_type is face; do not apply
+it to hair, headwear, glasses, clothing, shoes, bags, or accessories. Upper or
+lower clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
 cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags, and
 accessories need enough of the item to identify its structure independently.
 usable_as_attribute_condition=true only when the isolated crop provides clean,

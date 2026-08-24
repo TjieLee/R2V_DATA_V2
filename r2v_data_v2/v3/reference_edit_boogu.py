@@ -342,7 +342,12 @@ Accept only if Image 2 contains exactly the same single target entity, preserves
 its identity, appearance, scale, and layout, introduces no duplicate or salient
 entity, and does not extend or complete the target unexpectedly. Reject if the
 subject becomes smaller, moves toward a corner, or leaves large meaningless
-empty space. The background must be coherent, improve the reference's
+empty space. Set no_halo_or_seam=false for a newly generated wide softened rim,
+ghost rim, drop-shadow-like halo, blurred human or object outline, soft boundary
+that visibly disagrees with the source target, or obvious blending shadow or
+ghosting between the target and new background. Compare the source target with
+the generated candidate; do not reject natural scene depth of field by itself.
+The background must be coherent, improve the reference's
 naturalness, clarity, or usefulness, and make Image 2 clearly preferable to
 Image 1. A technically clean but implausible or unhelpful background must be
 rejected. Judge visible facts only and return one strict JSON object matching

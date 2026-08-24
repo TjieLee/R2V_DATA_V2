@@ -834,6 +834,10 @@ def test_review_prompt_requires_canonical_batch_shape() -> None:
     assert "recognizable requires sufficient component structure" in prompt
     assert "Hair needs a coherent hairstyle region or silhouette" in prompt
     assert "Face needs enough facial structure to function independently" in prompt
+    assert "at least 50% of the frontal facial structure visible" in prompt
+    assert "side profile" in prompt
+    assert "only when attribute_type is face" in prompt
+    assert "do not apply it to hair, headwear, glasses, clothing" in prompt
     assert "clothing needs coherent garment structure" in prompt
     assert "beyond the main subject reference" in prompt
     assert "pose-dominated cutout" in prompt

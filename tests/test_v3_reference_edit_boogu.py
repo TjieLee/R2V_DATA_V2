@@ -603,6 +603,13 @@ def test_background_review_prompt_requires_source_comparison() -> None:
     assert "layout" in prompt
     assert "large meaningless" in prompt
     assert "clearly preferable" in prompt
+    assert "no_halo_or_seam=false" in prompt
+    assert "wide softened rim" in prompt
+    assert "ghost rim" in prompt
+    assert "drop-shadow-like halo" in prompt
+    assert "blurred human or object outline" in prompt
+    assert "compare the source target" in prompt
+    assert "natural scene depth of field" in prompt
 
 
 def test_wrong_native_output_size_fails_closed_and_preserves_canonical(

@@ -85,21 +85,19 @@ white clothing or objects, white backgrounds, highlights, teeth, sclera, and
 paper are not artifacts merely because they are white. Judge unnatural
 source-to-reference alteration, not raw white-pixel presence.
 For a subject, require enough stable identity-bearing appearance for the stated
-scope, but do not require a visible face in every valid back view, masked person,
-character, or animal. For a human subject, when the highlighted source context
-visibly contains the person's head or head region, the final reference must
-preserve a recognizable head region together with stable person appearance. A
-visible face is not required. Accept a person viewed from behind with the head
-present, a helmeted or masked person with the head present, and a side-profile
-person with the head and upper body present. Reject a chef reference containing
-only coat and arms when the source shows the head, a person reference cropped
-completely below the neck, or a clothing-only fragment labeled as a subject.
-Set preserves_primary_identity_region to false for these human head-region
+scope. A human subject must preserve a front or near-front face with roughly at
+least 50% of the frontal facial identity region visible. A three-quarter human
+view may pass only when it still meets that near-front standard. Reject a strong
+three-quarter or near-side human view below that standard, a side-profile human,
+a rear human, or a human whose head or face is completely hidden. Do not invent
+a numeric ratio; make this a semantic judgment from visible evidence. Set
+preserves_primary_identity_region to false for these human frontal-identity
 failures. For a non-human subject or object, evaluate that field using its
-existing identity-bearing region without imposing human anatomy.
+existing identity-bearing region without imposing human anatomy or a human-face
+requirement.
 Reject a torso, arms, legs, or clothing fragment when the source contains
 substantially more useful identity evidence and the final image loses it. Apply
-this human head-region rule only to human subjects; do not introduce a face
+this human frontal-identity rule only to human subjects; do not introduce a face
 requirement or new rejection behavior for non-human subjects or objects. For an
 object, require its recognizable structural core. Reject major missing surfaces,
 large unnatural holes, disconnected remnants, identity-changing completion
