@@ -192,6 +192,31 @@ class _PilotClipResult:
     failure: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class ExplicitPilotClip:
+    """One explicitly selected V3 clip, possibly from a different shard run."""
+
+    clip_path: Path
+    source_run_root: Path
+    artifact_relpath: Path
+
+    def validated(self, *, source_root: Path) -> ExplicitPilotClip:
+        clip_path = self.clip_path.expanduser().resolve(strict=True)
+        shard_root = self.source_run_root.expanduser().resolve(strict=True)
+        clip_path.relative_to(shard_root)
+        shard_root.relative_to(source_root)
+        if not (shard_root / "run.json").is_file():
+            raise ValueError("explicit pilot shard root is not an initialized V3 run")
+        relative = Path(self.artifact_relpath)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise ValueError("explicit pilot artifact path must be safe and relative")
+        return ExplicitPilotClip(
+            clip_path=clip_path,
+            source_run_root=shard_root,
+            artifact_relpath=relative,
+        )
+
+
 def _empty_clip_counters() -> dict[str, int]:
     return {
         "clips_succeeded": 0,
@@ -218,6 +243,7 @@ def _run_pilot_clip(
     review_media_backend: ReviewMediaBackend,
     association_policy: FaceEntityAssociationPolicy | None,
     binding_policy: AudioBindingPolicy | None,
+    artifact_relpath: Path | None = None,
 ) -> _PilotClipResult:
     clip_uid = clip_path.parent.name
     counters = _empty_clip_counters()
@@ -313,12 +339,12 @@ def _run_pilot_clip(
             temporary / "review" / clip_uid / "voice_reference_quality.json",
             voice_quality_payload,
         )
+        clip_output = artifact_relpath or Path(clip_uid)
+        if clip_output.is_absolute() or ".." in clip_output.parts:
+            raise ValueError("pilot clip artifact path must be safe and relative")
+        _write_json(temporary / "clips" / clip_output / "audio_binding.json", sidecar_payload)
         _write_json(
-            temporary / "clips" / clip_uid / "audio_binding.json",
-            sidecar_payload,
-        )
-        _write_json(
-            temporary / "clips" / clip_uid / "voice_reference_quality.json",
+            temporary / "clips" / clip_output / "voice_reference_quality.json",
             voice_quality_payload,
         )
         counters["clips_succeeded"] = 1
@@ -372,15 +398,46 @@ def run_h3_audio_binding_pilot(
     workers: int = 1,
     association_policy: FaceEntityAssociationPolicy | None = None,
     binding_policy: AudioBindingPolicy | None = None,
+    explicit_clips: list[ExplicitPilotClip] | None = None,
 ) -> H3AudioBindingPilotSummary:
     if workers <= 0:
         raise ValueError("pilot workers must be positive")
-    source, destination = _validate_roots(run_root, output_root)
-    clip_paths = _selected_clip_paths(source, clip_ids=clip_ids, limit=limit)
+    if explicit_clips is None:
+        source, destination = _validate_roots(run_root, output_root)
+        selected = [
+            ExplicitPilotClip(
+                clip_path=clip_path,
+                source_run_root=source,
+                artifact_relpath=Path(clip_path.parent.name),
+            )
+            for clip_path in _selected_clip_paths(
+                source, clip_ids=clip_ids, limit=limit
+            )
+        ]
+    else:
+        if clip_ids is not None or limit is not None:
+            raise ValueError("explicit pilot clips cannot be combined with ID selection")
+        source = run_root.expanduser().resolve(strict=True)
+        destination = output_root.expanduser().resolve(strict=False)
+        if (
+            destination == source
+            or source in destination.parents
+            or destination in source.parents
+        ):
+            raise ValueError("pilot output must be separate from source run_root")
+        if destination.exists():
+            raise FileExistsError(f"pilot output already exists: {destination}")
+        selected = [item.validated(source_root=source) for item in explicit_clips]
+        clip_uids = [item.clip_path.parent.name for item in selected]
+        artifact_paths = [item.artifact_relpath.as_posix() for item in selected]
+        if len(clip_uids) != len(set(clip_uids)):
+            raise ValueError("explicit pilot clip UIDs must be unique")
+        if len(artifact_paths) != len(set(artifact_paths)):
+            raise ValueError("explicit pilot artifact paths must be unique")
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     counters = {
-        "clips_attempted": len(clip_paths),
+        "clips_attempted": len(selected),
         "clips_succeeded": 0,
         "clips_failed": 0,
         "clips_with_speech": 0,
@@ -399,8 +456,8 @@ def run_h3_audio_binding_pilot(
         temporary.mkdir()
         clip_arguments = [
             {
-                "clip_path": clip_path,
-                "source": source,
+                "clip_path": item.clip_path,
+                "source": item.source_run_root,
                 "temporary": temporary,
                 "destination": destination,
                 "lr_asd_backend": lr_asd_backend,
@@ -408,8 +465,9 @@ def run_h3_audio_binding_pilot(
                 "review_media_backend": review_media_backend,
                 "association_policy": association_policy,
                 "binding_policy": binding_policy,
+                "artifact_relpath": item.artifact_relpath,
             }
-            for clip_path in clip_paths
+            for item in selected
         ]
         if workers == 1 or not clip_arguments:
             results = [_run_pilot_clip(**values) for values in clip_arguments]

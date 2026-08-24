@@ -6,7 +6,7 @@ import math
 import shutil
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -379,6 +379,7 @@ def export_primary_voice_references(
     audio_backend: AudioMediaBackend,
     policy: VoiceReferenceQualityPolicy | None = None,
     overwrite: bool = False,
+    output_path_for_entity: Callable[[str, str], Path] | None = None,
 ) -> PrimaryVoiceReferenceExportSummary:
     source = pilot_root.expanduser().resolve(strict=True)
     destination = output_root.expanduser().resolve(strict=False)
@@ -396,22 +397,25 @@ def export_primary_voice_references(
     selected_rows: list[dict[str, object]] = []
     try:
         temporary.mkdir()
-        sidecar_paths = sorted((source / "clips").glob("*/audio_binding.json"))
+        sidecar_paths = sorted((source / "clips").glob("**/audio_binding.json"))
         if not sidecar_paths:
             raise ValueError("primary voice export found no audio binding artifacts")
         for sidecar_path in sidecar_paths:
             sidecar = AudioBindingSidecar.model_validate_json(
                 sidecar_path.read_text(encoding="utf-8")
             )
-            clip_uid = sidecar_path.parent.name
-            if sidecar.clip_uid != clip_uid or sidecar.status != "ready":
+            clip_uid = sidecar.clip_uid
+            if sidecar.status != "ready":
                 raise ValueError("primary voice export requires identity-matched ready clips")
             if sidecar.h3_ir is None:
                 raise ValueError("primary voice export requires H3 subject metadata")
-            report = load_voice_reference_quality_diagnostics(
-                sidecar_root=source,
-                clip_uid=clip_uid,
+            report = VoiceReferenceClipDiagnostics.model_validate_json(
+                sidecar_path.with_name("voice_reference_quality.json").read_text(
+                    encoding="utf-8"
+                )
             )
+            if report.clip_uid != clip_uid:
+                raise ValueError("primary voice diagnostics differ from Audio sidecar")
             clip_assessments = assess_voice_reference_clip(report, policy=active)
             assessments.extend(clip_assessments)
             subject_ids = [
@@ -453,13 +457,20 @@ def export_primary_voice_references(
                     )
                 else:
                     start_sample, end_sample = voice_turn_sample_range(chosen.metrics)
-                    voice_path = (
-                        temporary
-                        / "voice_refs"
+                    relative_voice_path = (
+                        output_path_for_entity(clip_uid, entity_id)
+                        if output_path_for_entity is not None
+                        else Path("voice_refs")
                         / clip_uid
                         / entity_id
                         / "voice_ref_1.flac"
                     )
+                    if (
+                        relative_voice_path.is_absolute()
+                        or ".." in relative_voice_path.parts
+                    ):
+                        raise ValueError("primary voice output path must be safe and relative")
+                    voice_path = temporary / relative_voice_path
                     audio_backend.extract_voice_reference(
                         clip_uid=clip_uid,
                         entity_id=entity_id,

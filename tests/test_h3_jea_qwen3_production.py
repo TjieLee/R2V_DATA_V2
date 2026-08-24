@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import tools.run_h3_jea_production as jea_cli
 from r2v_data_v2.h3.jea_audio_production import (
     JEAOccurrenceEmbedding,
     audio_binding_path,
@@ -24,6 +26,15 @@ from r2v_data_v2.h3.visual_production_source import (
     derive_readable_clip_identity,
     load_visual_production_inventory,
 )
+
+
+class _StageResult:
+    def __init__(self, **values: object) -> None:
+        self.values = values
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return dict(self.values)
 
 
 def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -224,9 +235,9 @@ def test_readable_audio_and_primary_voice_paths() -> None:
         .endswith("audio/full_audio/栏目/集合/片段 01.flac")
     )
     assert (
-        primary_voice_path(Path("primary_voice"), identity, subject_index=1)
+        primary_voice_path(Path("primary_voice"), identity, entity_id="hero")
         .as_posix()
-        .endswith("primary_voice/栏目/集合/片段 01/e1.flac")
+        .endswith("primary_voice/栏目/集合/片段 01/hero.flac")
     )
 
 
@@ -246,7 +257,7 @@ def _occurrences(inventory: object) -> list[JEAOccurrenceEmbedding]:
                 ),
                 primary_voice_reference_path=str(
                     primary_voice_path(
-                        Path("primary_voice"), clip.identity, subject_index=1
+                        Path("primary_voice"), clip.identity, entity_id="entity_1"
                     )
                 ),
                 face_embedding=[1.0, 0.0, float(index) * 0.0],
@@ -346,6 +357,221 @@ def test_pair_policy_keeps_frozen_thresholds_and_no_extra_gates(tmp_path: Path) 
     assert not summary.rank_gate_enabled
     assert not summary.margin_gate_enabled
     assert not summary.text_gate_enabled
+
+
+def test_multi_subject_matching_maximizes_complete_face_assignment(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "target",
+                "shard_id": "s1",
+                "clip_relative_path": "show/collection/target_0.mp4",
+                "source_relative_path": "show/collection/target.mkv",
+            },
+            {
+                "clip_uid": "donor-a",
+                "shard_id": "s2",
+                "clip_relative_path": "show/collection/a_0.mp4",
+                "source_relative_path": "show/collection/a.mkv",
+            },
+            {
+                "clip_uid": "donor-b",
+                "shard_id": "s3",
+                "clip_relative_path": "show/collection/b_0.mp4",
+                "source_relative_path": "show/collection/b.mkv",
+            },
+        ],
+    )
+    clip_by_uid = {item.identity.clip_uid: item for item in inventory.clips}
+
+    def vector(angle: float) -> list[float]:
+        radians = math.radians(angle)
+        return [math.cos(radians), math.sin(radians)]
+
+    def occurrence(clip_uid: str, entity_id: str, index: int, angle: float):
+        clip = clip_by_uid[clip_uid]
+        return JEAOccurrenceEmbedding(
+            occurrence_id=f"{clip_uid}/{entity_id}",
+            clip_uid=clip_uid,
+            entity_id=entity_id,
+            subject_index=index,
+            identity=clip.identity,
+            visual_reference_path=f"/{clip_uid}/{entity_id}.png",
+            primary_voice_reference_path=f"/{clip_uid}/{entity_id}.flac",
+            face_embedding=vector(angle),
+            voice_embedding=[1.0, 0.0],
+        )
+
+    rows = [
+        occurrence("target", "e1", 1, 0),
+        occurrence("target", "e2", 2, 30),
+        occurrence("donor-a", "e1", 1, 10),
+        occurrence("donor-b", "e1", 1, -10),
+    ]
+    build_jea_pairs(
+        visual_inventory=inventory,
+        occurrences=rows,
+        audio_root=tmp_path / "audio",
+        output_root=tmp_path / "pairs",
+    )
+    cross_pairs = [
+        json.loads(line)
+        for line in (tmp_path / "pairs/cross_pairs.jsonl").read_text().splitlines()
+    ]
+    target = next(item for item in cross_pairs if item["target_clip_uid"] == "target")
+    assert [item["donor_occurrence_id"] for item in target["mappings"]] == [
+        "donor-b/e1",
+        "donor-a/e1",
+    ]
+
+
+def test_two_shard_cli_wires_all_seven_stages_without_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "clip-a",
+                "shard_id": "shard-a",
+                "clip_relative_path": "show/collection/a_0.mp4",
+                "source_relative_path": "show/collection/a.mkv",
+            },
+            {
+                "clip_uid": "clip-b",
+                "shard_id": "shard-b",
+                "clip_relative_path": "show/collection/b_0.mp4",
+                "source_relative_path": "show/collection/b.mkv",
+            },
+        ],
+    )
+    for shard in ("shard-a", "shard-b"):
+        (Path(inventory.visual_runs_root) / shard / "run.json").write_text("{}")
+    output = tmp_path / "audio-production"
+    calls: list[str] = []
+
+    monkeypatch.setattr(jea_cli, "load_visual_production_inventory", lambda **_: inventory)
+    monkeypatch.setattr(jea_cli, "FFmpegAudioMediaBackend", lambda **_: object())
+    monkeypatch.setattr(jea_cli, "_path_argument", lambda *_, **__: tmp_path)
+    monkeypatch.setattr(jea_cli, "LRASDRuntimeConfig", lambda **_: object())
+    monkeypatch.setattr(jea_cli, "SileroVADRuntimeConfig", lambda **_: object())
+    monkeypatch.setattr(jea_cli, "LRASDSubprocessBackend", lambda _: object())
+    monkeypatch.setattr(jea_cli, "SileroVADSubprocessBackend", lambda _: object())
+    monkeypatch.setattr(jea_cli, "ExternalReviewMediaBackend", lambda **_: object())
+
+    def audio_stage(**kwargs: object) -> _StageResult:
+        calls.append("audio")
+        root = Path(kwargs["output_root"])
+        root.mkdir(parents=True)
+        (root / "summary.json").write_text("{}")
+        return _StageResult(clip_count=2)
+
+    def primary_stage(**kwargs: object) -> _StageResult:
+        calls.append("primary-voice")
+        root = Path(kwargs["output_root"])
+        root.mkdir(parents=True)
+        (root / "primary_voice_references.jsonl").write_text("{}\n")
+        return _StageResult(reference_count=2)
+
+    def embedding_stage(**kwargs: object) -> _StageResult:
+        calls.append("embedding")
+        root = Path(kwargs["output_root"])
+        root.mkdir(parents=True)
+        _jsonl(
+            root / "occurrences.jsonl",
+            [item.model_dump(mode="json") for item in _occurrences(inventory)],
+        )
+        return _StageResult(occurrence_count=2)
+
+    def pair_stage(**kwargs: object) -> _StageResult:
+        calls.append("pair")
+        root = Path(kwargs["output_root"])
+        root.mkdir(parents=True)
+        (root / "in_pairs.jsonl").write_text("{}\n")
+        return _StageResult(pair_count=2)
+
+    class _Backend:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(jea_cli, "run_jea_audio_stage", audio_stage)
+    monkeypatch.setattr(jea_cli, "run_jea_primary_voice_stage", primary_stage)
+    monkeypatch.setattr(jea_cli, "run_jea_embedding_stage", embedding_stage)
+    monkeypatch.setattr(jea_cli, "build_jea_pairs", pair_stage)
+    monkeypatch.setattr(jea_cli, "_embedding_backends", lambda *_: (_Backend(), _Backend()))
+    monkeypatch.setattr(jea_cli, "build_jea_diarization_inventory", lambda **_: object())
+    monkeypatch.setattr(
+        jea_cli,
+        "_runtime_backend",
+        lambda **_: (_Backend(), tmp_path / "missing-diagnostics"),
+    )
+
+    def diarization_stage(**kwargs: object) -> _StageResult:
+        calls.append("diarization")
+        root = Path(kwargs["output_root"])
+        root.mkdir(parents=True)
+        (root / "inventory.json").write_text("{}")
+        (root / "bound_segments.jsonl").write_text("{}\n")
+        return _StageResult(segment_count=2)
+
+    monkeypatch.setattr(jea_cli, "run_diarization_binding_pilot", diarization_stage)
+    monkeypatch.setattr(
+        jea_cli,
+        "publish_readable_diarization_metadata",
+        lambda **_: _StageResult(segment_count=2),
+    )
+    monkeypatch.setenv("QWEN3_ASR_ENV", str(tmp_path / "qwen"))
+    monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path / "qwen-model"))
+    monkeypatch.setattr(jea_cli, "Qwen3ASRBackend", lambda _: object())
+
+    def asr_stage(**kwargs: object) -> _StageResult:
+        calls.append("qwen3-asr")
+        root = Path(kwargs["output_root"])
+        root.mkdir(parents=True)
+        (root / "segments.jsonl").write_text("{}\n")
+        return _StageResult(segment_count=2)
+
+    def h3_stage(**kwargs: object) -> _StageResult:
+        calls.append("h3")
+        Path(kwargs["output_root"]).mkdir(parents=True)
+        return _StageResult(sample_count=2)
+
+    monkeypatch.setattr(jea_cli, "run_qwen3_asr", asr_stage)
+    monkeypatch.setattr(jea_cli, "render_jea_final_samples", h3_stage)
+    result = jea_cli.main(
+        [
+            "--visual-production-root",
+            inventory.visual_production_root,
+            "--visual-runs-root",
+            inventory.visual_runs_root,
+            "--audio-production-root",
+            str(output),
+            "--stages",
+            "all",
+            "--workers",
+            "1",
+        ]
+    )
+    assert calls == [
+        "audio",
+        "primary-voice",
+        "embedding",
+        "pair",
+        "diarization",
+        "qwen3-asr",
+        "h3",
+    ]
+    assert list(result["stage_results"]) == calls
 
 
 class _FakeQwenModel:

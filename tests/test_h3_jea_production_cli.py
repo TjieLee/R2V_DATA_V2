@@ -43,6 +43,15 @@ def test_production_stage_parser_is_direct_and_ordered() -> None:
         "qwen3-asr",
         "h3",
     )
+    assert _parse_stages("all") == (
+        "audio",
+        "primary-voice",
+        "embedding",
+        "pair",
+        "diarization",
+        "qwen3-asr",
+        "h3",
+    )
     with pytest.raises(ValueError):
         _parse_stages("whisper")
 

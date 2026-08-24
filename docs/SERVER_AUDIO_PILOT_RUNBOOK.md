@@ -1,6 +1,11 @@
 # Active JEA production path
 
-For full canonical JEA production, readable media-collection grouping, the isolated qwen-asr==0.0.6 environment, and Qwen3/final-renderer commands, use docs/H3_QWEN3_ASR.md. The Whisper commands below are legacy pilot procedures, not the active JEA production ASR path.
+For full canonical JEA production, readable media-collection grouping, all
+seven sequential stage commands, the isolated `qwen-asr==0.0.6` environment,
+and Qwen3/final-renderer operation, use `docs/H3_QWEN3_ASR.md`. Audio,
+primary-voice, embedding, pair, DiariZen, and H3 use `R2V_PYTHON`; only
+`qwen3-asr` uses `QWEN3_ASR_ENV/bin/python`. The Whisper commands below are
+legacy pilot procedures, not the active JEA production ASR path.
 
 # Server Audio Pilot Runbook
 

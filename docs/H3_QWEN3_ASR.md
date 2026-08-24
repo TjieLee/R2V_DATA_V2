@@ -56,7 +56,7 @@ Clip artifacts use the readable path:
 ```text
 audio/clips/<clip_display_path>/audio_binding.json
 audio/full_audio/<clip_display_path>.flac
-primary_voice/<clip_display_path>/e1.flac
+primary_voice/<clip_display_path>/<entity_id>.flac
 ```
 
 Pair rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
@@ -82,7 +82,8 @@ export QWEN3_ASR_DTYPE=bfloat16
 export QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE=1
 
 uv venv --python 3.12 --seed "$QWEN3_ASR_ENV"
-uv pip install --python "$QWEN3_ASR_ENV/bin/python" "qwen-asr==0.0.6"
+uv pip install --python "$QWEN3_ASR_ENV/bin/python" \
+  "qwen-asr==0.0.6" "pydantic>=2,<3" numpy pillow
 ```
 
 Runtime is local-files-only. The backend loads
@@ -123,16 +124,59 @@ python tools/run_h3_jea_production.py \
   --dry-run
 ```
 
-After readable Audio, primary-voice, embedding, and unchanged DiariZen stages
-have produced their direct stage directories, run the active downstream path:
+Run each stage explicitly. The first six commands use the normal repository
+environment. Only Qwen3 ASR uses the isolated Qwen Python:
 
 ```bash
+export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages audio --workers 4
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages primary-voice
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages embedding
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages pair
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages diarization
+
 "$QWEN3_ASR_ENV/bin/python" tools/run_h3_jea_production.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --stages pair,qwen3-asr,h3
+  --stages qwen3-asr
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages h3
 ```
+
+The active order is `audio -> primary-voice -> embedding -> pair ->
+diarization -> qwen3-asr -> h3`. Every stage reads only its canonical upstream
+artifacts. Existing stage directories are not silently reused; inspect them and
+pass `--overwrite` only for an intentional replacement.
 
 For a minimal ASR-only rerun:
 

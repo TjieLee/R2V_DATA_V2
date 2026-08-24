@@ -1,6 +1,12 @@
 # JEA Qwen3 Audio production integration
 
-The active readable JEA Audio production path consumes the compacted canonical Visual samples.jsonl, groups cross donors by the full media collection path, uses isolated local Qwen/Qwen3-ASR-1.7B, and publishes r2v.h3.final_sample.2. See docs/H3_QWEN3_ASR.md. Legacy Whisper pilots are retained but are not selected by this production path; Dots3 remains paused.
+The active readable JEA Audio production path now runs all seven explicit stages
+from canonical Visual `samples.jsonl`: Audio binding, frozen primary voice,
+InsightFace/ECAPA embeddings, frozen PairPolicy, DiariZen, isolated local
+Qwen/Qwen3-ASR-1.7B, and final H3 rendering. Cross donors remain restricted to
+the full media collection path. See `docs/H3_QWEN3_ASR.md`. Legacy Whisper
+pilots are retained but are not selected by this production path; Dots3 remains
+paused.
 
 # R2V_DATA_V2 Project State
 

@@ -46,7 +46,7 @@ from r2v_data_v2.h3.lr_asd import (
     SileroVADSubprocessBackend,
     normalize_lr_asd_evidence,
 )
-from r2v_data_v2.h3.pilot import run_h3_audio_binding_pilot
+from r2v_data_v2.h3.pilot import ExplicitPilotClip, run_h3_audio_binding_pilot
 from r2v_data_v2.h3.pilot_schemas import (
     LRASDNativeArtifact,
     LRASDNativeSample,
@@ -1407,6 +1407,68 @@ def test_pilot_isolates_lr_asd_failure_and_runs_backend_once_per_clip(
         }
     ]
     assert _tree_hashes(run_root) == before
+
+
+def test_explicit_multi_shard_pilot_publishes_readable_clip_paths(
+    tmp_path: Path,
+) -> None:
+    runs_root = tmp_path / "runs"
+    native_artifacts = {}
+    speech_artifacts = {}
+    explicit = []
+    for index, clip_uid in enumerate(("clip-a", "clip-b"), start=1):
+        shard_root = runs_root / f"shard-{index}"
+        source = tmp_path / f"{clip_uid}.mp4"
+        audio = tmp_path / f"{clip_uid}.wav"
+        source.write_bytes(b"video")
+        _write_pcm16_wav(audio, [100] * 16000)
+        _write_pilot_clip(
+            shard_root,
+            _pilot_clip(clip_uid, source),
+            masks_by_entity={"e1": _full_entity_mask()},
+        )
+        native_artifacts[clip_uid] = _native_artifact(
+            clip_uid=clip_uid,
+            source_video=source,
+            audio_path=audio,
+            logits_by_track=[[0.7] * 25],
+            duration_seconds=1.0,
+        )
+        speech_artifacts[clip_uid] = _speech_artifact(
+            clip_uid,
+            audio,
+            speech=True,
+            duration_seconds=1.0,
+        )
+        explicit.append(
+            ExplicitPilotClip(
+                clip_path=shard_root / "clips" / clip_uid / "clip.json",
+                source_run_root=shard_root,
+                artifact_relpath=Path("节目") / "集合" / f"片段 {index}",
+            )
+        )
+
+    summary = run_h3_audio_binding_pilot(
+        run_root=runs_root,
+        output_root=tmp_path / "pilot",
+        lr_asd_backend=_CountingLRASDBackend(native_artifacts),
+        speech_backend=PrecomputedSpeechActivityBackend(speech_artifacts),
+        review_media_backend=_FakeReviewMediaBackend(),
+        explicit_clips=explicit,
+        workers=1,
+    )
+
+    assert summary.clips_succeeded == 2
+    for index in (1, 2):
+        assert (
+            tmp_path
+            / "pilot"
+            / "clips"
+            / "节目"
+            / "集合"
+            / f"片段 {index}"
+            / "audio_binding.json"
+        ).is_file()
 
 
 def test_parallel_pilot_matches_serial_outputs_and_failure_accounting(

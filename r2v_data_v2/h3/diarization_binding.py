@@ -918,6 +918,37 @@ def _inventory_fingerprint(
     )
 
 
+def build_complete_diarization_inventory(
+    *,
+    source_pairs_path: Path,
+    targets: Sequence[DiarizationTargetClip],
+) -> DiarizationInventory:
+    """Build the frozen production inventory from an explicit complete pair set."""
+    pairs_path = source_pairs_path.expanduser().resolve(strict=True)
+    ordered = list(targets)
+    target_ids = [item.target_clip_uid for item in ordered]
+    if target_ids != sorted(target_ids) or len(target_ids) != len(set(target_ids)):
+        raise ValueError("complete diarization targets must be unique and ordered")
+    pairs_sha256 = _sha256_file(pairs_path)
+    fingerprint = _inventory_fingerprint(
+        source_pairs_sha256=pairs_sha256,
+        source_asr_inventory_fingerprint=None,
+        mode="production",
+        targets=ordered,
+    )
+    return DiarizationInventory(
+        mode="production",
+        source_pairs_path=str(pairs_path),
+        source_pairs_sha256=pairs_sha256,
+        inventory_fingerprint=fingerprint,
+        source_target_count=len(ordered),
+        selected_target_count=len(ordered),
+        selection_mode="complete_in_pair_target_inventory_v1",
+        bounded_selection_applied=False,
+        targets=ordered,
+    )
+
+
 def build_diarization_inventory(
     *,
     audio_run_root: Path,
