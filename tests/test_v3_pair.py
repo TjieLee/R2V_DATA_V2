@@ -5489,6 +5489,7 @@ def test_repairable_completion_accept_is_canonical_without_background_edit(
     config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0]
     assert (
         storage.read_clip("clip-1")
         .references.entities[0]
@@ -5524,6 +5525,9 @@ def test_repairable_completion_accept_is_canonical_without_background_edit(
     assert state.background_fallback == "none"
     assert state.variants.generated_background.status == "unavailable"
     assert clip.references.entities[0].synthetic is True
+    assert clip.references.entities[0].source_frame_index == (
+        canonical.source_frame_index
+    )
     assert clip.references.entities[0].completion_needed_for_reference_use is True
     assert clip.references.entities[0].detached_target_fragments_present is True
 
@@ -5633,10 +5637,46 @@ def test_repairable_candidate2_completion_can_beat_canonical_alpha(
     assert completion_metadata["comparison_source_image_path"] == canonical.image_path
     assert len(completion_metadata["comparison_source_image_sha256"]) == 64
     state = storage.read_clip("clip-1").reference_edit.entities[0]
+    final_reference = storage.read_clip("clip-1").references.entities[0]
     assert state.status == "accepted"
     assert state.default_variant == "accepted_base"
     assert state.default_reason == "completion_candidate_2_review_accepted"
     assert state.output_image_path != canonical.image_path
+    assert final_reference.source_frame_index == (
+        alternate_metadata["source_frame_index"]
+    )
+
+
+def test_legacy_completion_metadata_falls_back_to_canonical_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0]
+    reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+    edit_dir = storage.reference_edit_dir("clip-1") / "e1"
+    metadata_path = edit_dir / "final_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("completion_source_frame_index")
+    write_json_atomic(metadata_path, metadata)
+
+    accepted = reference_edit_module._accepted_reference(
+        storage,
+        canonical,
+        clip_uid="clip-1",
+        output_path=edit_dir / "final_reference_1k.png",
+        metadata_path=metadata_path,
+    )
+
+    assert accepted.source_frame_index == canonical.source_frame_index
 
 
 def test_cross_pair_canonical_uses_highest_ranked_local_completion_source(

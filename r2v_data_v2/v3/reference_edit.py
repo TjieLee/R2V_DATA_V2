@@ -434,6 +434,14 @@ def _accepted_reference(
         or metadata.get("generated_reference_sha256") != output_sha256
     ):
         raise ValueError("accepted Boogu metadata hashes do not match artifacts")
+    source_frame_index = reference.source_frame_index
+    completion_source_frame_index = metadata.get("completion_source_frame_index")
+    if (
+        metadata.get("operation") == "complete_entity"
+        and type(completion_source_frame_index) is int
+        and completion_source_frame_index >= 0
+    ):
+        source_frame_index = completion_source_frame_index
     return EntityReferenceState(
         entity_id=reference.entity_id,
         status="ready",
@@ -447,7 +455,7 @@ def _accepted_reference(
         ),
         scope_reason="accepted_boogu_reference_edit",
         image_path=storage.relative_artifact_path(output_path),
-        source_frame_index=reference.source_frame_index,
+        source_frame_index=source_frame_index,
         source_clip_uid=clip_uid,
         source_entity_id=reference.entity_id,
         image_quality=(
