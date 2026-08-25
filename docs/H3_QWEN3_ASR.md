@@ -262,3 +262,28 @@ For a minimal ASR-only rerun:
 
 Do not use `--overwrite` unless the exact target stage directory has been
 checked and intentional replacement is required.
+
+## Model-free Qwen3 ASR human review
+
+After `qwen3-asr` completes, generate the independent QA sidecar without
+loading Qwen or modifying `asr/`, `pairs/`, `diarization/`, or `h3/`:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_qwen3_asr_review.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+```
+
+The fixed output is `$AUDIO_PRODUCTION_ROOT/asr_review/`. It contains a static
+`review.html`, a deterministic `manifest.json`, and browser-compatible H.264/AAC
+review proxies under `media/`. Proxies retain the complete video and audio
+timeline and are QA-only derivatives; canonical target videos and Qwen rows are
+never changed. The page displays transcribed, empty, failed, and unbound rows,
+supports exact-segment playback, persists labels/notes in browser localStorage,
+and exports a deterministic QA JSON sidecar.
+
+Serve the static directory from the server when reviewing remotely:
+
+```bash
+python -m http.server 8768 \
+  --directory "$AUDIO_PRODUCTION_ROOT/asr_review"
+```
