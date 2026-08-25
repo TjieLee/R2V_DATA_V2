@@ -179,15 +179,6 @@ class SubjectAttributeReview(_SchemaModel):
     def validate_reason(self) -> SubjectAttributeReview:
         if not self.reason.strip():
             raise ValueError("attribute review reason must not be empty")
-        if (
-            self.matches_attribute
-            and self.owner_binding_correct
-            and not self.structure_complete
-            and not self.completion_recommended
-        ):
-            raise ValueError(
-                "semantically correct incomplete structure must recommend completion"
-            )
         return self
 
 

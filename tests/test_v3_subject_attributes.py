@@ -761,29 +761,67 @@ def test_clearly_different_attribute_masks_do_not_conflict() -> None:
     )
 
 
-def test_recognizability_requires_every_review_boolean() -> None:
-    assert _accepted_review("a1").accepted is True
-    fragment = _accepted_review("a1").model_copy(update={"recognizable": False})
-    assert fragment.accepted is False
+@pytest.mark.parametrize(
+    "false_flag",
+    [
+        "matches_attribute",
+        "owner_binding_correct",
+        "recognizable",
+        "characteristic_appearance_visible",
+        "usable_as_attribute_condition",
+        "sufficient_source_evidence",
+    ],
+)
+def test_attribute_review_accepted_requires_only_six_hard_flags(
+    false_flag: str,
+) -> None:
+    diagnostic_variants = (
+        {"structure_complete": True, "completion_recommended": True},
+        {"structure_complete": True, "completion_recommended": False},
+        {"structure_complete": False, "completion_recommended": True},
+        {"structure_complete": False, "completion_recommended": False},
+    )
+    for diagnostics in diagnostic_variants:
+        accepted = _accepted_review("a1").model_copy(update=diagnostics)
+        assert accepted.accepted is True
+        rejected = accepted.model_copy(update={false_flag: False})
+        assert rejected.accepted is False
 
 
-def test_incomplete_semantically_correct_review_must_recommend_completion() -> None:
-    with pytest.raises(
-        ValidationError,
-        match="semantically correct incomplete structure must recommend completion",
-    ):
-        SubjectAttributeReview(
-            attribute_id="a1",
-            matches_attribute=True,
-            owner_binding_correct=True,
-            recognizable=True,
-            characteristic_appearance_visible=True,
-            usable_as_attribute_condition=True,
-            sufficient_source_evidence=True,
-            structure_complete=False,
-            completion_recommended=False,
-            reason="visible missing region",
-        )
+def test_incomplete_review_without_completion_recommendation_parses() -> None:
+    review = SubjectAttributeReview(
+        attribute_id="a1",
+        matches_attribute=True,
+        owner_binding_correct=True,
+        recognizable=True,
+        characteristic_appearance_visible=True,
+        usable_as_attribute_condition=True,
+        sufficient_source_evidence=True,
+        structure_complete=False,
+        completion_recommended=False,
+        reason="visible missing region; completion not recommended",
+    )
+
+    assert review.structure_complete is False
+    assert review.completion_recommended is False
+    assert review.accepted is True
+
+
+def test_diagnostic_mismatch_does_not_invalidate_review_batch() -> None:
+    incomplete = {
+        **_accepted_review("a1").model_dump(mode="json"),
+        "structure_complete": False,
+        "completion_recommended": False,
+        "reason": "incomplete diagnostic without repair recommendation",
+    }
+    complete = _accepted_review("a2").model_dump(mode="json")
+
+    batch = SubjectAttributeReviewBatch.model_validate(
+        {"owner_entity_id": "e1", "reviews": [incomplete, complete]}
+    )
+
+    assert [review.attribute_id for review in batch.reviews] == ["a1", "a2"]
+    assert all(review.accepted for review in batch.reviews)
 
 
 @pytest.mark.parametrize(
