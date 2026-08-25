@@ -1775,6 +1775,60 @@ def test_production_sam3_boogu_reviewer_is_review_only_and_tracks_ten_frames(
     assert backend.calls[0]["grounding_prompt"] == "the blue object"
 
 
+def test_completion_accepts_threefold_area_growth_and_records_legacy_limit(
+    tmp_path: Path,
+) -> None:
+    run_root, canonical, _ = _environment(tmp_path, size=(10, 10))
+    source = Image.new("RGBA", (10, 10), (20, 180, 70, 0))
+    source_alpha = np.zeros((10, 10), dtype=np.uint8)
+    source_alpha[3:7, 3:7] = 255
+    source.putalpha(Image.fromarray(source_alpha, mode="L"))
+    source.save(canonical, format="PNG")
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[1:7, 1:9] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path / "sam",
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+    judge = _Judge()
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="the object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=judge,
+        sam_reviewer=reviewer,
+        target_area=100,
+        alignment=1,
+        min_source_content_area_pixels=1,
+        min_source_content_long_side_pixels=1,
+    )
+
+    assert result.status == "accepted"
+    assert len(judge.calls) == 1
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    sam_review = metadata["sam_review"]
+    assert sam_review["passed"] is True
+    assert sam_review["area_growth_acceptable"] is True
+    assert sam_review["diagnostics"]["source_area_ratio"] == pytest.approx(0.16)
+    assert sam_review["diagnostics"]["candidate_area_ratio"] == pytest.approx(0.48)
+    assert sam_review["diagnostics"]["area_growth_ratio"] == pytest.approx(3.0)
+    assert (
+        sam_review["diagnostics"][
+            "source_relative_area_growth_within_legacy_limit"
+        ]
+        is False
+    )
+    assert sam_review["diagnostics"]["failure_kind"] == "none"
+
+
 def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
     tmp_path: Path,
 ) -> None:
@@ -1800,6 +1854,56 @@ def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
     assert review.passed is False
     assert review.area_growth_acceptable is False
     assert review.diagnostics["failure_kind"] == "excessive_area_growth"
+    assert (
+        review.diagnostics["source_relative_area_growth_within_legacy_limit"]
+        is False
+    )
+
+
+def test_completion_sam_still_rejects_multiple_instances(tmp_path: Path) -> None:
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamAmbiguousInstancesBackend(),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.exactly_one_target_instance is False
+    assert review.diagnostics["failure_kind"] == "multiple_instances"
+
+
+def test_completion_sam_still_rejects_fragmentation(tmp_path: Path) -> None:
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[:4, :4] = True
+    candidate_mask[6:, 6:] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=1,
+    )
+
+    review = reviewer.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.area_growth_acceptable is True
+    assert review.fragmentation_acceptable is False
+    assert review.diagnostics["failure_kind"] == "fragmented"
 
 
 def test_production_sam3_empty_mask_is_not_found_without_fake_geometry(

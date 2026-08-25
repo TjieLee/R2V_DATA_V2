@@ -641,7 +641,6 @@ class Sam3BooguReferenceReviewer:
         entity_phrase: str,
         reference_type: ReferenceType,
     ) -> BooguSamReview:
-        del operation
         self.temporary_root.mkdir(parents=True, exist_ok=True)
         try:
             with tempfile.TemporaryDirectory(
@@ -697,7 +696,8 @@ class Sam3BooguReferenceReviewer:
             target_present
             and len({item.object_id for item in result.observations}) == 1
         )
-        area_ok = area_growth <= self.max_area_growth_ratio
+        legacy_area_ok = area_growth <= self.max_area_growth_ratio
+        area_ok = operation == "complete_entity" or legacy_area_ok
         fragmentation_ok = component_count <= self.max_significant_components
         passed = all((target_present, exactly_one, area_ok, fragmentation_ok))
         failure_kind = _sam_failure_kind(
@@ -727,6 +727,9 @@ class Sam3BooguReferenceReviewer:
                 "source_area_ratio": source_ratio,
                 "candidate_area_ratio": candidate_ratio,
                 "area_growth_ratio": area_growth,
+                "source_relative_area_growth_within_legacy_limit": (
+                    legacy_area_ok
+                ),
                 "significant_component_count": component_count,
                 "review_slot": observation.slot,
                 "mask_usage": "review_only",
