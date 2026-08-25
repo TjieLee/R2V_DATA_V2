@@ -499,6 +499,60 @@ def test_composition_geometry_failure_rejects_candidate_publication(
     assert rejection["reason"] == reason
 
 
+@pytest.mark.parametrize(
+    ("reason", "scale_ratio", "center_shift"),
+    [
+        ("entity_scale_collapsed", 0.4, 0.0),
+        ("entity_shifted_off_layout", 1.0, 0.35),
+    ],
+)
+def test_completion_source_relative_geometry_is_diagnostic_not_hard_reject(
+    tmp_path: Path,
+    reason: str,
+    scale_ratio: float,
+    center_shift: float,
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+    judge = _Judge()
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=judge,
+        sam_reviewer=_SamReviewer(
+            geometry=_geometry_diagnostics(
+                reason,
+                scale_ratio=scale_ratio,
+                center_shift=center_shift,
+            )
+        ),
+    )
+
+    assert result.status == "accepted"
+    assert len(judge.calls) == 1
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["geometry_gate_passed"] is False
+    assert metadata["geometry_rejection_reason"] == reason
+    assert metadata["qwen_review"]["verdict"] == "accept"
+
+
+def test_completion_review_prompt_allows_spatial_change_but_rejects_distortion() -> None:
+    prompt = " ".join(boogu_module._COMPLETION_REVIEW_PROMPT.split())
+    assert "Reasonable spatial changes are allowed" in prompt
+    assert "recentered" in prompt
+    assert "conditioning reference" in prompt
+    assert "extreme corner or edge" in prompt
+    assert "stretched or compressed body proportions" in prompt
+    assert "warped anatomy" in prompt
+    assert "distorted object proportions" in prompt
+
+
 def test_small_composition_change_passes_geometry_gate(tmp_path: Path) -> None:
     run_root, _, _ = _environment(tmp_path)
 

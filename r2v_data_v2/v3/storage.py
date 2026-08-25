@@ -1283,7 +1283,7 @@ class DatasetExporter:
             if kind not in {"subject", "object"} or entity_id not in edits:
                 continue
             edit = edits[entity_id]
-            if edit.route not in {"complete", "local_usable"}:
+            if edit.route not in {"complete", "local_usable", "repairable"}:
                 continue
             if edit.variants is None:
                 variants, default_variant, default_path, default_reason = (
@@ -1317,6 +1317,11 @@ class DatasetExporter:
                     default_variant=default_variant,
                     default_image_path=default_export,
                     default_reason=default_reason,
+                    accepted_base_image_path=(
+                        default_export
+                        if default_variant == "accepted_base"
+                        else None
+                    ),
                     variants=exported_variants,
                 )
             )

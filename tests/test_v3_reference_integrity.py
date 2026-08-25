@@ -54,6 +54,8 @@ from r2v_data_v2.v3.schemas import (
     ReferenceEditState,
     ReferenceIntegrityEntityState,
     ReferenceIntegrityReview,
+    ReferenceVariantState,
+    ReferenceVariantsState,
     ReferencesState,
     ReferenceTopologyDiagnostics,
     SampledFrame,
@@ -1804,6 +1806,162 @@ def test_source_bbox_fallback_updates_reference_edit_provenance_atomically(
     assert final_edit.metadata_path == original_generation_metadata
     assert final_edit.operations == ["add_entity_background"]
     ClipRecord.model_validate(updated.model_dump(mode="json"))
+
+
+def _write_completion_reference_edit_state(storage: RunStorage) -> None:
+    clip = storage.read_clip("clip-1")
+    first = clip.references.entities[0]
+    completed = clip.references.entities[1]
+    assert completed.image_path is not None
+    raw_path = storage.selected_path("clip-1", "e2_source_alpha.png")
+    raw_path.write_bytes((storage.root / completed.image_path).read_bytes())
+    raw_relative = storage.relative_artifact_path(raw_path)
+    source_reference = completed.model_copy(
+        update={
+            "image_path": raw_relative,
+            "synthetic": False,
+            "generation_metadata_path": None,
+            "generation_source_sha256": None,
+            "generation_output_sha256": None,
+        }
+    )
+    metadata_path = completed.generation_metadata_path
+    assert metadata_path is not None
+    variants = ReferenceVariantsState(
+        alpha=ReferenceVariantState(
+            image_path=raw_relative,
+            status="accepted",
+            reviewed=True,
+            review_status="accepted_pair_reference",
+            reason="pair accepted alpha",
+            synthetic=False,
+            source_frame_index=source_reference.source_frame_index,
+        ),
+        bbox=ReferenceVariantState(
+            image_path=raw_relative,
+            status="available",
+            reviewed=False,
+            review_status="not_reviewed",
+            reason="materialized source bbox",
+            synthetic=False,
+            source_frame_index=source_reference.source_frame_index,
+        ),
+        generated_background=ReferenceVariantState(
+            image_path=None,
+            status="unavailable",
+            reviewed=False,
+            review_status="not_applicable",
+            reason="entity_background_disabled_by_policy",
+            synthetic=True,
+            source_frame_index=source_reference.source_frame_index,
+        ),
+    )
+    state = ReferenceEditState(
+        status="ready",
+        entities=[
+            ReferenceEditEntityState(
+                entity_id="e1",
+                route="complete",
+                status="not_required",
+                source_reference=first,
+                source_image_path=first.image_path,
+                output_image_path=first.image_path,
+            ),
+            ReferenceEditEntityState(
+                entity_id="e2",
+                route="repairable",
+                status="accepted",
+                source_reference=source_reference,
+                source_image_path=raw_relative,
+                variants=variants,
+                default_variant="accepted_base",
+                default_image_path=completed.image_path,
+                default_reason="completion_review_accepted",
+                accepted_base_image_path=completed.image_path,
+                output_image_path=completed.image_path,
+                operation="complete_entity",
+                metadata_path=metadata_path,
+                operations=["complete_entity"],
+                completion_metadata_path=metadata_path,
+            ),
+        ],
+    )
+    storage.write_reference_edit_result(
+        "clip-1",
+        clip.references,
+        clip.pairing,
+        state,
+    )
+
+
+def test_completion_integrity_reject_reviews_alpha_before_any_bbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_synthetic=True,
+    )
+    _write_completion_reference_edit_state(storage)
+    judge = FakeIntegrityJudge(
+        [_severe_reference_artifact_review(), _review(accept=True)]
+    )
+    bbox_judge = FakeSourceBboxFallbackJudge([])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert len(judge.calls) == 2
+    assert judge.calls[0]["synthetic"] is True
+    assert judge.calls[1]["synthetic"] is False
+    assert bbox_judge.calls == []
+    assert stats.source_bbox_fallback_attempted == 0
+    final_reference = updated.references.entities[1]
+    final_edit = updated.reference_edit.entities[1]
+    assert final_reference.synthetic is False
+    assert final_reference.image_path == final_edit.source_image_path
+    assert final_edit.default_variant == "alpha"
+    assert final_edit.fallback_policy == "keep_source"
+    assert final_edit.reason == "completion_integrity_rejected_fallback_to_alpha"
+
+
+def test_completion_and_alpha_integrity_reject_before_bbox_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_synthetic=True,
+    )
+    _write_completion_reference_edit_state(storage)
+    judge = FakeIntegrityJudge(
+        [_severe_reference_artifact_review(), _severe_reference_artifact_review()]
+    )
+    bbox_judge = FakeSourceBboxFallbackJudge([_bbox_review(accept=True)])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert len(judge.calls) == 2
+    assert len(bbox_judge.calls) == 1
+    assert stats.source_bbox_fallback_attempted == 1
+    assert stats.source_bbox_fallback_accepted == 1
+    assert updated.references.entities[1].source_bbox_fallback is True
+    assert updated.reference_edit.entities[1].default_variant == "bbox"
 
 
 def test_source_bbox_fields_are_backward_compatible_for_existing_clip_json(

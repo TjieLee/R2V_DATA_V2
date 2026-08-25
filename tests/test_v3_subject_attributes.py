@@ -989,6 +989,7 @@ def _bbox_review_payload(*, accepted: bool = True) -> dict[str, object]:
         "target_is_dominant_and_identifiable": accepted,
         "no_large_competing_attribute_or_entity": accepted,
         "context_is_limited_and_supportive": accepted,
+        "no_strong_owner_pose_or_scene_leakage": accepted,
         "no_severe_blur_or_artifact": accepted,
         "usable_as_attribute_condition": accepted,
         "certain": accepted,
@@ -1119,6 +1120,7 @@ def test_bbox_review_second_invalid_response_fails_after_one_repair() -> None:
     [
         (None, "reject", "accept"),
         ("no_severe_blur_or_artifact", "accept", "reject"),
+        ("no_strong_owner_pose_or_scene_leakage", "accept", "reject"),
     ],
 )
 def test_bbox_review_verdict_is_normalized_from_complete_flags(
@@ -1733,7 +1735,7 @@ def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Pat
     )
     assert discovery.calls == 1
     assert review.calls == 1
-    assert segmenter.calls == [1, 1]
+    assert segmenter.calls == [1, 0, 1, 0]
     assert artifact.metrics.discovery_calls == 1
     assert artifact.metrics.review_calls == 1
     assert artifact.metrics.sam3_attempts == 2
@@ -2556,6 +2558,92 @@ def _completion_review(
     )
 
 
+@pytest.mark.parametrize(
+    "false_flag",
+    [
+        "original_visible_details_preserved",
+        "materially_more_complete",
+        "no_wrong_new_instance",
+        "no_duplicate_component",
+        "no_unrelated_content",
+        "no_structural_distortion",
+        "target_clear_and_prominent",
+        "candidate_preferred_over_alpha",
+    ],
+)
+def test_attribute_completion_comparative_flags_fail_closed(
+    false_flag: str,
+) -> None:
+    payload = _completion_review(accepted=True).model_dump(mode="json")
+    payload[false_flag] = False
+    payload["verdict"] = "reject"
+
+    review = subject_attributes.SubjectAttributeCompletionReview.model_validate(payload)
+
+    assert review.verdict == "reject"
+    assert getattr(review, false_flag) is False
+
+
+def test_attribute_completion_prompt_allows_layout_change_but_requires_improvement() -> None:
+    prompt = " ".join(
+        subject_attributes.ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT.split()
+    )
+    assert "material and useful structural completeness improvement" in prompt
+    assert "merely redraws an already sufficient source" in prompt
+    assert "Reasonable spatial changes are allowed" in prompt
+    assert "moved, was recentered, changed size moderately" in prompt
+    assert "extreme corner or edge" in prompt
+    assert "stretched, compressed, warped, duplicated" in prompt
+
+
+def test_attribute_completion_qwen_uses_strict_schema_and_normalizes_verdict() -> None:
+    payload = _completion_review(accepted=True).model_dump(mode="json")
+    payload["verdict"] = "reject"
+
+    class Completions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=json.dumps(payload))
+                    )
+                ]
+            )
+
+    completions = Completions()
+    judge = subject_attributes.QwenSubjectAttributeCompletionJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+    review = judge.review(
+        source_attribute=Image.new("RGBA", (32, 24), (80, 90, 100, 255)),
+        generated_candidate=Image.new("RGB", (40, 36), (80, 90, 100)),
+        attribute_type="upper_clothing",
+        attribute_phrase="gray robe",
+    )
+
+    assert review.verdict == "accept"
+    response_format = completions.calls[0]["response_format"]
+    assert response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "v3_boogu_reference_edit_review",
+            "strict": True,
+            "schema": (
+                subject_attributes.SubjectAttributeCompletionReview.model_json_schema()
+            ),
+        },
+    }
+
+
 def _attempt_completion_direct(
     tmp_path: Path,
     *,
@@ -3027,7 +3115,220 @@ def _run_completion_routing_case(
     return artifact, review, backend, segmenter
 
 
-def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
+def _run_two_candidate_routing_case(
+    tmp_path: Path,
+    *,
+    raw_kinds: tuple[str, str],
+    completion_accepts: tuple[bool, ...] = (),
+    attribute_type: str = "face",
+    bbox_accepts: bool = False,
+):
+    _frames(tmp_path / "run")
+
+    class Discovery:
+        def discover(self, *, owner, **_kwargs):
+            return SubjectAttributeDiscovery(
+                owner_entity_id=owner.entity_id,
+                owner_is_human=True,
+                attributes=[
+                    DiscoveredSubjectAttribute(
+                        attribute_type=attribute_type,
+                        phrase=f"distinct {attribute_type}",
+                        grounding_prompt=f"distinct {attribute_type} of person 1",
+                    )
+                ],
+            )
+
+    class Review:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+            self.candidate_calls: list[list[str]] = []
+            self.bbox_calls = 0
+
+        def review(self, *, owner, candidates):
+            self.calls.append([candidate.attribute_id for candidate in candidates])
+            self.candidate_calls.append(
+                [candidate.owner_candidate.candidate_id for candidate in candidates]
+            )
+            return SubjectAttributeReviewBatch(
+                owner_entity_id=owner.entity_id,
+                reviews=[
+                    _routing_review(
+                        candidate.attribute_id,
+                        raw_kinds[
+                            0
+                            if candidate.owner_candidate.candidate_id == "candidate_1"
+                            else 1
+                        ],
+                    )
+                    for candidate in candidates
+                ],
+            )
+
+        def review_attribute_bbox(self, **_kwargs):
+            self.bbox_calls += 1
+            return _attribute_variant_review(accepted=bbox_accepts)
+
+    class Backend:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def attribute_completion(self, *, source_path, output_path, **_kwargs):
+            self.calls.append(source_path.parents[1].name)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (100, 100), (180, 180, 180)).save(output_path)
+            return {"model_call_time_seconds": 0.1}
+
+    class Judge:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def review(self, **_kwargs):
+            accepted = completion_accepts[self.calls]
+            self.calls += 1
+            return _completion_review(accepted=accepted)
+
+    class Segmenter:
+        def segment_frame(self, **_kwargs):
+            mask = np.zeros((100, 100), dtype=bool)
+            mask[30:70, 30:70] = True
+            return (mask,)
+
+    review = Review()
+    backend = Backend()
+    judge = Judge()
+    clip = _clip()
+    artifact = subject_attributes._process_owner(
+        config=SimpleNamespace(
+            pair=SimpleNamespace(crop_padding_ratio=0.08),
+            subject_attributes=SubjectAttributesConfig(
+                completion=replace(
+                    SubjectAttributeCompletionConfig(enabled=True),
+                    minimum_sharpness_score=-1.0,
+                )
+            ),
+        ),
+        storage=_FakeStorage(tmp_path / "run"),
+        output_root=tmp_path / "output",
+        clip=clip,
+        owner=clip.annotation.entities[0],
+        owner_candidates=[
+            _candidate("candidate_1", slot=1, source_frame_index=10),
+            _candidate("candidate_2", slot=2, source_frame_index=20),
+        ],
+        masks=TrackedMasksArtifact(
+            clip_uid="clip-1",
+            height=100,
+            width=100,
+            entities={},
+        ),
+        attribute_id_start=1,
+        discovery_client=Discovery(),
+        review_client=review,
+        segmentation_backend=Segmenter(),
+        completion_backend=backend,
+        completion_judge=judge,
+    )
+    return artifact, review, backend, judge
+
+
+def test_candidate2_completion_is_tried_after_candidate1_qwen_reject(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        completion_accepts=(False, True),
+    )
+
+    record = artifact.records[0]
+    assert record.final_selection == "completed"
+    assert record.owner_candidate_id == "candidate_2"
+    assert review.candidate_calls == [["candidate_1"], ["candidate_2"]]
+    assert backend.calls == ["candidate_1", "candidate_2"]
+    assert judge.calls == 2
+    assert artifact.metrics.review_calls == 2
+    assert artifact.metrics.attribute_source_candidates_considered == 2
+    assert artifact.metrics.attribute_second_candidate_attempts == 1
+    assert artifact.metrics.attribute_completion_candidate1_accepted == 0
+    assert artifact.metrics.attribute_completion_candidate2_accepted == 1
+
+
+def test_two_completion_rejects_fall_back_to_highest_ranked_accepted_alpha(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, _ = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        completion_accepts=(False, False),
+    )
+
+    record = artifact.records[0]
+    assert record.final_selection == "raw"
+    assert record.owner_candidate_id == "candidate_1"
+    assert review.bbox_calls == 0
+    assert backend.calls == ["candidate_1", "candidate_2"]
+    assert artifact.metrics.completion_fallback_to_raw == 1
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+
+
+def test_wrong_semantic_candidate1_skips_boogu_and_candidate2_can_complete(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("wrong_semantic", "accepted_complete"),
+        completion_accepts=(True,),
+    )
+
+    record = artifact.records[0]
+    assert record.final_selection == "completed"
+    assert record.owner_candidate_id == "candidate_2"
+    assert review.candidate_calls == [["candidate_1"], ["candidate_2"]]
+    assert backend.calls == ["candidate_2"]
+    assert judge.calls == 1
+
+
+def test_noncompletion_type_uses_candidate2_without_boogu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject_attributes, "HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS", 4)
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("wrong_semantic", "accepted_complete"),
+        attribute_type="hair",
+    )
+
+    record = artifact.records[0]
+    assert record.final_selection == "raw"
+    assert record.owner_candidate_id == "candidate_2"
+    assert review.candidate_calls == [["candidate_1"], ["candidate_2"]]
+    assert backend.calls == []
+    assert judge.calls == 0
+
+
+def test_bbox_is_reviewed_only_after_both_candidates_lack_accepted_alpha(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, _ = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("unusable_repair", "unusable_repair"),
+        completion_accepts=(False, False),
+        bbox_accepts=True,
+    )
+
+    record = artifact.records[0]
+    assert record.final_selection == "bbox"
+    assert record.default_variant == "bbox"
+    assert record.accepted_base_image_path is None
+    assert review.bbox_calls == 1
+    assert backend.calls == ["candidate_1", "candidate_2"]
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 1
+
+
+def test_raw_accepted_complete_still_compares_boogu(tmp_path: Path) -> None:
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_complete",
@@ -3035,9 +3336,10 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
 
     record = artifact.records[0]
     assert record.status == "accepted"
-    assert record.final_selection == "raw"
-    assert record.completion_attempted is False
-    assert backend.calls == segmenter.generated_calls == 0
+    assert record.final_selection == "completed"
+    assert record.completion_attempted is True
+    assert backend.calls == 1
+    assert segmenter.generated_calls == 0
     assert backend.background_calls == 0
     assert review.calls == [["a1"]]
 
@@ -3266,7 +3568,7 @@ def test_raw_unusable_repair_is_completed_or_rejected_fail_closed(
 
 @pytest.mark.parametrize(
     "raw_kind",
-    ["wrong_semantic", "wrong_owner", "unusable_no_repair"],
+    ["wrong_semantic", "wrong_owner"],
 )
 def test_hard_rejected_or_nonrepairable_raw_never_reaches_boogu(
     tmp_path: Path,
@@ -3292,6 +3594,7 @@ def _attribute_variant_review(*, accepted: bool):
         "target_is_dominant_and_identifiable",
         "no_large_competing_attribute_or_entity",
         "context_is_limited_and_supportive",
+        "no_strong_owner_pose_or_scene_leakage",
         "no_severe_blur_or_artifact",
         "usable_as_attribute_condition",
         "certain",
@@ -3386,8 +3689,8 @@ def test_attribute_variants_use_bbox_and_never_generate_background(
         bbox_accepts=bbox_accepts,
     )
 
-    assert judge.bbox_calls == 1
-    assert record.default_variant == ("bbox" if bbox_accepts else "accepted_base")
+    assert judge.bbox_calls == 0
+    assert record.default_variant == "accepted_base"
     assert record.variants is not None
     assert record.variants.alpha.image_path is not None
     assert (tmp_path / record.variants.alpha.image_path).is_file()
@@ -3404,7 +3707,7 @@ def test_attribute_variants_use_bbox_and_never_generate_background(
         "source_frame_index": 10,
     }
     assert metrics.bbox_variants_materialized == 1
-    assert metrics.bbox_reviews_attempted == 1
+    assert metrics.bbox_reviews_attempted == 0
 
 
 def test_attribute_bbox_judge_failure_preserves_available_path_and_base_default(
@@ -3416,11 +3719,11 @@ def test_attribute_bbox_judge_failure_preserves_available_path_and_base_default(
         bbox_failure=True,
     )
 
-    assert judge.bbox_calls == 1
+    assert judge.bbox_calls == 0
     assert record.variants is not None
     assert record.variants.bbox.status == "available"
     assert record.variants.bbox.reviewed is False
-    assert record.variants.bbox.review_status == "judge_failed"
+    assert record.variants.bbox.review_status == "not_reviewed"
     assert record.variants.bbox.image_path is not None
     assert (tmp_path / record.variants.bbox.image_path).is_file()
     assert record.default_variant == "accepted_base"
@@ -3436,7 +3739,7 @@ def test_completed_attribute_variant_fallback_preserves_accepted_base(
         completed_base=True,
     )
 
-    assert judge.bbox_calls == 1
+    assert judge.bbox_calls == 0
     assert record.final_selection == "completed"
     assert record.default_variant == "accepted_base"
     assert record.image_path == record.accepted_base_image_path

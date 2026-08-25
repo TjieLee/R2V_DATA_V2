@@ -51,9 +51,12 @@ class ReferenceVariantsManifestRecord(BaseModel):
             or self.attribute_id is not None
             or self.owner_entity_id is not None
             or self.attribute_type is not None
-            or self.accepted_base_image_path is not None
         ):
             raise ValueError("entity variants require entity-only provenance")
+        elif self.default_variant == "accepted_base" and (
+            self.accepted_base_image_path is None
+        ):
+            raise ValueError("completed entity variants require accepted base provenance")
         if self.default_variant != "accepted_base":
             selected = getattr(self.variants, self.default_variant)
             if (

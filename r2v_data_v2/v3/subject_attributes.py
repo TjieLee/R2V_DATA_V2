@@ -49,7 +49,6 @@ from r2v_data_v2.v3.profiling import (
     profiled_openai_call,
 )
 from r2v_data_v2.v3.reference_edit_boogu import (
-    BooguCompletionReview,
     QwenBooguReferenceEditJudge,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend, mask_iou
@@ -71,6 +70,7 @@ ATTRIBUTE_ENRICHMENT_SCHEMA_VERSION = "r2v.v3.subject_attributes.1"
 ATTRIBUTE_OWNER_SCHEMA_VERSION = "r2v.v3.subject_attribute_owner.1"
 ENRICHED_SAMPLE_SCHEMA_VERSION = "r2v.v3.enriched_sample.1"
 MAX_ATTRIBUTES_PER_OWNER = 3
+MAX_ATTRIBUTE_SOURCE_CANDIDATES = 2
 QWEN_INPUT_MAX_LONG_SIDE_PIXELS = 768
 MIN_ATTRIBUTE_AREA_PIXELS = 16
 MIN_ATTRIBUTE_LONG_SIDE_PIXELS = 4
@@ -201,8 +201,88 @@ class SubjectAttributeReviewBatch(_SchemaModel):
         return self
 
 
-class SubjectAttributeCompletionReview(BooguCompletionReview):
-    """Strict identity and quality verdict for an attribute completion."""
+class SubjectAttributeCompletionReview(_SchemaModel):
+    """Comparative decision for replacing raw alpha with a completion."""
+
+    same_physical_attribute: StrictBool
+    original_visible_details_preserved: StrictBool
+    materially_more_complete: StrictBool
+    no_wrong_new_instance: StrictBool
+    no_duplicate_component: StrictBool
+    no_unrelated_content: StrictBool
+    no_structural_distortion: StrictBool
+    target_clear_and_prominent: StrictBool
+    candidate_preferred_over_alpha: StrictBool
+    certain: StrictBool
+    reason: str
+    verdict: Literal["accept", "reject"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_review(cls, value: object) -> object:
+        if not isinstance(value, dict) or "same_physical_attribute" in value:
+            return value
+        legacy_flags = {
+            "same_physical_entity",
+            "identity_preserved",
+            "original_visible_attributes_preserved",
+            "exactly_one_entity",
+            "missing_parts_plausibly_completed",
+            "no_duplicate_entity",
+            "no_unrelated_entity",
+            "no_severe_structure_artifact",
+            "style_coherent",
+            "resolution_usable",
+            "reference_usable",
+            "certain",
+        }
+        if not legacy_flags.issubset(value):
+            return value
+        return {
+            "same_physical_attribute": value["same_physical_entity"],
+            "original_visible_details_preserved": all(
+                (
+                    value["identity_preserved"],
+                    value["original_visible_attributes_preserved"],
+                    value["style_coherent"],
+                )
+            ),
+            "materially_more_complete": value[
+                "missing_parts_plausibly_completed"
+            ],
+            "no_wrong_new_instance": all(
+                (
+                    value["same_physical_entity"],
+                    value["identity_preserved"],
+                    value["exactly_one_entity"],
+                )
+            ),
+            "no_duplicate_component": value["no_duplicate_entity"],
+            "no_unrelated_content": value["no_unrelated_entity"],
+            "no_structural_distortion": value[
+                "no_severe_structure_artifact"
+            ],
+            "target_clear_and_prominent": all(
+                (value["resolution_usable"], value["reference_usable"])
+            ),
+            "candidate_preferred_over_alpha": value.get("verdict") == "accept",
+            "certain": value["certain"],
+            "reason": value.get("reason"),
+            "verdict": value.get("verdict"),
+        }
+
+    @model_validator(mode="after")
+    def validate_review(self) -> SubjectAttributeCompletionReview:
+        if not self.reason.strip():
+            raise ValueError("attribute completion review reason must not be empty")
+        flags = tuple(
+            getattr(self, name)
+            for name in type(self).model_fields
+            if name not in {"reason", "verdict"}
+        )
+        if self.verdict != ("accept" if all(flags) else "reject"):
+            raise ValueError("attribute completion verdict must match strict checks")
+        return self
 
 
 class SubjectAttributeBboxReview(_SchemaModel):
@@ -211,6 +291,7 @@ class SubjectAttributeBboxReview(_SchemaModel):
     target_is_dominant_and_identifiable: StrictBool
     no_large_competing_attribute_or_entity: StrictBool
     context_is_limited_and_supportive: StrictBool
+    no_strong_owner_pose_or_scene_leakage: StrictBool
     no_severe_blur_or_artifact: StrictBool
     usable_as_attribute_condition: StrictBool
     certain: StrictBool
@@ -228,6 +309,7 @@ class SubjectAttributeBboxReview(_SchemaModel):
                 self.target_is_dominant_and_identifiable,
                 self.no_large_competing_attribute_or_entity,
                 self.context_is_limited_and_supportive,
+                self.no_strong_owner_pose_or_scene_leakage,
                 self.no_severe_blur_or_artifact,
                 self.usable_as_attribute_condition,
                 self.certain,
@@ -347,8 +429,11 @@ def _normalize_attribute_background_policy_payload(value: object) -> object:
         and isinstance(bbox_value.get("image_path"), str)
         and bool(bbox_value["image_path"].strip())
     )
-    default_variant = "bbox" if bbox_accepted else "accepted_base"
-    default_path = bbox_value["image_path"] if bbox_accepted else accepted_base
+    accepted_base_available = isinstance(accepted_base, str) and bool(
+        accepted_base.strip()
+    )
+    default_variant = "accepted_base" if accepted_base_available else "bbox"
+    default_path = accepted_base if accepted_base_available else bbox_value["image_path"]
     normalized_generated = {
         "image_path": None,
         "status": "unavailable",
@@ -371,9 +456,9 @@ def _normalize_attribute_background_policy_payload(value: object) -> object:
         "default_variant": default_variant,
         "default_image_path": default_path,
         "default_reason": (
-            "attribute_bbox_review_accepted"
-            if bbox_accepted
-            else "attribute_background_disabled_by_policy_fallback_to_accepted_base"
+            "legacy_attribute_default_normalized_to_accepted_base"
+            if accepted_base_available
+            else "legacy_attribute_bbox_fallback"
         ),
     }
 
@@ -396,7 +481,7 @@ class SubjectAttributeRecord(_SchemaModel):
     completion_review: SubjectAttributeCompletionReview | None = None
     gme_attempts: list[GmeAttributeScreenAttempt] = Field(default_factory=list)
     selected_gme_attempt_index: int | None = Field(default=None, ge=0)
-    final_selection: Literal["raw", "completed"] | None = None
+    final_selection: Literal["raw", "completed", "bbox"] | None = None
     completion_attempted: bool = False
     completion_seed: int | None = Field(default=None, ge=0)
     completion_outcome: str | None = None
@@ -442,23 +527,36 @@ class SubjectAttributeRecord(_SchemaModel):
                     )
                 if not self.completion_attempted:
                     raise ValueError("completed attribute requires a completion attempt")
+            elif self.final_selection == "bbox":
+                if not (
+                    self.review.matches_attribute
+                    and self.review.owner_binding_correct
+                    and self.variants is not None
+                    and self.variants.bbox.status == "accepted"
+                ):
+                    raise ValueError(
+                        "bbox attribute requires semantic ownership and accepted bbox"
+                    )
             elif not self.review.accepted:
                 raise ValueError("raw attribute requires an accepted review")
         elif self.image_path is not None:
             raise ValueError("rejected attribute must not publish an image")
         if not self.completion_attempted and self.completion_seed is not None:
             raise ValueError("unattempted completion cannot publish a seed")
-        defaults = (
+        required_defaults = (
             self.default_variant,
             self.default_image_path,
             self.default_reason,
-            self.accepted_base_image_path,
         )
         if self.variants is None:
-            if any(value is not None for value in defaults):
+            if any(value is not None for value in required_defaults) or (
+                self.accepted_base_image_path is not None
+            ):
                 raise ValueError("attribute variant defaults require variants")
         else:
-            if self.status != "accepted" or any(value is None for value in defaults):
+            if self.status != "accepted" or any(
+                value is None for value in required_defaults
+            ):
                 raise ValueError(
                     "accepted attribute variants require complete default provenance"
                 )
@@ -474,7 +572,10 @@ class SubjectAttributeRecord(_SchemaModel):
                     raise ValueError(
                         "attribute default variant must be accepted and path-matched"
                     )
-            elif self.default_image_path != self.accepted_base_image_path:
+            elif (
+                self.accepted_base_image_path is None
+                or self.default_image_path != self.accepted_base_image_path
+            ):
                 raise ValueError("accepted-base default must preserve its base image")
         if self.selected_gme_attempt_index is not None:
             if self.selected_gme_attempt_index >= len(self.gme_attempts):
@@ -538,6 +639,12 @@ class OwnerEnrichmentMetrics(_SchemaModel):
     )
     attribute_background_variants_attempted: int = Field(default=0, ge=0)
     attribute_background_variants_accepted: int = Field(default=0, ge=0)
+    attribute_source_candidates_considered: int = Field(default=0, ge=0)
+    attribute_second_candidate_attempts: int = Field(default=0, ge=0)
+    attribute_completion_candidate1_accepted: int = Field(default=0, ge=0)
+    attribute_completion_candidate2_accepted: int = Field(default=0, ge=0)
+    attribute_bbox_fallback_attempts: int = Field(default=0, ge=0)
+    attribute_bbox_fallback_accepted: int = Field(default=0, ge=0)
     failures: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
@@ -579,13 +686,9 @@ class OwnerEnrichmentMetrics(_SchemaModel):
                 raise ValueError(
                     "completion attempts must equal raw usable plus raw unusable attempts"
                 )
-            if self.completion_attempts != (
-                self.completion_selected_completed
-                + self.completion_fallback_to_raw
-                + self.completion_rejected
-            ):
+            if self.completion_attempts < self.completion_selected_completed:
                 raise ValueError(
-                    "each completion attempt must have one final selection"
+                    "completion selections cannot exceed candidate attempts"
                 )
             if self.completion_accepted != self.completion_selected_completed:
                 raise ValueError("completion accepted must equal selected completed")
@@ -908,6 +1011,12 @@ class EnrichmentTotals:
     attribute_bbox_reviews_skipped_background_accepted: int = 0
     attribute_background_variants_attempted: int = 0
     attribute_background_variants_accepted: int = 0
+    attribute_source_candidates_considered: int = 0
+    attribute_second_candidate_attempts: int = 0
+    attribute_completion_candidate1_accepted: int = 0
+    attribute_completion_candidate2_accepted: int = 0
+    attribute_bbox_fallback_attempts: int = 0
+    attribute_bbox_fallback_accepted: int = 0
     failures: int = 0
     failure_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -996,6 +1105,24 @@ class EnrichmentTotals:
         )
         self.attribute_background_variants_accepted += (
             metrics.attribute_background_variants_accepted
+        )
+        self.attribute_source_candidates_considered += (
+            metrics.attribute_source_candidates_considered
+        )
+        self.attribute_second_candidate_attempts += (
+            metrics.attribute_second_candidate_attempts
+        )
+        self.attribute_completion_candidate1_accepted += (
+            metrics.attribute_completion_candidate1_accepted
+        )
+        self.attribute_completion_candidate2_accepted += (
+            metrics.attribute_completion_candidate2_accepted
+        )
+        self.attribute_bbox_fallback_attempts += (
+            metrics.attribute_bbox_fallback_attempts
+        )
+        self.attribute_bbox_fallback_accepted += (
+            metrics.attribute_bbox_fallback_accepted
         )
         self.failures += metrics.failures
 
@@ -1398,24 +1525,52 @@ shape is {"owner_entity_id":"e1","reviews":[{"attribute_id":"a1",
 "completion_recommended":false,"reason":"..."}]}. Return JSON only."""
 
 
-ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT = """Review one generated subject
-attribute completion. Image 1 is the isolated raw/source attribute crop and
-Image 2 is the generated candidate. Apply the existing strict completion
-identity and quality standard: accept only if Image 2 preserves the same
-physical entity and every visible identity attribute, contains exactly one
-coherent target, plausibly completes missing structure, adds no duplicate or
-unrelated entity, has no severe structural artifact, remains stylistically
-coherent, and is a usable high-resolution attribute reference. For a face,
-preserve the same person's facial identity, orientation, and expression. For
-clothing, hair, headwear, or an accessory, preserve the same item or component,
-including its material, color, texture, shape, and structure. Judge visible
-facts only and fail closed when uncertain.
-Return one strict JSON object matching the supplied schema and no other text."""
+ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT = """You are comparing an isolated
+source attribute reference with a Boogu completion candidate.
 
-ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT = """Review one RGB source bbox for a subject-bound attribute.
-The bbox may contain limited owner body, skin, garment context, or local background. Do not reject that limited context by itself.
-Accept only when the named attribute and intended owner binding are correct, the attribute is dominant and clearly identifiable, no other large competing attribute or entity is present, the context remains limited and supportive, there is no severe blur or artifact, and the bbox is independently useful as an attribute conditioning reference. Fail closed when uncertain.
-Return exactly the strict JSON schema with reason before verdict and no extra fields."""
+Image 1 is the original isolated alpha/raw attribute. Image 2 is the generated
+completion. Choose Image 2 only when it provides a material and useful
+structural completeness improvement over Image 1 while preserving the same
+physical attribute and all visible identity-bearing appearance. Preserve the
+source attribute's visible color, material, texture, pattern, identity, shape
+cues, and distinctive details.
+
+Reject Image 2 when it changes the physical attribute identity or important
+visible color, material, texture, or pattern details; invents a wrong new
+instance; duplicates the attribute or a component; adds unrelated content;
+introduces malformed, stretched, compressed, warped, duplicated, or otherwise
+structurally implausible parts; or merely redraws an already sufficient source
+without a meaningful completeness improvement. For a face, preserve the same
+person's identity and visible facial features; reject a different person,
+duplicate face, or malformed anatomy.
+
+Reasonable spatial changes are allowed. Do not reject Image 2 merely because
+the attribute moved, was recentered, changed size moderately, or has a somewhat
+different crop or layout. This is a conditioning reference, not a source-layout
+reconstruction. Reject spatial changes only if the target becomes too small,
+is pushed into an extreme corner or edge, loses visual prominence, becomes
+severely cropped, or otherwise loses reference value.
+
+Prefer Image 1 whenever Image 2 does not provide a clear and safe improvement.
+Judge visible facts only and fail closed when uncertain. Return one strict JSON
+object matching the supplied schema and no other text."""
+
+ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT = """You are reviewing a last-resort RGB
+bbox reference for one subject-bound attribute. The isolated or completed
+attribute alternatives were not usable, so this bbox is considered only as a
+fallback.
+
+Accept the bbox only when the target attribute remains clearly identifiable and
+dominant while unrelated owner identity, face, body pose, other garments, other
+people, scene layout, background, text, and unrelated objects contribute only
+minimal conditioning information. Reject when the bbox contains substantial
+owner identity, a large face or body, strong pose information, other major
+garments, another person, or scene content that could create a strong
+copy-paste shortcut. The bbox must primarily teach the requested attribute, not
+the original frame. Fail closed when uncertain.
+
+Return exactly the strict JSON schema with reason before verdict and no extra
+fields."""
 
 
 def _png_data_url(image: Image.Image) -> str:
@@ -1856,7 +2011,7 @@ class QwenSubjectAttributeClient:
 
 
 class QwenSubjectAttributeCompletionJudge(QwenBooguReferenceEditJudge):
-    """Subject-attribute completion review with a single SAM3 prompt output."""
+    """Strict comparative alpha-versus-completion reviewer."""
 
     def review(
         self,
@@ -1903,7 +2058,11 @@ class QwenSubjectAttributeCompletionJudge(QwenBooguReferenceEditJudge):
             raw = self._request(messages, SubjectAttributeCompletionReview)
         for attempt in range(self.repair_retries + 1):
             try:
-                return SubjectAttributeCompletionReview.model_validate_json(raw)
+                payload = QwenSubjectAttributeClient._normalize_structured_verdict(
+                    json.loads(raw),
+                    SubjectAttributeCompletionReview,
+                )
+                return SubjectAttributeCompletionReview.model_validate(payload)
             except (TypeError, ValueError) as exc:
                 if attempt >= self.repair_retries:
                     raise ValueError(
@@ -1915,8 +2074,14 @@ class QwenSubjectAttributeCompletionJudge(QwenBooguReferenceEditJudge):
                     {
                         "role": "user",
                         "content": (
-                            "Repair the JSON to match the schema exactly. "
-                            f"Validation error: {exc}"
+                            "Repair only the JSON structure while preserving the "
+                            "original visual judgments. Every required boolean must "
+                            "be present. Return exactly one JSON object and no extra "
+                            f"fields. Validation error: {exc}\nRequired schema:\n"
+                            + json.dumps(
+                                SubjectAttributeCompletionReview.model_json_schema(),
+                                ensure_ascii=False,
+                            )
                         ),
                     },
                 ]
@@ -2256,7 +2421,7 @@ def _accepted_record(
     owner_reference: EntityReferenceState,
     review: SubjectAttributeReview,
     completion_review: SubjectAttributeCompletionReview | None = None,
-    final_selection: Literal["raw", "completed"],
+    final_selection: Literal["raw", "completed", "bbox"],
     completion_attempted: bool,
     completion_outcome: str,
     completion_seed: int | None = None,
@@ -2275,7 +2440,7 @@ def _accepted_record(
     )
     raw_crop = candidate.raw_crop if candidate.raw_crop is not None else candidate.crop
     alpha_path = relative_path
-    if final_selection == "completed":
+    if final_selection in {"completed", "bbox"}:
         alpha_path = _save_attribute_variant(
             output_root,
             sample_id=sample_id,
@@ -2306,10 +2471,14 @@ def _accepted_record(
         ),
         bbox=ReferenceVariantState(
             image_path=bbox_path,
-            status="available",
-            reviewed=False,
-            review_status="not_reviewed",
-            reason="source_attribute_bbox_materialized",
+            status="accepted" if final_selection == "bbox" else "available",
+            reviewed=final_selection == "bbox",
+            review_status=("accept" if final_selection == "bbox" else "not_reviewed"),
+            reason=(
+                "attribute_bbox_fallback_review_accepted"
+                if final_selection == "bbox"
+                else "source_attribute_bbox_materialized"
+            ),
             synthetic=False,
             source_frame_index=candidate.owner_candidate.source_frame_index,
         ),
@@ -2323,7 +2492,11 @@ def _accepted_record(
             source_frame_index=candidate.owner_candidate.source_frame_index,
         ),
     )
-    default_variant: ReferenceDefaultVariant = "accepted_base"
+    default_variant: ReferenceDefaultVariant = (
+        "bbox" if final_selection == "bbox" else "accepted_base"
+    )
+    if final_selection == "bbox":
+        relative_path = bbox_path
     return SubjectAttributeRecord(
         attribute_id=candidate.attribute_id,
         owner_entity_id=candidate.owner_entity_id,
@@ -2353,8 +2526,10 @@ def _accepted_record(
             "raw_attribute_review_accepted"
             if final_selection == "raw"
             else "attribute_completion_review_accepted"
+            if final_selection == "completed"
+            else "attribute_bbox_fallback_review_accepted"
         ),
-        accepted_base_image_path=relative_path,
+        accepted_base_image_path=(relative_path if final_selection != "bbox" else None),
         reason="accepted",
     )
 
@@ -2381,55 +2556,10 @@ def _with_attribute_variants(
         source_frame_index=record.source_frame_index,
     )
     bbox_variant = variants.bbox
-    default_variant: ReferenceDefaultVariant = "accepted_base"
-    default_image_path = record.accepted_base_image_path
+    del candidate, output_root, judge
+    default_variant = record.default_variant
+    default_image_path = record.default_image_path
     default_reason = record.default_reason
-    if judge is not None and bbox_variant.image_path is not None:
-        metrics.bbox_reviews_attempted += 1
-        bbox_path = (output_root / bbox_variant.image_path).resolve(strict=False)
-        bbox_path.relative_to(output_root.resolve(strict=False))
-        with Image.open(bbox_path) as opened:
-            opened.load()
-            bbox_image = opened.convert("RGB")
-        owner_context = build_candidate_context_image(
-            candidate.source_image,
-            candidate.owner_candidate.mask,
-        )
-        try:
-            bbox_review = judge.review_attribute_bbox(
-                bbox_candidate=bbox_image,
-                owner_context=owner_context,
-                attribute_type=record.attribute_type,
-                attribute_phrase=record.phrase,
-            )
-        except Exception as exc:  # noqa: BLE001 - accepted base remains valid
-            bbox_variant = bbox_variant.model_copy(
-                update={
-                    "status": "available",
-                    "reviewed": False,
-                    "review_status": "judge_failed",
-                    "reason": f"{type(exc).__name__}:{exc}",
-                }
-            )
-            default_reason = "attribute_bbox_judge_failed_fallback_to_accepted_base"
-        else:
-            bbox_accepted = bbox_review.verdict == "accept"
-            bbox_variant = bbox_variant.model_copy(
-                update={
-                    "status": "accepted" if bbox_accepted else "rejected",
-                    "reviewed": True,
-                    "review_status": bbox_review.verdict,
-                    "reason": bbox_review.reason,
-                }
-            )
-            if bbox_accepted:
-                default_variant = "bbox"
-                default_image_path = bbox_variant.image_path
-                default_reason = "attribute_bbox_review_accepted"
-            else:
-                default_reason = (
-                    "attribute_bbox_review_rejected_fallback_to_accepted_base"
-                )
     updated = record.model_copy(
         update={
             "image_path": default_image_path,
@@ -2617,7 +2747,7 @@ def _attempt_attribute_completion(
     )
 
 
-def _select_attribute_candidate(
+def _collect_attribute_candidates(
     *,
     discovered: DiscoveredSubjectAttribute,
     attribute_id: str,
@@ -2633,7 +2763,10 @@ def _select_attribute_candidate(
     gme_screener: AttributeGmeScreener | None = None,
     gme_metrics: _GmeSelectionMetrics | None = None,
     completion_config: object | None = None,
-) -> PendingAttributeCandidate | SubjectAttributeRecord:
+    max_candidates: int = MAX_ATTRIBUTE_SOURCE_CANDIDATES,
+) -> list[PendingAttributeCandidate] | SubjectAttributeRecord:
+    if max_candidates < 1 or max_candidates > MAX_ATTRIBUTE_SOURCE_CANDIDATES:
+        raise ValueError("attribute source candidate bound is invalid")
     owner_reference_is_local = owner_reference.source_clip_uid in {None, clip_uid}
     ordered = prefer_attribute_candidate_frames(
         owner_candidates,
@@ -2653,6 +2786,7 @@ def _select_attribute_candidate(
     raw_quality_rejections: list[
         tuple[EntityReferenceCandidate, OwnershipGeometry, str]
     ] = []
+    candidates: list[PendingAttributeCandidate] = []
     for owner_candidate_index, owner_candidate in enumerate(ordered):
         gme_rejected_on_frame = False
         frame_path = (storage.root / owner_candidate.image_path).resolve(strict=False)
@@ -2815,7 +2949,7 @@ def _select_attribute_candidate(
                     active_gme_metrics.model_call_time_seconds += (
                         time.perf_counter() - gme_started
                     )
-            pending = PendingAttributeCandidate(
+            candidates.append(PendingAttributeCandidate(
                 discovered=discovered,
                 attribute_id=attribute_id,
                 owner_entity_id=owner.entity_id,
@@ -2827,10 +2961,14 @@ def _select_attribute_candidate(
                 gme_attempts=tuple(gme_attempts),
                 selected_gme_attempt_index=selected_gme_attempt_index,
                 raw_crop=crop,
-            )
-            return pending
+            ))
+            break
+        if len(candidates) >= max_candidates:
+            return candidates
         if gme_rejected_on_frame and owner_candidate_index + 1 < len(ordered):
             active_gme_metrics.retried_next_frame += 1
+    if candidates:
+        return candidates
     if gme_rejections:
         owner_candidate, geometry = gme_rejections[0]
         return _rejected_record(
@@ -2892,6 +3030,17 @@ def _select_attribute_candidate(
         owner_entity_id=owner.entity_id,
         reason=reason,
     )
+
+
+def _select_attribute_candidate(
+    **kwargs: object,
+) -> PendingAttributeCandidate | SubjectAttributeRecord:
+    """Compatibility wrapper returning the highest-ranked bounded candidate."""
+
+    selected = _collect_attribute_candidates(**kwargs, max_candidates=1)
+    if isinstance(selected, SubjectAttributeRecord):
+        return selected
+    return selected[0]
 
 
 def _save_attribute_crop(
@@ -2961,7 +3110,7 @@ def _validate_attribute_png(
     output_root: Path,
     relative_path: str,
     *,
-    final_selection: Literal["raw", "completed"] = "raw",
+    final_selection: Literal["raw", "completed", "bbox"] = "raw",
     expected_mode: Literal["RGB", "RGBA"] | None = None,
 ) -> None:
     path = (output_root / relative_path).resolve(strict=False)
@@ -2971,11 +3120,11 @@ def _validate_attribute_png(
         if opened.format != "PNG":
             raise ValueError("accepted attribute artifact must be PNG")
         mode = expected_mode or (
-            "RGB" if final_selection == "completed" else "RGBA"
+            "RGB" if final_selection in {"completed", "bbox"} else "RGBA"
         )
         if mode == "RGB":
             if opened.mode != "RGB":
-                if expected_mode is None and final_selection == "completed":
+                if expected_mode is None and final_selection in {"completed", "bbox"}:
                     raise ValueError("completed attribute artifact must be RGB PNG")
                 raise ValueError("selected attribute artifact must be RGB PNG")
             return
@@ -3019,11 +3168,7 @@ def _load_cached_owner_artifact(
                 _validate_attribute_png(
                     output_root,
                     record.image_path,
-                    final_selection=(
-                        "completed"
-                        if record.final_selection == "completed"
-                        else "raw"
-                    ),
+                    final_selection=record.final_selection or "raw",
                     expected_mode=(
                         "RGB"
                         if record.default_variant
@@ -3053,11 +3198,7 @@ def _load_cached_owner_artifact(
                     _validate_attribute_png(
                         output_root,
                         record.accepted_base_image_path,
-                        final_selection=(
-                            "completed"
-                            if record.final_selection == "completed"
-                            else "raw"
-                        ),
+                        final_selection=record.final_selection or "raw",
                     )
         return artifact
     except (OSError, ValueError):
@@ -3170,6 +3311,7 @@ def _process_owner(
         )
     ]
     pending: list[PendingAttributeCandidate] = []
+    candidate_options_by_id: dict[str, list[PendingAttributeCandidate]] = {}
     records_by_id: dict[str, SubjectAttributeRecord] = {}
     sam_seconds = 0.0
     gme_metrics = _GmeSelectionMetrics()
@@ -3180,7 +3322,7 @@ def _process_owner(
         sam_started = time.perf_counter()
         gme_seconds_before = gme_metrics.model_call_time_seconds
         try:
-            selected = _select_attribute_candidate(
+            selected = _collect_attribute_candidates(
                 discovered=discovered,
                 attribute_id=attribute_id,
                 clip_uid=clip.clip_uid,
@@ -3215,7 +3357,8 @@ def _process_owner(
         if isinstance(selected, SubjectAttributeRecord):
             records_by_id[attribute_id] = selected
         else:
-            pending.append(selected)
+            candidate_options_by_id[attribute_id] = selected
+            pending.append(selected[0])
 
     duplicate_conflicts = _duplicate_attribute_mask_conflicts(pending)
     if duplicate_conflicts:
@@ -3245,106 +3388,115 @@ def _process_owner(
                 ),
             )
         pending = retained_pending
+        for attribute_id in duplicate_conflicts:
+            candidate_options_by_id.pop(attribute_id, None)
 
-    review_calls = 0
-    review_failures = 0
-    review_failure: str | None = None
-    raw_reviews: dict[str, SubjectAttributeReview] = {}
-    accepted_candidate_by_id: dict[str, PendingAttributeCandidate] = {}
-    if pending:
-        review_calls = 1
+    new_review_calls = 0
+    new_review_failures = 0
+    new_review_failure: str | None = None
+    second_candidate_attempts = 0
+    completion_candidate_accepted = [0, 0]
+    new_variant_metrics = _AttributeVariantMetrics()
+    selected_candidate_by_id: dict[str, PendingAttributeCandidate] = {}
+    raw_fallback_pool: dict[
+        str, list[tuple[PendingAttributeCandidate, SubjectAttributeReview]]
+    ] = {}
+    semantic_candidate_pool: dict[
+        str, list[tuple[PendingAttributeCandidate, SubjectAttributeReview]]
+    ] = {}
+    completion_provenance: dict[
+        str, tuple[str, SubjectAttributeCompletionReview | None, int | None]
+    ] = {}
+    unresolved = {candidate.attribute_id for candidate in pending}
+
+    for candidate_rank in range(MAX_ATTRIBUTE_SOURCE_CANDIDATES):
+        round_candidates = [
+            options[candidate_rank]
+            for attribute_id, options in candidate_options_by_id.items()
+            if attribute_id in unresolved and candidate_rank < len(options)
+        ]
+        if not round_candidates:
+            continue
+        if candidate_rank == 1:
+            second_candidate_attempts += len(round_candidates)
+        new_review_calls += 1
         review_started = time.perf_counter()
+        round_reviews: dict[str, SubjectAttributeReview] = {}
+        round_failure: str | None = None
         try:
-            batch = review_client.review(owner=owner, candidates=pending)
-            raw_reviews = {
-                review.attribute_id: review for review in batch.reviews
-            }
-        except Exception as exc:  # noqa: BLE001 - fail closed for this owner batch
-            review_failure = f"review_failed:{type(exc).__name__}:{exc}"
-            review_failures += 1
+            batch = review_client.review(owner=owner, candidates=round_candidates)
+            round_reviews = {review.attribute_id: review for review in batch.reviews}
+        except Exception as exc:  # noqa: BLE001 - fail closed for this review round
+            round_failure = f"review_failed:{type(exc).__name__}:{exc}"
+            new_review_failure = round_failure
+            new_review_failures += 1
         qwen_seconds += time.perf_counter() - review_started
 
-    for candidate in pending:
-        review = raw_reviews.get(candidate.attribute_id)
-        same_frame = (
-            owner_reference.source_clip_uid in {None, clip.clip_uid}
-            and candidate.owner_candidate.source_frame_index
-            == owner_reference.source_frame_index
-        )
-        if review is None:
-            records_by_id[candidate.attribute_id] = _rejected_record(
-                candidate.discovered,
-                attribute_id=candidate.attribute_id,
-                owner_entity_id=owner.entity_id,
-                reason=review_failure or "recognizability_review_missing",
-                geometry=candidate.geometry,
-                source_frame_index=candidate.owner_candidate.source_frame_index,
-                source_frame_slot=candidate.owner_candidate.frame_slot,
-                owner_candidate_id=candidate.owner_candidate.candidate_id,
-                same_frame=same_frame,
-                gme_attempts=candidate.gme_attempts,
-                selected_gme_attempt_index=(
-                    candidate.selected_gme_attempt_index
-                ),
+        for candidate in round_candidates:
+            attribute_id = candidate.attribute_id
+            if attribute_id not in unresolved:
+                continue
+            review = round_reviews.get(attribute_id)
+            same_frame = (
+                owner_reference.source_clip_uid in {None, clip.clip_uid}
+                and candidate.owner_candidate.source_frame_index
+                == owner_reference.source_frame_index
             )
-            continue
-        if review.accepted:
-            completion_metrics.raw_review_accepted += 1
-        repair_recommended = bool(
-            review.matches_attribute
-            and review.owner_binding_correct
-            and not review.structure_complete
-            and review.completion_recommended
-        )
-        if repair_recommended:
-            completion_metrics.raw_review_repair_recommended += 1
-        elif not review.accepted:
-            completion_metrics.raw_review_hard_rejected += 1
-
-        semantic_owner_correct = bool(
-            review.matches_attribute and review.owner_binding_correct
-        )
-        completion_eligible = bool(
-            completion_config.enabled
-            and candidate.discovered.attribute_type
-            in completion_config.eligible_types
-        )
-        if not semantic_owner_correct:
-            records_by_id[candidate.attribute_id] = _rejected_record(
-                candidate.discovered,
-                attribute_id=candidate.attribute_id,
-                owner_entity_id=owner.entity_id,
-                reason=f"recognizability:{review.reason}",
-                geometry=candidate.geometry,
-                source_frame_index=candidate.owner_candidate.source_frame_index,
-                source_frame_slot=candidate.owner_candidate.frame_slot,
-                owner_candidate_id=candidate.owner_candidate.candidate_id,
-                same_frame=same_frame,
-                review=review,
-                gme_attempts=candidate.gme_attempts,
-                selected_gme_attempt_index=(
-                    candidate.selected_gme_attempt_index
-                ),
-            )
-            continue
-        if not completion_eligible or not repair_recommended:
-            if review.accepted:
-                accepted_candidate_by_id[candidate.attribute_id] = candidate
-                records_by_id[candidate.attribute_id] = _accepted_record(
-                    candidate,
-                    output_root=output_root,
-                    sample_id=clip.clip_uid,
-                    owner_reference=owner_reference,
-                    review=review,
-                    final_selection="raw",
-                    completion_attempted=False,
-                    completion_outcome="not_attempted",
-                    crop_padding_ratio=config.pair.crop_padding_ratio,
-                )
-            else:
-                records_by_id[candidate.attribute_id] = _rejected_record(
+            if review is None:
+                if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
+                    continue
+                records_by_id[attribute_id] = _rejected_record(
                     candidate.discovered,
-                    attribute_id=candidate.attribute_id,
+                    attribute_id=attribute_id,
+                    owner_entity_id=owner.entity_id,
+                    reason=round_failure or "recognizability_review_missing",
+                    geometry=candidate.geometry,
+                    source_frame_index=candidate.owner_candidate.source_frame_index,
+                    source_frame_slot=candidate.owner_candidate.frame_slot,
+                    owner_candidate_id=candidate.owner_candidate.candidate_id,
+                    same_frame=same_frame,
+                    gme_attempts=candidate.gme_attempts,
+                    selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+                )
+                unresolved.discard(attribute_id)
+                continue
+
+            completion_metrics.raw_review_accepted += int(review.accepted)
+            repair_recommended = bool(
+                review.matches_attribute
+                and review.owner_binding_correct
+                and not review.structure_complete
+                and review.completion_recommended
+            )
+            completion_metrics.raw_review_repair_recommended += int(
+                repair_recommended
+            )
+            completion_metrics.raw_review_hard_rejected += int(
+                not review.accepted
+            )
+            semantic_owner_correct = bool(
+                review.matches_attribute and review.owner_binding_correct
+            )
+            if semantic_owner_correct:
+                semantic_candidate_pool.setdefault(attribute_id, []).append(
+                    (candidate, review)
+                )
+            if review.accepted:
+                raw_fallback_pool.setdefault(attribute_id, []).append(
+                    (candidate, review)
+                )
+
+            completion_eligible = bool(
+                completion_config.enabled
+                and candidate.discovered.attribute_type
+                in completion_config.eligible_types
+            )
+            if not semantic_owner_correct:
+                if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
+                    continue
+                records_by_id[attribute_id] = _rejected_record(
+                    candidate.discovered,
+                    attribute_id=attribute_id,
                     owner_entity_id=owner.entity_id,
                     reason=f"recognizability:{review.reason}",
                     geometry=candidate.geometry,
@@ -3354,70 +3506,114 @@ def _process_owner(
                     same_frame=same_frame,
                     review=review,
                     gme_attempts=candidate.gme_attempts,
-                    selected_gme_attempt_index=(
-                        candidate.selected_gme_attempt_index
-                    ),
+                    selected_gme_attempt_index=candidate.selected_gme_attempt_index,
                 )
-            continue
+                unresolved.discard(attribute_id)
+                continue
 
-        if completion_backend is None or completion_judge is None:
-            completed = None
-            completion_review = None
-            completion_seed = None
-            completion_reason = "completion_failed:backend_not_configured"
-            completion_metrics.attempts += 1
-            completion_metrics.attempts_by_type[
-                candidate.discovered.attribute_type
-            ] += 1
-            if review.accepted:
-                completion_metrics.raw_usable_attempts += 1
+            if not completion_eligible:
+                if review.accepted:
+                    selected_candidate_by_id[attribute_id] = candidate
+                    records_by_id[attribute_id] = _accepted_record(
+                        candidate,
+                        output_root=output_root,
+                        sample_id=clip.clip_uid,
+                        owner_reference=owner_reference,
+                        review=review,
+                        final_selection="raw",
+                        completion_attempted=False,
+                        completion_outcome="not_attempted",
+                        crop_padding_ratio=config.pair.crop_padding_ratio,
+                    )
+                    unresolved.discard(attribute_id)
+                elif candidate_rank + 1 >= len(
+                    candidate_options_by_id[attribute_id]
+                ):
+                    # The last-resort bbox route is handled after both raw rounds.
+                    pass
+                continue
+
+            if completion_backend is None or completion_judge is None:
+                completed = None
+                completion_review = None
+                completion_seed = None
+                completion_reason = "completion_failed:backend_not_configured"
+                completion_metrics.attempts += 1
+                completion_metrics.attempts_by_type[
+                    candidate.discovered.attribute_type
+                ] += 1
+                if review.accepted:
+                    completion_metrics.raw_usable_attempts += 1
+                else:
+                    completion_metrics.raw_unusable_attempts += 1
+                completion_metrics.failures += 1
+                completion_metrics.backend_failures += 1
             else:
-                completion_metrics.raw_unusable_attempts += 1
-            completion_metrics.failures += 1
-            completion_metrics.backend_failures += 1
-        else:
-            (
-                completed,
+                (
+                    completed,
+                    completion_reason,
+                    _,
+                    completion_review,
+                    completion_seed,
+                ) = _attempt_attribute_completion(
+                    candidate,
+                    clip_uid=clip.clip_uid,
+                    output_root=output_root,
+                    completion_config=completion_config,
+                    completion_backend=completion_backend,
+                    completion_judge=completion_judge,
+                    metrics=completion_metrics,
+                    raw_usable=review.accepted,
+                )
+            completion_provenance[attribute_id] = (
                 completion_reason,
-                _,
                 completion_review,
                 completion_seed,
-            ) = _attempt_attribute_completion(
-                candidate,
-                clip_uid=clip.clip_uid,
-                output_root=output_root,
-                completion_config=completion_config,
-                completion_backend=completion_backend,
-                completion_judge=completion_judge,
-                metrics=completion_metrics,
-                raw_usable=review.accepted,
             )
-        if completed is not None:
-            assert completion_review is not None
-            completion_metrics.accepted += 1
-            completion_metrics.selected_completed += 1
-            completion_metrics.accepted_by_type[
-                candidate.discovered.attribute_type
-            ] += 1
-            accepted_candidate_by_id[candidate.attribute_id] = completed
-            records_by_id[candidate.attribute_id] = _accepted_record(
-                completed,
-                output_root=output_root,
-                sample_id=clip.clip_uid,
-                owner_reference=owner_reference,
-                review=review,
-                completion_review=completion_review,
-                final_selection="completed",
-                completion_attempted=True,
-                completion_seed=completion_seed,
-                completion_outcome="selected_completed",
-                crop_padding_ratio=config.pair.crop_padding_ratio,
+            if completed is not None:
+                assert completion_review is not None
+                completion_metrics.accepted += 1
+                completion_metrics.selected_completed += 1
+                completion_metrics.accepted_by_type[
+                    candidate.discovered.attribute_type
+                ] += 1
+                completion_candidate_accepted[candidate_rank] += 1
+                selected_candidate_by_id[attribute_id] = completed
+                records_by_id[attribute_id] = _accepted_record(
+                    completed,
+                    output_root=output_root,
+                    sample_id=clip.clip_uid,
+                    owner_reference=owner_reference,
+                    review=review,
+                    completion_review=completion_review,
+                    final_selection="completed",
+                    completion_attempted=True,
+                    completion_seed=completion_seed,
+                    completion_outcome="selected_completed",
+                    crop_padding_ratio=config.pair.crop_padding_ratio,
+                )
+                unresolved.discard(attribute_id)
+
+    variant_judge = (
+        review_client
+        if callable(getattr(review_client, "review_attribute_bbox", None))
+        else None
+    )
+    for attribute_id in list(unresolved):
+        raw_pool = raw_fallback_pool.get(attribute_id, [])
+        completion_reason, completion_review, completion_seed = (
+            completion_provenance.get(
+                attribute_id,
+                ("not_attempted", None, None),
             )
-            continue
-        if review.accepted:
-            completion_metrics.fallback_to_raw += 1
-            accepted_candidate_by_id[candidate.attribute_id] = candidate
-            records_by_id[candidate.attribute_id] = _accepted_record(
+        )
+        if raw_pool:
+            candidate, review = raw_pool[0]
+            completion_attempted = attribute_id in completion_provenance
+            if completion_attempted:
+                completion_metrics.fallback_to_raw += 1
+            selected_candidate_by_id[attribute_id] = candidate
+            records_by_id[attribute_id] = _accepted_record(
                 candidate,
                 output_root=output_root,
                 sample_id=clip.clip_uid,
@@ -3425,47 +3621,124 @@ def _process_owner(
                 review=review,
                 completion_review=completion_review,
                 final_selection="raw",
-                completion_attempted=True,
+                completion_attempted=completion_attempted,
                 completion_seed=completion_seed,
                 completion_outcome=completion_reason,
                 crop_padding_ratio=config.pair.crop_padding_ratio,
             )
-        else:
-            completion_metrics.rejected += 1
-            records_by_id[candidate.attribute_id] = _rejected_record(
+            unresolved.discard(attribute_id)
+            continue
+
+        semantic_pool = semantic_candidate_pool.get(attribute_id, [])
+        if not semantic_pool or variant_judge is None:
+            options = candidate_options_by_id[attribute_id]
+            candidate = options[min(len(options) - 1, 1)]
+            review = semantic_pool[0][1] if semantic_pool else None
+            if attribute_id in completion_provenance:
+                completion_metrics.rejected += 1
+            records_by_id[attribute_id] = _rejected_record(
                 candidate.discovered,
-                attribute_id=candidate.attribute_id,
+                attribute_id=attribute_id,
                 owner_entity_id=owner.entity_id,
-                reason=completion_reason,
+                reason=(
+                    f"recognizability:{review.reason}"
+                    if semantic_pool
+                    else "recognizability:no_semantic_owner_candidate"
+                ),
                 geometry=candidate.geometry,
                 source_frame_index=candidate.owner_candidate.source_frame_index,
                 source_frame_slot=candidate.owner_candidate.frame_slot,
                 owner_candidate_id=candidate.owner_candidate.candidate_id,
-                same_frame=same_frame,
+                same_frame=(
+                    owner_reference.source_clip_uid in {None, clip.clip_uid}
+                    and candidate.owner_candidate.source_frame_index
+                    == owner_reference.source_frame_index
+                ),
                 review=review,
                 completion_review=completion_review,
-                gme_attempts=candidate.gme_attempts,
-                selected_gme_attempt_index=candidate.selected_gme_attempt_index,
-                completion_attempted=True,
+                completion_attempted=attribute_id in completion_provenance,
                 completion_seed=completion_seed,
                 completion_outcome=completion_reason,
             )
+            unresolved.discard(attribute_id)
+            continue
 
-    variant_metrics = _AttributeVariantMetrics()
-    variant_judge = (
-        review_client
-        if callable(getattr(review_client, "review_attribute_bbox", None))
-        else None
-    )
-    for attribute_id, candidate in accepted_candidate_by_id.items():
+        candidate, review = semantic_pool[0]
+        new_variant_metrics.bbox_reviews_attempted += 1
+        bbox_image = _attribute_bbox_crop(
+            candidate.source_image,
+            candidate.attribute_mask,
+            crop_padding_ratio=config.pair.crop_padding_ratio,
+        )
+        owner_context = build_candidate_context_image(
+            candidate.source_image,
+            candidate.owner_candidate.mask,
+        )
+        try:
+            bbox_review = variant_judge.review_attribute_bbox(
+                bbox_candidate=bbox_image,
+                owner_context=owner_context,
+                attribute_type=candidate.discovered.attribute_type,
+                attribute_phrase=candidate.discovered.phrase,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            bbox_review = None
+            bbox_reason = f"attribute_bbox_judge_failed:{type(exc).__name__}:{exc}"
+        else:
+            bbox_reason = bbox_review.reason
+        if bbox_review is not None and bbox_review.verdict == "accept":
+            selected_candidate_by_id[attribute_id] = candidate
+            records_by_id[attribute_id] = _accepted_record(
+                candidate,
+                output_root=output_root,
+                sample_id=clip.clip_uid,
+                owner_reference=owner_reference,
+                review=review,
+                completion_review=completion_review,
+                final_selection="bbox",
+                completion_attempted=attribute_id in completion_provenance,
+                completion_seed=completion_seed,
+                completion_outcome="bbox_fallback_accepted",
+                crop_padding_ratio=config.pair.crop_padding_ratio,
+            )
+        else:
+            if attribute_id in completion_provenance:
+                completion_metrics.rejected += 1
+            records_by_id[attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=f"attribute_bbox_fallback_rejected:{bbox_reason}",
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=(
+                    owner_reference.source_clip_uid in {None, clip.clip_uid}
+                    and candidate.owner_candidate.source_frame_index
+                    == owner_reference.source_frame_index
+                ),
+                review=review,
+                completion_review=completion_review,
+                completion_attempted=attribute_id in completion_provenance,
+                completion_seed=completion_seed,
+                completion_outcome=completion_reason,
+            )
+        unresolved.discard(attribute_id)
+
+    for attribute_id, candidate in selected_candidate_by_id.items():
         records_by_id[attribute_id] = _with_attribute_variants(
             records_by_id[attribute_id],
             candidate,
             output_root=output_root,
-            judge=variant_judge,
-            metrics=variant_metrics,
+            judge=None,
+            metrics=new_variant_metrics,
         )
 
+    review_calls = new_review_calls
+    review_failures = new_review_failures
+    review_failure = new_review_failure
+    variant_metrics = new_variant_metrics
     ordered_records = [
         records_by_id[f"a{attribute_id_start + offset}"]
         for offset in range(len(discovery.attributes))
@@ -3599,6 +3872,23 @@ def _process_owner(
             attribute_bbox_reviews_skipped_background_accepted=0,
             attribute_background_variants_attempted=0,
             attribute_background_variants_accepted=0,
+            attribute_source_candidates_considered=sum(
+                len(options) for options in candidate_options_by_id.values()
+            ),
+            attribute_second_candidate_attempts=second_candidate_attempts,
+            attribute_completion_candidate1_accepted=(
+                completion_candidate_accepted[0]
+            ),
+            attribute_completion_candidate2_accepted=(
+                completion_candidate_accepted[1]
+            ),
+            attribute_bbox_fallback_attempts=(
+                new_variant_metrics.bbox_reviews_attempted
+            ),
+            attribute_bbox_fallback_accepted=sum(
+                record.status == "accepted" and record.final_selection == "bbox"
+                for record in ordered_records
+            ),
             failures=failures,
         ),
         gme_screen_mode=gme_screen_mode,
@@ -4278,6 +4568,24 @@ def reconcile_subject_attribute_outputs(
         ),
         "attribute_background_variants_accepted": (
             totals.attribute_background_variants_accepted
+        ),
+        "attribute_source_candidates_considered": (
+            totals.attribute_source_candidates_considered
+        ),
+        "attribute_second_candidate_attempts": (
+            totals.attribute_second_candidate_attempts
+        ),
+        "attribute_completion_candidate1_accepted": (
+            totals.attribute_completion_candidate1_accepted
+        ),
+        "attribute_completion_candidate2_accepted": (
+            totals.attribute_completion_candidate2_accepted
+        ),
+        "attribute_bbox_fallback_attempts": (
+            totals.attribute_bbox_fallback_attempts
+        ),
+        "attribute_bbox_fallback_accepted": (
+            totals.attribute_bbox_fallback_accepted
         ),
         "deterministic_ownership_rejects": totals.deterministic_ownership_rejects,
         "recognizability_rejects": totals.recognizability_rejects,

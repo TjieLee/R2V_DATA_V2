@@ -1179,6 +1179,46 @@ def _reference_edit_after_source_bbox(
     )
 
 
+def _reference_edit_after_source_alpha(
+    state: ReferenceEditState | None,
+    *,
+    entity_id: str,
+    reason: str,
+) -> ReferenceEditState | None:
+    if state is None:
+        return None
+    updated = []
+    found = False
+    for item in state.entities:
+        if item.entity_id != entity_id:
+            updated.append(item)
+            continue
+        if item.variants is None or item.variants.alpha.image_path is None:
+            raise ValueError("completion fallback requires a source alpha variant")
+        found = True
+        updated.append(
+            item.model_copy(
+                update={
+                    "status": "fallback",
+                    "output_image_path": item.source_image_path,
+                    "default_variant": "alpha",
+                    "default_image_path": item.source_image_path,
+                    "default_reason": reason,
+                    "accepted_base_image_path": item.source_image_path,
+                    "background_fallback": "none",
+                    "fallback_policy": "keep_source",
+                    "source_bbox_fallback_metadata_path": None,
+                    "reason": reason,
+                }
+            )
+        )
+    if not found:
+        raise ValueError("source alpha fallback requires matching reference edit state")
+    return ReferenceEditState.model_validate(
+        state.model_copy(update={"entities": updated}).model_dump(mode="json")
+    )
+
+
 @dataclass(frozen=True)
 class _SourceBboxEvaluation:
     candidate_relative: str
@@ -1476,6 +1516,15 @@ def reference_integrity_clips(
                 references_by_id = {
                     item.entity_id: item for item in clip.references.entities
                 }
+                reference_edits_by_id = {
+                    item.entity_id: item
+                    for item in (
+                        clip.reference_edit.entities
+                        if clip.reference_edit is not None
+                        and clip.reference_edit.status == "ready"
+                        else []
+                    )
+                }
                 entities_by_id = {
                     item.entity_id: item
                     for item in (
@@ -1609,6 +1658,104 @@ def reference_integrity_clips(
                                 "finish_reasons": list(attempt.finish_reasons),
                             },
                         )
+                    edit = reference_edits_by_id.get(entity_id)
+                    if (
+                        attempt.review.verdict == "reject"
+                        and reference.synthetic
+                        and edit is not None
+                        and edit.default_variant == "accepted_base"
+                        and edit.source_reference.image_path is not None
+                    ):
+                        alpha_reference = edit.source_reference
+                        alpha_path = _resolve_run_artifact(
+                            storage, alpha_reference.image_path
+                        )
+                        with Image.open(alpha_path) as opened:
+                            alpha_image = opened.copy()
+                            alpha_image.load()
+                        alpha_diagnostics = reference_topology_diagnostics(alpha_image)
+                        counters["topology_suspicious"] += int(
+                            alpha_diagnostics.suspicious
+                        )
+                        alpha_evidence = _source_evidence(
+                            storage,
+                            clip_uid=clip.clip_uid,
+                            reference=alpha_reference,
+                        )
+                        alpha_context = _source_context(alpha_evidence)
+                        alpha_context_path = storage.selected_path(
+                            clip.clip_uid,
+                            f"integrity_context_{entity_id}_source_alpha.png",
+                        )
+                        _write_context_atomic(alpha_context_path, alpha_context)
+                        alpha_context_relative = storage.relative_artifact_path(
+                            alpha_context_path
+                        )
+                        counters["entities_reviewed"] += 1
+                        try:
+                            alpha_attempt = active_judge.review(
+                                source_context=alpha_context,
+                                final_reference=alpha_image,
+                                reference_type=entity.reference_type,
+                                phrase=entity.phrase,
+                                grounding_prompt=entity.grounding_prompt,
+                                reference_scope=alpha_reference.reference_scope,
+                                synthetic=False,
+                            )
+                        except ReferenceIntegrityJudgeFailure as exc:
+                            rejected_ids.add(entity_id)
+                            counters["judge_failed"] += 1
+                            counters["entities_rejected"] += 1
+                            results.append(
+                                ReferenceIntegrityEntityState(
+                                    entity_id=entity_id,
+                                    status="rejected",
+                                    input_reference=alpha_reference,
+                                    final_reference_path=alpha_reference.image_path,
+                                    source_context_path=alpha_context_relative,
+                                    diagnostics=alpha_diagnostics,
+                                    reviewed=True,
+                                    judge_failed=True,
+                                    reason=(
+                                        "completion_rejected_then_alpha_integrity_"
+                                        f"judge_failed:{exc}"
+                                    ),
+                                )
+                            )
+                            continue
+                        if alpha_attempt.review.verdict == "accept":
+                            fallback_references[entity_id] = alpha_reference
+                            updated_reference_edit = _reference_edit_after_source_alpha(
+                                updated_reference_edit,
+                                entity_id=entity_id,
+                                reason="completion_integrity_rejected_fallback_to_alpha",
+                            )
+                            counters["entities_accepted"] += 1
+                            results.append(
+                                ReferenceIntegrityEntityState(
+                                    entity_id=entity_id,
+                                    status="accepted",
+                                    input_reference=alpha_reference,
+                                    final_reference_path=alpha_reference.image_path,
+                                    source_context_path=alpha_context_relative,
+                                    diagnostics=alpha_diagnostics,
+                                    reviewed=True,
+                                    review=alpha_attempt.review,
+                                    reason=(
+                                        "completion_integrity_rejected_"
+                                        "source_alpha_accepted"
+                                    ),
+                                )
+                            )
+                            continue
+                        reference = alpha_reference
+                        final_path = alpha_path
+                        final_image = alpha_image
+                        diagnostics = alpha_diagnostics
+                        source_evidence = alpha_evidence
+                        context = alpha_context
+                        context_relative = alpha_context_relative
+                        attempt = alpha_attempt
                     topology_upgrade_eligible = _topology_bbox_upgrade_eligible(
                         review=attempt.review,
                         reference_type=entity.reference_type,

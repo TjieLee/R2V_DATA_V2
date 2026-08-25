@@ -353,8 +353,25 @@ Image 1 is the source reference and Image 2 is the generated completion.
 Accept only if Image 2 preserves the same physical entity and every visible
 identity attribute, contains exactly one coherent target, plausibly completes
 missing structure, adds no duplicate or unrelated entity, has no severe
-structural artifact, and is a usable high-resolution reference. Judge visible
-facts only and return one strict JSON object matching the supplied schema."""
+structural artifact, and is a usable high-resolution reference.
+
+Reasonable spatial changes are allowed. Do not reject Image 2 merely because
+the target moved, was recentered, changed size moderately, or has a somewhat
+different crop or composition. This is a conditioning reference, not a
+reconstruction of the source layout. Accept reasonable position and scale
+changes when the same target remains clear, prominent, structurally plausible,
+and useful as a reference.
+
+Reject spatial or composition changes only when the target becomes too small,
+is pushed into an extreme corner or edge, loses visual prominence, becomes
+severely cropped, or otherwise loses conditioning value. Reject severe
+structural distortion, including stretched or compressed body proportions, an
+elongated torso, abnormally long or short limbs, warped anatomy, distorted
+object proportions, duplicated limbs or components, malformed completion, an
+identity-changing redraw, a wrong new instance, or unrelated added content.
+
+Judge visible facts only and return one strict JSON object matching the
+supplied schema."""
 
 _BACKGROUND_REVIEW_PROMPT = """You review a generated entity reference.
 Image 1 is the source reference and Image 2 adds a clean supporting background.
@@ -532,9 +549,21 @@ class QwenBooguReferenceEditJudge:
                 },
             )
         except BadRequestError:
+            fallback_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Return exactly one JSON object matching this schema. "
+                        "Every required field must be present. Do not omit booleans. "
+                        "No extra fields.\n"
+                        + json.dumps(model.model_json_schema(), ensure_ascii=False)
+                    ),
+                },
+            ]
             response = profiled_openai_call(
                 lambda: self.client.chat.completions.create(
-                    **parameters,
+                    **{**parameters, "messages": fallback_messages},
                     response_format={"type": "json_object"},
                 ),
                 component=(
@@ -545,7 +574,7 @@ class QwenBooguReferenceEditJudge:
                 operation="initial" if retry_index == 0 else "repair",
                 retry_index=retry_index,
                 model=self.config.model,
-                messages=messages,
+                messages=fallback_messages,
                 metadata={
                     "edit_operation": operation,
                     "response_format": "json_object",
@@ -1546,7 +1575,11 @@ def run_boogu_reference_edit(
 
         qwen_accepted = qwen_review is not None and qwen_review.verdict == "accept"
         sam_accepted = sam_review is None or sam_review.passed
-        if geometry_metadata and not geometry_metadata["geometry_gate_passed"]:
+        if (
+            operation == "add_entity_background"
+            and geometry_metadata
+            and not geometry_metadata["geometry_gate_passed"]
+        ):
             sam_accepted = False
         if (
             qwen_accepted
@@ -1560,7 +1593,8 @@ def run_boogu_reference_edit(
         if not accepted:
             rejection_reason = (
                 str(geometry_metadata["geometry_rejection_reason"])
-                if geometry_metadata
+                if operation == "add_entity_background"
+                and geometry_metadata
                 and not geometry_metadata["geometry_gate_passed"]
                 else qwen_review_skipped_reason
                 if qwen_review_skipped_reason is not None

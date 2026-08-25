@@ -1137,6 +1137,7 @@ class ReferenceEditEntityState(SchemaModel):
     default_variant: Optional[ReferenceDefaultVariant] = None
     default_image_path: Optional[str] = None
     default_reason: Optional[str] = None
+    accepted_base_image_path: Optional[str] = None
     output_image_path: Optional[str] = None
     operation: Optional[ReferenceEditOperation] = None
     metadata_path: Optional[str] = None
@@ -1174,18 +1175,26 @@ class ReferenceEditEntityState(SchemaModel):
             self.default_reason,
         )
         if self.variants is None:
-            if any(value is not None for value in defaults):
+            if any(value is not None for value in defaults) or (
+                self.accepted_base_image_path is not None
+            ):
                 raise ValueError("reference variant defaults require variants")
         else:
             if any(value is None for value in defaults):
                 raise ValueError("reference variants require complete default provenance")
             assert self.default_variant is not None
             assert self.default_image_path is not None
-            selected = getattr(self.variants, self.default_variant, None)
-            if selected is None or selected.image_path != self.default_image_path:
-                raise ValueError("reference variant default must match its image path")
-            if selected.status != "accepted":
-                raise ValueError("reference variant default must be accepted")
+            if self.default_variant == "accepted_base":
+                if self.default_image_path != self.accepted_base_image_path:
+                    raise ValueError(
+                        "accepted-base reference default must match its image path"
+                    )
+            else:
+                selected = getattr(self.variants, self.default_variant, None)
+                if selected is None or selected.image_path != self.default_image_path:
+                    raise ValueError("reference variant default must match its image path")
+                if selected.status != "accepted":
+                    raise ValueError("reference variant default must be accepted")
         allowed_sequences = {
             (),
             ("complete_entity",),
