@@ -18,6 +18,9 @@ def _convert_fixture(
     bbox: list[float] | None = None,
     detection_bbox: list[float] | None = None,
     video_size: tuple[int, int] = (100, 80),
+    frame_indices: list[int] | None = None,
+    track_bboxes: list[list[float]] | None = None,
+    score_values: list[float] | None = None,
 ) -> dict[str, object]:
     vendor_output = tmp_path / "vendor-output"
     model_video = vendor_output / "pyavi" / "video.avi"
@@ -31,16 +34,19 @@ def _convert_fixture(
     model_path.write_bytes(b"model")
     track_bbox = bbox or [1.0, 2.0, 11.0, 12.0]
     face_bbox = detection_bbox or track_bbox
+    frames = frame_indices if frame_indices is not None else list(range(frame_count))
+    bboxes = track_bboxes if track_bboxes is not None else [track_bbox] * bbox_count
+    logits = score_values if score_values is not None else [0.25] * score_count
     artifacts = {
         "tracks.pckl": [
             {
                 "track": {
-                    "frame": list(range(frame_count)),
-                    "bbox": [track_bbox] * bbox_count,
+                    "frame": frames,
+                    "bbox": bboxes,
                 }
             }
         ],
-        "scores.pckl": [[0.25] * score_count],
+        "scores.pckl": [logits],
         "faces.pckl": [
             [{"bbox": face_bbox, "conf": 0.9}] for _ in range(frame_count)
         ],
@@ -87,28 +93,74 @@ def test_converter_accepts_full_or_one_short_score_prefix(
     assert samples[-1]["frame_index"] == expected_sample_count - 1
 
 
-@pytest.mark.parametrize(
-    ("bbox_count", "score_count", "message"),
-    [
-        (249, 250, "frames and boxes differ"),
-        (250, 248, "frames and scores differ"),
-        (250, 251, "frames and scores differ"),
-    ],
-)
-def test_converter_rejects_other_track_length_mismatches(
+def test_converter_accepts_shorter_scored_prefix_without_fabricating_tail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    bbox_count: int,
-    score_count: int,
-    message: str,
 ) -> None:
-    with pytest.raises(ValueError, match=message):
+    frames = [10, 11, 12, 13, 14, 15]
+    bboxes = [
+        [float(index), 2.0, float(index + 10), 12.0]
+        for index in range(1, 7)
+    ]
+    logits = [0.1, 0.2, 0.3]
+
+    payload = _convert_fixture(
+        tmp_path,
+        monkeypatch,
+        frame_count=6,
+        bbox_count=6,
+        score_count=3,
+        frame_indices=frames,
+        track_bboxes=bboxes,
+        score_values=logits,
+    )
+
+    samples = payload["tracks"][0]["samples"]
+    assert [sample["frame_index"] for sample in samples] == frames[:3]
+    assert [sample["bbox_xyxy"] for sample in samples] == bboxes[:3]
+    assert [sample["raw_class1_logit"] for sample in samples] == logits
+
+
+def test_converter_rejects_frame_and_bbox_length_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="frames and boxes differ"):
         _convert_fixture(
             tmp_path,
             monkeypatch,
             frame_count=250,
-            bbox_count=bbox_count,
-            score_count=score_count,
+            bbox_count=249,
+            score_count=250,
+        )
+
+
+def test_converter_rejects_more_scores_than_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="more scores than tracked frames"):
+        _convert_fixture(
+            tmp_path,
+            monkeypatch,
+            frame_count=250,
+            bbox_count=250,
+            score_count=251,
+        )
+
+
+def test_converter_rejects_empty_scores(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="track has no scores"):
+        _convert_fixture(
+            tmp_path,
+            monkeypatch,
+            frame_count=250,
+            bbox_count=250,
+            score_count=0,
+            score_values=[],
         )
 
 

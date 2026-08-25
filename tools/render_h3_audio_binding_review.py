@@ -6,6 +6,37 @@ import subprocess
 from pathlib import Path
 
 
+def _review_mux_command(
+    *,
+    ffmpeg: str,
+    silent_video: Path,
+    source_video: Path,
+    output: Path,
+) -> list[str]:
+    return [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(silent_video),
+        "-i",
+        str(source_video),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-ac:a",
+        "2",
+        "-shortest",
+        str(output),
+        "-loglevel",
+        "error",
+    ]
+
+
 def _state_at(bindings: list[dict[str, object]], timestamp: float) -> str:
     for binding in bindings:
         if float(binding["start_time"]) <= timestamp < float(binding["end_time"]):
@@ -114,26 +145,12 @@ def main(argv: list[str] | None = None) -> int:
         writer.release()
         capture.release()
 
-    command = [
-        args.ffmpeg,
-        "-y",
-        "-i",
-        str(silent),
-        "-i",
-        str(source),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a?",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-shortest",
-        str(output),
-        "-loglevel",
-        "error",
-    ]
+    command = _review_mux_command(
+        ffmpeg=args.ffmpeg,
+        silent_video=silent,
+        source_video=source,
+        output=output,
+    )
     result = subprocess.run(command, check=False)
     silent.unlink(missing_ok=True)
     if result.returncode != 0 or not output.is_file():

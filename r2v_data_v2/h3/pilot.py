@@ -144,6 +144,35 @@ def _published_optional_path(
     return _published_path(value, temporary=temporary, destination=destination)
 
 
+def _published_diagnostic_value(
+    value: object,
+    *,
+    temporary: Path,
+    destination: Path,
+) -> object:
+    if isinstance(value, str):
+        return value.replace(str(temporary), str(destination))
+    if isinstance(value, list):
+        return [
+            _published_diagnostic_value(
+                item,
+                temporary=temporary,
+                destination=destination,
+            )
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _published_diagnostic_value(
+                item,
+                temporary=temporary,
+                destination=destination,
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 def _published_native_artifact(
     native: LRASDNativeArtifact,
     *,
@@ -323,30 +352,43 @@ def _run_pilot_clip(
                 status="failed",
                 reason=f"{type(exc).__name__}: {exc}",
             )
-        stage = "review_bundle"
-        write_review_bundle(
-            destination=temporary / "review" / clip_uid,
-            source_video_path=source_video,
-            native=native,
-            associations=associations,
-            sidecar=sidecar,
-            media_backend=review_media_backend,
-            source_audio_path=Path(runtime_native.audio_path),
-        )
         sidecar_payload = sidecar.model_dump(mode="json")
         voice_quality_payload = voice_quality.model_dump(mode="json")
-        _write_json(
-            temporary / "review" / clip_uid / "voice_reference_quality.json",
-            voice_quality_payload,
-        )
         clip_output = artifact_relpath or Path(clip_uid)
         if clip_output.is_absolute() or ".." in clip_output.parts:
             raise ValueError("pilot clip artifact path must be safe and relative")
+        stage = "publish_canonical_audio"
         _write_json(temporary / "clips" / clip_output / "audio_binding.json", sidecar_payload)
         _write_json(
             temporary / "clips" / clip_output / "voice_reference_quality.json",
             voice_quality_payload,
         )
+        stage = "review_bundle"
+        try:
+            write_review_bundle(
+                destination=temporary / "review" / clip_uid,
+                source_video_path=source_video,
+                native=native,
+                associations=associations,
+                sidecar=sidecar,
+                media_backend=review_media_backend,
+                source_audio_path=Path(runtime_native.audio_path),
+            )
+        except Exception as exc:  # noqa: BLE001 - review media is diagnostic only
+            published_reason = str(exc).replace(str(temporary), str(destination))
+            _write_json(
+                temporary / "review" / clip_uid / "review_error.json",
+                {
+                    "clip_uid": clip_uid,
+                    "error_type": type(exc).__name__,
+                    "reason": published_reason,
+                },
+            )
+        else:
+            _write_json(
+                temporary / "review" / clip_uid / "voice_reference_quality.json",
+                voice_quality_payload,
+            )
         counters["clips_succeeded"] = 1
         counters["clips_with_speech"] = int(bool(speech.intervals))
         counters["face_entity_association_failures"] = sum(
@@ -499,7 +541,15 @@ def run_h3_audio_binding_pilot(
             **counters,
         )
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
-        _write_jsonl(temporary / "failures.jsonl", failures)
+        published_failures = [
+            _published_diagnostic_value(
+                failure,
+                temporary=temporary,
+                destination=destination,
+            )
+            for failure in failures
+        ]
+        _write_jsonl(temporary / "failures.jsonl", published_failures)
         _write_jsonl(temporary / "audio_bindings.jsonl", canonical_sidecars)
         voice_quality_turns = [
             turn.model_dump(mode="json")

@@ -94,6 +94,7 @@ from r2v_data_v2.v3.schemas import (
     TrackedMasksArtifact,
 )
 from run_pipeline_v3 import STAGE_ORDER
+from tools import render_h3_audio_binding_review as review_renderer
 from tools.build_v3_h3_audio_binding_sidecar import main as sidecar_main
 from tools.eval_h3_audio_binding_lr_asd import _parser as lr_asd_pilot_parser
 from tools.recompute_h3_voice_quality import main as recompute_voice_quality_main
@@ -1230,6 +1231,18 @@ class _FakeReviewMediaBackend:
         destination_path.write_bytes(f"{start_time:.3f}-{end_time:.3f}".encode())
 
 
+class _FailingReviewMediaBackend(_FakeReviewMediaBackend):
+    def render_visualization(
+        self,
+        *,
+        source_video_path: Path,
+        timeline_path: Path,
+        destination_path: Path,
+    ) -> None:
+        del source_video_path, timeline_path, destination_path
+        raise RuntimeError("fake review mux failure")
+
+
 class _CountingLRASDBackend(PrecomputedLRASDBackend):
     def __init__(
         self,
@@ -1256,6 +1269,21 @@ class _CountingLRASDBackend(PrecomputedLRASDBackend):
             source_video_path=source_video_path,
             work_dir=work_dir,
         )
+
+
+class _DiagnosticPathLRASDBackend:
+    def analyze(
+        self,
+        *,
+        clip_uid: str,
+        source_video_path: Path,
+        work_dir: Path,
+    ) -> LRASDNativeArtifact:
+        del clip_uid, source_video_path
+        work_dir.mkdir(parents=True)
+        stderr_path = work_dir / "converter.stderr.log"
+        stderr_path.write_text("converter failed", encoding="utf-8")
+        raise LRASDRuntimeError(f"converter failed; stderr={stderr_path}")
 
 
 class _OutputLocalLRASDBackend:
@@ -1407,6 +1435,84 @@ def test_pilot_isolates_lr_asd_failure_and_runs_backend_once_per_clip(
         }
     ]
     assert _tree_hashes(run_root) == before
+
+
+def test_review_failure_preserves_canonical_audio_success(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    source = tmp_path / "clip-1.mp4"
+    audio = tmp_path / "clip-1.wav"
+    source.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.7] * 10],
+    )
+    output = tmp_path / "pilot"
+
+    summary = run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=output,
+        lr_asd_backend=PrecomputedLRASDBackend({"clip-1": native}),
+        speech_backend=PrecomputedSpeechActivityBackend(
+            {"clip-1": _speech_artifact("clip-1", audio, speech=True)}
+        ),
+        review_media_backend=_FailingReviewMediaBackend(),
+        clip_ids=["clip-1"],
+    )
+
+    assert summary.clips_succeeded == 1
+    assert summary.clips_failed == 0
+    assert (output / "clips/clip-1/audio_binding.json").is_file()
+    assert (output / "clips/clip-1/voice_reference_quality.json").is_file()
+    assert (output / "audio_bindings.jsonl").read_text(encoding="utf-8").strip()
+    assert not (output / "failures.jsonl").read_text(encoding="utf-8").strip()
+    review_root = output / "review/clip-1"
+    assert (review_root / "timeline.json").is_file()
+    assert json.loads(
+        (review_root / "review_error.json").read_text(encoding="utf-8")
+    ) == {
+        "clip_uid": "clip-1",
+        "error_type": "RuntimeError",
+        "reason": "fake review mux failure",
+    }
+
+
+def test_published_failure_rebases_temporary_diagnostic_path(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    source = tmp_path / "clip-1.mp4"
+    source.write_bytes(b"video")
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    output = tmp_path / "audio"
+
+    summary = run_h3_audio_binding_pilot(
+        run_root=run_root,
+        output_root=output,
+        lr_asd_backend=_DiagnosticPathLRASDBackend(),
+        speech_backend=PrecomputedSpeechActivityBackend({}),
+        review_media_backend=_FakeReviewMediaBackend(),
+        clip_ids=["clip-1"],
+    )
+
+    assert summary.clips_succeeded == 0
+    assert summary.clips_failed == 1
+    failure = json.loads(
+        (output / "failures.jsonl").read_text(encoding="utf-8")
+    )
+    expected_stderr = output / "runtime/clip-1/lr_asd/converter.stderr.log"
+    assert str(expected_stderr) in failure["reason"]
+    assert ".audio.tmp-" not in failure["reason"]
+    assert expected_stderr.read_text(encoding="utf-8") == "converter failed"
 
 
 def test_explicit_multi_shard_pilot_publishes_readable_clip_paths(
@@ -1969,6 +2075,24 @@ def test_review_bundle_metadata_is_deterministic_and_keeps_native_evidence(
     assert (first / "source.mp4").read_bytes() == b"video"
     assert (first / "visualization.mp4").read_bytes() == b"visualization"
     assert list((first / "bound_audio").glob("e1_*.wav"))
+
+
+def test_review_visualization_mux_downmixes_optional_source_audio_to_stereo(
+    tmp_path: Path,
+) -> None:
+    command = review_renderer._review_mux_command(
+        ffmpeg="ffmpeg",
+        silent_video=tmp_path / "silent.mp4",
+        source_video=tmp_path / "source.mp4",
+        output=tmp_path / "review.mp4",
+    )
+
+    assert command[command.index("-map") + 1] == "0:v:0"
+    second_map = command.index("-map", command.index("-map") + 1)
+    assert command[second_map + 1] == "1:a?"
+    assert command[command.index("-c:a") + 1] == "aac"
+    assert command[command.index("-ac:a") + 1] == "2"
+    assert "-shortest" in command
 
 
 def test_pilot_rebases_internal_runtime_paths_before_atomic_publication(

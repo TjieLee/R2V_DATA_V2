@@ -112,8 +112,12 @@ def convert(args: argparse.Namespace) -> dict[str, object]:
         logits = [float(value) for value in track_scores]
         if len(frame_indices) != len(bboxes):
             raise ValueError("official LR-ASD track frames and boxes differ")
-        if len(logits) not in {len(frame_indices), len(frame_indices) - 1}:
-            raise ValueError("official LR-ASD track frames and scores differ")
+        if not logits:
+            raise ValueError("official LR-ASD track has no scores")
+        if len(logits) > len(frame_indices):
+            raise ValueError(
+                "official LR-ASD returned more scores than tracked frames"
+            )
         artifact_bboxes = [
             _clip_bbox_for_artifact(bbox, width=width, height=height)
             for bbox in bboxes
