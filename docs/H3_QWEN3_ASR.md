@@ -149,6 +149,14 @@ from final speech segments. There is no fallback ASR, VAD resegmentation,
 denoising, enhancement, timestamp aligner, visual prompt, identity prompt, or
 network access. Dots3 is paused and is not used by this path.
 
+The isolated ASR process reads `diarization/readable_segments.jsonl` as its
+complete readable identity and sample-range input. It validates those rows
+against `readable_summary.json`, `raw_segments.jsonl`, and
+`bound_segments.jsonl` without loading Visual V3 samples or importing Visual
+model dependencies. The Visual production root remains inventory provenance
+only. The isolated environment does not require `openai`, SAM, or general V3
+production dependencies.
+
 ## Commands
 
 Dry-run enumerates the detected `visual_input_schema` and `visual_input_mode`,
@@ -167,8 +175,11 @@ python tools/run_h3_jea_production.py \
   --dry-run
 ```
 
-Run each stage explicitly. All stages except `qwen3-asr` use the normal
-repository environment. Only Qwen3 ASR uses the isolated Qwen Python:
+Run each stage explicitly from the normal repository environment. For the
+`qwen3-asr` stage, the JEA orchestrator launches exactly one child process with
+`$QWEN3_ASR_ENV/bin/python`; that child loads Qwen once and processes all
+readable DiariZen segments. Do not launch the all-stage orchestrator with the
+isolated Qwen Python:
 
 ```bash
 export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
@@ -203,7 +214,7 @@ export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --stages diarization
 
-"$QWEN3_ASR_ENV/bin/python" tools/run_h3_jea_production.py \
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \

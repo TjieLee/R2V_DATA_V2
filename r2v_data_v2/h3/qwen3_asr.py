@@ -12,15 +12,9 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 import numpy as np
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from r2v_data_v2.h3.diarization_binding import (
-    BoundDiarizationSegment,
-    DiarizationInventory,
-    RawDiarizationSegment,
-)
 from r2v_data_v2.h3.schemas import SchemaModel
-from r2v_data_v2.h3.visual_production_source import VisualProductionInventory
 
 QWEN3_ASR_MODEL_IDENTIFIER = "Qwen/Qwen3-ASR-1.7B"
 QWEN3_ASR_SEGMENT_VERSION = "r2v.h3.qwen3_asr_segment.1"
@@ -152,6 +146,114 @@ class Qwen3ASRSummary(SchemaModel):
         ):
             raise ValueError("Qwen3 ASR summary counts must reconcile")
         return self
+
+
+class _ReadableDiarizationSegment(SchemaModel):
+    schema_version: Literal["r2v.h3.jea_diarization_segment.1"] = (
+        "r2v.h3.jea_diarization_segment.1"
+    )
+    clip_uid: str
+    clip_display_path: str
+    media_collection_relpath: str
+    media_collection_name: str
+    episode_name: str
+    clip_name: str
+    shard_id: str
+    segment_id: str
+    speaker_cluster_id: str
+    entity_id: str | None = None
+    entity_occurrence_id: str | None = None
+    source_audio_path: str
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    source_sample_rate_hz: int = Field(gt=0)
+    start_time: float = Field(ge=0)
+    end_time: float = Field(gt=0)
+    raw_schema_version: Literal["r2v.h3.diarization_segment.2"] = (
+        "r2v.h3.diarization_segment.2"
+    )
+    bound_schema_version: Literal["r2v.h3.diarization_bound_segment.1"] = (
+        "r2v.h3.diarization_bound_segment.1"
+    )
+    mapping_policy_version: Literal["h3_diarizen_sparse_anchor_policy_v1"] = (
+        "h3_diarizen_sparse_anchor_policy_v1"
+    )
+    segmentation_changed: Literal[False] = False
+    numeric_mapping_thresholds_changed: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_segment(self) -> _ReadableDiarizationSegment:
+        if self.source_end_sample <= self.source_start_sample:
+            raise ValueError("readable DiariZen sample range must be positive")
+        if self.end_time <= self.start_time:
+            raise ValueError("readable DiariZen time range must be positive")
+        expected_occurrence = (
+            f"{self.clip_uid}/{self.entity_id}"
+            if self.entity_id is not None
+            else None
+        )
+        if self.entity_occurrence_id != expected_occurrence:
+            raise ValueError("readable DiariZen entity occurrence is inconsistent")
+        for value in (
+            self.clip_uid,
+            self.clip_display_path,
+            self.media_collection_relpath,
+            self.media_collection_name,
+            self.episode_name,
+            self.clip_name,
+            self.shard_id,
+            self.segment_id,
+            self.speaker_cluster_id,
+            self.source_audio_path,
+        ):
+            if not value.strip():
+                raise ValueError("readable DiariZen metadata must not be empty")
+        return self
+
+
+class _ReadableDiarizationSummary(SchemaModel):
+    schema_version: Literal["r2v.h3.jea_diarization_summary.1"] = (
+        "r2v.h3.jea_diarization_summary.1"
+    )
+    target_count: int = Field(ge=0)
+    segment_count: int = Field(ge=0)
+    media_collection_count: int = Field(ge=0)
+    segmentation_changed: Literal[False] = False
+    numeric_mapping_thresholds_changed: Literal[False] = False
+
+
+class _ProvenanceModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+
+class _RawSegmentProvenance(_ProvenanceModel):
+    schema_version: Literal["r2v.h3.diarization_segment.2"] = (
+        "r2v.h3.diarization_segment.2"
+    )
+    target_clip_uid: str
+    segment_id: str
+    speaker_cluster_id: str
+    start_time: float = Field(ge=0)
+    end_time: float = Field(gt=0)
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    source_audio_path: str
+    source_sample_rate_hz: int = Field(gt=0)
+
+
+class _BoundSegmentProvenance(_ProvenanceModel):
+    schema_version: Literal["r2v.h3.diarization_bound_segment.1"] = (
+        "r2v.h3.diarization_bound_segment.1"
+    )
+    target_clip_uid: str
+    segment_id: str
+    speaker_cluster_id: str
+    start_time: float = Field(ge=0)
+    end_time: float = Field(gt=0)
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    entity_id: str | None = None
+    entity_occurrence_id: str | None = None
 
 
 class _QwenResult(Protocol):
@@ -303,48 +405,104 @@ def _review_html(rows: Sequence[Qwen3ASRSegment]) -> str:
 
 @dataclass(frozen=True)
 class _Inputs:
-    diarization: DiarizationInventory
-    raw_segments: list[RawDiarizationSegment]
-    bound_by_key: dict[tuple[str, str], BoundDiarizationSegment]
+    readable_segments: list[_ReadableDiarizationSegment]
+
+
+def _index_by_key(
+    rows: Sequence[
+        _ReadableDiarizationSegment
+        | _RawSegmentProvenance
+        | _BoundSegmentProvenance
+    ],
+    *,
+    source_name: str,
+) -> dict[tuple[str, str], object]:
+    result: dict[tuple[str, str], object] = {}
+    for row in rows:
+        clip_uid = (
+            row.clip_uid
+            if isinstance(row, _ReadableDiarizationSegment)
+            else row.target_clip_uid
+        )
+        key = (clip_uid, row.segment_id)
+        if key in result:
+            raise ValueError(f"duplicate {source_name} DiariZen segment identity")
+        result[key] = row
+    return result
 
 
 def _load_inputs(diarization_root: Path) -> _Inputs:
     root = diarization_root.expanduser().resolve(strict=True)
-    inventory = DiarizationInventory.model_validate_json(
-        (root / "inventory.json").read_text(encoding="utf-8")
+    readable_summary = _ReadableDiarizationSummary.model_validate_json(
+        (root / "readable_summary.json").read_text(encoding="utf-8")
     )
+    readable = [
+        _ReadableDiarizationSegment.model_validate(row)
+        for row in _read_rows(root / "readable_segments.jsonl")
+    ]
     raw = [
-        RawDiarizationSegment.model_validate(row)
+        _RawSegmentProvenance.model_validate(row)
         for row in _read_rows(root / "raw_segments.jsonl")
     ]
     bound = [
-        BoundDiarizationSegment.model_validate(row)
+        _BoundSegmentProvenance.model_validate(row)
         for row in _read_rows(root / "bound_segments.jsonl")
     ]
-    bound_by_key = {(item.target_clip_uid, item.segment_id): item for item in bound}
-    if len(bound_by_key) != len(bound):
-        raise ValueError("duplicate bound DiariZen segment identity")
-    if set(bound_by_key) != {(item.target_clip_uid, item.segment_id) for item in raw}:
-        raise ValueError("raw and bound DiariZen segment inventories differ")
-    return _Inputs(inventory, raw, bound_by_key)
+    if readable_summary.segment_count != len(readable):
+        raise ValueError("readable DiariZen segment count differs from summary")
+    readable_by_key = _index_by_key(readable, source_name="readable")
+    raw_by_key = _index_by_key(raw, source_name="raw")
+    bound_by_key = _index_by_key(bound, source_name="bound")
+    if set(readable_by_key) != set(raw_by_key) or set(readable_by_key) != set(
+        bound_by_key
+    ):
+        raise ValueError("readable, raw, and bound DiariZen inventories differ")
+    for key, readable_item in readable_by_key.items():
+        if not isinstance(readable_item, _ReadableDiarizationSegment):
+            raise TypeError("invalid readable DiariZen provenance row")
+        raw_item = raw_by_key[key]
+        bound_item = bound_by_key[key]
+        if not isinstance(raw_item, _RawSegmentProvenance) or not isinstance(
+            bound_item, _BoundSegmentProvenance
+        ):
+            raise TypeError("invalid raw or bound DiariZen provenance row")
+        if (
+            readable_item.source_start_sample != raw_item.source_start_sample
+            or readable_item.source_end_sample != raw_item.source_end_sample
+            or readable_item.source_start_sample != bound_item.source_start_sample
+            or readable_item.source_end_sample != bound_item.source_end_sample
+            or readable_item.speaker_cluster_id != raw_item.speaker_cluster_id
+            or readable_item.speaker_cluster_id != bound_item.speaker_cluster_id
+            or readable_item.entity_id != bound_item.entity_id
+            or readable_item.entity_occurrence_id != bound_item.entity_occurrence_id
+            or readable_item.source_audio_path != raw_item.source_audio_path
+            or readable_item.source_sample_rate_hz != raw_item.source_sample_rate_hz
+            or readable_item.start_time != raw_item.start_time
+            or readable_item.end_time != raw_item.end_time
+            or readable_item.start_time != bound_item.start_time
+            or readable_item.end_time != bound_item.end_time
+        ):
+            raise ValueError("readable DiariZen provenance differs from raw or bound")
+        if not Path(readable_item.source_audio_path).is_file():
+            raise FileNotFoundError(
+                f"readable DiariZen source audio is missing: "
+                f"{readable_item.source_audio_path}"
+            )
+    return _Inputs(readable)
 
 
 def run_qwen3_asr(
     *,
-    visual_inventory: VisualProductionInventory,
     diarization_root: Path,
+    source_visual_production_root: str,
     output_root: Path,
     backend: Qwen3ASRBackend,
     audio_loader: AudioLoader = load_official_diarizen_waveform,
     overwrite: bool = False,
 ) -> Qwen3ASRSummary:
     inputs = _load_inputs(diarization_root)
-    identity_by_clip = {
-        item.identity.clip_uid: item.identity for item in visual_inventory.clips
-    }
-    target_by_clip = {item.target_clip_uid: item for item in inputs.diarization.targets}
-    if set(target_by_clip) - set(identity_by_clip):
-        raise ValueError("DiariZen target is absent from canonical Visual Production")
+    if not source_visual_production_root.strip():
+        raise ValueError("Qwen3 ASR Visual production provenance is empty")
     destination = output_root.expanduser().resolve(strict=False)
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Qwen3 ASR output already exists: {destination}")
@@ -354,21 +512,20 @@ def run_qwen3_asr(
     loaded_audio: dict[str, tuple[np.ndarray, int]] = {}
     try:
         temporary.mkdir()
-        for raw in inputs.raw_segments:
-            identity = identity_by_clip[raw.target_clip_uid]
-            bound = inputs.bound_by_key[(raw.target_clip_uid, raw.segment_id)]
-            target = target_by_clip[raw.target_clip_uid]
+        for readable in inputs.readable_segments:
             try:
-                if raw.target_clip_uid not in loaded_audio:
-                    loaded_audio[raw.target_clip_uid] = audio_loader(
-                        Path(target.source_audio_path)
+                if readable.clip_uid not in loaded_audio:
+                    loaded_audio[readable.clip_uid] = audio_loader(
+                        Path(readable.source_audio_path)
                     )
-                waveform, sample_rate = loaded_audio[raw.target_clip_uid]
-                if sample_rate != raw.source_sample_rate_hz:
+                waveform, sample_rate = loaded_audio[readable.clip_uid]
+                if sample_rate != readable.source_sample_rate_hz:
                     raise ValueError("Qwen3 source sample rate differs from DiariZen")
-                if raw.source_end_sample > waveform.shape[0]:
+                if readable.source_end_sample > waveform.shape[0]:
                     raise ValueError("Qwen3 segment exceeds DiariZen source waveform")
-                crop = waveform[raw.source_start_sample : raw.source_end_sample]
+                crop = waveform[
+                    readable.source_start_sample : readable.source_end_sample
+                ]
                 text, language = backend.transcribe(
                     waveform=crop,
                     sample_rate_hz=sample_rate,
@@ -389,17 +546,23 @@ def run_qwen3_asr(
                 failure_reason = f"{type(exc).__name__}:{exc}"
             rows.append(
                 Qwen3ASRSegment(
-                    **identity.model_dump(mode="python"),
-                    segment_id=raw.segment_id,
-                    speaker_cluster_id=raw.speaker_cluster_id,
-                    entity_id=bound.entity_id,
-                    entity_occurrence_id=bound.entity_occurrence_id,
-                    source_audio_path=raw.source_audio_path,
-                    source_start_sample=raw.source_start_sample,
-                    source_end_sample=raw.source_end_sample,
-                    source_sample_rate_hz=raw.source_sample_rate_hz,
-                    start_time=raw.start_time,
-                    end_time=raw.end_time,
+                    clip_uid=readable.clip_uid,
+                    clip_display_path=readable.clip_display_path,
+                    media_collection_relpath=readable.media_collection_relpath,
+                    media_collection_name=readable.media_collection_name,
+                    episode_name=readable.episode_name,
+                    clip_name=readable.clip_name,
+                    shard_id=readable.shard_id,
+                    segment_id=readable.segment_id,
+                    speaker_cluster_id=readable.speaker_cluster_id,
+                    entity_id=readable.entity_id,
+                    entity_occurrence_id=readable.entity_occurrence_id,
+                    source_audio_path=readable.source_audio_path,
+                    source_start_sample=readable.source_start_sample,
+                    source_end_sample=readable.source_end_sample,
+                    source_sample_rate_hz=readable.source_sample_rate_hz,
+                    start_time=readable.start_time,
+                    end_time=readable.end_time,
                     status=status,
                     text=published_text,
                     language=published_language,
@@ -426,7 +589,7 @@ def run_qwen3_asr(
             source_diarization_root=str(
                 Path(diarization_root).expanduser().resolve(strict=True)
             ),
-            source_visual_production_root=visual_inventory.visual_production_root,
+            source_visual_production_root=source_visual_production_root,
             segment_count=len(rows),
             clip_count=len({item.clip_uid for item in rows}),
             configuration=backend.configuration,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 
 import tools.run_h3_jea_production as jea_cli
+import tools.run_h3_qwen3_asr as qwen_cli
 from r2v_data_v2.h3.jea_audio_production import (
     JEAOccurrenceEmbedding,
     audio_binding_path,
@@ -1147,6 +1149,7 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         root.mkdir(parents=True)
         (root / "inventory.json").write_text("{}")
         (root / "bound_segments.jsonl").write_text("{}\n")
+        (root / "readable_segments.jsonl").write_text("{}\n")
         return _StageResult(segment_count=2)
 
     monkeypatch.setattr(jea_cli, "run_diarization_binding_pilot", diarization_stage)
@@ -1155,23 +1158,43 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         "publish_readable_diarization_metadata",
         lambda **_: _StageResult(segment_count=2),
     )
-    monkeypatch.setenv("QWEN3_ASR_ENV", str(tmp_path / "qwen"))
+    qwen_environment = tmp_path / "qwen"
+    qwen_python = qwen_environment / "bin/python"
+    qwen_python.parent.mkdir(parents=True)
+    qwen_python.write_text("fake python", encoding="utf-8")
+    monkeypatch.setenv("QWEN3_ASR_ENV", str(qwen_environment))
     monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path / "qwen-model"))
-    monkeypatch.setattr(jea_cli, "Qwen3ASRBackend", lambda _: object())
 
-    def asr_stage(**kwargs: object) -> _StageResult:
+    def asr_subprocess(command: list[str], **kwargs: object) -> SimpleNamespace:
         calls.append("qwen3-asr")
-        root = Path(kwargs["output_root"])
+        assert command[0] == str(qwen_python)
+        assert kwargs["env"]["QWEN3_ASR_MODEL_PATH"] == str(
+            tmp_path / "qwen-model"
+        )
+        root = output / "asr"
         root.mkdir(parents=True)
         (root / "segments.jsonl").write_text("{}\n")
-        return _StageResult(segment_count=2)
+        (root / "summary.json").write_text(
+            json.dumps(
+                {
+                    "segment_count": 2,
+                    "transcribed_count": 2,
+                    "empty_count": 0,
+                    "failed_count": 0,
+                    "clip_count": 2,
+                    "language_counts": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def h3_stage(**kwargs: object) -> _StageResult:
         calls.append("h3")
         Path(kwargs["output_root"]).mkdir(parents=True)
         return _StageResult(sample_count=2)
 
-    monkeypatch.setattr(jea_cli, "run_qwen3_asr", asr_stage)
+    monkeypatch.setattr(jea_cli.subprocess, "run", asr_subprocess)
     monkeypatch.setattr(jea_cli, "render_jea_final_samples", h3_stage)
     result = jea_cli.main(
         [
@@ -1197,6 +1220,194 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         "h3",
     ]
     assert list(result["stage_results"]) == calls
+
+
+def test_dedicated_qwen_cli_imports_without_visual_or_openai() -> None:
+    script = """
+import builtins
+original_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == 'openai' or name == 'r2v_data_v2.v3.subject_attributes':
+        raise AssertionError(f'forbidden isolated ASR import: {name}')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = guarded_import
+import tools.run_h3_qwen3_asr
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_dedicated_qwen_cli_uses_roots_only_as_lightweight_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    visual_root = tmp_path / "visual-production"
+    visual_runs_root = tmp_path / "visual-runs"
+    audio_root = tmp_path / "audio-production"
+    for path in (visual_root, visual_runs_root, audio_root / "diarization"):
+        path.mkdir(parents=True)
+    qwen_environment = tmp_path / "qwen-env"
+    monkeypatch.setenv("QWEN3_ASR_ENV", str(qwen_environment))
+    monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path / "qwen-model"))
+    configuration = Qwen3ASRConfiguration(local_model_path=str(tmp_path / "qwen-model"))
+    monkeypatch.setattr(qwen_cli, "Qwen3ASRBackend", lambda value: ("backend", value))
+    calls: list[dict[str, object]] = []
+
+    def run_stage(**kwargs: object) -> _StageResult:
+        calls.append(kwargs)
+        return _StageResult(segment_count=3)
+
+    monkeypatch.setattr(qwen_cli, "run_qwen3_asr", run_stage)
+    monkeypatch.setattr(
+        qwen_cli.Qwen3ASRConfiguration,
+        "from_environment",
+        lambda: configuration,
+    )
+    result = qwen_cli.main(
+        [
+            "--visual-production-root",
+            str(visual_root),
+            "--visual-runs-root",
+            str(visual_runs_root),
+            "--audio-production-root",
+            str(audio_root),
+        ]
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["diarization_root"] == audio_root / "diarization"
+    assert calls[0]["source_visual_production_root"] == str(visual_root.resolve())
+    assert calls[0]["backend"] == ("backend", configuration)
+    assert result["visual_runs_root"] == str(visual_runs_root.resolve())
+
+
+def _isolated_qwen_orchestrator_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[object, Path, Path]:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "clip-asr",
+                "shard_id": "shard-asr",
+                "clip_relative_path": "01/节目/第一季/片段.mp4",
+                "source_relative_path": "01/节目/第一季/第一集.mkv",
+            }
+        ],
+    )
+    output = tmp_path / "audio-production"
+    diarization = output / "diarization"
+    diarization.mkdir(parents=True)
+    (diarization / "readable_segments.jsonl").write_text("{}\n", encoding="utf-8")
+    qwen_environment = tmp_path / "qwen-env"
+    qwen_python = qwen_environment / "bin/python"
+    qwen_python.parent.mkdir(parents=True)
+    qwen_python.write_text("fake python", encoding="utf-8")
+    monkeypatch.setenv("QWEN3_ASR_ENV", str(qwen_environment))
+    monkeypatch.setenv("QWEN3_ASR_MODEL_PATH", str(tmp_path / "qwen-model"))
+    monkeypatch.setenv("QWEN3_ASR_DEVICE", "cuda:3")
+    monkeypatch.setenv("QWEN3_ASR_DTYPE", "bfloat16")
+    monkeypatch.setenv("QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE", "1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setattr(
+        jea_cli,
+        "load_visual_production_inventory",
+        lambda **_: inventory,
+    )
+    return inventory, output, qwen_python
+
+
+def test_jea_qwen_stage_launches_one_isolated_subprocess_and_reads_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory, output, qwen_python = _isolated_qwen_orchestrator_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run_child(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((command, kwargs))
+        asr = output / "asr"
+        asr.mkdir()
+        (asr / "summary.json").write_text(
+            json.dumps(
+                {
+                    "segment_count": 3,
+                    "transcribed_count": 2,
+                    "empty_count": 1,
+                    "failed_count": 0,
+                    "clip_count": 1,
+                    "language_counts": {"zh": 2},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(jea_cli.subprocess, "run", run_child)
+    result = jea_cli.main(
+        [
+            "--visual-production-root",
+            inventory.visual_production_root,
+            "--visual-runs-root",
+            inventory.visual_runs_root,
+            "--audio-production-root",
+            str(output),
+            "--stages",
+            "qwen3-asr",
+        ]
+    )
+
+    assert len(calls) == 1
+    command, options = calls[0]
+    assert command[0] == str(qwen_python)
+    assert command[1].endswith("tools/run_h3_qwen3_asr.py")
+    assert options["env"]["QWEN3_ASR_DEVICE"] == "cuda:3"
+    assert options["env"]["CUDA_VISIBLE_DEVICES"] == "3"
+    assert result["stage_results"]["qwen3-asr"]["segment_count"] == 3
+
+
+def test_jea_qwen_subprocess_failure_prevents_asr_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory, output, _qwen_python = _isolated_qwen_orchestrator_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    calls = 0
+
+    def fail_child(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(returncode=7, stdout="", stderr="model load failed")
+
+    monkeypatch.setattr(jea_cli.subprocess, "run", fail_child)
+    with pytest.raises(RuntimeError, match="model load failed"):
+        jea_cli.main(
+            [
+                "--visual-production-root",
+                inventory.visual_production_root,
+                "--visual-runs-root",
+                inventory.visual_runs_root,
+                "--audio-production-root",
+                str(output),
+                "--stages",
+                "qwen3-asr",
+            ]
+        )
+
+    assert calls == 1
+    assert not (output / "asr").exists()
 
 
 class _FakeQwenModel:
@@ -1377,6 +1588,181 @@ def test_qwen3_empty_and_failed_schemas_publish_no_confidence() -> None:
         assert payload["text"] is None
 
 
+def _write_readable_diarization_artifacts(
+    *,
+    diarization_root: Path,
+    inventory: object,
+    raw_segments: list[dict[str, object]],
+    bound_segments: list[dict[str, object]],
+) -> None:
+    identity_by_clip = {
+        item.identity.clip_uid: item.identity for item in inventory.clips
+    }
+    bound_by_key = {
+        (str(item["target_clip_uid"]), str(item["segment_id"])): item
+        for item in bound_segments
+    }
+    readable = []
+    for raw in raw_segments:
+        clip_uid = str(raw["target_clip_uid"])
+        bound = bound_by_key[(clip_uid, str(raw["segment_id"]))]
+        readable.append(
+            {
+                **identity_by_clip[clip_uid].model_dump(mode="json"),
+                "schema_version": "r2v.h3.jea_diarization_segment.1",
+                "segment_id": raw["segment_id"],
+                "speaker_cluster_id": raw["speaker_cluster_id"],
+                "entity_id": bound.get("entity_id"),
+                "entity_occurrence_id": bound.get("entity_occurrence_id"),
+                "source_audio_path": raw["source_audio_path"],
+                "source_start_sample": raw["source_start_sample"],
+                "source_end_sample": raw["source_end_sample"],
+                "source_sample_rate_hz": raw["source_sample_rate_hz"],
+                "start_time": raw["start_time"],
+                "end_time": raw["end_time"],
+                "raw_schema_version": "r2v.h3.diarization_segment.2",
+                "bound_schema_version": "r2v.h3.diarization_bound_segment.1",
+                "mapping_policy_version": "h3_diarizen_sparse_anchor_policy_v1",
+                "segmentation_changed": False,
+                "numeric_mapping_thresholds_changed": False,
+            }
+        )
+    _jsonl(diarization_root / "readable_segments.jsonl", readable)
+    (diarization_root / "readable_summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "r2v.h3.jea_diarization_summary.1",
+                "target_count": len(identity_by_clip),
+                "segment_count": len(readable),
+                "media_collection_count": len(
+                    {
+                        item.media_collection_relpath
+                        for item in identity_by_clip.values()
+                    }
+                ),
+                "segmentation_changed": False,
+                "numeric_mapping_thresholds_changed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _single_qwen_diarization_fixture(
+    tmp_path: Path,
+) -> tuple[object, Path, Path]:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "clip-readable",
+                "shard_id": "shard-readable",
+                "clip_relative_path": "01/节目 系列/第一季/片段 01.mp4",
+                "source_relative_path": "01/节目 系列/第一季/第一集.mkv",
+            }
+        ],
+    )
+    diarization = tmp_path / "diarization"
+    diarization.mkdir()
+    source_audio = tmp_path / "source.flac"
+    source_audio.write_bytes(b"source audio")
+    raw_segments = [
+        {
+            "target_clip_uid": "clip-readable",
+            "segment_id": "segment_0001",
+            "speaker_cluster_id": "speaker_1",
+            "start_time": 0.000125,
+            "end_time": 0.0003125,
+            "source_start_sample": 2,
+            "source_end_sample": 5,
+            "source_audio_path": str(source_audio),
+            "source_sample_rate_hz": 16000,
+        }
+    ]
+    bound_segments = [
+        {
+            "target_clip_uid": "clip-readable",
+            "segment_id": "segment_0001",
+            "speaker_cluster_id": "speaker_1",
+            "start_time": 0.000125,
+            "end_time": 0.0003125,
+            "source_start_sample": 2,
+            "source_end_sample": 5,
+            "entity_id": "entity_1",
+            "entity_occurrence_id": "clip-readable/entity_1",
+        }
+    ]
+    _jsonl(diarization / "raw_segments.jsonl", raw_segments)
+    _jsonl(diarization / "bound_segments.jsonl", bound_segments)
+    _write_readable_diarization_artifacts(
+        diarization_root=diarization,
+        inventory=inventory,
+        raw_segments=raw_segments,
+        bound_segments=bound_segments,
+    )
+    return inventory, diarization, source_audio
+
+
+def test_qwen3_consumes_readable_diarization_without_visual_inventory(
+    tmp_path: Path,
+) -> None:
+    inventory, diarization, source_audio = _single_qwen_diarization_fixture(tmp_path)
+    model = _FakeQwenModel()
+    backend = Qwen3ASRBackend(
+        Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+        model_factory=lambda *_args, **_kwargs: model,
+    )
+    loader_paths: list[Path] = []
+
+    def audio_loader(path: Path) -> tuple[np.ndarray, int]:
+        loader_paths.append(path)
+        return np.arange(10, dtype=np.float32), 16000
+
+    output = tmp_path / "asr"
+    summary = run_qwen3_asr(
+        diarization_root=diarization,
+        source_visual_production_root=inventory.visual_production_root,
+        output_root=output,
+        backend=backend,
+        audio_loader=audio_loader,
+    )
+
+    assert summary.segment_count == 1
+    assert loader_paths == [source_audio]
+    waveform, sample_rate = model.calls[0]["audio"]
+    np.testing.assert_array_equal(waveform, np.asarray([2, 3, 4], dtype=np.float32))
+    assert sample_rate == 16000
+    row = json.loads((output / "segments.jsonl").read_text(encoding="utf-8"))
+    assert row["clip_display_path"] == "01/节目 系列/第一季/片段 01"
+    assert row["media_collection_relpath"] == "01/节目 系列"
+    assert row["source_start_sample"] == 2
+    assert row["source_end_sample"] == 5
+    assert row["speaker_cluster_id"] == "speaker_1"
+    assert row["entity_id"] == "entity_1"
+    assert row["entity_occurrence_id"] == "clip-readable/entity_1"
+
+
+def test_qwen3_readable_raw_bound_mismatch_fails_closed(tmp_path: Path) -> None:
+    inventory, diarization, _source_audio = _single_qwen_diarization_fixture(tmp_path)
+    readable_path = diarization / "readable_segments.jsonl"
+    readable = json.loads(readable_path.read_text(encoding="utf-8"))
+    readable["source_end_sample"] = 6
+    readable_path.write_text(json.dumps(readable) + "\n", encoding="utf-8")
+    backend = Qwen3ASRBackend(
+        Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+        model_factory=lambda *_args, **_kwargs: _FakeQwenModel(),
+    )
+
+    with pytest.raises(ValueError, match="differs from raw or bound"):
+        run_qwen3_asr(
+            diarization_root=diarization,
+            source_visual_production_root=inventory.visual_production_root,
+            output_root=tmp_path / "asr",
+            backend=backend,
+            audio_loader=lambda _path: (np.ones(10, dtype=np.float32), 16000),
+        )
+
+
 def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
     tmp_path: Path,
 ) -> None:
@@ -1394,6 +1780,7 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
     diarization = tmp_path / "diarization"
     diarization.mkdir()
     source_audio = tmp_path / "source.flac"
+    source_audio.write_bytes(b"source audio")
     inventory_payload = {
         "mode": "production",
         "source_pairs_path": str(tmp_path / "pairs.jsonl"),
@@ -1473,6 +1860,12 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
         )
     _jsonl(diarization / "raw_segments.jsonl", raw_segments)
     _jsonl(diarization / "bound_segments.jsonl", bound_segments)
+    _write_readable_diarization_artifacts(
+        diarization_root=diarization,
+        inventory=inventory,
+        raw_segments=raw_segments,
+        bound_segments=bound_segments,
+    )
 
     backend = Qwen3ASRBackend(
         Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
@@ -1491,8 +1884,8 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
         match="Qwen3 ASR failed for every diarization segment",
     ):
         run_qwen3_asr(
-            visual_inventory=inventory,
             diarization_root=diarization,
+            source_visual_production_root=inventory.visual_production_root,
             output_root=output,
             backend=backend,
             audio_loader=failed_loader,

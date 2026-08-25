@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,9 +35,7 @@ from r2v_data_v2.h3.lr_asd import (
 )
 from r2v_data_v2.h3.qwen3_asr import (
     QWEN3_ASR_MODEL_IDENTIFIER,
-    Qwen3ASRBackend,
-    Qwen3ASRConfiguration,
-    run_qwen3_asr,
+    Qwen3ASRSummary,
 )
 from r2v_data_v2.h3.review import ExternalReviewMediaBackend
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
@@ -116,6 +115,51 @@ def _require_stage_artifact(stage: str, prerequisite: str, path: Path) -> Path:
         raise ValueError(
             f"JEA stage {stage} requires completed {prerequisite}: {path}"
         ) from exc
+
+
+def _run_isolated_qwen3_asr(
+    *,
+    visual_production_root: str,
+    visual_runs_root: str,
+    audio_production_root: Path,
+    overwrite: bool,
+) -> Qwen3ASRSummary:
+    environment_root = os.environ.get("QWEN3_ASR_ENV")
+    if not environment_root:
+        raise ValueError("QWEN3_ASR_ENV is required for the active Qwen3 stage")
+    python = Path(environment_root).expanduser() / "bin" / "python"
+    if not python.is_file():
+        raise ValueError(f"QWEN3_ASR_ENV Python is missing: {python}")
+    command = [
+        str(python),
+        str(REPOSITORY_ROOT / "tools" / "run_h3_qwen3_asr.py"),
+        "--visual-production-root",
+        visual_production_root,
+        "--visual-runs-root",
+        visual_runs_root,
+        "--audio-production-root",
+        str(audio_production_root),
+    ]
+    if overwrite:
+        command.append("--overwrite")
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise RuntimeError(
+            f"isolated Qwen3 ASR subprocess failed ({result.returncode}): "
+            f"{diagnostic}"
+        )
+    return Qwen3ASRSummary.model_validate_json(
+        (audio_production_root / "asr" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
 
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
@@ -263,16 +307,14 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         }
     if "qwen3-asr" in stages:
         _require_stage_artifact(
-            "qwen3-asr", "diarization", paths.diarization / "inventory.json"
+            "qwen3-asr",
+            "diarization",
+            paths.diarization / "readable_segments.jsonl",
         )
-        if not os.environ.get("QWEN3_ASR_ENV"):
-            raise ValueError("QWEN3_ASR_ENV is required for the active Qwen3 stage")
-        configuration = Qwen3ASRConfiguration.from_environment()
-        stage_results["qwen3-asr"] = run_qwen3_asr(
-            visual_inventory=visual,
-            diarization_root=paths.diarization,
-            output_root=paths.asr,
-            backend=Qwen3ASRBackend(configuration),
+        stage_results["qwen3-asr"] = _run_isolated_qwen3_asr(
+            visual_production_root=visual.visual_production_root,
+            visual_runs_root=visual.visual_runs_root,
+            audio_production_root=paths.root,
             overwrite=arguments.overwrite,
         ).model_dump(mode="json")
     if "h3" in stages:

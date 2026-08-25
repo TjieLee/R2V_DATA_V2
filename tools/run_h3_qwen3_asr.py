@@ -17,9 +17,6 @@ from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRConfiguration,
     run_qwen3_asr,
 )
-from r2v_data_v2.h3.visual_production_source import (
-    load_visual_production_inventory,
-)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -39,20 +36,20 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     if not environment:
         raise ValueError("QWEN3_ASR_ENV must identify the isolated qwen-asr==0.0.6 env")
     configuration = Qwen3ASRConfiguration.from_environment()
-    visual = load_visual_production_inventory(
-        visual_production_root=arguments.visual_production_root,
-        visual_runs_root=arguments.visual_runs_root,
-    )
+    visual_root = arguments.visual_production_root.expanduser().resolve(strict=True)
+    visual_runs_root = arguments.visual_runs_root.expanduser().resolve(strict=True)
     audio_root = arguments.audio_production_root.expanduser().resolve(strict=True)
     summary = run_qwen3_asr(
-        visual_inventory=visual,
         diarization_root=audio_root / "diarization",
+        source_visual_production_root=str(visual_root),
         output_root=audio_root / "asr",
         backend=Qwen3ASRBackend(configuration),
         overwrite=arguments.overwrite,
     )
     result = {
         "audio_production_root": str(audio_root),
+        "visual_production_root": str(visual_root),
+        "visual_runs_root": str(visual_runs_root),
         "asr_output_root": str(audio_root / "asr"),
         "selected_asr_model": QWEN3_ASR_MODEL_IDENTIFIER,
         "qwen3_asr_env": environment,
