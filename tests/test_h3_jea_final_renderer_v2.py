@@ -581,9 +581,28 @@ def test_final_visual_reference_rejects_relative_or_missing_artifact_path(
         )
 
 
+def test_resolved_path_contract_requires_new_final_sample_schema(
+    tmp_path: Path,
+) -> None:
+    sample = _final_sample(tmp_path, [_voice(1)])
+    payload = sample.model_dump(mode="json")
+
+    assert sample.schema_version == "r2v.h3.final_sample.3"
+    without_artifact = json.loads(json.dumps(payload))
+    without_artifact["visual_references"][0].pop("image_artifact_path")
+    with pytest.raises(ValueError, match="image_artifact_path"):
+        FinalH3SampleV2.model_validate(without_artifact)
+
+    old_version = json.loads(json.dumps(payload))
+    old_version["schema_version"] = "r2v.h3.final_sample.2"
+    with pytest.raises(ValueError, match="r2v.h3.final_sample.3"):
+        FinalH3SampleV2.model_validate(old_version)
+
+
 def test_final_sample_allows_partial_subject_voice_coverage(tmp_path: Path) -> None:
     sample = _final_sample(tmp_path, [_voice(1)])
 
+    assert sample.schema_version == "r2v.h3.final_sample.3"
     assert [item.entity_id for item in sample.visual_references] == [
         "entity_1",
         "entity_2",
@@ -625,6 +644,10 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     tmp_path: Path,
 ) -> None:
     rows = _render(tmp_path)
+    assert {row["schema_version"] for row in rows} == {"r2v.h3.final_sample.3"}
+    summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
+    assert summary["schema_version"] == "r2v.h3.final_summary.3"
+    assert summary["final_sample_schema_version"] == "r2v.h3.final_sample.3"
     first = next(row for row in rows if row["sample_id"] == "clip-a/in_pair")
     assert first["r2v_instruction"] == "canonical clip-a: Image 1 and Image 2"
     assert [item["kind"] for item in first["visual_references"]] == [

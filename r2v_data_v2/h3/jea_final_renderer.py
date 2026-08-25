@@ -20,7 +20,8 @@ from r2v_data_v2.h3.visual_production_source import (
 )
 from r2v_data_v2.v3.production_export import ProductionReference
 
-FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.2"
+FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.3"
+FINAL_SUMMARY_VERSION = "r2v.h3.final_summary.3"
 
 
 class FinalVisualReference(ProductionReference):
@@ -87,7 +88,7 @@ class FinalQwen3SpeechSegment(SchemaModel):
 
 
 class FinalH3SampleV2(SchemaModel):
-    schema_version: Literal["r2v.h3.final_sample.2"] = FINAL_SAMPLE_VERSION
+    schema_version: Literal["r2v.h3.final_sample.3"] = FINAL_SAMPLE_VERSION
     sample_id: str
     pair_id: str
     pair_type: Literal["in_pair", "cross_pair"]
@@ -136,7 +137,10 @@ class FinalH3SampleV2(SchemaModel):
 
 
 class FinalH3SummaryV2(SchemaModel):
-    schema_version: Literal["r2v.h3.final_summary.2"] = "r2v.h3.final_summary.2"
+    schema_version: Literal["r2v.h3.final_summary.3"] = FINAL_SUMMARY_VERSION
+    final_sample_schema_version: Literal[
+        "r2v.h3.final_sample.3"
+    ] = FINAL_SAMPLE_VERSION
     canonical_clip_count: int = Field(ge=0)
     in_pair_sample_count: int = Field(ge=0)
     cross_pair_sample_count: int = Field(ge=0)

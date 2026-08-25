@@ -90,7 +90,10 @@ Pair rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
 `episode_name`, `clip_name`, and `shard_id`. Pair review pages sort readable
 paths first.
 
-Final H3 samples publish media paths with explicit ownership semantics:
+The active resolved-path output contracts are `r2v.h3.final_sample.3` and
+`r2v.h3.final_summary.3`; the summary declares
+`final_sample_schema_version=r2v.h3.final_sample.3`. Final H3 samples publish
+media paths with explicit ownership semantics:
 
 - `target_video` is the directly readable processed target-video path.
 - `target_full_audio_path` is the directly readable canonical full-audio path.
