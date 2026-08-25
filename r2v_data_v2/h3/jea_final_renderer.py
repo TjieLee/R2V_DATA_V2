@@ -18,24 +18,12 @@ from r2v_data_v2.h3.visual_production_source import (
     NormalizedVisualReference,
     VisualProductionInventory,
 )
+from r2v_data_v2.v3.production_export import ProductionReference
 
 FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.2"
 
 
-class FinalVisualReference(SchemaModel):
-    image_id: str
-    image_index: int = Field(gt=0)
-    kind: Literal["subject", "object", "group", "background", "attribute"]
-    image_path: str
-    entity_id: str | None = None
-    attribute_id: str | None = None
-    owner_entity_id: str | None = None
-    attribute_type: str | None = None
-    source_frame_index: int = Field(ge=0)
-    scope: str | None = None
-    visible_region: dict[str, object] | None = None
-    synthetic: bool
-
+class FinalVisualReference(ProductionReference):
     @classmethod
     def from_visual(cls, value: NormalizedVisualReference) -> FinalVisualReference:
         return cls.model_validate(

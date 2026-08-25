@@ -8,7 +8,10 @@ from r2v_data_v2.h3.jea_audio_production import (
     JEAOccurrenceEmbedding,
     build_jea_pairs,
 )
-from r2v_data_v2.h3.jea_final_renderer import render_jea_final_samples
+from r2v_data_v2.h3.jea_final_renderer import (
+    FinalVisualReference,
+    render_jea_final_samples,
+)
 from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRConfiguration,
     Qwen3ASRSegment,
@@ -36,7 +39,14 @@ def _identity(clip_uid: str, clip_name: str) -> ReadableClipIdentity:
     )
 
 
-def _visual_clip(tmp_path: Path, clip_uid: str, clip_name: str) -> VisualProductionClip:
+def _visual_clip(
+    tmp_path: Path,
+    clip_uid: str,
+    clip_name: str,
+    *,
+    subject_scope: str = "full",
+    subject_visible_region: str | None = None,
+) -> VisualProductionClip:
     identity = _identity(clip_uid, clip_name)
     target = tmp_path / f"{clip_uid}.mp4"
     target.write_bytes(b"processed")
@@ -59,7 +69,8 @@ def _visual_clip(tmp_path: Path, clip_uid: str, clip_name: str) -> VisualProduct
                     "entity_id": "entity_1",
                     "image_path": subject.name,
                     "source_frame_index": 0,
-                    "scope": "full",
+                    "scope": subject_scope,
+                    "visible_region": subject_visible_region,
                     "synthetic": False,
                 },
                 {
@@ -123,8 +134,19 @@ def _visual_clip(tmp_path: Path, clip_uid: str, clip_name: str) -> VisualProduct
 
 def _visual_inventory(tmp_path: Path) -> VisualProductionInventory:
     clips = [
-        _visual_clip(tmp_path, "clip-a", "episode_a_0001"),
-        _visual_clip(tmp_path, "clip-b", "episode_b_0002"),
+        _visual_clip(
+            tmp_path,
+            "clip-a",
+            "episode_a_0001",
+            subject_scope="local",
+            subject_visible_region="upper_body",
+        ),
+        _visual_clip(
+            tmp_path,
+            "clip-b",
+            "episode_b_0002",
+            subject_visible_region="whole",
+        ),
     ]
     return VisualProductionInventory(
         visual_production_root=str(tmp_path),
@@ -239,6 +261,80 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
     ]
 
 
+def test_final_visual_reference_preserves_canonical_visible_region_values(
+    tmp_path: Path,
+) -> None:
+    local = FinalVisualReference.from_visual(
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="subject",
+            image_path="references/local.png",
+            entity_id="entity_1",
+            source_frame_index=1,
+            scope="local",
+            visible_region="upper_body",
+            synthetic=False,
+            artifact_path=str(tmp_path / "local.png"),
+        )
+    )
+    full = FinalVisualReference.from_visual(
+        NormalizedVisualReference(
+            image_id="image_2",
+            image_index=2,
+            kind="object",
+            image_path="references/full.png",
+            entity_id="entity_2",
+            source_frame_index=2,
+            scope="full",
+            visible_region="whole",
+            synthetic=False,
+            artifact_path=str(tmp_path / "full.png"),
+        )
+    )
+
+    assert local.visible_region == "upper_body"
+    assert isinstance(local.visible_region, str)
+    assert full.visible_region == "whole"
+
+
+def test_final_visual_reference_keeps_nullable_background_and_attribute_region(
+    tmp_path: Path,
+) -> None:
+    background = FinalVisualReference.from_visual(
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="background",
+            image_path="references/background.png",
+            source_frame_index=1,
+            scope="scene",
+            visible_region=None,
+            synthetic=False,
+            artifact_path=str(tmp_path / "background.png"),
+        )
+    )
+    attribute = FinalVisualReference.from_visual(
+        NormalizedVisualReference(
+            image_id="image_2",
+            image_index=2,
+            kind="attribute",
+            image_path="references/hair.png",
+            attribute_id="attribute_hair",
+            owner_entity_id="entity_1",
+            attribute_type="hair",
+            source_frame_index=2,
+            scope=None,
+            visible_region=None,
+            synthetic=False,
+            artifact_path=str(tmp_path / "hair.png"),
+        )
+    )
+
+    assert background.visible_region is None
+    assert attribute.visible_region is None
+
+
 def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     tmp_path: Path,
 ) -> None:
@@ -251,6 +347,12 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     ]
     assert first["visual_references"][1]["attribute_id"] == "attribute_hair"
     assert first["visual_references"][1]["owner_entity_id"] == "entity_1"
+    assert first["visual_references"][0]["scope"] == "local"
+    assert first["visual_references"][0]["visible_region"] == "upper_body"
+    assert not isinstance(first["visual_references"][0]["visible_region"], dict)
+    second = next(row for row in rows if row["sample_id"] == "clip-b/in_pair")
+    assert second["visual_references"][0]["scope"] == "full"
+    assert second["visual_references"][0]["visible_region"] == "whole"
     assert len(first["subject_voices"]) == 1
 
 
