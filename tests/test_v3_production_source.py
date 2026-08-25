@@ -1322,6 +1322,7 @@ def _accepted_attribute(
             recognizable=True,
             characteristic_appearance_visible=True,
             usable_as_attribute_condition=True,
+            sufficient_source_evidence=True,
             structure_complete=not completed,
             completion_recommended=completed,
             reason=("repair recommended" if completed else "accepted"),

@@ -1808,7 +1808,11 @@ def test_source_bbox_fallback_updates_reference_edit_provenance_atomically(
     ClipRecord.model_validate(updated.model_dump(mode="json"))
 
 
-def _write_completion_reference_edit_state(storage: RunStorage) -> None:
+def _write_completion_reference_edit_state(
+    storage: RunStorage,
+    *,
+    default_reason: str = "completion_review_accepted",
+) -> None:
     clip = storage.read_clip("clip-1")
     first = clip.references.entities[0]
     completed = clip.references.entities[1]
@@ -1876,7 +1880,7 @@ def _write_completion_reference_edit_state(storage: RunStorage) -> None:
                 variants=variants,
                 default_variant="accepted_base",
                 default_image_path=completed.image_path,
-                default_reason="completion_review_accepted",
+                default_reason=default_reason,
                 accepted_base_image_path=completed.image_path,
                 output_image_path=completed.image_path,
                 operation="complete_entity",
@@ -1929,6 +1933,44 @@ def test_completion_integrity_reject_reviews_alpha_before_any_bbox(
     assert final_reference.image_path == final_edit.source_image_path
     assert final_edit.default_variant == "alpha"
     assert final_edit.fallback_policy == "keep_source"
+    assert final_edit.reason == "completion_integrity_rejected_fallback_to_alpha"
+
+
+def test_candidate2_completion_integrity_reject_still_reviews_canonical_alpha_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = _storage_with_ready_pair(
+        tmp_path,
+        monkeypatch,
+        second_scope="full",
+        second_synthetic=True,
+    )
+    _write_completion_reference_edit_state(
+        storage,
+        default_reason="completion_candidate_2_review_accepted",
+    )
+    judge = FakeIntegrityJudge(
+        [_severe_reference_artifact_review(), _review(accept=True)]
+    )
+    bbox_judge = FakeSourceBboxFallbackJudge([])
+
+    stats = reference_integrity_clips(
+        storage.config,
+        storage,
+        judge=judge,
+        bbox_fallback_judge=bbox_judge,
+    )
+
+    updated = storage.read_clip("clip-1")
+    assert [call["synthetic"] for call in judge.calls] == [True, False]
+    assert bbox_judge.calls == []
+    assert stats.source_bbox_fallback_attempted == 0
+    final_reference = updated.references.entities[1]
+    final_edit = updated.reference_edit.entities[1]
+    assert final_reference.synthetic is False
+    assert final_reference.image_path == final_edit.source_image_path
+    assert final_edit.default_variant == "alpha"
     assert final_edit.reason == "completion_integrity_rejected_fallback_to_alpha"
 
 

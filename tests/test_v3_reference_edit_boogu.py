@@ -54,7 +54,7 @@ def _completion_review(*, accept: bool = True) -> BooguCompletionReview:
         "identity_preserved": accept,
         "original_visible_attributes_preserved": accept,
         "exactly_one_entity": accept,
-        "missing_parts_plausibly_completed": accept,
+        "candidate_better_than_source": accept,
         "no_duplicate_entity": accept,
         "no_unrelated_entity": accept,
         "no_severe_structure_artifact": accept,
@@ -544,6 +544,9 @@ def test_completion_source_relative_geometry_is_diagnostic_not_hard_reject(
 
 def test_completion_review_prompt_allows_spatial_change_but_rejects_distortion() -> None:
     prompt = " ".join(boogu_module._COMPLETION_REVIEW_PROMPT.split())
+    assert "A modest real improvement" in prompt
+    assert "equivalent, keep the source" in prompt
+    assert "Image 2 is alternate source evidence for Image 3" in prompt
     assert "Reasonable spatial changes are allowed" in prompt
     assert "recentered" in prompt
     assert "conditioning reference" in prompt
@@ -551,6 +554,20 @@ def test_completion_review_prompt_allows_spatial_change_but_rejects_distortion()
     assert "stretched or compressed body proportions" in prompt
     assert "warped anatomy" in prompt
     assert "distorted object proportions" in prompt
+    assert "significantly" not in prompt.lower()
+    assert "materially" not in prompt.lower()
+    assert "substantially better" not in prompt.lower()
+
+
+def test_legacy_completion_review_maps_old_improvement_flag() -> None:
+    payload = _completion_review().model_dump(mode="json")
+    payload["missing_parts_plausibly_completed"] = payload.pop(
+        "candidate_better_than_source"
+    )
+
+    review = BooguCompletionReview.model_validate(payload)
+
+    assert review.candidate_better_than_source is True
 
 
 def test_small_composition_change_passes_geometry_gate(tmp_path: Path) -> None:
@@ -1589,10 +1606,44 @@ def test_production_qwen_boogu_reviewer_uses_structured_two_image_review() -> No
     assert not any("mask" in str(item).lower() for item in user_content)
 
 
+def test_attempt2_qwen_review_uses_canonical_alternate_and_candidate_images() -> None:
+    completions = _ReviewCompletions(_completion_review().model_dump(mode="json"))
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+    review = judge.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (12, 10), (1, 2, 3, 255)),
+        source_input_rgb=Image.new("RGB", (12, 10), (11, 12, 13)),
+        comparison_source_rgb=Image.new("RGB", (12, 10), (21, 22, 23)),
+        candidate_rgb=Image.new("RGB", (32, 32), (31, 32, 33)),
+        entity_phrase="a person in a blue coat",
+        reference_type="subject",
+    )
+
+    assert review.verdict == "accept"
+    user_content = completions.calls[0]["messages"][1]["content"]
+    labels = [
+        item["text"] for item in user_content if item.get("type") == "text"
+    ]
+    assert sum(item["type"] == "image_url" for item in user_content) == 3
+    assert labels[-3:] == [
+        "Image 1: canonical source reference",
+        "Image 2: alternate source evidence only",
+        "Image 3: generated candidate",
+    ]
+
+
 @pytest.mark.parametrize(
     ("operation", "false_flag"),
     [
         ("complete_entity", "no_severe_structure_artifact"),
+        ("complete_entity", "candidate_better_than_source"),
         ("add_entity_background", "no_halo_or_seam"),
     ],
 )

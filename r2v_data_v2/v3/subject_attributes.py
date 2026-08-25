@@ -157,6 +157,7 @@ class SubjectAttributeReview(_SchemaModel):
     recognizable: StrictBool
     characteristic_appearance_visible: StrictBool
     usable_as_attribute_condition: StrictBool
+    sufficient_source_evidence: StrictBool
     structure_complete: StrictBool
     completion_recommended: StrictBool
     reason: str
@@ -170,6 +171,7 @@ class SubjectAttributeReview(_SchemaModel):
                 self.recognizable,
                 self.characteristic_appearance_visible,
                 self.usable_as_attribute_condition,
+                self.sufficient_source_evidence,
             )
         )
 
@@ -206,13 +208,12 @@ class SubjectAttributeCompletionReview(_SchemaModel):
 
     same_physical_attribute: StrictBool
     original_visible_details_preserved: StrictBool
-    materially_more_complete: StrictBool
     no_wrong_new_instance: StrictBool
     no_duplicate_component: StrictBool
     no_unrelated_content: StrictBool
     no_structural_distortion: StrictBool
     target_clear_and_prominent: StrictBool
-    candidate_preferred_over_alpha: StrictBool
+    candidate_better_than_alpha: StrictBool
     certain: StrictBool
     reason: str
     verdict: Literal["accept", "reject"]
@@ -220,8 +221,25 @@ class SubjectAttributeCompletionReview(_SchemaModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_review(cls, value: object) -> object:
-        if not isinstance(value, dict) or "same_physical_attribute" in value:
+        if not isinstance(value, dict):
             return value
+        if "same_physical_attribute" in value:
+            if "candidate_better_than_alpha" in value:
+                return value
+            legacy_better = value.get("candidate_preferred_over_alpha")
+            if not isinstance(legacy_better, bool):
+                legacy_better = value.get("materially_more_complete")
+            if not isinstance(legacy_better, bool):
+                return value
+            return {
+                key: item
+                for key, item in {
+                    **value,
+                    "candidate_better_than_alpha": legacy_better,
+                }.items()
+                if key
+                not in {"materially_more_complete", "candidate_preferred_over_alpha"}
+            }
         legacy_flags = {
             "same_physical_entity",
             "identity_preserved",
@@ -247,9 +265,6 @@ class SubjectAttributeCompletionReview(_SchemaModel):
                     value["style_coherent"],
                 )
             ),
-            "materially_more_complete": value[
-                "missing_parts_plausibly_completed"
-            ],
             "no_wrong_new_instance": all(
                 (
                     value["same_physical_entity"],
@@ -265,7 +280,9 @@ class SubjectAttributeCompletionReview(_SchemaModel):
             "target_clear_and_prominent": all(
                 (value["resolution_usable"], value["reference_usable"])
             ),
-            "candidate_preferred_over_alpha": value.get("verdict") == "accept",
+            "candidate_better_than_alpha": value[
+                "missing_parts_plausibly_completed"
+            ],
             "certain": value["certain"],
             "reason": value.get("reason"),
             "verdict": value.get("verdict"),
@@ -495,7 +512,16 @@ class SubjectAttributeRecord(_SchemaModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_disabled_attribute_background(cls, value: object) -> object:
-        return _normalize_attribute_background_policy_payload(value)
+        normalized = _normalize_attribute_background_policy_payload(value)
+        if not isinstance(normalized, dict):
+            return normalized
+        review = normalized.get("review")
+        if not isinstance(review, dict) or "sufficient_source_evidence" in review:
+            return normalized
+        return {
+            **normalized,
+            "review": {**review, "sufficient_source_evidence": True},
+        }
 
     @model_validator(mode="after")
     def validate_record(self) -> SubjectAttributeRecord:
@@ -1210,6 +1236,30 @@ class ClipEnrichmentResult:
             "completion_model_call_time_seconds": (
                 self.totals.completion_model_call_time_seconds
             ),
+            "attribute_source_candidates_considered": (
+                self.totals.attribute_source_candidates_considered
+            ),
+            "attribute_second_candidate_attempts": (
+                self.totals.attribute_second_candidate_attempts
+            ),
+            "attribute_completion_candidate1_accepted": (
+                self.totals.attribute_completion_candidate1_accepted
+            ),
+            "attribute_completion_candidate2_accepted": (
+                self.totals.attribute_completion_candidate2_accepted
+            ),
+            "attribute_bbox_fallback_attempts": (
+                self.totals.attribute_bbox_fallback_attempts
+            ),
+            "attribute_bbox_fallback_accepted": (
+                self.totals.attribute_bbox_fallback_accepted
+            ),
+            "attribute_background_variants_attempted": (
+                self.totals.attribute_background_variants_attempted
+            ),
+            "attribute_background_variants_accepted": (
+                self.totals.attribute_background_variants_accepted
+            ),
         }
 
 
@@ -1275,6 +1325,7 @@ class AttributeCompletionJudge(Protocol):
         self,
         *,
         source_attribute: Image.Image,
+        source_bbox: Image.Image,
         generated_candidate: Image.Image,
         attribute_type: str,
         attribute_phrase: str,
@@ -1471,6 +1522,14 @@ matches_attribute when substantial unrelated body regions, another garment, or
 a general owner or body silhouette is present, even if the target component is
 also visible. owner_binding_correct means the component belongs to the intended
 person.
+sufficient_source_evidence=true only when the isolated alpha crop retains
+enough real visual evidence to constrain the attribute's identity, appearance,
+or structure. It does not require whole-object completeness. Set it false for
+a tiny fragment, isolated edge, a few colors, a blurry patch, disconnected weak
+pieces, or content whose meaning can be guessed only from owner context, bbox,
+attribute type, or text. A visibly incomplete garment may still be true when
+its real material, color, pattern, shape cues, and component structure provide
+meaningful evidence for a conservative completion.
 recognizable requires sufficient component structure, not merely a guessable
 category. Hair needs a coherent hairstyle region or silhouette; reject fringe,
 arcs, isolated strands, or contour-only regions. Face needs enough facial
@@ -1515,43 +1574,38 @@ reviews. reviews must be a JSON array preserving the supplied attribute order.
 Every review array item must contain exactly attribute_id,
 matches_attribute, owner_binding_correct, recognizable,
 characteristic_appearance_visible, usable_as_attribute_condition,
-structure_complete, completion_recommended, and one concise reason. Copy each
+sufficient_source_evidence, structure_complete, completion_recommended, and one
+concise reason. Copy each
 supplied attribute_id into its review item. Do not
 return an object keyed by a1, a2, a3, or any other attribute_id. The required
 shape is {"owner_entity_id":"e1","reviews":[{"attribute_id":"a1",
 "matches_attribute":true,"owner_binding_correct":true,"recognizable":true,
 "characteristic_appearance_visible":true,
-"usable_as_attribute_condition":true,"structure_complete":true,
+"usable_as_attribute_condition":true,"sufficient_source_evidence":true,
+"structure_complete":true,
 "completion_recommended":false,"reason":"..."}]}. Return JSON only."""
 
 
-ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT = """You are comparing an isolated
-source attribute reference with a Boogu completion candidate.
+ATTRIBUTE_COMPLETION_REVIEW_SYSTEM_PROMPT = """You compare an isolated source
+attribute with a generated completion. Image 1 is the original alpha crop,
+Image 2 is an RGB source bbox used only as physical-instance and identity
+evidence, and Image 3 is the generated candidate.
 
-Image 1 is the original isolated alpha/raw attribute. Image 2 is the generated
-completion. Choose Image 2 only when it provides a material and useful
-structural completeness improvement over Image 1 while preserving the same
-physical attribute and all visible identity-bearing appearance. Preserve the
-source attribute's visible color, material, texture, pattern, identity, shape
-cues, and distinctive details.
+Choose Image 3 only if it is a better conditioning reference than Image 1 while
+remaining the same physical attribute shown by Image 2. A modest real gain in
+completeness, coherence, clarity, or reference usability is enough. If Image 3
+is equivalent to Image 1, keep Image 1. Preserve visible color, material,
+texture, pattern, shape cues, and distinctive details. For a face, Image 3 must
+depict the same person as Image 2. For headwear, accessories, clothing, and
+dresses or skirts, Image 3 must remain the same physical item or component.
 
-Reject Image 2 when it changes the physical attribute identity or important
-visible color, material, texture, or pattern details; invents a wrong new
-instance; duplicates the attribute or a component; adds unrelated content;
-introduces malformed, stretched, compressed, warped, duplicated, or otherwise
-structurally implausible parts; or merely redraws an already sufficient source
-without a meaningful completeness improvement. For a face, preserve the same
-person's identity and visible facial features; reject a different person,
-duplicate face, or malformed anatomy.
+Reject a wrong new instance, identity or appearance drift, a duplicate
+attribute or component, unrelated content, malformed or structurally distorted
+parts, a target that is too small or pushed into an extreme corner or edge, or
+loss of visual prominence. Image 2 is identity evidence only. Do not require
+Image 3 to match Image 2's position, scale, crop, or composition. Reasonable
+translation, recentering, moderate scale change, and layout change are allowed.
 
-Reasonable spatial changes are allowed. Do not reject Image 2 merely because
-the attribute moved, was recentered, changed size moderately, or has a somewhat
-different crop or layout. This is a conditioning reference, not a source-layout
-reconstruction. Reject spatial changes only if the target becomes too small,
-is pushed into an extreme corner or edge, loses visual prominence, becomes
-severely cropped, or otherwise loses reference value.
-
-Prefer Image 1 whenever Image 2 does not provide a clear and safe improvement.
 Judge visible facts only and fail closed when uncertain. Return one strict JSON
 object matching the supplied schema and no other text."""
 
@@ -1567,7 +1621,9 @@ minimal conditioning information. Reject when the bbox contains substantial
 owner identity, a large face or body, strong pose information, other major
 garments, another person, or scene content that could create a strong
 copy-paste shortcut. The bbox must primarily teach the requested attribute, not
-the original frame. Fail closed when uncertain.
+the original frame. Reject a tiny, blurry, or semantically weak attribute
+region even when surrounding owner context or text makes its category
+guessable. Fail closed when uncertain.
 
 Return exactly the strict JSON schema with reason before verdict and no extra
 fields."""
@@ -2017,6 +2073,7 @@ class QwenSubjectAttributeCompletionJudge(QwenBooguReferenceEditJudge):
         self,
         *,
         source_attribute: Image.Image,
+        source_bbox: Image.Image,
         generated_candidate: Image.Image,
         attribute_type: str,
         attribute_phrase: str,
@@ -2032,7 +2089,8 @@ class QwenSubjectAttributeCompletionJudge(QwenBooguReferenceEditJudge):
         ]
         for label, image in (
             ("Image 1: isolated raw/source attribute crop", source_attribute),
-            ("Image 2: generated completion candidate", generated_candidate),
+            ("Image 2: source RGB bbox identity evidence only", source_bbox),
+            ("Image 3: generated completion candidate", generated_candidate),
         ):
             content.extend(
                 (
@@ -2636,6 +2694,7 @@ def _attempt_attribute_completion(
     completion_judge: AttributeCompletionJudge,
     metrics: _CompletionSelectionMetrics,
     raw_usable: bool,
+    crop_padding_ratio: float = 0.08,
 ) -> tuple[
     PendingAttributeCandidate | None,
     str,
@@ -2689,6 +2748,11 @@ def _attempt_attribute_completion(
         metrics.review_calls += 1
         review = completion_judge.review(
             source_attribute=candidate.crop,
+            source_bbox=_attribute_bbox_crop(
+                candidate.source_image,
+                candidate.attribute_mask,
+                crop_padding_ratio=crop_padding_ratio,
+            ),
             generated_candidate=completed_rgb,
             attribute_type=candidate.discovered.attribute_type,
             attribute_phrase=candidate.discovered.phrase,
@@ -3511,6 +3575,12 @@ def _process_owner(
                 unresolved.discard(attribute_id)
                 continue
 
+            if not review.sufficient_source_evidence:
+                if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
+                    continue
+                # Keep only semantic provenance for the last-resort bbox route.
+                continue
+
             if not completion_eligible:
                 if review.accepted:
                     selected_candidate_by_id[attribute_id] = candidate
@@ -3564,6 +3634,7 @@ def _process_owner(
                     completion_judge=completion_judge,
                     metrics=completion_metrics,
                     raw_usable=review.accepted,
+                    crop_padding_ratio=config.pair.crop_padding_ratio,
                 )
             completion_provenance[attribute_id] = (
                 completion_reason,

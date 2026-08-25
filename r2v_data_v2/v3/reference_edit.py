@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,6 +32,11 @@ from r2v_data_v2.v3.reference_geometry import (
 from r2v_data_v2.v3.reference_integrity import (
     _materialize_source_bbox,
     _source_evidence,
+)
+from r2v_data_v2.v3.pair import (
+    EntityReferenceCandidate,
+    build_entity_reference_candidates,
+    build_reference_crop,
 )
 from r2v_data_v2.v3.sam3_backend import Sam3SegmentationBackend
 from r2v_data_v2.v3.schemas import (
@@ -74,16 +80,23 @@ class ReferenceEditStats:
     bbox_reviews_skipped_background_accepted: int = 0
     background_variants_attempted: int = 0
     background_variants_accepted: int = 0
+    completion_attempts: int = 0
+    completion_candidate1_accepted: int = 0
+    completion_candidate2_attempts: int = 0
+    completion_candidate2_accepted: int = 0
+    completion_fallback_to_alpha: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
 
 
 COMPLETION_PROMPT_TEMPLATE = (
-    "图片中只有一个实体，实体是“{entity_phrase}”。"
-    "补全残缺的部分。不要引入新的实体，风格保持一致。"
-    "如果补全不了，则只保留最能表示该实体的部分，"
-    "去除零散且不合理的部分。"
+    'Complete the missing or broken parts of the same target entity: '
+    '"{entity_phrase}".\n'
+    "Preserve its identity, appearance, colors, materials, proportions, and style.\n"
+    "Do not add another entity or unrelated content.\n"
+    "Remove broken fragments and keep uncertain completion simple and consistent "
+    "with visible evidence."
 )
 _ENTITY_BACKGROUND_DISABLED_REASON = "entity_background_disabled_by_policy"
 _ENTITY_COUNTER_FIELDS = (
@@ -106,10 +119,18 @@ _REFERENCE_VARIANT_COUNTER_FIELDS = (
     "background_variants_attempted",
     "background_variants_accepted",
 )
+_COMPLETION_RETRY_COUNTER_FIELDS = (
+    "completion_attempts",
+    "completion_candidate1_accepted",
+    "completion_candidate2_attempts",
+    "completion_candidate2_accepted",
+    "completion_fallback_to_alpha",
+)
 _CLIP_COUNTER_FIELDS = (
     *_ENTITY_COUNTER_FIELDS,
     *_SCALE_COLLAPSE_GUARD_COUNTER_FIELDS,
     *_REFERENCE_VARIANT_COUNTER_FIELDS,
+    *_COMPLETION_RETRY_COUNTER_FIELDS,
 )
 
 
@@ -269,6 +290,85 @@ def _instruction_rewrite_enabled(config: V3Config, operation: str) -> bool:
     if operation == "complete_entity":
         return config.reference_edit.completion_instruction_rewrite_enabled
     raise ValueError(f"unsupported reference-edit operation: {operation}")
+
+
+@dataclass(frozen=True)
+class _AlternateCompletionSource:
+    candidate: EntityReferenceCandidate
+    image_path: Path
+    metadata_path: Path
+
+
+def _alternate_completion_source(
+    config: V3Config,
+    storage: RunStorage,
+    *,
+    clip_uid: str,
+    entity: AnnotationEntity,
+    canonical_reference: EntityReferenceState,
+) -> _AlternateCompletionSource | None:
+    frames = storage.read_frames(clip_uid)
+    masks = storage.read_masks(clip_uid)
+    candidates = build_entity_reference_candidates(
+        config,
+        storage,
+        clip_uid=clip_uid,
+        entity=entity,
+        frames=frames,
+        masks=masks,
+    )
+    canonical_is_local = canonical_reference.source_clip_uid in {None, clip_uid}
+    alternate = next(
+        (
+            candidate
+            for candidate in candidates
+            if not canonical_is_local
+            or candidate.source_frame_index
+            != canonical_reference.source_frame_index
+        ),
+        None,
+    )
+    if alternate is None:
+        return None
+    source_path = _resolve_artifact(storage, alternate.image_path)
+    with Image.open(source_path) as opened:
+        opened.load()
+        source_rgb = opened.convert("RGB")
+    crop, _ = build_reference_crop(
+        source_rgb,
+        alternate.mask,
+        crop_padding_ratio=config.pair.crop_padding_ratio,
+    )
+    edit_dir = storage.reference_edit_dir(clip_uid) / entity.entity_id
+    image_path = edit_dir / "alternate_source_2.png"
+    buffer = io.BytesIO()
+    crop.save(buffer, format="PNG")
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = image_path.with_name(f".{image_path.name}.tmp")
+    try:
+        temporary.write_bytes(buffer.getvalue())
+        temporary.replace(image_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    metadata_path = edit_dir / "alternate_source_2.json"
+    write_json_atomic(
+        metadata_path,
+        {
+            "schema_version": 1,
+            "candidate_id": alternate.candidate_id,
+            "source_frame_index": alternate.source_frame_index,
+            "frame_slot": alternate.frame_slot,
+            "source_image_path": alternate.image_path,
+            "source_image_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            "alternate_source_path": storage.relative_artifact_path(image_path),
+            "alternate_source_sha256": hashlib.sha256(buffer.getvalue()).hexdigest(),
+        },
+    )
+    return _AlternateCompletionSource(
+        candidate=alternate,
+        image_path=image_path,
+        metadata_path=metadata_path,
+    )
 
 
 def _disabled_entity_background_variant(
@@ -725,19 +825,25 @@ def reference_edit_clips(
                         operation_judge,
                         operation_sam,
                     ) = initialize_runtime()
-                    results: dict[str, BooguReferenceEditResult] = {}
-                    source_image_path: Path | None = None
-                    geometry_source_image_path = _resolve_artifact(
-                        storage,
-                        reference.image_path,
+                    canonical_source_path = _resolve_artifact(
+                        storage, reference.image_path
                     )
-                    for operation in operations:
-                        result = run_boogu_reference_edit(
+
+                    def run_completion_attempt(
+                        *,
+                        attempt_index: int,
+                        source_path: Path | None,
+                        source_candidate_id: str,
+                        source_frame_index: int,
+                        comparison_source_path: Path | None,
+                    ) -> BooguReferenceEditResult:
+                        clip_entity_counters["completion_attempts"] += 1
+                        return run_boogu_reference_edit(
                             run_root=storage.root,
                             clip_uid=clip.clip_uid,
                             entity_id=reference.entity_id,
-                            operation=operation,
-                            instruction=_instruction(operation, entity),
+                            operation="complete_entity",
+                            instruction=_instruction("complete_entity", entity),
                             entity_phrase=entity.phrase,
                             grounding_prompt=entity.grounding_prompt,
                             reference_type=entity.reference_type,
@@ -746,7 +852,7 @@ def reference_edit_clips(
                             sam_reviewer=operation_sam,
                             instruction_rewrite_enabled=_instruction_rewrite_enabled(
                                 config,
-                                operation,
+                                "complete_entity",
                             ),
                             target_area=config.reference_edit.target_area,
                             alignment=config.reference_edit.alignment,
@@ -758,29 +864,60 @@ def reference_edit_clips(
                             ),
                             model_revision=config.reference_edit.model_revision,
                             fallback_status=config.reference_edit.fallback_policy,
-                            source_image_path=source_image_path,
-                            geometry_source_image_path=geometry_source_image_path,
+                            source_image_path=source_path,
+                            geometry_source_image_path=(
+                                canonical_source_path
+                                if source_path is None
+                                else source_path
+                            ),
+                            comparison_source_image_path=comparison_source_path,
+                            completion_attempt_index=attempt_index,
+                            completion_source_candidate_id=source_candidate_id,
+                            completion_source_frame_index=source_frame_index,
                             publish_final=False,
                             overwrite=overwrite,
                         )
-                        results[operation] = result
-                        if result.status != "accepted":
-                            break
-                        if operation == "complete_entity":
-                            if result.candidate_path is None:
-                                raise RuntimeError(
-                                    "accepted completion has no candidate artifact"
-                                )
-                            source_image_path = result.candidate_path
 
-                    attempted_operations = list(results)
-                    completion_result = results.get("complete_entity")
-                    rejected_result: BooguReferenceEditResult | None = None
+                    completion_result = run_completion_attempt(
+                        attempt_index=1,
+                        source_path=None,
+                        source_candidate_id="canonical_reference",
+                        source_frame_index=reference.source_frame_index,
+                        comparison_source_path=None,
+                    )
+                    selected_attempt_index: int | None = None
+                    if completion_result.status == "accepted":
+                        selected_attempt_index = 1
+                        clip_entity_counters["completion_candidate1_accepted"] += 1
+                    else:
+                        alternate = _alternate_completion_source(
+                            config,
+                            storage,
+                            clip_uid=clip.clip_uid,
+                            entity=entity,
+                            canonical_reference=reference,
+                        )
+                        if alternate is not None:
+                            clip_entity_counters["completion_candidate2_attempts"] += 1
+                            completion_result = run_completion_attempt(
+                                attempt_index=2,
+                                source_path=alternate.image_path,
+                                source_candidate_id=alternate.candidate.candidate_id,
+                                source_frame_index=(
+                                    alternate.candidate.source_frame_index
+                                ),
+                                comparison_source_path=canonical_source_path,
+                            )
+                            if completion_result.status == "accepted":
+                                selected_attempt_index = 2
+                                clip_entity_counters[
+                                    "completion_candidate2_accepted"
+                                ] += 1
+
+                    attempted_operations = ["complete_entity"]
                     rejection_reason: str | None = None
-                    last_result = results[attempted_operations[-1]]
-                    if last_result.status != "accepted":
-                        rejected_result = last_result
-                        rejection_reason = _rejection_reason(rejected_result)
+                    if selected_attempt_index is None:
+                        rejection_reason = _rejection_reason(completion_result)
                         if rejection_reason.startswith(
                             "boogu_reference_edit_failed:"
                         ):
@@ -791,12 +928,12 @@ def reference_edit_clips(
                                 reason=rejection_reason,
                                 details={
                                     "entity_id": reference.entity_id,
-                                    "operation": rejected_result.operation,
+                                    "operation": completion_result.operation,
                                 },
                             )
                     if route == "repairable":
                         if (
-                            completion_result is not None
+                            selected_attempt_index is not None
                             and completion_result.status == "accepted"
                             and completion_result.candidate_path is not None
                         ):
@@ -809,7 +946,9 @@ def reference_edit_clips(
                                 completion_metadata_path=completion_result.metadata_path,
                                 final_selection="completion_candidate",
                                 final_selection_reason=(
-                                    "accepted_completion_preferred_over_source_alpha"
+                                    "accepted_completion_candidate_"
+                                    f"{selected_attempt_index}_preferred_over_"
+                                    "canonical_source_alpha"
                                 ),
                             )
                             accepted = _accepted_reference(
@@ -850,7 +989,8 @@ def reference_edit_clips(
                                         else None
                                     ),
                                     default_reason=(
-                                        "completion_review_accepted"
+                                        "completion_candidate_"
+                                        f"{selected_attempt_index}_review_accepted"
                                         if entity_variant_route
                                         else None
                                     ),
@@ -877,6 +1017,7 @@ def reference_edit_clips(
                             "repairable_completion_rejected:"
                             f"{rejection_reason or 'completion_unavailable'}"
                         )
+                        clip_entity_counters["completion_fallback_to_alpha"] += 1
                         final_metadata_path = _write_source_selection_metadata(
                             storage,
                             clip_uid=clip.clip_uid,

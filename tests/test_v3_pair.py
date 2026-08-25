@@ -4394,16 +4394,24 @@ class _ReferenceEditJudge:
         accept: bool = True,
         reject_operations: set[str] | None = None,
         background_updates: dict[str, bool] | None = None,
+        accept_sequence: list[bool] | None = None,
     ) -> None:
         self.accept = accept
         self.reject_operations = reject_operations or set()
         self.background_updates = background_updates or {}
+        self.accept_sequence = list(accept_sequence or [])
         self.calls: list[str] = []
+        self.requests: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> object:
         operation = str(kwargs["operation"])
         self.calls.append(operation)
-        accepted = self.accept and operation not in self.reject_operations
+        self.requests.append(kwargs)
+        accepted = (
+            self.accept_sequence.pop(0)
+            if self.accept_sequence
+            else self.accept and operation not in self.reject_operations
+        )
         values = {
             field: accepted
             for field in (
@@ -4926,9 +4934,20 @@ def test_repairable_reference_runs_completion_only_with_one_worker(
         call["instruction_rewrite_enabled"] for call in backend.calls
     ] == [True]
     entity_phrase = storage.read_clip("clip-1").annotation.entities[0].phrase
+    expected_instruction = (
+        f'Complete the missing or broken parts of the same target entity: "{entity_phrase}".\n'
+        "Preserve its identity, appearance, colors, materials, proportions, and style.\n"
+        "Do not add another entity or unrelated content.\n"
+        "Remove broken fragments and keep uncertain completion simple and consistent "
+        "with visible evidence."
+    )
     assert [call["instruction"] for call in backend.calls] == [
-        COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity_phrase),
+        expected_instruction,
     ]
+    assert COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity_phrase) == (
+        expected_instruction
+    )
+    assert not any("\u4e00" <= character <= "\u9fff" for character in expected_instruction)
     edit_dir = storage.reference_edit_dir("clip-1") / "e1"
     completion_path = edit_dir / "completion_candidate_1k.png"
     assert completion_path.is_file()
@@ -5336,7 +5355,9 @@ def test_legacy_touching_local_completion_rejection_falls_back_to_alpha(
     edit = clip.reference_edit.entities[0]
     assert stats.entities_fallback == 1
     assert stats.entities_rejected == 0
-    assert len(backend.calls) == 1
+    assert len(backend.calls) == 2
+    assert stats.completion_candidate2_attempts == 1
+    assert stats.completion_fallback_to_alpha == 1
     assert backend.calls[0]["thinking_enabled"] is True
     assert edit.route == "repairable"
     assert edit.operations == ["complete_entity"]
@@ -5489,6 +5510,8 @@ def test_repairable_completion_accept_is_canonical_without_background_edit(
     final_path = edit_dir / "final_reference_1k.png"
     assert stats.entities_accepted == 1
     assert len(backend.calls) == 1
+    assert stats.completion_candidate1_accepted == 1
+    assert stats.completion_candidate2_attempts == 0
     assert final_path.read_bytes() == completion_path.read_bytes()
     final_metadata = json.loads(
         (edit_dir / "final_metadata.json").read_text(encoding="utf-8")
@@ -5544,12 +5567,131 @@ def test_repairable_completion_rejection_falls_back_to_source_alpha(
     assert clip.pairing.status == "ready"
     assert clip.reference_edit.entities[0].status == "fallback"
     assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
-    assert len(backend.calls) == 1
+    assert len(backend.calls) == 2
+    assert stats.completion_candidate2_attempts == 1
+    assert stats.completion_fallback_to_alpha == 1
     assert reference.synthetic is False
     assert reference.status == "ready"
     assert reference.image_path == source_reference.image_path
     assert source_path.read_bytes() == source_bytes
     assert source_reference.status == "ready"
+
+
+def test_repairable_candidate2_completion_can_beat_canonical_alpha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0]
+    judge = _ReferenceEditJudge(accept_sequence=[False, True])
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=judge,
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert len(backend.calls) == 2
+    assert stats.completion_attempts == 2
+    assert stats.completion_candidate1_accepted == 0
+    assert stats.completion_candidate2_attempts == 1
+    assert stats.completion_candidate2_accepted == 1
+    assert stats.completion_fallback_to_alpha == 0
+    assert judge.requests[0]["comparison_source_rgb"] is None
+    assert isinstance(judge.requests[1]["comparison_source_rgb"], Image.Image)
+    edit_dir = storage.reference_edit_dir("clip-1") / "e1"
+    assert (edit_dir / "alternate_source_2.png").is_file()
+    with Image.open(edit_dir / "alternate_source_2.png") as alternate_source:
+        assert alternate_source.mode == "RGBA"
+    alternate_metadata = json.loads(
+        (edit_dir / "alternate_source_2.json").read_text(encoding="utf-8")
+    )
+    assert alternate_metadata["source_frame_index"] != canonical.source_frame_index
+    assert alternate_metadata["candidate_id"].startswith("candidate_")
+    assert isinstance(alternate_metadata["frame_slot"], int)
+    assert alternate_metadata["source_image_path"].endswith(".jpg")
+    assert len(alternate_metadata["source_image_sha256"]) == 64
+    assert len(alternate_metadata["alternate_source_sha256"]) == 64
+    completion_metadata = json.loads(
+        (edit_dir / "completion_metadata_2.json").read_text(encoding="utf-8")
+    )
+    assert completion_metadata["completion_attempt_index"] == 2
+    assert completion_metadata["completion_source_candidate_id"].startswith(
+        "candidate_"
+    )
+    assert completion_metadata["completion_source_frame_index"] == (
+        alternate_metadata["source_frame_index"]
+    )
+    assert completion_metadata["source_input_rgb_path"].endswith(
+        "completion_source_input_rgb_2.png"
+    )
+    assert completion_metadata["comparison_source_image_path"] == canonical.image_path
+    assert len(completion_metadata["comparison_source_image_sha256"]) == 64
+    state = storage.read_clip("clip-1").reference_edit.entities[0]
+    assert state.status == "accepted"
+    assert state.default_variant == "accepted_base"
+    assert state.default_reason == "completion_candidate_2_review_accepted"
+    assert state.output_image_path != canonical.image_path
+
+
+def test_cross_pair_canonical_uses_highest_ranked_local_completion_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0].model_copy(
+        update={"source_clip_uid": "other-clip", "source_entity_id": "e1"}
+    )
+
+    alternate = reference_edit_module._alternate_completion_source(
+        config,
+        storage,
+        clip_uid="clip-1",
+        entity=storage.read_clip("clip-1").annotation.entities[0],
+        canonical_reference=canonical,
+    )
+
+    assert alternate is not None
+    assert alternate.candidate.candidate_id == "candidate_1"
+    assert alternate.candidate.source_frame_index == 10
+
+
+def test_repairable_without_alternate_source_attempts_completion_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+        pair=PairConfig(max_candidates_per_entity=1),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(accept=False),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert len(backend.calls) == 1
+    assert stats.completion_attempts == 1
+    assert stats.completion_candidate2_attempts == 0
+    assert stats.completion_fallback_to_alpha == 1
+    state = storage.read_clip("clip-1").reference_edit.entities[0]
+    assert state.default_variant == "alpha"
+    assert state.output_image_path == state.source_image_path
 
 
 def test_reference_edit_overwrite_restores_immutable_source_reference(

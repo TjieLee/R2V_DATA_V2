@@ -147,7 +147,7 @@ class BooguCompletionReview(BaseModel):
     identity_preserved: StrictBool
     original_visible_attributes_preserved: StrictBool
     exactly_one_entity: StrictBool
-    missing_parts_plausibly_completed: StrictBool
+    candidate_better_than_source: StrictBool
     no_duplicate_entity: StrictBool
     no_unrelated_entity: StrictBool
     no_severe_structure_artifact: StrictBool
@@ -156,6 +156,23 @@ class BooguCompletionReview(BaseModel):
     reference_usable: StrictBool
     certain: StrictBool
     reason: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_review(cls, value: object) -> object:
+        if not isinstance(value, dict) or "candidate_better_than_source" in value:
+            return value
+        legacy_better = value.get("missing_parts_plausibly_completed")
+        if not isinstance(legacy_better, bool):
+            return value
+        return {
+            key: item
+            for key, item in {
+                **value,
+                "candidate_better_than_source": legacy_better,
+            }.items()
+            if key != "missing_parts_plausibly_completed"
+        }
 
     @field_validator("reason")
     @classmethod
@@ -169,7 +186,7 @@ class BooguCompletionReview(BaseModel):
             self.identity_preserved,
             self.original_visible_attributes_preserved,
             self.exactly_one_entity,
-            self.missing_parts_plausibly_completed,
+            self.candidate_better_than_source,
             self.no_duplicate_entity,
             self.no_unrelated_entity,
             self.no_severe_structure_artifact,
@@ -330,6 +347,7 @@ class BooguReferenceEditJudge(Protocol):
         operation: BooguEditOperation,
         source_rgba: Image.Image,
         source_input_rgb: Image.Image,
+        comparison_source_rgb: Image.Image | None,
         candidate_rgb: Image.Image,
         entity_phrase: str,
         reference_type: ReferenceType,
@@ -348,19 +366,20 @@ class BooguSamReviewer(Protocol):
     ) -> BooguSamReview: ...
 
 
-_COMPLETION_REVIEW_PROMPT = """You review a generated entity reference.
-Image 1 is the source reference and Image 2 is the generated completion.
-Accept only if Image 2 preserves the same physical entity and every visible
-identity attribute, contains exactly one coherent target, plausibly completes
-missing structure, adds no duplicate or unrelated entity, has no severe
-structural artifact, and is a usable high-resolution reference.
+_COMPLETION_REVIEW_PROMPT = """You compare a source reference with a generated
+completion. Choose the generated candidate only if it is a better conditioning
+reference while preserving the same physical entity, identity, appearance, and
+semantics. A modest real improvement in completeness, coherence, clarity, or
+reference usability is enough. If the images are equivalent, keep the source.
+Reject a wrong instance, duplicate entity or component, unrelated content,
+severe structural distortion, or loss of reference usability.
 
-Reasonable spatial changes are allowed. Do not reject Image 2 merely because
-the target moved, was recentered, changed size moderately, or has a somewhat
-different crop or composition. This is a conditioning reference, not a
-reconstruction of the source layout. Accept reasonable position and scale
-changes when the same target remains clear, prominent, structurally plausible,
-and useful as a reference.
+Reasonable spatial changes are allowed. Do not reject the generated candidate
+merely because the target moved, was recentered, changed size moderately, or
+has a somewhat different crop or composition. This is a conditioning
+reference, not a reconstruction of the source layout. Accept reasonable
+position and scale changes when the same target remains clear, prominent,
+structurally plausible, and useful as a reference.
 
 Reject spatial or composition changes only when the target becomes too small,
 is pushed into an extreme corner or edge, loses visual prominence, becomes
@@ -370,8 +389,12 @@ elongated torso, abnormally long or short limbs, warped anatomy, distorted
 object proportions, duplicated limbs or components, malformed completion, an
 identity-changing redraw, a wrong new instance, or unrelated added content.
 
-Judge visible facts only and return one strict JSON object matching the
-supplied schema."""
+When three images are supplied, Image 2 is alternate source evidence for Image
+3. Use Image 2 only to verify that Image 3 preserves the same entity. Compare
+Image 3 against Image 1 when deciding which final reference is better.
+
+Judge visible facts only and return one strict JSON object matching the supplied
+schema."""
 
 _BACKGROUND_REVIEW_PROMPT = """You review a generated entity reference.
 Image 1 is the source reference and Image 2 adds a clean supporting background.
@@ -429,6 +452,7 @@ class QwenBooguReferenceEditJudge:
         operation: BooguEditOperation,
         source_rgba: Image.Image,
         source_input_rgb: Image.Image,
+        comparison_source_rgb: Image.Image | None = None,
         candidate_rgb: Image.Image,
         entity_phrase: str,
         reference_type: ReferenceType,
@@ -457,10 +481,22 @@ class QwenBooguReferenceEditJudge:
                 ),
             }
         ]
-        for label, image in (
-            ("Image 1: source reference", source),
-            ("Image 2: generated candidate", candidate_rgb),
-        ):
+        review_images = [
+            (
+                "Image 1: canonical source reference",
+                comparison_source_rgb if comparison_source_rgb is not None else source,
+            )
+        ]
+        if operation == "complete_entity" and comparison_source_rgb is not None:
+            review_images.extend(
+                (
+                    ("Image 2: alternate source evidence only", source),
+                    ("Image 3: generated candidate", candidate_rgb),
+                )
+            )
+        else:
+            review_images.append(("Image 2: generated candidate", candidate_rgb))
+        for label, image in review_images:
             content.extend(
                 [
                     {"type": "text", "text": label},
@@ -1374,6 +1410,10 @@ def run_boogu_reference_edit(
     fallback_status: str = "canonical_preserved",
     source_image_path: Path | None = None,
     geometry_source_image_path: Path | None = None,
+    comparison_source_image_path: Path | None = None,
+    completion_attempt_index: int | None = None,
+    completion_source_candidate_id: str | None = None,
+    completion_source_frame_index: int | None = None,
     publish_final: bool = True,
     overwrite: bool = False,
 ) -> BooguReferenceEditResult:
@@ -1381,6 +1421,20 @@ def run_boogu_reference_edit(
 
     if operation not in {"complete_entity", "add_entity_background"}:
         raise ValueError(f"unsupported Boogu edit operation: {operation}")
+    if operation == "complete_entity":
+        completion_attempt_index = completion_attempt_index or 1
+        if completion_attempt_index not in {1, 2}:
+            raise ValueError("completion_attempt_index must be 1 or 2")
+    elif any(
+        value is not None
+        for value in (
+            completion_attempt_index,
+            completion_source_candidate_id,
+            completion_source_frame_index,
+            comparison_source_image_path,
+        )
+    ):
+        raise ValueError("completion provenance is valid only for complete_entity")
     if instruction_rewrite_enabled is None:
         instruction_rewrite_enabled = operation == "complete_entity"
     if not isinstance(instruction_rewrite_enabled, bool):
@@ -1412,15 +1466,29 @@ def run_boogu_reference_edit(
     )
     if root not in geometry_source_path.parents or not geometry_source_path.is_file():
         raise ValueError("Boogu geometry source must be an existing run artifact")
+    comparison_source_path = (
+        None
+        if comparison_source_image_path is None
+        else comparison_source_image_path.expanduser().resolve(strict=False)
+    )
+    if comparison_source_path is not None and (
+        root not in comparison_source_path.parents
+        or not comparison_source_path.is_file()
+    ):
+        raise ValueError("Boogu comparison source must be an existing run artifact")
     edit_dir = root / "clips" / clip_uid / "reference_edit" / entity_id
     edit_dir.mkdir(parents=True, exist_ok=True)
     candidate_name = (
         "completion_candidate_1k.png"
+        if operation == "complete_entity" and completion_attempt_index == 1
+        else "completion_candidate_2_1k.png"
         if operation == "complete_entity"
         else "background_candidate_1k.png"
     )
     metadata_name = (
         "completion_metadata.json"
+        if operation == "complete_entity" and completion_attempt_index == 1
+        else "completion_metadata_2.json"
         if operation == "complete_entity"
         else "background_metadata.json"
     )
@@ -1430,6 +1498,8 @@ def run_boogu_reference_edit(
     final_metadata_path = edit_dir / "final_metadata.json"
     rejection_path = edit_dir / (
         "completion_rejection.json"
+        if operation == "complete_entity" and completion_attempt_index == 1
+        else "completion_rejection_2.json"
         if operation == "complete_entity"
         else "background_rejection.json"
     )
@@ -1457,6 +1527,11 @@ def run_boogu_reference_edit(
         minimum_long_side_pixels=min_source_content_long_side_pixels,
     )
     source_input_rgb = _white_composite(source_rgba)
+    comparison_source_rgb = (
+        None
+        if comparison_source_path is None
+        else _white_composite(_load_source_rgba(comparison_source_path.read_bytes()))
+    )
     width, height = resolve_boogu_1k_size(
         source_rgba.width,
         source_rgba.height,
@@ -1469,7 +1544,11 @@ def run_boogu_reference_edit(
     else:
         source_evidence_path = actual_source_path
     source_input_path = edit_dir / (
-        "completion_source_input_rgb.png"
+        (
+            "completion_source_input_rgb.png"
+            if completion_attempt_index == 1
+            else "completion_source_input_rgb_2.png"
+        )
         if operation == "complete_entity"
         else "background_source_input_rgb.png"
     )
@@ -1532,6 +1611,11 @@ def run_boogu_reference_edit(
                 operation=operation,
                 source_rgba=source_rgba.copy(),
                 source_input_rgb=source_input_rgb.copy(),
+                comparison_source_rgb=(
+                    comparison_source_rgb.copy()
+                    if comparison_source_rgb is not None
+                    else None
+                ),
                 candidate_rgb=candidate_rgb.copy(),
                 entity_phrase=entity_phrase,
                 reference_type=reference_type,
@@ -1631,6 +1715,9 @@ def run_boogu_reference_edit(
         "entity_id": entity_id,
         "status": "accepted" if accepted else "rejected",
         "operation": operation,
+        "completion_attempt_index": completion_attempt_index,
+        "completion_source_candidate_id": completion_source_candidate_id,
+        "completion_source_frame_index": completion_source_frame_index,
         "entity_phrase": entity_phrase,
         "grounding_prompt": grounding_prompt,
         "source_dimensions": {
@@ -1663,6 +1750,16 @@ def run_boogu_reference_edit(
         "source_geometry_image_path": geometry_source_path.relative_to(root).as_posix(),
         "source_geometry_image_sha256": geometry_source_sha256,
         "source_input_rgb_path": source_input_path.relative_to(root).as_posix(),
+        "comparison_source_image_path": (
+            comparison_source_path.relative_to(root).as_posix()
+            if comparison_source_path is not None
+            else None
+        ),
+        "comparison_source_image_sha256": (
+            _sha256_bytes(comparison_source_path.read_bytes())
+            if comparison_source_path is not None
+            else None
+        ),
         "generated_reference_sha256": output_sha256,
         "qwen_review": (
             qwen_review.model_dump(mode="json") if qwen_review is not None else None
