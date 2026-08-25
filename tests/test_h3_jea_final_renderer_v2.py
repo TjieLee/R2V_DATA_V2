@@ -219,24 +219,31 @@ def _jsonl(path: Path, values: list[object]) -> None:
 
 
 def _final_sample(
+    tmp_path: Path,
     voices: list[FinalSubjectVoice],
     *,
     clip_uid: str = "clip-a",
+    references: list[FinalVisualReference] | None = None,
 ) -> FinalH3SampleV2:
-    references = [
-        FinalVisualReference(
-            image_id=f"image_{index}",
-            image_index=index,
-            kind="subject",
-            image_path=f"references/entity_{index}.png",
-            entity_id=f"entity_{index}",
-            source_frame_index=0,
-            scope="full",
-            visible_region="whole",
-            synthetic=False,
-        )
-        for index in (1, 2)
-    ]
+    if references is None:
+        references = []
+        for index in (1, 2):
+            artifact = tmp_path / f"entity_{index}.png"
+            artifact.write_bytes(f"entity-{index}".encode())
+            references.append(
+                FinalVisualReference(
+                    image_id=f"image_{index}",
+                    image_index=index,
+                    kind="subject",
+                    image_path=f"references/entity_{index}.png",
+                    image_artifact_path=str(artifact),
+                    entity_id=f"entity_{index}",
+                    source_frame_index=0,
+                    scope="full",
+                    visible_region="whole",
+                    synthetic=False,
+                )
+            )
     return FinalH3SampleV2(
         sample_id=f"{clip_uid}/in_pair",
         pair_id=f"in_pair/{clip_uid}",
@@ -342,6 +349,8 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
 def test_final_visual_reference_preserves_canonical_visible_region_values(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "local.png").write_bytes(b"local")
+    (tmp_path / "full.png").write_bytes(b"full")
     local = FinalVisualReference.from_visual(
         NormalizedVisualReference(
             image_id="image_1",
@@ -379,6 +388,8 @@ def test_final_visual_reference_preserves_canonical_visible_region_values(
 def test_final_visual_reference_keeps_nullable_background_and_attribute_region(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "background.png").write_bytes(b"background")
+    (tmp_path / "hair.png").write_bytes(b"hair")
     background = FinalVisualReference.from_visual(
         NormalizedVisualReference(
             image_id="image_1",
@@ -413,8 +424,165 @@ def test_final_visual_reference_keeps_nullable_background_and_attribute_region(
     assert attribute.visible_region is None
 
 
-def test_final_sample_allows_partial_subject_voice_coverage() -> None:
-    sample = _final_sample([_voice(1)])
+def test_final_visual_reference_publishes_exact_normalized_artifact_paths(
+    tmp_path: Path,
+) -> None:
+    ordinary = tmp_path / "visual-export/references/ordinary.png"
+    enriched = tmp_path / "visual-runs/clips/clip-a/selected/local.png"
+    background_path = tmp_path / "visual-runs/clips/clip-a/selected/background.png"
+    attribute_path = (
+        tmp_path / "visual-runs/subject_attributes/clip-a/attribute_hair.png"
+    )
+    compacted = tmp_path / "compacted-production/references/subject.png"
+    for path in (ordinary, enriched, background_path, attribute_path, compacted):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(path.name.encode())
+
+    values = [
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="subject",
+            image_path="references/ordinary.png",
+            entity_id="entity_1",
+            source_frame_index=0,
+            scope="full",
+            visible_region="whole",
+            synthetic=False,
+            artifact_path=str(ordinary),
+        ),
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="subject",
+            image_path="clips/clip-a/selected/local.png",
+            entity_id="entity_1",
+            source_frame_index=0,
+            scope="local",
+            visible_region="upper_body",
+            synthetic=True,
+            artifact_path=str(enriched),
+        ),
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="background",
+            image_path="clips/clip-a/selected/background.png",
+            source_frame_index=0,
+            scope="scene",
+            synthetic=False,
+            artifact_path=str(background_path),
+        ),
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="attribute",
+            image_path="clip-a/attribute_hair.png",
+            attribute_id="attribute_hair",
+            owner_entity_id="entity_1",
+            attribute_type="hair",
+            source_frame_index=0,
+            synthetic=False,
+            artifact_path=str(attribute_path),
+        ),
+        NormalizedVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="subject",
+            image_path="references/subject.png",
+            entity_id="entity_1",
+            source_frame_index=0,
+            scope="full",
+            visible_region="whole",
+            synthetic=False,
+            artifact_path=str(compacted),
+        ),
+    ]
+
+    published = [FinalVisualReference.from_visual(value) for value in values]
+
+    assert [item.image_path for item in published] == [
+        value.image_path for value in values
+    ]
+    assert [item.image_artifact_path for item in published] == [
+        str(ordinary),
+        str(enriched),
+        str(background_path),
+        str(attribute_path),
+        str(compacted),
+    ]
+
+
+def test_final_sample_supports_visual_assets_from_different_owner_roots(
+    tmp_path: Path,
+) -> None:
+    subject_path = tmp_path / "visual-export/references/subject.png"
+    attribute_path = (
+        tmp_path / "visual-runs/subject_attributes/clip-a/attribute_hair.png"
+    )
+    for path in (subject_path, attribute_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(path.name.encode())
+    references = [
+        FinalVisualReference(
+            image_id="image_1",
+            image_index=1,
+            kind="subject",
+            image_path="references/subject.png",
+            image_artifact_path=str(subject_path),
+            entity_id="entity_1",
+            source_frame_index=0,
+            scope="full",
+            visible_region="whole",
+            synthetic=False,
+        ),
+        FinalVisualReference(
+            image_id="image_2",
+            image_index=2,
+            kind="attribute",
+            image_path="clip-a/attribute_hair.png",
+            image_artifact_path=str(attribute_path),
+            attribute_id="attribute_hair",
+            owner_entity_id="entity_1",
+            attribute_type="hair",
+            source_frame_index=0,
+            synthetic=False,
+        ),
+    ]
+
+    sample = _final_sample(tmp_path, [], references=references)
+
+    assert [Path(item.image_artifact_path).read_bytes() for item in sample.visual_references] == [
+        b"subject.png",
+        b"attribute_hair.png",
+    ]
+
+
+def test_final_visual_reference_rejects_relative_or_missing_artifact_path(
+    tmp_path: Path,
+) -> None:
+    values = {
+        "image_id": "image_1",
+        "image_index": 1,
+        "kind": "subject",
+        "image_path": "references/subject.png",
+        "entity_id": "entity_1",
+        "source_frame_index": 0,
+        "scope": "full",
+        "visible_region": "whole",
+        "synthetic": False,
+    }
+    with pytest.raises(ValueError, match="must be absolute"):
+        FinalVisualReference(**values, image_artifact_path="subject.png")
+    with pytest.raises(ValueError, match="must be an existing file"):
+        FinalVisualReference(
+            **values,
+            image_artifact_path=str(tmp_path / "missing.png"),
+        )
+
+
+def test_final_sample_allows_partial_subject_voice_coverage(tmp_path: Path) -> None:
+    sample = _final_sample(tmp_path, [_voice(1)])
 
     assert [item.entity_id for item in sample.visual_references] == [
         "entity_1",
@@ -423,8 +591,8 @@ def test_final_sample_allows_partial_subject_voice_coverage() -> None:
     assert [item.entity_id for item in sample.subject_voices] == ["entity_1"]
 
 
-def test_final_sample_still_allows_all_subjects_to_have_voice() -> None:
-    sample = _final_sample([_voice(1), _voice(2)])
+def test_final_sample_still_allows_all_subjects_to_have_voice(tmp_path: Path) -> None:
+    sample = _final_sample(tmp_path, [_voice(1), _voice(2)])
 
     assert [item.entity_id for item in sample.subject_voices] == [
         "entity_1",
@@ -432,18 +600,25 @@ def test_final_sample_still_allows_all_subjects_to_have_voice() -> None:
     ]
 
 
-def test_final_sample_rejects_noncanonical_or_duplicate_voice_bindings() -> None:
+def test_final_sample_rejects_noncanonical_or_duplicate_voice_bindings(
+    tmp_path: Path,
+) -> None:
     with pytest.raises(ValueError, match="only canonical subject references"):
-        _final_sample([_voice(3)])
+        _final_sample(tmp_path, [_voice(3)])
     with pytest.raises(ValueError, match="unique entity IDs"):
-        _final_sample([_voice(1), _voice(1)])
+        _final_sample(tmp_path, [_voice(1), _voice(1)])
 
 
-def test_final_sample_validates_voice_occurrence_and_subject_index() -> None:
+def test_final_sample_validates_voice_occurrence_and_subject_index(
+    tmp_path: Path,
+) -> None:
     with pytest.raises(ValueError, match="target occurrence is inconsistent"):
-        _final_sample([_voice(1, target_occurrence_id="other/entity_1")])
+        _final_sample(
+            tmp_path,
+            [_voice(1, target_occurrence_id="other/entity_1")],
+        )
     with pytest.raises(ValueError, match="canonical subject order"):
-        _final_sample([_voice(1, subject_index=2)])
+        _final_sample(tmp_path, [_voice(1, subject_index=2)])
 
 
 def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
@@ -461,6 +636,8 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     assert first["visual_references"][0]["scope"] == "local"
     assert first["visual_references"][0]["visible_region"] == "upper_body"
     assert not isinstance(first["visual_references"][0]["visible_region"], dict)
+    assert first["visual_references"][0]["image_path"].endswith("subject-1.png")
+    assert Path(first["visual_references"][0]["image_artifact_path"]).is_file()
     second = next(row for row in rows if row["sample_id"] == "clip-b/in_pair")
     assert second["visual_references"][0]["scope"] == "full"
     assert second["visual_references"][0]["visible_region"] == "whole"

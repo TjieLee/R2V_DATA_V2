@@ -2,6 +2,12 @@
 
 ## Status
 
+> **Legacy path:** This document describes the older Whisper ASR V2,
+> text-usability, and copied `assets/` renderer. It is not the active JEA Qwen3
+> H3 production path. The current renderer contract and commands are documented
+> in `docs/H3_QWEN3_ASR.md`; in particular, current Visual references publish a
+> directly readable `image_artifact_path` and do not copy Visual assets into H3.
+
 The deterministic final renderer is implemented as a data-assembly stage. It
 does not run Whisper, DiariZen, an MLLM, or any other model. Its inputs remain
 read-only and its fixed output is:

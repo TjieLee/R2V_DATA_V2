@@ -90,6 +90,22 @@ Pair rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
 `episode_name`, `clip_name`, and `shard_id`. Pair review pages sort readable
 paths first.
 
+Final H3 samples publish media paths with explicit ownership semantics:
+
+- `target_video` is the directly readable processed target-video path.
+- `target_full_audio_path` is the directly readable canonical full-audio path.
+- `visual_references[].image_path` is the original Visual-relative provenance
+  path and intentionally retains its source representation.
+- `visual_references[].image_artifact_path` is the directly readable absolute
+  reference-image path copied from the normalized Visual inventory.
+- `subject_voices[].voice_reference_path` is the directly readable
+  voice-reference path.
+
+Visual reference assets are not copied into H3. A training reader must read
+`image_artifact_path` directly and must not reconstruct Visual export/run-root
+resolution rules from `image_path`; references in one sample may originate from
+different validated Visual ownership roots.
+
 PairPolicy V1 remains unchanged: face similarity is at least `0.72`, voice
 similarity is at least `0.20`, there are no rank, margin, or text gates,
 multi-subject mappings are one-to-one, and there is at most one cross sample

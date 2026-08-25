@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from r2v_data_v2.h3.diarization_binding import BoundDiarizationSegment
 from r2v_data_v2.h3.jea_audio_production import JEACrossPair, JEAInPair
@@ -24,11 +24,23 @@ FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.2"
 
 
 class FinalVisualReference(ProductionReference):
+    image_artifact_path: str
+
+    @field_validator("image_artifact_path")
+    @classmethod
+    def validate_image_artifact_path(cls, value: str) -> str:
+        path = Path(value)
+        if not value.strip() or not path.is_absolute():
+            raise ValueError("final Visual image_artifact_path must be absolute")
+        if not path.exists() or not path.is_file():
+            raise ValueError("final Visual image_artifact_path must be an existing file")
+        return value
+
     @classmethod
     def from_visual(cls, value: NormalizedVisualReference) -> FinalVisualReference:
-        return cls.model_validate(
-            value.model_dump(mode="json", exclude={"artifact_path"})
-        )
+        payload = value.model_dump(mode="json", exclude={"artifact_path"})
+        payload["image_artifact_path"] = value.artifact_path
+        return cls.model_validate(payload)
 
 
 class FinalSubjectVoice(SchemaModel):
