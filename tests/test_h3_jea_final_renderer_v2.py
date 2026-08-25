@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from r2v_data_v2.h3.diarization_binding import BoundDiarizationSegment
 from r2v_data_v2.h3.jea_audio_production import (
     JEAOccurrenceEmbedding,
     build_jea_pairs,
 )
 from r2v_data_v2.h3.jea_final_renderer import (
+    FinalH3SampleV2,
+    FinalSubjectVoice,
     FinalVisualReference,
     render_jea_final_samples,
 )
@@ -46,45 +50,60 @@ def _visual_clip(
     *,
     subject_scope: str = "full",
     subject_visible_region: str | None = None,
+    subject_entity_ids: tuple[str, ...] = ("entity_1",),
 ) -> VisualProductionClip:
     identity = _identity(clip_uid, clip_name)
     target = tmp_path / f"{clip_uid}.mp4"
     target.write_bytes(b"processed")
-    subject = tmp_path / f"{clip_uid}-subject.png"
+    subjects = [
+        tmp_path / f"{clip_uid}-subject-{index}.png"
+        for index in range(1, len(subject_entity_ids) + 1)
+    ]
     attribute = tmp_path / f"{clip_uid}-hair.png"
-    subject.write_bytes(b"subject")
+    for index, subject in enumerate(subjects, start=1):
+        subject.write_bytes(f"subject-{index}".encode())
     attribute.write_bytes(b"hair")
+    reference_rows = [
+        {
+            "image_id": f"image_{index}",
+            "image_index": index,
+            "kind": "subject",
+            "entity_id": entity_id,
+            "image_path": subject.name,
+            "source_frame_index": 0,
+            "scope": subject_scope,
+            "visible_region": subject_visible_region,
+            "synthetic": False,
+        }
+        for index, (entity_id, subject) in enumerate(
+            zip(subject_entity_ids, subjects, strict=True), start=1
+        )
+    ]
+    attribute_index = len(reference_rows) + 1
+    reference_rows.append(
+        {
+            "image_id": f"image_{attribute_index}",
+            "image_index": attribute_index,
+            "kind": "attribute",
+            "attribute_id": "attribute_hair",
+            "owner_entity_id": "entity_1",
+            "attribute_type": "hair",
+            "image_path": attribute.name,
+            "source_frame_index": 0,
+            "synthetic": False,
+        }
+    )
     sample = ProductionSample.model_validate(
         {
             "sample_id": clip_uid,
             "clip_uid": clip_uid,
             "target_video": str(target),
             "t2v_caption": "canonical caption",
-            "r2v_instruction": f"canonical {clip_uid}: Image 1 and Image 2",
-            "references": [
-                {
-                    "image_id": "image_1",
-                    "image_index": 1,
-                    "kind": "subject",
-                    "entity_id": "entity_1",
-                    "image_path": subject.name,
-                    "source_frame_index": 0,
-                    "scope": subject_scope,
-                    "visible_region": subject_visible_region,
-                    "synthetic": False,
-                },
-                {
-                    "image_id": "image_2",
-                    "image_index": 2,
-                    "kind": "attribute",
-                    "attribute_id": "attribute_hair",
-                    "owner_entity_id": "entity_1",
-                    "attribute_type": "hair",
-                    "image_path": attribute.name,
-                    "source_frame_index": 0,
-                    "synthetic": False,
-                },
-            ],
+            "r2v_instruction": f"canonical {clip_uid}: "
+            + " and ".join(
+                f"Image {index}" for index in range(1, attribute_index + 1)
+            ),
+            "references": reference_rows,
             "source": {
                 "parent_video_id": "legacy-parent",
                 "clip_suffix": clip_uid,
@@ -128,7 +147,9 @@ def _visual_clip(
         sample=normalized,
         clip=clip,
         clip_record_path=str(tmp_path / identity.shard_id / clip_uid / "clip.json"),
-        subject_references=[references[0]],
+        subject_references=[
+            reference for reference in references if reference.kind == "subject"
+        ],
     )
 
 
@@ -194,6 +215,63 @@ def _jsonl(path: Path, values: list[object]) -> None:
             for value in values
         ),
         encoding="utf-8",
+    )
+
+
+def _final_sample(
+    voices: list[FinalSubjectVoice],
+    *,
+    clip_uid: str = "clip-a",
+) -> FinalH3SampleV2:
+    references = [
+        FinalVisualReference(
+            image_id=f"image_{index}",
+            image_index=index,
+            kind="subject",
+            image_path=f"references/entity_{index}.png",
+            entity_id=f"entity_{index}",
+            source_frame_index=0,
+            scope="full",
+            visible_region="whole",
+            synthetic=False,
+        )
+        for index in (1, 2)
+    ]
+    return FinalH3SampleV2(
+        sample_id=f"{clip_uid}/in_pair",
+        pair_id=f"in_pair/{clip_uid}",
+        pair_type="in_pair",
+        clip_uid=clip_uid,
+        clip_display_path=f"节目/集合/{clip_uid}",
+        media_collection_relpath="节目/集合",
+        media_collection_name="集合",
+        episode_name="episode",
+        clip_name=clip_uid,
+        shard_id="shard-a",
+        target_video=f"{clip_uid}.mp4",
+        target_full_audio_path=f"{clip_uid}.flac",
+        r2v_instruction="Image 1 and Image 2",
+        visual_references=references,
+        subject_voices=voices,
+        speech_segments=[],
+    )
+
+
+def _voice(
+    entity_index: int,
+    *,
+    subject_index: int | None = None,
+    clip_uid: str = "clip-a",
+    target_occurrence_id: str | None = None,
+) -> FinalSubjectVoice:
+    entity_id = f"entity_{entity_index}"
+    return FinalSubjectVoice(
+        subject_index=entity_index if subject_index is None else subject_index,
+        entity_id=entity_id,
+        target_occurrence_id=target_occurrence_id
+        or f"{clip_uid}/{entity_id}",
+        voice_reference_path=f"voices/{entity_id}.flac",
+        voice_source="target",
     )
 
 
@@ -335,6 +413,39 @@ def test_final_visual_reference_keeps_nullable_background_and_attribute_region(
     assert attribute.visible_region is None
 
 
+def test_final_sample_allows_partial_subject_voice_coverage() -> None:
+    sample = _final_sample([_voice(1)])
+
+    assert [item.entity_id for item in sample.visual_references] == [
+        "entity_1",
+        "entity_2",
+    ]
+    assert [item.entity_id for item in sample.subject_voices] == ["entity_1"]
+
+
+def test_final_sample_still_allows_all_subjects_to_have_voice() -> None:
+    sample = _final_sample([_voice(1), _voice(2)])
+
+    assert [item.entity_id for item in sample.subject_voices] == [
+        "entity_1",
+        "entity_2",
+    ]
+
+
+def test_final_sample_rejects_noncanonical_or_duplicate_voice_bindings() -> None:
+    with pytest.raises(ValueError, match="only canonical subject references"):
+        _final_sample([_voice(3)])
+    with pytest.raises(ValueError, match="unique entity IDs"):
+        _final_sample([_voice(1), _voice(1)])
+
+
+def test_final_sample_validates_voice_occurrence_and_subject_index() -> None:
+    with pytest.raises(ValueError, match="target occurrence is inconsistent"):
+        _final_sample([_voice(1, target_occurrence_id="other/entity_1")])
+    with pytest.raises(ValueError, match="canonical subject order"):
+        _final_sample([_voice(1, subject_index=2)])
+
+
 def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     tmp_path: Path,
 ) -> None:
@@ -354,6 +465,101 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     assert second["visual_references"][0]["scope"] == "full"
     assert second["visual_references"][0]["visible_region"] == "whole"
     assert len(first["subject_voices"]) == 1
+
+
+def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path) -> None:
+    visual = _visual_clip(
+        tmp_path,
+        "clip-a",
+        "episode_a_0001",
+        subject_entity_ids=("entity_1", "entity_2"),
+    )
+    inventory = VisualProductionInventory(
+        visual_production_root=str(tmp_path),
+        visual_runs_root=str(tmp_path / "runs"),
+        visual_input_schema="r2v.v3.production_sample.1",
+        visual_input_mode="compacted_production",
+        canonical_sample_count=1,
+        eligible_clip_count=1,
+        eligible_subject_occurrence_count=2,
+        media_collection_count=1,
+        media_collection_clip_counts={"节目/集合": 1},
+        shard_count=1,
+        clips=[visual],
+        skip_reason_counts={},
+    )
+    build_jea_pairs(
+        visual_inventory=inventory,
+        occurrences=_occurrences(inventory),
+        audio_root=tmp_path / "audio",
+        output_root=tmp_path / "pairs",
+    )
+    bound = []
+    qwen = []
+    for index in (1, 2):
+        entity_id = f"entity_{index}"
+        segment_id = f"segment_{index:04d}"
+        start_sample = (index - 1) * 1600
+        end_sample = index * 1600
+        bound.append(
+            BoundDiarizationSegment(
+                target_clip_uid="clip-a",
+                segment_id=segment_id,
+                speaker_cluster_id=f"speaker_{index}",
+                start_time=(index - 1) * 0.1,
+                end_time=index * 0.1,
+                source_start_sample=start_sample,
+                source_end_sample=end_sample,
+                cluster_binding_status="candidate_mapped",
+                entity_id=entity_id,
+                entity_occurrence_id=f"clip-a/{entity_id}",
+                direct_anchor_samples=100,
+                direct_anchor_seconds=0.00625,
+                identity_scope="direct_anchor_present",
+            )
+        )
+        qwen.append(
+            Qwen3ASRSegment(
+                **visual.identity.model_dump(mode="python"),
+                segment_id=segment_id,
+                speaker_cluster_id=f"speaker_{index}",
+                entity_id=entity_id,
+                entity_occurrence_id=f"clip-a/{entity_id}",
+                source_audio_path=str(tmp_path / "clip-a.flac"),
+                source_start_sample=start_sample,
+                source_end_sample=end_sample,
+                source_sample_rate_hz=16000,
+                start_time=(index - 1) * 0.1,
+                end_time=index * 0.1,
+                status="transcribed",
+                text=f"speech from {entity_id}",
+                language="en",
+                configuration=Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+            )
+        )
+    _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
+    _jsonl(tmp_path / "asr/segments.jsonl", qwen)
+
+    render_jea_final_samples(
+        visual_inventory=inventory,
+        pairs_root=tmp_path / "pairs",
+        diarization_root=tmp_path / "diarization",
+        qwen3_asr_root=tmp_path / "asr",
+        output_root=tmp_path / "h3",
+    )
+
+    row = json.loads(
+        (tmp_path / "h3/samples.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert [item["entity_id"] for item in row["visual_references"][:2]] == [
+        "entity_1",
+        "entity_2",
+    ]
+    assert [item["entity_id"] for item in row["subject_voices"]] == ["entity_1"]
+    assert [item["entity_id"] for item in row["speech_segments"]] == [
+        "entity_1",
+        "entity_2",
+    ]
 
 
 def test_final_cross_pair_swaps_only_donor_voice(tmp_path: Path) -> None:

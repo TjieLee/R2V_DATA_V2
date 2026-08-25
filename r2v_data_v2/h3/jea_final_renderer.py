@@ -98,13 +98,26 @@ class FinalH3SampleV2(SchemaModel):
         indexes = [item.image_index for item in self.visual_references]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("final Visual references must preserve canonical order")
-        subject_ids = {
+        subject_ids = [
             item.entity_id for item in self.visual_references if item.kind == "subject"
+        ]
+        subject_index_by_entity = {
+            entity_id: index for index, entity_id in enumerate(subject_ids, start=1)
         }
-        if {item.entity_id for item in self.subject_voices} != subject_ids:
+        voice_entity_ids = [item.entity_id for item in self.subject_voices]
+        if len(voice_entity_ids) != len(set(voice_entity_ids)):
+            raise ValueError("subject voice bindings must have unique entity IDs")
+        if not set(voice_entity_ids).issubset(subject_index_by_entity):
             raise ValueError(
                 "only canonical subject references may receive voice binding"
             )
+        for voice in self.subject_voices:
+            if voice.target_occurrence_id != f"{self.clip_uid}/{voice.entity_id}":
+                raise ValueError("subject voice target occurrence is inconsistent")
+            if voice.subject_index != subject_index_by_entity[voice.entity_id]:
+                raise ValueError(
+                    "subject voice index must match canonical subject order"
+                )
         if any(not item.text.strip() for item in self.speech_segments):
             raise ValueError("final Qwen3 speech segments must be non-empty")
         return self
