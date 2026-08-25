@@ -3,14 +3,25 @@
 This file is the repository-level handoff and operating contract for Codex, ChatGPT, and other coding agents. Read it before inspecting, editing, testing, or proposing server commands.
 
 > **Branch-specific V3 override — `feature/v3-subject-attributes-v1`:** The
-> current Visual/Subject Attribute code freeze is
-> `51fef9d44bb1372b4afad5fed9795d5c3d46bda7`. Read
-> `docs/V3_SUBJECT_ATTRIBUTES_STATE.md` and
-> `docs/VISUAL_ATTRIBUTE_DEVELOPMENT_HANDOFF.md` before changing V3
-> references. The older V2/main flow below is legacy context and does not
-> override current V3 state documents. Annotation production remains frozen;
-> Audio/H3 is a separate branch. Do not infer current V3 removal or completion
-> behavior from the old V2 FLUX or Qwen Image Edit text in this file.
+> repository is `TjieLee/R2V_DATA_V2`; the
+> final Visual/reference code freeze is
+> `d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0`. A later docs-only commit may
+> advance branch `HEAD`, but it does not change that algorithm freeze. The
+> frozen original Visual branch is `feature/v3-runtime-integrity-v1` at
+> `87bd4e06107d7f56df550979b0e96515cb70f911`; its core original Visual
+> algorithm baseline is `3cfb11fdd1fbe4a5bbad02a775097d8ab3097288`. Before
+> changing or operating V3, every new agent must read, in order:
+>
+> 1. `docs/VISUAL_ATTRIBUTE_DEVELOPMENT_HANDOFF.md`
+> 2. `docs/V3_SUBJECT_ATTRIBUTES_STATE.md`
+> 3. `docs/SERVER_ENVIRONMENT_RUNBOOK.md`
+> 4. `docs/V3_VISUAL_AUDIO_INTEGRATION.md`
+>
+> These files override old chats, the legacy sections below, the old README,
+> and older design docs.
+> Verify branch and `HEAD` from GitHub before deciding what to develop or run;
+> never guess current server or branch state from chat history. Annotation
+> production remains frozen. Audio/H3 is developed only on its separate branch.
 
 ## 1. Repository identity
 

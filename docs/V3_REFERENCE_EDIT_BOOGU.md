@@ -1,211 +1,145 @@
-# V3 Boogu Reference Edit
+# V3 Boogu Reference Completion Contract
 
-This is the production V3 post-pair `reference_edit` stage. It treats Boogu
-output as a newly generated reference image, not as a repair layer for the
-canonical reference. Legacy Qwen completion source and artifacts remain
-readable, but production pairing does not invoke that fallback when this stage
-is enabled.
+Last updated: 2026-08-26
 
-## Fixed server layout
+## Freeze identity
 
 ```text
-Boogu code:   /mnt/workspace/litengjie/data/vendor/Boogu-Image
-Boogu Python: /mnt/workspace/litengjie/data/venvs/boogu-image/bin/python
-Boogu model:  /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708
-Revision:     hotfix-1k-20260708
+repository: TjieLee/R2V_DATA_V2
+Visual/reference branch: feature/v3-subject-attributes-v1
+final Visual/reference code freeze: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+
+frozen original Visual branch: feature/v3-runtime-integrity-v1
+frozen original Visual HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
+core original Visual algorithm baseline: 3cfb11fdd1fbe4a5bbad02a775097d8ab3097288
 ```
 
-The parent process invokes the configured Python executable directly. The
-worker does not run `conda activate`, `source activate`, or `micromamba
-activate`. The model is loaded from the local path with network access disabled.
+Later docs-only commits may advance branch HEAD. This document describes the
+frozen production behavior at the code freeze above.
 
-## Image contract
+## Fresh Subject/Object behavior
 
-`selected/<entity_id>.png` remains immutable. A source with alpha is composited
-onto pure white to create the sole RGB model input. No alpha mask or SAM mask is
-sent to Boogu.
+Boogu is used only for repairable `complete_entity` references. Complete and
+locally usable references remain canonical alpha. Fresh entity-background
+generation is disabled and its generated-background variant remains unavailable
+with reason `entity_background_disabled_by_policy`.
 
-The output dimensions are derived from the source aspect ratio at approximately
-one megapixel and aligned to multiples of 16. Width and height are passed
-explicitly to the worker. Boogu must return one RGB PNG at exactly those
-dimensions. The result is never resized or cropped back to the source size.
-
-For `complete_entity`, instruction rewriting is enabled. For
-`add_entity_background`, instruction rewriting is disabled. Both operations
-produce a complete new image. The accepted `final_reference_1k.png` is a
-byte-for-byte copy of the native worker candidate. There is no mask paste-back,
-foreground restoration, protected-core restoration, or pixel-identity gate.
-
-The production instructions are fixed:
+The exact generation prompt is:
 
 ```text
-图片中只有一个实体，实体是“{entity_phrase}”。补全残缺的部分。不要引入新的实体，风格保持一致。如果补全不了，则只保留最能表示该实体的部分，去除零散且不合理的部分。
-给图像添加符合风格的背景，不要增加任何实例。
+Complete the missing or broken parts of the same target entity: "{entity_phrase}".
+Preserve its identity, appearance, colors, materials, proportions, and style.
+Do not add another entity or unrelated content.
+Remove broken fragments and keep uncertain completion simple and consistent with visible evidence.
 ```
 
-SAM3 may re-segment a generated candidate for presence, instance-count, growth,
-and fragmentation diagnostics. Those masks are review-only and cannot modify
-the candidate.
-
-Before generation, source content geometry is measured from the nonzero alpha
-bbox, never from the full transparent or white canvas. Sources with bbox area
-below `16384` pixels or longest bbox side below `128` pixels fall back to the
-unchanged source with `tiny_source_entity`; no Boogu request is sent. The long
-side rule intentionally permits sufficiently large thin objects.
-
-When SAM3 returns a candidate target mask, both bboxes are normalized to their
-own image dimensions. Publication requires:
+The first attempt uses the canonical source candidate. When it is rejected or
+not better and an alternate source exists, the second attempt uses candidate 2.
+The alternate attempt records:
 
 ```text
-candidate_scale_ratio = candidate_normalized_bbox_area / source_normalized_bbox_area
-candidate_scale_ratio >= 0.60
-normalized_center_distance <= 0.20
+completion_attempt_index
+completion_source_candidate_id
+completion_source_frame_index
+comparison_source_image_path
+comparison_source_image_hash
 ```
 
-Scale collapse and layout shift reject with `entity_scale_collapsed` and
-`entity_shifted_off_layout`. If SAM3 cannot produce a mask, no geometry values
-are fabricated; the existing fail-closed or background `not_found` policy
-applies, and Qwen must still affirm subject scale and layout preservation.
+An accepted candidate-2 reference publishes its actual alternate
+`source_frame_index`. Legacy metadata without that field falls back to the
+canonical reference frame for read compatibility.
 
-Every SAM review records `diagnostics.failure_kind` as `none`, `not_found`,
-`multiple_instances`, `excessive_area_growth`, `fragmented`, or
-`backend_failure`. Qwen rejection always rejects. A passing SAM review follows
-the normal acceptance path. The only SAM failure exception is
-`add_entity_background` with an accepted Qwen review and `not_found`; that
-candidate may publish with `sam_warning: target_not_found`. Completion
-`not_found` and every other SAM failure remain hard rejections.
-
-## Subject Attribute Completion Reuse
-
-Subject Attribute completion reuses the same persistent Boogu infrastructure
-and GPU6 capacity, but it is not the normal entity `reference_edit` validation
-path.
-
-Its frozen generic prompt is:
+The final routing is:
 
 ```text
-把图片中破损、缺失或不完整的区域补充完整。
+candidate 1 completion + comparative Qwen
+  -> accepted and better: completion 1
+  -> otherwise candidate 2 when available
+       -> completion 2 + three-image comparative Qwen
+       -> accepted and better: completion 2
+       -> otherwise canonical alpha
 ```
 
-Normal `reference_edit` may use generated-candidate SAM3 masks for review-only
-diagnostics as documented above. Subject Attribute completion does not run
-generated-image SAM3 resegmentation and does not apply the normal
-`reference_edit` SAM diagnostics or geometry gates to the completed image.
-Acceptance is determined by `SubjectAttributeCompletionReview`; an accepted
-candidate publishes the native Boogu RGB output.
+After reference integrity, a failed selected completion falls back to canonical
+alpha integrity. Bbox is attempted only after alpha integrity fails. Completion
+does not fall directly to bbox.
 
-Do not apply normal entity-reference SAM diagnostics, completion masks, alpha
-restoration, or geometry gates to Subject Attribute completion unless a future
-explicit design changes this contract.
+## Review and SAM gates
 
-## Artifacts
+The comparative Qwen review requires the same physical entity, identity, and
+semantics. A modest real improvement is enough; equivalent output returns to
+canonical alpha. Translation, recentering, moderate scale, crop, and layout
+changes are allowed. Warped structure, duplicate or wrong instances, tiny
+targets, and extreme-corner placement reject.
+
+SAM review still hard-rejects target-not-found, multiple target instances,
+severe fragmentation, and backend failure. For `complete_entity`, source-relative
+area growth, scale, and center shift are diagnostic only because valid repair
+may complete missing structure. Legacy background-operation compatibility may
+retain its old gates, but fresh production never routes to that operation.
+
+SAM masks used by Subject/Object reference edit are review evidence. They do not
+alter the generated image artifact. The persistent Boogu worker loads once on
+GPU 6 and serves reference edit serially per worker while the pipeline remains
+concurrent across stages.
+
+## Subject Attribute completion reuse
+
+Attribute completion reuses the persistent GPU 6 Boogu worker but has a separate
+exact prompt:
 
 ```text
-clips/<clip_uid>/reference_edit/<entity_id>/
-  source_rgba.png
-  source_input_rgb.png
-  completion_candidate_1k.png
-  completion_metadata.json
-  completion_rejection.json
-  background_candidate_1k.png
-  background_metadata.json
-  background_rejection.json
-  final_reference_1k.png
-  final_metadata.json
+补全成完整的{entity_name}，去除掉破碎的部分，不添加其他内容
 ```
 
-Rejected candidates remain diagnostic artifacts. Rejection never changes the
-canonical reference and never publishes a composited rescue image. The caller
-may keep the canonical reference, try another source candidate, or reject the
-entity.
-
-## Persistent worker boundary
-
-The stage starts one worker process before its first eligible entity:
-
-```bash
-/mnt/workspace/litengjie/data/venvs/boogu-image/bin/python \
-  tools/run_v3_boogu_reference_edit_worker.py \
-  --serve \
-  --code-root /mnt/workspace/litengjie/data/vendor/Boogu-Image \
-  --model-path /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708 \
-  --model-name Boogu-Image-0.1-Edit-Turbo \
-  --model-revision hotfix-1k-20260708 \
-  --device cuda:0 \
-  --seed 0
-```
-
-The worker loads the pipeline once, emits a JSONL readiness record, then reads
-one request per stdin line and writes one response per stdout line. Every edit
-and shutdown message carries a `request_id`. All eligible entities in the stage
-reuse this process. The parent sends shutdown after the stage, writes worker
-stderr to a separate run log, and fails closed on timeout, process exit,
-request-ID mismatch, or invalid JSON. When there are no eligible entities, no
-worker is started. `CUDA_VISIBLE_DEVICES` comes from `reference_edit` config.
-The native call uses `align_res=false`, and an exposed instruction rewriter is
-moved explicitly to the same configured device. A valid per-request JSONL error
-rejects only that generation; it does not unload the worker or prevent later
-entities from using the already loaded pipeline.
-
-The worker is the only repository file that imports torch or Boogu, and those
-imports occur once during worker startup. macOS development and unit tests use
-fake backends and do not load Boogu, CUDA, weights, or real data.
-
-## Production routing
-
-The candidate judge records `image_quality` and one completeness route:
-`complete`, `repairable`, `local_usable`, `severely_incomplete`, or
-`fragmented`. `complete` runs only background generation. `repairable` first
-runs completion review, then passes the accepted completion candidate into
-background generation using the same worker. `local_usable` runs background
-generation but retains its local scope and visibility semantics. The two severe
-outcomes do not enter this stage.
-
-Visible truncation through a person's torso, hips, buttocks, legs, or arms, or
-through a main object structure, is `repairable` even when the visible mask is
-one connected component. A stable local identity view without such truncation
-may remain `local_usable`. For legacy local references with no completeness
-value, a non-whole recognizable alpha bbox touching the canvas boundary routes
-to repairable; an explicit `local_usable` value always wins.
-
-Qwen and SAM3 review each generated candidate; SAM3 masks are review-only. If a
-repairable completion passes but background generation fails, the accepted
-completion candidate is published byte-for-byte and `final_metadata.json`
-records `background_fallback=completion_candidate`. Other rejections follow the
-configured `keep_source` or `reject_entity` policy. Background generation is an
-optional enhancement, not a mandatory replacement. Its existing structured
-Qwen review compares source and candidate and must affirm subject scale, subject
-layout, coherent and beneficial background, and that the candidate is
-preferable to the source. Final selection is deterministic:
+Mapping:
 
 ```text
-repairable: accepted background > accepted completion > source
-complete/local_usable: accepted preferable background > source
+face -> 人脸
+headwear -> 帽子
+accessory -> 配饰
+upper_clothing -> 衣服
+lower_clothing -> 下装
+dress_or_skirt -> 裙子
 ```
 
-`final_metadata.json` records `final_selection` and
-`final_selection_reason`. A source fallback remains non-synthetic and preserves
-the original reference fields and bytes.
+Hair, glasses, shoes, and bag do not enter completion. Attribute comparison uses
+raw alpha, source RGB bbox as identity-only evidence, and the generated
+candidate. Face must preserve the same person; other types must preserve the
+same physical item or component. A modest improvement is enough and an
+equivalent candidate returns to alpha.
 
-## Manual smoke regression checklist
+Accepted Attribute Boogu output is published directly as RGB PNG. It receives
+no completion SAM3, alpha restoration, foreground extraction, or bbox pass.
+Fresh Attribute background generation is disabled with reason
+`attribute_background_disabled_by_policy`.
 
-Run these only on the server pilot; the identifiers are review notes and are
-not production conditions.
+## Artifacts and provenance
 
-- Extreme tiny-person source: expect `tiny_source_entity` and no Boogu request.
-- Both examples where the subject shrank into the upper-left: expect the
-  scale/layout gate to reject publication.
-- `b35058...` / `e3`: expect `repairable`; completion failure keeps the source.
-- `b35058...` / `e1`: an implausible background must not replace the source.
-- Duplicate-crab example: duplicate candidate remains a hard rejection.
+Attempt artifacts remain durable and auditable, including the canonical and
+alternate source inputs, generated candidates, Qwen/SAM review JSON, and
+per-attempt metadata. Candidate-retry layouts may include names such as:
 
-## Validation
-
-Run local CPU checks with POSIX shell commands:
-
-```bash
-python -m pytest tests/test_v3_reference_edit_boogu.py -q
-python -m pytest -q
-python -m ruff check .
-git diff --check
+```text
+alternate_source_2.png
+completion_candidate_2_1k.png
+metadata_2.json
 ```
+
+Internal retry provenance is not part of the public
+`r2v.v3.production_sample.1` schema. The stable public reference carries its
+selected `source_frame_index` and normal entity/reference provenance.
+
+## Frozen runtime
+
+```text
+Boogu code: /mnt/workspace/litengjie/data/vendor/Boogu-Image
+Boogu python: /mnt/workspace/litengjie/data/venvs/boogu-image/bin/python
+Boogu model: /mnt/workspace/litengjie/data/models/Boogu-Image-0.1-Edit-Turbo-hotfix-1k-20260708
+GPU: 6
+instruction rewrite: disabled for completion
+thinking: disabled
+```
+
+Do not change this contract without new production evidence and an explicit
+unfreeze decision.
