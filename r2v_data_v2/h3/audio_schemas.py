@@ -12,7 +12,6 @@ AUDIO_CLIP_BINDING_SCHEMA_VERSION = "r2v.audio.clip_binding.1"
 AUDIO_PAIR_SAMPLE_SCHEMA_VERSION = "r2v.audio.pair_sample.1"
 H3_SAMPLE_SCHEMA_VERSION = "r2v.h3.sample.1"
 
-_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
 _TURN_ID = re.compile(r"turn_[1-9]\d*")
@@ -23,12 +22,13 @@ _AUDIO_ID = re.compile(r"audio_[1-9]\d*")
 
 def _validate_relative_path(value: str, field_name: str) -> str:
     normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
     if (
         not normalized.strip()
-        or normalized.startswith(("/", "../"))
-        or "/../" in normalized
-        or normalized.endswith("/..")
-        or _SAFE_ID.fullmatch(normalized) is None
+        or "\x00" in normalized
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:/", normalized) is not None
+        or any(part in {"", ".", ".."} for part in parts)
     ):
         raise ValueError(f"{field_name} must be a safe export-relative path")
     return normalized

@@ -6,10 +6,12 @@ import math
 import wave
 from array import array
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from r2v_data_v2.h3.audio_backends import FFmpegAudioMediaBackend
+from r2v_data_v2.h3.jea_audio_production import run_jea_primary_voice_stage
 from r2v_data_v2.h3.pilot_schemas import (
     AssociationConfidenceDiagnostics,
     LRASDScoreDiagnostics,
@@ -31,6 +33,7 @@ from r2v_data_v2.h3.schemas import (
     PictureAsset,
     SemanticSubject,
 )
+from r2v_data_v2.h3.visual_production_source import ReadableClipIdentity
 
 
 def _turn(
@@ -127,6 +130,14 @@ class _SampleSliceBackend:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(frames)
         return destination
+
+
+class _FailingSampleSliceBackend:
+    def extract_voice_reference(self, **request: object) -> Path:
+        destination = Path(str(request["destination"]))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"partial")
+        raise RuntimeError("simulated primary voice export failure")
 
 
 def _write_pilot(
@@ -329,6 +340,73 @@ def test_offline_export_is_read_only_and_publishes_exact_selected_samples(
         "voice_refs/clip-a/e1/voice_ref_1.flac",
     ):
         assert (output / relative).read_bytes() == (second_output / relative).read_bytes()
+
+
+def test_jea_primary_voice_publishes_unicode_readable_asset_path(
+    tmp_path: Path,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    _write_pilot(pilot, [_turn()])
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/不惑之旅/不惑之旅 第一集/片段 01",
+        media_collection_relpath="01/不惑之旅",
+        media_collection_name="不惑之旅",
+        episode_name="不惑之旅 第一集",
+        clip_name="片段 01",
+        shard_id="shard-1",
+    )
+
+    summary = run_jea_primary_voice_stage(
+        visual_inventory=SimpleNamespace(
+            clips=[SimpleNamespace(identity=identity)]
+        ),
+        audio_root=pilot,
+        output_root=output,
+        audio_backend=_SampleSliceBackend(),
+    )
+
+    expected = Path("01/不惑之旅/不惑之旅 第一集/片段 01/e1.flac")
+    assert (output / expected).is_file()
+    selection = json.loads(
+        (output / "primary_voice_references.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    reference = selection["primary_voice_reference"]
+    assert reference["asset"]["path"] == expected.as_posix()
+    assert summary.selected_reference_rows[0]["asset_path"] == expected.as_posix()
+
+
+def test_failed_jea_primary_voice_export_leaves_no_completed_directory(
+    tmp_path: Path,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    _write_pilot(pilot, [_turn()])
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/创世纪 全系列/创世纪 第一集/片段 01",
+        media_collection_relpath="01/创世纪 全系列",
+        media_collection_name="创世纪 全系列",
+        episode_name="创世纪 第一集",
+        clip_name="片段 01",
+        shard_id="shard-1",
+    )
+
+    with pytest.raises(RuntimeError, match="simulated primary voice export failure"):
+        run_jea_primary_voice_stage(
+            visual_inventory=SimpleNamespace(
+                clips=[SimpleNamespace(identity=identity)]
+            ),
+            audio_root=pilot,
+            output_root=output,
+            audio_backend=_FailingSampleSliceBackend(),
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".primary_voice.tmp-*"))
 
 
 def test_ffmpeg_backend_slices_exact_pcm_samples_before_flac_encoding(

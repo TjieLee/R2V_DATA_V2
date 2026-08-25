@@ -1386,6 +1386,59 @@ def test_audio_asset_path_traversal_fails_closed(tmp_path: Path) -> None:
         AudioClipBinding.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "01/不惑之旅/不惑之旅_01/e1.flac",
+        "01/创世纪 全系列/创世纪1.罗嘉良,陈锦鸿.靖洋.国语1999/e1.flac",
+        "02/伊伦嘉：诱惑的艺术/example/e1.flac",
+        "voice_refs/clip-a/e1/voice_ref_1.flac",
+    ],
+)
+def test_file_asset_accepts_safe_unicode_readable_paths(path: str) -> None:
+    asset = FileAsset(
+        path=path,
+        sha256="a" * 64,
+        byte_size=1,
+        media_type="audio/flac",
+    )
+
+    assert asset.path == path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/absolute/file.flac",
+        "../escape.flac",
+        "a/../escape.flac",
+        "a/./file.flac",
+        "C:/absolute/file.flac",
+        "a//file.flac",
+        "a/file.flac\x00",
+    ],
+)
+def test_file_asset_rejects_unsafe_relative_paths(path: str) -> None:
+    with pytest.raises(ValidationError, match="safe export-relative path"):
+        FileAsset(
+            path=path,
+            sha256="a" * 64,
+            byte_size=1,
+            media_type="audio/flac",
+        )
+
+
+def test_file_asset_normalizes_legacy_backslash_paths() -> None:
+    asset = FileAsset(
+        path=r"01\不惑之旅\不惑之旅_01\e1.flac",
+        sha256="a" * 64,
+        byte_size=1,
+        media_type="audio/flac",
+    )
+
+    assert asset.path == "01/不惑之旅/不惑之旅_01/e1.flac"
+
+
 def test_visual_stage_order_remains_frozen() -> None:
     pipeline_source = Path("run_pipeline_v3.py").read_text(encoding="utf-8")
 
