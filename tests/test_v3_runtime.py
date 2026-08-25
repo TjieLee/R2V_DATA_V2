@@ -962,6 +962,95 @@ def test_deferred_subject_attributes_start_no_attribute_or_gme_workers(
     assert result["completed_stages"] == []
 
 
+def test_subject_attributes_without_completion_do_not_start_boogu_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            mode="streaming_v1",
+            gpu_workers=replace(
+                config.runtime.gpu_workers,
+                reference_edit="6",
+            ),
+        ),
+    )
+    config_path = tmp_path / "runtime.yaml"
+    config_path.write_text("unused: true\n", encoding="utf-8")
+
+    class Storage:
+        root = config.resolved_run_root
+
+        def iter_clips(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(clip_uid="clip-a")]
+
+        def update_stage_counts(self, *_args: object) -> None:
+            return None
+
+        def append_failure(self, **_kwargs: object) -> None:
+            return None
+
+    class Scheduler:
+        def __init__(self, stages, **_kwargs):
+            self.stages = stages
+
+        def run(self, clip_uids):
+            return SimpleNamespace(
+                stage_counts={stage.name: {"processed": 1} for stage in self.stages},
+                failed_tasks=[],
+                to_dict=lambda: {},
+            )
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "PersistentStageProcess",
+        lambda *_args, **_kwargs: pytest.fail("Boogu worker started"),
+    )
+    monkeypatch.setattr(pipeline_module, "StreamingDAGScheduler", Scheduler)
+    monkeypatch.setattr(
+        pipeline_module,
+        "_streaming_stage_handler",
+        lambda **_kwargs: (lambda _clip_uid: {"processed": 1}),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "reconcile_subject_attribute_outputs",
+        lambda **_kwargs: {},
+    )
+
+    pipeline_module._run_streaming_pipeline(
+        config_path=config_path,
+        config=config,
+        storage=Storage(),  # type: ignore[arg-type]
+        ordered_stages=("subject_attributes",),
+        overwrite=False,
+        profiler=None,
+        results={},
+        annotation_client=None,
+        frame_decoder=None,
+        segmentation_backend=None,
+        instruction_client=None,
+        background_removal_backend=None,
+        background_removal_judge=None,
+        entity_reference_judge=None,
+        cross_pair_judge=None,
+        background_final_judge=None,
+        reference_completion_backend=None,
+        reference_completion_judge=None,
+        reference_edit_backend=None,
+        reference_edit_judge=None,
+        reference_edit_sam_reviewer=None,
+        reference_integrity_judge=None,
+        subject_attribute_discovery_client=object(),
+        subject_attribute_review_client=object(),
+        attribute_segmentation_backend=object(),
+        attribute_gme_screener=None,
+    )
+
+
 def test_dag_overlaps_different_clips_but_never_same_clip_writers() -> None:
     active_by_clip: dict[str, int] = {}
     maximum_by_clip: dict[str, int] = {}
@@ -1638,51 +1727,9 @@ def test_attribute_completion_disables_thinking_and_instruction_rewrite(
     assert result["instruction_rewrite_enabled"] is False
 
 
-def test_attribute_background_reuses_boogu_without_thinking_or_rewrite(
-    tmp_path: Path,
-) -> None:
-    sidecar = tmp_path / "subject_attributes"
-    source_path = sidecar / "references" / "clip" / "a1.png"
-    output_path = sidecar / "variants" / "clip" / "a1" / "background.png"
-    source_path.parent.mkdir(parents=True)
-    Image.new("RGBA", (64, 48), (80, 90, 100, 255)).save(source_path)
-    observed: dict[str, object] = {}
-
-    class Backend:
-        def edit(self, **kwargs):
-            observed.update(kwargs)
-            buffer = io.BytesIO()
-            Image.new("RGB", (kwargs["width"], kwargs["height"]), "gray").save(
-                buffer,
-                format="PNG",
-            )
-            return SimpleNamespace(png_bytes=buffer.getvalue())
-
-    runtime = object.__new__(_StageRuntime)
-    runtime.stage = "reference_edit"
-    runtime.storage = SimpleNamespace(root=tmp_path)
-    runtime._reference_edit_backend = Backend()
-    runtime.config = SimpleNamespace(
-        reference_edit=SimpleNamespace(
-            target_area=1024 * 1024,
-            alignment=16,
-            model_path=Path("/model/boogu"),
-        )
-    )
-
-    result = runtime.attribute_background(
-        source_path=source_path,
-        output_path=output_path,
-        instruction="add a simple supporting background",
-        seed=23,
-    )
-
-    assert output_path.is_file()
-    assert observed["thinking_enabled"] is False
-    assert observed["instruction_rewrite_enabled"] is False
-    assert observed["seed"] == 23
-    assert result["thinking_enabled"] is False
-    assert result["instruction_rewrite_enabled"] is False
+def test_attribute_background_runtime_request_path_is_removed() -> None:
+    assert not hasattr(_StageRuntime, "attribute_background")
+    assert not hasattr(PersistentStageProcess, "attribute_background")
 
 
 def test_segment_pool_returns_worker_after_attribute_probe_exception() -> None:

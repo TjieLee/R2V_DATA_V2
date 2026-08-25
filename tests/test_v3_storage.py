@@ -2053,8 +2053,19 @@ def test_exporter_publishes_attribute_variants_with_one_default_binding(
     assert manifest["kind"] == "attribute"
     assert manifest["attribute_id"] == "a1"
     assert manifest["owner_entity_id"] == "e1"
-    assert manifest["default_variant"] == "generated_background"
+    assert generated_path.is_file()
+    assert manifest["default_variant"] == "accepted_base"
     assert manifest["default_image_path"] == exported_enriched.references[1].image_path
+    assert manifest["variants"]["generated_background"] == {
+        "image_path": None,
+        "status": "unavailable",
+        "reviewed": False,
+        "review_status": "not_applicable",
+        "reason": "attribute_background_disabled_by_policy",
+        "synthetic": True,
+        "metadata_path": None,
+        "source_frame_index": 10,
+    }
     for variant in manifest["variants"].values():
         if variant["image_path"] is not None:
             assert (export_root / variant["image_path"]).is_file()

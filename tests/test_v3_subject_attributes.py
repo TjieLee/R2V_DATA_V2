@@ -5,8 +5,10 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 import pytest
+from openai import BadRequestError
 from PIL import Image
 from pydantic import ValidationError
 
@@ -978,6 +980,162 @@ def test_review_keeps_distinct_owner_contexts_and_output_order(
     assert sum(item.get("type") == "image_url" for item in content) == 6
     assert len(context_labels) == 3
     assert [review.attribute_id for review in payload.reviews] == ["a1", "a2", "a3"]
+
+
+def _bbox_review_payload(*, accepted: bool = True) -> dict[str, object]:
+    return {
+        "correct_attribute": accepted,
+        "owner_binding_correct": accepted,
+        "target_is_dominant_and_identifiable": accepted,
+        "no_large_competing_attribute_or_entity": accepted,
+        "context_is_limited_and_supportive": accepted,
+        "no_severe_blur_or_artifact": accepted,
+        "usable_as_attribute_condition": accepted,
+        "certain": accepted,
+        "reason": "usable" if accepted else "not usable",
+        "verdict": "accept" if accepted else "reject",
+    }
+
+
+class _SequencedAttributeCompletions:
+    def __init__(self, responses: list[dict[str, object] | BaseException]) -> None:
+        self.responses = iter(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        response = next(self.responses)
+        if isinstance(response, BaseException):
+            raise response
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(response))
+                )
+            ]
+        )
+
+
+def _bbox_review_client(
+    completions: _SequencedAttributeCompletions,
+) -> subject_attributes.QwenSubjectAttributeClient:
+    return subject_attributes.QwenSubjectAttributeClient(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+
+def _call_bbox_review(
+    client: subject_attributes.QwenSubjectAttributeClient,
+) -> subject_attributes.SubjectAttributeBboxReview:
+    return client.review_attribute_bbox(
+        bbox_candidate=Image.new("RGB", (32, 24), "gray"),
+        owner_context=Image.new("RGB", (48, 40), "white"),
+        attribute_type="upper_clothing",
+        attribute_phrase="gray robe",
+    )
+
+
+def test_bbox_review_uses_strict_json_schema() -> None:
+    completions = _SequencedAttributeCompletions([_bbox_review_payload()])
+
+    review = _call_bbox_review(_bbox_review_client(completions))
+
+    assert review.verdict == "accept"
+    response_format = completions.calls[0]["response_format"]
+    assert response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "v3_subject_attribute_bbox_review",
+            "strict": True,
+            "schema": subject_attributes.SubjectAttributeBboxReview.model_json_schema(),
+        },
+    }
+
+
+def test_bbox_review_json_schema_falls_back_with_full_schema() -> None:
+    bad_request = BadRequestError(
+        "json_schema unsupported",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "http://test/v1/chat/completions"),
+        ),
+        body={},
+    )
+    completions = _SequencedAttributeCompletions(
+        [bad_request, _bbox_review_payload()]
+    )
+
+    review = _call_bbox_review(_bbox_review_client(completions))
+
+    assert review.verdict == "accept"
+    assert completions.calls[1]["response_format"] == {"type": "json_object"}
+    fallback_prompt = completions.calls[1]["messages"][-1]["content"]
+    assert json.dumps(
+        subject_attributes.SubjectAttributeBboxReview.model_json_schema(),
+        ensure_ascii=False,
+    ) in fallback_prompt
+    assert "Every required field must be present" in fallback_prompt
+    assert "Do not omit booleans" in fallback_prompt
+
+
+def test_bbox_review_missing_fields_gets_exactly_one_structural_repair() -> None:
+    completions = _SequencedAttributeCompletions(
+        [
+            {"reason": "usable", "verdict": "accept"},
+            _bbox_review_payload(),
+        ]
+    )
+
+    review = _call_bbox_review(_bbox_review_client(completions))
+
+    assert review.verdict == "accept"
+    assert len(completions.calls) == 2
+    repair_prompt = completions.calls[1]["messages"][-1]["content"]
+    assert '"reason": "usable"' in repair_prompt
+    assert "Validation error" in repair_prompt
+    assert "Required schema" in repair_prompt
+
+
+def test_bbox_review_second_invalid_response_fails_after_one_repair() -> None:
+    completions = _SequencedAttributeCompletions(
+        [
+            {"reason": "usable", "verdict": "accept"},
+            {"reason": "still incomplete", "verdict": "accept"},
+        ]
+    )
+
+    with pytest.raises(ValueError, match="invalid structured"):
+        _call_bbox_review(_bbox_review_client(completions))
+
+    assert len(completions.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("false_flag", "model_verdict", "expected_verdict"),
+    [
+        (None, "reject", "accept"),
+        ("no_severe_blur_or_artifact", "accept", "reject"),
+    ],
+)
+def test_bbox_review_verdict_is_normalized_from_complete_flags(
+    false_flag: str | None,
+    model_verdict: str,
+    expected_verdict: str,
+) -> None:
+    payload = _bbox_review_payload()
+    if false_flag is not None:
+        payload[false_flag] = False
+    payload["verdict"] = model_verdict
+    completions = _SequencedAttributeCompletions([payload])
+
+    review = _call_bbox_review(_bbox_review_client(completions))
+
+    assert review.verdict == expected_verdict
+    assert len(completions.calls) == 1
 
 
 def test_owner_aware_rendering_keeps_attributes_after_correct_subject() -> None:
@@ -2787,6 +2945,7 @@ def _run_completion_routing_case(
     class Backend:
         def __init__(self) -> None:
             self.calls = 0
+            self.background_calls = 0
 
         def attribute_completion(self, *, output_path, **_kwargs):
             self.calls += 1
@@ -2798,6 +2957,10 @@ def _run_completion_routing_case(
             pixels[58:68, 20:80] = (35, 35, 35)
             Image.fromarray(pixels, mode="RGB").save(output_path)
             return {"model_call_time_seconds": 0.1}
+
+        def attribute_background(self, **_kwargs):
+            self.background_calls += 1
+            raise AssertionError("attribute background is disabled by policy")
 
     class Segmenter:
         def __init__(self) -> None:
@@ -2875,6 +3038,7 @@ def test_raw_accepted_complete_skips_boogu(tmp_path: Path) -> None:
     assert record.final_selection == "raw"
     assert record.completion_attempted is False
     assert backend.calls == segmenter.generated_calls == 0
+    assert backend.background_calls == 0
     assert review.calls == [["a1"]]
 
 
@@ -2900,6 +3064,7 @@ def test_hair_repair_recommendation_never_calls_boogu(
     assert record.image_path is not None
     assert (tmp_path / "output" / record.image_path).is_file()
     assert backend.calls == 0
+    assert backend.background_calls == 0
 
 
 def test_glasses_publish_raw_without_boogu(tmp_path: Path) -> None:
@@ -2916,6 +3081,47 @@ def test_glasses_publish_raw_without_boogu(tmp_path: Path) -> None:
     assert record.image_path is not None
     assert (tmp_path / "output" / record.image_path).is_file()
     assert backend.calls == 0
+    assert backend.background_calls == 0
+
+
+@pytest.mark.parametrize(
+    "attribute_type",
+    [
+        "face",
+        "hair",
+        "headwear",
+        "glasses",
+        "upper_clothing",
+        "lower_clothing",
+        "dress_or_skirt",
+        "shoes",
+        "bag",
+        "accessory",
+    ],
+)
+def test_fresh_attribute_never_calls_background_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attribute_type: str,
+) -> None:
+    monkeypatch.setattr(subject_attributes, "HAIR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS", 4)
+    monkeypatch.setattr(
+        subject_attributes,
+        "HEADWEAR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS",
+        4,
+    )
+
+    artifact, _, backend, _ = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_complete",
+        first_attribute_type=attribute_type,
+    )
+
+    assert artifact.records[0].status == "accepted"
+    assert backend.background_calls == 0
+    assert artifact.metrics.attribute_background_variants_attempted == 0
+    assert artifact.metrics.attribute_background_variants_accepted == 0
+    assert artifact.metrics.attribute_bbox_reviews_skipped_background_accepted == 0
 
 
 @pytest.mark.parametrize(
@@ -2948,6 +3154,7 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
         failure_stage == "identity_reject"
     )
     assert backend.calls == 1
+    assert backend.background_calls == 0
     assert segmenter.generated_calls == 0
     assert review.calls == [["a1"]]
     assert record.completion_review == (
@@ -2990,6 +3197,7 @@ def test_raw_accepted_repair_success_selects_completed(
     assert artifact.metrics.completion_accepted_by_type == {"face": 1}
     assert review.calls == [["a1"]]
     assert backend.calls == 1
+    assert backend.background_calls == 0
     assert segmenter.generated_calls == 0
     assert review.crops[0][0].mode == "RGBA"
     assert record.completion_review == _completion_review(accepted=True)
@@ -3017,6 +3225,7 @@ def test_raw_review_is_owner_batched_without_repaired_review(tmp_path: Path) -> 
     assert review.calls == [["a1", "a2"]]
     assert artifact.metrics.review_calls == 1
     assert backend.calls == 2
+    assert backend.background_calls == 0
     assert segmenter.generated_calls == 0
 
 
@@ -3072,27 +3281,11 @@ def test_hard_rejected_or_nonrepairable_raw_never_reaches_boogu(
     assert artifact.metrics.completion_attempts == 0
     assert artifact.metrics.raw_attribute_review_hard_rejected == 1
     assert backend.calls == segmenter.generated_calls == 0
+    assert backend.background_calls == 0
     assert review.calls == [["a1"]]
 
 
-def _attribute_variant_review(*, accepted: bool, background: bool):
-    if background:
-        fields = (
-            "same_attribute_appearance",
-            "shape_color_texture_preserved",
-            "target_is_clear_and_dominant",
-            "no_duplicate_or_unrelated_entity",
-            "background_does_not_occlude_target",
-            "no_halo_or_seam",
-            "no_severe_artifact",
-            "usable_as_attribute_condition",
-            "certain",
-        )
-        return subject_attributes.SubjectAttributeBackgroundReview(
-            **{field: accepted for field in fields},
-            verdict="accept" if accepted else "reject",
-            reason="usable" if accepted else "not usable",
-        )
+def _attribute_variant_review(*, accepted: bool):
     fields = (
         "correct_attribute",
         "owner_binding_correct",
@@ -3113,8 +3306,8 @@ def _attribute_variant_review(*, accepted: bool, background: bool):
 def _run_attribute_variant_case(
     tmp_path: Path,
     *,
-    background_accepts: bool,
     bbox_accepts: bool,
+    bbox_failure: bool = False,
     completed_base: bool = False,
 ):
     mask = np.zeros((100, 100), dtype=bool)
@@ -3162,96 +3355,83 @@ def _run_attribute_variant_case(
         crop_padding_ratio=0.08,
     )
 
-    class Backend:
-        calls = 0
-
-        def attribute_background(self, *, output_path, **_kwargs):
-            self.calls += 1
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            Image.new("RGB", (64, 64), (200, 210, 220)).save(output_path)
-            return {"model_call_time_seconds": 0.1}
-
     class Judge:
-        background_calls = 0
         bbox_calls = 0
-
-        def review_attribute_background(self, **_kwargs):
-            self.background_calls += 1
-            return _attribute_variant_review(
-                accepted=background_accepts,
-                background=True,
-            )
 
         def review_attribute_bbox(self, **_kwargs):
             self.bbox_calls += 1
-            return _attribute_variant_review(
-                accepted=bbox_accepts,
-                background=False,
-            )
+            if bbox_failure:
+                raise RuntimeError("invalid structured review")
+            return _attribute_variant_review(accepted=bbox_accepts)
 
-    backend = Backend()
     judge = Judge()
     metrics = subject_attributes._AttributeVariantMetrics()
     selected = subject_attributes._with_attribute_variants(
         record,
         candidate,
         output_root=tmp_path,
-        sample_id="clip-1",
-        backend=backend,
         judge=judge,
         metrics=metrics,
     )
-    return selected, backend, judge, metrics
+    return selected, judge, metrics
 
 
-def test_attribute_background_accept_skips_bbox_review_and_keeps_bbox(
-    tmp_path: Path,
-) -> None:
-    record, backend, judge, metrics = _run_attribute_variant_case(
-        tmp_path,
-        background_accepts=True,
-        bbox_accepts=False,
-    )
-
-    assert backend.calls == 1
-    assert judge.background_calls == 1
-    assert judge.bbox_calls == 0
-    assert record.default_variant == "generated_background"
-    assert record.variants is not None
-    assert record.variants.bbox.status == "review_skipped"
-    assert (tmp_path / record.variants.bbox.image_path).is_file()
-    assert metrics.bbox_variants_materialized == 1
-    assert metrics.bbox_reviews_attempted == 0
-    assert metrics.bbox_reviews_skipped_background_accepted == 1
-
-
-@pytest.mark.parametrize(
-    ("bbox_accepts", "expected_default"),
-    [(True, "bbox"), (False, "alpha")],
-)
-def test_attribute_background_reject_reviews_bbox_then_selects_default(
+@pytest.mark.parametrize("bbox_accepts", [True, False])
+def test_attribute_variants_use_bbox_and_never_generate_background(
     tmp_path: Path,
     bbox_accepts: bool,
-    expected_default: str,
 ) -> None:
-    record, _, judge, metrics = _run_attribute_variant_case(
+    record, judge, metrics = _run_attribute_variant_case(
         tmp_path,
-        background_accepts=False,
         bbox_accepts=bbox_accepts,
     )
 
-    assert judge.background_calls == 1
     assert judge.bbox_calls == 1
-    assert record.default_variant == expected_default
+    assert record.default_variant == ("bbox" if bbox_accepts else "accepted_base")
+    assert record.variants is not None
+    assert record.variants.alpha.image_path is not None
+    assert (tmp_path / record.variants.alpha.image_path).is_file()
+    assert record.variants.bbox.image_path is not None
+    assert (tmp_path / record.variants.bbox.image_path).is_file()
+    assert record.variants.generated_background.model_dump(mode="json") == {
+        "image_path": None,
+        "status": "unavailable",
+        "reviewed": False,
+        "review_status": "not_applicable",
+        "reason": "attribute_background_disabled_by_policy",
+        "synthetic": True,
+        "metadata_path": None,
+        "source_frame_index": 10,
+    }
+    assert metrics.bbox_variants_materialized == 1
     assert metrics.bbox_reviews_attempted == 1
+
+
+def test_attribute_bbox_judge_failure_preserves_available_path_and_base_default(
+    tmp_path: Path,
+) -> None:
+    record, judge, _ = _run_attribute_variant_case(
+        tmp_path,
+        bbox_accepts=False,
+        bbox_failure=True,
+    )
+
+    assert judge.bbox_calls == 1
+    assert record.variants is not None
+    assert record.variants.bbox.status == "available"
+    assert record.variants.bbox.reviewed is False
+    assert record.variants.bbox.review_status == "judge_failed"
+    assert record.variants.bbox.image_path is not None
+    assert (tmp_path / record.variants.bbox.image_path).is_file()
+    assert record.default_variant == "accepted_base"
+    assert record.image_path == record.accepted_base_image_path
 
 
 def test_completed_attribute_variant_fallback_preserves_accepted_base(
     tmp_path: Path,
 ) -> None:
-    record, _, judge, _ = _run_attribute_variant_case(
+    record, judge, _ = _run_attribute_variant_case(
         tmp_path,
-        background_accepts=False,
         bbox_accepts=False,
         completed_base=True,
     )
@@ -3264,3 +3444,37 @@ def test_completed_attribute_variant_fallback_preserves_accepted_base(
     assert record.variants.alpha.status == "rejected"
     with Image.open(tmp_path / record.image_path) as opened:
         assert opened.mode == "RGB"
+
+
+def test_legacy_attribute_generated_background_is_read_but_not_selected(
+    tmp_path: Path,
+) -> None:
+    record, _, _ = _run_attribute_variant_case(tmp_path, bbox_accepts=False)
+    assert record.variants is not None
+    legacy_background = tmp_path / "variants/clip-1/a1/generated_background.png"
+    legacy_background.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 64), "blue").save(legacy_background)
+    payload = record.model_dump(mode="json")
+    payload["image_path"] = legacy_background.relative_to(tmp_path).as_posix()
+    payload["default_variant"] = "generated_background"
+    payload["default_image_path"] = payload["image_path"]
+    payload["default_reason"] = "attribute_background_review_accepted"
+    payload["variants"]["generated_background"] = {
+        "image_path": payload["image_path"],
+        "status": "accepted",
+        "reviewed": True,
+        "review_status": "accept",
+        "reason": "legacy accepted background",
+        "synthetic": True,
+        "metadata_path": None,
+        "source_frame_index": 10,
+    }
+
+    normalized = SubjectAttributeRecord.model_validate(payload)
+
+    assert legacy_background.is_file()
+    assert normalized.default_variant == "accepted_base"
+    assert normalized.image_path == normalized.accepted_base_image_path
+    assert normalized.variants is not None
+    assert normalized.variants.generated_background.image_path is None
+    assert normalized.variants.generated_background.status == "unavailable"

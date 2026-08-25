@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import io
 import json
 import math
@@ -16,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import numpy as np
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 from PIL import Image
 from pydantic import (
     BaseModel,
@@ -206,41 +205,6 @@ class SubjectAttributeCompletionReview(BooguCompletionReview):
     """Strict identity and quality verdict for an attribute completion."""
 
 
-class SubjectAttributeBackgroundReview(_SchemaModel):
-    same_attribute_appearance: StrictBool
-    shape_color_texture_preserved: StrictBool
-    target_is_clear_and_dominant: StrictBool
-    no_duplicate_or_unrelated_entity: StrictBool
-    background_does_not_occlude_target: StrictBool
-    no_halo_or_seam: StrictBool
-    no_severe_artifact: StrictBool
-    usable_as_attribute_condition: StrictBool
-    certain: StrictBool
-    reason: str
-    verdict: Literal["accept", "reject"]
-
-    @model_validator(mode="after")
-    def validate_review(self) -> SubjectAttributeBackgroundReview:
-        if not self.reason.strip():
-            raise ValueError("attribute background review reason must not be empty")
-        passed = all(
-            (
-                self.same_attribute_appearance,
-                self.shape_color_texture_preserved,
-                self.target_is_clear_and_dominant,
-                self.no_duplicate_or_unrelated_entity,
-                self.background_does_not_occlude_target,
-                self.no_halo_or_seam,
-                self.no_severe_artifact,
-                self.usable_as_attribute_condition,
-                self.certain,
-            )
-        )
-        if self.verdict != ("accept" if passed else "reject"):
-            raise ValueError("attribute background verdict must match strict checks")
-        return self
-
-
 class SubjectAttributeBboxReview(_SchemaModel):
     correct_attribute: StrictBool
     owner_binding_correct: StrictBool
@@ -345,6 +309,75 @@ class GmeAttributeScreenAttempt(_SchemaModel):
         return self
 
 
+_ATTRIBUTE_BACKGROUND_DISABLED_REASON = "attribute_background_disabled_by_policy"
+
+
+def _normalize_attribute_background_policy_payload(value: object) -> object:
+    """Read old Attribute variants while enforcing the current no-BG policy."""
+
+    if not isinstance(value, dict) or value.get("status") != "accepted":
+        return value
+    variants_value = value.get("variants")
+    if isinstance(variants_value, BaseModel):
+        variants_value = variants_value.model_dump(mode="json")
+    if not isinstance(variants_value, dict):
+        return value
+    generated_value = variants_value.get("generated_background")
+    if isinstance(generated_value, BaseModel):
+        generated_value = generated_value.model_dump(mode="json")
+    if not isinstance(generated_value, dict):
+        return value
+    policy_compliant = (
+        generated_value.get("image_path") is None
+        and generated_value.get("status") == "unavailable"
+        and generated_value.get("reviewed") is False
+        and generated_value.get("review_status") == "not_applicable"
+        and generated_value.get("reason") == _ATTRIBUTE_BACKGROUND_DISABLED_REASON
+    )
+    if policy_compliant and value.get("default_variant") != "generated_background":
+        return value
+
+    accepted_base = value.get("accepted_base_image_path")
+    bbox_value = variants_value.get("bbox")
+    if isinstance(bbox_value, BaseModel):
+        bbox_value = bbox_value.model_dump(mode="json")
+    bbox_accepted = (
+        isinstance(bbox_value, dict)
+        and bbox_value.get("status") == "accepted"
+        and isinstance(bbox_value.get("image_path"), str)
+        and bool(bbox_value["image_path"].strip())
+    )
+    default_variant = "bbox" if bbox_accepted else "accepted_base"
+    default_path = bbox_value["image_path"] if bbox_accepted else accepted_base
+    normalized_generated = {
+        "image_path": None,
+        "status": "unavailable",
+        "reviewed": False,
+        "review_status": "not_applicable",
+        "reason": _ATTRIBUTE_BACKGROUND_DISABLED_REASON,
+        "synthetic": True,
+        "metadata_path": None,
+        "source_frame_index": generated_value.get(
+            "source_frame_index", value.get("source_frame_index")
+        ),
+    }
+    return {
+        **value,
+        "image_path": default_path,
+        "variants": {
+            **variants_value,
+            "generated_background": normalized_generated,
+        },
+        "default_variant": default_variant,
+        "default_image_path": default_path,
+        "default_reason": (
+            "attribute_bbox_review_accepted"
+            if bbox_accepted
+            else "attribute_background_disabled_by_policy_fallback_to_accepted_base"
+        ),
+    }
+
+
 class SubjectAttributeRecord(_SchemaModel):
     attribute_id: str = Field(pattern=r"^a[1-9]\d*$")
     owner_entity_id: str = Field(pattern=r"^e[1-9]\d*$")
@@ -373,6 +406,11 @@ class SubjectAttributeRecord(_SchemaModel):
     default_reason: str | None = None
     accepted_base_image_path: str | None = None
     reason: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_disabled_attribute_background(cls, value: object) -> object:
+        return _normalize_attribute_background_policy_payload(value)
 
     @model_validator(mode="after")
     def validate_record(self) -> SubjectAttributeRecord:
@@ -686,6 +724,42 @@ class EnrichedSample(_SchemaModel):
     references: list[EnrichedReference]
     accepted_attributes: list[SubjectAttributeRecord]
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_disabled_attribute_background(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        accepted = value.get("accepted_attributes")
+        references = value.get("references")
+        if not isinstance(accepted, list) or not isinstance(references, list):
+            return value
+        normalized_records = [
+            _normalize_attribute_background_policy_payload(record)
+            for record in accepted
+        ]
+        selected_path_by_id = {
+            record["attribute_id"]: record.get("image_path")
+            for record in normalized_records
+            if isinstance(record, dict)
+            and isinstance(record.get("attribute_id"), str)
+        }
+        normalized_references: list[object] = []
+        for reference in references:
+            if not isinstance(reference, dict) or reference.get("kind") != "attribute":
+                normalized_references.append(reference)
+                continue
+            selected_path = selected_path_by_id.get(reference.get("attribute_id"))
+            normalized_references.append(
+                {**reference, "image_path": selected_path}
+                if isinstance(selected_path, str)
+                else reference
+            )
+        return {
+            **value,
+            "accepted_attributes": normalized_records,
+            "references": normalized_references,
+        }
+
     @model_validator(mode="after")
     def validate_sample(self) -> EnrichedSample:
         indexes = [reference.image_index for reference in self.references]
@@ -778,9 +852,6 @@ class _CompletionSelectionMetrics:
 class _AttributeVariantMetrics:
     bbox_variants_materialized: int = 0
     bbox_reviews_attempted: int = 0
-    bbox_reviews_skipped_background_accepted: int = 0
-    background_variants_attempted: int = 0
-    background_variants_accepted: int = 0
 
 
 @dataclass
@@ -1071,15 +1142,6 @@ class AttributeCompletionBackend(Protocol):
         seed: int,
     ) -> dict[str, object]: ...
 
-    def attribute_background(
-        self,
-        *,
-        source_path: Path,
-        output_path: Path,
-        instruction: str,
-        seed: int,
-    ) -> dict[str, object]: ...
-
 
 class AttributeCompletionJudge(Protocol):
     def review(
@@ -1093,15 +1155,6 @@ class AttributeCompletionJudge(Protocol):
 
 
 class AttributeVariantJudge(Protocol):
-    def review_attribute_background(
-        self,
-        *,
-        accepted_base: Image.Image,
-        generated_candidate: Image.Image,
-        attribute_type: str,
-        attribute_phrase: str,
-    ) -> SubjectAttributeBackgroundReview: ...
-
     def review_attribute_bbox(
         self,
         *,
@@ -1359,16 +1412,6 @@ including its material, color, texture, shape, and structure. Judge visible
 facts only and fail closed when uncertain.
 Return one strict JSON object matching the supplied schema and no other text."""
 
-ATTRIBUTE_BACKGROUND_PROMPT = """Add a simple, natural supporting background behind this single attribute reference.
-Preserve the target attribute exactly: do not change its shape, color, texture, material, identity, or visible details.
-Keep the target clear, dominant, and unobstructed. Do not add another person, object, duplicate attribute, or distracting foreground content.
-Blend the boundary cleanly with no halo or seam. Output one polished attribute reference with a supportive background."""
-
-ATTRIBUTE_BACKGROUND_REVIEW_SYSTEM_PROMPT = """Review a generated-background variant of one accepted attribute reference.
-Image 1 is the accepted base attribute. Image 2 is the generated-background candidate.
-Accept only when Image 2 preserves the same physical attribute and its shape, color, texture, material, and identity-bearing appearance; keeps the target clear, dominant, and unobstructed; adds no duplicate attribute, person, object, or unrelated salient entity; has no halo, seam, severe artifact, or identity-changing edit; and remains useful as an attribute conditioning reference. The background must be merely supportive. Fail closed when uncertain.
-Return exactly the strict JSON schema with reason before verdict and no extra fields."""
-
 ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT = """Review one RGB source bbox for a subject-bound attribute.
 The bbox may contain limited owner body, skin, garment context, or local background. Do not reject that limited context by itself.
 Accept only when the named attribute and intended owner binding are correct, the attribute is dominant and clearly identifiable, no other large competing attribute or entity is present, the context remains limited and supportive, there is no severe blur or artifact, and the bbox is independently useful as an attribute conditioning reference. Fail closed when uncertain.
@@ -1468,6 +1511,149 @@ class QwenSubjectAttributeClient:
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError(f"{component} returned empty content")
         return raw
+
+    def _structured_call(
+        self,
+        *,
+        component: str,
+        messages: list[dict[str, object]],
+        response_model: type[BaseModel],
+        retry_index: int,
+    ) -> str:
+        schema = response_model.model_json_schema()
+        parameters: dict[str, object] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+        operation = "initial" if retry_index == 0 else "repair"
+        try:
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **parameters,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "v3_subject_attribute_bbox_review",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                ),
+                component=component,
+                operation=operation,
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=messages,
+                metadata={"response_format": "json_schema"},
+            )
+        except BadRequestError:
+            fallback_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Return exactly one JSON object matching this schema. "
+                        "Every required field must be present. "
+                        "Do not omit booleans. No extra fields.\n"
+                        + json.dumps(schema, ensure_ascii=False)
+                    ),
+                },
+            ]
+            response = profiled_openai_call(
+                lambda: self.client.chat.completions.create(
+                    **{**parameters, "messages": fallback_messages},
+                    response_format={"type": "json_object"},
+                ),
+                component=component,
+                operation=operation,
+                retry_index=retry_index,
+                model=self.config.model,
+                messages=fallback_messages,
+                metadata={"response_format": "json_object"},
+            )
+        raw = response.choices[0].message.content
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"{component} returned empty content")
+        return raw
+
+    @staticmethod
+    def _normalize_structured_verdict(
+        payload: object,
+        response_model: type[BaseModel],
+    ) -> object:
+        if not isinstance(payload, dict):
+            return payload
+        flag_names = tuple(
+            name
+            for name in response_model.model_fields
+            if name not in {"reason", "verdict"}
+        )
+        if flag_names and all(type(payload.get(name)) is bool for name in flag_names):
+            return {
+                **payload,
+                "verdict": (
+                    "accept" if all(payload[name] for name in flag_names) else "reject"
+                ),
+            }
+        return payload
+
+    def _request_structured(
+        self,
+        *,
+        component: str,
+        system_prompt: str,
+        content: list[dict[str, object]],
+        response_model: type[BaseModel],
+    ) -> BaseModel:
+        schema = response_model.model_json_schema()
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+        raw = self._structured_call(
+            component=component,
+            messages=messages,
+            response_model=response_model,
+            retry_index=0,
+        )
+        for attempt in range(2):
+            try:
+                payload = self._normalize_structured_verdict(
+                    json.loads(raw),
+                    response_model,
+                )
+                return response_model.model_validate(payload)
+            except (TypeError, ValueError) as exc:
+                if attempt == 1:
+                    raise ValueError(
+                        f"invalid structured {component} response: {exc}"
+                    ) from exc
+                repair_messages = [
+                    *messages,
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair only the JSON structure while preserving the "
+                            "original visual judgments. Return exactly one JSON object. "
+                            "Every required field must be present, including every "
+                            "boolean. No extra fields.\n"
+                            f"Original JSON:\n{raw}\n"
+                            f"Validation error:\n{exc}\n"
+                            "Required schema:\n"
+                            + json.dumps(schema, ensure_ascii=False)
+                        ),
+                    },
+                ]
+                raw = self._structured_call(
+                    component=component,
+                    messages=repair_messages,
+                    response_model=response_model,
+                    retry_index=1,
+                )
+        raise AssertionError("unreachable")
 
     def discover(
         self,
@@ -1624,46 +1810,6 @@ class QwenSubjectAttributeClient:
             raise ValueError("attribute review IDs must match proposed attributes")
         return payload
 
-    def review_attribute_background(
-        self,
-        *,
-        accepted_base: Image.Image,
-        generated_candidate: Image.Image,
-        attribute_type: str,
-        attribute_phrase: str,
-    ) -> SubjectAttributeBackgroundReview:
-        content: list[dict[str, object]] = [
-            {
-                "type": "text",
-                "text": (
-                    f"Attribute type: {attribute_type}\n"
-                    f"Attribute phrase: {attribute_phrase.strip()}"
-                ),
-            }
-        ]
-        for label, image in (
-            ("Image 1: accepted base attribute", accepted_base),
-            ("Image 2: generated-background candidate", generated_candidate),
-        ):
-            content.extend(
-                (
-                    {"type": "text", "text": label},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": _png_data_url(_resize_qwen_input_image(image))
-                        },
-                    },
-                )
-            )
-        return SubjectAttributeBackgroundReview.model_validate_json(
-            self._request(
-                component="qwen_attribute_background_review",
-                system_prompt=ATTRIBUTE_BACKGROUND_REVIEW_SYSTEM_PROMPT,
-                content=content,
-            )
-        )
-
     def review_attribute_bbox(
         self,
         *,
@@ -1694,11 +1840,12 @@ class QwenSubjectAttributeClient:
                 },
             },
         ]
-        return SubjectAttributeBboxReview.model_validate_json(
-            self._request(
+        return SubjectAttributeBboxReview.model_validate(
+            self._request_structured(
                 component="qwen_attribute_bbox_review",
                 system_prompt=ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT,
                 content=content,
+                response_model=SubjectAttributeBboxReview,
             )
         )
 
@@ -2170,15 +2317,13 @@ def _accepted_record(
             image_path=None,
             status="unavailable",
             reviewed=False,
-            review_status="not_generated",
-            reason="attribute_background_not_attempted",
+            review_status="not_applicable",
+            reason=_ATTRIBUTE_BACKGROUND_DISABLED_REASON,
             synthetic=True,
             source_frame_index=candidate.owner_candidate.source_frame_index,
         ),
     )
-    default_variant: ReferenceDefaultVariant = (
-        "alpha" if final_selection == "raw" else "accepted_base"
-    )
+    default_variant: ReferenceDefaultVariant = "accepted_base"
     return SubjectAttributeRecord(
         attribute_id=candidate.attribute_id,
         owner_entity_id=candidate.owner_entity_id,
@@ -2219,8 +2364,6 @@ def _with_attribute_variants(
     candidate: PendingAttributeCandidate,
     *,
     output_root: Path,
-    sample_id: str,
-    backend: AttributeCompletionBackend | None,
     judge: AttributeVariantJudge | None,
     metrics: _AttributeVariantMetrics,
 ) -> SubjectAttributeRecord:
@@ -2228,140 +2371,18 @@ def _with_attribute_variants(
         return record
     metrics.bbox_variants_materialized += 1
     variants = record.variants
-    base_path = (output_root / (record.accepted_base_image_path or "")).resolve(
-        strict=False
-    )
-    base_path.relative_to(output_root.resolve(strict=False))
-    with Image.open(base_path) as opened:
-        opened.load()
-        accepted_base = opened.copy()
-    generated_path = (
-        output_root
-        / "variants"
-        / sample_id
-        / record.attribute_id
-        / "generated_background.png"
-    )
-    metadata_path = generated_path.with_suffix(".json")
-    background_method = getattr(backend, "attribute_background", None)
-    background_review: SubjectAttributeBackgroundReview | None = None
-    background_error: str | None = None
-    generation_seed: int | None = None
-    if callable(background_method) and judge is not None:
-        metrics.background_variants_attempted += 1
-        generation_seed = new_boogu_seed()
-        try:
-            generated_path.parent.mkdir(parents=True, exist_ok=True)
-            generation = background_method(
-                source_path=base_path,
-                output_path=generated_path,
-                instruction=ATTRIBUTE_BACKGROUND_PROMPT,
-                seed=generation_seed,
-            )
-            with Image.open(generated_path) as opened:
-                opened.load()
-                generated = opened.convert("RGB")
-            background_review = judge.review_attribute_background(
-                accepted_base=accepted_base,
-                generated_candidate=generated,
-                attribute_type=record.attribute_type,
-                attribute_phrase=record.phrase,
-            )
-            write_json_atomic(
-                metadata_path,
-                {
-                    "schema_version": 1,
-                    "operation": "attribute_add_background",
-                    "sample_id": sample_id,
-                    "attribute_id": record.attribute_id,
-                    "owner_entity_id": record.owner_entity_id,
-                    "attribute_type": record.attribute_type,
-                    "source_path": record.accepted_base_image_path,
-                    "source_sha256": hashlib.sha256(base_path.read_bytes()).hexdigest(),
-                    "candidate_path": generated_path.relative_to(output_root).as_posix(),
-                    "candidate_sha256": hashlib.sha256(
-                        generated_path.read_bytes()
-                    ).hexdigest(),
-                    "instruction": ATTRIBUTE_BACKGROUND_PROMPT,
-                    "instruction_rewrite_enabled": False,
-                    "thinking_enabled": False,
-                    "seed": generation_seed,
-                    "generation": generation,
-                    "review": background_review.model_dump(mode="json"),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 - default remains accepted base
-            background_error = f"{type(exc).__name__}:{exc}"
-    else:
-        background_error = "attribute_background_backend_or_judge_unavailable"
-
-    if background_review is not None and background_review.verdict == "accept":
-        metrics.background_variants_accepted += 1
-        metrics.bbox_reviews_skipped_background_accepted += 1
-        updated_variants = variants.model_copy(
-            update={
-                "bbox": variants.bbox.model_copy(
-                    update={
-                        "status": "review_skipped",
-                        "review_status": "skipped_due_to_background_accept",
-                        "reason": "background_variant_accepted_before_bbox_review",
-                    }
-                ),
-                "generated_background": ReferenceVariantState(
-                    image_path=generated_path.relative_to(output_root).as_posix(),
-                    status="accepted",
-                    reviewed=True,
-                    review_status="accepted",
-                    reason=background_review.reason,
-                    synthetic=True,
-                    metadata_path=metadata_path.relative_to(output_root).as_posix(),
-                    source_frame_index=record.source_frame_index,
-                ),
-            }
-        )
-        return SubjectAttributeRecord.model_validate(
-            record.model_copy(
-                update={
-                    "image_path": generated_path.relative_to(output_root).as_posix(),
-                    "variants": updated_variants,
-                    "default_variant": "generated_background",
-                    "default_image_path": generated_path.relative_to(
-                        output_root
-                    ).as_posix(),
-                    "default_reason": "attribute_background_review_accepted",
-                }
-            ).model_dump(mode="json")
-        )
-
     generated_variant = ReferenceVariantState(
-        image_path=(
-            generated_path.relative_to(output_root).as_posix()
-            if generated_path.is_file()
-            else None
-        ),
-        status="rejected" if generated_path.is_file() else "generation_failed",
-        reviewed=background_review is not None,
-        review_status=(
-            background_review.verdict
-            if background_review is not None
-            else "generation_failed"
-        ),
-        reason=(
-            background_review.reason
-            if background_review is not None
-            else background_error or "attribute_background_failed"
-        ),
+        image_path=None,
+        status="unavailable",
+        reviewed=False,
+        review_status="not_applicable",
+        reason=_ATTRIBUTE_BACKGROUND_DISABLED_REASON,
         synthetic=True,
-        metadata_path=(
-            metadata_path.relative_to(output_root).as_posix()
-            if metadata_path.is_file()
-            else None
-        ),
         source_frame_index=record.source_frame_index,
     )
     bbox_variant = variants.bbox
-    default_variant = record.default_variant
-    default_image_path = record.default_image_path
+    default_variant: ReferenceDefaultVariant = "accepted_base"
+    default_image_path = record.accepted_base_image_path
     default_reason = record.default_reason
     if judge is not None and bbox_variant.image_path is not None:
         metrics.bbox_reviews_attempted += 1
@@ -2384,12 +2405,13 @@ def _with_attribute_variants(
         except Exception as exc:  # noqa: BLE001 - accepted base remains valid
             bbox_variant = bbox_variant.model_copy(
                 update={
-                    "status": "rejected",
-                    "reviewed": True,
+                    "status": "available",
+                    "reviewed": False,
                     "review_status": "judge_failed",
                     "reason": f"{type(exc).__name__}:{exc}",
                 }
             )
+            default_reason = "attribute_bbox_judge_failed_fallback_to_accepted_base"
         else:
             bbox_accepted = bbox_review.verdict == "accept"
             bbox_variant = bbox_variant.model_copy(
@@ -2404,6 +2426,10 @@ def _with_attribute_variants(
                 default_variant = "bbox"
                 default_image_path = bbox_variant.image_path
                 default_reason = "attribute_bbox_review_accepted"
+            else:
+                default_reason = (
+                    "attribute_bbox_review_rejected_fallback_to_accepted_base"
+                )
     updated = record.model_copy(
         update={
             "image_path": default_image_path,
@@ -3428,8 +3454,7 @@ def _process_owner(
     variant_metrics = _AttributeVariantMetrics()
     variant_judge = (
         review_client
-        if callable(getattr(review_client, "review_attribute_background", None))
-        and callable(getattr(review_client, "review_attribute_bbox", None))
+        if callable(getattr(review_client, "review_attribute_bbox", None))
         else None
     )
     for attribute_id, candidate in accepted_candidate_by_id.items():
@@ -3437,8 +3462,6 @@ def _process_owner(
             records_by_id[attribute_id],
             candidate,
             output_root=output_root,
-            sample_id=clip.clip_uid,
-            backend=completion_backend,
             judge=variant_judge,
             metrics=variant_metrics,
         )
@@ -3573,15 +3596,9 @@ def _process_owner(
                 variant_metrics.bbox_variants_materialized
             ),
             attribute_bbox_reviews_attempted=variant_metrics.bbox_reviews_attempted,
-            attribute_bbox_reviews_skipped_background_accepted=(
-                variant_metrics.bbox_reviews_skipped_background_accepted
-            ),
-            attribute_background_variants_attempted=(
-                variant_metrics.background_variants_attempted
-            ),
-            attribute_background_variants_accepted=(
-                variant_metrics.background_variants_accepted
-            ),
+            attribute_bbox_reviews_skipped_background_accepted=0,
+            attribute_background_variants_attempted=0,
+            attribute_background_variants_accepted=0,
             failures=failures,
         ),
         gme_screen_mode=gme_screen_mode,

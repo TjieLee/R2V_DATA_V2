@@ -1535,6 +1535,47 @@ def test_production_qwen_boogu_reviewer_uses_structured_two_image_review() -> No
     assert not any("mask" in str(item).lower() for item in user_content)
 
 
+@pytest.mark.parametrize(
+    ("operation", "false_flag"),
+    [
+        ("complete_entity", "no_severe_structure_artifact"),
+        ("add_entity_background", "no_halo_or_seam"),
+    ],
+)
+def test_qwen_boogu_reviewer_normalizes_verdict_from_complete_flags(
+    operation: str,
+    false_flag: str,
+) -> None:
+    payload = (
+        _completion_review().model_dump(mode="json")
+        if operation == "complete_entity"
+        else _background_review().model_dump(mode="json")
+    )
+    payload[false_flag] = False
+    payload["verdict"] = "accept"
+    completions = _ReviewCompletions(payload)
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+    review = judge.review(
+        operation=operation,
+        source_rgba=Image.new("RGBA", (12, 10), (1, 2, 3, 255)),
+        source_input_rgb=Image.new("RGB", (12, 10), (1, 2, 3)),
+        candidate_rgb=Image.new("RGB", (32, 32), (4, 5, 6)),
+        entity_phrase="a person in a blue coat",
+        reference_type="subject",
+    )
+
+    assert review.verdict == "reject"
+    assert getattr(review, false_flag) is False
+    assert len(completions.calls) == 1
+
+
 def test_qwen_boogu_review_repair_and_operations_are_profiled(
     tmp_path: Path,
 ) -> None:

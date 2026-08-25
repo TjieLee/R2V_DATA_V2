@@ -280,6 +280,26 @@ class BooguSamReview(BaseModel):
 BooguQwenReview = BooguCompletionReview | BooguBackgroundReview
 
 
+def _normalize_boogu_review_verdict(
+    raw: str,
+    model: type[BooguCompletionReview | BooguBackgroundReview],
+) -> object:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        return payload
+    flag_names = tuple(
+        name for name in model.model_fields if name not in {"reason", "verdict"}
+    )
+    if flag_names and all(type(payload.get(name)) is bool for name in flag_names):
+        return {
+            **payload,
+            "verdict": (
+                "accept" if all(payload[name] for name in flag_names) else "reject"
+            ),
+        }
+    return payload
+
+
 @dataclass(frozen=True)
 class BooguEditOutput:
     png_bytes: bytes
@@ -444,7 +464,9 @@ class QwenBooguReferenceEditJudge:
             raw = self._request(messages, model)
         for attempt in range(self.repair_retries + 1):
             try:
-                return model.model_validate_json(raw)
+                return model.model_validate(
+                    _normalize_boogu_review_verdict(raw, model)
+                )
             except (TypeError, ValueError) as exc:
                 if attempt >= self.repair_retries:
                     raise ValueError(f"invalid Qwen Boogu review: {exc}") from exc
