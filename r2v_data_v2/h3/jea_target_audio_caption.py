@@ -37,16 +37,16 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.6"
+JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.7"
 JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION = "r2v.h3.target_audio_caption_inventory.3"
-JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.6"
+JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.7"
 JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = "r2v.h3.target_audio_caption_human_qa.3"
-JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION = "h3_target_audio_semantics_v1"
+JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION = "h3_target_audio_semantics_v2"
 JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION = (
-    "h3_target_audio_semantics_v1_recheck"
+    "h3_target_audio_semantics_v2_recheck"
 )
 JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION = (
-    "qwen_h3_audio_semantics_all_null_or_empty_recheck_v1"
+    "qwen_h3_audio_semantics_all_null_or_empty_recheck_v2"
 )
 JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION = (
     JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION
@@ -66,6 +66,7 @@ SemanticSource = Literal[
 ]
 SemanticFallbackTriggerReason = Literal["all_null", "empty_response"]
 InputModality = Literal[
+    "canonical_full_audio_only",
     "native_target_video_with_embedded_audio",
     "target_video_plus_canonical_full_audio",
 ]
@@ -86,9 +87,10 @@ QA_FLAGS = (
 
 SYSTEM_PROMPT = """You extract reusable AUDIO SEMANTICS from one target clip.
 
-AUDIBLE EVIDENCE IS THE SOURCE OF TRUTH. Visual evidence may only disambiguate
-the source or category of a sound that is already genuinely audible. Never infer
-a sound merely because an object, action, expression, or scene is visible.
+AUDIBLE EVIDENCE IS THE SOURCE OF TRUTH. If visual evidence is supplied, it may
+only disambiguate the source or category of a sound that is already genuinely
+audible. Visual evidence can never establish that a sound exists. Never infer a
+sound merely because an object, action, expression, or scene is visible.
 
 Perform four independent passes before returning JSON:
 
@@ -133,7 +135,8 @@ markdown, explanation, reasoning, or extra fields."""
 
 FALLBACK_SYSTEM_PROMPT = """Reinspect one target clip for reusable AUDIO
 SEMANTICS. Audible evidence is the source of truth. Be attentive to faint or
-partially masked sounds, but never invent audio from visible content.
+partially masked sounds. If visual evidence is supplied, it may only disambiguate
+an already-audible sound and can never establish that a sound exists.
 
 Return the same four-field schema: concise nullable overall_soundscape; concise
 nullable audience-only non_diegetic_music; chronological approximate
@@ -206,7 +209,7 @@ class JEATargetAudioCaptionBackendProvenance(SchemaModel):
     media_root: str
     media_base_url: str | None = None
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_target_audio_semantics_v1"] = (
+    prompt_version: Literal["h3_target_audio_semantics_v2"] = (
         JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
     )
     temperature: Literal[0.0] = 0.0
@@ -230,12 +233,15 @@ class JEATargetAudioCaptionBackendProvenance(SchemaModel):
             raise ValueError("audio caption HTTP media provenance is inconsistent")
         if self.media_base_url is not None and not self.media_base_url.strip():
             raise ValueError("audio caption HTTP media base URL is empty")
-        expected_modality = (
-            "native_target_video_with_embedded_audio"
+        expected_modalities = (
+            {"native_target_video_with_embedded_audio"}
             if self.backend_family == "dots3"
-            else "target_video_plus_canonical_full_audio"
+            else {
+                "canonical_full_audio_only",
+                "target_video_plus_canonical_full_audio",
+            }
         )
-        if self.input_modality != expected_modality:
+        if self.input_modality not in expected_modalities:
             raise ValueError("audio caption backend modality is inconsistent")
         if self.output_modalities != ["text"]:
             raise ValueError("audio caption backend must request text output only")
@@ -320,7 +326,7 @@ class JEATargetAudioCaptionFailure(SchemaModel):
 
 
 class JEATargetAudioCaptionRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption.6"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption.7"] = (
         JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION
     )
     target_clip_uid: str
@@ -343,7 +349,7 @@ class JEATargetAudioCaptionRecord(SchemaModel):
     semantic_source: SemanticSource | None
     semantic_fallback_attempted: bool
     semantic_fallback_prompt_version: (
-        Literal["h3_target_audio_semantics_v1_recheck"] | None
+        Literal["h3_target_audio_semantics_v2_recheck"] | None
     )
     semantic_fallback_trigger_reason: SemanticFallbackTriggerReason | None
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -460,7 +466,7 @@ class JEATargetAudioCaptionRecord(SchemaModel):
 
 
 class JEATargetAudioCaptionSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption_summary.6"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption_summary.7"] = (
         JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION
     )
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -925,6 +931,7 @@ class JEATargetAudioCaptionConfig:
     served_model_name: str
     checkpoint_id: str
     media_resolver: MediaURLResolver
+    include_video: bool = False
     timeout_seconds: float = 600.0
     max_tokens: int = 2048
 
@@ -943,14 +950,16 @@ class JEATargetAudioCaptionConfig:
             raise ValueError("audio caption backend timeout must be positive")
         if self.max_tokens <= 0:
             raise ValueError("audio caption backend max tokens must be positive")
+        if self.backend_family == "dots3" and self.include_video:
+            raise ValueError("include_video is only valid for Qwen3-Omni")
 
     @property
     def input_modality(self) -> InputModality:
-        return (
-            "native_target_video_with_embedded_audio"
-            if self.backend_family == "dots3"
-            else "target_video_plus_canonical_full_audio"
-        )
+        if self.backend_family == "dots3":
+            return "native_target_video_with_embedded_audio"
+        if self.include_video:
+            return "target_video_plus_canonical_full_audio"
+        return "canonical_full_audio_only"
 
     def provenance(self) -> JEATargetAudioCaptionBackendProvenance:
         values = {
@@ -1080,7 +1089,8 @@ def _user_prompt(job: JEATargetAudioCaptionJob) -> str:
     return (
         "Analyze the attached target media in four independent passes: overall "
         "soundscape, non-diegetic music, temporally localized audible events, and "
-        "speaker delivery. Use audible evidence only; visual content cannot establish "
+        "speaker delivery. Use audible evidence only. If visual evidence is supplied, "
+        "it may only disambiguate an already-audible sound and can never establish "
         "that a sound exists. Event times are approximate clip-relative semantic "
         "locations and must remain within target_duration_seconds. Do not transcribe "
         "speech or infer identity. Return every speaker_cluster_id exactly once in "
@@ -1094,7 +1104,8 @@ def _fallback_user_prompt(job: JEATargetAudioCaptionJob) -> str:
     return (
         "Reinspect only sounds actually audible in the attached target media. Be "
         "attentive to faint or partially masked ambience, non-diegetic music, and "
-        "localized non-dialogue events, while never inventing sound from visuals. "
+        "localized non-dialogue events. If visual evidence is supplied, use it only "
+        "to disambiguate an already-audible sound and never to invent sound. "
         "Return the same four-field schema. Keep approximate event times within "
         "target_duration_seconds. Do not transcribe speech or infer identity. Return "
         "every cluster exactly once in supplied order and no entity_id.\nInput:\n"
@@ -1261,15 +1272,17 @@ class OpenAIJEATargetAudioCaptionBackend:
                 job.target_full_audio_sha256,
                 field_name="target full audio",
             )
-            video_item = {
-                "type": "video_url",
-                "video_url": {"url": self.config.media_resolver.resolve(video_path)},
-            }
             if self.config.backend_family == "dots3":
-                media_items = [video_item]
+                media_items = [
+                    {
+                        "type": "video_url",
+                        "video_url": {
+                            "url": self.config.media_resolver.resolve(video_path)
+                        },
+                    }
+                ]
             else:
                 media_items = [
-                    video_item,
                     {
                         "type": "audio_url",
                         "audio_url": {
@@ -1277,6 +1290,16 @@ class OpenAIJEATargetAudioCaptionBackend:
                         },
                     },
                 ]
+                if self.config.include_video:
+                    media_items.insert(
+                        0,
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": self.config.media_resolver.resolve(video_path)
+                            },
+                        },
+                    )
             request: dict[str, object] = {
                 "model": self.config.served_model_name,
                 "messages": [

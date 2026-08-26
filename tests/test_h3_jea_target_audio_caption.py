@@ -232,6 +232,7 @@ def _config(
     tmp_path: Path,
     *,
     family: str,
+    include_video: bool = False,
 ) -> JEATargetAudioCaptionConfig:
     return JEATargetAudioCaptionConfig(
         backend_family=family,  # type: ignore[arg-type]
@@ -240,6 +241,7 @@ def _config(
         served_model_name="served-model",
         checkpoint_id="checkpoint",
         media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
+        include_video=include_video,
         max_tokens=321,
     )
 
@@ -294,6 +296,7 @@ def _run_semantic_sequence(
     responses: list[str | _FakeCompletion],
     *,
     family: str = "qwen3_omni",
+    include_video: bool = False,
     max_concurrency: int = 1,
 ) -> tuple[
     JEATargetAudioCaptionSummary,
@@ -306,7 +309,7 @@ def _run_semantic_sequence(
     inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
     completions = _FakeCompletions(responses)
     backend = OpenAIJEATargetAudioCaptionBackend(
-        _config(tmp_path, family=family),
+        _config(tmp_path, family=family, include_video=include_video),
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
     output = target_audio_caption_output_root(
@@ -327,8 +330,18 @@ def _run_semantic_sequence(
 
 
 class _FakeBackend:
-    def __init__(self, tmp_path: Path, *, family: str) -> None:
-        self._config = _config(tmp_path, family=family)
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        family: str,
+        include_video: bool = False,
+    ) -> None:
+        self._config = _config(
+            tmp_path,
+            family=family,
+            include_video=include_video,
+        )
         self.calls: list[str] = []
 
     @property
@@ -624,8 +637,8 @@ def test_speaker_cluster_conflicting_entity_bindings_fail_closed(
         ),
         (
             "qwen3_omni",
-            ["text", "video_url", "audio_url"],
-            "target_video_plus_canonical_full_audio",
+            ["text", "audio_url"],
+            "canonical_full_audio_only",
         ),
     ],
 )
@@ -680,8 +693,11 @@ def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence
     assert "api_key" not in backend.provenance.model_dump(mode="json")
     if family == "qwen3_omni":
         assert request["modalities"] == ["text"]
-        assert job.target_video_path in encoded
         assert job.target_full_audio_path in encoded
+        assert job.target_video_path not in encoded
+        assert result.response == TargetAudioCaptionResponse.model_validate_json(valid)
+        assert job.target_video_path == inventory.jobs[0].target_video_path
+        assert job.target_video_sha256 == inventory.jobs[0].target_video_sha256
     else:
         assert "modalities" not in request
         assert job.target_full_audio_path not in encoded
@@ -711,11 +727,57 @@ def test_qwen_omni_uses_pair_canonical_audio_not_readable_source(
     backend.describe(job)
 
     encoded = json.dumps(completions.requests[0], ensure_ascii=False)
-    assert job.target_video_path in encoded
+    assert job.target_video_path not in encoded
     assert job.target_full_audio_path in encoded
     assert readable["source_audio_path"] not in encoded
     assert "SECRET TRANSCRIPT" not in encoded
     assert '"entity_id":' not in encoded
+
+
+def test_qwen_omni_include_video_sends_video_and_canonical_audio(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=1)
+    inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
+    job = inventory.jobs[0]
+    completions = _FakeCompletions([_response(job_index=1).model_dump_json()])
+    backend = OpenAIJEATargetAudioCaptionBackend(
+        _config(tmp_path, family="qwen3_omni", include_video=True),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    backend.describe(job)
+
+    request = completions.requests[0]
+    content = request["messages"][1]["content"]  # type: ignore[index]
+    assert [item["type"] for item in content] == [
+        "text",
+        "video_url",
+        "audio_url",
+    ]
+    encoded = json.dumps(request, ensure_ascii=False)
+    assert job.target_video_path in encoded
+    assert job.target_full_audio_path in encoded
+    assert backend.provenance.input_modality == (
+        "target_video_plus_canonical_full_audio"
+    )
+
+
+def test_qwen_audio_only_still_verifies_canonical_video(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=1)
+    job = build_jea_target_audio_caption_inventory(audio_production_root=root).jobs[0]
+    Path(job.target_video_path).write_bytes(b"changed-video")
+    completions = _FakeCompletions([_response(job_index=1).model_dump_json()])
+    backend = OpenAIJEATargetAudioCaptionBackend(
+        _config(tmp_path, family="qwen3_omni"),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    with pytest.raises(JEATargetAudioCaptionBackendFailure) as failure:
+        backend.describe(job)
+
+    assert "target video changed or is unavailable" in failure.value.reason
+    assert completions.requests == []
 
 
 def test_cluster_order_mismatch_repairs_once_and_second_failure_fails_closed(
@@ -905,6 +967,39 @@ def test_review_uses_new_semantic_sections_and_configuration_qa_namespace(
     assert inventory.inventory_fingerprint in review
 
 
+def test_review_qa_namespace_distinguishes_qwen_input_modality(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=1)
+    inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
+    audio_backend = _FakeBackend(tmp_path, family="qwen3_omni")
+    video_backend = _FakeBackend(
+        tmp_path,
+        family="qwen3_omni",
+        include_video=True,
+    )
+    audio_output = root / "audio_caption/qwen-audio-only"
+    video_output = root / "audio_caption/qwen-video-audio"
+
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=audio_output,
+        backend=audio_backend,
+    )
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=video_output,
+        backend=video_backend,
+    )
+
+    audio_review = (audio_output / "review.html").read_text(encoding="utf-8")
+    video_review = (video_output / "review.html").read_text(encoding="utf-8")
+    assert audio_backend.provenance.configuration_fingerprint in audio_review
+    assert video_backend.provenance.configuration_fingerprint in video_review
+    assert audio_backend.provenance.configuration_fingerprint != (
+        video_backend.provenance.configuration_fingerprint
+    )
+    assert audio_review != video_review
+
+
 def test_programming_failure_leaves_no_partial_publication(tmp_path: Path) -> None:
     root = _production_fixture(tmp_path)
     inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
@@ -1003,12 +1098,12 @@ def test_v5_same_backend_output_can_be_atomically_replaced_by_v6(
     )
 
     assert replacement.calls == [job.target_clip_uid for job in inventory.jobs]
-    assert summary.backend_provenance.prompt_version == "h3_target_audio_semantics_v1"
+    assert summary.backend_provenance.prompt_version == "h3_target_audio_semantics_v2"
     published = JEATargetAudioCaptionSummary.model_validate_json(
         (output / "summary.json").read_text(encoding="utf-8")
     )
     assert published.backend_provenance.prompt_version == (
-        "h3_target_audio_semantics_v1"
+        "h3_target_audio_semantics_v2"
     )
 
 
@@ -1871,11 +1966,7 @@ def test_qwen_fallback_uses_new_schema_prompt_and_same_media(
     fallback_content = fallback_request["messages"][1]["content"]
     assert fallback_content[0]["text"] == _fallback_user_prompt(actual_job)
     assert "target_duration_seconds" in fallback_content[0]["text"]
-    assert [item["type"] for item in fallback_content] == [
-        "text",
-        "video_url",
-        "audio_url",
-    ]
+    assert [item["type"] for item in fallback_content] == ["text", "audio_url"]
     assert fallback_request["temperature"] == 0.0
     assert fallback_request["max_tokens"] == 321
     assert fallback_request["modalities"] == ["text"]
@@ -1884,7 +1975,7 @@ def test_qwen_fallback_uses_new_schema_prompt_and_same_media(
         "chat_template_kwargs": {"enable_thinking": False}
     }
     encoded = json.dumps(fallback_request, ensure_ascii=False)
-    assert actual_job.target_video_path in encoded
+    assert actual_job.target_video_path not in encoded
     assert actual_job.target_full_audio_path in encoded
     for forbidden in (
         "SECRET TRANSCRIPT",
@@ -1894,6 +1985,43 @@ def test_qwen_fallback_uses_new_schema_prompt_and_same_media(
         "donor_media",
     ):
         assert forbidden not in encoded
+
+
+@pytest.mark.parametrize(
+    ("include_video", "expected_media_types"),
+    [
+        (False, ["text", "audio_url"]),
+        (True, ["text", "video_url", "audio_url"]),
+    ],
+)
+def test_qwen_primary_repair_and_fallback_preserve_configured_modality(
+    tmp_path: Path,
+    include_video: bool,
+    expected_media_types: list[str],
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(audio_production_root=root).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    )
+    recovered = _response_for_job(
+        job,
+        background="faint music",
+        delivery_styles=[None, None],
+    )
+
+    _, _, _, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        ["not-json", all_null.model_dump_json(), recovered.model_dump_json()],
+        include_video=include_video,
+    )
+
+    assert len(completions.requests) == 3
+    for request in completions.requests:
+        content = request["messages"][1]["content"]  # type: ignore[index]
+        assert [item["type"] for item in content] == expected_media_types
 
 
 def test_fallback_repair_prompt_preserves_new_schema(
@@ -2300,6 +2428,38 @@ def test_qwen_fallback_policy_changes_request_fingerprint_without_affecting_dots
     ) == old_policy_fingerprint("dots3")
 
 
+def test_qwen_input_modality_changes_configuration_and_request_fingerprints(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=1)
+    job = build_jea_target_audio_caption_inventory(audio_production_root=root).jobs[0]
+    audio_provenance = _config(tmp_path, family="qwen3_omni").provenance()
+    video_provenance = _config(
+        tmp_path,
+        family="qwen3_omni",
+        include_video=True,
+    ).provenance()
+
+    assert audio_provenance.input_modality == "canonical_full_audio_only"
+    assert video_provenance.input_modality == (
+        "target_video_plus_canonical_full_audio"
+    )
+    assert audio_provenance.configuration_fingerprint != (
+        video_provenance.configuration_fingerprint
+    )
+    assert jea_caption.target_audio_caption_request_fingerprint(
+        job,
+        audio_provenance,
+    ) != jea_caption.target_audio_caption_request_fingerprint(job, video_provenance)
+
+
+def test_dots3_modality_is_unchanged_and_rejects_include_video(tmp_path: Path) -> None:
+    config = _config(tmp_path, family="dots3")
+    assert config.input_modality == "native_target_video_with_embedded_audio"
+    with pytest.raises(ValueError, match="only valid for Qwen3-Omni"):
+        _config(tmp_path, family="dots3", include_video=True)
+
+
 def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionRecord.model_validate(
@@ -2317,9 +2477,9 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
         )
     assert (
         JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION
-        == "r2v.h3.target_audio_caption_summary.6"
+        == "r2v.h3.target_audio_caption_summary.7"
     )
-    assert JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION == "r2v.h3.target_audio_caption.6"
+    assert JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION == "r2v.h3.target_audio_caption.7"
     assert (
         JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION
         == "r2v.h3.target_audio_caption_inventory.3"
@@ -2328,18 +2488,18 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
         JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION
         == "r2v.h3.target_audio_caption_human_qa.3"
     )
-    assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_semantics_v1"
+    assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_semantics_v2"
     assert (
         JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION
-        == "h3_target_audio_semantics_v1"
+        == "h3_target_audio_semantics_v2"
     )
     assert (
         JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
-        == "h3_target_audio_semantics_v1_recheck"
+        == "h3_target_audio_semantics_v2_recheck"
     )
     assert (
         JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION
-        == "qwen_h3_audio_semantics_all_null_or_empty_recheck_v1"
+        == "qwen_h3_audio_semantics_all_null_or_empty_recheck_v2"
     )
     assert set(TargetAudioCaptionResponse.model_json_schema()["properties"]) == {
         "overall_soundscape",
@@ -2362,14 +2522,14 @@ def test_current_records_and_summary_are_strict_new_versions(tmp_path: Path) -> 
         [response.model_dump_json()],
     )
 
-    assert record.schema_version == "r2v.h3.target_audio_caption.6"
-    assert summary.schema_version == "r2v.h3.target_audio_caption_summary.6"
+    assert record.schema_version == "r2v.h3.target_audio_caption.7"
+    assert summary.schema_version == "r2v.h3.target_audio_caption_summary.7"
     old_record = record.model_dump(mode="json")
-    old_record["schema_version"] = "r2v.h3.target_audio_caption.5"
+    old_record["schema_version"] = "r2v.h3.target_audio_caption.6"
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionRecord.model_validate(old_record)
     old_summary = summary.model_dump(mode="json")
-    old_summary["schema_version"] = "r2v.h3.target_audio_caption_summary.5"
+    old_summary["schema_version"] = "r2v.h3.target_audio_caption_summary.6"
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionSummary.model_validate(old_summary)
 
@@ -2412,7 +2572,8 @@ def test_h3_semantic_prompt_separates_four_audio_layers() -> None:
         assert evidence in prompt
     assert "Never transcribe, quote, paraphrase" in prompt
     assert "identity, gender, age, nationality" in prompt
-    assert "Visual evidence may only disambiguate" in prompt
+    assert "If visual evidence is supplied" in prompt
+    assert "Visual evidence can never establish that a sound exists" in prompt
 
 
 def test_qa_export_carries_backend_provenance(tmp_path: Path) -> None:
@@ -2427,7 +2588,7 @@ def test_qa_export_carries_backend_provenance(tmp_path: Path) -> None:
     )
     assert qa.backend_provenance.backend_family == "qwen3_omni"
     assert qa.backend_provenance.served_model_name == "served-model"
-    assert qa.backend_provenance.prompt_version == "h3_target_audio_semantics_v1"
+    assert qa.backend_provenance.prompt_version == "h3_target_audio_semantics_v2"
     assert qa.backend_provenance == qa.backend_provenance.model_validate_json(
         qa.backend_provenance.model_dump_json()
     )
@@ -2465,6 +2626,65 @@ def test_cli_dry_run_uses_current_root_and_constructs_no_backend(
     assert not (root / "audio_caption").exists()
 
 
+@pytest.mark.parametrize(
+    ("extra_arguments", "expected_modality"),
+    [
+        ([], "canonical_full_audio_only"),
+        (["--include-video"], "target_video_plus_canonical_full_audio"),
+    ],
+)
+def test_cli_qwen_dry_run_reports_selected_input_modality(
+    tmp_path: Path,
+    extra_arguments: list[str],
+    expected_modality: str,
+) -> None:
+    root = _production_fixture(tmp_path)
+
+    result = cli.main(
+        [
+            "--audio-production-root",
+            str(root),
+            "--backend",
+            "qwen3-omni",
+            "--dry-run",
+            *extra_arguments,
+        ]
+    )
+
+    assert result["input_modality"] == expected_modality
+    assert result["model_calls"] == 0
+
+
+def test_cli_rejects_dots3_include_video_before_inventory_build(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def forbidden_inventory(**kwargs: object) -> object:
+        raise AssertionError("invalid CLI combination must fail before inventory")
+
+    monkeypatch.setattr(
+        cli,
+        "build_jea_target_audio_caption_inventory",
+        forbidden_inventory,
+    )
+
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "--audio-production-root",
+                "/does/not/matter",
+                "--backend",
+                "dots3",
+                "--include-video",
+                "--dry-run",
+            ]
+        )
+
+    assert "--include-video is only valid with --backend qwen3-omni" in (
+        capsys.readouterr().err
+    )
+
+
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_cli_rejects_non_positive_max_concurrency(value: str) -> None:
     with pytest.raises(SystemExit):
@@ -2491,6 +2711,7 @@ def test_cli_defaults_to_single_clip_concurrency() -> None:
     )
 
     assert arguments.max_concurrency == 1
+    assert arguments.include_video is False
 
 
 def test_cli_model_calls_include_semantic_fallback_and_fallback_repair(

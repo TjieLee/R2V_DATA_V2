@@ -45,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--audio-production-root", type=Path, required=True)
     parser.add_argument("--backend", choices=("dots3", "qwen3-omni"), required=True)
+    parser.add_argument(
+        "--include-video",
+        action="store_true",
+        help="also send target video to Qwen3-Omni; invalid for Dots3",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--output-root", type=Path)
@@ -117,13 +122,17 @@ def _backend_config(arguments: argparse.Namespace) -> JEATargetAudioCaptionConfi
             media_root=media_root,
             media_base_url=media_base_url if media_mode == "http" else None,
         ),
+        include_video=arguments.include_video,
         timeout_seconds=arguments.timeout_seconds,
         max_tokens=arguments.max_tokens,
     )
 
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    if arguments.backend == "dots3" and arguments.include_video:
+        parser.error("--include-video is only valid with --backend qwen3-omni")
     production_root = arguments.audio_production_root.expanduser().resolve(strict=True)
     backend_family = "dots3" if arguments.backend == "dots3" else "qwen3_omni"
     inventory = build_jea_target_audio_caption_inventory(
@@ -142,7 +151,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "input_modality": (
             "native_target_video_with_embedded_audio"
             if backend_family == "dots3"
-            else "target_video_plus_canonical_full_audio"
+            else (
+                "target_video_plus_canonical_full_audio"
+                if arguments.include_video
+                else "canonical_full_audio_only"
+            )
         ),
         "transcript_supplied": False,
         "entity_id_supplied": False,

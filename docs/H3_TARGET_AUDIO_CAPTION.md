@@ -23,7 +23,7 @@ gate with a 0.10-second tolerance for LR-ASD 25fps, ffmpeg, and container durati
 quantization; readable segment sample ranges and both audio timeline bounds remain
 fail-closed.
 
-Both backends use primary prompt `h3_target_audio_semantics_v1` and the same
+Both backends use primary prompt `h3_target_audio_semantics_v2` and the same
 strict reusable semantic response:
 
 ```json
@@ -61,23 +61,31 @@ Qwen3-ASR remains the owner of linguistic speech text. DiariZen remains the owne
 of exact speaker and sample timing. Primary and cross voice-reference assets are
 unchanged. This stage assigns no training task, copy relationship, sampling
 policy, or rendering behavior; later training code may choose how to consume the
-reusable facts and assets. Visual evidence may only disambiguate an already
-audible sound and can never establish that a sound exists.
+reusable facts and assets. If visual evidence is supplied, it may only
+disambiguate an already audible sound and can never establish that a sound
+exists.
 
 Code requires every supplied cluster exactly once and in order, then reattaches
 the frozen nullable `entity_id`. The model receives neither transcript nor entity
-identity. Dots3 receives the native target video with embedded audio. The
-Qwen3-Omni Instruct backend receives both the whole target video and canonical
-full audio, and requests text output only. Qwen3-Omni-Captioner is not used because
-it does not accept the task's text prompt. Both backends fail closed after at most
-one primary structured-output repair.
+identity. Dots3 receives the native target video with embedded audio. By default,
+the Qwen3-Omni Instruct backend receives only canonical full audio and requests
+text output. The explicit `--include-video` experiment sends target video plus
+canonical full audio. Qwen3-Omni-Captioner is not used because it does not accept
+the task's text prompt. Both backends fail closed after at most one primary
+structured-output repair.
+
+The default follows the real 35-clip A/B: video plus audio produced 15/35
+whitespace-only generation failures, unchanged when producer concurrency was
+reduced from 4 to 1. Audio-only recovered schema-valid output for 13 of those 15
+failed clips. The target video path and hash remain canonical dataset provenance
+and are validated even when video is not sent to Qwen.
 
 ### Qwen semantic fallback
 
 Human QA found occasional complete abstention, and real production observed
 Qwen3-Omni generating only whitespace on an initial request or structured repair.
 Qwen3-Omni therefore performs exactly one semantic reinspection using
-`h3_target_audio_semantics_v1_recheck`. Primary and fallback return the same new
+`h3_target_audio_semantics_v2_recheck`. Primary and fallback return the same new
 schema. Fallback triggers only when all four semantic layers are empty/null or
 when primary processing ends with `qwen3_omni_vllm_empty_response`. Partial nulls
 are valid. Connection, HTTP, timeout, model, local-media, and other ordinary
@@ -101,9 +109,9 @@ runtime concurrency does not.
 
 The new contracts are:
 
-- `r2v.h3.target_audio_caption.6`;
+- `r2v.h3.target_audio_caption.7`;
 - `r2v.h3.target_audio_caption_inventory.3`;
-- `r2v.h3.target_audio_caption_summary.6`;
+- `r2v.h3.target_audio_caption_summary.7`;
 - `r2v.h3.target_audio_caption_human_qa.3`.
 
 Run model-free inventory validation first:
@@ -140,6 +148,10 @@ Run each A/B side independently:
   --backend qwen3-omni \
   --max-concurrency 4
 ```
+
+The Qwen command above is audio-only. Add `--include-video` only for an explicit
+target-video-plus-audio experiment. Dots3 rejects that flag because its native
+video input behavior is already fixed.
 
 `--max-concurrency` controls how many independent target clips the producer
 sends to the serving backend at once. It is not a GPU count or a vLLM tensor
