@@ -47,7 +47,7 @@ DEFAULT_DOTS3_MODEL = "dots3-note-prev"
 DEFAULT_DOTS3_CHECKPOINT_ID = "/mnt/workspace/public/pretrained/dots3-note-prev"
 DEFAULT_QWEN3_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 DEFAULT_QWEN3_OMNI_CHECKPOINT_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS = 0.05
+AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS = 0.10
 
 BackendFamily = Literal["dots3", "qwen3_omni"]
 InputModality = Literal[
@@ -577,6 +577,11 @@ def _validate_audio_timelines(
             + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
         ):
             raise ValueError("readable DiariZen segment exceeds source audio timeline")
+        if row.end_time > (
+            canonical_timeline.duration_seconds
+            + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
+        ):
+            raise ValueError("readable DiariZen segment exceeds canonical audio timeline")
 
 
 def build_jea_target_audio_caption_inventory(

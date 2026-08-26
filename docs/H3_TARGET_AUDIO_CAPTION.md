@@ -17,6 +17,12 @@ sample ranges, time ranges, and bindings, but transcript text is never placed in
 the caption inventory or model request. Whisper ASR-V2 and TextUsabilityPolicy are
 not inputs to this path.
 
+The readable LR-ASD audio and canonical final full audio may use different paths
+and encodings. Inventory validation retains a strict whole-clip timeline sanity
+gate with a 0.10-second tolerance for LR-ASD 25fps, ffmpeg, and container duration
+quantization; readable segment sample ranges and both audio timeline bounds remain
+fail-closed.
+
 Both backends use prompt `h3_target_audio_caption_v5` and the same strict response:
 
 ```json

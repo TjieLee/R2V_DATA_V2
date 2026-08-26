@@ -319,6 +319,25 @@ def test_inventory_rejects_incompatible_full_audio_timelines(tmp_path: Path) -> 
         build_jea_target_audio_caption_inventory(audio_production_root=root)
 
 
+def test_inventory_accepts_lr_asd_audio_quantization_delta(tmp_path: Path) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+        distinct_audio_artifacts=True,
+    )
+    pair = json.loads(
+        (root / "pairs/in_pairs.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    _write_pcm16_wave(Path(pair["target_full_audio_path"]), sample_count=16833)
+
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+
+    assert inventory.target_clip_count == 1
+
+
 def test_inventory_rejects_missing_readable_source_audio(tmp_path: Path) -> None:
     root = _production_fixture(
         tmp_path,
