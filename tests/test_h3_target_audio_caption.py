@@ -761,43 +761,17 @@ def test_background_selection_runs_exact_order_in_separate_root_and_keeps_clean_
     assert "Never transcribe, quote, paraphrase" in SYSTEM_PROMPT
 
 
-def test_cli_passes_manual_selection_and_uses_background_output_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    inventory = _inventory(tmp_path, count=1, mode="background_pilot")
-    selection_path = tmp_path / "manual-selection.json"
-    selection_path.write_text("{}\n", encoding="utf-8")
-    captured: dict[str, object] = {}
-
-    def fake_build(*, audio_run_root: Path, clip_selection_json: Path | None):
-        captured["audio_run_root"] = audio_run_root
-        captured["clip_selection_json"] = clip_selection_json
-        return inventory
-
-    monkeypatch.setattr(
-        target_audio_caption_cli,
-        "build_target_audio_caption_inventory",
-        fake_build,
-    )
-
-    result = target_audio_caption_cli.main(
-        [
-            "--audio-run-root",
-            str(tmp_path),
-            "--clip-selection-json",
-            str(selection_path),
-            "--dry-run",
-        ]
-    )
-
-    assert captured == {
-        "audio_run_root": tmp_path.resolve(),
-        "clip_selection_json": selection_path,
-    }
-    assert result["mode"] == "background_pilot"
-    assert result["output_root"] == str(
-        tmp_path / "target_audio_caption_background_pilot_v3"
-    )
+def test_cli_rejects_legacy_audio_run_root(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        target_audio_caption_cli.main(
+            [
+                "--audio-run-root",
+                str(tmp_path),
+                "--backend",
+                "dots3",
+                "--dry-run",
+            ]
+        )
 
 
 def test_failed_atomic_build_does_not_publish_partial_output(tmp_path: Path) -> None:

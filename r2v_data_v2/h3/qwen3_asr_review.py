@@ -115,6 +115,8 @@ class FFmpegQwen3ASRReviewMediaBackend:
                     "yuv420p",
                     "-c:a",
                     "aac",
+                    "-ac",
+                    "2",
                     "-b:a",
                     "128k",
                     "-movflags",

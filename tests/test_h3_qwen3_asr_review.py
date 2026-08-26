@@ -358,4 +358,5 @@ def test_ffmpeg_review_proxy_keeps_video_audio_and_full_timeline(
     assert ["-map", "0:v:0"] == command[command.index("0:v:0") - 1 : command.index("0:v:0") + 1]
     assert ["-map", "0:a:0"] == command[command.index("0:a:0") - 1 : command.index("0:a:0") + 1]
     assert "libx264" in command and "yuv420p" in command and "aac" in command
+    assert command[command.index("-ac") + 1] == "2"
     assert "-ss" not in command and "-t" not in command

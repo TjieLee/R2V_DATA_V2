@@ -1539,3 +1539,27 @@ find "$AUDIO_RUN_ROOT" -maxdepth 1 -type d \
 ```
 
 Do not delete `pilot20`, `production`, the frozen Visual run, or `audio_deps`.
+## JEA target-audio-caption A/B
+
+The current JEA semantic-caption sidecar is independent from the historical
+ASR-V2/TextUsability pilot. Validate and run Dots3 and Qwen3-Omni separately:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --backend dots3 \
+  --dry-run
+
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --backend qwen3-omni \
+  --dry-run
+```
+
+The Dots3 runtime reads only `DOTS3_*`; the Qwen3-Omni runtime reads only
+`QWEN3_OMNI_*`. Dots3 transports native target video with embedded audio.
+Qwen3-Omni transports canonical full audio and requests text output only.
+Neither receives Qwen3-ASR transcript text, entity IDs, donor media, reference
+images, or primary voice. Outputs remain separate under
+`audio_caption/dots3/` and `audio_caption/qwen3_omni/`; never use `--overwrite`
+until the exact backend directory has been reviewed.

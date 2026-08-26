@@ -1,6 +1,100 @@
-# H3 Target Audio Caption MLLM Pilot V1/V2/V3
+# H3 Target Audio Caption
 
-## Status
+## Current JEA multi-backend V4
+
+The current JEA production sidecar reads only:
+
+```text
+$AUDIO_PRODUCTION_ROOT/pairs/in_pairs.jsonl
+$AUDIO_PRODUCTION_ROOT/diarization/readable_segments.jsonl
+$AUDIO_PRODUCTION_ROOT/asr/segments.jsonl
+```
+
+`pairs/in_pairs.jsonl` owns target video/full-audio identity. Readable DiariZen
+rows own exact speech intervals, `speaker_cluster_id`, and nullable entity
+binding. Qwen3-ASR rows are reconciled exactly against those DiariZen identities,
+sample ranges, time ranges, and bindings, but transcript text is never placed in
+the caption inventory or model request. Whisper ASR-V2 and TextUsabilityPolicy are
+not inputs to this path.
+
+Both backends use prompt `h3_target_audio_caption_v4` and the same strict response:
+
+```json
+{
+  "background_audio_prompt": "meaningful non-speech audio or null",
+  "speaker_delivery": [
+    {
+      "speaker_cluster_id": "speaker_0",
+      "delivery_style": "concise prosody or null"
+    }
+  ]
+}
+```
+
+Code requires every supplied cluster exactly once and in order, then reattaches
+the frozen nullable `entity_id`. The model receives neither transcript nor entity
+identity. Dots3 receives the native target video with embedded audio; Qwen3-Omni
+receives only canonical full audio and requests text output only. Both fail closed
+after at most one structured-output repair.
+
+The new contracts are:
+
+- `r2v.h3.target_audio_caption.3`;
+- `r2v.h3.target_audio_caption_inventory.2`;
+- `r2v.h3.target_audio_caption_summary.2`;
+- `r2v.h3.target_audio_caption_human_qa.2`.
+
+Run model-free inventory validation first:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --backend dots3 \
+  --dry-run
+
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --backend qwen3-omni \
+  --dry-run
+```
+
+For Dots3 configure only `DOTS3_BASE_URL`, `DOTS3_API_KEY`, `DOTS3_MODEL`,
+`DOTS3_CHECKPOINT_ID`, `DOTS3_MEDIA_MODE`, `DOTS3_MEDIA_ROOT`, and optionally
+`DOTS3_MEDIA_BASE_URL`. For Qwen3-Omni use the corresponding `QWEN3_OMNI_*`
+variables. Variables for the unselected backend are not required. The Qwen3-Omni
+served-model/checkpoint default is `Qwen/Qwen3-Omni-30B-A3B-Instruct`; deployment
+may override it explicitly without changing the shared semantic schema.
+
+Run each A/B side independently:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --backend dots3
+
+"$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --backend qwen3-omni
+```
+
+Outputs are atomically published and cannot overwrite one another:
+
+```text
+$AUDIO_PRODUCTION_ROOT/audio_caption/dots3/
+$AUDIO_PRODUCTION_ROOT/audio_caption/qwen3_omni/
+```
+
+Each contains `inventory.json`, `records.jsonl`, `summary.json`, `raw/`,
+`media/`, and `review.html`. The static review exports deterministic QA with
+backend/model/checkpoint/configuration provenance plus `CORRECT`, `WRONG`, or
+`UNCERTAIN` and the approved failure flags. API keys are never persisted.
+
+## Historical ASR-V2 pilot
+
+Everything below this point is retained for old V1/V2/V3 pilot provenance. It
+does not define the current JEA CLI, inputs, schema versions, or output roots.
+
+### Status
 
 The first bounded 20-clip runtime completed 20/20 and its review bundle is
 available. Those ASR-pilot clips are predominantly acoustically clean, so formal
