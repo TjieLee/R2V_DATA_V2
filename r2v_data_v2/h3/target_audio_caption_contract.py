@@ -102,6 +102,19 @@ class TargetAudioCaptionResponse(SchemaModel):
         return self
 
 
+class OverallAudioDescriptionResponse(SchemaModel):
+    overall_audio_description: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_description(self) -> OverallAudioDescriptionResponse:
+        if (
+            self.overall_audio_description is not None
+            and not self.overall_audio_description.strip()
+        ):
+            raise ValueError("overall_audio_description must be non-empty or null")
+        return self
+
+
 class TargetSpeakerDelivery(ModelSpeakerDelivery):
     entity_id: str | None = None
 
@@ -109,6 +122,7 @@ class TargetSpeakerDelivery(ModelSpeakerDelivery):
 __all__ = [
     "LegacyTargetAudioCaptionResponse",
     "ModelSpeakerDelivery",
+    "OverallAudioDescriptionResponse",
     "SpeakerClusterEvidence",
     "SpeakerTimeRange",
     "TargetAudioCaptionResponse",

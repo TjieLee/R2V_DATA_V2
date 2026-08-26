@@ -107,12 +107,45 @@ counts), and the validation issues that caused a repair even if that repair late
 fails. Fallback policy versioning participates in Qwen request fingerprints;
 runtime concurrency does not.
 
+### Qwen whole-audio non-vocal description
+
+After the existing four-field semantic pass is complete, each Qwen clip runs one
+independent, lightweight whole-audio pass using
+`h3_overall_audio_description_v1`. It returns only nullable
+`overall_audio_description`: a concise, high-recall description of meaningful
+non-vocal content across the entire clip. It intentionally overlaps
+`overall_soundscape`, `non_diegetic_music`, and `temporal_audio_events`;
+this redundancy is canonical and does not change the V2 main prompt or any of its
+four fields. It receives the same configured media transport as the main Qwen
+pass, but no transcript, entity ID, speaker clusters, event timeline, or other
+main-pass model input.
+
+A non-null result is accepted immediately. A schema-valid null or a
+whitespace-only response triggers exactly one semantic recheck with
+`h3_overall_audio_description_v1_recheck`. Schema-invalid JSON receives exactly
+one structured repair within its current pass. Ordinary connection, HTTP,
+timeout, model, and local-media failures do not trigger the recheck. If the
+recheck returns null, the null is confirmed and ready; if it fails, only
+`overall_audio_description_status` becomes `failed` and valid main semantics
+remain ready. Dots3 makes no extra call and publishes this subpass as `not_run`.
+
+Records keep description status, source/trigger provenance, and failure separate,
+so a confirmed valid null cannot be confused with inference failure. Summary
+counters separately reconcile initial calls, repairs, fallback triggers by
+reason, fallback initial calls, recoveries, confirmed nulls, and failures. Raw
+JSON retains primary, repair, and recheck responses, validated output, failure,
+finish/token/whitespace diagnostics, and exact model-call counts. The two prompt
+versions and policy version participate in Qwen configuration and request
+fingerprints. Review shows this field before the original soundscape and adds
+`hallucinated_overall_audio`, `missed_overall_audio`, and
+`voice_leakage_in_overall_audio` QA flags.
+
 The new contracts are:
 
-- `r2v.h3.target_audio_caption.7`;
+- `r2v.h3.target_audio_caption.8`;
 - `r2v.h3.target_audio_caption_inventory.3`;
-- `r2v.h3.target_audio_caption_summary.7`;
-- `r2v.h3.target_audio_caption_human_qa.3`.
+- `r2v.h3.target_audio_caption_summary.8`;
+- `r2v.h3.target_audio_caption_human_qa.4`.
 
 Run model-free inventory validation first:
 
@@ -156,8 +189,9 @@ video input behavior is already fixed.
 `--max-concurrency` controls how many independent target clips the producer
 sends to the serving backend at once. It is not a GPU count or a vLLM tensor
 parallel setting, and it is deliberately excluded from semantic request
-fingerprints. Each clip's primary request, optional structured repair, and
-optional Qwen semantic fallback remain sequential. The default value `1` is
+fingerprints. Each clip's primary request, optional structured repair, optional
+Qwen semantic fallback, and whole-audio description pass remain sequential. The
+default value `1` is
 the compatibility and debugging mode. For the current four-GPU evaluation
 deployment, start with `4`; benchmark `1`, `2`, `4`, and `8` against the actual
 serving topology before freezing an operational value. No linear scaling is
@@ -171,8 +205,9 @@ $AUDIO_PRODUCTION_ROOT/audio_caption/qwen3_omni/
 ```
 
 Each contains `inventory.json`, `records.jsonl`, `summary.json`, `raw/`,
-`media/`, and `review.html`. Review renders soundscape, non-diegetic music,
-temporal events, and speaker delivery separately. Its localStorage namespace is
+`media/`, and `review.html`. Review renders the whole-audio description,
+soundscape, non-diegetic music, temporal events, and speaker delivery separately.
+Its localStorage namespace is
 derived from schema, prompt, backend family, backend configuration fingerprint,
 and inventory fingerprint, so stale labels cannot cross semantic configurations.
 The static review exports deterministic QA with backend/model/checkpoint/

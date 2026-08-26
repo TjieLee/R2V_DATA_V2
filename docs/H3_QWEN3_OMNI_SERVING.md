@@ -254,7 +254,11 @@ requests text only. Add `--include-video` to send the whole target video plus
 canonical full audio for an explicit A/B run. It does not send Qwen3-ASR
 transcript text, entity IDs, reference images, voice references, or donor media.
 The target video path and hash remain validated canonical provenance in both
-modes.
+modes. After the existing four-field semantic pass, the producer makes one
+additional lightweight, sequential whole-audio request per clip for a high-recall
+non-vocal description. It uses the same audio-only default or video-plus-audio
+experiment transport, requests text only, and does not send transcript, identity,
+speaker clusters, or the main semantic response. Dots3 does not run this pass.
 
 This default is evidence-driven: the real 35-clip video-plus-audio run produced
 15/35 whitespace-only generation failures, and reducing producer concurrency
@@ -287,7 +291,11 @@ Current four-GPU evaluation run:
 The command above uses the default audio-only transport. Add `--include-video`
 only when intentionally reproducing the video-plus-audio experiment.
 
-`--max-concurrency` is producer-side clip concurrency, not tensor parallelism. The current evaluation starts at `4`; benchmark `1`, `2`, `4`, and `8` before freezing a large-scale production value. Each clip's primary request, structured-output repair, and same-schema semantic fallback remain sequential.
+`--max-concurrency` is producer-side clip concurrency, not tensor parallelism.
+The current evaluation starts at `4`; benchmark `1`, `2`, `4`, and `8` before
+freezing a large-scale production value. Each clip's primary request,
+structured-output repair, same-schema semantic fallback, and independent
+whole-audio description pass remain sequential.
 
 Review the atomically published output:
 
@@ -314,7 +322,16 @@ jq -c '
 
 A small number of observed Qwen3-Omni calls returned a long string consisting only of whitespace/newline characters. The producer classifies `response.strip() == ""` as `qwen3_omni_vllm_empty_response`. For Qwen only, a primary `h3_target_audio_semantics_v2` whitespace-only failure invokes exactly one `h3_target_audio_semantics_v2_recheck` fallback, including when whitespace occurs on the primary structured repair after an earlier schema-invalid response. Primary and fallback use the same H3-aligned schema: `overall_soundscape`, `non_diegetic_music`, `temporal_audio_events`, and `speaker_delivery`. Partial-null valid output remains accepted, and ordinary HTTP, timeout, model, or media failures do not trigger fallback. Completion finish reason, optional token usage, and whitespace counts are retained for diagnosis; validation issues that caused a repair are also retained if the repair later fails. This is distinct from a schema-valid JSON response whose semantic fields are explicitly all null or empty.
 
-Do not interpret an individual null semantic field in an otherwise ready record as a transport or token-limit error. Complete all-null means null soundscape, null non-diegetic music, no temporal events, and null delivery for every supplied speaker. Preserve raw diagnostics for failed and repaired cases.
+Do not interpret an individual null semantic field in an otherwise ready record
+as a transport or token-limit error. Complete all-null means null soundscape,
+null non-diegetic music, no temporal events, and null delivery for every supplied
+speaker. Preserve raw diagnostics for failed and repaired cases.
+
+The independent `h3_overall_audio_description_v1` pass has its own whitespace
+policy: a whitespace-only primary result or a schema-valid null gets exactly one
+`h3_overall_audio_description_v1_recheck`. Schema-invalid output gets one
+structured repair. Infrastructure failures do not trigger recheck, and failure of
+this subpass does not invalidate already-ready main semantics.
 
 ## Dots3 endpoint used for the current A/B
 
