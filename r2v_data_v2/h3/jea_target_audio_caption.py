@@ -6,7 +6,9 @@ import json
 import math
 import re
 import shutil
+import subprocess
 import uuid
+import wave
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ DEFAULT_DOTS3_MODEL = "dots3-note-prev"
 DEFAULT_DOTS3_CHECKPOINT_ID = "/mnt/workspace/public/pretrained/dots3-note-prev"
 DEFAULT_QWEN3_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 DEFAULT_QWEN3_OMNI_CHECKPOINT_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS = 0.05
 
 BackendFamily = Literal["dots3", "qwen3_omni"]
 InputModality = Literal[
@@ -449,6 +452,133 @@ def _resolved_file(path_value: str, *, field_name: str) -> Path:
     return resolved
 
 
+@dataclass(frozen=True)
+class _AudioTimeline:
+    duration_seconds: float
+    sample_rate_hz: int | None
+    sample_count: int | None
+
+
+def _audio_timeline(path: Path, *, field_name: str) -> _AudioTimeline:
+    try:
+        with wave.open(str(path), "rb") as source:
+            sample_rate_hz = source.getframerate()
+            sample_count = source.getnframes()
+        if sample_rate_hz <= 0 or sample_count <= 0:
+            raise ValueError(f"{field_name} has an invalid PCM timeline")
+        return _AudioTimeline(
+            duration_seconds=sample_count / sample_rate_hz,
+            sample_rate_hz=sample_rate_hz,
+            sample_count=sample_count,
+        )
+    except (EOFError, OSError, wave.Error):
+        pass
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        raise ValueError(f"cannot inspect {field_name}: ffprobe is unavailable")
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate,duration:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"cannot inspect {field_name} timeline")
+    try:
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams", [])
+        stream = streams[0] if streams else {}
+        duration_value = stream.get("duration") or payload.get("format", {}).get(
+            "duration"
+        )
+        duration_seconds = float(duration_value)
+        sample_rate_value = stream.get("sample_rate")
+        sample_rate_hz = (
+            None if sample_rate_value is None else int(sample_rate_value)
+        )
+    except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot parse {field_name} timeline") from exc
+    if (
+        not math.isfinite(duration_seconds)
+        or duration_seconds <= 0
+        or (sample_rate_hz is not None and sample_rate_hz <= 0)
+    ):
+        raise ValueError(f"{field_name} has an invalid timeline")
+    return _AudioTimeline(
+        duration_seconds=duration_seconds,
+        sample_rate_hz=sample_rate_hz,
+        sample_count=None,
+    )
+
+
+def _validate_audio_timelines(
+    *,
+    clip_rows: Sequence[JEAReadableDiarizationSegment],
+    readable_audio_path: Path,
+    canonical_audio_path: Path,
+) -> None:
+    readable_timeline = _audio_timeline(
+        readable_audio_path,
+        field_name="readable source audio",
+    )
+    canonical_timeline = _audio_timeline(
+        canonical_audio_path,
+        field_name="target full audio",
+    )
+    if (
+        abs(
+            readable_timeline.duration_seconds
+            - canonical_timeline.duration_seconds
+        )
+        > AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
+    ):
+        raise ValueError("readable and canonical full-audio timelines differ")
+    if (
+        readable_timeline.sample_count is not None
+        and canonical_timeline.sample_count is not None
+        and readable_timeline.sample_rate_hz == canonical_timeline.sample_rate_hz
+    ):
+        allowed_samples = math.ceil(
+            AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
+            * readable_timeline.sample_rate_hz
+        )
+        if (
+            abs(readable_timeline.sample_count - canonical_timeline.sample_count)
+            > allowed_samples
+        ):
+            raise ValueError("readable and canonical full-audio sample counts differ")
+    for row in clip_rows:
+        if row.source_end_sample <= row.source_start_sample:
+            raise ValueError("readable DiariZen segment sample range is invalid")
+        if (
+            readable_timeline.sample_rate_hz is not None
+            and row.source_sample_rate_hz != readable_timeline.sample_rate_hz
+        ):
+            raise ValueError("readable DiariZen sample rate differs from source audio")
+        if (
+            readable_timeline.sample_count is not None
+            and row.source_end_sample > readable_timeline.sample_count
+        ):
+            raise ValueError("readable DiariZen segment exceeds source audio samples")
+        if row.end_time > (
+            readable_timeline.duration_seconds
+            + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
+        ):
+            raise ValueError("readable DiariZen segment exceeds source audio timeline")
+
+
 def build_jea_target_audio_caption_inventory(
     *,
     audio_production_root: Path,
@@ -495,12 +625,18 @@ def build_jea_target_audio_caption_inventory(
         binding_path = _resolved_file(
             pair.target_audio_binding_path, field_name="target audio binding"
         )
-        if any(
-            _resolved_file(item.source_audio_path, field_name="readable source audio")
-            != audio_path
-            for item in clip_rows
-        ):
-            raise ValueError("readable DiariZen audio differs from pair full audio")
+        readable_audio_values = {item.source_audio_path for item in clip_rows}
+        if len(readable_audio_values) != 1:
+            raise ValueError("readable DiariZen source audio paths differ within clip")
+        readable_audio_path = _resolved_file(
+            next(iter(readable_audio_values)),
+            field_name="readable source audio",
+        )
+        _validate_audio_timelines(
+            clip_rows=clip_rows,
+            readable_audio_path=readable_audio_path,
+            canonical_audio_path=audio_path,
+        )
 
         rows_by_cluster: dict[str, list[JEAReadableDiarizationSegment]] = defaultdict(list)
         cluster_order: list[str] = []

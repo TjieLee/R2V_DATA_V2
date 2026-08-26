@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,11 +65,26 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+def _write_pcm16_wave(
+    path: Path,
+    *,
+    sample_rate_hz: int = 16000,
+    sample_count: int = 16000,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate_hz)
+        output.writeframes(b"\x00\x00" * sample_count)
+
+
 def _production_fixture(
     tmp_path: Path,
     *,
     clip_count: int = 2,
     segment_count: int = 4,
+    distinct_audio_artifacts: bool = False,
 ) -> Path:
     root = tmp_path / "production"
     pairs: list[JEAInPair] = []
@@ -82,10 +98,17 @@ def _production_fixture(
         media = root / "source" / clip_uid
         media.mkdir(parents=True)
         video = media / "target.mp4"
-        audio = media / "audio.flac"
+        readable_audio = media / "audio_source" / "clip.wav"
+        canonical_audio = (
+            media / "full_audio" / "clip.flac"
+            if distinct_audio_artifacts
+            else readable_audio
+        )
         binding = media / "audio_binding.json"
         video.write_bytes(f"video-{clip_uid}".encode())
-        audio.write_bytes(f"audio-{clip_uid}".encode())
+        _write_pcm16_wave(readable_audio)
+        if canonical_audio != readable_audio:
+            _write_pcm16_wave(canonical_audio)
         binding.write_text("{}\n", encoding="utf-8")
         pairs.append(
             JEAInPair(
@@ -98,7 +121,7 @@ def _production_fixture(
                 clip_name=clip_uid,
                 shard_id="shard-1",
                 target_video_path=str(video),
-                target_full_audio_path=str(audio),
+                target_full_audio_path=str(canonical_audio),
                 target_audio_binding_path=str(binding),
                 subjects=[],
             )
@@ -127,7 +150,7 @@ def _production_fixture(
                 "entity_occurrence_id": (
                     None if entity_id is None else f"{clip_uid}/{entity_id}"
                 ),
-                "source_audio_path": str(audio),
+                "source_audio_path": str(readable_audio),
                 "source_start_sample": start_sample,
                 "source_end_sample": end_sample,
                 "source_sample_rate_hz": 16000,
@@ -255,6 +278,124 @@ def test_current_35_target_92_segment_inventory_and_partial_binding(
     )
 
 
+def test_inventory_allows_distinct_readable_and_canonical_audio_artifacts(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+        distinct_audio_artifacts=True,
+    )
+
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+
+    job = inventory.jobs[0]
+    assert job.target_full_audio_path.endswith("/full_audio/clip.flac")
+    readable = json.loads(
+        (root / "diarization/readable_segments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert readable["source_audio_path"].endswith("/audio_source/clip.wav")
+    assert readable["source_audio_path"] != job.target_full_audio_path
+
+
+def test_inventory_rejects_incompatible_full_audio_timelines(tmp_path: Path) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+        distinct_audio_artifacts=True,
+    )
+    pair = json.loads(
+        (root / "pairs/in_pairs.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    _write_pcm16_wave(Path(pair["target_full_audio_path"]), sample_count=32000)
+
+    with pytest.raises(ValueError, match="timelines differ"):
+        build_jea_target_audio_caption_inventory(audio_production_root=root)
+
+
+def test_inventory_rejects_missing_readable_source_audio(tmp_path: Path) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+        distinct_audio_artifacts=True,
+    )
+    readable = json.loads(
+        (root / "diarization/readable_segments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    Path(readable["source_audio_path"]).unlink()
+
+    with pytest.raises(FileNotFoundError, match="readable source audio is missing"):
+        build_jea_target_audio_caption_inventory(audio_production_root=root)
+
+
+def test_inventory_rejects_missing_pair_canonical_audio(tmp_path: Path) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+        distinct_audio_artifacts=True,
+    )
+    pair = json.loads(
+        (root / "pairs/in_pairs.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    Path(pair["target_full_audio_path"]).unlink()
+
+    with pytest.raises(FileNotFoundError, match="target full audio is missing"):
+        build_jea_target_audio_caption_inventory(audio_production_root=root)
+
+
+def test_inventory_rejects_inconsistent_readable_source_audio_within_clip(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    alternate = root / "source/clip-000/audio_source/alternate.wav"
+    _write_pcm16_wave(alternate)
+    for relative_path in (
+        "diarization/readable_segments.jsonl",
+        "asr/segments.jsonl",
+    ):
+        path = root / relative_path
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[1]["source_audio_path"] = str(alternate)
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="source audio paths differ within clip"):
+        build_jea_target_audio_caption_inventory(audio_production_root=root)
+
+
+def test_inventory_rejects_segment_outside_readable_source_audio(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=1)
+    for relative_path in (
+        "diarization/readable_segments.jsonl",
+        "asr/segments.jsonl",
+    ):
+        path = root / relative_path
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["source_end_sample"] = 16001
+        rows[0]["end_time"] = 16001 / 16000
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="exceeds source audio samples"):
+        build_jea_target_audio_caption_inventory(audio_production_root=root)
+
+
 def test_qwen_asr_and_readable_diarization_mismatch_fails_closed(
     tmp_path: Path,
 ) -> None:
@@ -344,6 +485,39 @@ def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence
     else:
         assert "modalities" not in request
         assert job.target_full_audio_path not in encoded
+
+
+def test_qwen_omni_uses_pair_canonical_audio_not_readable_source(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+        distinct_audio_artifacts=True,
+    )
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    readable = json.loads(
+        (root / "diarization/readable_segments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    completions = _FakeCompletions([_response(job_index=1).model_dump_json()])
+    backend = OpenAIJEATargetAudioCaptionBackend(
+        _config(tmp_path, family="qwen3_omni"),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    backend.describe(job)
+
+    encoded = json.dumps(completions.requests[0], ensure_ascii=False)
+    assert job.target_video_path in encoded
+    assert job.target_full_audio_path in encoded
+    assert readable["source_audio_path"] not in encoded
+    assert "SECRET TRANSCRIPT" not in encoded
+    assert '"entity_id":' not in encoded
 
 
 def test_cluster_order_mismatch_repairs_once_and_second_failure_fails_closed(
