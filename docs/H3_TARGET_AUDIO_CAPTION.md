@@ -1,6 +1,6 @@
 # H3 Target Audio Caption
 
-## Current JEA multi-backend V5
+## Current JEA multi-backend V6
 
 The current JEA production sidecar reads only:
 
@@ -23,7 +23,7 @@ gate with a 0.10-second tolerance for LR-ASD 25fps, ffmpeg, and container durati
 quantization; readable segment sample ranges and both audio timeline bounds remain
 fail-closed.
 
-Both backends use prompt `h3_target_audio_caption_v5` and the same strict response:
+Both backends use prompt `h3_target_audio_caption_v6` and the same strict response:
 
 ```json
 {
@@ -36,6 +36,17 @@ Both backends use prompt `h3_target_audio_caption_v5` and the same strict respon
   ]
 }
 ```
+
+Human review of the 35-clip V5 A/B run found visual-content leakage, especially
+from Dots3, and found that speech-dominant clips could suppress recall of
+concurrent music, ambience, laughter, and other non-dialogue sounds. V6 therefore
+uses two independent conceptual passes: first the complete non-dialogue
+soundscape, then speaker delivery and prosody. The field name
+`background_audio_prompt` is retained for schema compatibility, but it means all
+meaningful foreground and background non-dialogue audio, including human
+non-speech vocalizations. Visual evidence may only disambiguate an already
+audible sound and can never establish that a sound exists. V6 accuracy remains
+unconfirmed until the rerun receives human QA.
 
 Code requires every supplied cluster exactly once and in order, then reattaches
 the frozen nullable `entity_id`. The model receives neither transcript nor entity

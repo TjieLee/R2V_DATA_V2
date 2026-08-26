@@ -42,7 +42,7 @@ JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.
 JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = (
     "r2v.h3.target_audio_caption_human_qa.2"
 )
-JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_target_audio_caption_v5"
+JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_target_audio_caption_v6"
 DEFAULT_DOTS3_MODEL = "dots3-note-prev"
 DEFAULT_DOTS3_CHECKPOINT_ID = "/mnt/workspace/public/pretrained/dots3-note-prev"
 DEFAULT_QWEN3_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -64,30 +64,59 @@ QA_FLAGS = (
     "other",
 )
 
-SYSTEM_PROMPT = """You analyze AUDIO SEMANTICS for one target clip.
-Use audible evidence as the source of truth. Visual evidence may help disambiguate
-a sound that is genuinely audible, but never invent a sound merely because a
-visible action or object could produce it.
+SYSTEM_PROMPT = """You analyze AUDIO SEMANTICS for one target clip for
+audio-generation conditioning.
 
-Return only:
-- background_audio_prompt: one short English description of meaningful non-speech
-  audio actually audible, or null when there is none. Actively check for background
-  music, ambience, sound effects, traffic, crowds, footsteps, doors, machinery,
-  nature, and other non-speech audio. Include faint or partially masked background
-  audio when it is genuinely audible.
-- speaker_delivery: one entry per supplied speaker cluster, using its exact
-  speaker_cluster_id and a concise, generation-useful delivery/prosody condition
-  or null. Focus on audible emotion, pace, energy, loudness, pitch tendency,
-  rhythm, hesitation, pauses, whispering, shouting, questioning, commanding, and
-  similarly useful delivery traits when supported by the audio.
+AUDIBLE EVIDENCE IS THE ONLY SOURCE OF TRUTH. Visual evidence may only help
+disambiguate the source or category of a sound that is already genuinely audible.
+Never infer that a sound exists merely because an action, object, person, event,
+expression, gesture, or scene is visible. Do not describe visual content itself.
+If a visually apparent event is silent, omit it.
+
+Analyze the audio in two independent passes before producing JSON.
+
+PASS 1 - COMPLETE NON-DIALOGUE SOUNDSCAPE
+Independently inspect the entire clip for every meaningful audible sound other
+than spoken linguistic content. Continue even during speech and do not stop after
+identifying speaker delivery. background_audio_prompt is one short English
+audio-generation description of ALL meaningful audible non-dialogue sound, not
+merely distant background ambience.
+
+When genuinely audible, include foreground or background music and musical
+accompaniment; ambience and room tone; sound effects and object sounds; traffic,
+crowds, footsteps, doors, impacts, machinery, nature, applause, and similar
+sounds; and human non-speech vocalizations such as laughter, chuckling, sighing,
+gasping, coughing, crying, sobbing, breathing, or cheering. Include a sound when
+it overlaps speech, comes from the current speaker, is foreground, is quieter
+than dialogue, is partially masked by speech, or occurs only briefly. Do not
+transcribe or paraphrase words spoken during a vocalization.
+
+Return background_audio_prompt as null only when no meaningful non-dialogue sound
+is reliably audible anywhere. Before returning null, independently verify the
+whole clip for music, ambience, sound effects or object sounds, and human
+non-speech vocalizations.
+
+PASS 2 - SPEAKER DELIVERY
+Separately analyze each supplied speaker cluster for speech delivery and prosody
+only, using its exact speaker_cluster_id. Describe concise, generation-useful
+audible traits when supported: emotion expressed through voice, pace, energy,
+loudness, pitch tendency, rhythm, articulation, hesitation, pauses, whispering,
+shouting, questioning, commanding, or similar delivery. Never infer delivery from
+facial expression, gesture, pose, scene semantics, or other visual evidence.
+
+Distinct non-speech events such as laughter, coughing, gasping, crying, or sighing
+belong in background_audio_prompt when audible, even when produced by the current
+speaker. speaker_delivery describes speech prosody and is not the only location
+for those events.
 
 Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
 speaker, entity, or subject identity, gender, age, nationality, intrinsic voice
 identity, or timbre. Do not emit entity_id. Return every supplied
 speaker_cluster_id exactly once, in supplied order, and no unknown cluster ID.
+Prefer concise generation-useful descriptions without speculative details.
 
 Return exactly one compact JSON object matching the supplied schema, with no
-markdown or explanation."""
+markdown, explanation, reasoning, or extra fields."""
 
 
 def _compact_json(value: object) -> str:
@@ -150,7 +179,7 @@ class JEATargetAudioCaptionBackendProvenance(SchemaModel):
     media_root: str
     media_base_url: str | None = None
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_target_audio_caption_v5"] = (
+    prompt_version: Literal["h3_target_audio_caption_v6"] = (
         JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
     )
     temperature: Literal[0.0] = 0.0
@@ -813,12 +842,15 @@ def _model_input(job: JEATargetAudioCaptionJob) -> dict[str, object]:
 
 def _user_prompt(job: JEATargetAudioCaptionJob) -> str:
     return (
-        "Analyze only sounds actually audible in the attached target media. Do not "
-        "transcribe, quote, paraphrase, correct, or summarize speech. Do not infer "
-        "speaker, entity, or subject identity. Return one short English "
-        "background_audio_prompt for meaningful non-speech audio, or null, and "
-        "concise nullable delivery/prosody for each supplied speaker cluster. Return "
-        "every cluster exactly once in the supplied order and no entity_id.\nInput:\n"
+        "Analyze the complete audible soundscape of the attached target media. "
+        "First, independently scan the whole clip for all meaningful non-dialogue "
+        "audio, including music, ambience, sound effects or object sounds, and "
+        "human non-speech vocalizations such as laughter, even when they overlap "
+        "speech or come from the current speaker. Second, separately describe "
+        "speech delivery and prosody for each supplied speaker cluster. Use audible "
+        "evidence only; visual content cannot establish that a sound exists. Do not "
+        "transcribe speech or infer identity. Return every speaker_cluster_id "
+        "exactly once in supplied order and no entity_id.\nInput:\n"
         f"{_compact_json(_model_input(job))}\nJSON schema:\n"
         f"{_compact_json(TargetAudioCaptionResponse.model_json_schema())}"
     )
@@ -857,9 +889,10 @@ def _repair_prompt(
 ) -> str:
     return (
         "Repair the previous JSON only. Reinspect the same attached audio when "
-        "needed. Follow the original audible-only policy. Do not emit dialogue or "
-        "entity_id. Return every speaker_cluster_id exactly once in supplied order. "
-        "Return one compact JSON object only.\nOriginal request:\n"
+        "needed. Preserve the original two-pass audible-only analysis. Do not infer "
+        "sound from visual content. Do not emit dialogue or entity_id. Return every "
+        "speaker_cluster_id exactly once in supplied order. Return one compact JSON "
+        "object only.\nOriginal request:\n"
         f"{_user_prompt(job)}\nValidation issues:\n"
         f"{_compact_json([item.to_dict() for item in issues])}\nInvalid response:\n"
         f"{invalid_response}"

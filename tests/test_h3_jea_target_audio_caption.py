@@ -492,6 +492,27 @@ def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence
     request = completions.requests[0]
     content = request["messages"][1]["content"]  # type: ignore[index]
     assert [item["type"] for item in content] == media_types
+    user_text = content[0]["text"]
+    model_input = json.loads(
+        user_text.split("\nInput:\n", maxsplit=1)[1].split(
+            "\nJSON schema:\n", maxsplit=1
+        )[0]
+    )
+    assert set(model_input) == {"speaker_clusters"}
+    assert all(
+        set(cluster) == {"speaker_cluster_id", "active_time_ranges"}
+        for cluster in model_input["speaker_clusters"]
+    )
+    model_input_text = json.dumps(model_input, ensure_ascii=False)
+    for forbidden in (
+        "SECRET TRANSCRIPT",
+        "entity_id",
+        "gender",
+        "reference_image",
+        "primary_voice",
+        "donor_media",
+    ):
+        assert forbidden not in model_input_text
     encoded = json.dumps(request, ensure_ascii=False)
     assert "SECRET TRANSCRIPT" not in encoded
     assert '"entity_id":' not in encoded
@@ -559,6 +580,9 @@ def test_cluster_order_mismatch_repairs_once_and_second_failure_fails_closed(
 
     assert len(backend.describe(job).raw_responses) == 2
     assert len(completions.requests) == 2
+    repair_text = completions.requests[1]["messages"][1]["content"][0]["text"]
+    assert "Preserve the original two-pass audible-only analysis" in repair_text
+    assert "Do not infer sound from visual content" in repair_text
 
     failed_completions = _FakeCompletions([reordered, reordered])
     failed_backend = OpenAIJEATargetAudioCaptionBackend(
@@ -797,20 +821,40 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
             }
         )
     assert JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION.endswith(".2")
-    assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_caption_v5"
+    assert JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION == "r2v.h3.target_audio_caption.3"
+    assert (
+        JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION
+        == "r2v.h3.target_audio_caption_inventory.2"
+    )
+    assert (
+        JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION
+        == "r2v.h3.target_audio_caption_human_qa.2"
+    )
+    assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_caption_v6"
     assert set(TargetAudioCaptionResponse.model_json_schema()["properties"]) == {
         "background_audio_prompt",
         "speaker_delivery",
     }
 
 
-def test_v5_prompt_prioritizes_generation_useful_audible_evidence() -> None:
+def test_v6_prompt_separates_non_dialogue_recall_from_speaker_delivery() -> None:
     prompt = " ".join(SYSTEM_PROMPT.split())
-    assert "faint or partially masked background" in prompt
+    assert "AUDIBLE EVIDENCE IS THE ONLY SOURCE OF TRUTH" in prompt
+    assert "Never infer that a sound exists merely because" in prompt
+    assert "two independent passes" in prompt
+    assert "PASS 1 - COMPLETE NON-DIALOGUE SOUNDSCAPE" in prompt
+    assert "Continue even during speech" in prompt
+    assert "PASS 2 - SPEAKER DELIVERY" in prompt
+    assert "Before returning null" in prompt
+    assert "whole clip for music, ambience, sound effects or object sounds" in prompt
+    assert "even when produced by the current speaker" in prompt
+    assert "background_audio_prompt when audible" in prompt
     for evidence in (
-        "background music",
+        "music",
         "ambience",
         "sound effects",
+        "laughter",
+        "human non-speech vocalizations",
         "traffic",
         "crowds",
         "footsteps",
@@ -833,7 +877,7 @@ def test_v5_prompt_prioritizes_generation_useful_audible_evidence() -> None:
         assert evidence in prompt
     assert "Never transcribe, quote, paraphrase" in prompt
     assert "identity, gender, age, nationality" in prompt
-    assert "never invent a sound merely because" in prompt
+    assert "Do not describe visual content itself" in prompt
 
 
 def test_qa_export_carries_backend_provenance(tmp_path: Path) -> None:
@@ -848,6 +892,10 @@ def test_qa_export_carries_backend_provenance(tmp_path: Path) -> None:
     )
     assert qa.backend_provenance.backend_family == "qwen3_omni"
     assert qa.backend_provenance.served_model_name == "served-model"
+    assert qa.backend_provenance.prompt_version == "h3_target_audio_caption_v6"
+    assert qa.backend_provenance == qa.backend_provenance.model_validate_json(
+        qa.backend_provenance.model_dump_json()
+    )
 
 
 def test_cli_dry_run_uses_current_root_and_constructs_no_backend(
