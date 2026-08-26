@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -14,20 +15,27 @@ from pydantic import ValidationError
 from r2v_data_v2.h3.jea_audio_production import JEAInPair
 from r2v_data_v2.h3.jea_diarization import JEAReadableDiarizationSegment
 from r2v_data_v2.h3.jea_target_audio_caption import (
+    JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
     JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION,
     JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION,
+    JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION,
     JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION,
     JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION,
     JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION,
     SYSTEM_PROMPT,
+    V5_FALLBACK_SYSTEM_PROMPT,
     JEATargetAudioCaptionBackendFailure,
     JEATargetAudioCaptionBackendResult,
     JEATargetAudioCaptionConfig,
     JEATargetAudioCaptionHumanQAExport,
     JEATargetAudioCaptionInventory,
+    JEATargetAudioCaptionJob,
     JEATargetAudioCaptionRecord,
     JEATargetAudioCaptionSummary,
     OpenAIJEATargetAudioCaptionBackend,
+    _is_all_semantic_null,
+    _v5_fallback_repair_prompt,
+    _v5_fallback_user_prompt,
     build_jea_target_audio_caption_inventory,
     run_jea_target_audio_caption,
     target_audio_caption_output_root,
@@ -230,6 +238,74 @@ def _response(job_index: int = 0) -> TargetAudioCaptionResponse:
             for cluster_id in cluster_ids
         ],
     )
+
+
+def _response_for_job(
+    job: JEATargetAudioCaptionJob,
+    *,
+    background: str | None,
+    delivery_styles: list[str | None],
+) -> TargetAudioCaptionResponse:
+    clusters = job.speaker_clusters
+    assert len(clusters) == len(delivery_styles)
+    return TargetAudioCaptionResponse(
+        background_audio_prompt=background,
+        speaker_delivery=[
+            ModelSpeakerDelivery(
+                speaker_cluster_id=cluster.speaker_cluster_id,
+                delivery_style=delivery_style,
+            )
+            for cluster, delivery_style in zip(
+                clusters, delivery_styles, strict=True
+            )
+        ],
+    )
+
+
+def _read_records(output: Path) -> list[JEATargetAudioCaptionRecord]:
+    return [
+        JEATargetAudioCaptionRecord.model_validate_json(line)
+        for line in (output / "records.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def _run_semantic_sequence(
+    tmp_path: Path,
+    responses: list[str],
+    *,
+    family: str = "qwen3_omni",
+) -> tuple[
+    JEATargetAudioCaptionSummary,
+    JEATargetAudioCaptionRecord,
+    dict[str, object],
+    _FakeCompletions,
+    JEATargetAudioCaptionJob,
+]:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    completions = _FakeCompletions(responses)
+    backend = OpenAIJEATargetAudioCaptionBackend(
+        _config(tmp_path, family=family),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    output = target_audio_caption_output_root(
+        root,
+        backend_family=family,  # type: ignore[arg-type]
+    )
+    summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=backend,
+    )
+    record = _read_records(output)[0]
+    raw = json.loads(
+        (output / "raw" / f"{record.target_clip_uid}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return summary, record, raw, completions, inventory.jobs[0]
 
 
 class _FakeBackend:
@@ -1007,6 +1083,382 @@ def test_failed_v6_regeneration_preserves_existing_v5_output(tmp_path: Path) -> 
     assert _tree_bytes(output) == before
 
 
+@pytest.mark.parametrize(
+    ("background", "delivery_styles"),
+    [
+        ("music and room tone", ["calm", "measured"]),
+        (None, ["calm", None]),
+        ("faint traffic", [None, None]),
+        (None, [None, "questioning"]),
+    ],
+)
+def test_qwen_partial_semantics_accept_v6_without_fallback(
+    tmp_path: Path,
+    background: str | None,
+    delivery_styles: list[str | None],
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    response = _response_for_job(
+        job,
+        background=background,
+        delivery_styles=delivery_styles,
+    )
+
+    summary, record, _, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [response.model_dump_json()],
+    )
+
+    assert len(completions.requests) == 1
+    assert record.semantic_source == "primary_v6"
+    assert record.semantic_fallback_attempted is False
+    assert summary.semantic_fallback_trigger_count == 0
+    assert summary.semantic_fallback_initial_call_count == 0
+
+
+def test_qwen_all_null_uses_one_v5_fallback_and_complete_v5_result(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    )
+    recovered = _response_for_job(
+        job,
+        background="faint instrumental music",
+        delivery_styles=[None, "soft and hesitant"],
+    )
+
+    summary, record, raw, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [all_null.model_dump_json(), recovered.model_dump_json()],
+    )
+
+    assert len(completions.requests) == 2
+    assert record.status == "ready"
+    assert record.background_audio_prompt == "faint instrumental music"
+    assert [item.delivery_style for item in record.speaker_delivery] == [
+        None,
+        "soft and hesitant",
+    ]
+    assert record.semantic_source == "fallback_v5"
+    assert record.semantic_fallback_attempted is True
+    assert (
+        record.semantic_fallback_prompt_version
+        == JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
+    )
+    assert summary.semantic_fallback_trigger_count == 1
+    assert summary.semantic_fallback_initial_call_count == 1
+    assert summary.semantic_fallback_repair_call_count == 0
+    assert summary.semantic_fallback_recovered_count == 1
+    assert summary.semantic_fallback_still_all_null_count == 0
+    assert summary.semantic_fallback_failed_count == 0
+    assert summary.raw_response_count == 2
+    assert raw["primary"]["raw_responses"] == [all_null.model_dump_json()]
+    assert raw["semantic_fallback"]["raw_responses"] == [
+        recovered.model_dump_json()
+    ]
+    assert raw["primary"]["validated_response"] == all_null.model_dump(mode="json")
+    assert raw["semantic_fallback"]["validated_response"] == recovered.model_dump(
+        mode="json"
+    )
+    assert raw["raw_responses"] == [
+        all_null.model_dump_json(),
+        recovered.model_dump_json(),
+    ]
+
+
+def test_qwen_v5_all_null_confirms_ready_primary_without_third_attempt(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    ).model_dump_json()
+
+    summary, record, _, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [all_null, all_null],
+    )
+
+    assert len(completions.requests) == 2
+    assert record.status == "ready"
+    assert record.background_audio_prompt is None
+    assert all(item.delivery_style is None for item in record.speaker_delivery)
+    assert record.semantic_source == "primary_v6_all_null_confirmed"
+    assert summary.semantic_fallback_still_all_null_count == 1
+    assert summary.semantic_fallback_recovered_count == 0
+    assert summary.semantic_fallback_failed_count == 0
+
+
+def test_qwen_v5_request_failure_preserves_valid_v6_all_null(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    ).model_dump_json()
+
+    summary, record, raw, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [all_null],
+    )
+
+    assert len(completions.requests) == 2
+    assert record.status == "ready"
+    assert record.semantic_source == "primary_v6_fallback_failed"
+    assert record.failure is None
+    assert summary.ready_count == 1
+    assert summary.failed_count == 0
+    assert summary.semantic_fallback_failed_count == 1
+    assert raw["semantic_fallback"]["failure"]["code"].endswith(
+        "vllm_request_failed"
+    )
+
+
+def test_qwen_v5_malformed_then_repaired_counts_separately(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    )
+    recovered = _response_for_job(
+        job,
+        background="quiet room tone",
+        delivery_styles=[None, None],
+    )
+
+    summary, record, raw, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [all_null.model_dump_json(), "not json", recovered.model_dump_json()],
+    )
+
+    assert len(completions.requests) == 3
+    assert record.semantic_source == "fallback_v5"
+    assert record.repair_count == 0
+    assert summary.initial_call_count == 1
+    assert summary.repair_call_count == 0
+    assert summary.semantic_fallback_initial_call_count == 1
+    assert summary.semantic_fallback_repair_call_count == 1
+    assert summary.semantic_fallback_recovered_count == 1
+    assert summary.raw_response_count == 3
+    assert raw["semantic_fallback"]["raw_responses"] == [
+        "not json",
+        recovered.model_dump_json(),
+    ]
+
+
+@pytest.mark.parametrize("fallback_expected", [False, True])
+def test_primary_structured_repair_controls_semantic_fallback(
+    tmp_path: Path,
+    fallback_expected: bool,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    repaired = _response_for_job(
+        job,
+        background=None if fallback_expected else "room ambience",
+        delivery_styles=[None, None],
+    )
+    responses = ["not json", repaired.model_dump_json()]
+    if fallback_expected:
+        responses.append(
+            _response_for_job(
+                job,
+                background="faint music",
+                delivery_styles=[None, None],
+            ).model_dump_json()
+        )
+
+    summary, record, _, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        responses,
+    )
+
+    assert len(completions.requests) == 2 + int(fallback_expected)
+    assert record.repair_count == 1
+    assert summary.initial_call_count == 1
+    assert summary.repair_call_count == 1
+    assert summary.semantic_fallback_trigger_count == int(fallback_expected)
+    assert record.semantic_source == (
+        "fallback_v5" if fallback_expected else "primary_v6"
+    )
+
+
+def test_primary_request_failure_does_not_trigger_semantic_fallback(
+    tmp_path: Path,
+) -> None:
+    summary, record, raw, completions, _ = _run_semantic_sequence(
+        tmp_path,
+        [],
+    )
+
+    assert len(completions.requests) == 1
+    assert record.status == "failed"
+    assert record.semantic_source is None
+    assert record.semantic_fallback_attempted is False
+    assert summary.semantic_fallback_trigger_count == 0
+    assert raw["semantic_fallback"]["attempted"] is False
+
+
+def test_dots3_all_null_does_not_use_qwen_semantic_fallback(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    )
+
+    summary, record, _, completions, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [all_null.model_dump_json()],
+        family="dots3",
+    )
+
+    assert len(completions.requests) == 1
+    assert record.semantic_source == "primary_v6"
+    assert summary.semantic_fallback_trigger_count == 0
+
+
+def test_all_null_helper_handles_empty_cluster_list() -> None:
+    assert _is_all_semantic_null(
+        TargetAudioCaptionResponse(
+            background_audio_prompt=None,
+            speaker_delivery=[],
+        )
+    )
+    assert not _is_all_semantic_null(
+        TargetAudioCaptionResponse(
+            background_audio_prompt="room tone",
+            speaker_delivery=[],
+        )
+    )
+
+
+def test_qwen_fallback_uses_exact_historical_v5_prompt_and_same_media(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    all_null = _response_for_job(
+        job,
+        background=None,
+        delivery_styles=[None, None],
+    )
+    recovered = _response_for_job(
+        job,
+        background="music",
+        delivery_styles=[None, None],
+    )
+
+    _, _, _, completions, actual_job = _run_semantic_sequence(
+        tmp_path / "run",
+        [all_null.model_dump_json(), recovered.model_dump_json()],
+    )
+
+    fallback_request = completions.requests[1]
+    assert hashlib.sha256(V5_FALLBACK_SYSTEM_PROMPT.encode()).hexdigest() == (
+        "44bbbddc834ca45f0885ebb767e9e60547b6a56f78edba2214631c859c852651"
+    )
+    assert fallback_request["messages"][0]["content"] == V5_FALLBACK_SYSTEM_PROMPT
+    fallback_content = fallback_request["messages"][1]["content"]
+    assert fallback_content[0]["text"] == _v5_fallback_user_prompt(actual_job)
+    assert hashlib.sha256(fallback_content[0]["text"].encode()).hexdigest() == (
+        "b86d09ea348e7d829a0b220630184c182ed3a5a40bb853588fbff01e36eb2562"
+    )
+    assert [item["type"] for item in fallback_content] == [
+        "text",
+        "video_url",
+        "audio_url",
+    ]
+    assert fallback_request["temperature"] == 0.0
+    assert fallback_request["max_tokens"] == 321
+    assert fallback_request["modalities"] == ["text"]
+    assert fallback_request["stream"] is False
+    assert fallback_request["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    encoded = json.dumps(fallback_request, ensure_ascii=False)
+    assert actual_job.target_video_path in encoded
+    assert actual_job.target_full_audio_path in encoded
+    for forbidden in (
+        "SECRET TRANSCRIPT",
+        '"entity_id":',
+        "reference_image",
+        "primary_voice",
+        "donor_media",
+    ):
+        assert forbidden not in encoded
+
+
+def test_v5_fallback_repair_prompt_is_exact_historical_behavior(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    issues = [
+        SimpleNamespace(
+            to_dict=lambda: {
+                "code": "invalid_json",
+                "field": None,
+                "message": "invalid JSON",
+            }
+        )
+    ]
+    expected = (
+        "Repair the previous JSON only. Reinspect the same attached audio when "
+        "needed. Follow the original audible-only policy. Do not emit dialogue or "
+        "entity_id. Return every speaker_cluster_id exactly once in supplied order. "
+        "Return one compact JSON object only.\nOriginal request:\n"
+        f"{_v5_fallback_user_prompt(job)}\nValidation issues:\n"
+        '[{"code":"invalid_json","field":null,"message":"invalid JSON"}]'
+        "\nInvalid response:\nbad"
+    )
+
+    actual = _v5_fallback_repair_prompt(
+        job=job,
+        invalid_response="bad",
+        issues=issues,  # type: ignore[arg-type]
+    )
+    assert actual == expected
+    assert hashlib.sha256(actual.encode()).hexdigest() == (
+        "c7959da397dca4086871376c35286efa04ba0f57d0c64e1922e744365818bd49"
+    )
+
+
 def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionRecord.model_validate(
@@ -1022,8 +1474,11 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
                 "target_clip_count": 1,
             }
         )
-    assert JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION.endswith(".2")
-    assert JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION == "r2v.h3.target_audio_caption.3"
+    assert (
+        JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION
+        == "r2v.h3.target_audio_caption_summary.3"
+    )
+    assert JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION == "r2v.h3.target_audio_caption.4"
     assert (
         JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION
         == "r2v.h3.target_audio_caption_inventory.2"
@@ -1033,10 +1488,45 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
         == "r2v.h3.target_audio_caption_human_qa.2"
     )
     assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_caption_v6"
+    assert (
+        JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION
+        == "h3_target_audio_caption_v6"
+    )
+    assert (
+        JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
+        == "h3_target_audio_caption_v5"
+    )
     assert set(TargetAudioCaptionResponse.model_json_schema()["properties"]) == {
         "background_audio_prompt",
         "speaker_delivery",
     }
+
+
+def test_current_records_and_summary_are_strict_new_versions(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=1)
+    job = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    ).jobs[0]
+    response = _response_for_job(
+        job,
+        background="room tone",
+        delivery_styles=["measured"],
+    )
+    summary, record, _, _, _ = _run_semantic_sequence(
+        tmp_path / "run",
+        [response.model_dump_json()],
+    )
+
+    assert record.schema_version == "r2v.h3.target_audio_caption.4"
+    assert summary.schema_version == "r2v.h3.target_audio_caption_summary.3"
+    old_record = record.model_dump(mode="json")
+    old_record["schema_version"] = "r2v.h3.target_audio_caption.3"
+    with pytest.raises(ValidationError):
+        JEATargetAudioCaptionRecord.model_validate(old_record)
+    old_summary = summary.model_dump(mode="json")
+    old_summary["schema_version"] = "r2v.h3.target_audio_caption_summary.2"
+    with pytest.raises(ValidationError):
+        JEATargetAudioCaptionSummary.model_validate(old_summary)
 
 
 def test_v6_prompt_separates_non_dialogue_recall_from_speaker_delivery() -> None:
@@ -1127,6 +1617,66 @@ def test_cli_dry_run_uses_current_root_and_constructs_no_backend(
     assert result["target_clip_count"] == 2
     assert result["output_root"] == str(root / "audio_caption/qwen3_omni")
     assert not (root / "audio_caption").exists()
+
+
+def test_cli_model_calls_include_semantic_fallback_and_fallback_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=1, segment_count=2)
+
+    class CliFallbackBackend:
+        def __init__(self, config: JEATargetAudioCaptionConfig) -> None:
+            self._provenance = config.provenance()
+
+        @property
+        def provenance(self):
+            return self._provenance
+
+        def describe(self, job):
+            return JEATargetAudioCaptionBackendResult(
+                response=_response_for_job(
+                    job,
+                    background=None,
+                    delivery_styles=[None, None],
+                ),
+                raw_responses=("primary",),
+            )
+
+        def describe_semantic_fallback(self, job):
+            return JEATargetAudioCaptionBackendResult(
+                response=_response_for_job(
+                    job,
+                    background="faint music",
+                    delivery_styles=[None, None],
+                ),
+                raw_responses=("fallback-invalid", "fallback-valid"),
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "OpenAIJEATargetAudioCaptionBackend",
+        CliFallbackBackend,
+    )
+
+    result = cli.main(
+        [
+            "--audio-production-root",
+            str(root),
+            "--backend",
+            "qwen3-omni",
+            "--base-url",
+            "https://example.invalid/v1",
+            "--media-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert result["model_calls"] == 3
+    assert result["summary"]["initial_call_count"] == 1
+    assert result["summary"]["repair_call_count"] == 0
+    assert result["summary"]["semantic_fallback_initial_call_count"] == 1
+    assert result["summary"]["semantic_fallback_repair_call_count"] == 1
 
 
 @pytest.mark.parametrize(

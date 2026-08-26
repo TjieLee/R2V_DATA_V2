@@ -23,7 +23,8 @@ gate with a 0.10-second tolerance for LR-ASD 25fps, ffmpeg, and container durati
 quantization; readable segment sample ranges and both audio timeline bounds remain
 fail-closed.
 
-Both backends use prompt `h3_target_audio_caption_v6` and the same strict response:
+Both backends use primary prompt `h3_target_audio_caption_v6` and the same strict
+response:
 
 ```json
 {
@@ -45,8 +46,10 @@ soundscape, then speaker delivery and prosody. The field name
 `background_audio_prompt` is retained for schema compatibility, but it means all
 meaningful foreground and background non-dialogue audio, including human
 non-speech vocalizations. Visual evidence may only disambiguate an already
-audible sound and can never establish that a sound exists. V6 accuracy remains
-unconfirmed until the rerun receives human QA.
+audible sound and can never establish that a sound exists. V6 remains subject to
+human QA; review found its overall quality, delivery descriptions, and
+non-dialogue recall strong while exposing the narrow complete-abstention case
+handled below.
 
 Code requires every supplied cluster exactly once and in order, then reattaches
 the frozen nullable `entity_id`. The model receives neither transcript nor entity
@@ -54,13 +57,35 @@ identity. Dots3 receives the native target video with embedded audio. The
 Qwen3-Omni Instruct backend receives both the whole target video and canonical
 full audio, and requests text output only. Qwen3-Omni-Captioner is not used because
 it does not accept the task's text prompt. Both backends fail closed after at most
-one structured-output repair.
+one primary structured-output repair.
+
+### Qwen all-null semantic fallback
+
+Human QA found occasional complete V6 abstention on clips where historical V5
+produced useful semantics. Qwen3-Omni therefore performs exactly one semantic
+fallback with the exact historical `h3_target_audio_caption_v5` system, user, and
+repair prompts only when a valid V6 response has both a null
+`background_audio_prompt` and null `delivery_style` for every supplied speaker.
+Partial nulls are valid and are accepted immediately without fallback.
+
+If V5 recovers any semantic value, its complete response becomes final; fields
+are never merged across prompts. If V5 is also all-null, the valid all-null result
+is accepted as ready. If the V5 request or its one structured-output repair fails,
+the original valid V6 all-null response remains ready. There is no third semantic
+attempt. This policy does not mean null is generally a failure or that V5 is
+globally better than V6. Dots3 never uses this semantic fallback.
+
+Primary structured-output repair and Qwen semantic fallback are separate
+mechanisms. Summary counters report primary initial/repair calls separately from
+fallback triggers, initial calls, repair calls, recoveries, confirmed all-null
+results, and fallback failures. Each record publishes the semantic source, and
+raw diagnostics retain both passes when fallback is attempted.
 
 The new contracts are:
 
-- `r2v.h3.target_audio_caption.3`;
+- `r2v.h3.target_audio_caption.4`;
 - `r2v.h3.target_audio_caption_inventory.2`;
-- `r2v.h3.target_audio_caption_summary.2`;
+- `r2v.h3.target_audio_caption_summary.3`;
 - `r2v.h3.target_audio_caption_human_qa.2`.
 
 Run model-free inventory validation first:

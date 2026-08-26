@@ -159,7 +159,12 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         backend=backend,
         overwrite=arguments.overwrite,
     )
-    result["model_calls"] = summary.initial_call_count + summary.repair_call_count
+    result["model_calls"] = (
+        summary.initial_call_count
+        + summary.repair_call_count
+        + summary.semantic_fallback_initial_call_count
+        + summary.semantic_fallback_repair_call_count
+    )
     result["summary"] = summary.model_dump(mode="json")
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return result
