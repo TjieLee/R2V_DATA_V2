@@ -26,6 +26,7 @@ from r2v_data_v2.h3.jea_target_audio_caption import (
     JEATargetAudioCaptionHumanQAExport,
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionRecord,
+    JEATargetAudioCaptionSummary,
     OpenAIJEATargetAudioCaptionBackend,
     build_jea_target_audio_caption_inventory,
     run_jea_target_audio_caption,
@@ -63,6 +64,16 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _rewrite_summary_prompt_version(output: Path, prompt_version: str) -> None:
+    path = output / "summary.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["backend_provenance"]["prompt_version"] = prompt_version
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _write_pcm16_wave(
@@ -803,6 +814,197 @@ def test_backend_cannot_overwrite_other_backend_custom_root(tmp_path: Path) -> N
         )
 
     assert dots_backend.calls == []
+
+
+@pytest.mark.parametrize("family", ["dots3", "qwen3_omni"])
+def test_v5_same_backend_output_can_be_atomically_replaced_by_v6(
+    tmp_path: Path,
+    family: str,
+) -> None:
+    root = _production_fixture(tmp_path)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = target_audio_caption_output_root(
+        root,
+        backend_family=family,  # type: ignore[arg-type]
+    )
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=_FakeBackend(tmp_path, family=family),
+    )
+    _rewrite_summary_prompt_version(output, "h3_target_audio_caption_v5")
+    replacement = _FakeBackend(tmp_path, family=family)
+
+    summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=replacement,
+        overwrite=True,
+    )
+
+    assert replacement.calls == [job.target_clip_uid for job in inventory.jobs]
+    assert summary.backend_provenance.prompt_version == (
+        "h3_target_audio_caption_v6"
+    )
+    published = JEATargetAudioCaptionSummary.model_validate_json(
+        (output / "summary.json").read_text(encoding="utf-8")
+    )
+    assert published.backend_provenance.prompt_version == (
+        "h3_target_audio_caption_v6"
+    )
+
+
+@pytest.mark.parametrize(
+    ("existing_family", "replacement_family"),
+    [("dots3", "qwen3_omni"), ("qwen3_omni", "dots3")],
+)
+def test_v5_output_cannot_be_overwritten_by_other_backend(
+    tmp_path: Path,
+    existing_family: str,
+    replacement_family: str,
+) -> None:
+    root = _production_fixture(tmp_path)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = root / "audio_caption/custom"
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=_FakeBackend(tmp_path, family=existing_family),
+    )
+    _rewrite_summary_prompt_version(output, "h3_target_audio_caption_v5")
+    before = _tree_bytes(output)
+    replacement = _FakeBackend(tmp_path, family=replacement_family)
+
+    with pytest.raises(ValueError, match="cannot overwrite"):
+        run_jea_target_audio_caption(
+            inventory=inventory,
+            output_root=output,
+            backend=replacement,
+            overwrite=True,
+        )
+
+    assert replacement.calls == []
+    assert _tree_bytes(output) == before
+
+
+@pytest.mark.parametrize(
+    "summary_payload",
+    [
+        "{malformed",
+        [],
+        {},
+        {"backend_provenance": {}},
+        {"backend_provenance": {"backend_family": "unknown"}},
+    ],
+    ids=("malformed", "not-object", "missing-provenance", "missing-family", "unknown"),
+)
+def test_unknown_existing_output_ownership_fails_before_inference(
+    tmp_path: Path,
+    summary_payload: object,
+) -> None:
+    root = _production_fixture(tmp_path)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = root / "audio_caption/custom"
+    output.mkdir(parents=True)
+    summary_text = (
+        summary_payload
+        if isinstance(summary_payload, str)
+        else json.dumps(summary_payload)
+    )
+    (output / "summary.json").write_text(summary_text, encoding="utf-8")
+    backend = _FakeBackend(tmp_path, family="dots3")
+
+    with pytest.raises(ValueError, match="cannot establish.*ownership"):
+        run_jea_target_audio_caption(
+            inventory=inventory,
+            output_root=output,
+            backend=backend,
+            overwrite=True,
+        )
+
+    assert backend.calls == []
+    assert (output / "summary.json").read_text(encoding="utf-8") == summary_text
+
+
+def test_missing_existing_summary_fails_before_inference(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = root / "audio_caption/custom"
+    output.mkdir(parents=True)
+    backend = _FakeBackend(tmp_path, family="dots3")
+
+    with pytest.raises(ValueError, match="cannot establish.*ownership"):
+        run_jea_target_audio_caption(
+            inventory=inventory,
+            output_root=output,
+            backend=backend,
+            overwrite=True,
+        )
+
+    assert backend.calls == []
+    assert output.is_dir()
+
+
+def test_existing_output_without_overwrite_still_fails_before_inference(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = target_audio_caption_output_root(root, backend_family="dots3")
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=_FakeBackend(tmp_path, family="dots3"),
+    )
+    backend = _FakeBackend(tmp_path, family="dots3")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        run_jea_target_audio_caption(
+            inventory=inventory,
+            output_root=output,
+            backend=backend,
+        )
+
+    assert backend.calls == []
+
+
+def test_failed_v6_regeneration_preserves_existing_v5_output(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = target_audio_caption_output_root(root, backend_family="dots3")
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=_FakeBackend(tmp_path, family="dots3"),
+    )
+    _rewrite_summary_prompt_version(output, "h3_target_audio_caption_v5")
+    before = _tree_bytes(output)
+
+    class BrokenBackend(_FakeBackend):
+        def describe(self, job):
+            raise RuntimeError("programming failure")
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        run_jea_target_audio_caption(
+            inventory=inventory,
+            output_root=output,
+            backend=BrokenBackend(tmp_path, family="dots3"),
+            overwrite=True,
+        )
+
+    assert _tree_bytes(output) == before
 
 
 def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:

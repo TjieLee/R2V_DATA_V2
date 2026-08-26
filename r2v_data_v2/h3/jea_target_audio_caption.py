@@ -1283,13 +1283,7 @@ def _publish_directory(
         return
     if not overwrite:
         raise FileExistsError(f"audio caption output already exists: {destination}")
-    JEATargetAudioCaptionInventory.model_validate_json(
-        (destination / "inventory.json").read_text(encoding="utf-8")
-    )
-    existing_summary = JEATargetAudioCaptionSummary.model_validate_json(
-        (destination / "summary.json").read_text(encoding="utf-8")
-    )
-    if existing_summary.backend_provenance.backend_family != backend_family:
+    if _existing_backend_family(destination) != backend_family:
         raise ValueError("one audio caption backend cannot overwrite the other")
     backup = destination.with_name(f".{destination.name}.old-{uuid.uuid4().hex}")
     destination.replace(backup)
@@ -1299,6 +1293,29 @@ def _publish_directory(
         backup.replace(destination)
         raise
     shutil.rmtree(backup)
+
+
+def _unknown_output_ownership() -> ValueError:
+    return ValueError("cannot establish existing audio caption output ownership")
+
+
+def _existing_backend_family(destination: Path) -> BackendFamily:
+    summary_path = destination / "summary.json"
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _unknown_output_ownership() from exc
+    if not isinstance(payload, dict):
+        raise _unknown_output_ownership()
+    provenance = payload.get("backend_provenance")
+    if not isinstance(provenance, dict):
+        raise _unknown_output_ownership()
+    backend_family = provenance.get("backend_family")
+    if backend_family == "dots3":
+        return "dots3"
+    if backend_family == "qwen3_omni":
+        return "qwen3_omni"
+    raise _unknown_output_ownership()
 
 
 def run_jea_target_audio_caption(
@@ -1338,12 +1355,10 @@ def run_jea_target_audio_caption(
         raise ValueError("one audio caption backend cannot overwrite the other")
     if destination.exists() and not overwrite:
         raise FileExistsError(f"audio caption output already exists: {destination}")
-    if destination.exists():
-        existing_summary = JEATargetAudioCaptionSummary.model_validate_json(
-            (destination / "summary.json").read_text(encoding="utf-8")
-        )
-        if existing_summary.backend_provenance.backend_family != provenance.backend_family:
-            raise ValueError("one audio caption backend cannot overwrite the other")
+    if destination.exists() and (
+        _existing_backend_family(destination) != provenance.backend_family
+    ):
+        raise ValueError("one audio caption backend cannot overwrite the other")
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     records: list[JEATargetAudioCaptionRecord] = []
