@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "input_modality": (
             "native_target_video_with_embedded_audio"
             if backend_family == "dots3"
-            else "canonical_full_audio"
+            else "target_video_plus_canonical_full_audio"
         ),
         "transcript_supplied": False,
         "entity_id_supplied": False,

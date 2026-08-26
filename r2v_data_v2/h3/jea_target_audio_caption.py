@@ -40,7 +40,7 @@ JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.
 JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = (
     "r2v.h3.target_audio_caption_human_qa.2"
 )
-JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_target_audio_caption_v4"
+JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION = "h3_target_audio_caption_v5"
 DEFAULT_DOTS3_MODEL = "dots3-note-prev"
 DEFAULT_DOTS3_CHECKPOINT_ID = "/mnt/workspace/public/pretrained/dots3-note-prev"
 DEFAULT_QWEN3_OMNI_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -49,7 +49,7 @@ DEFAULT_QWEN3_OMNI_CHECKPOINT_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 BackendFamily = Literal["dots3", "qwen3_omni"]
 InputModality = Literal[
     "native_target_video_with_embedded_audio",
-    "canonical_full_audio",
+    "target_video_plus_canonical_full_audio",
 ]
 QA_LABELS = ("CORRECT", "WRONG", "UNCERTAIN")
 QA_FLAGS = (
@@ -62,16 +62,21 @@ QA_FLAGS = (
 )
 
 SYSTEM_PROMPT = """You analyze AUDIO SEMANTICS for one target clip.
-Use audible evidence only. Never use visual appearance to invent sounds.
+Use audible evidence as the source of truth. Visual evidence may help disambiguate
+a sound that is genuinely audible, but never invent a sound merely because a
+visible action or object could produce it.
 
 Return only:
 - background_audio_prompt: one short English description of meaningful non-speech
-  audio actually audible, or null when there is none. This may include music,
-  ambience, sound effects, traffic, crowds, footsteps, doors, machinery, nature,
-  or other audible background content. Mention faint or partially masked
-  accompaniment when audible.
+  audio actually audible, or null when there is none. Actively check for background
+  music, ambience, sound effects, traffic, crowds, footsteps, doors, machinery,
+  nature, and other non-speech audio. Include faint or partially masked background
+  audio when it is genuinely audible.
 - speaker_delivery: one entry per supplied speaker cluster, using its exact
-  speaker_cluster_id and a concise delivery/prosody description or null.
+  speaker_cluster_id and a concise, generation-useful delivery/prosody condition
+  or null. Focus on audible emotion, pace, energy, loudness, pitch tendency,
+  rhythm, hesitation, pauses, whispering, shouting, questioning, commanding, and
+  similarly useful delivery traits when supported by the audio.
 
 Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
 speaker, entity, or subject identity, gender, age, nationality, intrinsic voice
@@ -142,7 +147,7 @@ class JEATargetAudioCaptionBackendProvenance(SchemaModel):
     media_root: str
     media_base_url: str | None = None
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_target_audio_caption_v4"] = (
+    prompt_version: Literal["h3_target_audio_caption_v5"] = (
         JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
     )
     temperature: Literal[0.0] = 0.0
@@ -169,7 +174,7 @@ class JEATargetAudioCaptionBackendProvenance(SchemaModel):
         expected_modality = (
             "native_target_video_with_embedded_audio"
             if self.backend_family == "dots3"
-            else "canonical_full_audio"
+            else "target_video_plus_canonical_full_audio"
         )
         if self.input_modality != expected_modality:
             raise ValueError("audio caption backend modality is inconsistent")
@@ -590,7 +595,7 @@ class JEATargetAudioCaptionConfig:
         return (
             "native_target_video_with_embedded_audio"
             if self.backend_family == "dots3"
-            else "canonical_full_audio"
+            else "target_video_plus_canonical_full_audio"
         )
 
     def provenance(self) -> JEATargetAudioCaptionBackendProvenance:
@@ -753,20 +758,24 @@ class OpenAIJEATargetAudioCaptionBackend:
                 job.target_full_audio_sha256,
                 field_name="target full audio",
             )
+            video_item = {
+                "type": "video_url",
+                "video_url": {
+                    "url": self.config.media_resolver.resolve(video_path)
+                },
+            }
             if self.config.backend_family == "dots3":
-                media_item = {
-                    "type": "video_url",
-                    "video_url": {
-                        "url": self.config.media_resolver.resolve(video_path)
-                    },
-                }
+                media_items = [video_item]
             else:
-                media_item = {
-                    "type": "audio_url",
-                    "audio_url": {
-                        "url": self.config.media_resolver.resolve(audio_path)
+                media_items = [
+                    video_item,
+                    {
+                        "type": "audio_url",
+                        "audio_url": {
+                            "url": self.config.media_resolver.resolve(audio_path)
+                        },
                     },
-                }
+                ]
             request: dict[str, object] = {
                 "model": self.config.served_model_name,
                 "messages": [
@@ -775,7 +784,7 @@ class OpenAIJEATargetAudioCaptionBackend:
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
-                            media_item,
+                            *media_items,
                         ],
                     },
                 ],

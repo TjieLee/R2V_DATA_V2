@@ -1558,7 +1558,9 @@ ASR-V2/TextUsability pilot. Validate and run Dots3 and Qwen3-Omni separately:
 
 The Dots3 runtime reads only `DOTS3_*`; the Qwen3-Omni runtime reads only
 `QWEN3_OMNI_*`. Dots3 transports native target video with embedded audio.
-Qwen3-Omni transports canonical full audio and requests text output only.
+Qwen3-Omni-30B-A3B-Instruct transports both whole target video and canonical
+full audio and requests text output only. Qwen3-Omni-Captioner is not part of
+this A/B because it does not accept the required text prompt.
 Neither receives Qwen3-ASR transcript text, entity IDs, donor media, reference
 images, or primary voice. Outputs remain separate under
 `audio_caption/dots3/` and `audio_caption/qwen3_omni/`; never use `--overwrite`

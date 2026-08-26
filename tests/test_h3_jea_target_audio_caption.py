@@ -18,6 +18,7 @@ from r2v_data_v2.h3.jea_target_audio_caption import (
     JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION,
     JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION,
     JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION,
+    SYSTEM_PROMPT,
     JEATargetAudioCaptionBackendFailure,
     JEATargetAudioCaptionBackendResult,
     JEATargetAudioCaptionConfig,
@@ -293,22 +294,24 @@ def test_speaker_cluster_conflicting_entity_bindings_fail_closed(
 
 
 @pytest.mark.parametrize(
-    ("family", "media_type", "forbidden_type", "modality"),
+    ("family", "media_types", "modality"),
     [
         (
             "dots3",
-            "video_url",
-            "audio_url",
+            ["text", "video_url"],
             "native_target_video_with_embedded_audio",
         ),
-        ("qwen3_omni", "audio_url", "video_url", "canonical_full_audio"),
+        (
+            "qwen3_omni",
+            ["text", "video_url", "audio_url"],
+            "target_video_plus_canonical_full_audio",
+        ),
     ],
 )
 def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence(
     tmp_path: Path,
     family: str,
-    media_type: str,
-    forbidden_type: str,
+    media_types: list[str],
     modality: str,
 ) -> None:
     root = _production_fixture(tmp_path)
@@ -328,8 +331,7 @@ def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence
     assert isinstance(result.response, TargetAudioCaptionResponse)
     request = completions.requests[0]
     content = request["messages"][1]["content"]  # type: ignore[index]
-    assert [item["type"] for item in content] == ["text", media_type]
-    assert all(item["type"] != forbidden_type for item in content)
+    assert [item["type"] for item in content] == media_types
     encoded = json.dumps(request, ensure_ascii=False)
     assert "SECRET TRANSCRIPT" not in encoded
     assert '"entity_id":' not in encoded
@@ -337,7 +339,8 @@ def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence
     assert "api_key" not in backend.provenance.model_dump(mode="json")
     if family == "qwen3_omni":
         assert request["modalities"] == ["text"]
-        assert job.target_video_path not in encoded
+        assert job.target_video_path in encoded
+        assert job.target_full_audio_path in encoded
     else:
         assert "modalities" not in request
         assert job.target_full_audio_path not in encoded
@@ -601,11 +604,43 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
             }
         )
     assert JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION.endswith(".2")
-    assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_caption_v4"
+    assert JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION == "h3_target_audio_caption_v5"
     assert set(TargetAudioCaptionResponse.model_json_schema()["properties"]) == {
         "background_audio_prompt",
         "speaker_delivery",
     }
+
+
+def test_v5_prompt_prioritizes_generation_useful_audible_evidence() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "faint or partially masked background" in prompt
+    for evidence in (
+        "background music",
+        "ambience",
+        "sound effects",
+        "traffic",
+        "crowds",
+        "footsteps",
+        "doors",
+        "machinery",
+        "nature",
+        "emotion",
+        "pace",
+        "energy",
+        "loudness",
+        "pitch tendency",
+        "rhythm",
+        "hesitation",
+        "pauses",
+        "whispering",
+        "shouting",
+        "questioning",
+        "commanding",
+    ):
+        assert evidence in prompt
+    assert "Never transcribe, quote, paraphrase" in prompt
+    assert "identity, gender, age, nationality" in prompt
+    assert "never invent a sound merely because" in prompt
 
 
 def test_qa_export_carries_backend_provenance(tmp_path: Path) -> None:

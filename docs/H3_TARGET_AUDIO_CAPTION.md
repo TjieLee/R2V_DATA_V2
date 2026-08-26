@@ -1,6 +1,6 @@
 # H3 Target Audio Caption
 
-## Current JEA multi-backend V4
+## Current JEA multi-backend V5
 
 The current JEA production sidecar reads only:
 
@@ -17,7 +17,7 @@ sample ranges, time ranges, and bindings, but transcript text is never placed in
 the caption inventory or model request. Whisper ASR-V2 and TextUsabilityPolicy are
 not inputs to this path.
 
-Both backends use prompt `h3_target_audio_caption_v4` and the same strict response:
+Both backends use prompt `h3_target_audio_caption_v5` and the same strict response:
 
 ```json
 {
@@ -33,9 +33,11 @@ Both backends use prompt `h3_target_audio_caption_v4` and the same strict respon
 
 Code requires every supplied cluster exactly once and in order, then reattaches
 the frozen nullable `entity_id`. The model receives neither transcript nor entity
-identity. Dots3 receives the native target video with embedded audio; Qwen3-Omni
-receives only canonical full audio and requests text output only. Both fail closed
-after at most one structured-output repair.
+identity. Dots3 receives the native target video with embedded audio. The
+Qwen3-Omni Instruct backend receives both the whole target video and canonical
+full audio, and requests text output only. Qwen3-Omni-Captioner is not used because
+it does not accept the task's text prompt. Both backends fail closed after at most
+one structured-output repair.
 
 The new contracts are:
 
