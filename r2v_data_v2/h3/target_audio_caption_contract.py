@@ -48,12 +48,12 @@ class ModelSpeakerDelivery(SchemaModel):
         return self
 
 
-class TargetAudioCaptionResponse(SchemaModel):
+class LegacyTargetAudioCaptionResponse(SchemaModel):
     background_audio_prompt: StrictStr | None = None
     speaker_delivery: list[ModelSpeakerDelivery]
 
     @model_validator(mode="after")
-    def validate_response(self) -> TargetAudioCaptionResponse:
+    def validate_response(self) -> LegacyTargetAudioCaptionResponse:
         if (
             self.background_audio_prompt is not None
             and not self.background_audio_prompt.strip()
@@ -65,14 +65,53 @@ class TargetAudioCaptionResponse(SchemaModel):
         return self
 
 
+class TemporalAudioEvent(SchemaModel):
+    start_time: float = Field(ge=0, allow_inf_nan=False)
+    end_time: float = Field(gt=0, allow_inf_nan=False)
+    description: StrictStr
+
+    @model_validator(mode="after")
+    def validate_event(self) -> TemporalAudioEvent:
+        if self.end_time <= self.start_time:
+            raise ValueError("temporal audio event range must be positive")
+        if not self.description.strip():
+            raise ValueError("temporal audio event description must not be empty")
+        return self
+
+
+class TargetAudioCaptionResponse(SchemaModel):
+    overall_soundscape: StrictStr | None = None
+    non_diegetic_music: StrictStr | None = None
+    temporal_audio_events: list[TemporalAudioEvent] = Field(default_factory=list)
+    speaker_delivery: list[ModelSpeakerDelivery]
+
+    @model_validator(mode="after")
+    def validate_response(self) -> TargetAudioCaptionResponse:
+        for field_name in ("overall_soundscape", "non_diegetic_music"):
+            value = getattr(self, field_name)
+            if value is not None and not value.strip():
+                raise ValueError(f"{field_name} must be non-empty or null")
+        if self.temporal_audio_events != sorted(
+            self.temporal_audio_events,
+            key=lambda item: (item.start_time, item.end_time),
+        ):
+            raise ValueError("temporal audio events must be chronological")
+        cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
+        if len(cluster_ids) != len(set(cluster_ids)):
+            raise ValueError("speaker delivery cluster IDs must be unique")
+        return self
+
+
 class TargetSpeakerDelivery(ModelSpeakerDelivery):
     entity_id: str | None = None
 
 
 __all__ = [
+    "LegacyTargetAudioCaptionResponse",
     "ModelSpeakerDelivery",
     "SpeakerClusterEvidence",
     "SpeakerTimeRange",
     "TargetAudioCaptionResponse",
     "TargetSpeakerDelivery",
+    "TemporalAudioEvent",
 ]

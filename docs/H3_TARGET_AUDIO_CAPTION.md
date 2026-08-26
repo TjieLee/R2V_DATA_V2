@@ -1,6 +1,6 @@
 # H3 Target Audio Caption
 
-## Current JEA multi-backend V6
+## Current JEA H3 audio semantics
 
 The current JEA production sidecar reads only:
 
@@ -23,12 +23,20 @@ gate with a 0.10-second tolerance for LR-ASD 25fps, ffmpeg, and container durati
 quantization; readable segment sample ranges and both audio timeline bounds remain
 fail-closed.
 
-Both backends use primary prompt `h3_target_audio_caption_v6` and the same strict
-response:
+Both backends use primary prompt `h3_target_audio_semantics_v1` and the same
+strict reusable semantic response:
 
 ```json
 {
-  "background_audio_prompt": "meaningful non-speech audio or null",
+  "overall_soundscape": "global ambience and recurring sound or null",
+  "non_diegetic_music": "audience-only score or null",
+  "temporal_audio_events": [
+    {
+      "start_time": 5.1,
+      "end_time": 5.8,
+      "description": "brief laughter immediately after the speech"
+    }
+  ],
   "speaker_delivery": [
     {
       "speaker_cluster_id": "speaker_0",
@@ -38,18 +46,23 @@ response:
 }
 ```
 
-Human review of the 35-clip V5 A/B run found visual-content leakage, especially
-from Dots3, and found that speech-dominant clips could suppress recall of
-concurrent music, ambience, laughter, and other non-dialogue sounds. V6 therefore
-uses two independent conceptual passes: first the complete non-dialogue
-soundscape, then speaker delivery and prosody. The field name
-`background_audio_prompt` is retained for schema compatibility, but it means all
-meaningful foreground and background non-dialogue audio, including human
-non-speech vocalizations. Visual evidence may only disambiguate an already
-audible sound and can never establish that a sound exists. V6 remains subject to
-human QA; review found its overall quality, delivery descriptions, and
-non-dialogue recall strong while exposing the narrow complete-abstention case
-handled below.
+The canonical ontology separates global recurring ambience, non-diegetic score,
+localized audible events, and speaker-specific delivery. `overall_soundscape`
+contains ambience, room tone, environmental noise, and recurring physical or
+non-verbal sound. `non_diegetic_music` contains audience-only score or BGM.
+`temporal_audio_events` contains concise English descriptions and approximate
+clip-relative ranges for discrete audible events, including diegetic music and
+non-verbal human events. Overlap is allowed, but events must be chronological and
+remain within the canonical clip duration plus the existing timeline tolerance.
+These model-estimated event times are semantic evidence, not authoritative sample
+boundaries.
+
+Qwen3-ASR remains the owner of linguistic speech text. DiariZen remains the owner
+of exact speaker and sample timing. Primary and cross voice-reference assets are
+unchanged. This stage assigns no training task, copy relationship, sampling
+policy, or rendering behavior; later training code may choose how to consume the
+reusable facts and assets. Visual evidence may only disambiguate an already
+audible sound and can never establish that a sound exists.
 
 Code requires every supplied cluster exactly once and in order, then reattaches
 the frozen nullable `entity_id`. The model receives neither transcript nor entity
@@ -61,23 +74,20 @@ one primary structured-output repair.
 
 ### Qwen semantic fallback
 
-Human QA found occasional complete V6 abstention on clips where historical V5
-produced useful semantics. Real production also observed Qwen3-Omni generating
-only whitespace, either on the initial V6 request or on its structured repair.
-Qwen3-Omni therefore performs exactly one semantic fallback with the exact
-historical `h3_target_audio_caption_v5` system, user, and repair prompts when a
-valid V6 response is completely all-null or when primary V6 processing ends with
-`qwen3_omni_vllm_empty_response`. Partial nulls are valid and are accepted
-immediately without fallback. Connection, HTTP, timeout, model, local-media, and
-other ordinary infrastructure failures do not trigger V5.
+Human QA found occasional complete abstention, and real production observed
+Qwen3-Omni generating only whitespace on an initial request or structured repair.
+Qwen3-Omni therefore performs exactly one semantic reinspection using
+`h3_target_audio_semantics_v1_recheck`. Primary and fallback return the same new
+schema. Fallback triggers only when all four semantic layers are empty/null or
+when primary processing ends with `qwen3_omni_vllm_empty_response`. Partial nulls
+are valid. Connection, HTTP, timeout, model, local-media, and other ordinary
+infrastructure failures do not trigger semantic fallback.
 
-If V5 recovers any semantic value, its complete response becomes final; fields
-are never merged across prompts. If V5 is also all-null, the result is accepted
-as ready and there is no third semantic attempt. A failed V5 retains the valid V6
-all-null response when one exists; after a whitespace-only V6 failure it remains
-failed because there is no valid primary response to preserve. This policy does
-not mean null is generally a failure or that V5 is globally better than V6.
-Dots3 never uses this semantic fallback.
+If fallback recovers any semantic value, its complete response becomes final;
+fields are never merged. If fallback is also all-null, the result is ready and
+there is no third attempt. Failed fallback preserves a valid all-null primary;
+after whitespace-only primary failure it remains failed because no valid primary
+exists. Dots3 never uses semantic fallback.
 
 Primary structured-output repair and Qwen semantic fallback are separate
 mechanisms. Summary counters report primary initial/repair calls separately from
@@ -91,10 +101,10 @@ runtime concurrency does not.
 
 The new contracts are:
 
-- `r2v.h3.target_audio_caption.5`;
-- `r2v.h3.target_audio_caption_inventory.2`;
-- `r2v.h3.target_audio_caption_summary.5`;
-- `r2v.h3.target_audio_caption_human_qa.2`.
+- `r2v.h3.target_audio_caption.6`;
+- `r2v.h3.target_audio_caption_inventory.3`;
+- `r2v.h3.target_audio_caption_summary.6`;
+- `r2v.h3.target_audio_caption_human_qa.3`.
 
 Run model-free inventory validation first:
 
@@ -135,7 +145,7 @@ Run each A/B side independently:
 sends to the serving backend at once. It is not a GPU count or a vLLM tensor
 parallel setting, and it is deliberately excluded from semantic request
 fingerprints. Each clip's primary request, optional structured repair, and
-optional Qwen V5 semantic fallback remain sequential. The default value `1` is
+optional Qwen semantic fallback remain sequential. The default value `1` is
 the compatibility and debugging mode. For the current four-GPU evaluation
 deployment, start with `4`; benchmark `1`, `2`, `4`, and `8` against the actual
 serving topology before freezing an operational value. No linear scaling is
@@ -149,9 +159,13 @@ $AUDIO_PRODUCTION_ROOT/audio_caption/qwen3_omni/
 ```
 
 Each contains `inventory.json`, `records.jsonl`, `summary.json`, `raw/`,
-`media/`, and `review.html`. The static review exports deterministic QA with
-backend/model/checkpoint/configuration provenance plus `CORRECT`, `WRONG`, or
-`UNCERTAIN` and the approved failure flags. API keys are never persisted.
+`media/`, and `review.html`. Review renders soundscape, non-diegetic music,
+temporal events, and speaker delivery separately. Its localStorage namespace is
+derived from schema, prompt, backend family, backend configuration fingerprint,
+and inventory fingerprint, so stale labels cannot cross semantic configurations.
+The static review exports deterministic QA with backend/model/checkpoint/
+configuration provenance plus `CORRECT`, `WRONG`, or `UNCERTAIN` and the approved
+field-specific failure flags. API keys are never persisted.
 
 ## Historical ASR-V2 pilot
 

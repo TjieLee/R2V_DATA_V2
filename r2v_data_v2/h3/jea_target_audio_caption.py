@@ -30,24 +30,23 @@ from r2v_data_v2.h3.target_audio_caption_contract import (
     SpeakerTimeRange,
     TargetAudioCaptionResponse,
     TargetSpeakerDelivery,
+    TemporalAudioEvent,
 )
 from r2v_data_v2.structured_output import (
     ValidationIssue,
     parse_structured_json_issues,
 )
 
-JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.5"
-JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION = (
-    "r2v.h3.target_audio_caption_inventory.2"
+JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION = "r2v.h3.target_audio_caption.6"
+JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION = "r2v.h3.target_audio_caption_inventory.3"
+JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.6"
+JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = "r2v.h3.target_audio_caption_human_qa.3"
+JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION = "h3_target_audio_semantics_v1"
+JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION = (
+    "h3_target_audio_semantics_v1_recheck"
 )
-JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION = "r2v.h3.target_audio_caption_summary.5"
-JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION = (
-    "r2v.h3.target_audio_caption_human_qa.2"
-)
-JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION = "h3_target_audio_caption_v6"
-JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION = "h3_target_audio_caption_v5"
 JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION = (
-    "qwen_v6_all_null_or_empty_to_v5_v2"
+    "qwen_h3_audio_semantics_all_null_or_empty_recheck_v1"
 )
 JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION = (
     JEA_TARGET_AUDIO_CAPTION_PRIMARY_PROMPT_VERSION
@@ -60,10 +59,10 @@ AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS = 0.10
 
 BackendFamily = Literal["dots3", "qwen3_omni"]
 SemanticSource = Literal[
-    "primary_v6",
-    "fallback_v5",
-    "primary_v6_all_null_confirmed",
-    "primary_v6_fallback_failed",
+    "primary",
+    "fallback",
+    "primary_all_null_confirmed",
+    "primary_all_null_fallback_failed",
 ]
 SemanticFallbackTriggerReason = Literal["all_null", "empty_response"]
 InputModality = Literal[
@@ -72,92 +71,81 @@ InputModality = Literal[
 ]
 QA_LABELS = ("CORRECT", "WRONG", "UNCERTAIN")
 QA_FLAGS = (
+    "hallucinated_soundscape",
+    "missed_soundscape",
     "hallucinated_music",
-    "hallucinated_sound_event",
-    "wrong_ambient_scene",
+    "missed_music",
+    "hallucinated_audio_event",
+    "missed_audio_event",
+    "wrong_audio_event_timing",
     "wrong_speaker_style",
     "dialogue_leakage",
+    "visual_leakage",
     "other",
 )
 
-SYSTEM_PROMPT = """You analyze AUDIO SEMANTICS for one target clip for
-audio-generation conditioning.
+SYSTEM_PROMPT = """You extract reusable AUDIO SEMANTICS from one target clip.
 
-AUDIBLE EVIDENCE IS THE ONLY SOURCE OF TRUTH. Visual evidence may only help
-disambiguate the source or category of a sound that is already genuinely audible.
-Never infer that a sound exists merely because an action, object, person, event,
-expression, gesture, or scene is visible. Do not describe visual content itself.
-If a visually apparent event is silent, omit it.
+AUDIBLE EVIDENCE IS THE SOURCE OF TRUTH. Visual evidence may only disambiguate
+the source or category of a sound that is already genuinely audible. Never infer
+a sound merely because an object, action, expression, or scene is visible.
 
-Analyze the audio in two independent passes before producing JSON.
+Perform four independent passes before returning JSON:
 
-PASS 1 - COMPLETE NON-DIALOGUE SOUNDSCAPE
-Independently inspect the entire clip for every meaningful audible sound other
-than spoken linguistic content. Continue even during speech and do not stop after
-identifying speaker delivery. background_audio_prompt is one short English
-audio-generation description of ALL meaningful audible non-dialogue sound, not
-merely distant background ambience.
+PASS 1 - OVERALL SOUNDSCAPE
+Describe concise global ambience and recurring or continuous physical and
+non-verbal sound across the clip. This may include room tone, environmental noise,
+recurring physical sounds, or global non-verbal human audio. Exclude dialogue,
+speaker prosody, non-diegetic score, visual descriptions, and isolated events.
+Actively inspect audible ambience, traffic, crowds, machinery, nature, room tone,
+and recurring human non-speech vocalizations.
+Return overall_soundscape as null when no meaningful global soundscape is audible.
 
-When genuinely audible, include foreground or background music and musical
-accompaniment; ambience and room tone; sound effects and object sounds; traffic,
-crowds, footsteps, doors, impacts, machinery, nature, applause, and similar
-sounds; and human non-speech vocalizations such as laughter, chuckling, sighing,
-gasping, coughing, crying, sobbing, breathing, or cheering. Include a sound when
-it overlaps speech, comes from the current speaker, is foreground, is quieter
-than dialogue, is partially masked by speech, or occurs only briefly. Do not
-transcribe or paraphrase words spoken during a vocalization.
+PASS 2 - NON-DIEGETIC MUSIC
+Describe audience-only score or BGM, including audible instrumentation, tempo,
+rhythm, intensity, and changes over time. Do not infer emotion from scene meaning.
+Return non_diegetic_music as null when no non-diegetic music is reliably audible.
+Radio, TV, or other in-scene music is diegetic and belongs in temporal events.
 
-Return background_audio_prompt as null only when no meaningful non-dialogue sound
-is reliably audible anywhere. Before returning null, independently verify the
-whole clip for music, ambience, sound effects or object sounds, and human
-non-speech vocalizations.
+PASS 3 - TEMPORAL AUDIO EVENTS
+List salient discrete or temporally localized audible events with approximate
+clip-relative start and end times. Examples include laughter, gasps, coughs,
+crying, footsteps, doors, impacts, sound effects, applause, engines, phone rings,
+diegetic music, and singing without lyrics. Do not include ordinary dialogue or
+transcribe lyrics.
+Include only events whose approximate location is reasonably audible. Order events
+by start_time then end_time; overlapping events are allowed. These approximate
+semantic times are not authoritative sample boundaries.
 
-PASS 2 - SPEAKER DELIVERY
-Separately analyze each supplied speaker cluster for speech delivery and prosody
-only, using its exact speaker_cluster_id. Describe concise, generation-useful
-audible traits when supported: emotion expressed through voice, pace, energy,
-loudness, pitch tendency, rhythm, articulation, hesitation, pauses, whispering,
-shouting, questioning, commanding, or similar delivery. Never infer delivery from
-facial expression, gesture, pose, scene semantics, or other visual evidence.
+PASS 4 - SPEAKER DELIVERY
+For every supplied speaker cluster, describe concise audible speech prosody and
+performance only: audible emotion, pace, energy, loudness, pitch tendency, rhythm, articulation,
+hesitation, pauses, whispering, shouting, questioning, commanding, or similarly
+useful traits. Never infer delivery from visual evidence.
 
-Distinct non-speech events such as laughter, coughing, gasping, crying, or sighing
-belong in background_audio_prompt when audible, even when produced by the current
-speaker. speaker_delivery describes speech prosody and is not the only location
-for those events.
-
-Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
-speaker, entity, or subject identity, gender, age, nationality, intrinsic voice
-identity, or timbre. Do not emit entity_id. Return every supplied
+Use concise English descriptions. Never transcribe, quote, paraphrase, correct,
+or summarize dialogue. Never infer identity, gender, age, nationality, intrinsic
+voice identity, or timbre. Do not emit entity_id. Return every supplied
 speaker_cluster_id exactly once, in supplied order, and no unknown cluster ID.
-Prefer concise generation-useful descriptions without speculative details.
 
 Return exactly one compact JSON object matching the supplied schema, with no
 markdown, explanation, reasoning, or extra fields."""
 
-V5_FALLBACK_SYSTEM_PROMPT = """You analyze AUDIO SEMANTICS for one target clip.
-Use audible evidence as the source of truth. Visual evidence may help disambiguate
-a sound that is genuinely audible, but never invent a sound merely because a
-visible action or object could produce it.
+FALLBACK_SYSTEM_PROMPT = """Reinspect one target clip for reusable AUDIO
+SEMANTICS. Audible evidence is the source of truth. Be attentive to faint or
+partially masked sounds, but never invent audio from visible content.
 
-Return only:
-- background_audio_prompt: one short English description of meaningful non-speech
-  audio actually audible, or null when there is none. Actively check for background
-  music, ambience, sound effects, traffic, crowds, footsteps, doors, machinery,
-  nature, and other non-speech audio. Include faint or partially masked background
-  audio when it is genuinely audible.
-- speaker_delivery: one entry per supplied speaker cluster, using its exact
-  speaker_cluster_id and a concise, generation-useful delivery/prosody condition
-  or null. Focus on audible emotion, pace, energy, loudness, pitch tendency,
-  rhythm, hesitation, pauses, whispering, shouting, questioning, commanding, and
-  similarly useful delivery traits when supported by the audio.
-
-Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
-speaker, entity, or subject identity, gender, age, nationality, intrinsic voice
-identity, or timbre. Do not emit entity_id. Return every supplied
-speaker_cluster_id exactly once, in supplied order, and no unknown cluster ID.
+Return the same four-field schema: concise nullable overall_soundscape; concise
+nullable audience-only non_diegetic_music; chronological approximate
+temporal_audio_events for clearly audible localized non-dialogue events; and one
+nullable speaker_delivery entry for every supplied cluster in supplied order.
+Radio or TV music is a temporal diegetic event, not non-diegetic music. Overlapping
+events are allowed. Never include dialogue or singing lyrics. Never infer identity,
+gender, age, nationality, intrinsic voice identity, or timbre. Do not emit
+entity_id.
 
 Return exactly one compact JSON object matching the supplied schema, with no
-markdown or explanation."""
+markdown, explanation, reasoning, or extra fields."""
 
 
 def _compact_json(value: object) -> str:
@@ -202,9 +190,7 @@ def _write_json(path: Path, value: SchemaModel | dict[str, object]) -> None:
 
 def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
     path.write_text(
-        "".join(
-            _compact_json(item.model_dump(mode="json")) + "\n" for item in values
-        ),
+        "".join(_compact_json(item.model_dump(mode="json")) + "\n" for item in values),
         encoding="utf-8",
     )
 
@@ -220,7 +206,7 @@ class JEATargetAudioCaptionBackendProvenance(SchemaModel):
     media_root: str
     media_base_url: str | None = None
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_target_audio_caption_v6"] = (
+    prompt_version: Literal["h3_target_audio_semantics_v1"] = (
         JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
     )
     temperature: Literal[0.0] = 0.0
@@ -266,6 +252,7 @@ class JEATargetAudioCaptionJob(SchemaModel):
     target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_full_audio_path: str
     target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
     target_audio_binding_path: str
     target_audio_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     speaker_clusters: list[SpeakerClusterEvidence]
@@ -273,19 +260,20 @@ class JEATargetAudioCaptionJob(SchemaModel):
     @model_validator(mode="after")
     def validate_job(self) -> JEATargetAudioCaptionJob:
         if (
-            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.target_clip_uid)
-            is None
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.target_clip_uid) is None
             or not self.clip_display_path.strip()
         ):
             raise ValueError("audio caption target identity must not be empty")
         cluster_ids = [item.speaker_cluster_id for item in self.speaker_clusters]
         if not cluster_ids or len(cluster_ids) != len(set(cluster_ids)):
-            raise ValueError("audio caption speaker clusters must be non-empty and unique")
+            raise ValueError(
+                "audio caption speaker clusters must be non-empty and unique"
+            )
         return self
 
 
 class JEATargetAudioCaptionInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption_inventory.2"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption_inventory.3"] = (
         JEA_TARGET_AUDIO_CAPTION_INVENTORY_VERSION
     )
     source_audio_production_root: str
@@ -332,18 +320,21 @@ class JEATargetAudioCaptionFailure(SchemaModel):
 
 
 class JEATargetAudioCaptionRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption.5"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption.6"] = (
         JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION
     )
     target_clip_uid: str
     clip_display_path: str
     status: Literal["ready", "failed"]
-    background_audio_prompt: str | None = None
+    overall_soundscape: str | None = None
+    non_diegetic_music: str | None = None
+    temporal_audio_events: list[TemporalAudioEvent] = Field(default_factory=list)
     speaker_delivery: list[TargetSpeakerDelivery] = Field(default_factory=list)
     target_video_path: str
     target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_full_audio_path: str
     target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
     target_audio_binding_path: str
     target_audio_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_modality: InputModality
@@ -352,7 +343,7 @@ class JEATargetAudioCaptionRecord(SchemaModel):
     semantic_source: SemanticSource | None
     semantic_fallback_attempted: bool
     semantic_fallback_prompt_version: (
-        Literal["h3_target_audio_caption_v5"] | None
+        Literal["h3_target_audio_semantics_v1_recheck"] | None
     )
     semantic_fallback_trigger_reason: SemanticFallbackTriggerReason | None
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -362,6 +353,13 @@ class JEATargetAudioCaptionRecord(SchemaModel):
     def validate_record(self) -> JEATargetAudioCaptionRecord:
         if self.input_modality != self.backend_provenance.input_modality:
             raise ValueError("audio caption record modality is inconsistent")
+        if any(
+            event.end_time
+            > self.target_duration_seconds
+            + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
+            for event in self.temporal_audio_events
+        ):
+            raise ValueError("temporal audio event exceeds target duration")
         if self.status == "ready":
             cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
             if (
@@ -371,8 +369,13 @@ class JEATargetAudioCaptionRecord(SchemaModel):
                 or len(cluster_ids) != len(set(cluster_ids))
             ):
                 raise ValueError("ready audio caption semantics are inconsistent")
-        elif self.failure is None or self.background_audio_prompt is not None or bool(
-            self.speaker_delivery
+        elif self.failure is None or any(
+            (
+                self.overall_soundscape is not None,
+                self.non_diegetic_music is not None,
+                bool(self.temporal_audio_events),
+                bool(self.speaker_delivery),
+            )
         ):
             raise ValueError("failed audio caption cannot publish semantics")
         elif self.semantic_source is not None:
@@ -381,7 +384,9 @@ class JEATargetAudioCaptionRecord(SchemaModel):
             self.semantic_fallback_prompt_version
             == JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
         ):
-            raise ValueError("audio caption semantic fallback provenance is inconsistent")
+            raise ValueError(
+                "audio caption semantic fallback provenance is inconsistent"
+            )
         if self.semantic_fallback_attempted != (
             self.semantic_fallback_trigger_reason is not None
         ):
@@ -392,11 +397,14 @@ class JEATargetAudioCaptionRecord(SchemaModel):
         ):
             raise ValueError("Dots3 cannot use Qwen semantic fallback")
         fallback_sources = {
-            "fallback_v5",
-            "primary_v6_all_null_confirmed",
-            "primary_v6_fallback_failed",
+            "fallback",
+            "primary_all_null_confirmed",
+            "primary_all_null_fallback_failed",
         }
-        if self.semantic_source in fallback_sources and not self.semantic_fallback_attempted:
+        if (
+            self.semantic_source in fallback_sources
+            and not self.semantic_fallback_attempted
+        ):
             raise ValueError("audio caption semantic source is inconsistent")
         if (
             self.status == "ready"
@@ -410,27 +418,40 @@ class JEATargetAudioCaptionRecord(SchemaModel):
             and self.semantic_fallback_trigger_reason != "empty_response"
         ):
             raise ValueError("failed semantic fallback trigger is inconsistent")
-        all_semantic_null = self.background_audio_prompt is None and all(
-            item.delivery_style is None for item in self.speaker_delivery
+        all_semantic_null = (
+            self.overall_soundscape is None
+            and self.non_diegetic_music is None
+            and not self.temporal_audio_events
+            and all(item.delivery_style is None for item in self.speaker_delivery)
         )
         if (
-            self.semantic_source == "fallback_v5"
+            self.semantic_source == "fallback"
             and all_semantic_null
             and self.semantic_fallback_trigger_reason != "empty_response"
         ):
-            raise ValueError("all-null V5 semantics require empty-response recovery")
-        if self.semantic_source in {
-            "primary_v6_all_null_confirmed",
-            "primary_v6_fallback_failed",
-        } and not all_semantic_null:
-            raise ValueError("retained V6 fallback semantics must be all-null")
-        if self.semantic_source in {
-            "primary_v6_all_null_confirmed",
-            "primary_v6_fallback_failed",
-        } and self.semantic_fallback_trigger_reason != "all_null":
-            raise ValueError("retained V6 fallback trigger is inconsistent")
+            raise ValueError(
+                "all-null fallback semantics require empty-response recovery"
+            )
         if (
-            self.semantic_source == "primary_v6"
+            self.semantic_source
+            in {
+                "primary_all_null_confirmed",
+                "primary_all_null_fallback_failed",
+            }
+            and not all_semantic_null
+        ):
+            raise ValueError("retained primary semantics must be all-null")
+        if (
+            self.semantic_source
+            in {
+                "primary_all_null_confirmed",
+                "primary_all_null_fallback_failed",
+            }
+            and self.semantic_fallback_trigger_reason != "all_null"
+        ):
+            raise ValueError("retained primary fallback trigger is inconsistent")
+        if (
+            self.semantic_source == "primary"
             and self.backend_provenance.backend_family == "qwen3_omni"
             and all_semantic_null
         ):
@@ -439,7 +460,7 @@ class JEATargetAudioCaptionRecord(SchemaModel):
 
 
 class JEATargetAudioCaptionSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption_summary.5"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption_summary.6"] = (
         JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION
     )
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -482,14 +503,18 @@ class JEATargetAudioCaptionSummary(SchemaModel):
             self.semantic_fallback_all_null_trigger_count
             + self.semantic_fallback_empty_response_trigger_count
         ):
-            raise ValueError("audio caption semantic fallback triggers do not reconcile")
+            raise ValueError(
+                "audio caption semantic fallback triggers do not reconcile"
+            )
         if (
             self.semantic_fallback_trigger_count
             != self.semantic_fallback_recovered_count
             + self.semantic_fallback_still_all_null_count
             + self.semantic_fallback_failed_count
         ):
-            raise ValueError("audio caption semantic fallback outcomes do not reconcile")
+            raise ValueError(
+                "audio caption semantic fallback outcomes do not reconcile"
+            )
         if (
             self.semantic_fallback_repair_call_count
             > self.semantic_fallback_initial_call_count
@@ -508,11 +533,16 @@ class JEATargetAudioCaptionHumanQALabel(SchemaModel):
     label: Literal["CORRECT", "WRONG", "UNCERTAIN"]
     failure_flags: list[
         Literal[
+            "hallucinated_soundscape",
+            "missed_soundscape",
             "hallucinated_music",
-            "hallucinated_sound_event",
-            "wrong_ambient_scene",
+            "missed_music",
+            "hallucinated_audio_event",
+            "missed_audio_event",
+            "wrong_audio_event_timing",
             "wrong_speaker_style",
             "dialogue_leakage",
+            "visual_leakage",
             "other",
         ]
     ] = Field(default_factory=list)
@@ -520,7 +550,7 @@ class JEATargetAudioCaptionHumanQALabel(SchemaModel):
 
 
 class JEATargetAudioCaptionHumanQAExport(SchemaModel):
-    schema_version: Literal["r2v.h3.target_audio_caption_human_qa.2"] = (
+    schema_version: Literal["r2v.h3.target_audio_caption_human_qa.3"] = (
         JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION
     )
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -555,7 +585,9 @@ def _inventory_fingerprint(
     return _sha256_text(_compact_json(values))
 
 
-def _segment_identity(row: JEAReadableDiarizationSegment | Qwen3ASRSegment) -> tuple[str, str]:
+def _segment_identity(
+    row: JEAReadableDiarizationSegment | Qwen3ASRSegment,
+) -> tuple[str, str]:
     return row.clip_uid, row.segment_id
 
 
@@ -603,8 +635,7 @@ def _reconcile_segments(
     for identity, readable_row in readable_by_id.items():
         asr_row = asr_by_id[identity]
         if any(
-            getattr(readable_row, field) != getattr(asr_row, field)
-            for field in fields
+            getattr(readable_row, field) != getattr(asr_row, field) for field in fields
         ):
             raise ValueError(
                 "Qwen3 ASR and readable DiariZen segment evidence differs: "
@@ -678,10 +709,14 @@ def _audio_timeline(path: Path, *, field_name: str) -> _AudioTimeline:
         )
         duration_seconds = float(duration_value)
         sample_rate_value = stream.get("sample_rate")
-        sample_rate_hz = (
-            None if sample_rate_value is None else int(sample_rate_value)
-        )
-    except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        sample_rate_hz = None if sample_rate_value is None else int(sample_rate_value)
+    except (
+        AttributeError,
+        IndexError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ValueError(f"cannot parse {field_name} timeline") from exc
     if (
         not math.isfinite(duration_seconds)
@@ -701,7 +736,7 @@ def _validate_audio_timelines(
     clip_rows: Sequence[JEAReadableDiarizationSegment],
     readable_audio_path: Path,
     canonical_audio_path: Path,
-) -> None:
+) -> float:
     readable_timeline = _audio_timeline(
         readable_audio_path,
         field_name="readable source audio",
@@ -711,10 +746,7 @@ def _validate_audio_timelines(
         field_name="target full audio",
     )
     if (
-        abs(
-            readable_timeline.duration_seconds
-            - canonical_timeline.duration_seconds
-        )
+        abs(readable_timeline.duration_seconds - canonical_timeline.duration_seconds)
         > AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
     ):
         raise ValueError("readable and canonical full-audio timelines differ")
@@ -724,8 +756,7 @@ def _validate_audio_timelines(
         and readable_timeline.sample_rate_hz == canonical_timeline.sample_rate_hz
     ):
         allowed_samples = math.ceil(
-            AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
-            * readable_timeline.sample_rate_hz
+            AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS * readable_timeline.sample_rate_hz
         )
         if (
             abs(readable_timeline.sample_count - canonical_timeline.sample_count)
@@ -754,7 +785,10 @@ def _validate_audio_timelines(
             canonical_timeline.duration_seconds
             + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
         ):
-            raise ValueError("readable DiariZen segment exceeds canonical audio timeline")
+            raise ValueError(
+                "readable DiariZen segment exceeds canonical audio timeline"
+            )
+    return canonical_timeline.duration_seconds
 
 
 def build_jea_target_audio_caption_inventory(
@@ -763,9 +797,7 @@ def build_jea_target_audio_caption_inventory(
 ) -> JEATargetAudioCaptionInventory:
     root = audio_production_root.expanduser().resolve(strict=True)
     pairs_path = (root / "pairs/in_pairs.jsonl").resolve(strict=True)
-    readable_path = (root / "diarization/readable_segments.jsonl").resolve(
-        strict=True
-    )
+    readable_path = (root / "diarization/readable_segments.jsonl").resolve(strict=True)
     asr_path = (root / "asr/segments.jsonl").resolve(strict=True)
     pairs = [JEAInPair.model_validate(row) for row in _read_jsonl(pairs_path)]
     readable = [
@@ -794,7 +826,10 @@ def build_jea_target_audio_caption_inventory(
             readable_by_clip[pair.target_clip_uid],
             key=lambda item: (item.source_start_sample, item.segment_id),
         )
-        if any(item.clip_display_path != pair.target_clip_display_path for item in clip_rows):
+        if any(
+            item.clip_display_path != pair.target_clip_display_path
+            for item in clip_rows
+        ):
             raise ValueError("JEA pair and readable DiariZen clip paths differ")
         video_path = _resolved_file(pair.target_video_path, field_name="target video")
         audio_path = _resolved_file(
@@ -810,13 +845,15 @@ def build_jea_target_audio_caption_inventory(
             next(iter(readable_audio_values)),
             field_name="readable source audio",
         )
-        _validate_audio_timelines(
+        target_duration_seconds = _validate_audio_timelines(
             clip_rows=clip_rows,
             readable_audio_path=readable_audio_path,
             canonical_audio_path=audio_path,
         )
 
-        rows_by_cluster: dict[str, list[JEAReadableDiarizationSegment]] = defaultdict(list)
+        rows_by_cluster: dict[str, list[JEAReadableDiarizationSegment]] = defaultdict(
+            list
+        )
         cluster_order: list[str] = []
         for row in clip_rows:
             if row.speaker_cluster_id not in rows_by_cluster:
@@ -825,7 +862,9 @@ def build_jea_target_audio_caption_inventory(
         clusters: list[SpeakerClusterEvidence] = []
         for cluster_id in cluster_order:
             cluster_rows = rows_by_cluster[cluster_id]
-            bound_ids = {item.entity_id for item in cluster_rows if item.entity_id is not None}
+            bound_ids = {
+                item.entity_id for item in cluster_rows if item.entity_id is not None
+            }
             if len(bound_ids) > 1:
                 raise ValueError("speaker cluster resolves to conflicting entity IDs")
             clusters.append(
@@ -849,6 +888,7 @@ def build_jea_target_audio_caption_inventory(
                 target_video_sha256=_sha256_file(video_path),
                 target_full_audio_path=str(audio_path),
                 target_full_audio_sha256=_sha256_file(audio_path),
+                target_duration_seconds=target_duration_seconds,
                 target_audio_binding_path=str(binding_path),
                 target_audio_binding_sha256=_sha256_file(binding_path),
                 speaker_clusters=clusters,
@@ -1014,6 +1054,7 @@ class JEATargetAudioCaptionBackend(Protocol):
 
 def _model_input(job: JEATargetAudioCaptionJob) -> dict[str, object]:
     return {
+        "target_duration_seconds": job.target_duration_seconds,
         "speaker_clusters": [
             {
                 "speaker_cluster_id": cluster.speaker_cluster_id,
@@ -1022,40 +1063,41 @@ def _model_input(job: JEATargetAudioCaptionJob) -> dict[str, object]:
                 ],
             }
             for cluster in job.speaker_clusters
-        ]
+        ],
     }
 
 
 def _is_all_semantic_null(response: TargetAudioCaptionResponse) -> bool:
-    return response.background_audio_prompt is None and all(
-        item.delivery_style is None for item in response.speaker_delivery
+    return (
+        response.overall_soundscape is None
+        and response.non_diegetic_music is None
+        and not response.temporal_audio_events
+        and all(item.delivery_style is None for item in response.speaker_delivery)
     )
 
 
 def _user_prompt(job: JEATargetAudioCaptionJob) -> str:
     return (
-        "Analyze the complete audible soundscape of the attached target media. "
-        "First, independently scan the whole clip for all meaningful non-dialogue "
-        "audio, including music, ambience, sound effects or object sounds, and "
-        "human non-speech vocalizations such as laughter, even when they overlap "
-        "speech or come from the current speaker. Second, separately describe "
-        "speech delivery and prosody for each supplied speaker cluster. Use audible "
-        "evidence only; visual content cannot establish that a sound exists. Do not "
-        "transcribe speech or infer identity. Return every speaker_cluster_id "
-        "exactly once in supplied order and no entity_id.\nInput:\n"
+        "Analyze the attached target media in four independent passes: overall "
+        "soundscape, non-diegetic music, temporally localized audible events, and "
+        "speaker delivery. Use audible evidence only; visual content cannot establish "
+        "that a sound exists. Event times are approximate clip-relative semantic "
+        "locations and must remain within target_duration_seconds. Do not transcribe "
+        "speech or infer identity. Return every speaker_cluster_id exactly once in "
+        "supplied order and no entity_id.\nInput:\n"
         f"{_compact_json(_model_input(job))}\nJSON schema:\n"
         f"{_compact_json(TargetAudioCaptionResponse.model_json_schema())}"
     )
 
 
-def _v5_fallback_user_prompt(job: JEATargetAudioCaptionJob) -> str:
+def _fallback_user_prompt(job: JEATargetAudioCaptionJob) -> str:
     return (
-        "Analyze only sounds actually audible in the attached target media. Do not "
-        "transcribe, quote, paraphrase, correct, or summarize speech. Do not infer "
-        "speaker, entity, or subject identity. Return one short English "
-        "background_audio_prompt for meaningful non-speech audio, or null, and "
-        "concise nullable delivery/prosody for each supplied speaker cluster. Return "
-        "every cluster exactly once in the supplied order and no entity_id.\nInput:\n"
+        "Reinspect only sounds actually audible in the attached target media. Be "
+        "attentive to faint or partially masked ambience, non-diegetic music, and "
+        "localized non-dialogue events, while never inventing sound from visuals. "
+        "Return the same four-field schema. Keep approximate event times within "
+        "target_duration_seconds. Do not transcribe speech or infer identity. Return "
+        "every cluster exactly once in supplied order and no entity_id.\nInput:\n"
         f"{_compact_json(_model_input(job))}\nJSON schema:\n"
         f"{_compact_json(TargetAudioCaptionResponse.model_json_schema())}"
     )
@@ -1065,10 +1107,23 @@ def _response_issues(
     response: TargetAudioCaptionResponse,
     job: JEATargetAudioCaptionJob,
 ) -> list[ValidationIssue]:
+    timing_issues = [
+        ValidationIssue(
+            code="audio_event_out_of_range",
+            field=f"temporal_audio_events.{index}",
+            message=(
+                "temporal audio event must end within target duration plus timeline "
+                "tolerance"
+            ),
+        )
+        for index, event in enumerate(response.temporal_audio_events)
+        if event.end_time
+        > job.target_duration_seconds + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS
+    ]
     expected = [item.speaker_cluster_id for item in job.speaker_clusters]
     actual = [item.speaker_cluster_id for item in response.speaker_delivery]
     if actual == expected:
-        return []
+        return timing_issues
     if len(actual) != len(set(actual)):
         code = "duplicate_speaker_cluster"
     elif set(actual) - set(expected):
@@ -1078,11 +1133,12 @@ def _response_issues(
     else:
         code = "speaker_cluster_order_mismatch"
     return [
+        *timing_issues,
         ValidationIssue(
             code=code,
             field="speaker_delivery",
             message="speaker delivery must contain every supplied cluster exactly once in order",
-        )
+        ),
     ]
 
 
@@ -1094,7 +1150,7 @@ def _repair_prompt(
 ) -> str:
     return (
         "Repair the previous JSON only. Reinspect the same attached audio when "
-        "needed. Preserve the original two-pass audible-only analysis. Do not infer "
+        "needed. Preserve the original four-pass audible-only analysis. Do not infer "
         "sound from visual content. Do not emit dialogue or entity_id. Return every "
         "speaker_cluster_id exactly once in supplied order. Return one compact JSON "
         "object only.\nOriginal request:\n"
@@ -1104,7 +1160,7 @@ def _repair_prompt(
     )
 
 
-def _v5_fallback_repair_prompt(
+def _fallback_repair_prompt(
     *,
     job: JEATargetAudioCaptionJob,
     invalid_response: str,
@@ -1112,10 +1168,11 @@ def _v5_fallback_repair_prompt(
 ) -> str:
     return (
         "Repair the previous JSON only. Reinspect the same attached audio when "
-        "needed. Follow the original audible-only policy. Do not emit dialogue or "
+        "needed. Follow the fallback four-pass audible-only policy and the same new "
+        "semantic schema. Do not emit dialogue or "
         "entity_id. Return every speaker_cluster_id exactly once in supplied order. "
         "Return one compact JSON object only.\nOriginal request:\n"
-        f"{_v5_fallback_user_prompt(job)}\nValidation issues:\n"
+        f"{_fallback_user_prompt(job)}\nValidation issues:\n"
         f"{_compact_json([item.to_dict() for item in issues])}\nInvalid response:\n"
         f"{invalid_response}"
     )
@@ -1206,9 +1263,7 @@ class OpenAIJEATargetAudioCaptionBackend:
             )
             video_item = {
                 "type": "video_url",
-                "video_url": {
-                    "url": self.config.media_resolver.resolve(video_path)
-                },
+                "video_url": {"url": self.config.media_resolver.resolve(video_path)},
             }
             if self.config.backend_family == "dots3":
                 media_items = [video_item]
@@ -1237,9 +1292,7 @@ class OpenAIJEATargetAudioCaptionBackend:
                 "temperature": 0.0,
                 "max_tokens": self.config.max_tokens,
                 "stream": False,
-                "extra_body": {
-                    "chat_template_kwargs": {"enable_thinking": False}
-                },
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
             }
             if self.config.backend_family == "qwen3_omni":
                 request["modalities"] = ["text"]
@@ -1259,9 +1312,7 @@ class OpenAIJEATargetAudioCaptionBackend:
                 code=f"{self.config.backend_family}_vllm_request_failed",
                 reason=f"{type(exc).__name__}: {exc}",
                 attempt_count=1,
-                completion_diagnostics=(
-                    () if diagnostic is None else (diagnostic,)
-                ),
+                completion_diagnostics=(() if diagnostic is None else (diagnostic,)),
                 model_call_count=model_call_count,
             ) from exc
         if not response.strip():
@@ -1278,22 +1329,24 @@ class OpenAIJEATargetAudioCaptionBackend:
         self,
         job: JEATargetAudioCaptionJob,
         *,
-        use_v5_fallback: bool,
+        use_semantic_fallback: bool,
     ) -> JEATargetAudioCaptionBackendResult:
         raw_responses: list[str] = []
         completion_diagnostics: list[_ModelCompletionDiagnostic] = []
         model_call_count = 0
         issues: list[ValidationIssue] = []
-        system_prompt = V5_FALLBACK_SYSTEM_PROMPT if use_v5_fallback else SYSTEM_PROMPT
+        system_prompt = (
+            FALLBACK_SYSTEM_PROMPT if use_semantic_fallback else SYSTEM_PROMPT
+        )
         for attempt in range(2):
             if attempt == 0:
                 prompt = (
-                    _v5_fallback_user_prompt(job)
-                    if use_v5_fallback
+                    _fallback_user_prompt(job)
+                    if use_semantic_fallback
                     else _user_prompt(job)
                 )
-            elif use_v5_fallback:
-                prompt = _v5_fallback_repair_prompt(
+            elif use_semantic_fallback:
+                prompt = _fallback_repair_prompt(
                     job=job,
                     invalid_response=raw_responses[-1],
                     issues=issues,
@@ -1351,14 +1404,14 @@ class OpenAIJEATargetAudioCaptionBackend:
     def describe(
         self, job: JEATargetAudioCaptionJob
     ) -> JEATargetAudioCaptionBackendResult:
-        return self._describe(job, use_v5_fallback=False)
+        return self._describe(job, use_semantic_fallback=False)
 
     def describe_semantic_fallback(
         self, job: JEATargetAudioCaptionJob
     ) -> JEATargetAudioCaptionBackendResult:
         if self.config.backend_family != "qwen3_omni":
             raise ValueError("semantic fallback is only available for Qwen3-Omni")
-        return self._describe(job, use_v5_fallback=True)
+        return self._describe(job, use_semantic_fallback=True)
 
 
 def target_audio_caption_request_fingerprint(
@@ -1404,7 +1457,9 @@ def _record_from_result(
         target_clip_uid=job.target_clip_uid,
         clip_display_path=job.clip_display_path,
         status="ready",
-        background_audio_prompt=result.response.background_audio_prompt,
+        overall_soundscape=result.response.overall_soundscape,
+        non_diegetic_music=result.response.non_diegetic_music,
+        temporal_audio_events=result.response.temporal_audio_events,
         speaker_delivery=[
             TargetSpeakerDelivery(
                 speaker_cluster_id=item.speaker_cluster_id,
@@ -1417,6 +1472,7 @@ def _record_from_result(
         target_video_sha256=job.target_video_sha256,
         target_full_audio_path=job.target_full_audio_path,
         target_full_audio_sha256=job.target_full_audio_sha256,
+        target_duration_seconds=job.target_duration_seconds,
         target_audio_binding_path=job.target_audio_binding_path,
         target_audio_binding_sha256=job.target_audio_binding_sha256,
         input_modality=provenance.input_modality,
@@ -1450,6 +1506,7 @@ def _record_from_failure(
         target_video_sha256=job.target_video_sha256,
         target_full_audio_path=job.target_full_audio_path,
         target_full_audio_sha256=job.target_full_audio_sha256,
+        target_duration_seconds=job.target_duration_seconds,
         target_audio_binding_path=job.target_audio_binding_path,
         target_audio_binding_sha256=job.target_audio_binding_sha256,
         input_modality=provenance.input_modality,
@@ -1524,19 +1581,16 @@ def _process_caption_job(
         )
         primary_validated_response = primary_result.response
         selected_result = primary_result
-        semantic_source: SemanticSource = "primary_v6"
-        if (
-            provenance.backend_family == "qwen3_omni"
-            and _is_all_semantic_null(primary_result.response)
+        semantic_source: SemanticSource = "primary"
+        if provenance.backend_family == "qwen3_omni" and _is_all_semantic_null(
+            primary_result.response
         ):
             fallback_attempted = True
             fallback_trigger_reason = "all_null"
             try:
                 fallback_result = backend.describe_semantic_fallback(job)
                 fallback_raw_responses = fallback_result.raw_responses
-                fallback_completion_diagnostics = (
-                    fallback_result.completion_diagnostics
-                )
+                fallback_completion_diagnostics = fallback_result.completion_diagnostics
                 fallback_attempt_count = len(fallback_raw_responses)
                 fallback_model_call_count = (
                     len(fallback_raw_responses)
@@ -1545,9 +1599,9 @@ def _process_caption_job(
                 )
                 fallback_validated_response = fallback_result.response
                 if _is_all_semantic_null(fallback_result.response):
-                    semantic_source = "primary_v6_all_null_confirmed"
+                    semantic_source = "primary_all_null_confirmed"
                 else:
-                    semantic_source = "fallback_v5"
+                    semantic_source = "fallback"
                     selected_result = fallback_result
             except JEATargetAudioCaptionBackendFailure as exc:
                 fallback_failure = exc
@@ -1557,7 +1611,7 @@ def _process_caption_job(
                     len(fallback_raw_responses), exc.attempt_count
                 )
                 fallback_model_call_count = exc.model_call_count
-                semantic_source = "primary_v6_fallback_failed"
+                semantic_source = "primary_all_null_fallback_failed"
         record = _record_from_result(
             job=job,
             result=selected_result,
@@ -1582,9 +1636,7 @@ def _process_caption_job(
             try:
                 fallback_result = backend.describe_semantic_fallback(job)
                 fallback_raw_responses = fallback_result.raw_responses
-                fallback_completion_diagnostics = (
-                    fallback_result.completion_diagnostics
-                )
+                fallback_completion_diagnostics = fallback_result.completion_diagnostics
                 fallback_attempt_count = len(fallback_raw_responses)
                 fallback_model_call_count = (
                     len(fallback_raw_responses)
@@ -1597,16 +1649,14 @@ def _process_caption_job(
                     result=fallback_result,
                     provenance=provenance,
                     primary_repair_count=max(0, primary_attempt_count - 1),
-                    semantic_source="fallback_v5",
+                    semantic_source="fallback",
                     semantic_fallback_attempted=True,
                     semantic_fallback_trigger_reason="empty_response",
                 )
             except JEATargetAudioCaptionBackendFailure as fallback_exc:
                 fallback_failure = fallback_exc
                 fallback_raw_responses = fallback_exc.raw_responses
-                fallback_completion_diagnostics = (
-                    fallback_exc.completion_diagnostics
-                )
+                fallback_completion_diagnostics = fallback_exc.completion_diagnostics
                 fallback_attempt_count = max(
                     len(fallback_raw_responses), fallback_exc.attempt_count
                 )
@@ -1708,6 +1758,13 @@ def _review_html(
         delivery_by_cluster = {
             item.speaker_cluster_id: item for item in record.speaker_delivery
         }
+        event_rows = [
+            "<li>"
+            + f"{event.start_time:.3f}-{event.end_time:.3f}s | "
+            + html.escape(event.description)
+            + "</li>"
+            for event in record.temporal_audio_events
+        ]
         delivery_rows = []
         for cluster in job.speaker_clusters:
             delivery = delivery_by_cluster.get(cluster.speaker_cluster_id)
@@ -1724,7 +1781,9 @@ def _review_html(
                 + html.escape(ranges)
                 + " | delivery_style="
                 + html.escape(
-                    "[null]" if delivery is None or delivery.delivery_style is None else delivery.delivery_style
+                    "[null]"
+                    if delivery is None or delivery.delivery_style is None
+                    else delivery.delivery_style
                 )
                 + "</li>"
             )
@@ -1745,21 +1804,27 @@ def _review_html(
             + (
                 ""
                 if record.failure is None
-                else "<p><b>Failure:</b> "
-                + html.escape(record.failure.reason)
-                + "</p>"
+                else "<p><b>Failure:</b> " + html.escape(record.failure.reason) + "</p>"
             )
             + (
                 ""
                 if not record.semantic_fallback_attempted
                 else "<details><summary>Semantic fallback diagnostics</summary>"
-                "<p>Primary V6 and fallback V5 raw responses are retained in "
+                "<p>Primary and fallback raw responses are retained in "
                 f"<a href='raw/{html.escape(job.target_clip_uid)}.json'>raw diagnostics JSON</a>."
                 "</p></details>"
             )
-            + "<h3>Background audio</h3><p>"
-            + html.escape(record.background_audio_prompt or "[null]")
-            + "</p><h3>Speaker delivery</h3><ul>"
+            + "<h3>Overall soundscape</h3><p>"
+            + html.escape(record.overall_soundscape or "[null]")
+            + "</p><h3>Non-diegetic music</h3><p>"
+            + html.escape(record.non_diegetic_music or "[null]")
+            + "</p><h3>Temporal audio events</h3>"
+            + (
+                "<ul>" + "".join(event_rows) + "</ul>"
+                if event_rows
+                else "<p>[none]</p>"
+            )
+            + "<h3>Speaker delivery</h3><ul>"
             + "".join(delivery_rows)
             + "</ul><div class='qa'><b>Decision:</b> "
             + labels
@@ -1769,8 +1834,9 @@ def _review_html(
         )
     clip_order = [item.target_clip_uid for item in inventory.jobs]
     prefix = (
-        f"h3-target-audio-caption-v4-{provenance.backend_family}-"
-        f"{inventory.inventory_fingerprint}:"
+        f"h3-target-audio-caption-qa:{JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION}:"
+        f"{provenance.prompt_version}:{provenance.backend_family}:"
+        f"{provenance.configuration_fingerprint}:{inventory.inventory_fingerprint}:"
     )
     provenance_json = json.dumps(
         provenance.model_dump(mode="json"),
@@ -1964,22 +2030,18 @@ def run_jea_target_audio_caption(
                     fallback_empty_response_triggers += 1
                 else:
                     raise RuntimeError("audio caption fallback trigger is inconsistent")
-                fallback_repair_calls += max(
-                    0, processed.fallback_model_call_count - 1
-                )
-                if record.semantic_source == "fallback_v5":
+                fallback_repair_calls += max(0, processed.fallback_model_call_count - 1)
+                if record.semantic_source == "fallback":
                     if (
                         processed.fallback_validated_response is not None
-                        and _is_all_semantic_null(
-                            processed.fallback_validated_response
-                        )
+                        and _is_all_semantic_null(processed.fallback_validated_response)
                     ):
                         fallback_still_all_null += 1
                     else:
                         fallback_recovered += 1
-                elif record.semantic_source == "primary_v6_all_null_confirmed":
+                elif record.semantic_source == "primary_all_null_confirmed":
                     fallback_still_all_null += 1
-                elif record.semantic_source == "primary_v6_fallback_failed" or (
+                elif record.semantic_source == "primary_all_null_fallback_failed" or (
                     record.status == "failed"
                     and processed.fallback_failure is not None
                     and processed.fallback_trigger_reason == "empty_response"
@@ -2126,6 +2188,7 @@ __all__ = [
     "DEFAULT_DOTS3_MODEL",
     "DEFAULT_QWEN3_OMNI_CHECKPOINT_ID",
     "DEFAULT_QWEN3_OMNI_MODEL",
+    "FALLBACK_SYSTEM_PROMPT",
     "JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION",
     "JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION",
     "JEA_TARGET_AUDIO_CAPTION_HUMAN_QA_VERSION",
@@ -2135,7 +2198,6 @@ __all__ = [
     "JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION",
     "JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION",
     "SYSTEM_PROMPT",
-    "V5_FALLBACK_SYSTEM_PROMPT",
     "JEATargetAudioCaptionBackendFailure",
     "JEATargetAudioCaptionBackendProvenance",
     "JEATargetAudioCaptionBackendResult",

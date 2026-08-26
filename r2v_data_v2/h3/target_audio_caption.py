@@ -33,13 +33,13 @@ from r2v_data_v2.h3.background_audio_scout import (
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.target_audio_caption_contract import (
-    ModelSpeakerDelivery as _ModelSpeakerDelivery,
-)
-from r2v_data_v2.h3.target_audio_caption_contract import (
+    LegacyTargetAudioCaptionResponse,
     SpeakerClusterEvidence,
     SpeakerTimeRange,
-    TargetAudioCaptionResponse,
     TargetSpeakerDelivery,
+)
+from r2v_data_v2.h3.target_audio_caption_contract import (
+    ModelSpeakerDelivery as _ModelSpeakerDelivery,
 )
 from r2v_data_v2.h3.text_usability import (
     TextUsabilityInventory,
@@ -140,7 +140,7 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-Dots3TargetAudioCaptionResponse = TargetAudioCaptionResponse
+Dots3TargetAudioCaptionResponse = LegacyTargetAudioCaptionResponse
 
 
 class TargetAudioCaptionFailure(SchemaModel):
