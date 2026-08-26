@@ -5,6 +5,8 @@ import json
 import re
 import shutil
 import subprocess
+import threading
+import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import r2v_data_v2.h3.jea_target_audio_caption as jea_caption
 from r2v_data_v2.h3.jea_audio_production import JEAInPair
 from r2v_data_v2.h3.jea_diarization import JEAReadableDiarizationSegment
 from r2v_data_v2.h3.jea_target_audio_caption import (
@@ -274,6 +277,7 @@ def _run_semantic_sequence(
     responses: list[str],
     *,
     family: str = "qwen3_omni",
+    max_concurrency: int = 1,
 ) -> tuple[
     JEATargetAudioCaptionSummary,
     JEATargetAudioCaptionRecord,
@@ -298,6 +302,7 @@ def _run_semantic_sequence(
         inventory=inventory,
         output_root=output,
         backend=backend,
+        max_concurrency=max_concurrency,
     )
     record = _read_records(output)[0]
     raw = json.loads(
@@ -332,6 +337,55 @@ class _FakeBackend:
             ),
             raw_responses=("{}",),
         )
+
+
+class _ConcurrentBackend(_FakeBackend):
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        family: str,
+        delays: dict[str, float] | None = None,
+        backend_failure_clip: str | None = None,
+        programming_failure_clip: str | None = None,
+    ) -> None:
+        super().__init__(tmp_path, family=family)
+        self.delays = delays or {}
+        self.backend_failure_clip = backend_failure_clip
+        self.programming_failure_clip = programming_failure_clip
+        self.completion_order: list[str] = []
+        self.active_count = 0
+        self.peak_active_count = 0
+        self._lock = threading.Lock()
+
+    def describe(self, job):
+        with self._lock:
+            self.calls.append(job.target_clip_uid)
+            self.active_count += 1
+            self.peak_active_count = max(self.peak_active_count, self.active_count)
+        try:
+            time.sleep(self.delays.get(job.target_clip_uid, 0.02))
+            if job.target_clip_uid == self.backend_failure_clip:
+                raise JEATargetAudioCaptionBackendFailure(
+                    code="structured_output_failed",
+                    reason="invalid after repair",
+                    raw_responses=("bad", "still bad"),
+                    attempt_count=2,
+                )
+            if job.target_clip_uid == self.programming_failure_clip:
+                raise RuntimeError("programming failure")
+            return JEATargetAudioCaptionBackendResult(
+                response=_response_for_job(
+                    job,
+                    background="room ambience",
+                    delivery_styles=["calm"] * len(job.speaker_clusters),
+                ),
+                raw_responses=("{}",),
+            )
+        finally:
+            with self._lock:
+                self.active_count -= 1
+                self.completion_order.append(job.target_clip_uid)
 
 
 def test_current_35_target_92_segment_inventory_and_partial_binding(
@@ -1459,6 +1513,298 @@ def test_v5_fallback_repair_prompt_is_exact_historical_behavior(
     )
 
 
+def test_concurrent_completion_preserves_inventory_order_and_record_semantics(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=4, segment_count=4)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    serial_output = root / "audio_caption/serial"
+    concurrent_output = root / "audio_caption/concurrent"
+    serial_backend = _ConcurrentBackend(tmp_path, family="dots3")
+    concurrent_backend = _ConcurrentBackend(
+        tmp_path,
+        family="dots3",
+        delays={
+            "clip-000": 0.08,
+            "clip-001": 0.06,
+            "clip-002": 0.04,
+            "clip-003": 0.01,
+        },
+    )
+
+    serial_summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=serial_output,
+        backend=serial_backend,
+        max_concurrency=1,
+    )
+    concurrent_summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=concurrent_output,
+        backend=concurrent_backend,
+        max_concurrency=4,
+    )
+
+    expected_order = [job.target_clip_uid for job in inventory.jobs]
+    concurrent_records = _read_records(concurrent_output)
+    assert [record.target_clip_uid for record in concurrent_records] == expected_order
+    assert concurrent_backend.completion_order != expected_order
+    assert concurrent_backend.peak_active_count > 1
+    assert (serial_output / "records.jsonl").read_bytes() == (
+        concurrent_output / "records.jsonl"
+    ).read_bytes()
+    assert (serial_output / "review.html").read_bytes() == (
+        concurrent_output / "review.html"
+    ).read_bytes()
+    assert [record.request_fingerprint for record in _read_records(serial_output)] == [
+        record.request_fingerprint for record in concurrent_records
+    ]
+    assert serial_summary.inventory_fingerprint == concurrent_summary.inventory_fingerprint
+    assert serial_summary.max_concurrency == 1
+    assert concurrent_summary.max_concurrency == 4
+    assert serial_summary.model_dump(exclude={"max_concurrency"}) == (
+        concurrent_summary.model_dump(exclude={"max_concurrency"})
+    )
+
+
+def test_concurrent_backend_failure_isolated_without_reordering(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path, clip_count=4, segment_count=4)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = root / "audio_caption/concurrent"
+    backend = _ConcurrentBackend(
+        tmp_path,
+        family="dots3",
+        backend_failure_clip="clip-001",
+    )
+
+    summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=backend,
+        max_concurrency=4,
+    )
+
+    records = _read_records(output)
+    assert [record.target_clip_uid for record in records] == [
+        job.target_clip_uid for job in inventory.jobs
+    ]
+    assert [record.status for record in records] == [
+        "ready",
+        "failed",
+        "ready",
+        "ready",
+    ]
+    assert summary.ready_count == 3
+    assert summary.failed_count == 1
+    assert summary.initial_call_count == 4
+    assert summary.repair_call_count == 1
+    assert summary.failure_reason_counts == {"structured_output_failed": 1}
+
+
+def test_concurrent_qwen_fallbacks_are_clip_local_and_counters_reconcile(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=4, segment_count=4)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = root / "audio_caption/qwen-concurrent"
+
+    class ConcurrentFallbackBackend(_FakeBackend):
+        def __init__(self) -> None:
+            super().__init__(tmp_path, family="qwen3_omni")
+            self.fallback_calls: list[str] = []
+            self._lock = threading.Lock()
+
+        def describe(self, job):
+            with self._lock:
+                self.calls.append(job.target_clip_uid)
+            return JEATargetAudioCaptionBackendResult(
+                response=_response_for_job(
+                    job,
+                    background=(
+                        "room ambience" if job.target_clip_uid == "clip-000" else None
+                    ),
+                    delivery_styles=[None] * len(job.speaker_clusters),
+                ),
+                raw_responses=(f"primary-{job.target_clip_uid}",),
+            )
+
+        def describe_semantic_fallback(self, job):
+            with self._lock:
+                self.fallback_calls.append(job.target_clip_uid)
+            if job.target_clip_uid == "clip-003":
+                raise JEATargetAudioCaptionBackendFailure(
+                    code="structured_output_failed",
+                    reason="invalid after repair",
+                    raw_responses=("fallback-bad",),
+                    attempt_count=2,
+                )
+            return JEATargetAudioCaptionBackendResult(
+                response=_response_for_job(
+                    job,
+                    background=(
+                        "faint music" if job.target_clip_uid == "clip-001" else None
+                    ),
+                    delivery_styles=[None] * len(job.speaker_clusters),
+                ),
+                raw_responses=(f"fallback-{job.target_clip_uid}",),
+            )
+
+    backend = ConcurrentFallbackBackend()
+    summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=backend,
+        max_concurrency=4,
+    )
+
+    records = _read_records(output)
+    assert [record.semantic_source for record in records] == [
+        "primary_v6",
+        "fallback_v5",
+        "primary_v6_all_null_confirmed",
+        "primary_v6_fallback_failed",
+    ]
+    assert sorted(backend.fallback_calls) == ["clip-001", "clip-002", "clip-003"]
+    assert summary.initial_call_count == 4
+    assert summary.repair_call_count == 0
+    assert summary.semantic_fallback_trigger_count == 3
+    assert summary.semantic_fallback_initial_call_count == 3
+    assert summary.semantic_fallback_repair_call_count == 1
+    assert summary.semantic_fallback_recovered_count == 1
+    assert summary.semantic_fallback_still_all_null_count == 1
+    assert summary.semantic_fallback_failed_count == 1
+    assert summary.raw_response_count == 7
+    assert summary.ready_count == 4
+    assert summary.failed_count == 0
+
+
+def test_dots3_all_null_has_no_fallback_under_concurrency(tmp_path: Path) -> None:
+    root = _production_fixture(tmp_path, clip_count=4, segment_count=4)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+
+    class ConcurrentAllNullDotsBackend(_FakeBackend):
+        def describe(self, job):
+            self.calls.append(job.target_clip_uid)
+            return JEATargetAudioCaptionBackendResult(
+                response=_response_for_job(
+                    job,
+                    background=None,
+                    delivery_styles=[None] * len(job.speaker_clusters),
+                ),
+                raw_responses=("all-null",),
+            )
+
+        def describe_semantic_fallback(self, job):
+            raise AssertionError("Dots3 must not use semantic fallback")
+
+    summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=root / "audio_caption/dots-concurrent",
+        backend=ConcurrentAllNullDotsBackend(tmp_path, family="dots3"),
+        max_concurrency=4,
+    )
+
+    assert summary.ready_count == 4
+    assert summary.semantic_fallback_trigger_count == 0
+
+
+def test_unexpected_concurrent_error_preserves_existing_destination(
+    tmp_path: Path,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=4, segment_count=4)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    output = root / "audio_caption/dots3"
+    run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=output,
+        backend=_FakeBackend(tmp_path, family="dots3"),
+    )
+    before = _tree_bytes(output)
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        run_jea_target_audio_caption(
+            inventory=inventory,
+            output_root=output,
+            backend=_ConcurrentBackend(
+                tmp_path,
+                family="dots3",
+                programming_failure_clip="clip-001",
+            ),
+            overwrite=True,
+            max_concurrency=4,
+        )
+
+    assert _tree_bytes(output) == before
+    assert not list(output.parent.glob(".dots3.tmp-*"))
+
+
+def test_openai_backend_reuses_one_client_per_worker_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _production_fixture(tmp_path, clip_count=8, segment_count=8)
+    inventory = build_jea_target_audio_caption_inventory(
+        audio_production_root=root
+    )
+    barrier = threading.Barrier(4)
+    lock = threading.Lock()
+    client_threads: list[int] = []
+    request_count = 0
+
+    class ThreadCompletions:
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            nonlocal request_count
+            with lock:
+                request_count += 1
+            response = TargetAudioCaptionResponse(
+                background_audio_prompt="room ambience",
+                speaker_delivery=[
+                    ModelSpeakerDelivery(
+                        speaker_cluster_id="speaker-0",
+                        delivery_style="calm",
+                    )
+                ],
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=response.model_dump_json()))]
+            )
+
+    def client_factory(**kwargs: object) -> SimpleNamespace:
+        with lock:
+            client_threads.append(threading.get_ident())
+        barrier.wait(timeout=2)
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=ThreadCompletions())
+        )
+
+    monkeypatch.setattr(jea_caption, "OpenAI", client_factory)
+    backend = OpenAIJEATargetAudioCaptionBackend(
+        _config(tmp_path, family="dots3")
+    )
+
+    summary = run_jea_target_audio_caption(
+        inventory=inventory,
+        output_root=root / "audio_caption/thread-local",
+        backend=backend,
+        max_concurrency=4,
+    )
+
+    assert summary.ready_count == 8
+    assert request_count == 8
+    assert len(client_threads) == 4
+    assert len(set(client_threads)) == 4
+
+
 def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionRecord.model_validate(
@@ -1476,7 +1822,7 @@ def test_old_contracts_do_not_validate_as_jea_multibackend_contract() -> None:
         )
     assert (
         JEA_TARGET_AUDIO_CAPTION_SUMMARY_VERSION
-        == "r2v.h3.target_audio_caption_summary.3"
+        == "r2v.h3.target_audio_caption_summary.4"
     )
     assert JEA_TARGET_AUDIO_CAPTION_SCHEMA_VERSION == "r2v.h3.target_audio_caption.4"
     assert (
@@ -1518,13 +1864,13 @@ def test_current_records_and_summary_are_strict_new_versions(tmp_path: Path) -> 
     )
 
     assert record.schema_version == "r2v.h3.target_audio_caption.4"
-    assert summary.schema_version == "r2v.h3.target_audio_caption_summary.3"
+    assert summary.schema_version == "r2v.h3.target_audio_caption_summary.4"
     old_record = record.model_dump(mode="json")
     old_record["schema_version"] = "r2v.h3.target_audio_caption.3"
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionRecord.model_validate(old_record)
     old_summary = summary.model_dump(mode="json")
-    old_summary["schema_version"] = "r2v.h3.target_audio_caption_summary.2"
+    old_summary["schema_version"] = "r2v.h3.target_audio_caption_summary.3"
     with pytest.raises(ValidationError):
         JEATargetAudioCaptionSummary.model_validate(old_summary)
 
@@ -1609,14 +1955,45 @@ def test_cli_dry_run_uses_current_root_and_constructs_no_backend(
             str(root),
             "--backend",
             "qwen3-omni",
+            "--max-concurrency",
+            "4",
             "--dry-run",
         ]
     )
 
     assert result["model_calls"] == 0
+    assert result["max_concurrency"] == 4
     assert result["target_clip_count"] == 2
     assert result["output_root"] == str(root / "audio_caption/qwen3_omni")
     assert not (root / "audio_caption").exists()
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cli_rejects_non_positive_max_concurrency(value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(
+            [
+                "--audio-production-root",
+                "/tmp/audio-production",
+                "--backend",
+                "dots3",
+                "--max-concurrency",
+                value,
+            ]
+        )
+
+
+def test_cli_defaults_to_single_clip_concurrency() -> None:
+    arguments = cli._parser().parse_args(
+        [
+            "--audio-production-root",
+            "/tmp/audio-production",
+            "--backend",
+            "dots3",
+        ]
+    )
+
+    assert arguments.max_concurrency == 1
 
 
 def test_cli_model_calls_include_semantic_fallback_and_fallback_repair(

@@ -85,7 +85,7 @@ The new contracts are:
 
 - `r2v.h3.target_audio_caption.4`;
 - `r2v.h3.target_audio_caption_inventory.2`;
-- `r2v.h3.target_audio_caption_summary.3`;
+- `r2v.h3.target_audio_caption_summary.4`;
 - `r2v.h3.target_audio_caption_human_qa.2`.
 
 Run model-free inventory validation first:
@@ -114,12 +114,24 @@ Run each A/B side independently:
 ```bash
 "$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --backend dots3
+  --backend dots3 \
+  --max-concurrency 4
 
 "$R2V_PYTHON" tools/run_h3_target_audio_caption.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --backend qwen3-omni
+  --backend qwen3-omni \
+  --max-concurrency 4
 ```
+
+`--max-concurrency` controls how many independent target clips the producer
+sends to the serving backend at once. It is not a GPU count or a vLLM tensor
+parallel setting, and it is deliberately excluded from semantic request
+fingerprints. Each clip's primary request, optional structured repair, and
+optional Qwen V5 semantic fallback remain sequential. The default value `1` is
+the compatibility and debugging mode. For the current four-GPU evaluation
+deployment, start with `4`; benchmark `1`, `2`, `4`, and `8` against the actual
+serving topology before freezing an operational value. No linear scaling is
+assumed.
 
 Outputs are atomically published and cannot overwrite one another:
 

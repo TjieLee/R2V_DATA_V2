@@ -57,6 +57,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-base-url")
     parser.add_argument("--timeout-seconds", type=_positive_float, default=600.0)
     parser.add_argument("--max-tokens", type=_positive_int, default=2048)
+    parser.add_argument("--max-concurrency", type=_positive_int, default=1)
     return parser
 
 
@@ -146,6 +147,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "transcript_supplied": False,
         "entity_id_supplied": False,
         "donor_media_used": False,
+        "max_concurrency": arguments.max_concurrency,
         "model_calls": 0,
     }
     if arguments.dry_run:
@@ -158,6 +160,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         output_root=output_root,
         backend=backend,
         overwrite=arguments.overwrite,
+        max_concurrency=arguments.max_concurrency,
     )
     result["model_calls"] = (
         summary.initial_call_count
