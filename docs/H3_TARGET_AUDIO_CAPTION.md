@@ -59,33 +59,41 @@ full audio, and requests text output only. Qwen3-Omni-Captioner is not used beca
 it does not accept the task's text prompt. Both backends fail closed after at most
 one primary structured-output repair.
 
-### Qwen all-null semantic fallback
+### Qwen semantic fallback
 
 Human QA found occasional complete V6 abstention on clips where historical V5
-produced useful semantics. Qwen3-Omni therefore performs exactly one semantic
-fallback with the exact historical `h3_target_audio_caption_v5` system, user, and
-repair prompts only when a valid V6 response has both a null
-`background_audio_prompt` and null `delivery_style` for every supplied speaker.
-Partial nulls are valid and are accepted immediately without fallback.
+produced useful semantics. Real production also observed Qwen3-Omni generating
+only whitespace, either on the initial V6 request or on its structured repair.
+Qwen3-Omni therefore performs exactly one semantic fallback with the exact
+historical `h3_target_audio_caption_v5` system, user, and repair prompts when a
+valid V6 response is completely all-null or when primary V6 processing ends with
+`qwen3_omni_vllm_empty_response`. Partial nulls are valid and are accepted
+immediately without fallback. Connection, HTTP, timeout, model, local-media, and
+other ordinary infrastructure failures do not trigger V5.
 
 If V5 recovers any semantic value, its complete response becomes final; fields
-are never merged across prompts. If V5 is also all-null, the valid all-null result
-is accepted as ready. If the V5 request or its one structured-output repair fails,
-the original valid V6 all-null response remains ready. There is no third semantic
-attempt. This policy does not mean null is generally a failure or that V5 is
-globally better than V6. Dots3 never uses this semantic fallback.
+are never merged across prompts. If V5 is also all-null, the result is accepted
+as ready and there is no third semantic attempt. A failed V5 retains the valid V6
+all-null response when one exists; after a whitespace-only V6 failure it remains
+failed because there is no valid primary response to preserve. This policy does
+not mean null is generally a failure or that V5 is globally better than V6.
+Dots3 never uses this semantic fallback.
 
 Primary structured-output repair and Qwen semantic fallback are separate
 mechanisms. Summary counters report primary initial/repair calls separately from
-fallback triggers, initial calls, repair calls, recoveries, confirmed all-null
-results, and fallback failures. Each record publishes the semantic source, and
-raw diagnostics retain both passes when fallback is attempted.
+fallback triggers by reason, initial calls, repair calls, recoveries, confirmed
+all-null results, and fallback failures. Each record publishes the explicit
+trigger reason and semantic source. Raw diagnostics retain both passes, ordered
+completion metadata (`finish_reason`, optional usage, and whitespace character
+counts), and the validation issues that caused a repair even if that repair later
+fails. Fallback policy versioning participates in Qwen request fingerprints;
+runtime concurrency does not.
 
 The new contracts are:
 
-- `r2v.h3.target_audio_caption.4`;
+- `r2v.h3.target_audio_caption.5`;
 - `r2v.h3.target_audio_caption_inventory.2`;
-- `r2v.h3.target_audio_caption_summary.4`;
+- `r2v.h3.target_audio_caption_summary.5`;
 - `r2v.h3.target_audio_caption_human_qa.2`.
 
 Run model-free inventory validation first:

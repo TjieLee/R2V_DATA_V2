@@ -299,7 +299,7 @@ jq -c '
 
 ## Known failure mode: whitespace-only generation
 
-A small number of observed Qwen3-Omni calls returned a long string consisting only of whitespace/newline characters. The producer currently classifies `response.strip() == ""` as `qwen3_omni_vllm_empty_response`. This is distinct from a schema-valid JSON response that explicitly contains null semantic fields.
+A small number of observed Qwen3-Omni calls returned a long string consisting only of whitespace/newline characters. The producer classifies `response.strip() == ""` as `qwen3_omni_vllm_empty_response`. For Qwen only, a primary V6 whitespace-only failure now invokes exactly one historical V5 semantic fallback, including when whitespace occurs on the V6 repair after an earlier schema-invalid response. Partial-null valid V6 output remains accepted, and ordinary HTTP, timeout, model, or media failures do not trigger V5. Completion finish reason, optional token usage, and whitespace counts are retained for diagnosis; validation issues that caused a repair are also retained if the repair later fails. This is distinct from a schema-valid JSON response that explicitly contains null semantic fields.
 
 Do not interpret a `background_audio_prompt: null` in an otherwise ready record as a transport or token-limit error. A reproduced ready request completed normally with `finish_reason=stop`, 4780 prompt tokens, and 73 completion tokens while returning a null background prompt and non-null speaker delivery. Preserve raw diagnostics for failed/repair cases.
 
