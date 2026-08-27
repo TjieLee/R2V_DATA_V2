@@ -3292,6 +3292,114 @@ def _load_stage(
     return records, summary
 
 
+def _load_stage_raw(
+    destination: Path,
+    records: Sequence[SchemaModel],
+) -> dict[str, dict[str, object]]:
+    raw_directory = destination / "raw"
+    expected_names = {f"{record.target_clip_uid}.json" for record in records}
+    try:
+        actual_names = {path.name for path in raw_directory.iterdir() if path.is_file()}
+    except Exception as exc:
+        raise ValueError(f"invalid existing specialized raw output: {destination}") from exc
+    if actual_names != expected_names:
+        raise ValueError(f"existing specialized raw output is incomplete: {destination}")
+    payloads: dict[str, dict[str, object]] = {}
+    for record in records:
+        try:
+            payload = json.loads(
+                (raw_directory / f"{record.target_clip_uid}.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"invalid existing specialized raw output: {record.target_clip_uid}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise TypeError(
+                f"specialized raw output is not an object: {record.target_clip_uid}"
+            )
+        raw_responses = payload.get("raw_responses")
+        diagnostics = payload.get("completion_diagnostics", [])
+        if (
+            payload.get("status") != record.status
+            or not isinstance(raw_responses, list)
+            or not isinstance(diagnostics, list)
+            or len(raw_responses) != record.raw_response_count
+            or len(diagnostics) != record.raw_response_count
+        ):
+            raise ValueError(
+                f"specialized raw output differs from record: {record.target_clip_uid}"
+            )
+        payloads[record.target_clip_uid] = payload
+    return payloads
+
+
+def _merge_retry_result(
+    previous: _ProcessedRecord[RecordT],
+    retried: _ProcessedRecord[RecordT],
+) -> _ProcessedRecord[RecordT]:
+    previous_record = previous.record
+    retried_record = retried.record
+    if (
+        type(previous_record) is not type(retried_record)
+        or previous_record.target_clip_uid != retried_record.target_clip_uid
+        or previous_record.request_fingerprint != retried_record.request_fingerprint
+    ):
+        raise ValueError("specialized retry result differs from existing request")
+
+    diagnostics = [
+        *previous_record.completion_diagnostics,
+        *retried_record.completion_diagnostics,
+    ]
+    values = {
+        field_name: getattr(retried_record, field_name)
+        for field_name in type(retried_record).model_fields
+        if field_name not in {"schema_version", "record_fingerprint"}
+    }
+    values.update(
+        {
+            "model_call_count": (
+                previous_record.model_call_count + retried_record.model_call_count
+            ),
+            "raw_response_count": len(diagnostics),
+            "completion_diagnostics": diagnostics,
+        }
+    )
+    if (
+        isinstance(previous_record, LocalSemanticsRecord)
+        and isinstance(retried_record, LocalSemanticsRecord)
+        and retried_record.status == "failed"
+        and not retried_record.speaker_delivery
+    ):
+        values["speaker_delivery"] = previous_record.speaker_delivery
+    merged_record = _make_record(type(retried_record), values)
+
+    previous_history = previous.raw.get("retry_history", [])
+    if not isinstance(previous_history, list):
+        raise TypeError("specialized retry history is invalid")
+    previous_raw = {
+        key: value for key, value in previous.raw.items() if key != "retry_history"
+    }
+    merged_raw = dict(retried.raw)
+    merged_raw["raw_responses"] = [
+        *previous.raw.get("raw_responses", []),
+        *retried.raw.get("raw_responses", []),
+    ]
+    merged_raw["completion_diagnostics"] = [
+        item.model_dump(mode="json") for item in diagnostics
+    ]
+    merged_raw["retry_history"] = [
+        *previous_history,
+        {
+            "record": previous_record.model_dump(mode="json"),
+            "raw": previous_raw,
+        },
+    ]
+    return _ProcessedRecord(record=merged_record, raw=merged_raw)
+
+
 def _validate_global_dependencies(
     global_records: Sequence[GlobalSemanticsRecord],
     captioner_records: Sequence[CaptionerRecord],
@@ -3518,10 +3626,13 @@ def run_global_semantics_phase(
     captioner_backend: CaptionerBackend,
     music_backend: MusicRescueBackend,
     overwrite: bool = False,
+    retry_failed: bool = False,
     max_inflight: int = 4,
     captioner_max_inflight: int = 1,
     music_max_inflight: int = 1,
 ) -> tuple[list[GlobalSemanticsRecord], SpecializedStageSummary]:
+    if overwrite and retry_failed:
+        raise ValueError("specialized retry-failed and overwrite are mutually exclusive")
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "global_semantics")
     provenance = _global_runtime_provenance(
@@ -3538,6 +3649,82 @@ def run_global_semantics_phase(
     )
     if captioner_backend.provenance != captioner_summary.backend_provenance:
         raise ValueError("recaption backend differs from primary captioner stage")
+    if retry_failed:
+        if not destination.exists():
+            raise ValueError("specialized global retry requires an existing stage")
+        records, summary = _load_stage(
+            destination=destination,
+            role="global_semantics",
+            inventory=inventory,
+            provenance=provenance,
+            model=GlobalSemanticsRecord,
+        )
+        _validate_global_dependencies(records, captioner_records)
+        raw_by_clip = _load_stage_raw(destination, records)
+        failed_records = [record for record in records if record.status == "failed"]
+        if not failed_records:
+            return records, summary
+        jobs_by_clip = {job.target_clip_uid: job for job in inventory.jobs}
+        captioner_by_clip = {
+            record.target_clip_uid: record for record in captioner_records
+        }
+        retry_jobs = [jobs_by_clip[record.target_clip_uid] for record in failed_records]
+        retried = _bounded_process(
+            retry_jobs,
+            lambda job: _global_record(
+                job,
+                captioner_by_clip[job.target_clip_uid],
+                backend,
+                provenance,
+            ),
+            max_inflight=max_inflight,
+        )
+        retried = _run_recaption_rescues(
+            jobs=retry_jobs,
+            processed=retried,
+            captioner_backend=captioner_backend,
+            global_backend=backend,
+            captioner_max_inflight=captioner_max_inflight,
+            global_max_inflight=max_inflight,
+        )
+        retried = _run_music_rescues(
+            jobs=retry_jobs,
+            processed=retried,
+            music_backend=music_backend,
+            max_inflight=music_max_inflight,
+        )
+        retried_by_clip = {
+            item.record.target_clip_uid: item for item in retried
+        }
+        merged = [
+            _merge_retry_result(
+                _ProcessedRecord(
+                    record=record,
+                    raw=raw_by_clip[record.target_clip_uid],
+                ),
+                retried_by_clip[record.target_clip_uid],
+            )
+            if record.target_clip_uid in retried_by_clip
+            else _ProcessedRecord(
+                record=record,
+                raw=raw_by_clip[record.target_clip_uid],
+            )
+            for record in records
+        ]
+        merged_records = [item.record for item in merged]
+        merged_summary = _summary(
+            role="global_semantics",
+            inventory=inventory,
+            provenance=provenance,
+            records=merged_records,
+        )
+        _publish_stage(
+            destination=destination,
+            records=merged_records,
+            summary=merged_summary,
+            raw_by_clip={item.record.target_clip_uid: item.raw for item in merged},
+        )
+        return merged_records, merged_summary
     if destination.exists() and not overwrite:
         records, summary = _load_stage(
             destination=destination,
@@ -3600,8 +3787,11 @@ def run_local_semantics_phase(
     output_root: Path,
     backend: LocalSemanticsBackend,
     overwrite: bool = False,
+    retry_failed: bool = False,
     max_inflight: int = 1,
 ) -> tuple[list[LocalSemanticsRecord], SpecializedStageSummary]:
+    if overwrite and retry_failed:
+        raise ValueError("specialized retry-failed and overwrite are mutually exclusive")
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "local_semantics")
     provenance = backend.provenance
@@ -3613,6 +3803,60 @@ def run_local_semantics_phase(
         provenance=_existing_stage_provenance(captioner_destination),
         model=CaptionerRecord,
     )
+    if retry_failed:
+        if not destination.exists():
+            raise ValueError("specialized local retry requires an existing stage")
+        records, summary = _load_stage(
+            destination=destination,
+            role="local_semantics",
+            inventory=inventory,
+            provenance=provenance,
+            model=LocalSemanticsRecord,
+        )
+        _validate_local_dependencies(records, captioner_records)
+        raw_by_clip = _load_stage_raw(destination, records)
+        failed_records = [record for record in records if record.status == "failed"]
+        if not failed_records:
+            return records, summary
+        by_clip = {record.target_clip_uid: record for record in captioner_records}
+        jobs_by_clip = {job.target_clip_uid: job for job in inventory.jobs}
+        retried = _bounded_map(
+            [jobs_by_clip[record.target_clip_uid] for record in failed_records],
+            lambda job: _local_record(job, by_clip[job.target_clip_uid], backend),
+            max_inflight=max_inflight,
+        )
+        retried_by_clip = {
+            item.record.target_clip_uid: item for item in retried
+        }
+        merged = [
+            _merge_retry_result(
+                _ProcessedRecord(
+                    record=record,
+                    raw=raw_by_clip[record.target_clip_uid],
+                ),
+                retried_by_clip[record.target_clip_uid],
+            )
+            if record.target_clip_uid in retried_by_clip
+            else _ProcessedRecord(
+                record=record,
+                raw=raw_by_clip[record.target_clip_uid],
+            )
+            for record in records
+        ]
+        merged_records = [item.record for item in merged]
+        merged_summary = _summary(
+            role="local_semantics",
+            inventory=inventory,
+            provenance=provenance,
+            records=merged_records,
+        )
+        _publish_stage(
+            destination=destination,
+            records=merged_records,
+            summary=merged_summary,
+            raw_by_clip={item.record.target_clip_uid: item.raw for item in merged},
+        )
+        return merged_records, merged_summary
     if destination.exists() and not overwrite:
         records, summary = _load_stage(
             destination=destination,

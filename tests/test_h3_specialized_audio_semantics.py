@@ -14,6 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 import r2v_data_v2.h3.specialized_audio_semantics as specialized
+import tools.run_h3_specialized_audio_semantics as specialized_cli
 from r2v_data_v2.h3.jea_audio_production import (
     CanonicalAudioClip,
     CanonicalAudioClipSummary,
@@ -3235,6 +3236,298 @@ def test_overwrite_fails_closed_on_unknown_stage_ownership(tmp_path: Path) -> No
             overwrite=True,
         )
     assert backend.calls == []
+
+
+def test_global_retry_failed_only_calls_failed_record_and_preserves_ready_records(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=4)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    captioner = _FakeCaptioner(_caption_config(inventory))
+    run_captioner_phase(inventory=inventory, output_root=root, backend=captioner)
+    initial_backend = _FakeGlobal(_global_config(), failures={"clip-001"})
+    run_global_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=initial_backend,
+        captioner_backend=captioner,
+        music_backend=_FakeMusic(_music_config(inventory)),
+        max_inflight=1,
+    )
+    before = specialized._read_jsonl(
+        root / "global_semantics/records.jsonl",
+        specialized.GlobalSemanticsRecord,
+    )
+    previous_failed = before[1]
+    retry_backend = _SequencedGlobal(
+        _global_config(),
+        [
+            GlobalAudioSemanticsResponse(
+                overall_audio_description=None,
+                overall_soundscape=None,
+                non_diegetic_music=None,
+            ),
+            GlobalAudioSemanticsResponse(
+                overall_audio_description="rescued description",
+                overall_soundscape="rescued room",
+                non_diegetic_music="rescued score",
+            ),
+        ],
+    )
+    retry_captioner = _FakeCaptioner(_caption_config(inventory))
+    retry_music = _FakeMusic(_music_config(inventory))
+
+    records, summary = run_global_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=retry_backend,
+        captioner_backend=retry_captioner,
+        music_backend=retry_music,
+        retry_failed=True,
+        max_inflight=1,
+    )
+
+    assert [clip_uid for clip_uid, _ in retry_backend.calls] == [
+        "clip-001",
+        "clip-001",
+    ]
+    assert retry_captioner.calls == ["clip-001"]
+    assert retry_music.calls == []
+    assert summary.ready_count == 4 and summary.failed_count == 0
+    assert records[1].status == "ready"
+    assert records[1].request_fingerprint == previous_failed.request_fingerprint
+    assert records[1].model_call_count == previous_failed.model_call_count + 3
+    for index in (0, 2, 3):
+        assert records[index].model_dump(mode="json") == before[index].model_dump(
+            mode="json"
+        )
+        assert records[index].record_fingerprint == before[index].record_fingerprint
+    raw = json.loads(
+        (root / "global_semantics/raw/clip-001.json").read_text(encoding="utf-8")
+    )
+    assert raw["retry_history"][0]["record"]["failure"]["code"] == (
+        "global_fake_failure"
+    )
+
+
+def test_local_retry_failed_only_calls_failed_record_and_preserves_ready_records(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=4)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(_local_config(inventory), failures={"clip-002"}),
+        max_inflight=1,
+    )
+    before = specialized._read_jsonl(
+        root / "local_semantics/records.jsonl",
+        specialized.LocalSemanticsRecord,
+    )
+    retry_backend = _FakeLocal(_local_config(inventory))
+
+    records, summary = run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=retry_backend,
+        retry_failed=True,
+        max_inflight=1,
+    )
+
+    assert retry_backend.calls == ["clip-002"]
+    assert summary.ready_count == 4 and summary.failed_count == 0
+    assert records[2].model_call_count == before[2].model_call_count + 1
+    for index in (0, 1, 3):
+        assert records[index].model_dump(mode="json") == before[index].model_dump(
+            mode="json"
+        )
+
+
+def test_local_retry_failure_remains_failed_and_preserves_previous_history(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=2)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(
+            _local_config(inventory),
+            failures={"clip-001"},
+            failure_raw_by_clip={"clip-001": ["initial-invalid-json"]},
+        ),
+    )
+    before = specialized._read_jsonl(
+        root / "local_semantics/records.jsonl",
+        specialized.LocalSemanticsRecord,
+    )
+    retry_backend = _FakeLocal(
+        _local_config(inventory),
+        failures={"clip-001"},
+        failure_raw_by_clip={"clip-001": ["retry-invalid-json"]},
+    )
+
+    records, summary = run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=retry_backend,
+        retry_failed=True,
+    )
+
+    assert records[1].status == "failed"
+    assert summary.failed_count == 1
+    assert records[1].model_call_count == before[1].model_call_count + 1
+    assert records[0].model_dump(mode="json") == before[0].model_dump(mode="json")
+    raw = json.loads(
+        (root / "local_semantics/raw/clip-001.json").read_text(encoding="utf-8")
+    )
+    assert raw["raw_responses"] == [
+        "initial-invalid-json",
+        "retry-invalid-json",
+    ]
+    assert raw["retry_history"][0]["raw"]["raw_responses"] == [
+        "initial-invalid-json"
+    ]
+    assert raw["retry_history"][0]["record"]["failure"]["code"] == (
+        "local_fake_failure"
+    )
+
+
+def test_retry_with_no_failed_records_makes_no_calls_or_stage_changes(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=2)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(_local_config(inventory)),
+    )
+    before = _tree_bytes(root / "local_semantics")
+    retry_backend = _FakeLocal(_local_config(inventory))
+
+    records, summary = run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=retry_backend,
+        retry_failed=True,
+    )
+
+    assert retry_backend.calls == []
+    assert summary.failed_count == 0 and len(records) == 2
+    assert _tree_bytes(root / "local_semantics") == before
+
+
+def test_retry_runtime_exception_preserves_existing_stage(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(_local_config(inventory), failures={"clip-000"}),
+    )
+    before = _tree_bytes(root / "local_semantics")
+
+    class _BrokenLocal(_FakeLocal):
+        def describe(self, job, raw_audio_caption=None):  # type: ignore[no-untyped-def]
+            del job, raw_audio_caption
+            raise RuntimeError("unexpected retry failure")
+
+    with pytest.raises(RuntimeError, match="unexpected retry failure"):
+        run_local_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=_BrokenLocal(_local_config(inventory)),
+            retry_failed=True,
+        )
+    assert _tree_bytes(root / "local_semantics") == before
+
+
+def test_retry_fails_closed_on_stale_captioner_dependency(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(_local_config(inventory), failures={"clip-000"}),
+    )
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory), caption_prefix="changed"),
+        overwrite=True,
+    )
+    retry_backend = _FakeLocal(_local_config(inventory))
+
+    with pytest.raises(ValueError, match="stale captioner"):
+        run_local_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=retry_backend,
+            retry_failed=True,
+        )
+    assert retry_backend.calls == []
+
+
+def test_retry_failed_rejects_overwrite_and_unsupported_phases(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        run_local_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=_FakeLocal(_local_config(inventory)),
+            overwrite=True,
+            retry_failed=True,
+        )
+    with pytest.raises(SystemExit):
+        specialized_cli._parser().parse_args(
+            [
+                "--audio-production-root",
+                str(tmp_path),
+                "--phase",
+                "global-semantics",
+                "--overwrite",
+                "--retry-failed",
+            ]
+        )
+    with pytest.raises(ValueError, match="only supported"):
+        specialized_cli.main(
+            [
+                "--audio-production-root",
+                str(tmp_path),
+                "--phase",
+                "captioner",
+                "--retry-failed",
+                "--dry-run",
+            ]
+        )
 
 
 def test_legacy_target_audio_caption_remains_importable() -> None:

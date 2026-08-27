@@ -77,7 +77,9 @@ def _parser() -> argparse.ArgumentParser:
         ),
         required=True,
     )
-    parser.add_argument("--overwrite", action="store_true")
+    publication_mode = parser.add_mutually_exclusive_group()
+    publication_mode.add_argument("--overwrite", action="store_true")
+    publication_mode.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--include-video", action="store_true")
     parser.add_argument("--captioner-max-inflight", type=_positive_int, default=1)
@@ -190,6 +192,14 @@ def _music_config(arguments: argparse.Namespace) -> MusicRescueConfig:
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
+    if arguments.retry_failed and arguments.phase not in {
+        "global-semantics",
+        "local-semantics",
+    }:
+        raise ValueError(
+            "--retry-failed is only supported for global-semantics or "
+            "local-semantics"
+        )
     production_root = arguments.audio_production_root.expanduser().resolve(strict=True)
     inventory = build_specialized_inventory(audio_production_root=production_root)
     output_root = specialized_output_root(production_root)
@@ -206,6 +216,21 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     if arguments.dry_run:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return result
+
+    previous_model_calls = 0
+    if arguments.retry_failed:
+        stage_name = arguments.phase.replace("-", "_")
+        try:
+            previous_summary = json.loads(
+                (output_root / stage_name / "summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            previous_model_calls = int(previous_summary["model_call_count"])
+        except Exception as exc:
+            raise ValueError(
+                f"cannot read existing {arguments.phase} retry summary"
+            ) from exc
 
     if arguments.phase == "captioner":
         _, summary = run_captioner_phase(
@@ -225,22 +250,24 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             captioner_backend=OpenAICaptionerBackend(_captioner_config(arguments)),
             music_backend=OpenAIMusicRescueBackend(_music_config(arguments)),
             overwrite=arguments.overwrite,
+            retry_failed=arguments.retry_failed,
             max_inflight=arguments.global_vl_max_inflight,
             captioner_max_inflight=arguments.captioner_max_inflight,
             music_max_inflight=arguments.local_instruct_max_inflight,
         )
         result["summary"] = summary.model_dump(mode="json")
-        result["model_calls"] = summary.model_call_count
+        result["model_calls"] = summary.model_call_count - previous_model_calls
     elif arguments.phase == "local-semantics":
         _, summary = run_local_semantics_phase(
             inventory=inventory,
             output_root=output_root,
             backend=OpenAILocalSemanticsBackend(_local_config(arguments)),
             overwrite=arguments.overwrite,
+            retry_failed=arguments.retry_failed,
             max_inflight=arguments.local_instruct_max_inflight,
         )
         result["summary"] = summary.model_dump(mode="json")
-        result["model_calls"] = summary.model_call_count
+        result["model_calls"] = summary.model_call_count - previous_model_calls
     elif arguments.phase == "assemble":
         _, summary = run_assemble_phase(
             inventory=inventory,
