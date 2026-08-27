@@ -202,8 +202,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             inventory=inventory,
             output_root=output_root,
             backend=OpenAIGlobalSemanticsBackend(_global_config(arguments)),
+            captioner_backend=OpenAICaptionerBackend(_captioner_config(arguments)),
             overwrite=arguments.overwrite,
             max_inflight=arguments.global_vl_max_inflight,
+            captioner_max_inflight=arguments.captioner_max_inflight,
         )
         result["summary"] = summary.model_dump(mode="json")
         result["model_calls"] = summary.model_call_count

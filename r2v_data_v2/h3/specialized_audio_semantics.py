@@ -54,7 +54,7 @@ from r2v_data_v2.structured_output import (
 
 SPECIALIZED_ROOT_NAME = "audio_semantics_specialized_v1"
 CAPTIONER_RECORD_VERSION = "r2v.h3.specialized_audio_captioner.1"
-GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.1"
+GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.2"
 LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.2"
 ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.2"
 STAGE_SUMMARY_VERSION = "r2v.h3.specialized_audio_stage_summary.1"
@@ -65,6 +65,12 @@ CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v2"
 GLOBAL_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v2"
 GLOBAL_FALLBACK_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v2_recheck"
 GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
+GLOBAL_RECAPTION_RESCUE_POLICY_VERSION = (
+    "global_missing_semantics_recaption_once_v1"
+)
+GLOBAL_RUNTIME_POLICY_VERSION = (
+    f"{GLOBAL_FALLBACK_POLICY_VERSION}+{GLOBAL_RECAPTION_RESCUE_POLICY_VERSION}"
+)
 LOCAL_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
 LOCAL_FALLBACK_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
 LOCAL_FALLBACK_POLICY_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION
@@ -557,7 +563,7 @@ class GlobalSemanticsConfig:
             media_resolver=None,
             prompt_version=GLOBAL_PROMPT_VERSION,
             fallback_prompt_version=GLOBAL_FALLBACK_PROMPT_VERSION,
-            fallback_policy_version=GLOBAL_FALLBACK_POLICY_VERSION,
+            fallback_policy_version=GLOBAL_RUNTIME_POLICY_VERSION,
             temperature=0.0,
             top_p=None,
             top_k=None,
@@ -1341,7 +1347,7 @@ class CaptionerRecord(SchemaModel):
 
 
 class GlobalSemanticsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_global_audio_semantics.1"] = (
+    schema_version: Literal["r2v.h3.specialized_global_audio_semantics.2"] = (
         GLOBAL_RECORD_VERSION
     )
     target_clip_uid: str
@@ -1352,6 +1358,8 @@ class GlobalSemanticsRecord(SchemaModel):
     non_diegetic_music: str | None = None
     semantic_source: SemanticSource | None = None
     fallback_attempted: bool = False
+    recaption_rescue_attempted: bool = False
+    recaption_rescue_used: bool = False
     captioner_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_audio_caption_sha256: str | None = Field(
         default=None,
@@ -1371,6 +1379,8 @@ class GlobalSemanticsRecord(SchemaModel):
             raise ValueError("global record provenance role differs")
         if self.raw_response_count != len(self.completion_diagnostics):
             raise ValueError("global response diagnostics differ")
+        if self.recaption_rescue_used and not self.recaption_rescue_attempted:
+            raise ValueError("used recaption rescue must be attempted")
         values = (
             self.overall_audio_description,
             self.overall_soundscape,
@@ -1391,6 +1401,8 @@ class GlobalSemanticsRecord(SchemaModel):
             or self.raw_audio_caption_sha256 is not None
             or self.model_call_count
             or self.raw_response_count
+            or self.recaption_rescue_attempted
+            or self.recaption_rescue_used
             or self.failure is None
         ):
             raise ValueError("blocked global record must not claim model work")
@@ -1604,6 +1616,9 @@ def global_request_fingerprint(
                 "prompt_version": GLOBAL_PROMPT_VERSION,
                 "fallback_prompt_version": GLOBAL_FALLBACK_PROMPT_VERSION,
                 "fallback_policy_version": GLOBAL_FALLBACK_POLICY_VERSION,
+                "recaption_rescue_policy_version": (
+                    GLOBAL_RECAPTION_RESCUE_POLICY_VERSION
+                ),
             }
         )
     )
@@ -1881,6 +1896,272 @@ def _captioner_record(
         )
 
 
+@dataclass(frozen=True)
+class _RecaptionCaptionOutcome:
+    job: JEATargetAudioCaptionJob
+    backend_provenance: SpecializedBackendProvenance
+    result: CaptionerBackendResult | None = None
+    failure: SpecializedBackendFailure | None = None
+
+
+@dataclass(frozen=True)
+class _RecaptionGlobalOutcome:
+    captioner: _RecaptionCaptionOutcome
+    backend_provenance: SpecializedBackendProvenance
+    result: SpecializedBackendResult[GlobalAudioSemanticsResponse] | None = None
+    failure: SpecializedBackendFailure | None = None
+
+
+def _recaption_caption(
+    job: JEATargetAudioCaptionJob,
+    backend: CaptionerBackend,
+) -> _RecaptionCaptionOutcome:
+    try:
+        return _RecaptionCaptionOutcome(
+            job=job,
+            backend_provenance=backend.provenance,
+            result=backend.caption(job),
+        )
+    except SpecializedBackendFailure as exc:
+        return _RecaptionCaptionOutcome(
+            job=job,
+            backend_provenance=backend.provenance,
+            failure=exc,
+        )
+
+
+def _recaption_global(
+    captioner: _RecaptionCaptionOutcome,
+    backend: GlobalSemanticsBackend,
+) -> _RecaptionGlobalOutcome:
+    if captioner.result is None:
+        return _RecaptionGlobalOutcome(
+            captioner=captioner,
+            backend_provenance=backend.provenance,
+        )
+    try:
+        return _RecaptionGlobalOutcome(
+            captioner=captioner,
+            backend_provenance=backend.provenance,
+            result=backend.extract(
+                captioner.job,
+                captioner.result.raw_audio_caption,
+            ),
+        )
+    except SpecializedBackendFailure as exc:
+        return _RecaptionGlobalOutcome(
+            captioner=captioner,
+            backend_provenance=backend.provenance,
+            failure=exc,
+        )
+
+
+def _needs_recaption_rescue(record: GlobalSemanticsRecord) -> bool:
+    return record.status == "failed" or (
+        record.status == "ready"
+        and (
+            record.overall_audio_description is None
+            or record.non_diegetic_music is None
+        )
+    )
+
+
+def _outcome_raw(
+    outcome: _RecaptionGlobalOutcome,
+    *,
+    used: bool,
+) -> dict[str, object]:
+    caption_result = outcome.captioner.result
+    caption_failure = outcome.captioner.failure
+    global_result = outcome.result
+    global_failure = outcome.failure
+    if caption_result is not None:
+        captioner_raw = _raw_payload(
+            status="ready",
+            raw_responses=caption_result.raw_responses,
+            diagnostics=caption_result.diagnostics,
+        )
+        captioner_raw["raw_audio_caption"] = caption_result.raw_audio_caption
+    else:
+        assert caption_failure is not None
+        captioner_raw = _raw_payload(
+            status="failed",
+            raw_responses=caption_failure.raw_responses,
+            diagnostics=caption_failure.diagnostics,
+            failure=caption_failure,
+        )
+    if global_result is not None:
+        global_raw: dict[str, object] | None = _raw_payload(
+            status="ready",
+            raw_responses=global_result.raw_responses,
+            diagnostics=global_result.diagnostics,
+            semantic_source=global_result.semantic_source,
+        )
+    elif global_failure is not None:
+        global_raw = _raw_payload(
+            status="failed",
+            raw_responses=global_failure.raw_responses,
+            diagnostics=global_failure.diagnostics,
+            failure=global_failure,
+        )
+    else:
+        global_raw = None
+    return {
+        "attempted": True,
+        "used": used,
+        "policy_version": GLOBAL_RECAPTION_RESCUE_POLICY_VERSION,
+        "captioner": {
+            **captioner_raw,
+            "backend_provenance": outcome.captioner.backend_provenance.model_dump(
+                mode="json"
+            ),
+        },
+        "global": (
+            None
+            if global_raw is None
+            else {
+                **global_raw,
+                "backend_provenance": outcome.backend_provenance.model_dump(
+                    mode="json"
+                ),
+            }
+        ),
+    }
+
+
+def _merge_recaption_outcome(
+    primary: _ProcessedRecord[GlobalSemanticsRecord],
+    outcome: _RecaptionGlobalOutcome,
+) -> _ProcessedRecord[GlobalSemanticsRecord]:
+    primary_record = primary.record
+    caption_result = outcome.captioner.result
+    caption_failure = outcome.captioner.failure
+    rescue_result = outcome.result
+    rescue_failure = outcome.failure
+    primary_ready = primary_record.status == "ready"
+    rescue_ready = rescue_result is not None
+
+    used = False
+    if primary_ready:
+        response = rescue_result.response if rescue_result is not None else None
+        description = primary_record.overall_audio_description
+        soundscape = primary_record.overall_soundscape
+        music = primary_record.non_diegetic_music
+        if description is None and response is not None:
+            description = response.overall_audio_description
+            used = used or description is not None
+        if soundscape is None and response is not None:
+            soundscape = response.overall_soundscape
+            used = used or soundscape is not None
+        if music is None and response is not None:
+            music = response.non_diegetic_music
+            used = used or music is not None
+        status: StageStatus = "ready"
+        semantic_source = primary_record.semantic_source
+        fallback_attempted = primary_record.fallback_attempted or (
+            used and rescue_result is not None and rescue_result.fallback_attempted
+        )
+        failure = None
+    elif rescue_ready:
+        assert rescue_result is not None
+        description = rescue_result.response.overall_audio_description
+        soundscape = rescue_result.response.overall_soundscape
+        music = rescue_result.response.non_diegetic_music
+        status = "ready"
+        semantic_source = rescue_result.semantic_source
+        fallback_attempted = rescue_result.fallback_attempted
+        failure = None
+        used = True
+    else:
+        description = None
+        soundscape = None
+        music = None
+        status = "failed"
+        semantic_source = None
+        fallback_attempted = primary_record.fallback_attempted
+        failure = primary_record.failure
+
+    caption_diagnostics = (
+        caption_result.diagnostics
+        if caption_result is not None
+        else (() if caption_failure is None else caption_failure.diagnostics)
+    )
+    rescue_diagnostics = (
+        rescue_result.diagnostics
+        if rescue_result is not None
+        else (() if rescue_failure is None else rescue_failure.diagnostics)
+    )
+    diagnostics = [
+        *primary_record.completion_diagnostics,
+        *caption_diagnostics,
+        *rescue_diagnostics,
+    ]
+    caption_call_count = (
+        caption_result.model_call_count
+        if caption_result is not None
+        else (0 if caption_failure is None else caption_failure.model_call_count)
+    )
+    rescue_call_count = (
+        rescue_result.model_call_count
+        if rescue_result is not None
+        else (0 if rescue_failure is None else rescue_failure.model_call_count)
+    )
+    values = primary_record.model_dump(
+        mode="python",
+        exclude={"schema_version", "record_fingerprint"},
+    )
+    values["backend_provenance"] = primary_record.backend_provenance
+    values.update(
+        {
+            "status": status,
+            "overall_audio_description": description,
+            "overall_soundscape": soundscape,
+            "non_diegetic_music": music,
+            "semantic_source": semantic_source,
+            "fallback_attempted": fallback_attempted,
+            "recaption_rescue_attempted": True,
+            "recaption_rescue_used": used,
+            "model_call_count": (
+                primary_record.model_call_count
+                + caption_call_count
+                + rescue_call_count
+            ),
+            "raw_response_count": len(diagnostics),
+            "completion_diagnostics": diagnostics,
+            "failure": failure,
+        }
+    )
+    record = _make_record(GlobalSemanticsRecord, values)
+
+    primary_raw_responses = list(primary.raw.get("raw_responses", []))
+    caption_raw_responses = (
+        caption_result.raw_responses
+        if caption_result is not None
+        else (() if caption_failure is None else caption_failure.raw_responses)
+    )
+    rescue_raw_responses = (
+        rescue_result.raw_responses
+        if rescue_result is not None
+        else (() if rescue_failure is None else rescue_failure.raw_responses)
+    )
+    raw = {
+        "status": status,
+        "semantic_source": semantic_source,
+        "raw_responses": [
+            *primary_raw_responses,
+            *caption_raw_responses,
+            *rescue_raw_responses,
+        ],
+        "completion_diagnostics": [
+            item.model_dump(mode="json") for item in diagnostics
+        ],
+        "failure": None if failure is None else failure.model_dump(mode="json"),
+        "primary_global": primary.raw,
+        "recaption_rescue": _outcome_raw(outcome, used=used),
+    }
+    return _ProcessedRecord(record=record, raw=raw)
+
+
 def _global_record(
     job: JEATargetAudioCaptionJob,
     captioner: CaptionerRecord,
@@ -1897,6 +2178,8 @@ def _global_record(
             "target_clip_uid": job.target_clip_uid,
             "clip_display_path": job.clip_display_path,
             "status": "blocked",
+            "recaption_rescue_attempted": False,
+            "recaption_rescue_used": False,
             "captioner_record_fingerprint": captioner.record_fingerprint,
             "raw_audio_caption_sha256": None,
             "backend_provenance": provenance,
@@ -1928,6 +2211,8 @@ def _global_record(
             "non_diegetic_music": result.response.non_diegetic_music,
             "semantic_source": result.semantic_source,
             "fallback_attempted": result.fallback_attempted,
+            "recaption_rescue_attempted": False,
+            "recaption_rescue_used": False,
             "captioner_record_fingerprint": captioner.record_fingerprint,
             "raw_audio_caption_sha256": raw_caption_hash,
             "backend_provenance": provenance,
@@ -1952,6 +2237,8 @@ def _global_record(
             "target_clip_uid": job.target_clip_uid,
             "clip_display_path": job.clip_display_path,
             "status": "failed",
+            "recaption_rescue_attempted": False,
+            "recaption_rescue_used": False,
             "captioner_record_fingerprint": captioner.record_fingerprint,
             "raw_audio_caption_sha256": raw_caption_hash,
             "backend_provenance": provenance,
@@ -2154,29 +2441,80 @@ def _validate_global_dependencies(
             )
 
 
+ItemT = TypeVar("ItemT")
+ResultT = TypeVar("ResultT")
+
+
+def _bounded_map(
+    items: Sequence[ItemT],
+    process: Callable[[ItemT], ResultT],
+    *,
+    max_inflight: int,
+) -> list[ResultT]:
+    if max_inflight < 1:
+        raise ValueError("specialized max inflight must be positive")
+    if max_inflight == 1:
+        return [process(item) for item in items]
+    results: dict[int, ResultT] = {}
+    pending: dict[Future[ResultT], int] = {}
+    next_index = 0
+    with ThreadPoolExecutor(max_workers=max_inflight) as executor:
+        while next_index < len(items) or pending:
+            while next_index < len(items) and len(pending) < max_inflight:
+                pending[executor.submit(process, items[next_index])] = next_index
+                next_index += 1
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                results[index] = future.result()
+    return [results[index] for index in range(len(items))]
+
+
 def _bounded_process(
     jobs: Sequence[JEATargetAudioCaptionJob],
     process: Callable[[JEATargetAudioCaptionJob], _ProcessedRecord[RecordT]],
     *,
     max_inflight: int,
 ) -> list[_ProcessedRecord[RecordT]]:
-    if max_inflight < 1:
-        raise ValueError("specialized max inflight must be positive")
-    if max_inflight == 1:
-        return [process(job) for job in jobs]
-    results: dict[int, _ProcessedRecord[RecordT]] = {}
-    pending: dict[Future[_ProcessedRecord[RecordT]], int] = {}
-    next_index = 0
-    with ThreadPoolExecutor(max_workers=max_inflight) as executor:
-        while next_index < len(jobs) or pending:
-            while next_index < len(jobs) and len(pending) < max_inflight:
-                pending[executor.submit(process, jobs[next_index])] = next_index
-                next_index += 1
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                index = pending.pop(future)
-                results[index] = future.result()
-    return [results[index] for index in range(len(jobs))]
+    return _bounded_map(jobs, process, max_inflight=max_inflight)
+
+
+def _run_recaption_rescues(
+    *,
+    jobs: Sequence[JEATargetAudioCaptionJob],
+    processed: Sequence[_ProcessedRecord[GlobalSemanticsRecord]],
+    captioner_backend: CaptionerBackend | None,
+    global_backend: GlobalSemanticsBackend,
+    captioner_max_inflight: int,
+    global_max_inflight: int,
+) -> list[_ProcessedRecord[GlobalSemanticsRecord]]:
+    jobs_by_clip = {job.target_clip_uid: job for job in jobs}
+    candidates = [item for item in processed if _needs_recaption_rescue(item.record)]
+    if not candidates:
+        return list(processed)
+    if captioner_backend is None:
+        raise ValueError("recaption rescue requires a captioner backend")
+    recaptions = _bounded_map(
+        [jobs_by_clip[item.record.target_clip_uid] for item in candidates],
+        lambda job: _recaption_caption(job, captioner_backend),
+        max_inflight=captioner_max_inflight,
+    )
+    rescues = _bounded_map(
+        recaptions,
+        lambda captioner: _recaption_global(captioner, global_backend),
+        max_inflight=global_max_inflight,
+    )
+    primary_by_clip = {item.record.target_clip_uid: item for item in candidates}
+    merged_by_clip = {
+        outcome.captioner.job.target_clip_uid: _merge_recaption_outcome(
+            primary_by_clip[outcome.captioner.job.target_clip_uid],
+            outcome,
+        )
+        for outcome in rescues
+    }
+    return [
+        merged_by_clip.get(item.record.target_clip_uid, item) for item in processed
+    ]
 
 
 def run_captioner_phase(
@@ -2229,19 +2567,23 @@ def run_global_semantics_phase(
     inventory: JEATargetAudioCaptionInventory,
     output_root: Path,
     backend: GlobalSemanticsBackend,
+    captioner_backend: CaptionerBackend,
     overwrite: bool = False,
     max_inflight: int = 4,
+    captioner_max_inflight: int = 1,
 ) -> tuple[list[GlobalSemanticsRecord], SpecializedStageSummary]:
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "global_semantics")
     provenance = backend.provenance
-    captioner_records, _ = _load_stage(
+    captioner_records, captioner_summary = _load_stage(
         destination=_stage_path(root, "captioner"),
         role="captioner",
         inventory=inventory,
         provenance=_existing_stage_provenance(_stage_path(root, "captioner")),
         model=CaptionerRecord,
     )
+    if captioner_backend.provenance != captioner_summary.backend_provenance:
+        raise ValueError("recaption backend differs from primary captioner stage")
     if destination.exists() and not overwrite:
         records, summary = _load_stage(
             destination=destination,
@@ -2259,6 +2601,14 @@ def run_global_semantics_phase(
         inventory.jobs,
         lambda job: _global_record(job, by_clip[job.target_clip_uid], backend),
         max_inflight=max_inflight,
+    )
+    processed = _run_recaption_rescues(
+        jobs=inventory.jobs,
+        processed=processed,
+        captioner_backend=captioner_backend,
+        global_backend=backend,
+        captioner_max_inflight=captioner_max_inflight,
+        global_max_inflight=max_inflight,
     )
     records = [item.record for item in processed]
     summary = _summary(
@@ -3009,6 +3359,15 @@ def run_specialized_pipeline(
     caption_processed = [caption_by_clip[job.target_clip_uid] for job in inventory.jobs]
     global_processed = [global_by_clip[job.target_clip_uid] for job in inventory.jobs]
     local_processed = [local_by_clip[job.target_clip_uid] for job in inventory.jobs]
+    if not global_reused:
+        global_processed = _run_recaption_rescues(
+            jobs=inventory.jobs,
+            processed=global_processed,
+            captioner_backend=captioner_backend,
+            global_backend=global_backend,
+            captioner_max_inflight=captioner_max_inflight,
+            global_max_inflight=global_vl_max_inflight,
+        )
     caption_records = [item.record for item in caption_processed]
     global_records = [item.record for item in global_processed]
     local_records = [item.record for item in local_processed]
@@ -3107,6 +3466,7 @@ __all__ = [
     "DEFAULT_GLOBAL_VL_MODEL",
     "GLOBAL_FALLBACK_PROMPT_VERSION",
     "GLOBAL_PROMPT_VERSION",
+    "GLOBAL_RECAPTION_RESCUE_POLICY_VERSION",
     "GLOBAL_RECORD_VERSION",
     "GLOBAL_SYSTEM_PROMPT",
     "LOCAL_FALLBACK_PROMPT_VERSION",
