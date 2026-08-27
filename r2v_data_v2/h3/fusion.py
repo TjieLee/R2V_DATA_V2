@@ -19,7 +19,7 @@ from r2v_data_v2.h3.schemas import (
     VoiceReference,
     VoiceReferenceCandidate,
 )
-from r2v_data_v2.v3.schemas import ClipRecord
+from r2v_data_v2.h3.visual_clip_contract import VisualClipRecord
 
 
 @dataclass(frozen=True)
@@ -380,7 +380,7 @@ def select_voice_references(
 
 
 def build_h3_audio_ir(
-    clip: ClipRecord,
+    clip: VisualClipRecord,
     evidence: AudioBindingEvidence,
     bindings: list[AudioEntityBinding],
     voice_references: list[VoiceReference],
@@ -482,7 +482,7 @@ def render_h3_audio_instruction(value: H3AudioBindingIR) -> str:
 
 
 def build_audio_binding_sidecar(
-    clip: ClipRecord,
+    clip: VisualClipRecord,
     evidence: AudioBindingEvidence,
     *,
     source_run_root: str,

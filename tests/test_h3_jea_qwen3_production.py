@@ -333,6 +333,7 @@ def _sample(
                             "entity_id": "e1",
                             "route": "complete",
                             "status": "not_required",
+                            "accepted_base_image_path": None,
                             "source_reference": ready_reference,
                             "source_image_path": selected_path,
                             "variants": {
@@ -371,6 +372,12 @@ def _sample(
                             "output_image_path": selected_path,
                         }
                     ],
+                },
+                "subject_attributes": {
+                    "internal_schema": "future-visual-only",
+                },
+                "diagnostics": {
+                    "visual_only_counter": 7,
                 },
             }
         )
@@ -760,7 +767,7 @@ def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(
     ] == ["subject", "object-only"]
 
 
-def test_audio_loader_reads_latest_variant_aware_clip_record(
+def test_audio_loader_ignores_latest_visual_internal_clip_sections(
     tmp_path: Path,
 ) -> None:
     inventory = _inventory(
@@ -776,14 +783,36 @@ def test_audio_loader_reads_latest_variant_aware_clip_record(
         ],
     )
 
-    reference_edit = inventory.clips[0].clip.reference_edit
-    assert reference_edit is not None
-    latest = reference_edit.entities[0]
-    assert latest.default_variant == "alpha"
-    assert latest.default_image_path == latest.source_image_path
-    assert latest.variants is not None
-    assert latest.variants.alpha.status == "accepted"
-    assert latest.variants.bbox.status == "available"
+    clip = inventory.clips[0].clip
+    assert clip.clip_uid == "clip-latest"
+    assert clip.pairing is not None
+    assert clip.pairing.retained_entity_ids == ["e1"]
+    assert "reference_edit" not in type(clip).model_fields
+    assert "subject_attributes" not in type(clip).model_fields
+    assert "diagnostics" not in type(clip).model_fields
+
+
+def test_visual_inventory_rejects_target_video_mismatch(tmp_path: Path) -> None:
+    sample, production, runs = _sample(
+        tmp_path,
+        clip_uid="clip-target-mismatch",
+        shard_id="shard-target-mismatch",
+        clip_relative_path="节目/集合/ep-target_0.mp4",
+        source_relative_path="节目/集合/ep-target.mkv",
+    )
+    different_target = tmp_path / "processed" / "different.mp4"
+    different_target.write_bytes(b"different")
+    sample["target_video"] = str(different_target)
+    _jsonl(production / "samples.jsonl", [sample])
+
+    with pytest.raises(
+        ValueError,
+        match="canonical target_video differs from clip source video_path",
+    ):
+        load_visual_production_inventory(
+            visual_production_root=production,
+            visual_runs_root=runs,
+        )
 
 
 def test_dataset_sample_single_run_normalizes_references_and_identity(

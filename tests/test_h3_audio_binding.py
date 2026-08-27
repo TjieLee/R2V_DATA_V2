@@ -46,7 +46,11 @@ from r2v_data_v2.h3.lr_asd import (
     SileroVADSubprocessBackend,
     normalize_lr_asd_evidence,
 )
-from r2v_data_v2.h3.pilot import ExplicitPilotClip, run_h3_audio_binding_pilot
+from r2v_data_v2.h3.pilot import (
+    ExplicitPilotClip,
+    _load_clip_artifacts,
+    run_h3_audio_binding_pilot,
+)
 from r2v_data_v2.h3.pilot_schemas import (
     LRASDNativeArtifact,
     LRASDNativeSample,
@@ -162,7 +166,10 @@ def _clip(
             clip_suffix="1",
             source_index=0,
             caption_raw="",
-            metadata={},
+            metadata={
+                "source_relative_video_path": "show/collection/clip-1.mp4",
+                "source_relative_source_video_path": "show/collection/source.mp4",
+            },
         ),
         annotation=AnnotationState(
             status="ready",
@@ -1345,6 +1352,42 @@ def _write_pilot_clip(
         masks.model_dump_json(indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def test_pilot_clip_loader_ignores_visual_internal_schema_evolution(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source = tmp_path / "clip-1.mp4"
+    source.write_bytes(b"video")
+    clip = _pilot_clip("clip-1", source)
+    _write_pilot_clip(
+        run_root,
+        clip,
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    clip_path = run_root / "clips" / "clip-1" / "clip.json"
+    payload = json.loads(clip_path.read_text(encoding="utf-8"))
+    payload["reference_edit"] = {
+        "status": "ready",
+        "entities": [
+            {
+                "entity_id": "e1",
+                "accepted_base_image_path": None,
+                "future_visual_review": {"passed": True},
+            }
+        ],
+    }
+    payload["subject_attributes"] = {"future": "visual-only"}
+    payload["diagnostics"] = {"future": [1, 2, 3]}
+    clip_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded, frames, masks = _load_clip_artifacts(clip_path)
+
+    assert loaded.clip_uid == "clip-1"
+    assert loaded.pairing is not None
+    assert loaded.pairing.retained_entity_ids == ["e1"]
+    assert frames.clip_uid == masks.clip_uid == "clip-1"
 
 
 def test_pilot_isolates_lr_asd_failure_and_runs_backend_once_per_clip(

@@ -8,9 +8,13 @@ from itertools import chain
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.visual_clip_contract import (
+    VisualClipRecord,
+    load_visual_clip_record,
+)
 from r2v_data_v2.v3.production_export import (
     PRODUCTION_SAMPLE_SCHEMA_VERSION,
     ProductionReference,
@@ -19,7 +23,6 @@ from r2v_data_v2.v3.production_export import (
 )
 from r2v_data_v2.v3.schemas import (
     SAMPLE_SCHEMA_VERSION,
-    ClipRecord,
     DatasetReference,
     DatasetSample,
 )
@@ -245,9 +248,18 @@ class NormalizedVisualSample(SchemaModel):
 class VisualProductionClip(SchemaModel):
     identity: ReadableClipIdentity
     sample: NormalizedVisualSample
-    clip: ClipRecord
+    clip: VisualClipRecord
     clip_record_path: str
     subject_references: list[NormalizedVisualReference]
+
+    @field_validator("clip", mode="before")
+    @classmethod
+    def project_clip_model(cls, value: object) -> object:
+        if isinstance(value, VisualClipRecord):
+            return value
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode="python")
+        return value
 
     @model_validator(mode="after")
     def validate_clip(self) -> VisualProductionClip:
@@ -659,9 +671,7 @@ def load_visual_production_inventory(
         clip_uids.add(clip_uid)
 
         clip_path.relative_to(runs_root)
-        clip = ClipRecord.model_validate_json(clip_path.read_text(encoding="utf-8"))
-        if clip.clip_uid != clip_uid:
-            raise ValueError("canonical sample does not match its clip.json")
+        clip = load_visual_clip_record(clip_path, expected_clip_uid=clip_uid)
         if normalized_sample.target_video != clip.source.video_path:
             raise ValueError(
                 "canonical target_video differs from clip source video_path"
@@ -670,9 +680,9 @@ def load_visual_production_inventory(
         identity = derive_readable_clip_identity(
             clip_uid=clip_uid,
             shard_id=shard_id,
-            source_relative_video_path=metadata.get("source_relative_video_path"),
-            source_relative_source_video_path=metadata.get(
-                "source_relative_source_video_path"
+            source_relative_video_path=metadata.source_relative_video_path,
+            source_relative_source_video_path=(
+                metadata.source_relative_source_video_path
             ),
         )
         subject_references = [

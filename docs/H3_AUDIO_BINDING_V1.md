@@ -121,6 +121,13 @@ interval summaries and at most 32 ordered geometry samples per face track, not
 unbounded frame-by-frame timelines. The H3 sidecar does not add fields to
 `clip.json`.
 
+The sidecar and pilot read `clip.json` through a strict H3-owned projection,
+not the current full Visual `ClipRecord` model. Audio consumes only clip/source
+identity, readable source metadata, annotation entities, coverage admission,
+pairing retention, and ready entity-reference image paths. Visual-internal
+reference-edit, attribute, review, and diagnostic fields are ignored; missing
+or inconsistent projected identity and binding fields remain hard failures.
+
 `AudioTrackMetadata.full_audio_path` is source evidence only. Merely observing a
 full-audio path never publishes an H3 conditioning asset. A full-audio asset is
 created only for an explicitly requested `audio_reuse` variant.

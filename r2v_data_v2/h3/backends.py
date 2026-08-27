@@ -14,7 +14,7 @@ from r2v_data_v2.h3.schemas import (
     PrecomputedEvidenceFile,
     VoiceReferenceCandidate,
 )
-from r2v_data_v2.v3.schemas import ClipRecord
+from r2v_data_v2.h3.visual_clip_contract import VisualClipRecord
 
 
 class AudioPreprocessorBackend(Protocol):
@@ -34,7 +34,7 @@ class EntityFaceAssociationBackend(Protocol):
     def associate(
         self,
         *,
-        clip: ClipRecord,
+        clip: VisualClipRecord,
         source_run_root: Path,
         tracked_masks_path: Path,
         face_tracks: Sequence[FaceTrack],
@@ -63,7 +63,7 @@ class VoiceReferenceBackend(Protocol):
 
 
 class AudioBindingEvidenceBackend(Protocol):
-    def collect(self, clip: ClipRecord) -> AudioBindingEvidence: ...
+    def collect(self, clip: VisualClipRecord) -> AudioBindingEvidence: ...
 
 
 class PrecomputedEvidenceBackend:
@@ -76,7 +76,7 @@ class PrecomputedEvidenceBackend:
     def from_path(cls, path: Path) -> PrecomputedEvidenceBackend:
         return cls(PrecomputedEvidenceFile.model_validate_json(path.read_text("utf-8")))
 
-    def collect(self, clip: ClipRecord) -> AudioBindingEvidence:
+    def collect(self, clip: VisualClipRecord) -> AudioBindingEvidence:
         try:
             return self._by_clip[clip.clip_uid].evidence
         except KeyError as exc:

@@ -47,6 +47,17 @@ checklists are deliberately not parsed, so checklist evolution cannot invalidate
 otherwise compatible frozen runs. Missing or inconsistent downstream fields
 still fail closed. Visual artifacts stay read-only.
 
+The same boundary applies to each selected `clip.json`. Audio/H3 parses an
+H3-owned projection of clip identity, source video and readable source paths,
+annotation entities, coverage admission, pairing retention, and ready reference
+image paths. Visual-only sections such as `reference_edit`, subject-attribute
+state, review checklists, and diagnostics are ignored rather than validated
+against the current Visual implementation. Required projected fields, duplicate
+or unknown entity bindings, missing ready references, clip identity, and target
+video provenance still fail closed. Pilot and sidecar/fusion paths use this same
+projection; Visual frames and tracked-mask artifacts retain their canonical V3
+schemas.
+
 For compacted production each canonical row reads exactly:
 
 ```text

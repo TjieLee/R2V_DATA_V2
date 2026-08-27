@@ -16,6 +16,14 @@ For ordinary single-run exports, Audio consumes a strict stable projection of
 reference/attribute provenance needed downstream but does not depend on Visual's
 internal review or completion-review checklist schemas.
 
+Audio production and pilot runtime also consume an H3-owned stable projection
+of Visual `clip.json`. The projection retains source/clip identity,
+annotation/coverage/pairing admission, and ready reference bindings while
+ignoring Visual-internal `reference_edit`, subject-attribute, review, and
+diagnostic sections. This keeps frozen Visual runs readable across internal QA
+schema evolution without weakening target-video, entity, or reference
+provenance checks.
+
 # R2V_DATA_V2 Project State
 
 Last updated: 2026-08-19

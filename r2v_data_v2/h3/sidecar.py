@@ -16,7 +16,10 @@ from r2v_data_v2.h3.schemas import (
     AudioBindingSidecar,
     H3TaskSpecification,
 )
-from r2v_data_v2.v3.schemas import ClipRecord
+from r2v_data_v2.h3.visual_clip_contract import (
+    VisualClipRecord,
+    load_visual_clip_record,
+)
 
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
@@ -39,7 +42,7 @@ def _validate_roots(run_root: Path, output_root: Path) -> tuple[Path, Path]:
 
 
 def _failed_sidecar(
-    clip: ClipRecord,
+    clip: VisualClipRecord,
     *,
     source_run_root: str,
     reason: str,
@@ -122,7 +125,10 @@ def build_audio_binding_sidecar_run(
     try:
         clip_paths = sorted((source / "clips").glob("*/clip.json"))
         for clip_path in clip_paths:
-            clip = ClipRecord.model_validate_json(clip_path.read_text(encoding="utf-8"))
+            clip = load_visual_clip_record(
+                clip_path,
+                expected_clip_uid=clip_path.parent.name,
+            )
             if (
                 _SAFE_COMPONENT.fullmatch(clip.clip_uid) is None
                 or clip.clip_uid in {".", ".."}

@@ -27,12 +27,15 @@ from r2v_data_v2.h3.pilot_schemas import (
 )
 from r2v_data_v2.h3.review import ReviewMediaBackend, write_review_bundle
 from r2v_data_v2.h3.schemas import H3TaskSpecification
+from r2v_data_v2.h3.visual_clip_contract import (
+    VisualClipRecord,
+    load_visual_clip_record,
+)
 from r2v_data_v2.h3.voice_quality import (
     build_voice_reference_quality_diagnostics,
     build_voice_reference_quality_report,
 )
 from r2v_data_v2.v3.schemas import (
-    ClipRecord,
     SampledFramesArtifact,
     TrackedMasksArtifact,
 )
@@ -81,10 +84,11 @@ def _selected_clip_paths(
 
 def _load_clip_artifacts(
     clip_path: Path,
-) -> tuple[ClipRecord, SampledFramesArtifact, TrackedMasksArtifact]:
-    clip = ClipRecord.model_validate_json(clip_path.read_text(encoding="utf-8"))
-    if clip.clip_uid != clip_path.parent.name:
-        raise ValueError("clip.json UID does not match its directory")
+) -> tuple[VisualClipRecord, SampledFramesArtifact, TrackedMasksArtifact]:
+    clip = load_visual_clip_record(
+        clip_path,
+        expected_clip_uid=clip_path.parent.name,
+    )
     if clip.annotation is None or clip.annotation.status != "ready":
         raise ValueError("pilot clip annotation is not ready")
     if clip.coverage is None or not clip.coverage.passed:
