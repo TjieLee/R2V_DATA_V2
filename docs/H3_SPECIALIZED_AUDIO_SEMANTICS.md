@@ -36,9 +36,13 @@ canonical target audio -+                                               +-> asse
   language, identity, and delivery content and must not resolve speculative
   sources.
 - **Qwen3-Omni-30B-A3B-Instruct** receives canonical full audio by default and
-  publishes only `temporal_audio_events` and `speaker_delivery`. An explicit
-  `--include-video` option remains an A/B mode and changes provenance and the
-  request fingerprint.
+  reuses the validated `h3_target_audio_semantics_v2` prompt, structured repair,
+  and semantic fallback contract. The complete four-field response is validated
+  first; Local then publishes only `temporal_audio_events` and
+  `speaker_delivery`, discarding `overall_soundscape` and
+  `non_diegetic_music`. It does not run the independent
+  `overall_audio_description` pass. An explicit `--include-video` option remains
+  an A/B mode and changes provenance and the request fingerprint.
 - **DiariZen** remains the exact speaker/sample-time authority.
 - **Qwen3-ASR** remains the dialogue-text authority.
 - **Primary and cross voice references** remain the voice identity/timbre

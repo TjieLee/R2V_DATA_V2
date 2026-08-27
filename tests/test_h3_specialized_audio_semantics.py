@@ -14,6 +14,11 @@ from pydantic import ValidationError
 
 import r2v_data_v2.h3.specialized_audio_semantics as specialized
 from r2v_data_v2.h3.jea_target_audio_caption import (
+    FALLBACK_SYSTEM_PROMPT as TARGET_AUDIO_FALLBACK_SYSTEM_PROMPT,
+)
+from r2v_data_v2.h3.jea_target_audio_caption import (
+    JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
+    JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION,
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionJob,
     _inventory_fingerprint,
@@ -51,6 +56,7 @@ from r2v_data_v2.h3.target_audio_caption_contract import (
     ModelSpeakerDelivery,
     SpeakerClusterEvidence,
     SpeakerTimeRange,
+    TargetAudioCaptionResponse,
     TemporalAudioEvent,
 )
 
@@ -226,6 +232,21 @@ def _local_response(*, style: str | None = "calm") -> LocalAudioSemanticsRespons
                 delivery_style=style,
             )
         ],
+    )
+
+
+def _target_audio_response(
+    *,
+    style: str | None = "calm",
+    overall_soundscape: str | None = "quiet room tone",
+    non_diegetic_music: str | None = "soft score",
+) -> TargetAudioCaptionResponse:
+    local = _local_response(style=style)
+    return TargetAudioCaptionResponse(
+        overall_soundscape=overall_soundscape,
+        non_diegetic_music=non_diegetic_music,
+        temporal_audio_events=local.temporal_audio_events,
+        speaker_delivery=local.speaker_delivery,
     )
 
 
@@ -449,7 +470,7 @@ def test_global_infrastructure_failure_has_no_semantic_recheck(tmp_path: Path) -
 
 def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
-    valid = _local_response().model_dump_json()
+    valid = _target_audio_response().model_dump_json()
     for include_video, expected_types in (
         (False, ["text", "audio_url"]),
         (True, ["text", "video_url", "audio_url"]),
@@ -463,10 +484,58 @@ def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Pat
         content = completions.requests[0]["messages"][1]["content"]  # type: ignore[index]
         assert [item["type"] for item in content] == expected_types  # type: ignore[index]
         assert len(result.response.temporal_audio_events) == 2
+        assert set(result.response.model_dump()) == {
+            "temporal_audio_events",
+            "speaker_delivery",
+        }
+        assert not hasattr(result.response, "overall_soundscape")
+        assert not hasattr(result.response, "non_diegetic_music")
         serialized = json.dumps(completions.requests)
-        assert "Do not produce" in LOCAL_SYSTEM_PROMPT
         assert "overall_soundscape" in LOCAL_SYSTEM_PROMPT
+        assert "non_diegetic_music" in LOCAL_SYSTEM_PROMPT
+        assert completions.requests[0]["messages"][0]["content"] == (
+            LOCAL_SYSTEM_PROMPT
+        )
+        assert len(completions.requests) == 1
         assert "SECRET TRANSCRIPT" not in serialized
+
+
+def test_local_reuses_verified_target_audio_prompt_versions(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    provenance = _local_config(inventory).provenance()
+    assert LOCAL_PROMPT_VERSION == JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
+    assert provenance.prompt_version == "h3_target_audio_semantics_v2"
+    assert provenance.fallback_prompt_version == (
+        JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
+    )
+
+
+def test_local_full_response_drives_fallback_before_field_projection(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    full_response = TargetAudioCaptionResponse(
+        overall_soundscape="steady rain outside",
+        non_diegetic_music=None,
+        temporal_audio_events=[],
+        speaker_delivery=[
+            ModelSpeakerDelivery(
+                speaker_cluster_id="speaker_0",
+                delivery_style=None,
+            )
+        ],
+    )
+    client, completions = _client([full_response.model_dump_json()])
+
+    result = OpenAILocalSemanticsBackend(
+        _local_config(inventory), client=client
+    ).describe(inventory.jobs[0])
+
+    assert result.semantic_source == "primary"
+    assert result.fallback_attempted is False
+    assert result.response.temporal_audio_events == []
+    assert result.response.speaker_delivery[0].delivery_style is None
+    assert len(completions.requests) == 1
 
 
 @pytest.mark.parametrize(
@@ -511,7 +580,9 @@ def test_local_invalid_cluster_or_timing_repairs_once(
 
 def test_local_all_null_and_whitespace_recheck(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
-    null_response = LocalAudioSemanticsResponse(
+    null_response = TargetAudioCaptionResponse(
+        overall_soundscape=None,
+        non_diegetic_music=None,
         temporal_audio_events=[],
         speaker_delivery=[
             ModelSpeakerDelivery(speaker_cluster_id="speaker_0", delivery_style=None)
@@ -523,8 +594,11 @@ def test_local_all_null_and_whitespace_recheck(tmp_path: Path) -> None:
     ).describe(inventory.jobs[0])
     assert result.semantic_source == "fallback_all_null_confirmed"
     assert len(completions.requests) == 2
+    assert completions.requests[1]["messages"][0]["content"] == (
+        TARGET_AUDIO_FALLBACK_SYSTEM_PROMPT
+    )
 
-    client, completions = _client([" ", _local_response().model_dump_json()])
+    client, completions = _client([" ", _target_audio_response().model_dump_json()])
     result = OpenAILocalSemanticsBackend(
         _local_config(inventory), client=client
     ).describe(inventory.jobs[0])

@@ -19,10 +19,24 @@ from openai import OpenAI
 from pydantic import Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.jea_target_audio_caption import (
+    JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION,
+    JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
+    JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION,
+    JEATargetAudioCaptionBackendFailure,
+    JEATargetAudioCaptionBackendResult,
+    JEATargetAudioCaptionConfig,
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionJob,
+    OpenAIJEATargetAudioCaptionBackend,
     _inventory_fingerprint,
+    _is_all_semantic_null,
     build_jea_target_audio_caption_inventory,
+)
+from r2v_data_v2.h3.jea_target_audio_caption import (
+    SYSTEM_PROMPT as LOCAL_SYSTEM_PROMPT,
+)
+from r2v_data_v2.h3.jea_target_audio_caption import (
+    _model_input as _local_model_input,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
@@ -49,9 +63,9 @@ CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v2"
 GLOBAL_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v1"
 GLOBAL_FALLBACK_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v1_recheck"
 GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
-LOCAL_PROMPT_VERSION = "qwen3_omni_local_audio_semantics_v1"
-LOCAL_FALLBACK_PROMPT_VERSION = "qwen3_omni_local_audio_semantics_v1_recheck"
-LOCAL_FALLBACK_POLICY_VERSION = "local_audio_all_null_or_empty_recheck_v1"
+LOCAL_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
+LOCAL_FALLBACK_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
+LOCAL_FALLBACK_POLICY_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION
 
 DEFAULT_CAPTIONER_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Captioner"
 DEFAULT_CAPTIONER_CHECKPOINT_ID = (
@@ -118,31 +132,6 @@ NON-VOCAL AUDIO evidence only. Use only facts explicitly present in the caption.
 Ignore all speech, language, identity, delivery, voice, and other human-vocal
 content. Preserve generic acoustic evidence but never resolve speculative source
 identity. Return the same three-field schema as one compact JSON object."""
-
-LOCAL_SYSTEM_PROMPT = """Extract LOCAL reusable audio semantics from canonical
-full audio. Return only temporally localized non-dialogue events and delivery
-style for the supplied anonymous speaker clusters.
-
-temporal_audio_events may include laughter, cough, gasp, crying, doors,
-footsteps, impacts, applause, engines, phones, diegetic music, and sound effects.
-Do not transcribe, quote, or paraphrase dialogue. Event times are approximate
-semantic locations, not authoritative speech timing, and may overlap.
-
-speaker_delivery describes only audible prosody, pace, energy, loudness,
-articulation, hesitation, whispering, shouting, questioning, commanding, and
-performance. Never infer gender, age, nationality, identity, or intrinsic voice
-timbre. Return every supplied speaker_cluster_id exactly once and in order.
-
-Do not produce overall_audio_description, overall_soundscape, or
-non_diegetic_music. Return exactly one compact JSON object matching the supplied
-schema, with no markdown, reasoning, explanation, or extra fields."""
-
-LOCAL_FALLBACK_SYSTEM_PROMPT = """Reinspect canonical full audio only for LOCAL
-non-dialogue temporal events and supplied-cluster delivery style. Do not produce
-global audio fields, dialogue text, identity, demographic traits, or timbre.
-Return every supplied cluster exactly once and in order in the same two-field
-schema."""
-
 
 def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -306,12 +295,6 @@ def _is_global_null(response: GlobalAudioSemanticsResponse) -> bool:
             "overall_soundscape",
             "non_diegetic_music",
         )
-    )
-
-
-def _is_local_null(response: LocalAudioSemanticsResponse) -> bool:
-    return not response.temporal_audio_events and all(
-        item.delivery_style is None for item in response.speaker_delivery
     )
 
 
@@ -976,243 +959,167 @@ class OpenAIGlobalSemanticsBackend(_OpenAIBackendBase):
         )
 
 
-def _local_model_input(job: JEATargetAudioCaptionJob) -> dict[str, object]:
-    return {
-        "target_duration_seconds": job.target_duration_seconds,
-        "speaker_clusters": [
-            {
-                "speaker_cluster_id": cluster.speaker_cluster_id,
-                "active_time_ranges": [
-                    item.model_dump(mode="json") for item in cluster.active_time_ranges
-                ],
-            }
-            for cluster in job.speaker_clusters
-        ],
-    }
-
-
-def _local_user_prompt(job: JEATargetAudioCaptionJob, *, fallback: bool) -> str:
-    instruction = (
-        "Recheck local non-dialogue events and speaker delivery."
-        if fallback
-        else "Extract local non-dialogue events and speaker delivery."
-    )
-    return (
-        f"{instruction} Use only audible evidence. Do not transcribe speech or infer "
-        "identity. Return every cluster exactly once in supplied order.\nInput:\n"
-        f"{_compact_json(_local_model_input(job))}\nJSON schema:\n"
-        f"{_compact_json(LocalAudioSemanticsResponse.model_json_schema())}"
+def _specialized_diagnostics(
+    diagnostics: Sequence[Any],
+) -> tuple[CompletionDiagnostic, ...]:
+    return tuple(
+        CompletionDiagnostic.model_validate(item.to_dict()) for item in diagnostics
     )
 
 
-def _local_repair_prompt(
-    job: JEATargetAudioCaptionJob,
-    invalid_response: str,
-    issues: Sequence[ValidationIssue],
+def _specialized_local_failure(
+    failure: JEATargetAudioCaptionBackendFailure,
+) -> SpecializedBackendFailure:
+    code = {
+        "qwen3_omni_vllm_empty_response": "local_semantics_empty_response",
+        "qwen3_omni_vllm_request_failed": "local_semantics_vllm_request_failed",
+        "structured_output_failed": "local_semantics_structured_output_failed",
+    }.get(failure.code, f"local_semantics_{failure.code}")
+    return SpecializedBackendFailure(
+        code=code,
+        reason=failure.reason,
+        raw_responses=failure.raw_responses,
+        diagnostics=_specialized_diagnostics(failure.completion_diagnostics),
+        issues=failure.issues,
+        model_call_count=failure.model_call_count,
+    )
+
+
+def _project_local_result(
+    result: JEATargetAudioCaptionBackendResult,
     *,
-    fallback: bool,
-) -> str:
-    return (
-        "Repair the previous JSON only. Preserve the local-only audible policy, "
-        "cluster order, and event bounds. Return one compact JSON object.\n"
-        f"Original request:\n{_local_user_prompt(job, fallback=fallback)}\nIssues:\n"
-        f"{_compact_json([item.to_dict() for item in issues])}\nInvalid response:\n"
-        f"{invalid_response}"
+    semantic_source: SemanticSource,
+    fallback_attempted: bool,
+    primary_raw_responses: Sequence[str] = (),
+    primary_diagnostics: Sequence[CompletionDiagnostic] = (),
+    primary_model_call_count: int = 0,
+) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
+    diagnostics = _specialized_diagnostics(result.completion_diagnostics)
+    return SpecializedBackendResult(
+        response=LocalAudioSemanticsResponse(
+            temporal_audio_events=result.response.temporal_audio_events,
+            speaker_delivery=result.response.speaker_delivery,
+        ),
+        raw_responses=(*primary_raw_responses, *result.raw_responses),
+        diagnostics=(*primary_diagnostics, *diagnostics),
+        model_call_count=primary_model_call_count + (result.model_call_count or 0),
+        semantic_source=semantic_source,
+        fallback_attempted=fallback_attempted,
     )
 
 
-class OpenAILocalSemanticsBackend(_OpenAIBackendBase):
+class OpenAILocalSemanticsBackend:
     def __init__(
         self, config: LocalSemanticsConfig, *, client: Any | None = None
     ) -> None:
-        super().__init__(
-            base_url=config.base_url,
-            api_key=config.api_key,
-            timeout_seconds=config.timeout_seconds,
+        self.config = config
+        self._delegate = OpenAIJEATargetAudioCaptionBackend(
+            JEATargetAudioCaptionConfig(
+                backend_family="qwen3_omni",
+                base_url=config.base_url,
+                api_key=config.api_key,
+                served_model_name=config.served_model_name,
+                checkpoint_id=config.checkpoint_id,
+                media_resolver=config.media_resolver,
+                include_video=config.include_video,
+                timeout_seconds=config.timeout_seconds,
+                max_tokens=config.max_tokens,
+            ),
             client=client,
         )
-        self.config = config
 
     @property
     def provenance(self) -> SpecializedBackendProvenance:
         return self.config.provenance()
 
-    def _pass(
-        self,
-        job: JEATargetAudioCaptionJob,
-        *,
-        fallback: bool,
-    ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
+    def _verify_media(self, job: JEATargetAudioCaptionJob) -> None:
         try:
-            audio_path = _verify_file(
+            _verify_file(
                 job.target_full_audio_path,
                 job.target_full_audio_sha256,
                 field_name="target full audio",
             )
-            video_path = (
+            if self.config.include_video:
                 _verify_file(
                     job.target_video_path,
                     job.target_video_sha256,
                     field_name="target video",
                 )
-                if self.config.include_video
-                else None
-            )
         except (OSError, ValueError) as exc:
             raise SpecializedBackendFailure(
                 code="local_semantics_media_unavailable",
                 reason=f"{type(exc).__name__}: {exc}",
             ) from exc
-        media_items: list[dict[str, object]] = [
-            {
-                "type": "audio_url",
-                "audio_url": {"url": self.config.media_resolver.resolve(audio_path)},
-            }
-        ]
-        if self.config.include_video:
-            assert video_path is not None
-            media_items.insert(
-                0,
-                {
-                    "type": "video_url",
-                    "video_url": {"url": self.config.media_resolver.resolve(video_path)},
-                },
-            )
-        raw_responses: list[str] = []
-        diagnostics: list[CompletionDiagnostic] = []
-        issues: list[ValidationIssue] = []
-        system_prompt = LOCAL_FALLBACK_SYSTEM_PROMPT if fallback else LOCAL_SYSTEM_PROMPT
-        for attempt in range(2):
-            prompt = (
-                _local_user_prompt(job, fallback=fallback)
-                if attempt == 0
-                else _local_repair_prompt(
-                    job,
-                    raw_responses[-1],
-                    issues,
-                    fallback=fallback,
-                )
-            )
-            request: dict[str, object] = {
-                "model": self.config.served_model_name,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": prompt}, *media_items],
-                    },
-                ],
-                "temperature": 0.0,
-                "max_tokens": self.config.max_tokens,
-                "modalities": ["text"],
-                "stream": False,
-                "response_format": _json_schema_response_format(
-                    LocalAudioSemanticsResponse,
-                    name="local_audio_semantics",
-                ),
-                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
-            }
-            try:
-                raw, diagnostic = self._call(request, role="local_semantics")
-            except SpecializedBackendFailure as exc:
-                if exc.code != "local_semantics_invalid_response":
-                    raise
-                raw = ""
-                diagnostics.extend(exc.diagnostics)
-                raw_responses.append(raw)
-                issues = [
-                    ValidationIssue(
-                        code="invalid_response_type",
-                        field=None,
-                        message=exc.reason,
-                    )
-                ]
-                continue
-            raw_responses.append(raw)
-            diagnostics.append(diagnostic)
-            if not raw.strip():
-                raise SpecializedBackendFailure(
-                    code="local_semantics_empty_response",
-                    reason="local semantics returned empty text",
-                    raw_responses=raw_responses,
-                    diagnostics=diagnostics,
-                    model_call_count=len(raw_responses),
-                )
-            response, issues = parse_structured_json_issues(
-                raw,
-                LocalAudioSemanticsResponse,
-            )
-            if response is not None:
-                issues = _local_response_issues(response, job)
-            if response is not None and not issues:
-                return SpecializedBackendResult(
-                    response=response,
-                    raw_responses=tuple(raw_responses),
-                    diagnostics=tuple(diagnostics),
-                    model_call_count=len(raw_responses),
-                    semantic_source="fallback" if fallback else "primary",
-                    fallback_attempted=fallback,
-                )
-        raise SpecializedBackendFailure(
-            code="local_semantics_structured_output_failed",
-            reason="local semantics failed closed after one repair",
-            raw_responses=raw_responses,
-            diagnostics=diagnostics,
-            issues=issues,
-            model_call_count=len(raw_responses),
+
+    def _fallback_after_failure(
+        self,
+        job: JEATargetAudioCaptionJob,
+        primary: SpecializedBackendFailure,
+    ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
+        try:
+            fallback = self._delegate.describe_semantic_fallback(job)
+        except JEATargetAudioCaptionBackendFailure as exc:
+            fallback_failure = _specialized_local_failure(exc)
+            raise _combined_fallback_failure(
+                primary_raw_responses=primary.raw_responses,
+                primary_diagnostics=primary.diagnostics,
+                primary_model_call_count=primary.model_call_count,
+                fallback=fallback_failure,
+            ) from exc
+        return _project_local_result(
+            fallback,
+            semantic_source=(
+                "fallback_all_null_confirmed"
+                if _is_all_semantic_null(fallback.response)
+                else "fallback"
+            ),
+            fallback_attempted=True,
+            primary_raw_responses=primary.raw_responses,
+            primary_diagnostics=primary.diagnostics,
+            primary_model_call_count=primary.model_call_count,
         )
 
     def describe(
         self, job: JEATargetAudioCaptionJob
     ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
+        self._verify_media(job)
         try:
-            primary = self._pass(job, fallback=False)
-        except SpecializedBackendFailure as exc:
-            if exc.code != "local_semantics_empty_response":
-                raise
-            try:
-                fallback = self._pass(job, fallback=True)
-            except SpecializedBackendFailure as fallback_exc:
-                raise _combined_fallback_failure(
-                    primary_raw_responses=exc.raw_responses,
-                    primary_diagnostics=exc.diagnostics,
-                    primary_model_call_count=exc.model_call_count,
-                    fallback=fallback_exc,
-                ) from fallback_exc
-            return SpecializedBackendResult(
-                response=fallback.response,
-                raw_responses=(*exc.raw_responses, *fallback.raw_responses),
-                diagnostics=(*exc.diagnostics, *fallback.diagnostics),
-                model_call_count=exc.model_call_count + fallback.model_call_count,
-                semantic_source=(
-                    "fallback_all_null_confirmed"
-                    if _is_local_null(fallback.response)
-                    else "fallback"
-                ),
-                fallback_attempted=True,
+            primary = self._delegate.describe(job)
+        except JEATargetAudioCaptionBackendFailure as exc:
+            primary_failure = _specialized_local_failure(exc)
+            if primary_failure.code != "local_semantics_empty_response":
+                raise primary_failure from exc
+            return self._fallback_after_failure(job, primary_failure)
+        if not _is_all_semantic_null(primary.response):
+            return _project_local_result(
+                primary,
+                semantic_source="primary",
+                fallback_attempted=False,
             )
-        if not _is_local_null(primary.response):
-            return primary
+        primary_diagnostics = _specialized_diagnostics(
+            primary.completion_diagnostics
+        )
         try:
-            fallback = self._pass(job, fallback=True)
-        except SpecializedBackendFailure as fallback_exc:
+            fallback = self._delegate.describe_semantic_fallback(job)
+        except JEATargetAudioCaptionBackendFailure as exc:
+            fallback_failure = _specialized_local_failure(exc)
             raise _combined_fallback_failure(
                 primary_raw_responses=primary.raw_responses,
-                primary_diagnostics=primary.diagnostics,
-                primary_model_call_count=primary.model_call_count,
-                fallback=fallback_exc,
-            ) from fallback_exc
-        return SpecializedBackendResult(
-            response=fallback.response,
-            raw_responses=(*primary.raw_responses, *fallback.raw_responses),
-            diagnostics=(*primary.diagnostics, *fallback.diagnostics),
-            model_call_count=primary.model_call_count + fallback.model_call_count,
+                primary_diagnostics=primary_diagnostics,
+                primary_model_call_count=primary.model_call_count or 0,
+                fallback=fallback_failure,
+            ) from exc
+        return _project_local_result(
+            fallback,
             semantic_source=(
                 "fallback_all_null_confirmed"
-                if _is_local_null(fallback.response)
+                if _is_all_semantic_null(fallback.response)
                 else "fallback"
             ),
             fallback_attempted=True,
+            primary_raw_responses=primary.raw_responses,
+            primary_diagnostics=primary_diagnostics,
+            primary_model_call_count=primary.model_call_count or 0,
         )
 
 
