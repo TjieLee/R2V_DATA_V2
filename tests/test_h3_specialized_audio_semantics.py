@@ -27,6 +27,8 @@ from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.specialized_audio_semantics import (
     ASSEMBLED_RECORD_VERSION,
     CAPTIONER_POLICY_VERSION,
+    GLOBAL_FALLBACK_PROMPT_VERSION,
+    GLOBAL_FALLBACK_SYSTEM_PROMPT,
     GLOBAL_PROMPT_VERSION,
     GLOBAL_SYSTEM_PROMPT,
     LOCAL_FIELD_POLICY_VERSION,
@@ -434,6 +436,90 @@ def test_global_vl_is_text_only_and_repairs_invalid_json_once(tmp_path: Path) ->
     assert "human-language or vocal" in GLOBAL_SYSTEM_PROMPT
     assert "Never add facts" in GLOBAL_SYSTEM_PROMPT
     assert "Never choose one uncertain source" in GLOBAL_SYSTEM_PROMPT
+
+
+def test_global_music_prompt_prefers_supported_music_recall() -> None:
+    prompt = " ".join(GLOBAL_SYSTEM_PROMPT.split())
+    assert GLOBAL_PROMPT_VERSION == "qwen3_vl_global_audio_extraction_v2"
+    assert GLOBAL_FALLBACK_PROMPT_VERSION == (
+        "qwen3_vl_global_audio_extraction_v2_recheck"
+    )
+    for phrase in (
+        'Do not require the caption to explicitly say "background music"',
+        '"BGM"',
+        '"score"',
+        "source is unspecified",
+        "Prefer recall over abstention when evidence is clearly musical",
+    ):
+        assert phrase in prompt
+    for evidence in (
+        "melody",
+        "melodic",
+        "harmonic",
+        "instrumental",
+        "synth",
+        "rhythmic musical backing",
+    ):
+        assert evidence in prompt
+
+
+def test_global_music_prompt_preserves_diegetic_and_tonal_boundaries() -> None:
+    prompt = " ".join(GLOBAL_SYSTEM_PROMPT.split())
+    fallback_prompt = " ".join(GLOBAL_FALLBACK_SYSTEM_PROMPT.split())
+    for source in (
+        "radio",
+        "television",
+        "phone",
+        "loudspeaker",
+        "live band",
+        "person playing guitar or piano",
+    ):
+        assert source in prompt
+    for non_music in ("hum", "buzz", "whine", "tone", "electronic tone"):
+        assert non_music in prompt
+    assert "alone is not music" in prompt
+    assert "source may be preserved as non_diegetic_music" in fallback_prompt
+    assert "exclude it only when" in fallback_prompt
+    assert "alone is not music" in fallback_prompt
+
+
+def test_global_prompt_version_changes_only_global_fingerprints(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = inventory.jobs[0]
+    global_config = _global_config(model="vl-a")
+    current_global = global_config.provenance()
+    previous_global = specialized._provenance(
+        role="global_semantics",
+        served_model_name=global_config.served_model_name,
+        checkpoint_id=global_config.checkpoint_id,
+        base_url=global_config.base_url,
+        input_modality="captioner_text_only",
+        media_resolver=None,
+        prompt_version="qwen3_vl_global_audio_extraction_v1",
+        fallback_prompt_version="qwen3_vl_global_audio_extraction_v1_recheck",
+        fallback_policy_version=specialized.GLOBAL_FALLBACK_POLICY_VERSION,
+        temperature=0.0,
+        top_p=None,
+        top_k=None,
+        max_tokens=global_config.max_tokens,
+    )
+    assert current_global.configuration_fingerprint != (
+        previous_global.configuration_fingerprint
+    )
+    assert global_request_fingerprint("soft piano melody", current_global) != (
+        global_request_fingerprint("soft piano melody", previous_global)
+    )
+
+    captioner = _caption_config(inventory).provenance()
+    local = _local_config(inventory).provenance()
+    assert captioner.prompt_version == CAPTIONER_POLICY_VERSION
+    assert local.prompt_version == LOCAL_PROMPT_VERSION
+    assert captioner_request_fingerprint(job, captioner) == (
+        captioner_request_fingerprint(job, _caption_config(inventory).provenance())
+    )
+    assert local_request_fingerprint(job, local) == (
+        local_request_fingerprint(job, _local_config(inventory).provenance())
+    )
 
 
 @pytest.mark.parametrize("initial", [_global_json(None), "  "])

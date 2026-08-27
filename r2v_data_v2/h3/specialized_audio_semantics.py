@@ -62,8 +62,8 @@ ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.2"
 BACKEND_PROVENANCE_VERSION = "r2v.h3.specialized_audio_backend_provenance.1"
 
 CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v2"
-GLOBAL_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v1"
-GLOBAL_FALLBACK_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v1_recheck"
+GLOBAL_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v2"
+GLOBAL_FALLBACK_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v2_recheck"
 GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
 LOCAL_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
 LOCAL_FALLBACK_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
@@ -125,10 +125,24 @@ overall_soundscape: supported NON-MUSICAL room tone, ambience, environmental
 noise, traffic, machinery, nature, physical sounds, or recurring/salient effects.
 No music, vocals, scene semantics, or source speculation.
 
-non_diegetic_music: only music explicitly supported as background music, BGM,
-score, orchestral/cinematic score, or soundtrack-like audience-facing
-accompaniment. Do not upgrade source-ambiguous, radio, TV, or in-scene music.
-Do not infer mood from plot. Return null when evidence is insufficient.
+non_diegetic_music: extract clearly musical or music-like content supported by
+the raw caption. Musical evidence includes music, musical, melody, melodic,
+harmony, harmonic, instrumental passages, piano, strings, guitar, orchestral
+instrumentation, synth or electronic musical layers, sustained tonal or harmonic
+accompaniment, rhythmic musical backing, beats, instrumental beats, score,
+soundtrack, BGM, background music, or a continuous musical bed beneath speech.
+Do not require the caption to explicitly say "background music", "BGM", "score",
+"soundtrack", or "non-diegetic". If clearly musical content is supported and its
+source is unspecified, preserve it as non-diegetic/background music. Prefer recall
+over abstention when evidence is clearly musical.
+
+Exclude music only when the caption explicitly identifies an in-scene playback or
+performance source, such as a radio, television, phone, loudspeaker, live band, a
+person playing guitar or piano, or another explicitly described visible/in-scene
+instrument performance. A hum, buzz, whine, ringing, drone, tone, or electronic
+tone alone is not music unless accompanied by clear musical evidence such as
+melodic, melody, harmonic, rhythmic, instrumental, accompaniment, musical, synth
+melody, or a repeating musical phrase. Do not infer mood from plot.
 
 Return exactly one compact JSON object matching the supplied schema. No markdown,
 reasoning, explanation, or extra fields."""
@@ -137,7 +151,13 @@ GLOBAL_FALLBACK_SYSTEM_PROMPT = """Recheck the supplied raw caption for GLOBAL
 NON-VOCAL AUDIO evidence only. Use only facts explicitly present in the caption.
 Ignore all speech, language, identity, delivery, voice, and other human-vocal
 content. Preserve generic acoustic evidence but never resolve speculative source
-identity. Return the same three-field schema as one compact JSON object."""
+identity. Recheck for musical, melodic, harmonic, instrumental, rhythmic, synth
+melody, or accompaniment evidence. Clearly musical content with an unspecified
+source may be preserved as non_diegetic_music; exclude it only when the caption
+explicitly identifies an in-scene playback or performance source such as radio,
+television, phone, loudspeaker, live performance, or a person playing an
+instrument. A hum, buzz, whine, drone, tone, or electronic tone alone is not
+music. Return the same three-field schema as one compact JSON object."""
 
 def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
