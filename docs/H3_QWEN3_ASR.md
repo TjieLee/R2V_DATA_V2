@@ -217,12 +217,36 @@ It has no limit or quota option.
 cd /mnt/workspace/litengjie/data/R2V_DATA_V2
 source .venv/bin/activate
 
+# Required for isolated embedding workers launched from embedding-venv.
+# The worker scripts import r2v_data_v2 directly, so the repository root must
+# remain importable in child processes even though their Python executable is
+# outside the repository virtualenv.
+export REPO=/mnt/workspace/litengjie/data/R2V_DATA_V2
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
+
 python tools/run_h3_jea_production.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --dry-run
 ```
+
+Before running the embedding stage, verify the isolated face/speaker workers can
+import the repository package from the configured embedding Python:
+
+```bash
+"$FACE_EMBEDDING_PYTHON" - <<'PY'
+import r2v_data_v2
+print("r2v_data_v2:", r2v_data_v2.__file__)
+PY
+```
+
+If this import fails with `ModuleNotFoundError: No module named 'r2v_data_v2'`,
+restore the `PYTHONPATH` export above before retrying embedding. A failed
+embedding run may still publish an all-zero summary because per-occurrence model
+failures are isolated; inspect `$AUDIO_PRODUCTION_ROOT/.embedding_worker_diagnostics/face/worker.stderr.log`
+before running `pair` when `face_embedding_available_count` unexpectedly equals
+zero.
 
 Run each stage explicitly from the normal repository environment. For the
 `qwen3-asr` stage, the JEA orchestrator launches exactly one child process with
