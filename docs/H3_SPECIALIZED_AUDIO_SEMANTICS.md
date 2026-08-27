@@ -226,6 +226,8 @@ Existing valid FLAC files are reused. Only missing canonical full audio is
 materialized from the processed canonical target video. The tool updates only
 `audio/canonical_clips.jsonl` and `audio/canonical_clips_summary.json`; subject
 bindings and all downstream stage directories remain untouched.
+The CLI argument remains the whole `$AUDIO_PRODUCTION_ROOT`; `audio/` is selected
+internally through the shared JEA production-path contract.
 
 ## Current runtime topology
 

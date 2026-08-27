@@ -1586,6 +1586,10 @@ without any AI model call:
   --audio-production-root "$AUDIO_PRODUCTION_ROOT"
 ```
 
+The argument is the whole production root. The tool resolves its canonical
+Audio stage through the shared layout and writes only below
+`$AUDIO_PRODUCTION_ROOT/audio/`, never directly at the production root.
+
 The specialized Audio semantics inventory is built from that manifest. Readable
 DiariZen speaker evidence is an optional subset overlay and Qwen3-ASR is not an
 inventory dependency. Future clip-level Visual/Audio rendering joins exactly on

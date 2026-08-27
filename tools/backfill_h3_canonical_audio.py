@@ -12,7 +12,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.h3.audio_backends import FFmpegAudioMediaBackend
-from r2v_data_v2.h3.jea_audio_production import materialize_canonical_audio_clips
+from r2v_data_v2.h3.jea_audio_production import (
+    jea_production_paths,
+    materialize_canonical_audio_clips,
+)
 from r2v_data_v2.h3.visual_production_source import (
     VisualProductionClip,
     load_visual_production_inventory,
@@ -61,7 +64,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         visual_production_root=arguments.visual_production_root,
         visual_runs_root=arguments.visual_runs_root,
     )
-    audio_root = arguments.audio_production_root.expanduser().resolve(strict=True)
+    production_root = arguments.audio_production_root.expanduser().resolve(strict=True)
+    audio_root = jea_production_paths(production_root).audio
     summary = materialize_canonical_audio_clips(
         visual_inventory=visual,
         audio_root=audio_root,

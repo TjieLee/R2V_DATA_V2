@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import r2v_data_v2.h3.jea_audio_production as jea_audio
+import tools.backfill_h3_canonical_audio as canonical_audio_backfill
 import tools.run_h3_jea_production as jea_cli
 import tools.run_h3_qwen3_asr as qwen_cli
 from r2v_data_v2.h3.jea_audio_production import (
@@ -20,6 +21,7 @@ from r2v_data_v2.h3.jea_audio_production import (
     audio_binding_path,
     build_jea_pairs,
     full_audio_path,
+    jea_production_paths,
     materialize_canonical_audio_clips,
     primary_voice_path,
 )
@@ -29,6 +31,11 @@ from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRSegment,
     load_official_diarizen_waveform,
     run_qwen3_asr,
+)
+from r2v_data_v2.h3.schemas import (
+    AudioBindingEvidence,
+    AudioBindingSidecar,
+    AudioTrackMetadata,
 )
 from r2v_data_v2.h3.visual_production_source import (
     ReadableClipIdentity,
@@ -705,6 +712,98 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
     )
     assert calls == []
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_canonical_audio_backfill_uses_official_audio_stage_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "subject",
+                "shard_id": "shard-a",
+                "clip_relative_path": "show/work/subject.mp4",
+                "source_relative_path": "show/work/source-a.mkv",
+            }
+        ],
+    )
+    production_root = tmp_path / "audio-production"
+    production_root.mkdir()
+    paths = jea_production_paths(production_root)
+    item = inventory.clips[0]
+    expected_audio = full_audio_path(paths.audio, item.identity)
+    binding_path = audio_binding_path(paths.audio, item.identity)
+    binding_path.parent.mkdir(parents=True)
+    binding = AudioBindingSidecar(
+        clip_uid=item.identity.clip_uid,
+        source_run_root=inventory.visual_runs_root,
+        source_video_path=item.sample.target_video,
+        status="ineligible",
+        reason="fixture has no clean speech",
+        evidence=AudioBindingEvidence(
+            clip_uid=item.identity.clip_uid,
+            audio=AudioTrackMetadata(
+                status="ready",
+                source_video_path=item.sample.target_video,
+                full_audio_path=str(expected_audio),
+                duration_seconds=2.5,
+                sample_rate_hz=16000,
+                channels=1,
+            ),
+        ),
+    )
+    binding_path.write_text(binding.model_dump_json(indent=2), encoding="utf-8")
+    calls: list[Path] = []
+
+    class _AudioBackend:
+        def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
+            destination = Path(kwargs["destination"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"canonical flac")
+            calls.append(destination)
+            return SimpleNamespace(
+                path=destination,
+                stream=SimpleNamespace(duration_seconds=2.5),
+            )
+
+    monkeypatch.setattr(
+        canonical_audio_backfill,
+        "load_visual_production_inventory",
+        lambda **_kwargs: inventory,
+    )
+    monkeypatch.setattr(
+        canonical_audio_backfill,
+        "FFmpegAudioMediaBackend",
+        lambda **_kwargs: _AudioBackend(),
+    )
+    arguments = [
+        "--visual-production-root",
+        inventory.visual_production_root,
+        "--visual-runs-root",
+        inventory.visual_runs_root,
+        "--audio-production-root",
+        str(production_root),
+    ]
+
+    result = canonical_audio_backfill.main(arguments)
+    second_result = canonical_audio_backfill.main(arguments)
+
+    assert calls == [expected_audio]
+    assert result == second_result
+    assert result["manifest_path"] == str(paths.audio / "canonical_clips.jsonl")
+    assert result["summary_path"] == str(
+        paths.audio / "canonical_clips_summary.json"
+    )
+    assert expected_audio.is_file()
+    record = CanonicalAudioClip.model_validate_json(
+        (paths.audio / "canonical_clips.jsonl").read_text(encoding="utf-8")
+    )
+    assert record.target_audio_binding_path == str(binding_path.resolve(strict=True))
+    assert not (production_root / "canonical_clips.jsonl").exists()
+    assert not (production_root / "canonical_clips_summary.json").exists()
+    assert not (production_root / "full_audio").exists()
 
 
 def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(

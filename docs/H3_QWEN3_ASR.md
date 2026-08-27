@@ -304,6 +304,9 @@ For an existing Audio root, model-free canonical full-audio backfill is:
 
 It does not rerun Audio binding or modify primary voice, embedding, pairs,
 diarization, ASR, specialized semantics, or H3 output.
+`--audio-production-root` names the whole production root; the backfill uses the
+official JEA layout and publishes only under its `audio/` child, including
+`audio/canonical_clips.jsonl` and `audio/full_audio/`.
 
 Specialized clip-level audio semantics reads `audio/canonical_clips.jsonl` and
 does not use Qwen3-ASR as an admission dependency. DiariZen speaker clusters are
