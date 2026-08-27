@@ -5,6 +5,7 @@ import json
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,9 @@ from r2v_data_v2.h3.specialized_audio_semantics import (
     LOCAL_FIELD_POLICY_VERSION,
     LOCAL_PROMPT_VERSION,
     LOCAL_SYSTEM_PROMPT,
+    MUSIC_RESCUE_POLICY_VERSION,
+    MUSIC_RESCUE_PROMPT_VERSION,
+    MUSIC_RESCUE_SYSTEM_PROMPT,
     SPECIALIZED_ROOT_NAME,
     CaptionerBackendResult,
     CaptionerConfig,
@@ -42,9 +46,11 @@ from r2v_data_v2.h3.specialized_audio_semantics import (
     GlobalSemanticsConfig,
     LocalAudioSemanticsResponse,
     LocalSemanticsConfig,
+    MusicRescueConfig,
     OpenAICaptionerBackend,
     OpenAIGlobalSemanticsBackend,
     OpenAILocalSemanticsBackend,
+    OpenAIMusicRescueBackend,
     SpecializedBackendFailure,
     SpecializedBackendResult,
     captioner_request_fingerprint,
@@ -213,6 +219,20 @@ def _local_config(
         checkpoint_id=f"/models/{model}",
         media_resolver=_resolver(inventory),
         include_video=include_video,
+    )
+
+
+def _music_config(
+    inventory: JEATargetAudioCaptionInventory,
+    *,
+    model: str = "music",
+) -> MusicRescueConfig:
+    return MusicRescueConfig(
+        base_url="http://local.invalid/v1",
+        api_key="EMPTY",
+        served_model_name=model,
+        checkpoint_id=f"/models/{model}",
+        media_resolver=_resolver(inventory),
     )
 
 
@@ -484,6 +504,90 @@ def test_global_music_prompt_preserves_diegetic_and_tonal_boundaries() -> None:
     assert "alone is not music" in fallback_prompt
 
 
+def test_direct_audio_music_backend_uses_only_canonical_audio(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    response = '{"non_diegetic_music":"soft piano accompaniment"}'
+    client, completions = _client([response])
+    backend = OpenAIMusicRescueBackend(
+        _music_config(inventory),
+        client=client,
+    )
+
+    result = backend.detect(inventory.jobs[0])
+
+    assert result.response.non_diegetic_music == "soft piano accompaniment"
+    assert result.model_call_count == 1
+    request = completions.requests[0]
+    assert request["temperature"] == 0.0
+    assert request["modalities"] == ["text"]
+    content = request["messages"][1]["content"]  # type: ignore[index]
+    assert [item["type"] for item in content] == ["audio_url"]  # type: ignore[index]
+    serialized = json.dumps(request)
+    assert inventory.jobs[0].target_full_audio_path in serialized
+    for forbidden in (
+        "speaker_cluster_id",
+        "entity_id",
+        "target_video_path",
+        "overall_audio_description",
+    ):
+        assert forbidden not in serialized
+    assert "high recall" in MUSIC_RESCUE_SYSTEM_PROMPT
+    assert "ordinary hum" in MUSIC_RESCUE_SYSTEM_PROMPT
+
+
+def test_direct_audio_music_null_is_one_semantic_call(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    client, completions = _client(['{"non_diegetic_music":null}'])
+
+    result = OpenAIMusicRescueBackend(
+        _music_config(inventory),
+        client=client,
+    ).detect(inventory.jobs[0])
+
+    assert result.response.non_diegetic_music is None
+    assert result.model_call_count == 1
+    assert len(completions.requests) == 1
+
+
+def test_direct_audio_music_verifies_canonical_audio_hash(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    Path(inventory.jobs[0].target_full_audio_path).write_bytes(b"changed")
+    client, completions = _client(['{"non_diegetic_music":null}'])
+
+    with pytest.raises(SpecializedBackendFailure) as captured:
+        OpenAIMusicRescueBackend(
+            _music_config(inventory),
+            client=client,
+        ).detect(inventory.jobs[0])
+
+    assert captured.value.code == "music_rescue_media_unavailable"
+    assert completions.requests == []
+
+
+def test_direct_audio_music_malformed_json_gets_one_format_repair(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    responses = [
+        '{"background_music":"piano"}',
+        '{"non_diegetic_music":"piano accompaniment"}',
+    ]
+    client, completions = _client(responses)
+
+    result = OpenAIMusicRescueBackend(
+        _music_config(inventory),
+        client=client,
+    ).detect(inventory.jobs[0])
+
+    assert result.response.non_diegetic_music == "piano accompaniment"
+    assert result.model_call_count == 2
+    assert len(completions.requests) == 2
+    repair_request = json.dumps(completions.requests[1])
+    assert "Repair the prior JSON format only" in repair_request
+    assert "background_music" in repair_request
+    assert "piano" in repair_request
+
+
 def test_global_prompt_version_changes_only_global_fingerprints(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
     job = inventory.jobs[0]
@@ -526,7 +630,7 @@ def test_global_prompt_version_changes_only_global_fingerprints(tmp_path: Path) 
         max_tokens=global_config.max_tokens,
     )
     assert GLOBAL_RECAPTION_RESCUE_POLICY_VERSION == (
-        "global_missing_semantics_recaption_once_v1"
+        "global_failed_or_missing_description_recaption_once_v2"
     )
     assert current_global.configuration_fingerprint != (
         previous_rescue_policy.configuration_fingerprint
@@ -861,6 +965,9 @@ def test_response_schema_is_strict_and_local_has_only_two_fields() -> None:
         "temporal_audio_events",
         "speaker_delivery",
     ]
+    assert list(specialized.DirectAudioMusicResponse.model_fields) == [
+        "non_diegetic_music"
+    ]
     with pytest.raises(ValidationError):
         GlobalAudioSemanticsResponse.model_validate(
             {
@@ -908,6 +1015,81 @@ def test_request_fingerprints_cover_semantics_but_not_inflight(tmp_path: Path) -
     )
     assert GLOBAL_PROMPT_VERSION in global_a.prompt_version
     assert LOCAL_PROMPT_VERSION in local_audio.prompt_version
+
+
+def test_global_runtime_fingerprint_covers_music_and_recaption_dependencies(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = inventory.jobs[0]
+    captioner = _caption_config(inventory).provenance()
+    local = _local_config(inventory).provenance()
+    global_provenance = _global_config().provenance()
+    music_a = _music_config(inventory, model="music-a").provenance()
+    music_b = _music_config(inventory, model="music-b").provenance()
+
+    runtime_a = specialized._global_runtime_provenance(
+        global_provenance,
+        captioner,
+        music_a,
+    )
+    runtime_b = specialized._global_runtime_provenance(
+        global_provenance,
+        captioner,
+        music_b,
+    )
+
+    assert runtime_a.configuration_fingerprint != runtime_b.configuration_fingerprint
+    assert global_request_fingerprint("caption", runtime_a) != (
+        global_request_fingerprint("caption", runtime_b)
+    )
+    assert global_request_fingerprint(
+        "caption",
+        runtime_a,
+        target_full_audio_sha256="a" * 64,
+    ) != global_request_fingerprint(
+        "caption",
+        runtime_a,
+        target_full_audio_sha256="b" * 64,
+    )
+    assert runtime_a.runtime_dependency_fingerprints == {
+        "recaption_captioner": captioner.configuration_fingerprint,
+        "direct_audio_music_rescue": music_a.configuration_fingerprint,
+    }
+    assert MUSIC_RESCUE_PROMPT_VERSION == "h3_non_diegetic_music_direct_audio_v1"
+    assert MUSIC_RESCUE_POLICY_VERSION == (
+        "global_non_diegetic_music_direct_audio_once_v1"
+    )
+    assert captioner_request_fingerprint(job, captioner) == (
+        captioner_request_fingerprint(job, _caption_config(inventory).provenance())
+    )
+    assert local_request_fingerprint(job, local) == (
+        local_request_fingerprint(job, _local_config(inventory).provenance())
+    )
+
+
+def test_optional_global_runtime_dependencies_preserve_legacy_record_hashes(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = inventory.jobs[0]
+    caption = specialized._captioner_record(
+        job,
+        _FakeCaptioner(_caption_config(inventory)),
+    ).record
+    local = specialized._local_record(
+        job,
+        _FakeLocal(_local_config(inventory)),
+    ).record
+
+    for record_type, record in (
+        (specialized.CaptionerRecord, caption),
+        (specialized.LocalSemanticsRecord, local),
+    ):
+        payload = record.model_dump(mode="json")
+        payload["backend_provenance"].pop("runtime_dependency_fingerprints")
+        parsed = record_type.model_validate(payload)
+        assert parsed.record_fingerprint == record.record_fingerprint
 
 
 def test_review_namespace_covers_stage_configuration_only(tmp_path: Path) -> None:
@@ -1087,6 +1269,39 @@ class _SequencedGlobal:
 
 
 @dataclass
+class _FakeMusic:
+    config: MusicRescueConfig
+    responses: list[str | None | SpecializedBackendFailure] = field(
+        default_factory=lambda: ["soft piano accompaniment"]
+    )
+    calls: list[str] = field(default_factory=list)
+    on_call: Callable[[], None] | None = None
+
+    @property
+    def provenance(self):  # type: ignore[no-untyped-def]
+        return self.config.provenance()
+
+    def detect(
+        self,
+        job: JEATargetAudioCaptionJob,
+    ) -> SpecializedBackendResult[specialized.DirectAudioMusicResponse]:
+        self.calls.append(job.target_clip_uid)
+        if self.on_call is not None:
+            self.on_call()
+        response = self.responses.pop(0)
+        if isinstance(response, SpecializedBackendFailure):
+            raise response
+        parsed = specialized.DirectAudioMusicResponse(non_diegetic_music=response)
+        raw = parsed.model_dump_json()
+        return SpecializedBackendResult(
+            response=parsed,
+            raw_responses=(raw,),
+            diagnostics=(_completion_diagnostic(raw),),
+            model_call_count=1,
+        )
+
+
+@dataclass
 class _FakeLocal:
     config: LocalSemanticsConfig
     failures: set[str] = field(default_factory=set)
@@ -1221,7 +1436,7 @@ def _primary_and_rescue(
     [
         ("ready", "description", "room", "music", False),
         ("ready", None, "room", "music", True),
-        ("ready", "description", "room", None, True),
+        ("ready", "description", "room", None, False),
         ("ready", "description", None, "music", False),
         ("failed", None, None, None, True),
         ("blocked", None, None, None, False),
@@ -1248,29 +1463,16 @@ def test_recaption_rescue_trigger_contract(
     [
         (
             GlobalAudioSemanticsResponse(
-                overall_audio_description="A",
-                overall_soundscape="B",
-                non_diegetic_music=None,
-            ),
-            GlobalAudioSemanticsResponse(
-                overall_audio_description="C",
-                overall_soundscape="D",
-                non_diegetic_music="M",
-            ),
-            ("A", "B", "M"),
-        ),
-        (
-            GlobalAudioSemanticsResponse(
                 overall_audio_description=None,
                 overall_soundscape="B",
-                non_diegetic_music="M1",
+                non_diegetic_music=None,
             ),
             GlobalAudioSemanticsResponse(
                 overall_audio_description="A",
                 overall_soundscape="D",
                 non_diegetic_music="M2",
             ),
-            ("A", "B", "M1"),
+            ("A", "B", "M2"),
         ),
         (
             GlobalAudioSemanticsResponse(
@@ -1316,9 +1518,9 @@ def test_failed_recaption_does_not_damage_ready_primary(
     failure_stage: str,
 ) -> None:
     primary = GlobalAudioSemanticsResponse(
-        overall_audio_description="primary description",
+        overall_audio_description=None,
         overall_soundscape="primary room",
-        non_diegetic_music=None,
+        non_diegetic_music="primary music",
     )
     merged, _, global_backend = _primary_and_rescue(
         tmp_path,
@@ -1335,9 +1537,9 @@ def test_failed_recaption_does_not_damage_ready_primary(
         ),
     )
     assert merged.record.status == "ready"
-    assert merged.record.overall_audio_description == "primary description"
+    assert merged.record.overall_audio_description is None
     assert merged.record.overall_soundscape == "primary room"
-    assert merged.record.non_diegetic_music is None
+    assert merged.record.non_diegetic_music == "primary music"
     assert merged.record.recaption_rescue_attempted is True
     assert merged.record.recaption_rescue_used is False
     assert merged.record.failure is None
@@ -1351,9 +1553,9 @@ def test_all_null_recaption_is_unused_and_primary_remains_ready(tmp_path: Path) 
     merged, _, global_backend = _primary_and_rescue(
         tmp_path,
         primary=GlobalAudioSemanticsResponse(
-            overall_audio_description="primary description",
+            overall_audio_description=None,
             overall_soundscape=None,
-            non_diegetic_music=None,
+            non_diegetic_music="primary music",
         ),
         rescue_caption="independent recaption",
         rescue=GlobalAudioSemanticsResponse(
@@ -1363,9 +1565,9 @@ def test_all_null_recaption_is_unused_and_primary_remains_ready(tmp_path: Path) 
         ),
     )
     assert merged.record.status == "ready"
-    assert merged.record.overall_audio_description == "primary description"
+    assert merged.record.overall_audio_description is None
     assert merged.record.overall_soundscape is None
-    assert merged.record.non_diegetic_music is None
+    assert merged.record.non_diegetic_music == "primary music"
     assert merged.record.recaption_rescue_attempted is True
     assert merged.record.recaption_rescue_used is False
     assert merged.record.model_call_count == 3
@@ -1411,6 +1613,189 @@ def test_failed_primary_and_failed_recaption_remain_failed(tmp_path: Path) -> No
     assert merged.record.raw_response_count == 3
 
 
+def _primary_global_record(
+    inventory: JEATargetAudioCaptionInventory,
+    response: GlobalAudioSemanticsResponse | SpecializedBackendFailure,
+) -> specialized._ProcessedRecord[specialized.GlobalSemanticsRecord]:
+    job = inventory.jobs[0]
+    captioner = _SequencedCaptioner(
+        _caption_config(inventory),
+        ["canonical caption"],
+    )
+    captioner_record = specialized._captioner_record(job, captioner).record
+    return specialized._global_record(
+        job,
+        captioner_record,
+        _SequencedGlobal(_global_config(), [response]),
+    )
+
+
+def test_music_rescue_skips_existing_music(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    primary = _primary_global_record(
+        inventory,
+        GlobalAudioSemanticsResponse(
+            overall_audio_description="description",
+            overall_soundscape="room",
+            non_diegetic_music="existing score",
+        ),
+    )
+    backend = _FakeMusic(_music_config(inventory))
+
+    merged = specialized._run_music_rescues(
+        jobs=inventory.jobs,
+        processed=[primary],
+        music_backend=backend,
+        max_inflight=1,
+    )[0]
+
+    assert backend.calls == []
+    assert merged.record.non_diegetic_music == "existing score"
+    assert merged.record.music_rescue_attempted is False
+    assert merged.record.music_rescue_used is False
+    assert merged.raw["music_rescue"]["attempted"] is False  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("music_result", "expected_music", "used"),
+    [
+        ("soft piano accompaniment", "soft piano accompaniment", True),
+        (None, None, False),
+    ],
+)
+def test_music_rescue_fills_only_missing_music(
+    tmp_path: Path,
+    music_result: str | None,
+    expected_music: str | None,
+    used: bool,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    primary = _primary_global_record(
+        inventory,
+        GlobalAudioSemanticsResponse(
+            overall_audio_description="primary description",
+            overall_soundscape="primary soundscape",
+            non_diegetic_music=None,
+        ),
+    )
+    backend = _FakeMusic(_music_config(inventory), [music_result])
+
+    merged = specialized._run_music_rescues(
+        jobs=inventory.jobs,
+        processed=[primary],
+        music_backend=backend,
+        max_inflight=1,
+    )[0]
+
+    assert backend.calls == ["clip-000"]
+    assert merged.record.status == "ready"
+    assert merged.record.overall_audio_description == "primary description"
+    assert merged.record.overall_soundscape == "primary soundscape"
+    assert merged.record.non_diegetic_music == expected_music
+    assert merged.record.music_rescue_attempted is True
+    assert merged.record.music_rescue_used is used
+    assert merged.record.model_call_count == 2
+    assert merged.record.raw_response_count == 2
+    raw = merged.raw["music_rescue"]
+    assert raw["attempted"] is True  # type: ignore[index]
+    assert raw["used"] is used  # type: ignore[index]
+    assert raw["prompt_version"] == MUSIC_RESCUE_PROMPT_VERSION  # type: ignore[index]
+    assert raw["policy_version"] == MUSIC_RESCUE_POLICY_VERSION  # type: ignore[index]
+
+
+def test_music_rescue_failure_does_not_damage_ready_global(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    primary = _primary_global_record(
+        inventory,
+        GlobalAudioSemanticsResponse(
+            overall_audio_description="primary description",
+            overall_soundscape="primary soundscape",
+            non_diegetic_music=None,
+        ),
+    )
+    backend = _FakeMusic(
+        _music_config(inventory),
+        [_failure("music_infrastructure_failed")],
+    )
+
+    merged = specialized._run_music_rescues(
+        jobs=inventory.jobs,
+        processed=[primary],
+        music_backend=backend,
+        max_inflight=1,
+    )[0]
+
+    assert merged.record.status == "ready"
+    assert merged.record.overall_audio_description == "primary description"
+    assert merged.record.overall_soundscape == "primary soundscape"
+    assert merged.record.non_diegetic_music is None
+    assert merged.record.music_rescue_attempted is True
+    assert merged.record.music_rescue_used is False
+    assert merged.record.failure is None
+    assert merged.record.model_call_count == 2
+    assert merged.raw["music_rescue"]["failure"]["code"] == (  # type: ignore[index]
+        "music_infrastructure_failed"
+    )
+
+
+def test_music_rescue_does_not_run_for_failed_global(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    failed = _primary_global_record(
+        inventory,
+        _failure("primary_global_failed"),
+    )
+    backend = _FakeMusic(_music_config(inventory))
+
+    merged = specialized._run_music_rescues(
+        jobs=inventory.jobs,
+        processed=[failed],
+        music_backend=backend,
+        max_inflight=1,
+    )[0]
+
+    assert backend.calls == []
+    assert merged.record.status == "failed"
+    assert merged.record.music_rescue_attempted is False
+
+
+def test_music_rescue_runs_after_recaption_when_music_remains_missing(
+    tmp_path: Path,
+) -> None:
+    recaptioned, _, _ = _primary_and_rescue(
+        tmp_path,
+        primary=GlobalAudioSemanticsResponse(
+            overall_audio_description=None,
+            overall_soundscape=None,
+            non_diegetic_music=None,
+        ),
+        rescue_caption="independent recaption",
+        rescue=GlobalAudioSemanticsResponse(
+            overall_audio_description="rescued description",
+            overall_soundscape="rescued soundscape",
+            non_diegetic_music=None,
+        ),
+    )
+    inventory = _inventory(tmp_path / "music", clip_count=1)
+    backend = _FakeMusic(
+        _music_config(inventory),
+        ["quiet string accompaniment"],
+    )
+
+    merged = specialized._run_music_rescues(
+        jobs=inventory.jobs,
+        processed=[recaptioned],
+        music_backend=backend,
+        max_inflight=1,
+    )[0]
+
+    assert backend.calls == ["clip-000"]
+    assert merged.record.overall_audio_description == "rescued description"
+    assert merged.record.overall_soundscape == "rescued soundscape"
+    assert merged.record.non_diegetic_music == "quiet string accompaniment"
+    assert merged.record.recaption_rescue_used is True
+    assert merged.record.music_rescue_used is True
+
+
 def test_standalone_global_recaption_preserves_primary_caption_artifact_and_audit(
     tmp_path: Path,
 ) -> None:
@@ -1431,7 +1816,7 @@ def test_standalone_global_recaption_preserves_primary_caption_artifact_and_audi
         if path.is_file()
     }
     primary = GlobalAudioSemanticsResponse(
-        overall_audio_description="primary description",
+        overall_audio_description=None,
         overall_soundscape="primary room",
         non_diegetic_music=None,
     )
@@ -1445,18 +1830,20 @@ def test_standalone_global_recaption_preserves_primary_caption_artifact_and_audi
         _caption_config(inventory),
         ["independent second caption"],
     )
+    music_backend = _FakeMusic(_music_config(inventory))
 
     records, summary = run_global_semantics_phase(
         inventory=inventory,
         output_root=root,
         backend=global_backend,
         captioner_backend=rescue_captioner,
+        music_backend=music_backend,
         captioner_max_inflight=1,
         max_inflight=1,
     )
 
     record = records[0]
-    assert record.overall_audio_description == "primary description"
+    assert record.overall_audio_description == "rescue description"
     assert record.overall_soundscape == "primary room"
     assert record.non_diegetic_music == "rescued music"
     assert record.model_call_count == 3
@@ -1464,6 +1851,7 @@ def test_standalone_global_recaption_preserves_primary_caption_artifact_and_audi
     assert len(record.completion_diagnostics) == 3
     assert summary.model_call_count == 3
     assert rescue_captioner.calls == ["clip-000"]
+    assert music_backend.calls == []
     assert len(global_backend.calls) == 2
     raw = json.loads(
         (root / "global_semantics/raw/clip-000.json").read_text(encoding="utf-8")
@@ -1475,6 +1863,7 @@ def test_standalone_global_recaption_preserves_primary_caption_artifact_and_audi
         "independent second caption"
     )
     assert raw["recaption_rescue"]["global"]["raw_responses"]
+    assert raw["music_rescue"]["attempted"] is False
     captioner_after = {
         path.relative_to(root / "captioner"): path.read_bytes()
         for path in (root / "captioner").rglob("*")
@@ -1483,11 +1872,73 @@ def test_standalone_global_recaption_preserves_primary_caption_artifact_and_audi
     assert captioner_after == captioner_before
 
 
+def test_standalone_global_runs_direct_audio_music_rescue(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    canonical_captioner = _SequencedCaptioner(
+        _caption_config(inventory),
+        ["canonical caption"],
+    )
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=canonical_captioner,
+    )
+    recaption_backend = _SequencedCaptioner(_caption_config(inventory), [])
+    global_backend = _SequencedGlobal(
+        _global_config(),
+        [
+            GlobalAudioSemanticsResponse(
+                overall_audio_description="complete description",
+                overall_soundscape="room tone",
+                non_diegetic_music=None,
+            )
+        ],
+    )
+    music_backend = _FakeMusic(
+        _music_config(inventory),
+        ["faint orchestral accompaniment"],
+    )
+
+    records, summary = run_global_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=global_backend,
+        captioner_backend=recaption_backend,
+        music_backend=music_backend,
+        max_inflight=1,
+        music_max_inflight=1,
+    )
+
+    record = records[0]
+    assert record.schema_version == "r2v.h3.specialized_global_audio_semantics.3"
+    assert record.non_diegetic_music == "faint orchestral accompaniment"
+    assert record.recaption_rescue_attempted is False
+    assert record.music_rescue_attempted is True
+    assert record.music_rescue_used is True
+    assert record.model_call_count == 2
+    assert summary.model_call_count == 2
+    assert recaption_backend.calls == []
+    assert music_backend.calls == ["clip-000"]
+    assert record.backend_provenance.runtime_dependency_fingerprints == {
+        "recaption_captioner": recaption_backend.provenance.configuration_fingerprint,
+        "direct_audio_music_rescue": music_backend.provenance.configuration_fingerprint,
+    }
+    raw = json.loads(
+        (root / "global_semantics/raw/clip-000.json").read_text(encoding="utf-8")
+    )
+    assert raw["primary_global"]["raw_responses"]
+    assert raw["recaption_rescue"]["attempted"] is False
+    assert raw["music_rescue"]["attempted"] is True
+    assert raw["music_rescue"]["used"] is True
+    assert raw["music_rescue"]["backend_provenance"]["role"] == "music_rescue"
+
+
 def test_pipeline_applies_same_one_shot_recaption_contract(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
     root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
     primary = GlobalAudioSemanticsResponse(
-        overall_audio_description="primary description",
+        overall_audio_description=None,
         overall_soundscape="primary room",
         non_diegetic_music=None,
     )
@@ -1508,6 +1959,7 @@ def test_pipeline_applies_same_one_shot_recaption_contract(tmp_path: Path) -> No
         captioner_backend=captioner,
         global_backend=global_backend,
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
         captioner_max_inflight=1,
         global_vl_max_inflight=1,
     )
@@ -1518,7 +1970,7 @@ def test_pipeline_applies_same_one_shot_recaption_contract(tmp_path: Path) -> No
     captioner_record = specialized.CaptionerRecord.model_validate_json(
         (root / "captioner/records.jsonl").read_text(encoding="utf-8")
     )
-    assert global_record.overall_audio_description == "primary description"
+    assert global_record.overall_audio_description == "rescue description"
     assert global_record.overall_soundscape == "primary room"
     assert global_record.non_diegetic_music == "rescued music"
     assert global_record.recaption_rescue_attempted is True
@@ -1544,6 +1996,7 @@ def test_phases_assemble_partial_results_and_preserve_upstream(tmp_path: Path) -
         output_root=root,
         backend=global_backend,
         captioner_backend=captioner,
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     run_local_semantics_phase(inventory=inventory, output_root=root, backend=local)
     upstream_before = {
@@ -1623,6 +2076,7 @@ def test_failed_local_salvages_strict_speaker_delivery_and_assembles_partial(
         output_root=root,
         backend=_FakeGlobal(_global_config()),
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     local_records, local_summary = run_local_semantics_phase(
         inventory=inventory,
@@ -1752,6 +2206,7 @@ def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:
         captioner_backend=captioner,
         global_backend=global_backend,
         local_backend=local,
+        music_backend=_FakeMusic(_music_config(inventory)),
         captioner_max_inflight=2,
         global_vl_max_inflight=2,
         local_instruct_max_inflight=1,
@@ -1781,6 +2236,7 @@ def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:
         captioner_backend=resumed_captioner,
         global_backend=resumed_global,
         local_backend=resumed_local,
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assert resumed.captioner_reused is True
     assert resumed.global_semantics_reused is True
@@ -1788,6 +2244,46 @@ def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:
     assert resumed_captioner.calls == []
     assert resumed_global.calls == []
     assert resumed_local.calls == []
+
+
+def test_pipeline_runs_music_rescue_after_local_phase_finishes(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=2)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    local = _FakeLocal(_local_config(inventory), delay=0.01)
+    observed_local_call_counts: list[int] = []
+    music = _FakeMusic(
+        _music_config(inventory),
+        ["music zero", "music one"],
+        on_call=lambda: observed_local_call_counts.append(len(local.calls)),
+    )
+    globals_without_music = [
+        GlobalAudioSemanticsResponse(
+            overall_audio_description=f"description {index}",
+            overall_soundscape=None,
+            non_diegetic_music=None,
+        )
+        for index in range(2)
+    ]
+
+    result = run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_SequencedGlobal(
+            _global_config(),
+            globals_without_music,
+        ),
+        local_backend=local,
+        music_backend=music,
+        captioner_max_inflight=1,
+        global_vl_max_inflight=1,
+        local_instruct_max_inflight=1,
+    )
+
+    assert music.calls == ["clip-000", "clip-001"]
+    assert observed_local_call_counts == [2, 2]
+    assert result.global_semantics_summary.model_call_count == 4
+    assert result.local_semantics_summary.model_call_count == 2
 
 
 def test_pipeline_failure_does_not_cancel_other_roles(tmp_path: Path) -> None:
@@ -1802,6 +2298,7 @@ def test_pipeline_failure_does_not_cancel_other_roles(tmp_path: Path) -> None:
         captioner_backend=captioner,
         global_backend=global_backend,
         local_backend=local,
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assert local.calls == ["clip-000", "clip-001"]
     assert global_backend.calls == ["clip-001"]
@@ -1820,6 +2317,7 @@ def test_pipeline_reuses_captioner_and_local_while_regenerating_global(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     shutil.rmtree(root / "global_semantics")
     captioner = _FakeCaptioner(_caption_config(inventory))
@@ -1832,6 +2330,7 @@ def test_pipeline_reuses_captioner_and_local_while_regenerating_global(
         captioner_backend=captioner,
         global_backend=global_backend,
         local_backend=local,
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
 
     assert result.captioner_reused is True
@@ -1853,6 +2352,7 @@ def test_stale_global_fails_independently_and_pipeline_regenerates_dependencies(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     run_captioner_phase(
         inventory=inventory,
@@ -1871,6 +2371,7 @@ def test_stale_global_fails_independently_and_pipeline_regenerates_dependencies(
             output_root=root,
             backend=independent_global,
             captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+            music_backend=_FakeMusic(_music_config(inventory)),
         )
     assert independent_global.calls == []
 
@@ -1883,6 +2384,7 @@ def test_stale_global_fails_independently_and_pipeline_regenerates_dependencies(
         captioner_backend=captioner,
         global_backend=global_backend,
         local_backend=local,
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assert result.captioner_reused is True
     assert result.global_semantics_reused is False
@@ -1900,7 +2402,7 @@ def test_stale_global_fails_independently_and_pipeline_regenerates_dependencies(
     ]
 
 
-@pytest.mark.parametrize("changed_role", ["captioner", "global", "local"])
+@pytest.mark.parametrize("changed_role", ["captioner", "global", "local", "music"])
 def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
     tmp_path: Path,
     changed_role: str,
@@ -1913,6 +2415,7 @@ def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     captioner = _FakeCaptioner(
         _caption_config(
@@ -1929,6 +2432,12 @@ def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
             include_video=changed_role == "local",
         )
     )
+    music = _FakeMusic(
+        _music_config(
+            inventory,
+            model="music-new" if changed_role == "music" else "music",
+        )
+    )
 
     result = run_specialized_pipeline(
         inventory=inventory,
@@ -1936,6 +2445,7 @@ def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
         captioner_backend=captioner,
         global_backend=global_backend,
         local_backend=local,
+        music_backend=music,
     )
 
     if changed_role == "captioner":
@@ -1952,13 +2462,21 @@ def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
         assert captioner.calls == []
         assert global_backend.calls == ["clip-000", "clip-001"]
         assert local.calls == []
-    else:
+    elif changed_role == "local":
         assert result.captioner_reused is True
         assert result.global_semantics_reused is True
         assert result.local_semantics_reused is False
         assert captioner.calls == []
         assert global_backend.calls == []
         assert local.calls == ["clip-000", "clip-001"]
+    else:
+        assert result.captioner_reused is True
+        assert result.global_semantics_reused is False
+        assert result.local_semantics_reused is True
+        assert captioner.calls == []
+        assert global_backend.calls == ["clip-000", "clip-001"]
+        assert local.calls == []
+        assert music.calls == []
 
 
 def test_stale_assembled_fails_independently_and_pipeline_rebuilds(
@@ -1972,6 +2490,7 @@ def test_stale_assembled_fails_independently_and_pipeline_rebuilds(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assembled_before = (root / "assembled/records.jsonl").read_bytes()
     run_local_semantics_phase(
@@ -1990,6 +2509,7 @@ def test_stale_assembled_fails_independently_and_pipeline_rebuilds(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assert result.captioner_reused is True
     assert result.global_semantics_reused is True
@@ -2012,6 +2532,7 @@ def test_independent_assemble_rejects_each_changed_upstream_record(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     if changed_role == "captioner":
         run_captioner_phase(
@@ -2028,6 +2549,7 @@ def test_independent_assemble_rejects_each_changed_upstream_record(
             output_root=root,
             backend=_FakeGlobal(_global_config()),
             captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+            music_backend=_FakeMusic(_music_config(inventory)),
             overwrite=True,
         )
     elif changed_role == "global":
@@ -2036,6 +2558,7 @@ def test_independent_assemble_rejects_each_changed_upstream_record(
             output_root=root,
             backend=_FakeGlobal(_global_config(), description_prefix="changed-"),
             captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+            music_backend=_FakeMusic(_music_config(inventory)),
             overwrite=True,
         )
     else:
@@ -2062,6 +2585,7 @@ def test_compatible_assembled_output_is_reused(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
 
     def unexpected_publish(*args: object, **kwargs: object) -> None:
@@ -2084,6 +2608,7 @@ def test_assembled_publication_failure_preserves_previous_output(
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assembled = root / "assembled"
     before = _tree_bytes(assembled)
@@ -2122,6 +2647,7 @@ def test_assembled_review_media_falls_back_to_copy(
         output_root=root,
         backend=_FakeGlobal(_global_config()),
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     run_local_semantics_phase(
         inventory=inventory,
@@ -2153,6 +2679,7 @@ def test_pipeline_and_independent_phases_publish_same_semantic_bytes(tmp_path: P
         output_root=root,
         backend=_FakeGlobal(_global_config()),
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     run_local_semantics_phase(
         inventory=inventory,
@@ -2169,6 +2696,7 @@ def test_pipeline_and_independent_phases_publish_same_semantic_bytes(tmp_path: P
         captioner_backend=_FakeCaptioner(_caption_config(inventory)),
         global_backend=_FakeGlobal(_global_config()),
         local_backend=_FakeLocal(_local_config(inventory)),
+        music_backend=_FakeMusic(_music_config(inventory)),
     )
     assert (root / "assembled/records.jsonl").read_bytes() == phased
 

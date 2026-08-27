@@ -25,9 +25,11 @@ from r2v_data_v2.h3.specialized_audio_semantics import (
     CaptionerConfig,
     GlobalSemanticsConfig,
     LocalSemanticsConfig,
+    MusicRescueConfig,
     OpenAICaptionerBackend,
     OpenAIGlobalSemanticsBackend,
     OpenAILocalSemanticsBackend,
+    OpenAIMusicRescueBackend,
     build_specialized_inventory,
     run_assemble_phase,
     run_captioner_phase,
@@ -168,6 +170,24 @@ def _local_config(arguments: argparse.Namespace) -> LocalSemanticsConfig:
     )
 
 
+def _music_config(arguments: argparse.Namespace) -> MusicRescueConfig:
+    return MusicRescueConfig(
+        base_url=_environment("QWEN3_OMNI_LOCAL_BASE_URL"),
+        api_key=_environment("QWEN3_OMNI_LOCAL_API_KEY", default="EMPTY"),
+        served_model_name=_environment(
+            "QWEN3_OMNI_LOCAL_MODEL",
+            default=DEFAULT_QWEN3_OMNI_MODEL,
+        ),
+        checkpoint_id=_environment(
+            "QWEN3_OMNI_LOCAL_CHECKPOINT_ID",
+            default=DEFAULT_QWEN3_OMNI_CHECKPOINT_ID,
+        ),
+        media_resolver=_media_resolver("QWEN3_OMNI_LOCAL"),
+        timeout_seconds=arguments.timeout_seconds,
+        max_tokens=arguments.local_instruct_max_tokens,
+    )
+
+
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     production_root = arguments.audio_production_root.expanduser().resolve(strict=True)
@@ -203,9 +223,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             output_root=output_root,
             backend=OpenAIGlobalSemanticsBackend(_global_config(arguments)),
             captioner_backend=OpenAICaptionerBackend(_captioner_config(arguments)),
+            music_backend=OpenAIMusicRescueBackend(_music_config(arguments)),
             overwrite=arguments.overwrite,
             max_inflight=arguments.global_vl_max_inflight,
             captioner_max_inflight=arguments.captioner_max_inflight,
+            music_max_inflight=arguments.local_instruct_max_inflight,
         )
         result["summary"] = summary.model_dump(mode="json")
         result["model_calls"] = summary.model_call_count
@@ -233,6 +255,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             captioner_backend=OpenAICaptionerBackend(_captioner_config(arguments)),
             global_backend=OpenAIGlobalSemanticsBackend(_global_config(arguments)),
             local_backend=OpenAILocalSemanticsBackend(_local_config(arguments)),
+            music_backend=OpenAIMusicRescueBackend(_music_config(arguments)),
             overwrite=arguments.overwrite,
             captioner_max_inflight=arguments.captioner_max_inflight,
             global_vl_max_inflight=arguments.global_vl_max_inflight,

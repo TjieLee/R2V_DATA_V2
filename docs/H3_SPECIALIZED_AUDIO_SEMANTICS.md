@@ -20,11 +20,12 @@ request fingerprints, and upstream dependency fingerprints.
 ## Current architecture
 
 ```text
-                                      +-> Qwen3-VL global ----------+
-canonical full audio -> Captioner ----+                              |
-                    \                 +-> optional recaption rescue  |
-                     \                                               +-> assemble
-                      +-> Qwen3-Omni-Instruct Local -----------------+
+canonical full audio -> Captioner -> Qwen3-VL Global
+                              \       -> optional recaption rescue
+                               \      -> direct-audio music rescue (8091)
+                                +----> Qwen3-Omni-Instruct Local (8091)
+                                              |
+                                              +-> assemble
 ```
 
 ### Captioner
@@ -71,10 +72,10 @@ when:
 ```text
 primary Global status == failed
 OR overall_audio_description is null
-OR non_diegetic_music is null
 ```
 
-A null `overall_soundscape` alone does not trigger recaption.
+A null `overall_soundscape` or `non_diegetic_music` alone does not trigger
+recaption.
 
 Rescue flow:
 
@@ -103,8 +104,29 @@ Qwen3-VL diagnostics.
 Current policy version:
 
 ```text
-global_missing_semantics_recaption_once_v1
+global_failed_or_missing_description_recaption_once_v2
 ```
+
+### Direct-audio music rescue
+
+After primary Global and optional recaption finish, a ready Global record whose
+`non_diegetic_music` is still null gets one music-only request to the existing
+Qwen3-Omni-Instruct service on port 8091. The detector receives canonical full
+audio only. It receives no Captioner text, transcript, speaker/entity evidence,
+video, reference image, or Local response.
+
+The detector may only fill `non_diegetic_music`; it cannot alter description,
+soundscape, events, or speaker delivery. A schema-valid null is final and does
+not trigger another semantic listen. Malformed JSON gets the existing one
+format-repair attempt. Transport, media, or repair failure is auxiliary evidence
+only and cannot turn a ready Global record into a failure.
+
+```text
+prompt: h3_non_diegetic_music_direct_audio_v1
+policy: global_non_diegetic_music_direct_audio_once_v1
+```
+
+The canonical H3-facing field remains `non_diegetic_music`.
 
 ### Local semantics
 
@@ -193,12 +215,11 @@ export no_proxy='127.0.0.1,localhost'
 
 ## Service requirements by phase
 
-The recaption rescue changes the Global phase dependency: Global now needs both
-Qwen3-VL and Captioner online.
+The two Global rescues mean standalone Global may need all three services.
 
 ```text
 captioner         -> 8092 Captioner
-global-semantics  -> 8000 Qwen3-VL + 8092 Captioner
+global-semantics  -> 8000 Qwen3-VL + 8092 Captioner + 8091 Omni-Instruct
 local-semantics   -> 8091 Qwen3-Omni-Instruct
 assemble          -> no model
 pipeline          -> 8000 + 8091 + 8092
@@ -215,14 +236,15 @@ Captioner only:
   --captioner-max-inflight 1
 ```
 
-Global only, including possible recaption rescue:
+Global only, including possible recaption and direct-audio music rescue:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_specialized_audio_semantics.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --phase global-semantics \
   --captioner-max-inflight 1 \
-  --global-vl-max-inflight 4
+  --global-vl-max-inflight 4 \
+  --local-instruct-max-inflight 1
 ```
 
 Local only:
@@ -265,6 +287,10 @@ rerun Local.
 - Global may then perform at most one recaption rescue under the trigger above.
 - Recaption rescue fills only missing Global fields and never overwrites a
   primary non-null field.
+- A ready Global record with null music then gets at most one direct-audio
+  music-only rescue; schema-valid null is not semantically retried.
+- Full pipeline music rescue starts only after the Local phase has finished, so
+  the two uses of port 8091 do not compete.
 - Local structured extraction reuses the validated Omni prompt/fallback path.
 - Local harmless order/envelope differences are normalized programmatically.
 - Local speaker semantics can survive an independent event-format failure when
@@ -276,7 +302,8 @@ rerun Local.
 - Captioner fingerprint includes canonical audio hash, checkpoint, sampling, and
   Captioner policy.
 - Global fingerprint includes primary Captioner dependency, Qwen3-VL prompt
-  versions, fallback policy, and recaption-rescue policy.
+  versions and fallback policy, recaption policy, plus the 8091 music model,
+  checkpoint, media configuration, prompt, and rescue policy.
 - Local fingerprint includes canonical audio, speaker clusters, duration,
   checkpoint, prompt/fallback policy, field-salvage policy, and input modality.
 - Assembly fingerprints all three upstream records.
@@ -317,7 +344,7 @@ Global result; the second Captioner/Global pass recovered description and
 soundscape but both Captioner samples still denied music, so
 `non_diegetic_music` remained null.
 
-This is the main remaining semantic limitation: one stochastic recaption reduces
-single-sample omission risk but cannot guarantee recovery when both Captioner
-samples make the same false-negative judgment. Human review remains required
-before freezing the Global music policy for large-scale production.
+This observation motivated separating concerns: recaption now handles failed or
+missing main Global description, while null music is checked directly from
+canonical audio by the 8091 music-only rescue. The figures above predate that
+new rescue and remain historical QA evidence, not post-change results.

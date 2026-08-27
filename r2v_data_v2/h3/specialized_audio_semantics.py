@@ -54,7 +54,7 @@ from r2v_data_v2.structured_output import (
 
 SPECIALIZED_ROOT_NAME = "audio_semantics_specialized_v1"
 CAPTIONER_RECORD_VERSION = "r2v.h3.specialized_audio_captioner.1"
-GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.2"
+GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.3"
 LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.2"
 ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.2"
 STAGE_SUMMARY_VERSION = "r2v.h3.specialized_audio_stage_summary.1"
@@ -66,10 +66,13 @@ GLOBAL_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v2"
 GLOBAL_FALLBACK_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v2_recheck"
 GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
 GLOBAL_RECAPTION_RESCUE_POLICY_VERSION = (
-    "global_missing_semantics_recaption_once_v1"
+    "global_failed_or_missing_description_recaption_once_v2"
 )
+MUSIC_RESCUE_PROMPT_VERSION = "h3_non_diegetic_music_direct_audio_v1"
+MUSIC_RESCUE_POLICY_VERSION = "global_non_diegetic_music_direct_audio_once_v1"
 GLOBAL_RUNTIME_POLICY_VERSION = (
     f"{GLOBAL_FALLBACK_POLICY_VERSION}+{GLOBAL_RECAPTION_RESCUE_POLICY_VERSION}"
+    f"+{MUSIC_RESCUE_POLICY_VERSION}"
 )
 LOCAL_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
 LOCAL_FALLBACK_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
@@ -91,6 +94,12 @@ DEFAULT_GLOBAL_VL_BASE_URL = "http://127.0.0.1:8000/v1"
 EVENT_TIME_TOLERANCE_SECONDS = 0.10
 
 StageRole = Literal["captioner", "global_semantics", "local_semantics"]
+BackendRole = Literal[
+    "captioner",
+    "global_semantics",
+    "local_semantics",
+    "music_rescue",
+]
 StageStatus = Literal["ready", "failed", "blocked"]
 InputModality = Literal[
     "canonical_full_audio_only",
@@ -165,8 +174,46 @@ television, phone, loudspeaker, live performance, or a person playing an
 instrument. A hum, buzz, whine, drone, tone, or electronic tone alone is not
 music. Return the same three-field schema as one compact JSON object."""
 
+MUSIC_RESCUE_SYSTEM_PROMPT = """Listen specifically for audible musical
+accompaniment in this audio. Detect music with high recall, especially quiet or
+low-volume background music partially masked by speech. Musical evidence can
+include melody, harmony, instrumental accompaniment, rhythmic musical backing,
+synth music, score-like material, repeating musical phrases, or a continuous
+musical bed.
+
+If clearly musical audio is audible and there is no explicit audible evidence
+that it comes from an in-scene source, describe it as non_diegetic_music. Only
+exclude music when there is clear audible evidence that it comes from an
+in-scene source such as a radio, television, phone, loudspeaker, live
+performance, or a person playing an instrument. Do not treat an ordinary hum,
+buzz, whine, ringing, drone, or isolated electronic tone as music unless
+additional musical structure is audible. Do not infer music from dialogue
+content, plot, emotion, or expected scene context.
+
+Return exactly one compact JSON object:
+{"non_diegetic_music":"<concise English audible music description>"}
+or {"non_diegetic_music":null}. No markdown, reasoning, explanation, or extra
+fields."""
+
+def _fingerprint_payload(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _fingerprint_payload(item)
+            for key, item in value.items()
+            if not (key == "runtime_dependency_fingerprints" and item is None)
+        }
+    if isinstance(value, list):
+        return [_fingerprint_payload(item) for item in value]
+    return value
+
+
 def _compact_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        _fingerprint_payload(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _sha256_text(value: str) -> str:
@@ -223,7 +270,7 @@ class SpecializedBackendProvenance(SchemaModel):
         "r2v.h3.specialized_audio_backend_provenance.1"
     ] = BACKEND_PROVENANCE_VERSION
     backend: Literal["vllm"] = "vllm"
-    role: StageRole
+    role: BackendRole
     served_model_name: str
     checkpoint_id: str
     base_url: str
@@ -240,6 +287,7 @@ class SpecializedBackendProvenance(SchemaModel):
     top_k: int | None = Field(default=None, ge=1)
     max_tokens: int = Field(gt=0)
     repair_retries: Literal[1] = 1
+    runtime_dependency_fingerprints: dict[str, str] | None = None
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -263,13 +311,14 @@ class SpecializedBackendProvenance(SchemaModel):
                 raise ValueError("media backend provenance requires media root")
             if (self.media_mode == "http") != (self.media_base_url is not None):
                 raise ValueError("specialized HTTP media provenance is inconsistent")
-        expected_modalities: dict[StageRole, set[InputModality]] = {
+        expected_modalities: dict[BackendRole, set[InputModality]] = {
             "captioner": {"canonical_full_audio_only"},
             "global_semantics": {"captioner_text_only"},
             "local_semantics": {
                 "canonical_full_audio_only",
                 "target_video_plus_canonical_full_audio",
             },
+            "music_rescue": {"canonical_full_audio_only"},
         }
         if self.input_modality not in expected_modalities[self.role]:
             raise ValueError("specialized backend role and modality differ")
@@ -279,6 +328,8 @@ class SpecializedBackendProvenance(SchemaModel):
         elif self.temperature != 0 or self.top_p is not None or self.top_k is not None:
             raise ValueError("structured semantics provenance must be deterministic")
         values = self.model_dump(mode="json", exclude={"configuration_fingerprint"})
+        if self.runtime_dependency_fingerprints is None:
+            values.pop("runtime_dependency_fingerprints")
         if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("specialized backend fingerprint is invalid")
         return self
@@ -299,6 +350,19 @@ class GlobalAudioSemanticsResponse(SchemaModel):
             value = getattr(self, field_name)
             if value is not None and not value.strip():
                 raise ValueError(f"{field_name} must be non-empty or null")
+        return self
+
+
+class DirectAudioMusicResponse(SchemaModel):
+    non_diegetic_music: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def validate_music(self) -> DirectAudioMusicResponse:
+        if (
+            self.non_diegetic_music is not None
+            and not self.non_diegetic_music.strip()
+        ):
+            raise ValueError("non_diegetic_music must be non-empty or null")
         return self
 
 
@@ -607,8 +671,44 @@ class LocalSemanticsConfig:
         )
 
 
+@dataclass(frozen=True)
+class MusicRescueConfig:
+    base_url: str
+    api_key: str
+    served_model_name: str
+    checkpoint_id: str
+    media_resolver: MediaURLResolver
+    timeout_seconds: float = 600.0
+    max_tokens: int = 2048
+
+    def __post_init__(self) -> None:
+        _validate_runtime_config(self)
+
+    def provenance(self) -> SpecializedBackendProvenance:
+        return _provenance(
+            role="music_rescue",
+            served_model_name=self.served_model_name,
+            checkpoint_id=self.checkpoint_id,
+            base_url=self.base_url,
+            input_modality="canonical_full_audio_only",
+            media_resolver=self.media_resolver,
+            prompt_version=MUSIC_RESCUE_PROMPT_VERSION,
+            fallback_prompt_version=f"{MUSIC_RESCUE_PROMPT_VERSION}_repair",
+            fallback_policy_version=MUSIC_RESCUE_POLICY_VERSION,
+            temperature=0.0,
+            top_p=None,
+            top_k=None,
+            max_tokens=self.max_tokens,
+        )
+
+
 def _validate_runtime_config(
-    config: CaptionerConfig | GlobalSemanticsConfig | LocalSemanticsConfig,
+    config: (
+        CaptionerConfig
+        | GlobalSemanticsConfig
+        | LocalSemanticsConfig
+        | MusicRescueConfig
+    ),
 ) -> None:
     values = [
         getattr(config, field_name)
@@ -650,7 +750,7 @@ def _validate_runtime_config(
 
 def _provenance(
     *,
-    role: StageRole,
+    role: BackendRole,
     served_model_name: str,
     checkpoint_id: str,
     base_url: str,
@@ -686,6 +786,31 @@ def _provenance(
         "top_k": top_k,
         "max_tokens": max_tokens,
         "repair_retries": 1,
+    }
+    return SpecializedBackendProvenance(
+        **values,
+        configuration_fingerprint=_sha256_text(_compact_json(values)),
+    )
+
+
+def _global_runtime_provenance(
+    global_provenance: SpecializedBackendProvenance,
+    captioner_provenance: SpecializedBackendProvenance,
+    music_provenance: SpecializedBackendProvenance,
+) -> SpecializedBackendProvenance:
+    if global_provenance.role != "global_semantics":
+        raise ValueError("global runtime requires global semantics provenance")
+    if captioner_provenance.role != "captioner":
+        raise ValueError("global runtime requires captioner provenance")
+    if music_provenance.role != "music_rescue":
+        raise ValueError("global runtime requires music rescue provenance")
+    values = global_provenance.model_dump(
+        mode="json",
+        exclude={"configuration_fingerprint", "runtime_dependency_fingerprints"},
+    )
+    values["runtime_dependency_fingerprints"] = {
+        "recaption_captioner": captioner_provenance.configuration_fingerprint,
+        "direct_audio_music_rescue": music_provenance.configuration_fingerprint,
     }
     return SpecializedBackendProvenance(
         **values,
@@ -806,6 +931,15 @@ class LocalSemanticsBackend(Protocol):
     def describe(
         self, job: JEATargetAudioCaptionJob
     ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]: ...
+
+
+class MusicRescueBackend(Protocol):
+    @property
+    def provenance(self) -> SpecializedBackendProvenance: ...
+
+    def detect(
+        self, job: JEATargetAudioCaptionJob
+    ) -> SpecializedBackendResult[DirectAudioMusicResponse]: ...
 
 
 class _OpenAIBackendBase:
@@ -1141,6 +1275,121 @@ class OpenAIGlobalSemanticsBackend(_OpenAIBackendBase):
         )
 
 
+class OpenAIMusicRescueBackend(_OpenAIBackendBase):
+    def __init__(
+        self, config: MusicRescueConfig, *, client: Any | None = None
+    ) -> None:
+        super().__init__(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout_seconds=config.timeout_seconds,
+            client=client,
+        )
+        self.config = config
+
+    @property
+    def provenance(self) -> SpecializedBackendProvenance:
+        return self.config.provenance()
+
+    def detect(
+        self, job: JEATargetAudioCaptionJob
+    ) -> SpecializedBackendResult[DirectAudioMusicResponse]:
+        try:
+            audio_path = _verify_file(
+                job.target_full_audio_path,
+                job.target_full_audio_sha256,
+                field_name="target full audio",
+            )
+        except (OSError, ValueError) as exc:
+            raise SpecializedBackendFailure(
+                code="music_rescue_media_unavailable",
+                reason=f"{type(exc).__name__}: {exc}",
+            ) from exc
+        raw_responses: list[str] = []
+        diagnostics: list[CompletionDiagnostic] = []
+        issues: list[ValidationIssue] = []
+        audio_item = {
+            "type": "audio_url",
+            "audio_url": {"url": self.config.media_resolver.resolve(audio_path)},
+        }
+        for attempt in range(2):
+            content: list[dict[str, object]] = [audio_item]
+            if attempt:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "Repair the prior JSON format only. Follow the same "
+                            "music-listening policy, add no fields, and return one "
+                            "compact JSON object.\nIssues:\n"
+                            f"{_compact_json([item.to_dict() for item in issues])}"
+                            "\nInvalid response:\n"
+                            f"{raw_responses[-1]}"
+                        ),
+                    }
+                )
+            request: dict[str, object] = {
+                "model": self.config.served_model_name,
+                "messages": [
+                    {"role": "system", "content": MUSIC_RESCUE_SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+                "temperature": 0.0,
+                "max_tokens": self.config.max_tokens,
+                "modalities": ["text"],
+                "stream": False,
+                "response_format": _json_schema_response_format(
+                    DirectAudioMusicResponse,
+                    name="direct_audio_music",
+                ),
+                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            }
+            try:
+                raw, diagnostic = self._call(request, role="music_rescue")
+            except SpecializedBackendFailure as exc:
+                if exc.code != "music_rescue_invalid_response":
+                    raise
+                raw_responses.append("")
+                diagnostics.extend(exc.diagnostics)
+                issues = [
+                    ValidationIssue(
+                        code="invalid_response_type",
+                        field=None,
+                        message=exc.reason,
+                    )
+                ]
+                continue
+            raw_responses.append(raw)
+            diagnostics.append(diagnostic)
+            if not raw.strip():
+                raise SpecializedBackendFailure(
+                    code="music_rescue_empty_response",
+                    reason="direct-audio music rescue returned empty text",
+                    raw_responses=raw_responses,
+                    diagnostics=diagnostics,
+                    model_call_count=len(raw_responses),
+                )
+            response, issues = parse_structured_json_issues(
+                raw,
+                DirectAudioMusicResponse,
+            )
+            if response is not None:
+                return SpecializedBackendResult(
+                    response=response,
+                    raw_responses=tuple(raw_responses),
+                    diagnostics=tuple(diagnostics),
+                    model_call_count=len(raw_responses),
+                )
+        raise SpecializedBackendFailure(
+            code="music_rescue_structured_output_failed",
+            reason="direct-audio music rescue failed closed after one repair",
+            raw_responses=raw_responses,
+            diagnostics=diagnostics,
+            issues=issues,
+            model_call_count=len(raw_responses),
+        )
+
+
 def _specialized_diagnostics(
     diagnostics: Sequence[Any],
 ) -> tuple[CompletionDiagnostic, ...]:
@@ -1347,7 +1596,7 @@ class CaptionerRecord(SchemaModel):
 
 
 class GlobalSemanticsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_global_audio_semantics.2"] = (
+    schema_version: Literal["r2v.h3.specialized_global_audio_semantics.3"] = (
         GLOBAL_RECORD_VERSION
     )
     target_clip_uid: str
@@ -1360,6 +1609,8 @@ class GlobalSemanticsRecord(SchemaModel):
     fallback_attempted: bool = False
     recaption_rescue_attempted: bool = False
     recaption_rescue_used: bool = False
+    music_rescue_attempted: bool = False
+    music_rescue_used: bool = False
     captioner_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_audio_caption_sha256: str | None = Field(
         default=None,
@@ -1381,6 +1632,8 @@ class GlobalSemanticsRecord(SchemaModel):
             raise ValueError("global response diagnostics differ")
         if self.recaption_rescue_used and not self.recaption_rescue_attempted:
             raise ValueError("used recaption rescue must be attempted")
+        if self.music_rescue_used and not self.music_rescue_attempted:
+            raise ValueError("used music rescue must be attempted")
         values = (
             self.overall_audio_description,
             self.overall_soundscape,
@@ -1403,6 +1656,8 @@ class GlobalSemanticsRecord(SchemaModel):
             or self.raw_response_count
             or self.recaption_rescue_attempted
             or self.recaption_rescue_used
+            or self.music_rescue_attempted
+            or self.music_rescue_used
             or self.failure is None
         ):
             raise ValueError("blocked global record must not claim model work")
@@ -1607,11 +1862,14 @@ def captioner_request_fingerprint(
 def global_request_fingerprint(
     raw_audio_caption: str,
     provenance: SpecializedBackendProvenance,
+    *,
+    target_full_audio_sha256: str | None = None,
 ) -> str:
     return _sha256_text(
         _compact_json(
             {
                 "raw_audio_caption_sha256": _sha256_text(raw_audio_caption),
+                "target_full_audio_sha256": target_full_audio_sha256,
                 "backend_configuration_fingerprint": provenance.configuration_fingerprint,
                 "prompt_version": GLOBAL_PROMPT_VERSION,
                 "fallback_prompt_version": GLOBAL_FALLBACK_PROMPT_VERSION,
@@ -1619,6 +1877,8 @@ def global_request_fingerprint(
                 "recaption_rescue_policy_version": (
                     GLOBAL_RECAPTION_RESCUE_POLICY_VERSION
                 ),
+                "music_rescue_prompt_version": MUSIC_RESCUE_PROMPT_VERSION,
+                "music_rescue_policy_version": MUSIC_RESCUE_POLICY_VERSION,
             }
         )
     )
@@ -1912,6 +2172,14 @@ class _RecaptionGlobalOutcome:
     failure: SpecializedBackendFailure | None = None
 
 
+@dataclass(frozen=True)
+class _MusicRescueOutcome:
+    job: JEATargetAudioCaptionJob
+    backend_provenance: SpecializedBackendProvenance
+    result: SpecializedBackendResult[DirectAudioMusicResponse] | None = None
+    failure: SpecializedBackendFailure | None = None
+
+
 def _recaption_caption(
     job: JEATargetAudioCaptionJob,
     backend: CaptionerBackend,
@@ -1956,13 +2224,28 @@ def _recaption_global(
         )
 
 
+def _detect_music(
+    job: JEATargetAudioCaptionJob,
+    backend: MusicRescueBackend,
+) -> _MusicRescueOutcome:
+    try:
+        return _MusicRescueOutcome(
+            job=job,
+            backend_provenance=backend.provenance,
+            result=backend.detect(job),
+        )
+    except SpecializedBackendFailure as exc:
+        return _MusicRescueOutcome(
+            job=job,
+            backend_provenance=backend.provenance,
+            failure=exc,
+        )
+
+
 def _needs_recaption_rescue(record: GlobalSemanticsRecord) -> bool:
     return record.status == "failed" or (
         record.status == "ready"
-        and (
-            record.overall_audio_description is None
-            or record.non_diegetic_music is None
-        )
+        and record.overall_audio_description is None
     )
 
 
@@ -2156,18 +2439,143 @@ def _merge_recaption_outcome(
             item.model_dump(mode="json") for item in diagnostics
         ],
         "failure": None if failure is None else failure.model_dump(mode="json"),
-        "primary_global": primary.raw,
+        "primary_global": primary.raw.get("primary_global", primary.raw),
         "recaption_rescue": _outcome_raw(outcome, used=used),
     }
     return _ProcessedRecord(record=record, raw=raw)
+
+
+def _music_outcome_raw(
+    outcome: _MusicRescueOutcome,
+    *,
+    used: bool,
+) -> dict[str, object]:
+    result = outcome.result
+    failure = outcome.failure
+    if result is not None:
+        payload = _raw_payload(
+            status="ready",
+            raw_responses=result.raw_responses,
+            diagnostics=result.diagnostics,
+        )
+    else:
+        assert failure is not None
+        payload = _raw_payload(
+            status="failed",
+            raw_responses=failure.raw_responses,
+            diagnostics=failure.diagnostics,
+            failure=failure,
+        )
+    return {
+        "attempted": True,
+        "used": used,
+        "prompt_version": MUSIC_RESCUE_PROMPT_VERSION,
+        "policy_version": MUSIC_RESCUE_POLICY_VERSION,
+        "backend_provenance": outcome.backend_provenance.model_dump(mode="json"),
+        **payload,
+    }
+
+
+def _unattempted_rescue_raw(
+    processed: _ProcessedRecord[GlobalSemanticsRecord],
+) -> _ProcessedRecord[GlobalSemanticsRecord]:
+    raw = dict(processed.raw)
+    raw.setdefault("primary_global", processed.raw)
+    raw.setdefault(
+        "recaption_rescue",
+        {
+            "attempted": False,
+            "used": False,
+            "policy_version": GLOBAL_RECAPTION_RESCUE_POLICY_VERSION,
+        },
+    )
+    raw["music_rescue"] = {
+        "attempted": False,
+        "used": False,
+        "prompt_version": MUSIC_RESCUE_PROMPT_VERSION,
+        "policy_version": MUSIC_RESCUE_POLICY_VERSION,
+    }
+    return _ProcessedRecord(record=processed.record, raw=raw)
+
+
+def _merge_music_outcome(
+    current: _ProcessedRecord[GlobalSemanticsRecord],
+    outcome: _MusicRescueOutcome,
+) -> _ProcessedRecord[GlobalSemanticsRecord]:
+    record = current.record
+    if record.status != "ready" or record.non_diegetic_music is not None:
+        raise ValueError("music rescue requires ready global semantics without music")
+    result = outcome.result
+    failure = outcome.failure
+    music = None if result is None else result.response.non_diegetic_music
+    used = music is not None
+    diagnostics = [
+        *record.completion_diagnostics,
+        *(
+            result.diagnostics
+            if result is not None
+            else (() if failure is None else failure.diagnostics)
+        ),
+    ]
+    model_call_count = (
+        result.model_call_count
+        if result is not None
+        else (0 if failure is None else failure.model_call_count)
+    )
+    values = record.model_dump(
+        mode="python",
+        exclude={"schema_version", "record_fingerprint"},
+    )
+    values["backend_provenance"] = record.backend_provenance
+    values.update(
+        {
+            "non_diegetic_music": music,
+            "music_rescue_attempted": True,
+            "music_rescue_used": used,
+            "model_call_count": record.model_call_count + model_call_count,
+            "raw_response_count": len(diagnostics),
+            "completion_diagnostics": diagnostics,
+        }
+    )
+    merged_record = _make_record(GlobalSemanticsRecord, values)
+    result_raw_responses = (
+        result.raw_responses
+        if result is not None
+        else (() if failure is None else failure.raw_responses)
+    )
+    raw = dict(current.raw)
+    raw.setdefault("primary_global", current.raw)
+    raw.setdefault(
+        "recaption_rescue",
+        {
+            "attempted": False,
+            "used": False,
+            "policy_version": GLOBAL_RECAPTION_RESCUE_POLICY_VERSION,
+        },
+    )
+    raw.update(
+        {
+            "status": "ready",
+            "raw_responses": [
+                *current.raw.get("raw_responses", []),
+                *result_raw_responses,
+            ],
+            "completion_diagnostics": [
+                item.model_dump(mode="json") for item in diagnostics
+            ],
+            "music_rescue": _music_outcome_raw(outcome, used=used),
+        }
+    )
+    return _ProcessedRecord(record=merged_record, raw=raw)
 
 
 def _global_record(
     job: JEATargetAudioCaptionJob,
     captioner: CaptionerRecord,
     backend: GlobalSemanticsBackend,
+    runtime_provenance: SpecializedBackendProvenance | None = None,
 ) -> _ProcessedRecord[GlobalSemanticsRecord]:
-    provenance = backend.provenance
+    provenance = runtime_provenance or backend.provenance
     if captioner.status != "ready":
         failure = SpecializedStageFailure(
             code="captioner_not_ready",
@@ -2180,6 +2588,8 @@ def _global_record(
             "status": "blocked",
             "recaption_rescue_attempted": False,
             "recaption_rescue_used": False,
+            "music_rescue_attempted": False,
+            "music_rescue_used": False,
             "captioner_record_fingerprint": captioner.record_fingerprint,
             "raw_audio_caption_sha256": None,
             "backend_provenance": provenance,
@@ -2199,6 +2609,7 @@ def _global_record(
     request_fingerprint = global_request_fingerprint(
         captioner.raw_audio_caption,
         provenance,
+        target_full_audio_sha256=job.target_full_audio_sha256,
     )
     try:
         result = backend.extract(job, captioner.raw_audio_caption)
@@ -2213,6 +2624,8 @@ def _global_record(
             "fallback_attempted": result.fallback_attempted,
             "recaption_rescue_attempted": False,
             "recaption_rescue_used": False,
+            "music_rescue_attempted": False,
+            "music_rescue_used": False,
             "captioner_record_fingerprint": captioner.record_fingerprint,
             "raw_audio_caption_sha256": raw_caption_hash,
             "backend_provenance": provenance,
@@ -2239,6 +2652,8 @@ def _global_record(
             "status": "failed",
             "recaption_rescue_attempted": False,
             "recaption_rescue_used": False,
+            "music_rescue_attempted": False,
+            "music_rescue_used": False,
             "captioner_record_fingerprint": captioner.record_fingerprint,
             "raw_audio_caption_sha256": raw_caption_hash,
             "backend_provenance": provenance,
@@ -2517,6 +2932,41 @@ def _run_recaption_rescues(
     ]
 
 
+def _run_music_rescues(
+    *,
+    jobs: Sequence[JEATargetAudioCaptionJob],
+    processed: Sequence[_ProcessedRecord[GlobalSemanticsRecord]],
+    music_backend: MusicRescueBackend,
+    max_inflight: int,
+) -> list[_ProcessedRecord[GlobalSemanticsRecord]]:
+    jobs_by_clip = {job.target_clip_uid: job for job in jobs}
+    candidates = [
+        item
+        for item in processed
+        if item.record.status == "ready"
+        and item.record.non_diegetic_music is None
+    ]
+    outcomes = _bounded_map(
+        [jobs_by_clip[item.record.target_clip_uid] for item in candidates],
+        lambda job: _detect_music(job, music_backend),
+        max_inflight=max_inflight,
+    )
+    current_by_clip = {item.record.target_clip_uid: item for item in candidates}
+    merged_by_clip = {
+        outcome.job.target_clip_uid: _merge_music_outcome(
+            current_by_clip[outcome.job.target_clip_uid],
+            outcome,
+        )
+        for outcome in outcomes
+    }
+    return [
+        merged_by_clip[item.record.target_clip_uid]
+        if item.record.target_clip_uid in merged_by_clip
+        else _unattempted_rescue_raw(item)
+        for item in processed
+    ]
+
+
 def run_captioner_phase(
     *,
     inventory: JEATargetAudioCaptionInventory,
@@ -2568,13 +3018,19 @@ def run_global_semantics_phase(
     output_root: Path,
     backend: GlobalSemanticsBackend,
     captioner_backend: CaptionerBackend,
+    music_backend: MusicRescueBackend,
     overwrite: bool = False,
     max_inflight: int = 4,
     captioner_max_inflight: int = 1,
+    music_max_inflight: int = 1,
 ) -> tuple[list[GlobalSemanticsRecord], SpecializedStageSummary]:
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "global_semantics")
-    provenance = backend.provenance
+    provenance = _global_runtime_provenance(
+        backend.provenance,
+        captioner_backend.provenance,
+        music_backend.provenance,
+    )
     captioner_records, captioner_summary = _load_stage(
         destination=_stage_path(root, "captioner"),
         role="captioner",
@@ -2599,7 +3055,12 @@ def run_global_semantics_phase(
     by_clip = {record.target_clip_uid: record for record in captioner_records}
     processed = _bounded_process(
         inventory.jobs,
-        lambda job: _global_record(job, by_clip[job.target_clip_uid], backend),
+        lambda job: _global_record(
+            job,
+            by_clip[job.target_clip_uid],
+            backend,
+            provenance,
+        ),
         max_inflight=max_inflight,
     )
     processed = _run_recaption_rescues(
@@ -2609,6 +3070,12 @@ def run_global_semantics_phase(
         global_backend=backend,
         captioner_max_inflight=captioner_max_inflight,
         global_max_inflight=max_inflight,
+    )
+    processed = _run_music_rescues(
+        jobs=inventory.jobs,
+        processed=processed,
+        music_backend=music_backend,
+        max_inflight=music_max_inflight,
     )
     records = [item.record for item in processed]
     summary = _summary(
@@ -3204,6 +3671,7 @@ def run_specialized_pipeline(
     captioner_backend: CaptionerBackend,
     global_backend: GlobalSemanticsBackend,
     local_backend: LocalSemanticsBackend,
+    music_backend: MusicRescueBackend,
     overwrite: bool = False,
     captioner_max_inflight: int = 1,
     global_vl_max_inflight: int = 4,
@@ -3217,6 +3685,11 @@ def run_specialized_pipeline(
     if any(value < 1 for value in limits):
         raise ValueError("specialized pipeline inflight limits must be positive")
     root = _ensure_root(inventory, output_root)
+    global_runtime_provenance = _global_runtime_provenance(
+        global_backend.provenance,
+        captioner_backend.provenance,
+        music_backend.provenance,
+    )
     assembled_destination = _stage_path(root, "assembled")
     if overwrite and assembled_destination.exists():
         _assert_overwrite_ownership(
@@ -3235,7 +3708,7 @@ def run_specialized_pipeline(
         root=root,
         role="global_semantics",
         inventory=inventory,
-        provenance=global_backend.provenance,
+        provenance=global_runtime_provenance,
         model=GlobalSemanticsRecord,
         overwrite=overwrite,
     )
@@ -3321,7 +3794,13 @@ def run_specialized_pipeline(
                 job = global_pending.popleft()
                 caption = caption_by_clip[job.target_clip_uid].record
                 global_futures[
-                    global_executor.submit(_global_record, job, caption, global_backend)
+                    global_executor.submit(
+                        _global_record,
+                        job,
+                        caption,
+                        global_backend,
+                        global_runtime_provenance,
+                    )
                 ] = job.target_clip_uid
             while (
                 caption_pending
@@ -3368,6 +3847,12 @@ def run_specialized_pipeline(
             captioner_max_inflight=captioner_max_inflight,
             global_max_inflight=global_vl_max_inflight,
         )
+        global_processed = _run_music_rescues(
+            jobs=inventory.jobs,
+            processed=global_processed,
+            music_backend=music_backend,
+            max_inflight=local_instruct_max_inflight,
+        )
     caption_records = [item.record for item in caption_processed]
     global_records = [item.record for item in global_processed]
     local_records = [item.record for item in local_processed]
@@ -3390,7 +3875,7 @@ def run_specialized_pipeline(
         global_summary = _summary(
             role="global_semantics",
             inventory=inventory,
-            provenance=global_backend.provenance,
+            provenance=global_runtime_provenance,
             records=global_records,
         )
         _publish_stage(
@@ -3474,10 +3959,14 @@ __all__ = [
     "LOCAL_PROMPT_VERSION",
     "LOCAL_RECORD_VERSION",
     "LOCAL_SYSTEM_PROMPT",
+    "MUSIC_RESCUE_POLICY_VERSION",
+    "MUSIC_RESCUE_PROMPT_VERSION",
+    "MUSIC_RESCUE_SYSTEM_PROMPT",
     "CaptionerBackend",
     "CaptionerBackendResult",
     "CaptionerConfig",
     "CaptionerRecord",
+    "DirectAudioMusicResponse",
     "GlobalAudioSemanticsResponse",
     "GlobalSemanticsBackend",
     "GlobalSemanticsConfig",
@@ -3486,9 +3975,12 @@ __all__ = [
     "LocalSemanticsBackend",
     "LocalSemanticsConfig",
     "LocalSemanticsRecord",
+    "MusicRescueBackend",
+    "MusicRescueConfig",
     "OpenAICaptionerBackend",
     "OpenAIGlobalSemanticsBackend",
     "OpenAILocalSemanticsBackend",
+    "OpenAIMusicRescueBackend",
     "SpecializedAssembledSummary",
     "SpecializedAudioSemanticsRecord",
     "SpecializedBackendFailure",

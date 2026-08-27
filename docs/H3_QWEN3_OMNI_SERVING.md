@@ -4,7 +4,8 @@ This runbook records the current specialized-audio deployment used by
 `tools/run_h3_specialized_audio_semantics.py` on the JEA production node.
 The specialized pipeline now uses **two Qwen3-Omni services at the same time**:
 
-- Qwen3-Omni-30B-A3B-Instruct, thinker-only, for Local speaker/event semantics.
+- Qwen3-Omni-30B-A3B-Instruct, thinker-only, for Local speaker/event semantics
+  and the later direct-audio music-only rescue.
 - Qwen3-Omni-30B-A3B-Captioner for canonical whole-audio captioning and Global
   recaption rescue.
 
@@ -275,12 +276,13 @@ export no_proxy='127.0.0.1,localhost'
 
 ## Which services are required by each phase
 
-The Global phase now has a one-time **recaption rescue**. Therefore it may call
-Captioner again when Global semantics are missing. Service requirements are:
+The Global phase has a one-time recaption rescue for failed or missing main
+description, followed by a direct-audio music-only rescue when the final ready
+Global record still has null `non_diegetic_music`. Service requirements are:
 
 ```text
 --phase captioner         requires 8092 Captioner
---phase global-semantics  requires 8000 Qwen3-VL + 8092 Captioner
+--phase global-semantics  requires 8000 Qwen3-VL + 8092 Captioner + 8091 Instruct
 --phase local-semantics   requires 8091 Instruct
 --phase assemble          requires no model service
 --phase pipeline          requires 8000 + 8091 + 8092
@@ -333,12 +335,15 @@ failure does not discard valid speaker semantics.
 
 The Captioner is stochastic by design. A single caption can miss an audible fact
 or make a false negative statement such as `There are no musical elements`.
-Global extraction therefore has one best-effort recaption rescue when the primary
-Global record fails or when `overall_audio_description` or
-`non_diegetic_music` is missing. The rescue never overwrites a non-null primary
-Global field; it only fills fields that were missing. Rescue raw caption,
-Qwen3-VL output, diagnostics, and exact call counts are preserved in the Global
-raw artifact.
+Global extraction therefore has one best-effort recaption rescue only when the
+primary Global record fails or `overall_audio_description` is missing. Null
+music alone no longer resamples Captioner. After Local work on port 8091 is fully
+finished, ready Global records with null music use that same Instruct service for
+one direct-audio music-only check against canonical full audio. It may only fill
+`non_diegetic_music`; schema-valid null is final, and detector failure cannot
+damage a ready Global record. Primary, recaption, and music-rescue raw evidence,
+diagnostics, provenance, and exact call counts remain distinct in the Global raw
+artifact.
 
 ## Historical Instruct TP4 fallback
 
