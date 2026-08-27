@@ -15,11 +15,6 @@ from pydantic import ValidationError
 
 import r2v_data_v2.h3.specialized_audio_semantics as specialized
 from r2v_data_v2.h3.jea_target_audio_caption import (
-    FALLBACK_SYSTEM_PROMPT as TARGET_AUDIO_FALLBACK_SYSTEM_PROMPT,
-)
-from r2v_data_v2.h3.jea_target_audio_caption import (
-    JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
-    JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION,
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionJob,
     _inventory_fingerprint,
@@ -33,8 +28,11 @@ from r2v_data_v2.h3.specialized_audio_semantics import (
     GLOBAL_PROMPT_VERSION,
     GLOBAL_RECAPTION_RESCUE_POLICY_VERSION,
     GLOBAL_SYSTEM_PROMPT,
+    LOCAL_FALLBACK_PROMPT_VERSION,
+    LOCAL_FALLBACK_SYSTEM_PROMPT,
     LOCAL_FIELD_POLICY_VERSION,
     LOCAL_PROMPT_VERSION,
+    LOCAL_RUNTIME_POLICY_VERSION,
     LOCAL_SYSTEM_PROMPT,
     MUSIC_RESCUE_POLICY_VERSION,
     MUSIC_RESCUE_PROMPT_VERSION,
@@ -531,8 +529,25 @@ def test_direct_audio_music_backend_uses_only_canonical_audio(tmp_path: Path) ->
         "overall_audio_description",
     ):
         assert forbidden not in serialized
-    assert "high recall" in MUSIC_RESCUE_SYSTEM_PROMPT
-    assert "ordinary hum" in MUSIC_RESCUE_SYSTEM_PROMPT
+    prompt = " ".join(MUSIC_RESCUE_SYSTEM_PROMPT.split())
+    assert "precision-oriented rescue pass" in prompt
+    for strong_evidence in (
+        "clearly audible melody",
+        "harmony or chord progression",
+        "rhythmic musical pattern or beat",
+        "clearly identifiable instrumental musical performance",
+    ):
+        assert strong_evidence in prompt
+    for insufficient in (
+        "ambient pad",
+        "electronic drone",
+        "continuous tone",
+        "vague tonal texture",
+    ):
+        assert insufficient in prompt
+    assert "is not sufficient by itself" in prompt
+    assert "ambiguous" in prompt and "return null" in prompt
+    assert "Do not invent a specific instrument" in prompt
 
 
 def test_direct_audio_music_null_is_one_semantic_call(tmp_path: Path) -> None:
@@ -641,13 +656,18 @@ def test_global_prompt_version_changes_only_global_fingerprints(tmp_path: Path) 
 
     captioner = _caption_config(inventory).provenance()
     local = _local_config(inventory).provenance()
+    caption_record = _ready_captioner_record(inventory)
     assert captioner.prompt_version == CAPTIONER_POLICY_VERSION
     assert local.prompt_version == LOCAL_PROMPT_VERSION
     assert captioner_request_fingerprint(job, captioner) == (
         captioner_request_fingerprint(job, _caption_config(inventory).provenance())
     )
-    assert local_request_fingerprint(job, local) == (
-        local_request_fingerprint(job, _local_config(inventory).provenance())
+    assert local_request_fingerprint(job, local, caption_record) == (
+        local_request_fingerprint(
+            job,
+            _local_config(inventory).provenance(),
+            caption_record,
+        )
     )
 
 
@@ -709,6 +729,7 @@ def test_global_infrastructure_failure_has_no_semantic_recheck(tmp_path: Path) -
 def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
     valid = _target_audio_response().model_dump_json()
+    caption_hint = "A quiet metallic clink is followed by a mechanical click."
     for include_video, expected_types in (
         (False, ["text", "audio_url"]),
         (True, ["text", "video_url", "audio_url"]),
@@ -718,7 +739,7 @@ def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Pat
             _local_config(inventory, include_video=include_video),
             client=client,
         )
-        result = backend.describe(inventory.jobs[0])
+        result = backend.describe(inventory.jobs[0], caption_hint)
         content = completions.requests[0]["messages"][1]["content"]  # type: ignore[index]
         assert [item["type"] for item in content] == expected_types  # type: ignore[index]
         assert len(result.response.temporal_audio_events) == 2
@@ -734,20 +755,28 @@ def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Pat
         assert completions.requests[0]["messages"][0]["content"] == (
             LOCAL_SYSTEM_PROMPT
         )
+        assert caption_hint in serialized
+        assert "UNTRUSTED SEARCH HINTS ONLY" in serialized
+        assert "AUDIO IS SOURCE OF TRUTH" in serialized
+        assert "Ignore the Captioner observation completely" in serialized
+        assert "partially masked by speech" in serialized
+        assert "ordinary speech" in serialized
+        for allowed_nonlinguistic in ("laughter", "coughs", "gasps", "sighs"):
+            assert allowed_nonlinguistic in serialized
         assert len(completions.requests) == 1
         assert "SECRET TRANSCRIPT" not in serialized
 
 
-def test_local_reuses_verified_target_audio_prompt_versions(tmp_path: Path) -> None:
+def test_local_uses_specialized_hint_and_event_policy_versions(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
     config = _local_config(inventory)
     provenance = config.provenance()
-    assert LOCAL_PROMPT_VERSION == JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
-    assert provenance.prompt_version == "h3_target_audio_semantics_v2"
-    assert provenance.fallback_prompt_version == (
-        JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
-    )
+    assert LOCAL_PROMPT_VERSION == "h3_specialized_local_audio_semantics_v1"
+    assert provenance.prompt_version == LOCAL_PROMPT_VERSION
+    assert provenance.fallback_prompt_version == LOCAL_FALLBACK_PROMPT_VERSION
     assert LOCAL_FIELD_POLICY_VERSION == "specialized_local_field_salvage_v2"
+    assert specialized.LOCAL_CAPTION_HINT_POLICY_VERSION in LOCAL_RUNTIME_POLICY_VERSION
+    assert specialized.LOCAL_EVENT_FILTER_POLICY_VERSION in LOCAL_RUNTIME_POLICY_VERSION
     previous = specialized._provenance(
         role="local_semantics",
         served_model_name=config.served_model_name,
@@ -756,7 +785,7 @@ def test_local_reuses_verified_target_audio_prompt_versions(tmp_path: Path) -> N
         input_modality="canonical_full_audio_only",
         media_resolver=config.media_resolver,
         prompt_version=LOCAL_PROMPT_VERSION,
-        fallback_prompt_version=JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
+        fallback_prompt_version="h3_target_audio_semantics_v2_recheck",
         fallback_policy_version=specialized.LOCAL_FALLBACK_POLICY_VERSION,
         temperature=0.0,
         top_p=None,
@@ -764,8 +793,11 @@ def test_local_reuses_verified_target_audio_prompt_versions(tmp_path: Path) -> N
         max_tokens=config.max_tokens,
     )
     assert provenance.configuration_fingerprint != previous.configuration_fingerprint
-    assert local_request_fingerprint(inventory.jobs[0], provenance) != (
-        local_request_fingerprint(inventory.jobs[0], previous)
+    caption_record = _ready_captioner_record(inventory)
+    assert local_request_fingerprint(
+        inventory.jobs[0], provenance, caption_record
+    ) != (
+        local_request_fingerprint(inventory.jobs[0], previous, caption_record)
     )
 
 
@@ -843,6 +875,94 @@ def test_local_normalizes_event_and_speaker_order_without_repair(
 
 
 @pytest.mark.parametrize(
+    "description",
+    [
+        "a person speaking",
+        "someone talking",
+        "speech",
+        "Dialogue.",
+        "an utterance",
+        "speech turn",
+    ],
+)
+def test_local_drops_only_pure_speech_events(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    response = TargetAudioCaptionResponse(
+        overall_soundscape=None,
+        non_diegetic_music=None,
+        temporal_audio_events=[
+            TemporalAudioEvent(
+                start_time=0.2,
+                end_time=0.5,
+                description=description,
+            )
+        ],
+        speaker_delivery=[
+            ModelSpeakerDelivery(
+                speaker_cluster_id="speaker_0",
+                delivery_style="calm",
+            )
+        ],
+    )
+    client, completions = _client([response.model_dump_json()])
+
+    result = OpenAILocalSemanticsBackend(
+        _local_config(inventory),
+        client=client,
+    ).describe(inventory.jobs[0], "A person speaks near a possible object sound.")
+
+    assert result.response.temporal_audio_events == []
+    assert result.semantic_source == "primary"
+    assert result.model_call_count == 1
+    assert len(completions.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "metallic clink while a person is speaking",
+        "door slam during dialogue",
+        "brief knock overlapping speech",
+    ],
+)
+def test_local_preserves_real_events_that_overlap_speech(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    response = TargetAudioCaptionResponse(
+        overall_soundscape=None,
+        non_diegetic_music=None,
+        temporal_audio_events=[
+            TemporalAudioEvent(
+                start_time=0.2,
+                end_time=0.5,
+                description=description,
+            )
+        ],
+        speaker_delivery=[
+            ModelSpeakerDelivery(
+                speaker_cluster_id="speaker_0",
+                delivery_style="calm",
+            )
+        ],
+    )
+    client, _ = _client([response.model_dump_json()])
+
+    result = OpenAILocalSemanticsBackend(
+        _local_config(inventory),
+        client=client,
+    ).describe(inventory.jobs[0], "Possible impact under speech.")
+
+    assert [event.description for event in result.response.temporal_audio_events] == [
+        description
+    ]
+
+
+@pytest.mark.parametrize(
     "wrapped",
     [
         "Assistant: {payload}",
@@ -899,11 +1019,13 @@ def test_local_invalid_cluster_or_timing_repairs_once(
 ) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
     client, completions = _client([json.dumps(invalid), _local_response().model_dump_json()])
+    caption_hint = "A metallic clink may be audible."
     result = OpenAILocalSemanticsBackend(
         _local_config(inventory), client=client
-    ).describe(inventory.jobs[0])
+    ).describe(inventory.jobs[0], caption_hint)
     assert result.model_call_count == 2
     assert len(completions.requests) == 2
+    assert all(caption_hint in json.dumps(request) for request in completions.requests)
 
 
 def test_local_all_null_and_whitespace_recheck(tmp_path: Path) -> None:
@@ -917,14 +1039,16 @@ def test_local_all_null_and_whitespace_recheck(tmp_path: Path) -> None:
         ],
     ).model_dump_json()
     client, completions = _client([null_response, null_response])
+    caption_hint = "A faint door click may be present."
     result = OpenAILocalSemanticsBackend(
         _local_config(inventory), client=client
-    ).describe(inventory.jobs[0])
+    ).describe(inventory.jobs[0], caption_hint)
     assert result.semantic_source == "fallback_all_null_confirmed"
     assert len(completions.requests) == 2
     assert completions.requests[1]["messages"][0]["content"] == (
-        TARGET_AUDIO_FALLBACK_SYSTEM_PROMPT
+        LOCAL_FALLBACK_SYSTEM_PROMPT
     )
+    assert all(caption_hint in json.dumps(request) for request in completions.requests)
 
     client, completions = _client([" ", _target_audio_response().model_dump_json()])
     result = OpenAILocalSemanticsBackend(
@@ -1010,8 +1134,11 @@ def test_request_fingerprints_cover_semantics_but_not_inflight(tmp_path: Path) -
     )
     local_audio = _local_config(inventory).provenance()
     local_video = _local_config(inventory, include_video=True).provenance()
-    assert local_request_fingerprint(job, local_audio) != local_request_fingerprint(
-        job, local_video
+    caption_record = _ready_captioner_record(inventory)
+    assert local_request_fingerprint(
+        job, local_audio, caption_record
+    ) != local_request_fingerprint(
+        job, local_video, caption_record
     )
     assert GLOBAL_PROMPT_VERSION in global_a.prompt_version
     assert LOCAL_PROMPT_VERSION in local_audio.prompt_version
@@ -1056,15 +1183,20 @@ def test_global_runtime_fingerprint_covers_music_and_recaption_dependencies(
         "recaption_captioner": captioner.configuration_fingerprint,
         "direct_audio_music_rescue": music_a.configuration_fingerprint,
     }
-    assert MUSIC_RESCUE_PROMPT_VERSION == "h3_non_diegetic_music_direct_audio_v1"
+    assert MUSIC_RESCUE_PROMPT_VERSION == "h3_non_diegetic_music_direct_audio_v2"
     assert MUSIC_RESCUE_POLICY_VERSION == (
-        "global_non_diegetic_music_direct_audio_once_v1"
+        "global_non_diegetic_music_direct_audio_once_v2"
     )
     assert captioner_request_fingerprint(job, captioner) == (
         captioner_request_fingerprint(job, _caption_config(inventory).provenance())
     )
-    assert local_request_fingerprint(job, local) == (
-        local_request_fingerprint(job, _local_config(inventory).provenance())
+    caption_record = _ready_captioner_record(inventory)
+    assert local_request_fingerprint(job, local, caption_record) == (
+        local_request_fingerprint(
+            job,
+            _local_config(inventory).provenance(),
+            caption_record,
+        )
     )
 
 
@@ -1079,6 +1211,7 @@ def test_optional_global_runtime_dependencies_preserve_legacy_record_hashes(
     ).record
     local = specialized._local_record(
         job,
+        caption,
         _FakeLocal(_local_config(inventory)),
     ).record
 
@@ -1132,6 +1265,7 @@ class _FakeCaptioner:
     calls: list[str] = field(default_factory=list)
     delay_by_clip: dict[str, float] = field(default_factory=dict)
     tracker: _ActivityTracker | None = None
+    completed: set[str] | None = None
 
     @property
     def provenance(self):  # type: ignore[no-untyped-def]
@@ -1157,6 +1291,8 @@ class _FakeCaptioner:
                 model_call_count=1,
             )
         finally:
+            if self.completed is not None:
+                self.completed.add(job.target_clip_uid)
             if self.tracker:
                 self.tracker.leave("captioner")
 
@@ -1310,13 +1446,22 @@ class _FakeLocal:
     calls: list[str] = field(default_factory=list)
     delay: float = 0.0
     tracker: _ActivityTracker | None = None
+    caption_hints: list[str | None] = field(default_factory=list)
+    required_captioner_completed: set[str] | None = None
 
     @property
     def provenance(self):  # type: ignore[no-untyped-def]
         return self.config.provenance()
 
-    def describe(self, job: JEATargetAudioCaptionJob):  # type: ignore[no-untyped-def]
+    def describe(
+        self,
+        job: JEATargetAudioCaptionJob,
+        raw_audio_caption: str | None = None,
+    ):  # type: ignore[no-untyped-def]
+        if self.required_captioner_completed is not None:
+            assert job.target_clip_uid in self.required_captioner_completed
         self.calls.append(job.target_clip_uid)
+        self.caption_hints.append(raw_audio_caption)
         if self.tracker:
             self.tracker.enter("local")
         try:
@@ -1357,6 +1502,18 @@ class _FakeLocal:
                 self.tracker.leave("local")
 
 
+def _ready_captioner_record(
+    inventory: JEATargetAudioCaptionInventory,
+    *,
+    index: int = 0,
+) -> specialized.CaptionerRecord:
+    job = inventory.jobs[index]
+    return specialized._captioner_record(
+        job,
+        _FakeCaptioner(_caption_config(inventory)),
+    ).record
+
+
 class _ActivityTracker:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -1386,6 +1543,74 @@ def _failure(code: str) -> SpecializedBackendFailure:
         raw_responses=(raw,),
         diagnostics=(_completion_diagnostic(raw),),
         model_call_count=1,
+    )
+
+
+def test_local_record_tracks_ready_captioner_dependency(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = inventory.jobs[0]
+    captioner = _ready_captioner_record(inventory)
+    backend = _FakeLocal(_local_config(inventory))
+
+    local = specialized._local_record(job, captioner, backend).record
+
+    assert local.schema_version == "r2v.h3.specialized_local_audio_semantics.3"
+    assert local.captioner_record_fingerprint == captioner.record_fingerprint
+    assert captioner.raw_audio_caption is not None
+    assert local.raw_audio_caption_sha256 == hashlib.sha256(
+        captioner.raw_audio_caption.encode()
+    ).hexdigest()
+    assert backend.caption_hints == [captioner.raw_audio_caption]
+
+
+def test_captioner_failure_does_not_block_local_audio_only(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = inventory.jobs[0]
+    captioner = specialized._captioner_record(
+        job,
+        _FakeCaptioner(
+            _caption_config(inventory),
+            failures={job.target_clip_uid},
+        ),
+    ).record
+    backend = _FakeLocal(_local_config(inventory))
+
+    local = specialized._local_record(job, captioner, backend).record
+
+    assert captioner.status == "failed"
+    assert local.status == "ready"
+    assert local.captioner_record_fingerprint == captioner.record_fingerprint
+    assert local.raw_audio_caption_sha256 is None
+    assert backend.caption_hints == [None]
+
+
+def test_local_dependency_rejects_resampled_captioner_record(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = inventory.jobs[0]
+    original = _ready_captioner_record(inventory)
+    local = specialized._local_record(
+        job,
+        original,
+        _FakeLocal(_local_config(inventory)),
+    ).record
+    changed = specialized._captioner_record(
+        job,
+        _FakeCaptioner(
+            _caption_config(inventory),
+            caption_prefix="resampled",
+        ),
+    ).record
+
+    with pytest.raises(ValueError, match="stale captioner records"):
+        specialized._validate_local_dependencies([local], [changed])
+    assert local_request_fingerprint(
+        job,
+        local.backend_provenance,
+        original,
+    ) != local_request_fingerprint(
+        job,
+        local.backend_provenance,
+        changed,
     )
 
 
@@ -2044,6 +2269,41 @@ def test_phases_assemble_partial_results_and_preserve_upstream(tmp_path: Path) -
     } == source_audio_before
 
 
+def test_standalone_local_requires_and_reuses_captioner_artifact(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    local = _FakeLocal(_local_config(inventory))
+
+    with pytest.raises(ValueError, match="cannot establish specialized stage ownership"):
+        run_local_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=local,
+        )
+    assert local.calls == []
+
+    captioner = _FakeCaptioner(_caption_config(inventory))
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=captioner,
+    )
+    caption_calls = list(captioner.calls)
+    records, _ = run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=local,
+    )
+
+    assert captioner.calls == caption_calls
+    assert local.caption_hints == ["raw clip-000"]
+    assert records[0].captioner_record_fingerprint == (
+        _ready_captioner_record(inventory).record_fingerprint
+    )
+
+
 def test_failed_local_salvages_strict_speaker_delivery_and_assembles_partial(
     tmp_path: Path,
 ) -> None:
@@ -2153,6 +2413,7 @@ def test_failed_local_does_not_salvage_untrusted_speaker_arrays(
     inventory = _inventory(tmp_path, clip_count=1)
     processed = specialized._local_record(
         inventory.jobs[0],
+        _ready_captioner_record(inventory),
         _FakeLocal(
             _local_config(inventory),
             failures={"clip-000"},
@@ -2190,15 +2451,22 @@ def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:
     root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
     tracker = _ActivityTracker()
     global_started = threading.Event()
+    captioner_completed: set[str] = set()
     captioner = _FakeCaptioner(
         _caption_config(inventory),
         delay_by_clip={"clip-000": 0.01, "clip-001": 0.15},
         tracker=tracker,
+        completed=captioner_completed,
     )
     global_backend = _FakeGlobal(
         _global_config(), first_started=global_started, tracker=tracker
     )
-    local = _FakeLocal(_local_config(inventory), delay=0.04, tracker=tracker)
+    local = _FakeLocal(
+        _local_config(inventory),
+        delay=0.04,
+        tracker=tracker,
+        required_captioner_completed=captioner_completed,
+    )
 
     result = run_specialized_pipeline(
         inventory=inventory,
@@ -2215,6 +2483,9 @@ def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:
     assert global_started.is_set()
     assert tracker.cross_role_peak > 1
     assert tracker.peaks == {"captioner": 2, "global": 1, "local": 1}
+    assert dict(zip(local.calls, local.caption_hints, strict=True)) == {
+        f"clip-{index:03d}": f"raw clip-{index:03d}" for index in range(5)
+    }
     assert result.peak_captioner_inflight <= 2
     assert result.peak_global_vl_inflight <= 2
     assert result.peak_local_instruct_inflight <= 1
@@ -2301,6 +2572,7 @@ def test_pipeline_failure_does_not_cancel_other_roles(tmp_path: Path) -> None:
         music_backend=_FakeMusic(_music_config(inventory)),
     )
     assert local.calls == ["clip-000", "clip-001"]
+    assert local.caption_hints == [None, "raw clip-001"]
     assert global_backend.calls == ["clip-001"]
     assert result.global_semantics_summary.blocked_count == 1
     assert result.local_semantics_summary.ready_count == 2
@@ -2388,10 +2660,11 @@ def test_stale_global_fails_independently_and_pipeline_regenerates_dependencies(
     )
     assert result.captioner_reused is True
     assert result.global_semantics_reused is False
-    assert result.local_semantics_reused is True
+    assert result.local_semantics_reused is False
     assert captioner.calls == []
     assert global_backend.calls == ["clip-000", "clip-001"]
-    assert local.calls == []
+    assert local.calls == ["clip-000", "clip-001"]
+    assert local.caption_hints == ["changed clip-000", "changed clip-001"]
     assembled = [
         json.loads(line)
         for line in (root / "assembled/records.jsonl").read_text().splitlines()
@@ -2451,10 +2724,11 @@ def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
     if changed_role == "captioner":
         assert result.captioner_reused is False
         assert result.global_semantics_reused is False
-        assert result.local_semantics_reused is True
+        assert result.local_semantics_reused is False
         assert captioner.calls == ["clip-000", "clip-001"]
         assert global_backend.calls == ["clip-000", "clip-001"]
-        assert local.calls == []
+        assert local.calls == ["clip-000", "clip-001"]
+        assert local.caption_hints == ["raw clip-000", "raw clip-001"]
     elif changed_role == "global":
         assert result.captioner_reused is True
         assert result.global_semantics_reused is False
@@ -2569,7 +2843,12 @@ def test_independent_assemble_rejects_each_changed_upstream_record(
             overwrite=True,
         )
 
-    with pytest.raises(ValueError, match="stale stage records"):
+    expected_error = (
+        "stale captioner records"
+        if changed_role == "captioner"
+        else "stale stage records"
+    )
+    with pytest.raises(ValueError, match=expected_error):
         run_assemble_phase(inventory=inventory, output_root=root)
 
 

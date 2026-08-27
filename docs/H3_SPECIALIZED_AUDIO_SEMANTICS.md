@@ -21,9 +21,10 @@ request fingerprints, and upstream dependency fingerprints.
 
 ```text
 canonical full audio -> Captioner -> Qwen3-VL Global
-                              \       -> optional recaption rescue
-                               \      -> direct-audio music rescue (8091)
-                                +----> Qwen3-Omni-Instruct Local (8091)
+                         |    \       -> optional recaption rescue
+                         |     \      -> direct-audio music rescue (8091)
+                         +----------> Qwen3-Omni-Instruct Local hints (8091)
+canonical full audio ----------------> Qwen3-Omni-Instruct Local truth (8091)
                                               |
                                               +-> assemble
 ```
@@ -121,18 +122,31 @@ not trigger another semantic listen. Malformed JSON gets the existing one
 format-repair attempt. Transport, media, or repair failure is auxiliary evidence
 only and cannot turn a ready Global record into a failure.
 
+This v2 detector is precision-oriented. It requires audible musical structure:
+a clear melody or repeating melodic phrase, harmony/chord progression, rhythmic
+musical pattern/beat, or clearly identifiable instrumental performance. An
+ambient pad, electronic drone, hum, rumble, continuous tone, isolated tone, or
+vague tonal texture is not sufficient by itself. Ambiguous music-versus-tonal
+sound returns null, and a specific instrument is named only when its timbre is
+actually clear. Upstream no-music text is not a veto; direct audio remains the
+only evidence for this rescue.
+
 ```text
-prompt: h3_non_diegetic_music_direct_audio_v1
-policy: global_non_diegetic_music_direct_audio_once_v1
+prompt: h3_non_diegetic_music_direct_audio_v2
+policy: global_non_diegetic_music_direct_audio_once_v2
 ```
 
 The canonical H3-facing field remains `non_diegetic_music`.
 
 ### Local semantics
 
-`Qwen3-Omni-30B-A3B-Instruct` receives canonical full audio and reuses the
-validated `h3_target_audio_semantics_v2` prompt/fallback path. Specialized Local
-publishes only:
+`Qwen3-Omni-30B-A3B-Instruct` receives canonical full audio plus the existing
+canonical Captioner raw caption. The caption is untrusted acoustic search hints,
+not truth: positive mentions only prompt active listening, hallucinated mentions
+must not be copied, and negative statements cannot veto sound audible in the
+audio. The attached audio remains the only factual source. Captioner evidence is
+ignored completely for `speaker_delivery`, which uses only audio and frozen
+speaker-cluster timing. Specialized Local publishes only:
 
 ```text
 temporal_audio_events
@@ -146,6 +160,14 @@ Program-side normalization handles harmless formatting variation:
 - exact `Assistant:` and complete JSON-fence wrappers are normalized;
 - a failed full Local response may conservatively salvage a complete valid
   `speaker_delivery` array without salvaging malformed event times.
+- obvious whole-string speech-only events such as `a person speaking`,
+  `someone talking`, `speech`, or `dialogue` are dropped; mixed descriptions
+  such as `metallic clink while a person is speaking` remain intact.
+
+The event pass actively scans the full clip for reliably audible brief, quiet,
+background, and speech-masked non-linguistic events. Ordinary dialogue is never
+an event; laughter, coughs, gasps, sighs, physical sounds, and other genuinely
+non-linguistic localized audio remain eligible.
 
 A failed Local record may therefore retain trusted speaker delivery while its
 `temporal_audio_events` remain unavailable.
@@ -220,7 +242,7 @@ The two Global rescues mean standalone Global may need all three services.
 ```text
 captioner         -> 8092 Captioner
 global-semantics  -> 8000 Qwen3-VL + 8092 Captioner + 8091 Omni-Instruct
-local-semantics   -> 8091 Qwen3-Omni-Instruct
+local-semantics   -> 8091 Qwen3-Omni-Instruct + existing Captioner artifact
 assemble          -> no model
 pipeline          -> 8000 + 8091 + 8092
 ```
@@ -255,6 +277,11 @@ Local only:
   --phase local-semantics \
   --local-instruct-max-inflight 1
 ```
+
+Standalone Local reads `captioner/records.jsonl` for each clip's canonical hint
+and dependency fingerprint. Port 8092 does not need to be online, but the
+Captioner stage artifact must exist. A failed per-clip Captioner record still
+allows Local to run audio-only with no hint.
 
 Assemble only:
 
@@ -291,7 +318,9 @@ rerun Local.
   music-only rescue; schema-valid null is not semantically retried.
 - Full pipeline music rescue starts only after the Local phase has finished, so
   the two uses of port 8091 do not compete.
-- Local structured extraction reuses the validated Omni prompt/fallback path.
+- Local structured extraction uses the specialized hint-aware prompt while
+  retaining the validated Omni transport, structured repair, semantic fallback,
+  and field-salvage lifecycle.
 - Local harmless order/envelope differences are normalized programmatically.
 - Local speaker semantics can survive an independent event-format failure when
   the complete speaker array is strictly recoverable.
@@ -305,10 +334,18 @@ rerun Local.
   versions and fallback policy, recaption policy, plus the 8091 music model,
   checkpoint, media configuration, prompt, and rescue policy.
 - Local fingerprint includes canonical audio, speaker clusters, duration,
-  checkpoint, prompt/fallback policy, field-salvage policy, and input modality.
+  checkpoint, prompt/fallback, field-salvage, caption-hint and event-filter
+  policies, input modality, the exact Captioner record fingerprint, and caption
+  hash when available.
 - Assembly fingerprints all three upstream records.
 
-A Global policy change does not invalidate Captioner or Local semantic identity.
+A Captioner artifact change invalidates Global, Local, and Assembly. A Global-only
+configuration change does not invalidate Local; a Local-only change does not
+invalidate Captioner or Global. In the streaming pipeline, each completed
+Captioner record independently makes that clip eligible for both Global and
+Local. Captioner failure blocks Global but still releases Local without a hint.
+Direct-audio music rescue starts only after all Local work finishes, so the two
+8091 workloads never compete.
 
 ## Review semantics
 
@@ -327,14 +364,17 @@ Temporal audio events are `[unavailable]`.
 
 ## Current pilot observations
 
-Observed on the current 35-clip pilot after adding recaption rescue:
+Observed on the current 35-clip production QA before the v2 precision and Local
+event-recall revision:
 
 ```text
-recaption rescue attempted: 20 / 35
-recaption rescue used:       4 / 35
+recaption rescue attempted:  2 / 35
+recaption rescue used:       2 / 35
+music rescue attempted:     18 / 35
+music rescue used:          13 / 35
 overall_audio_description:  35 / 35 non-null
 overall_soundscape:          35 / 35 non-null
-non_diegetic_music:          17 / 35 non-null
+non_diegetic_music:          30 / 35 non-null
 ```
 
 These numbers are observations, not acceptance thresholds. `recaption_used`
@@ -344,7 +384,7 @@ Global result; the second Captioner/Global pass recovered description and
 soundscape but both Captioner samples still denied music, so
 `non_diegetic_music` remained null.
 
-This observation motivated separating concerns: recaption now handles failed or
-missing main Global description, while null music is checked directly from
-canonical audio by the 8091 music-only rescue. The figures above predate that
-new rescue and remain historical QA evidence, not post-change results.
+Human review found false-positive music classifications and low Local event
+recall. Those findings motivated the precision-oriented direct-audio music v2
+policy and the audio-verified Captioner-hint Local event pass. The figures above
+remain pre-change QA evidence, not post-change results or thresholds.

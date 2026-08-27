@@ -1323,6 +1323,41 @@ class JEATargetAudioCaptionBackend(Protocol):
     ) -> OverallAudioDescriptionBackendResult: ...
 
 
+class JEATargetAudioCaptionPromptAdapter(Protocol):
+    system_prompt: str
+    fallback_system_prompt: str
+
+    def user_prompt(
+        self,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+    ) -> str: ...
+
+    def fallback_user_prompt(
+        self,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+    ) -> str: ...
+
+    def repair_prompt(
+        self,
+        *,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+        invalid_response: str,
+        issues: Sequence[ValidationIssue],
+    ) -> str: ...
+
+    def fallback_repair_prompt(
+        self,
+        *,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+        invalid_response: str,
+        issues: Sequence[ValidationIssue],
+    ) -> str: ...
+
+
 def _model_input(job: JEATargetAudioCaptionJob) -> dict[str, object]:
     return {
         "target_duration_seconds": job.target_duration_seconds,
@@ -1548,9 +1583,11 @@ class OpenAIJEATargetAudioCaptionBackend:
         config: JEATargetAudioCaptionConfig,
         *,
         client: Any | None = None,
+        prompt_adapter: JEATargetAudioCaptionPromptAdapter | None = None,
     ) -> None:
         self.config = config
         self._injected_client = client
+        self._prompt_adapter = prompt_adapter
         self._thread_local = threading.local()
 
     @property
@@ -1669,20 +1706,52 @@ class OpenAIJEATargetAudioCaptionBackend:
         job: JEATargetAudioCaptionJob,
         *,
         use_semantic_fallback: bool,
+        auxiliary_observation: str | None = None,
     ) -> JEATargetAudioCaptionBackendResult:
         raw_responses: list[str] = []
         completion_diagnostics: list[_ModelCompletionDiagnostic] = []
         model_call_count = 0
         issues: list[ValidationIssue] = []
-        system_prompt = (
-            FALLBACK_SYSTEM_PROMPT if use_semantic_fallback else SYSTEM_PROMPT
-        )
+        if self._prompt_adapter is None:
+            if auxiliary_observation is not None:
+                raise ValueError(
+                    "auxiliary observation requires a target-audio prompt adapter"
+                )
+            system_prompt = (
+                FALLBACK_SYSTEM_PROMPT if use_semantic_fallback else SYSTEM_PROMPT
+            )
+        else:
+            system_prompt = (
+                self._prompt_adapter.fallback_system_prompt
+                if use_semantic_fallback
+                else self._prompt_adapter.system_prompt
+            )
         for attempt in range(2):
             if attempt == 0:
-                prompt = (
-                    _fallback_user_prompt(job)
+                if self._prompt_adapter is None:
+                    prompt = (
+                        _fallback_user_prompt(job)
+                        if use_semantic_fallback
+                        else _user_prompt(job)
+                    )
+                else:
+                    builder = (
+                        self._prompt_adapter.fallback_user_prompt
+                        if use_semantic_fallback
+                        else self._prompt_adapter.user_prompt
+                    )
+                    prompt = builder(job, auxiliary_observation)
+            elif self._prompt_adapter is not None:
+                builder = (
+                    self._prompt_adapter.fallback_repair_prompt
                     if use_semantic_fallback
-                    else _user_prompt(job)
+                    else self._prompt_adapter.repair_prompt
+                )
+                prompt = builder(
+                    job=job,
+                    auxiliary_observation=auxiliary_observation,
+                    invalid_response=raw_responses[-1],
+                    issues=issues,
                 )
             elif use_semantic_fallback:
                 prompt = _fallback_repair_prompt(
@@ -1742,16 +1811,30 @@ class OpenAIJEATargetAudioCaptionBackend:
         )
 
     def describe(
-        self, job: JEATargetAudioCaptionJob
+        self,
+        job: JEATargetAudioCaptionJob,
+        *,
+        auxiliary_observation: str | None = None,
     ) -> JEATargetAudioCaptionBackendResult:
-        return self._describe(job, use_semantic_fallback=False)
+        return self._describe(
+            job,
+            use_semantic_fallback=False,
+            auxiliary_observation=auxiliary_observation,
+        )
 
     def describe_semantic_fallback(
-        self, job: JEATargetAudioCaptionJob
+        self,
+        job: JEATargetAudioCaptionJob,
+        *,
+        auxiliary_observation: str | None = None,
     ) -> JEATargetAudioCaptionBackendResult:
         if self.config.backend_family != "qwen3_omni":
             raise ValueError("semantic fallback is only available for Qwen3-Omni")
-        return self._describe(job, use_semantic_fallback=True)
+        return self._describe(
+            job,
+            use_semantic_fallback=True,
+            auxiliary_observation=auxiliary_observation,
+        )
 
     def _describe_overall_audio(
         self,
@@ -3015,6 +3098,7 @@ __all__ = [
     "JEATargetAudioCaptionConfig",
     "JEATargetAudioCaptionHumanQAExport",
     "JEATargetAudioCaptionInventory",
+    "JEATargetAudioCaptionPromptAdapter",
     "JEATargetAudioCaptionRecord",
     "JEATargetAudioCaptionSummary",
     "OpenAIJEATargetAudioCaptionBackend",

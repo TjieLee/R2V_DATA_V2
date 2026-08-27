@@ -20,20 +20,16 @@ from pydantic import Field, StrictStr, ValidationError, model_validator
 
 from r2v_data_v2.h3.jea_target_audio_caption import (
     JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION,
-    JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
-    JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION,
     JEATargetAudioCaptionBackendFailure,
     JEATargetAudioCaptionBackendResult,
     JEATargetAudioCaptionConfig,
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionJob,
+    JEATargetAudioCaptionPromptAdapter,
     OpenAIJEATargetAudioCaptionBackend,
     _inventory_fingerprint,
     _is_all_semantic_null,
     build_jea_target_audio_caption_inventory,
-)
-from r2v_data_v2.h3.jea_target_audio_caption import (
-    SYSTEM_PROMPT as LOCAL_SYSTEM_PROMPT,
 )
 from r2v_data_v2.h3.jea_target_audio_caption import (
     _model_input as _local_model_input,
@@ -55,7 +51,7 @@ from r2v_data_v2.structured_output import (
 SPECIALIZED_ROOT_NAME = "audio_semantics_specialized_v1"
 CAPTIONER_RECORD_VERSION = "r2v.h3.specialized_audio_captioner.1"
 GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.3"
-LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.2"
+LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.3"
 ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.2"
 STAGE_SUMMARY_VERSION = "r2v.h3.specialized_audio_stage_summary.1"
 ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.2"
@@ -68,18 +64,21 @@ GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
 GLOBAL_RECAPTION_RESCUE_POLICY_VERSION = (
     "global_failed_or_missing_description_recaption_once_v2"
 )
-MUSIC_RESCUE_PROMPT_VERSION = "h3_non_diegetic_music_direct_audio_v1"
-MUSIC_RESCUE_POLICY_VERSION = "global_non_diegetic_music_direct_audio_once_v1"
+MUSIC_RESCUE_PROMPT_VERSION = "h3_non_diegetic_music_direct_audio_v2"
+MUSIC_RESCUE_POLICY_VERSION = "global_non_diegetic_music_direct_audio_once_v2"
 GLOBAL_RUNTIME_POLICY_VERSION = (
     f"{GLOBAL_FALLBACK_POLICY_VERSION}+{GLOBAL_RECAPTION_RESCUE_POLICY_VERSION}"
     f"+{MUSIC_RESCUE_POLICY_VERSION}"
 )
-LOCAL_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
-LOCAL_FALLBACK_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
+LOCAL_PROMPT_VERSION = "h3_specialized_local_audio_semantics_v1"
+LOCAL_FALLBACK_PROMPT_VERSION = "h3_specialized_local_audio_semantics_v1_recheck"
 LOCAL_FALLBACK_POLICY_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION
 LOCAL_FIELD_POLICY_VERSION = "specialized_local_field_salvage_v2"
+LOCAL_CAPTION_HINT_POLICY_VERSION = "specialized_local_caption_hint_audio_truth_v1"
+LOCAL_EVENT_FILTER_POLICY_VERSION = "specialized_local_drop_speech_only_events_v1"
 LOCAL_RUNTIME_POLICY_VERSION = (
     f"{LOCAL_FALLBACK_POLICY_VERSION}+{LOCAL_FIELD_POLICY_VERSION}"
+    f"+{LOCAL_CAPTION_HINT_POLICY_VERSION}+{LOCAL_EVENT_FILTER_POLICY_VERSION}"
 )
 
 DEFAULT_CAPTIONER_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Captioner"
@@ -174,26 +173,188 @@ television, phone, loudspeaker, live performance, or a person playing an
 instrument. A hum, buzz, whine, drone, tone, or electronic tone alone is not
 music. Return the same three-field schema as one compact JSON object."""
 
-MUSIC_RESCUE_SYSTEM_PROMPT = """Listen specifically for audible musical
-accompaniment in this audio. Detect music with high recall, especially quiet or
-low-volume background music partially masked by speech. Musical evidence can
-include melody, harmony, instrumental accompaniment, rhythmic musical backing,
-synth music, score-like material, repeating musical phrases, or a continuous
-musical bed.
+MUSIC_RESCUE_SYSTEM_PROMPT = """Listen specifically for clearly audible musical
+accompaniment in this audio. This is a precision-oriented rescue pass. Return
+non_diegetic_music only when the audio contains clear musical structure.
 
-If clearly musical audio is audible and there is no explicit audible evidence
-that it comes from an in-scene source, describe it as non_diegetic_music. Only
-exclude music when there is clear audible evidence that it comes from an
-in-scene source such as a radio, television, phone, loudspeaker, live
-performance, or a person playing an instrument. Do not treat an ordinary hum,
-buzz, whine, ringing, drone, or isolated electronic tone as music unless
-additional musical structure is audible. Do not infer music from dialogue
-content, plot, emotion, or expected scene context.
+Strong musical evidence includes at least one of: a clearly audible melody or
+repeating melodic phrase; harmony or chord progression; a rhythmic musical
+pattern or beat; or clearly identifiable instrumental musical performance.
+
+A sustained pad, ambient pad, ambient drone, electronic drone, low-frequency
+drone, hum, buzz, hiss, whine, ringing, rumble, continuous tone, isolated
+electronic tone, or vague tonal texture is not sufficient by itself. If it is
+ambiguous whether a background layer is music or an environmental or electronic
+tonal sound, return null. Do not invent a specific instrument unless its timbre
+is clearly audible.
+
+If clearly structured music is audible and there is no explicit audible evidence
+that it comes from an in-scene radio, television, phone, loudspeaker, live
+performance, or a person playing an instrument, describe it as
+non_diegetic_music. Do not infer music from dialogue, emotion, plot, genre, or
+expected scene context.
 
 Return exactly one compact JSON object:
 {"non_diegetic_music":"<concise English audible music description>"}
 or {"non_diegetic_music":null}. No markdown, reasoning, explanation, or extra
 fields."""
+
+LOCAL_SYSTEM_PROMPT = """You extract two reusable LOCAL AUDIO SEMANTICS from one
+target clip. The attached audio is the only source of truth. If video is also
+attached, visual evidence may only disambiguate a sound already audible and can
+never establish that a sound exists.
+
+PASS 3 - TEMPORAL NON-LINGUISTIC AUDIO EVENTS
+
+Actively scan the entire audio from beginning to end for discrete or temporally
+localized NON-LINGUISTIC audible events. Include reliably audible events even
+when they are brief, quiet, in the background, or partially masked by speech.
+Examples include impacts, knocks, taps, metallic clinks, mechanical clicks,
+object handling, cup or glass placement, pouring, splashing, footsteps, doors,
+chair or fabric movement, rustling, paper movement, phone rings, electronic
+chimes, bells, machinery changes, engine sounds, applause, laughter, coughs,
+gasps, sighs, crying, non-lyrical singing, and diegetic music.
+
+Never emit ordinary speech, dialogue, conversation, talking, an utterance, a
+speech turn, "a person speaking", or "someone speaking" as an audio event.
+Speech timing is already represented by authoritative upstream data and must not
+be duplicated here. When speech overlaps a real non-linguistic event, describe
+the non-linguistic event and do not treat the speech itself as the event. Return
+an empty event list only when no localized non-linguistic event is reliably
+audible after inspecting the whole clip. Do not manufacture events for recall.
+
+The supplied Captioner observation is AUXILIARY, UNTRUSTED ACOUSTIC SEARCH HINTS
+ONLY. It may contain omissions, hallucinations, incorrect source or instrument
+guesses, and false-negative statements. Use positive mentions only to remind
+you what to actively search for in the audio. Publish an event only if listening
+to the audio verifies it. Do not copy an event merely because the Captioner
+mentions it, and do not suppress an audible event because the Captioner says it
+is absent. The Captioner observation never supplies event timestamps.
+
+PASS 4 - SPEAKER DELIVERY
+
+For every supplied speaker cluster, describe concise audible speech prosody and
+performance only: emotion, pace, energy, loudness, pitch tendency, rhythm,
+articulation, hesitation, pauses, whispering, shouting, questioning, commanding,
+or similarly useful traits. Ignore the Captioner observation completely for
+speaker_delivery. Determine delivery only from the attached audio and supplied
+speaker-cluster timing evidence.
+
+Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
+identity, gender, age, nationality, intrinsic voice identity, or timbre. Do not
+emit entity_id. Return every supplied speaker_cluster_id exactly once; array
+order is not semantic. Set overall_soundscape and non_diegetic_music to null;
+this specialized Local pass does not own those fields. Return exactly one compact
+JSON object matching the supplied schema, with no markdown or explanation."""
+
+LOCAL_FALLBACK_SYSTEM_PROMPT = """Reinspect the entire attached audio for the
+same specialized LOCAL AUDIO SEMANTICS. Audio remains the only source of truth.
+Actively check for brief, quiet, background, or speech-masked non-linguistic
+events, but publish only sounds verified by listening. Never emit ordinary
+speech, dialogue, conversation, talking, utterances, or speech turns as events.
+The auxiliary Captioner observation is untrusted search hints only: positive
+mentions require audio verification and negative claims cannot veto audible
+sound. Ignore it completely for speaker_delivery, which must come only from the
+audio and supplied speaker timing. Preserve all identity, transcript, timing,
+and output-schema constraints from the primary pass. Set overall_soundscape and
+non_diegetic_music to null and return one compact JSON object only."""
+
+
+def _local_user_prompt(
+    job: JEATargetAudioCaptionJob,
+    raw_audio_caption: str | None,
+    *,
+    fallback: bool,
+) -> str:
+    instruction = (
+        "Recheck the attached audio under the specialized Local policy."
+        if fallback
+        else "Extract the specialized Local audio semantics."
+    )
+    caption_hint = (
+        "[unavailable]" if raw_audio_caption is None else raw_audio_caption
+    )
+    return (
+        f"{instruction}\nTask metadata / supplied speaker clusters:\n"
+        f"{_compact_json(_local_model_input(job))}\n"
+        "Auxiliary Captioner observation "
+        "(UNTRUSTED SEARCH HINTS ONLY; AUDIO IS SOURCE OF TRUTH):\n"
+        f"{caption_hint}\nJSON schema:\n"
+        f"{_compact_json(TargetAudioCaptionResponse.model_json_schema())}"
+    )
+
+
+def _local_repair_prompt(
+    *,
+    job: JEATargetAudioCaptionJob,
+    raw_audio_caption: str | None,
+    invalid_response: str,
+    issues: Sequence[ValidationIssue],
+    fallback: bool,
+) -> str:
+    return (
+        "Repair the previous JSON format only. Preserve the same audio-only fact "
+        "policy: Captioner text remains untrusted event-search hints, event facts "
+        "and times require audio verification, and speaker_delivery must ignore "
+        "Captioner text. Do not add facts, transcript, identity, or entity_id. "
+        "Return one compact JSON object.\nOriginal request:\n"
+        f"{_local_user_prompt(job, raw_audio_caption, fallback=fallback)}\n"
+        "Validation issues:\n"
+        f"{_compact_json([item.to_dict() for item in issues])}\n"
+        f"Invalid response:\n{invalid_response}"
+    )
+
+
+@dataclass(frozen=True)
+class _SpecializedLocalPromptAdapter(JEATargetAudioCaptionPromptAdapter):
+    system_prompt: str = LOCAL_SYSTEM_PROMPT
+    fallback_system_prompt: str = LOCAL_FALLBACK_SYSTEM_PROMPT
+
+    def user_prompt(
+        self,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+    ) -> str:
+        return _local_user_prompt(job, auxiliary_observation, fallback=False)
+
+    def fallback_user_prompt(
+        self,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+    ) -> str:
+        return _local_user_prompt(job, auxiliary_observation, fallback=True)
+
+    def repair_prompt(
+        self,
+        *,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+        invalid_response: str,
+        issues: Sequence[ValidationIssue],
+    ) -> str:
+        return _local_repair_prompt(
+            job=job,
+            raw_audio_caption=auxiliary_observation,
+            invalid_response=invalid_response,
+            issues=issues,
+            fallback=False,
+        )
+
+    def fallback_repair_prompt(
+        self,
+        *,
+        job: JEATargetAudioCaptionJob,
+        auxiliary_observation: str | None,
+        invalid_response: str,
+        issues: Sequence[ValidationIssue],
+    ) -> str:
+        return _local_repair_prompt(
+            job=job,
+            raw_audio_caption=auxiliary_observation,
+            invalid_response=invalid_response,
+            issues=issues,
+            fallback=True,
+        )
 
 def _fingerprint_payload(value: object) -> object:
     if isinstance(value, dict):
@@ -436,6 +597,29 @@ def _local_response_issues(
     return issues
 
 
+_PURE_SPEECH_EVENT_DESCRIPTIONS = {
+    "conversation",
+    "dialogue",
+    "person speaking",
+    "person talking",
+    "someone speaking",
+    "someone talking",
+    "speech",
+    "speech turn",
+    "talking",
+    "utterance",
+}
+
+
+def _is_pure_speech_event(description: str) -> bool:
+    normalized = " ".join(description.strip().lower().split()).rstrip(" .,!?:;")
+    for article in ("a ", "an ", "the "):
+        if normalized.startswith(article):
+            normalized = normalized[len(article) :]
+            break
+    return normalized in _PURE_SPEECH_EVENT_DESCRIPTIONS
+
+
 def _normalize_local_response(
     response: LocalAudioSemanticsResponse,
     job: JEATargetAudioCaptionJob,
@@ -445,6 +629,11 @@ def _normalize_local_response(
     }
     return response.model_copy(
         update={
+            "temporal_audio_events": [
+                event
+                for event in response.temporal_audio_events
+                if not _is_pure_speech_event(event.description)
+            ],
             "speaker_delivery": [
                 delivery_by_cluster[item.speaker_cluster_id]
                 for item in job.speaker_clusters
@@ -929,7 +1118,9 @@ class LocalSemanticsBackend(Protocol):
     def provenance(self) -> SpecializedBackendProvenance: ...
 
     def describe(
-        self, job: JEATargetAudioCaptionJob
+        self,
+        job: JEATargetAudioCaptionJob,
+        raw_audio_caption: str | None = None,
     ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]: ...
 
 
@@ -1462,6 +1653,7 @@ class OpenAILocalSemanticsBackend:
                 max_tokens=config.max_tokens,
             ),
             client=client,
+            prompt_adapter=_SpecializedLocalPromptAdapter(),
         )
 
     @property
@@ -1490,10 +1682,14 @@ class OpenAILocalSemanticsBackend:
     def _fallback_after_failure(
         self,
         job: JEATargetAudioCaptionJob,
+        raw_audio_caption: str | None,
         primary: SpecializedBackendFailure,
     ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
         try:
-            fallback = self._delegate.describe_semantic_fallback(job)
+            fallback = self._delegate.describe_semantic_fallback(
+                job,
+                auxiliary_observation=raw_audio_caption,
+            )
         except JEATargetAudioCaptionBackendFailure as exc:
             fallback_failure = _specialized_local_failure(exc)
             raise _combined_fallback_failure(
@@ -1517,16 +1713,25 @@ class OpenAILocalSemanticsBackend:
         )
 
     def describe(
-        self, job: JEATargetAudioCaptionJob
+        self,
+        job: JEATargetAudioCaptionJob,
+        raw_audio_caption: str | None = None,
     ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
         self._verify_media(job)
         try:
-            primary = self._delegate.describe(job)
+            primary = self._delegate.describe(
+                job,
+                auxiliary_observation=raw_audio_caption,
+            )
         except JEATargetAudioCaptionBackendFailure as exc:
             primary_failure = _specialized_local_failure(exc)
             if primary_failure.code != "local_semantics_empty_response":
                 raise primary_failure from exc
-            return self._fallback_after_failure(job, primary_failure)
+            return self._fallback_after_failure(
+                job,
+                raw_audio_caption,
+                primary_failure,
+            )
         if not _is_all_semantic_null(primary.response):
             return _project_local_result(
                 primary,
@@ -1538,7 +1743,10 @@ class OpenAILocalSemanticsBackend:
             primary.completion_diagnostics
         )
         try:
-            fallback = self._delegate.describe_semantic_fallback(job)
+            fallback = self._delegate.describe_semantic_fallback(
+                job,
+                auxiliary_observation=raw_audio_caption,
+            )
         except JEATargetAudioCaptionBackendFailure as exc:
             fallback_failure = _specialized_local_failure(exc)
             raise _combined_fallback_failure(
@@ -1668,7 +1876,7 @@ class GlobalSemanticsRecord(SchemaModel):
 
 
 class LocalSemanticsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_local_audio_semantics.2"] = (
+    schema_version: Literal["r2v.h3.specialized_local_audio_semantics.3"] = (
         LOCAL_RECORD_VERSION
     )
     target_clip_uid: str
@@ -1678,6 +1886,11 @@ class LocalSemanticsRecord(SchemaModel):
     speaker_delivery: list[ModelSpeakerDelivery] = Field(default_factory=list)
     semantic_source: SemanticSource | None = None
     fallback_attempted: bool = False
+    captioner_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    raw_audio_caption_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     backend_provenance: SpecializedBackendProvenance
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_call_count: int = Field(ge=0)
@@ -1887,7 +2100,9 @@ def global_request_fingerprint(
 def local_request_fingerprint(
     job: JEATargetAudioCaptionJob,
     provenance: SpecializedBackendProvenance,
+    captioner_record: CaptionerRecord,
 ) -> str:
+    raw_caption = captioner_record.raw_audio_caption
     return _sha256_text(
         _compact_json(
             {
@@ -1904,6 +2119,14 @@ def local_request_fingerprint(
                 "fallback_prompt_version": LOCAL_FALLBACK_PROMPT_VERSION,
                 "fallback_policy_version": LOCAL_FALLBACK_POLICY_VERSION,
                 "field_policy_version": LOCAL_FIELD_POLICY_VERSION,
+                "caption_hint_policy_version": LOCAL_CAPTION_HINT_POLICY_VERSION,
+                "event_filter_policy_version": LOCAL_EVENT_FILTER_POLICY_VERSION,
+                "captioner_record_fingerprint": (
+                    captioner_record.record_fingerprint
+                ),
+                "raw_audio_caption_sha256": (
+                    None if raw_caption is None else _sha256_text(raw_caption)
+                ),
             }
         )
     )
@@ -2677,12 +2900,21 @@ def _global_record(
 
 def _local_record(
     job: JEATargetAudioCaptionJob,
+    captioner: CaptionerRecord,
     backend: LocalSemanticsBackend,
 ) -> _ProcessedRecord[LocalSemanticsRecord]:
     provenance = backend.provenance
-    request_fingerprint = local_request_fingerprint(job, provenance)
+    raw_audio_caption = captioner.raw_audio_caption
+    raw_caption_hash = (
+        None if raw_audio_caption is None else _sha256_text(raw_audio_caption)
+    )
+    request_fingerprint = local_request_fingerprint(
+        job,
+        provenance,
+        captioner,
+    )
     try:
-        result = backend.describe(job)
+        result = backend.describe(job, raw_audio_caption)
         issues = _local_response_issues(result.response, job)
         if issues:
             raise RuntimeError("local semantics backend returned unvalidated output")
@@ -2695,6 +2927,8 @@ def _local_record(
             "speaker_delivery": response.speaker_delivery,
             "semantic_source": result.semantic_source,
             "fallback_attempted": result.fallback_attempted,
+            "captioner_record_fingerprint": captioner.record_fingerprint,
+            "raw_audio_caption_sha256": raw_caption_hash,
             "backend_provenance": provenance,
             "request_fingerprint": request_fingerprint,
             "model_call_count": result.model_call_count,
@@ -2720,6 +2954,8 @@ def _local_record(
             "status": "failed",
             "temporal_audio_events": [],
             "speaker_delivery": speaker_delivery,
+            "captioner_record_fingerprint": captioner.record_fingerprint,
+            "raw_audio_caption_sha256": raw_caption_hash,
             "backend_provenance": provenance,
             "request_fingerprint": request_fingerprint,
             "model_call_count": exc.model_call_count,
@@ -2852,6 +3088,35 @@ def _validate_global_dependencies(
         ):
             raise _StaleSpecializedDependencyError(
                 "existing global output depends on stale captioner records; "
+                "use --overwrite"
+            )
+
+
+def _validate_local_dependencies(
+    local_records: Sequence[LocalSemanticsRecord],
+    captioner_records: Sequence[CaptionerRecord],
+) -> None:
+    if len(local_records) != len(captioner_records):
+        raise _StaleSpecializedDependencyError(
+            "existing local output depends on stale captioner records; use --overwrite"
+        )
+    for local_record, captioner_record in zip(
+        local_records,
+        captioner_records,
+        strict=True,
+    ):
+        caption = captioner_record.raw_audio_caption
+        expected_caption_hash = (
+            None if caption is None else _sha256_text(caption)
+        )
+        if (
+            local_record.target_clip_uid != captioner_record.target_clip_uid
+            or local_record.captioner_record_fingerprint
+            != captioner_record.record_fingerprint
+            or local_record.raw_audio_caption_sha256 != expected_caption_hash
+        ):
+            raise _StaleSpecializedDependencyError(
+                "existing local output depends on stale captioner records; "
                 "use --overwrite"
             )
 
@@ -3107,19 +3372,29 @@ def run_local_semantics_phase(
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "local_semantics")
     provenance = backend.provenance
+    captioner_destination = _stage_path(root, "captioner")
+    captioner_records, _ = _load_stage(
+        destination=captioner_destination,
+        role="captioner",
+        inventory=inventory,
+        provenance=_existing_stage_provenance(captioner_destination),
+        model=CaptionerRecord,
+    )
     if destination.exists() and not overwrite:
-        return _load_stage(
+        records, summary = _load_stage(
             destination=destination,
             role="local_semantics",
             inventory=inventory,
             provenance=provenance,
             model=LocalSemanticsRecord,
         )
+        _validate_local_dependencies(records, captioner_records)
+        return records, summary
     if destination.exists():
         _assert_overwrite_ownership(destination, expected_role="local_semantics")
-    processed = _bounded_process(
-        inventory.jobs,
-        lambda job: _local_record(job, backend),
+    processed = _bounded_map(
+        list(zip(inventory.jobs, captioner_records, strict=True)),
+        lambda item: _local_record(item[0], item[1], backend),
         max_inflight=max_inflight,
     )
     records = [item.record for item in processed]
@@ -3538,6 +3813,7 @@ def run_assemble_phase(
         model=LocalSemanticsRecord,
     )
     _validate_global_dependencies(global_records, captioner_records)
+    _validate_local_dependencies(local_records, captioner_records)
     if destination.exists() and not overwrite:
         try:
             return _load_assembled(
@@ -3730,6 +4006,16 @@ def run_specialized_pipeline(
         model=LocalSemanticsRecord,
         overwrite=overwrite,
     )
+    if local_existing is not None:
+        if caption_existing is None:
+            local_existing = None
+            local_summary = None
+        else:
+            try:
+                _validate_local_dependencies(local_existing, caption_existing)
+            except _StaleSpecializedDependencyError:
+                local_existing = None
+                local_summary = None
     caption_reused = caption_existing is not None
     global_reused = global_existing is not None
     local_reused = local_existing is not None
@@ -3750,7 +4036,9 @@ def run_specialized_pipeline(
         job for job in inventory.jobs if job.target_clip_uid not in caption_by_clip
     )
     local_pending = deque(
-        job for job in inventory.jobs if job.target_clip_uid not in local_by_clip
+        jobs_by_clip[clip_uid]
+        for clip_uid in caption_by_clip
+        if clip_uid not in local_by_clip
     )
     global_pending = deque(
         jobs_by_clip[clip_uid]
@@ -3787,9 +4075,15 @@ def run_specialized_pipeline(
         ):
             while local_pending and len(local_futures) < local_instruct_max_inflight:
                 job = local_pending.popleft()
-                local_futures[local_executor.submit(_local_record, job, local_backend)] = (
-                    job.target_clip_uid
-                )
+                captioner = caption_by_clip[job.target_clip_uid].record
+                local_futures[
+                    local_executor.submit(
+                        _local_record,
+                        job,
+                        captioner,
+                        local_backend,
+                    )
+                ] = job.target_clip_uid
             while global_pending and len(global_futures) < global_vl_max_inflight:
                 job = global_pending.popleft()
                 caption = caption_by_clip[job.target_clip_uid].record
@@ -3828,6 +4122,8 @@ def run_specialized_pipeline(
                     caption_by_clip[clip_uid] = future.result()
                     if clip_uid not in global_by_clip:
                         global_pending.append(jobs_by_clip[clip_uid])
+                    if clip_uid not in local_by_clip:
+                        local_pending.append(jobs_by_clip[clip_uid])
                 elif future in global_futures:
                     clip_uid = global_futures.pop(future)
                     global_by_clip[clip_uid] = future.result()
@@ -3954,10 +4250,14 @@ __all__ = [
     "GLOBAL_RECAPTION_RESCUE_POLICY_VERSION",
     "GLOBAL_RECORD_VERSION",
     "GLOBAL_SYSTEM_PROMPT",
+    "LOCAL_CAPTION_HINT_POLICY_VERSION",
+    "LOCAL_EVENT_FILTER_POLICY_VERSION",
     "LOCAL_FALLBACK_PROMPT_VERSION",
+    "LOCAL_FALLBACK_SYSTEM_PROMPT",
     "LOCAL_FIELD_POLICY_VERSION",
     "LOCAL_PROMPT_VERSION",
     "LOCAL_RECORD_VERSION",
+    "LOCAL_RUNTIME_POLICY_VERSION",
     "LOCAL_SYSTEM_PROMPT",
     "MUSIC_RESCUE_POLICY_VERSION",
     "MUSIC_RESCUE_PROMPT_VERSION",

@@ -291,6 +291,14 @@ Global record still has null `non_diegetic_music`. Service requirements are:
 This is why the current specialized deployment keeps both Qwen3-Omni services
 online simultaneously.
 
+Standalone Local also requires the existing on-disk canonical Captioner stage
+artifact, but it does not call port 8092. Each caption is untrusted acoustic
+search hints for event recall; canonical audio is the only truth, Captioner
+negative statements cannot veto audible events, and speaker delivery ignores
+Captioner text. In a full pipeline, a clip becomes Local-eligible only after its
+Captioner record is available. A failed Captioner record still releases Local
+audio-only, while Global remains blocked.
+
 ## Current full-pipeline command
 
 ```bash
@@ -339,11 +347,24 @@ Global extraction therefore has one best-effort recaption rescue only when the
 primary Global record fails or `overall_audio_description` is missing. Null
 music alone no longer resamples Captioner. After Local work on port 8091 is fully
 finished, ready Global records with null music use that same Instruct service for
-one direct-audio music-only check against canonical full audio. It may only fill
-`non_diegetic_music`; schema-valid null is final, and detector failure cannot
-damage a ready Global record. Primary, recaption, and music-rescue raw evidence,
+one direct-audio music-only check against canonical full audio. Music rescue v2
+is precision-oriented: audible melody, harmony, rhythm, or clear instrumental
+performance is required; an ambient pad, drone, hum, rumble, continuous tone, or
+vague tonal texture alone is insufficient, and ambiguity returns null. It may
+only fill `non_diegetic_music`; schema-valid null is final, and detector failure
+cannot damage a ready Global record. No Captioner or Global text is sent to this
+direct-audio check. Primary, recaption, and music-rescue raw evidence,
 diagnostics, provenance, and exact call counts remain distinct in the Global raw
 artifact.
+
+The specialized Local prompt actively scans for brief, quiet, background, and
+speech-masked non-linguistic events. Ordinary speech/dialogue is excluded;
+laughter, coughs, gasps, sighs, and verified physical sounds remain eligible.
+A narrow program-side filter removes only whole-string pure-speech descriptions,
+not mixed events such as `door slam during dialogue`. Captioner artifact changes
+invalidate Global, Local, and Assembly; Global-only changes do not invalidate
+Local. Music rescue still starts after every Local request finishes, so the two
+8091 workloads do not overlap.
 
 ## Historical Instruct TP4 fallback
 
