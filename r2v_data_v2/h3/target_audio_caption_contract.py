@@ -91,11 +91,10 @@ class TargetAudioCaptionResponse(SchemaModel):
             value = getattr(self, field_name)
             if value is not None and not value.strip():
                 raise ValueError(f"{field_name} must be non-empty or null")
-        if self.temporal_audio_events != sorted(
+        self.temporal_audio_events = sorted(
             self.temporal_audio_events,
-            key=lambda item: (item.start_time, item.end_time),
-        ):
-            raise ValueError("temporal audio events must be chronological")
+            key=lambda item: (item.start_time, item.end_time, item.description),
+        )
         cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
         if len(cluster_ids) != len(set(cluster_ids)):
             raise ValueError("speaker delivery cluster IDs must be unique")

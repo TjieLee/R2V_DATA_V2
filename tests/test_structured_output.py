@@ -68,6 +68,8 @@ def test_all_qwen_schemas_share_strict_json_and_fence_parsing(
     raw = json.dumps(payload)
     assert parse_qwen_json_response(raw, model)
     assert parse_qwen_json_response(f"```json\n{raw}\n```", model)
+    assert parse_qwen_json_response(f"Assistant: {raw}", model)
+    assert parse_qwen_json_response(f"Assistant:\n```json\n{raw}\n```", model)
     with pytest.raises(json.JSONDecodeError):
         parse_qwen_json_response(f"Result: {raw}", model)
     payload_with_extra = {**payload, "unexpected": True}

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
 
 from openai import OpenAI
-from pydantic import Field, StrictStr, model_validator
+from pydantic import Field, StrictStr, ValidationError, model_validator
 
 from r2v_data_v2.h3.jea_target_audio_caption import (
     JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION,
@@ -42,21 +42,23 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.target_audio_caption_contract import (
     ModelSpeakerDelivery,
+    TargetAudioCaptionResponse,
     TargetSpeakerDelivery,
     TemporalAudioEvent,
 )
 from r2v_data_v2.structured_output import (
     ValidationIssue,
+    normalize_structured_json_envelope,
     parse_structured_json_issues,
 )
 
 SPECIALIZED_ROOT_NAME = "audio_semantics_specialized_v1"
 CAPTIONER_RECORD_VERSION = "r2v.h3.specialized_audio_captioner.1"
 GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.1"
-LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.1"
-ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.1"
+LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.2"
+ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.2"
 STAGE_SUMMARY_VERSION = "r2v.h3.specialized_audio_stage_summary.1"
-ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.1"
+ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.2"
 BACKEND_PROVENANCE_VERSION = "r2v.h3.specialized_audio_backend_provenance.1"
 
 CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v2"
@@ -66,6 +68,10 @@ GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
 LOCAL_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
 LOCAL_FALLBACK_PROMPT_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
 LOCAL_FALLBACK_POLICY_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION
+LOCAL_FIELD_POLICY_VERSION = "specialized_local_field_salvage_v2"
+LOCAL_RUNTIME_POLICY_VERSION = (
+    f"{LOCAL_FALLBACK_POLICY_VERSION}+{LOCAL_FIELD_POLICY_VERSION}"
+)
 
 DEFAULT_CAPTIONER_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Captioner"
 DEFAULT_CAPTIONER_CHECKPOINT_ID = (
@@ -276,11 +282,10 @@ class LocalAudioSemanticsResponse(SchemaModel):
 
     @model_validator(mode="after")
     def validate_fields(self) -> LocalAudioSemanticsResponse:
-        if self.temporal_audio_events != sorted(
+        self.temporal_audio_events = sorted(
             self.temporal_audio_events,
             key=lambda item: (item.start_time, item.end_time, item.description),
-        ):
-            raise ValueError("local temporal audio events must be chronological")
+        )
         cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
         if len(cluster_ids) != len(set(cluster_ids)):
             raise ValueError("local speaker delivery cluster IDs must be unique")
@@ -305,12 +310,28 @@ def _local_response_issues(
     issues: list[ValidationIssue] = []
     expected = [item.speaker_cluster_id for item in job.speaker_clusters]
     actual = [item.speaker_cluster_id for item in response.speaker_delivery]
-    if actual != expected:
+    if len(actual) != len(set(actual)):
         issues.append(
             ValidationIssue(
-                code="speaker_cluster_order_mismatch",
+                code="duplicate_speaker_cluster",
                 field="speaker_delivery",
-                message="speaker delivery must contain every supplied cluster in order",
+                message="speaker delivery cluster IDs must be unique",
+            )
+        )
+    elif set(actual) - set(expected):
+        issues.append(
+            ValidationIssue(
+                code="unknown_speaker_cluster",
+                field="speaker_delivery",
+                message="speaker delivery contains an unknown cluster",
+            )
+        )
+    elif set(expected) - set(actual):
+        issues.append(
+            ValidationIssue(
+                code="missing_speaker_cluster",
+                field="speaker_delivery",
+                message="speaker delivery is missing a supplied cluster",
             )
         )
     for index, event in enumerate(response.temporal_audio_events):
@@ -323,6 +344,141 @@ def _local_response_issues(
                 )
             )
     return issues
+
+
+def _normalize_local_response(
+    response: LocalAudioSemanticsResponse,
+    job: JEATargetAudioCaptionJob,
+) -> LocalAudioSemanticsResponse:
+    delivery_by_cluster = {
+        item.speaker_cluster_id: item for item in response.speaker_delivery
+    }
+    return response.model_copy(
+        update={
+            "speaker_delivery": [
+                delivery_by_cluster[item.speaker_cluster_id]
+                for item in job.speaker_clusters
+            ]
+        }
+    )
+
+
+def _json_string_end(value: str, start: int) -> int | None:
+    escaped = False
+    for index in range(start + 1, len(value)):
+        character = value[index]
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == '"':
+            return index + 1
+    return None
+
+
+def _matching_json_array_end(value: str, start: int) -> int | None:
+    depth = 0
+    index = start
+    while index < len(value):
+        character = value[index]
+        if character == '"':
+            string_end = _json_string_end(value, index)
+            if string_end is None:
+                return None
+            index = string_end
+            continue
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+            if depth < 0:
+                return None
+        index += 1
+    return None
+
+
+def _extract_top_level_json_array(raw: str, key: str) -> list[object] | None:
+    try:
+        value = normalize_structured_json_envelope(raw)
+    except ValueError:
+        return None
+    if not value.startswith("{") or not value.endswith("}"):
+        return None
+    object_depth = 0
+    array_depth = 0
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == '"':
+            string_end = _json_string_end(value, index)
+            if string_end is None:
+                return None
+            if object_depth == 1 and array_depth == 0:
+                try:
+                    candidate_key = json.loads(value[index:string_end])
+                except json.JSONDecodeError:
+                    return None
+                cursor = string_end
+                while cursor < len(value) and value[cursor].isspace():
+                    cursor += 1
+                if candidate_key == key and cursor < len(value) and value[cursor] == ":":
+                    cursor += 1
+                    while cursor < len(value) and value[cursor].isspace():
+                        cursor += 1
+                    if cursor >= len(value) or value[cursor] != "[":
+                        return None
+                    array_end = _matching_json_array_end(value, cursor)
+                    if array_end is None:
+                        return None
+                    try:
+                        payload = json.loads(value[cursor:array_end])
+                    except json.JSONDecodeError:
+                        return None
+                    return payload if isinstance(payload, list) else None
+            index = string_end
+            continue
+        if character == "{":
+            object_depth += 1
+        elif character == "}":
+            object_depth -= 1
+            if object_depth < 0:
+                return None
+        elif character == "[":
+            array_depth += 1
+        elif character == "]":
+            array_depth -= 1
+            if array_depth < 0:
+                return None
+        index += 1
+    return None
+
+
+def _salvage_speaker_delivery(
+    raw_responses: Sequence[str],
+    job: JEATargetAudioCaptionJob,
+) -> list[ModelSpeakerDelivery]:
+    expected = [item.speaker_cluster_id for item in job.speaker_clusters]
+    for raw in reversed(raw_responses):
+        response, _ = parse_structured_json_issues(raw, TargetAudioCaptionResponse)
+        payload: Sequence[object] | None = (
+            response.speaker_delivery
+            if response is not None
+            else _extract_top_level_json_array(raw, "speaker_delivery")
+        )
+        if payload is None:
+            continue
+        try:
+            delivery = [ModelSpeakerDelivery.model_validate(item) for item in payload]
+        except (TypeError, ValidationError):
+            continue
+        actual = [item.speaker_cluster_id for item in delivery]
+        if len(actual) != len(set(actual)) or set(actual) != set(expected):
+            continue
+        delivery_by_cluster = {item.speaker_cluster_id: item for item in delivery}
+        return [delivery_by_cluster[cluster_id] for cluster_id in expected]
+    return []
 
 
 @dataclass(frozen=True)
@@ -417,7 +573,7 @@ class LocalSemanticsConfig:
             media_resolver=self.media_resolver,
             prompt_version=LOCAL_PROMPT_VERSION,
             fallback_prompt_version=LOCAL_FALLBACK_PROMPT_VERSION,
-            fallback_policy_version=LOCAL_FALLBACK_POLICY_VERSION,
+            fallback_policy_version=LOCAL_RUNTIME_POLICY_VERSION,
             temperature=0.0,
             top_p=None,
             top_k=None,
@@ -987,6 +1143,7 @@ def _specialized_local_failure(
 
 def _project_local_result(
     result: JEATargetAudioCaptionBackendResult,
+    job: JEATargetAudioCaptionJob,
     *,
     semantic_source: SemanticSource,
     fallback_attempted: bool,
@@ -995,11 +1152,15 @@ def _project_local_result(
     primary_model_call_count: int = 0,
 ) -> SpecializedBackendResult[LocalAudioSemanticsResponse]:
     diagnostics = _specialized_diagnostics(result.completion_diagnostics)
-    return SpecializedBackendResult(
-        response=LocalAudioSemanticsResponse(
+    response = _normalize_local_response(
+        LocalAudioSemanticsResponse(
             temporal_audio_events=result.response.temporal_audio_events,
             speaker_delivery=result.response.speaker_delivery,
         ),
+        job,
+    )
+    return SpecializedBackendResult(
+        response=response,
         raw_responses=(*primary_raw_responses, *result.raw_responses),
         diagnostics=(*primary_diagnostics, *diagnostics),
         model_call_count=primary_model_call_count + (result.model_call_count or 0),
@@ -1068,6 +1229,7 @@ class OpenAILocalSemanticsBackend:
             ) from exc
         return _project_local_result(
             fallback,
+            job,
             semantic_source=(
                 "fallback_all_null_confirmed"
                 if _is_all_semantic_null(fallback.response)
@@ -1093,6 +1255,7 @@ class OpenAILocalSemanticsBackend:
         if not _is_all_semantic_null(primary.response):
             return _project_local_result(
                 primary,
+                job,
                 semantic_source="primary",
                 fallback_attempted=False,
             )
@@ -1111,6 +1274,7 @@ class OpenAILocalSemanticsBackend:
             ) from exc
         return _project_local_result(
             fallback,
+            job,
             semantic_source=(
                 "fallback_all_null_confirmed"
                 if _is_all_semantic_null(fallback.response)
@@ -1217,7 +1381,7 @@ class GlobalSemanticsRecord(SchemaModel):
 
 
 class LocalSemanticsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_local_audio_semantics.1"] = (
+    schema_version: Literal["r2v.h3.specialized_local_audio_semantics.2"] = (
         LOCAL_RECORD_VERSION
     )
     target_clip_uid: str
@@ -1244,19 +1408,19 @@ class LocalSemanticsRecord(SchemaModel):
         if self.status == "ready":
             if self.semantic_source is None or self.failure is not None:
                 raise ValueError("ready local semantics record is incomplete")
-        elif (
-            self.temporal_audio_events
-            or self.speaker_delivery
-            or self.semantic_source is not None
-            or self.failure is None
-        ):
-            raise ValueError("failed local semantics record must contain only failure")
+        elif self.temporal_audio_events:
+            raise ValueError("failed local semantics record cannot publish audio events")
+        elif self.semantic_source is not None or self.failure is None:
+            raise ValueError("failed local semantics record requires only failure state")
+        cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
+        if len(cluster_ids) != len(set(cluster_ids)):
+            raise ValueError("local record speaker cluster IDs must be unique")
         _validate_record_fingerprint(self)
         return self
 
 
 class SpecializedAudioSemanticsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_audio_semantics.1"] = (
+    schema_version: Literal["r2v.h3.specialized_audio_semantics.2"] = (
         ASSEMBLED_RECORD_VERSION
     )
     target_clip_uid: str
@@ -1317,10 +1481,15 @@ class SpecializedAudioSemanticsRecord(SchemaModel):
             )
         ):
             raise ValueError("non-ready global stage cannot publish global semantics")
-        if self.local_semantics_status != "ready" and (
-            self.temporal_audio_events or self.speaker_delivery
+        if self.local_semantics_status != "ready" and self.temporal_audio_events:
+            raise ValueError("failed local stage cannot publish temporal audio events")
+        if (self.local_semantics_status == "ready") != (
+            self.local_semantics_failure is None
         ):
-            raise ValueError("failed local stage cannot publish local semantics")
+            raise ValueError("assembled local failure state is inconsistent")
+        cluster_ids = [item.speaker_cluster_id for item in self.speaker_delivery]
+        if len(cluster_ids) != len(set(cluster_ids)):
+            raise ValueError("assembled speaker delivery cluster IDs must be unique")
         values = self.model_dump(mode="json", exclude={"assemble_fingerprint"})
         if self.assemble_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("assembled specialized fingerprint is invalid")
@@ -1354,11 +1523,11 @@ class SpecializedStageSummary(SchemaModel):
 
 
 class SpecializedAssembledSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_audio_semantics_summary.1"] = (
+    schema_version: Literal["r2v.h3.specialized_audio_semantics_summary.2"] = (
         ASSEMBLED_SUMMARY_VERSION
     )
     assembled_record_schema_version: Literal[
-        "r2v.h3.specialized_audio_semantics.1"
+        "r2v.h3.specialized_audio_semantics.2"
     ] = ASSEMBLED_RECORD_VERSION
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     record_count: int = Field(ge=0)
@@ -1439,6 +1608,7 @@ def local_request_fingerprint(
                 "prompt_version": LOCAL_PROMPT_VERSION,
                 "fallback_prompt_version": LOCAL_FALLBACK_PROMPT_VERSION,
                 "fallback_policy_version": LOCAL_FALLBACK_POLICY_VERSION,
+                "field_policy_version": LOCAL_FIELD_POLICY_VERSION,
             }
         )
     )
@@ -1553,10 +1723,15 @@ def _assert_overwrite_ownership(
         raise TypeError(f"specialized output summary is not an object: {destination}")
     if expected_role == "assembled":
         owned = (
-            payload.get("schema_version") == ASSEMBLED_SUMMARY_VERSION
-            and payload.get("assembled_record_schema_version")
-            == ASSEMBLED_RECORD_VERSION
-        )
+            payload.get("schema_version"),
+            payload.get("assembled_record_schema_version"),
+        ) in {
+            (
+                "r2v.h3.specialized_audio_semantics_summary.1",
+                "r2v.h3.specialized_audio_semantics.1",
+            ),
+            (ASSEMBLED_SUMMARY_VERSION, ASSEMBLED_RECORD_VERSION),
+        }
     else:
         provenance = payload.get("backend_provenance")
         owned = (
@@ -1786,12 +1961,16 @@ def _local_record(
     request_fingerprint = local_request_fingerprint(job, provenance)
     try:
         result = backend.describe(job)
+        issues = _local_response_issues(result.response, job)
+        if issues:
+            raise RuntimeError("local semantics backend returned unvalidated output")
+        response = _normalize_local_response(result.response, job)
         values: dict[str, object] = {
             "target_clip_uid": job.target_clip_uid,
             "clip_display_path": job.clip_display_path,
             "status": "ready",
-            "temporal_audio_events": result.response.temporal_audio_events,
-            "speaker_delivery": result.response.speaker_delivery,
+            "temporal_audio_events": response.temporal_audio_events,
+            "speaker_delivery": response.speaker_delivery,
             "semantic_source": result.semantic_source,
             "fallback_attempted": result.fallback_attempted,
             "backend_provenance": provenance,
@@ -1812,10 +1991,13 @@ def _local_record(
             ),
         )
     except SpecializedBackendFailure as exc:
+        speaker_delivery = _salvage_speaker_delivery(exc.raw_responses, job)
         values = {
             "target_clip_uid": job.target_clip_uid,
             "clip_display_path": job.clip_display_path,
             "status": "failed",
+            "temporal_audio_events": [],
+            "speaker_delivery": speaker_delivery,
             "backend_provenance": provenance,
             "request_fingerprint": request_fingerprint,
             "model_call_count": exc.model_call_count,
@@ -2147,7 +2329,7 @@ def _assembled_record(
         != _sha256_text(captioner.raw_audio_caption)
     ):
         raise ValueError("global semantics caption hash differs")
-    if local.status == "ready":
+    if local.status == "ready" or local.speaker_delivery:
         issues = _local_response_issues(
             LocalAudioSemanticsResponse(
                 temporal_audio_events=local.temporal_audio_events,
@@ -2157,6 +2339,15 @@ def _assembled_record(
         )
         if issues:
             raise ValueError("local semantics record no longer matches inventory")
+    local_response = LocalAudioSemanticsResponse(
+        temporal_audio_events=local.temporal_audio_events,
+        speaker_delivery=local.speaker_delivery,
+    )
+    normalized_local = (
+        _normalize_local_response(local_response, job)
+        if local.status == "ready" or local.speaker_delivery
+        else local_response
+    )
     entity_by_cluster = {
         cluster.speaker_cluster_id: cluster.entity_id for cluster in job.speaker_clusters
     }
@@ -2166,7 +2357,7 @@ def _assembled_record(
             delivery_style=item.delivery_style,
             entity_id=entity_by_cluster[item.speaker_cluster_id],
         )
-        for item in local.speaker_delivery
+        for item in normalized_local.speaker_delivery
     ]
     statuses = (captioner.status, global_record.status, local.status)
     ready_count = sum(status == "ready" for status in statuses)
@@ -2179,7 +2370,7 @@ def _assembled_record(
         "overall_audio_description": global_record.overall_audio_description,
         "overall_soundscape": global_record.overall_soundscape,
         "non_diegetic_music": global_record.non_diegetic_music,
-        "temporal_audio_events": local.temporal_audio_events,
+        "temporal_audio_events": normalized_local.temporal_audio_events,
         "speaker_delivery": target_delivery,
         "target_video_path": job.target_video_path,
         "target_video_sha256": job.target_video_sha256,
@@ -2283,6 +2474,15 @@ def _review_html(
             + "</li>"
             for item in record.speaker_delivery
         )
+        events_html = (
+            "<ul>" + events + "</ul>"
+            if events
+            else (
+                "<p>[none]</p>"
+                if record.local_semantics_status == "ready"
+                else "<p>[unavailable]</p>"
+            )
+        )
         provenance = "".join(
             "<li>"
             + label
@@ -2319,7 +2519,7 @@ def _review_html(
             + "</p><h3>Non-diegetic music</h3><p>"
             + html.escape(record.non_diegetic_music or "[null/unavailable]")
             + "</p><h3>Temporal audio events</h3>"
-            + ("<ul>" + events + "</ul>" if events else "<p>[none/unavailable]</p>")
+            + events_html
             + "<h3>Speaker delivery</h3>"
             + (
                 "<ul>" + deliveries + "</ul>"
@@ -2890,6 +3090,7 @@ __all__ = [
     "GLOBAL_RECORD_VERSION",
     "GLOBAL_SYSTEM_PROMPT",
     "LOCAL_FALLBACK_PROMPT_VERSION",
+    "LOCAL_FIELD_POLICY_VERSION",
     "LOCAL_PROMPT_VERSION",
     "LOCAL_RECORD_VERSION",
     "LOCAL_SYSTEM_PROMPT",

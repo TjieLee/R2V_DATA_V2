@@ -44,8 +44,10 @@ class StructuredOutputFailure(ValueError):
         }
 
 
-def _strip_complete_json_fence(content: str) -> str:
+def normalize_structured_json_envelope(content: str) -> str:
     stripped = content.strip()
+    if stripped.startswith("Assistant:"):
+        stripped = stripped[len("Assistant:") :].lstrip()
     if not stripped.startswith("```"):
         return stripped
     match = re.fullmatch(
@@ -59,14 +61,14 @@ def _strip_complete_json_fence(content: str) -> str:
 
 
 def parse_structured_json_response(raw: str, model: type[ModelT]) -> ModelT:
-    payload = json.loads(_strip_complete_json_fence(raw))
+    payload = json.loads(normalize_structured_json_envelope(raw))
     if not isinstance(payload, dict):
         raise TypeError("structured response must be one JSON object")
     return model.model_validate(payload)
 
 
 def parse_qwen_json_response(raw: str, model: type[ModelT]) -> ModelT:
-    payload = json.loads(_strip_complete_json_fence(raw))
+    payload = json.loads(normalize_structured_json_envelope(raw))
     if not isinstance(payload, dict):
         raise TypeError("Qwen response must be one JSON object")
     return model.model_validate(payload)

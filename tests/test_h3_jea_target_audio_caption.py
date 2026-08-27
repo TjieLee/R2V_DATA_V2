@@ -835,7 +835,7 @@ def test_qwen_audio_only_still_verifies_canonical_video(tmp_path: Path) -> None:
     assert completions.requests == []
 
 
-def test_cluster_order_mismatch_repairs_once_and_second_failure_fails_closed(
+def test_cluster_order_is_normalized_without_repair(
     tmp_path: Path,
 ) -> None:
     root = _production_fixture(tmp_path)
@@ -844,27 +844,19 @@ def test_cluster_order_mismatch_repairs_once_and_second_failure_fails_closed(
         overall_soundscape=None,
         speaker_delivery=list(reversed(_response().speaker_delivery)),
     ).model_dump_json()
-    valid = _response().model_dump_json()
-    completions = _FakeCompletions([reordered, valid])
+    completions = _FakeCompletions([reordered])
     backend = OpenAIJEATargetAudioCaptionBackend(
         _config(tmp_path, family="dots3"),
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
-    assert len(backend.describe(job).raw_responses) == 2
-    assert len(completions.requests) == 2
-    repair_text = completions.requests[1]["messages"][1]["content"][0]["text"]
-    assert "Preserve the original four-pass audible-only analysis" in repair_text
-    assert "Do not infer sound from visual content" in repair_text
-
-    failed_completions = _FakeCompletions([reordered, reordered])
-    failed_backend = OpenAIJEATargetAudioCaptionBackend(
-        _config(tmp_path, family="dots3"),
-        client=SimpleNamespace(chat=SimpleNamespace(completions=failed_completions)),
-    )
-    with pytest.raises(RuntimeError, match="after one repair"):
-        failed_backend.describe(job)
-    assert len(failed_completions.requests) == 2
+    result = backend.describe(job)
+    assert len(result.raw_responses) == 1
+    assert len(completions.requests) == 1
+    assert [item.speaker_cluster_id for item in result.response.speaker_delivery] == [
+        "speaker-0",
+        "speaker-1",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1395,7 +1387,7 @@ def test_temporal_audio_event_range_is_strict() -> None:
         TemporalAudioEvent(start_time=0.2, end_time=0.2, description="impact")
 
 
-def test_temporal_audio_events_must_be_chronological_but_may_overlap() -> None:
+def test_temporal_audio_events_are_sorted_and_may_overlap() -> None:
     first = TemporalAudioEvent(
         start_time=0.1,
         end_time=0.4,
@@ -1411,11 +1403,11 @@ def test_temporal_audio_events_must_be_chronological_but_may_overlap() -> None:
         speaker_delivery=[],
     )
     assert response.temporal_audio_events == [first, overlapping]
-    with pytest.raises(ValidationError, match="chronological"):
-        TargetAudioCaptionResponse(
-            temporal_audio_events=[overlapping, first],
-            speaker_delivery=[],
-        )
+    reordered = TargetAudioCaptionResponse(
+        temporal_audio_events=[overlapping, first],
+        speaker_delivery=[],
+    )
+    assert reordered.temporal_audio_events == [first, overlapping]
 
 
 def test_temporal_audio_event_beyond_duration_repairs_once(tmp_path: Path) -> None:

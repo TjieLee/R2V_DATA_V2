@@ -29,6 +29,7 @@ from r2v_data_v2.h3.specialized_audio_semantics import (
     CAPTIONER_POLICY_VERSION,
     GLOBAL_PROMPT_VERSION,
     GLOBAL_SYSTEM_PROMPT,
+    LOCAL_FIELD_POLICY_VERSION,
     LOCAL_PROMPT_VERSION,
     LOCAL_SYSTEM_PROMPT,
     SPECIALIZED_ROOT_NAME,
@@ -247,6 +248,28 @@ def _target_audio_response(
         non_diegetic_music=non_diegetic_music,
         temporal_audio_events=local.temporal_audio_events,
         speaker_delivery=local.speaker_delivery,
+    )
+
+
+def _job_with_speaker_clusters(
+    inventory: JEATargetAudioCaptionInventory,
+    *cluster_ids: str,
+    duration_seconds: float = 4.0,
+) -> JEATargetAudioCaptionJob:
+    return inventory.jobs[0].model_copy(
+        update={
+            "target_duration_seconds": duration_seconds,
+            "speaker_clusters": [
+                SpeakerClusterEvidence(
+                    speaker_cluster_id=cluster_id,
+                    entity_id=f"e{index + 1}",
+                    active_time_ranges=[
+                        SpeakerTimeRange(start_time=0.1, end_time=1.2)
+                    ],
+                )
+                for index, cluster_id in enumerate(cluster_ids)
+            ],
+        }
     )
 
 
@@ -502,11 +525,32 @@ def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Pat
 
 def test_local_reuses_verified_target_audio_prompt_versions(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
-    provenance = _local_config(inventory).provenance()
+    config = _local_config(inventory)
+    provenance = config.provenance()
     assert LOCAL_PROMPT_VERSION == JEA_TARGET_AUDIO_CAPTION_PROMPT_VERSION
     assert provenance.prompt_version == "h3_target_audio_semantics_v2"
     assert provenance.fallback_prompt_version == (
         JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION
+    )
+    assert LOCAL_FIELD_POLICY_VERSION == "specialized_local_field_salvage_v2"
+    previous = specialized._provenance(
+        role="local_semantics",
+        served_model_name=config.served_model_name,
+        checkpoint_id=config.checkpoint_id,
+        base_url=config.base_url,
+        input_modality="canonical_full_audio_only",
+        media_resolver=config.media_resolver,
+        prompt_version=LOCAL_PROMPT_VERSION,
+        fallback_prompt_version=JEA_TARGET_AUDIO_CAPTION_FALLBACK_PROMPT_VERSION,
+        fallback_policy_version=specialized.LOCAL_FALLBACK_POLICY_VERSION,
+        temperature=0.0,
+        top_p=None,
+        top_k=None,
+        max_tokens=config.max_tokens,
+    )
+    assert provenance.configuration_fingerprint != previous.configuration_fingerprint
+    assert local_request_fingerprint(inventory.jobs[0], provenance) != (
+        local_request_fingerprint(inventory.jobs[0], previous)
     )
 
 
@@ -535,6 +579,75 @@ def test_local_full_response_drives_fallback_before_field_projection(
     assert result.fallback_attempted is False
     assert result.response.temporal_audio_events == []
     assert result.response.speaker_delivery[0].delivery_style is None
+    assert len(completions.requests) == 1
+
+
+def test_local_normalizes_event_and_speaker_order_without_repair(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = _job_with_speaker_clusters(inventory, "speaker_0", "speaker_1")
+    raw = json.dumps(
+        {
+            "overall_soundscape": "quiet room tone",
+            "non_diegetic_music": None,
+            "temporal_audio_events": [
+                {"start_time": 3.3125, "end_time": 3.5, "description": "third"},
+                {"start_time": 0.6725, "end_time": 0.9, "description": "first"},
+                {"start_time": 2.2925, "end_time": 2.6, "description": "second"},
+            ],
+            "speaker_delivery": [
+                {
+                    "speaker_cluster_id": "speaker_1",
+                    "delivery_style": "brief and neutral",
+                },
+                {
+                    "speaker_cluster_id": "speaker_0",
+                    "delivery_style": "calm and conversational",
+                },
+            ],
+        }
+    )
+    client, completions = _client([raw])
+
+    result = OpenAILocalSemanticsBackend(
+        _local_config(inventory), client=client
+    ).describe(job)
+
+    assert [item.start_time for item in result.response.temporal_audio_events] == [
+        0.6725,
+        2.2925,
+        3.3125,
+    ]
+    assert [item.speaker_cluster_id for item in result.response.speaker_delivery] == [
+        "speaker_0",
+        "speaker_1",
+    ]
+    assert result.model_call_count == 1
+    assert len(completions.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        "Assistant: {payload}",
+        "Assistant:\n```json\n{payload}\n```",
+    ],
+)
+def test_local_accepts_exact_assistant_json_envelopes(
+    tmp_path: Path,
+    wrapped: str,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    raw = wrapped.format(payload=_target_audio_response().model_dump_json())
+    client, completions = _client([raw])
+
+    result = OpenAILocalSemanticsBackend(
+        _local_config(inventory), client=client
+    ).describe(inventory.jobs[0])
+
+    assert result.response.speaker_delivery[0].delivery_style == "calm"
+    assert result.model_call_count == 1
     assert len(completions.requests) == 1
 
 
@@ -801,6 +914,7 @@ class _FakeGlobal:
 class _FakeLocal:
     config: LocalSemanticsConfig
     failures: set[str] = field(default_factory=set)
+    failure_raw_by_clip: dict[str, list[str]] = field(default_factory=dict)
     style_prefix: str = ""
     calls: list[str] = field(default_factory=list)
     delay: float = 0.0
@@ -817,10 +931,26 @@ class _FakeLocal:
         try:
             time.sleep(self.delay)
             if job.target_clip_uid in self.failures:
+                raw_responses = self.failure_raw_by_clip.get(job.target_clip_uid, [])
                 raise SpecializedBackendFailure(
                     code="local_fake_failure",
                     reason="fake failure",
-                    model_call_count=1,
+                    raw_responses=raw_responses,
+                    diagnostics=[
+                        specialized.CompletionDiagnostic(
+                            finish_reason="stop",
+                            prompt_tokens=11,
+                            completion_tokens=7,
+                            total_tokens=18,
+                            raw_content_char_count=len(raw),
+                            non_whitespace_content_char_count=sum(
+                                not character.isspace() for character in raw
+                            ),
+                            whitespace_only=not raw.strip(),
+                        )
+                        for raw in raw_responses
+                    ],
+                    model_call_count=max(1, len(raw_responses)),
                 )
             response = _local_response(
                 style=f"{self.style_prefix}{job.target_clip_uid}"
@@ -912,6 +1042,145 @@ def test_phases_assemble_partial_results_and_preserve_upstream(tmp_path: Path) -
         job.target_clip_uid: Path(job.target_full_audio_path).read_bytes()
         for job in inventory.jobs
     } == source_audio_before
+
+
+def test_failed_local_salvages_strict_speaker_delivery_and_assembles_partial(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    malformed = """{
+  "overall_soundscape": null,
+  "non_diegetic_music": null,
+  "temporal_audio_events": [
+    {"start_time": 00:02.12, "end_time": 2.4, "description": "impact"}
+  ],
+  "speaker_delivery": [
+    {"speaker_cluster_id": "speaker_0", "delivery_style": "calm [steady] \\"delivery\\""}
+    ]
+}"""
+    prompt_echo = "user\nRepair the previous JSON only"
+    client, completions = _client([malformed, prompt_echo])
+    local = OpenAILocalSemanticsBackend(
+        _local_config(inventory),
+        client=client,
+    )
+
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_global_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeGlobal(_global_config()),
+    )
+    local_records, local_summary = run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=local,
+    )
+    assembled, _ = run_assemble_phase(inventory=inventory, output_root=root)
+
+    local_record = local_records[0]
+    assert local_record.status == "failed"
+    assert local_record.failure is not None
+    assert local_record.model_call_count == 2
+    assert local_record.raw_response_count == 2
+    assert len(local_record.completion_diagnostics) == 2
+    assert len(completions.requests) == 2
+    assert local_record.temporal_audio_events == []
+    assert local_record.speaker_delivery[0].delivery_style == 'calm [steady] "delivery"'
+    assert local_summary.failed_count == 1
+    raw_payload = json.loads(
+        (root / "local_semantics/raw/clip-000.json").read_text(encoding="utf-8")
+    )
+    assert raw_payload["raw_responses"] == [malformed, prompt_echo]
+
+    record = assembled[0]
+    assert record.status == "partial"
+    assert record.local_semantics_status == "failed"
+    assert record.temporal_audio_events == []
+    assert record.speaker_delivery[0].entity_id == "e1"
+    assert record.speaker_delivery[0].delivery_style == 'calm [steady] "delivery"'
+    review = (root / "assembled/review.html").read_text(encoding="utf-8")
+    event_section = review.split("<h3>Temporal audio events</h3>", 1)[1].split(
+        "<h3>Speaker delivery</h3>", 1
+    )[0]
+    speaker_section = review.split("<h3>Speaker delivery</h3>", 1)[1].split(
+        "<details>", 1
+    )[0]
+    assert "[unavailable]" in event_section
+    assert "[unavailable]" not in speaker_section
+    assert "calm [steady] &quot;delivery&quot;" in speaker_section
+
+
+@pytest.mark.parametrize(
+    "raw_responses",
+    [
+        [
+            (
+                '{"temporal_audio_events":[{"start_time":00:02.12}],'
+                '"speaker_delivery":['
+                '{"speaker_cluster_id":"speaker_0","delivery_style":"calm"},'
+                '{"speaker_cluster_id":"speaker_0","delivery_style":"calm"}]}'
+            )
+        ],
+        [
+            (
+                '{"temporal_audio_events":[{"start_time":00:02.12}],'
+                '"speaker_delivery":['
+                '{"speaker_cluster_id":"unknown","delivery_style":"calm"}]}'
+            )
+        ],
+        [
+            (
+                '{"temporal_audio_events":[{"start_time":00:02.12}],'
+                '"speaker_delivery":[]}'
+            )
+        ],
+        ["", "\n\n"],
+        ["user\nRepair the previous JSON only"],
+    ],
+)
+def test_failed_local_does_not_salvage_untrusted_speaker_arrays(
+    tmp_path: Path,
+    raw_responses: list[str],
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    processed = specialized._local_record(
+        inventory.jobs[0],
+        _FakeLocal(
+            _local_config(inventory),
+            failures={"clip-000"},
+            failure_raw_by_clip={"clip-000": raw_responses},
+        ),
+    )
+
+    assert processed.record.status == "failed"
+    assert processed.record.speaker_delivery == []
+    assert processed.record.temporal_audio_events == []
+
+
+def test_failed_local_salvage_reorders_complete_speaker_set(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = _job_with_speaker_clusters(inventory, "speaker_0", "speaker_1")
+    malformed = (
+        '{"temporal_audio_events":[{"start_time":00:02.12}],'
+        '"speaker_delivery":['
+        '{"speaker_cluster_id":"speaker_1","delivery_style":"brief"},'
+        '{"speaker_cluster_id":"speaker_0","delivery_style":"calm"}]}'
+    )
+
+    delivery = specialized._salvage_speaker_delivery([malformed], job)
+
+    assert [item.speaker_cluster_id for item in delivery] == [
+        "speaker_0",
+        "speaker_1",
+    ]
 
 
 def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:

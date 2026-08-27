@@ -1395,7 +1395,7 @@ def _response_issues(
     ]
     expected = [item.speaker_cluster_id for item in job.speaker_clusters]
     actual = [item.speaker_cluster_id for item in response.speaker_delivery]
-    if actual == expected:
+    if len(actual) == len(set(actual)) and set(actual) == set(expected):
         return timing_issues
     if len(actual) != len(set(actual)):
         code = "duplicate_speaker_cluster"
@@ -1413,6 +1413,23 @@ def _response_issues(
             message="speaker delivery must contain every supplied cluster exactly once in order",
         ),
     ]
+
+
+def _normalize_response(
+    response: TargetAudioCaptionResponse,
+    job: JEATargetAudioCaptionJob,
+) -> TargetAudioCaptionResponse:
+    delivery_by_cluster = {
+        item.speaker_cluster_id: item for item in response.speaker_delivery
+    }
+    return response.model_copy(
+        update={
+            "speaker_delivery": [
+                delivery_by_cluster[item.speaker_cluster_id]
+                for item in job.speaker_clusters
+            ]
+        }
+    )
 
 
 def _repair_prompt(
@@ -1708,6 +1725,7 @@ class OpenAIJEATargetAudioCaptionBackend:
             if response is not None:
                 issues = _response_issues(response, job)
             if response is not None and not issues:
+                response = _normalize_response(response, job)
                 return JEATargetAudioCaptionBackendResult(
                     response=response,
                     raw_responses=tuple(raw_responses),
@@ -2040,6 +2058,7 @@ def _record_from_result(
     issues = _response_issues(result.response, job)
     if issues:
         raise RuntimeError("audio caption backend returned unvalidated output")
+    response = _normalize_response(result.response, job)
     entity_by_cluster = {
         item.speaker_cluster_id: item.entity_id for item in job.speaker_clusters
     }
@@ -2051,16 +2070,16 @@ def _record_from_result(
         overall_audio_description_status=overall_audio.status,
         overall_audio_description_provenance=overall_audio.provenance,
         overall_audio_description_failure=overall_audio.failure,
-        overall_soundscape=result.response.overall_soundscape,
-        non_diegetic_music=result.response.non_diegetic_music,
-        temporal_audio_events=result.response.temporal_audio_events,
+        overall_soundscape=response.overall_soundscape,
+        non_diegetic_music=response.non_diegetic_music,
+        temporal_audio_events=response.temporal_audio_events,
         speaker_delivery=[
             TargetSpeakerDelivery(
                 speaker_cluster_id=item.speaker_cluster_id,
                 entity_id=entity_by_cluster[item.speaker_cluster_id],
                 delivery_style=item.delivery_style,
             )
-            for item in result.response.speaker_delivery
+            for item in response.speaker_delivery
         ],
         target_video_path=job.target_video_path,
         target_video_sha256=job.target_video_sha256,
