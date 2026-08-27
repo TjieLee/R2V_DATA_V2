@@ -14,6 +14,10 @@ import pytest
 from pydantic import ValidationError
 
 import r2v_data_v2.h3.specialized_audio_semantics as specialized
+from r2v_data_v2.h3.jea_audio_production import (
+    CanonicalAudioClip,
+    CanonicalAudioClipSummary,
+)
 from r2v_data_v2.h3.jea_target_audio_caption import (
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionJob,
@@ -49,8 +53,11 @@ from r2v_data_v2.h3.specialized_audio_semantics import (
     OpenAIGlobalSemanticsBackend,
     OpenAILocalSemanticsBackend,
     OpenAIMusicRescueBackend,
+    SpecializedAudioSemanticsInventory,
+    SpecializedAudioSemanticsJob,
     SpecializedBackendFailure,
     SpecializedBackendResult,
+    build_specialized_inventory,
     captioner_request_fingerprint,
     global_request_fingerprint,
     local_request_fingerprint,
@@ -761,6 +768,10 @@ def test_local_contract_cluster_validation_overlap_and_media_modes(tmp_path: Pat
         assert "Ignore the Captioner observation completely" in serialized
         assert "partially masked by speech" in serialized
         assert "ordinary speech" in serialized
+        assert "Do not copy or preserve uncertain source" in serialized
+        assert "non-diegetic music" in serialized
+        assert "are not temporal_audio_events" in serialized
+        assert "return speaker_delivery as an empty array" in serialized
         for allowed_nonlinguistic in ("laughter", "coughs", "gasps", "sighs"):
             assert allowed_nonlinguistic in serialized
         assert len(completions.requests) == 1
@@ -771,7 +782,7 @@ def test_local_uses_specialized_hint_and_event_policy_versions(tmp_path: Path) -
     inventory = _inventory(tmp_path, clip_count=1)
     config = _local_config(inventory)
     provenance = config.provenance()
-    assert LOCAL_PROMPT_VERSION == "h3_specialized_local_audio_semantics_v1"
+    assert LOCAL_PROMPT_VERSION == "h3_specialized_local_audio_semantics_v2"
     assert provenance.prompt_version == LOCAL_PROMPT_VERSION
     assert provenance.fallback_prompt_version == LOCAL_FALLBACK_PROMPT_VERSION
     assert LOCAL_FIELD_POLICY_VERSION == "specialized_local_field_salvage_v2"
@@ -883,6 +894,10 @@ def test_local_normalizes_event_and_speaker_order_without_repair(
         "Dialogue.",
         "an utterance",
         "speech turn",
+        "A female voice speaking in a strained, desperate tone.",
+        "A male voice speaking in a calm, neutral tone.",
+        "A female voice speaks in Mandarin Chinese with a neutral delivery style.",
+        "A female voice continues speaking in Mandarin Chinese with a neutral delivery style.",
     ],
 )
 def test_local_drops_only_pure_speech_events(
@@ -960,6 +975,121 @@ def test_local_preserves_real_events_that_overlap_speech(
     assert [event.description for event in result.response.temporal_audio_events] == [
         description
     ]
+
+
+def test_local_empty_speaker_inventory_still_runs_event_pass_once(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = SpecializedAudioSemanticsJob.model_validate(
+        {
+            **inventory.jobs[0].model_dump(mode="json"),
+            "speaker_clusters": [],
+        }
+    )
+    response = TargetAudioCaptionResponse(
+        overall_soundscape=None,
+        non_diegetic_music=None,
+        temporal_audio_events=[],
+        speaker_delivery=[],
+    )
+    client, completions = _client([response.model_dump_json()])
+
+    result = OpenAILocalSemanticsBackend(
+        _local_config(inventory),
+        client=client,
+    ).describe(job, "No reliable localized event was captioned.")
+
+    assert result.response.temporal_audio_events == []
+    assert result.response.speaker_delivery == []
+    assert result.semantic_source == "primary"
+    assert result.model_call_count == 1
+    assert len(completions.requests) == 1
+
+
+def test_local_empty_speaker_inventory_rejects_invented_cluster(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    job = SpecializedAudioSemanticsJob.model_validate(
+        {
+            **inventory.jobs[0].model_dump(mode="json"),
+            "speaker_clusters": [],
+        }
+    )
+    invalid = TargetAudioCaptionResponse(
+        overall_soundscape=None,
+        non_diegetic_music=None,
+        temporal_audio_events=[],
+        speaker_delivery=[
+            ModelSpeakerDelivery(
+                speaker_cluster_id="invented",
+                delivery_style="calm",
+            )
+        ],
+    ).model_dump_json()
+    client, _ = _client([invalid, invalid])
+
+    with pytest.raises(SpecializedBackendFailure):
+        OpenAILocalSemanticsBackend(
+            _local_config(inventory),
+            client=client,
+        ).describe(job, None)
+
+
+def test_specialized_inventory_uses_all_canonical_clips_without_pair_or_asr(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "production"
+    audio_root = root / "audio"
+    audio_root.mkdir(parents=True)
+    records: list[CanonicalAudioClip] = []
+    for index in range(2):
+        clip_uid = f"clip-{index}"
+        video = root / "media" / f"{clip_uid}.mp4"
+        audio = root / "media" / f"{clip_uid}.flac"
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(f"video-{index}".encode())
+        audio.write_bytes(f"audio-{index}".encode())
+        records.append(
+            CanonicalAudioClip(
+                clip_uid=clip_uid,
+                clip_display_path=f"01/show/{clip_uid}",
+                media_collection_relpath="01/show",
+                media_collection_name="show",
+                episode_name=f"episode-{index}",
+                clip_name=clip_uid,
+                shard_id="shard",
+                target_video_path=str(video),
+                target_video_sha256=_sha256(video),
+                target_full_audio_path=str(audio),
+                target_full_audio_sha256=_sha256(audio),
+                target_duration_seconds=2.0,
+                subject_reference_count=0,
+            )
+        )
+    (audio_root / "canonical_clips.jsonl").write_text(
+        "".join(record.model_dump_json() + "\n" for record in records),
+        encoding="utf-8",
+    )
+    (audio_root / "canonical_clips_summary.json").write_text(
+        CanonicalAudioClipSummary(
+            visual_canonical_clip_count=2,
+            canonical_audio_clip_count=2,
+            subject_binding_clip_count=0,
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    result = build_specialized_inventory(audio_production_root=root)
+
+    assert isinstance(result, SpecializedAudioSemanticsInventory)
+    assert result.target_clip_count == 2
+    assert [job.target_clip_uid for job in result.jobs] == ["clip-0", "clip-1"]
+    assert all(job.speaker_clusters == [] for job in result.jobs)
+    assert result.source_readable_segments_path is None
+    assert not (root / "pairs").exists()
+    assert not (root / "asr").exists()
 
 
 @pytest.mark.parametrize(
@@ -1142,6 +1272,33 @@ def test_request_fingerprints_cover_semantics_but_not_inflight(tmp_path: Path) -
     )
     assert GLOBAL_PROMPT_VERSION in global_a.prompt_version
     assert LOCAL_PROMPT_VERSION in local_audio.prompt_version
+
+
+def test_speaker_binding_changes_local_not_captioner_request_identity(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    original = SpecializedAudioSemanticsJob.model_validate(
+        inventory.jobs[0].model_dump(mode="json")
+    )
+    rebound = original.model_copy(
+        update={
+            "speaker_clusters": [
+                cluster.model_copy(update={"entity_id": "e-rebound"})
+                for cluster in original.speaker_clusters
+            ]
+        }
+    )
+    captioner = _caption_config(inventory).provenance()
+    local = _local_config(inventory).provenance()
+    caption_record = _ready_captioner_record(inventory)
+
+    assert captioner_request_fingerprint(original, captioner) == (
+        captioner_request_fingerprint(rebound, captioner)
+    )
+    assert local_request_fingerprint(original, local, caption_record) != (
+        local_request_fingerprint(rebound, local, caption_record)
+    )
 
 
 def test_global_runtime_fingerprint_covers_music_and_recaption_dependencies(
@@ -1500,6 +1657,89 @@ class _FakeLocal:
         finally:
             if self.tracker:
                 self.tracker.leave("local")
+
+
+def test_no_speaker_job_runs_all_semantic_stages_and_assembles_complete(
+    tmp_path: Path,
+) -> None:
+    legacy = _inventory(tmp_path, clip_count=1)
+    root = Path(legacy.source_audio_production_root)
+    canonical_manifest = root / "canonical_clips.jsonl"
+    canonical_manifest.write_text("canonical\n", encoding="utf-8")
+    job = SpecializedAudioSemanticsJob.model_validate(
+        {
+            **legacy.jobs[0].model_dump(mode="json"),
+            "target_audio_binding_path": None,
+            "target_audio_binding_sha256": None,
+            "speaker_clusters": [],
+        }
+    )
+    values: dict[str, object] = {
+        "source_audio_production_root": str(root),
+        "source_canonical_audio_manifest_path": str(canonical_manifest),
+        "source_canonical_audio_manifest_sha256": _sha256(canonical_manifest),
+        "target_clip_count": 1,
+        "readable_segment_count": 0,
+        "jobs": [job.model_dump(mode="json")],
+    }
+    inventory = SpecializedAudioSemanticsInventory(
+        **values,
+        inventory_fingerprint=specialized._specialized_inventory_fingerprint(values),
+    )
+
+    @dataclass
+    class _EmptyLocal:
+        config: LocalSemanticsConfig
+        calls: list[str] = field(default_factory=list)
+
+        @property
+        def provenance(self):  # type: ignore[no-untyped-def]
+            return self.config.provenance()
+
+        def describe(self, active_job, raw_audio_caption=None):  # type: ignore[no-untyped-def]
+            del raw_audio_caption
+            self.calls.append(active_job.target_clip_uid)
+            return SpecializedBackendResult(
+                response=LocalAudioSemanticsResponse(
+                    temporal_audio_events=[],
+                    speaker_delivery=[],
+                ),
+                raw_responses=(),
+                diagnostics=(),
+                model_call_count=1,
+            )
+
+    output = root / SPECIALIZED_ROOT_NAME
+    captioner = _FakeCaptioner(_caption_config(inventory))  # type: ignore[arg-type]
+    global_backend = _FakeGlobal(_global_config())
+    local = _EmptyLocal(_local_config(inventory))  # type: ignore[arg-type]
+    music = _FakeMusic(_music_config(inventory))  # type: ignore[arg-type]
+    pipeline_result = run_specialized_pipeline(
+        inventory=inventory,  # type: ignore[arg-type]
+        output_root=output,
+        captioner_backend=captioner,
+        global_backend=global_backend,
+        local_backend=local,
+        music_backend=music,
+    )
+
+    assembled = specialized._read_jsonl(
+        output / "assembled/records.jsonl",
+        specialized.SpecializedAudioSemanticsRecord,
+    )
+    assert pipeline_result.target_clip_count == 1
+    assert captioner.calls == [job.target_clip_uid]
+    assert global_backend.calls == [job.target_clip_uid]
+    assert local.calls == [job.target_clip_uid]
+    assert assembled[0].status == "complete"
+    assert assembled[0].speaker_delivery == []
+    assert assembled[0].target_audio_binding_path is None
+    review = (output / "assembled/review.html").read_text(encoding="utf-8")
+    speaker_section = review.split("<h3>Speaker delivery</h3>", 1)[1].split(
+        "<details>", 1
+    )[0]
+    assert "[none]" in speaker_section
+    assert "[unavailable]" not in speaker_section
 
 
 def _ready_captioner_record(

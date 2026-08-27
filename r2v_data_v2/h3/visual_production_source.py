@@ -111,8 +111,20 @@ class VisualProductionInventory(SchemaModel):
     media_collection_count: int
     media_collection_clip_counts: dict[str, int]
     shard_count: int
+    canonical_clips: list[VisualProductionClip]
     clips: list[VisualProductionClip]
     skip_reason_counts: dict[str, int]
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> VisualProductionInventory:
+        if self.canonical_sample_count != len(self.canonical_clips):
+            raise ValueError("canonical Visual clip count is inconsistent")
+        if self.eligible_clip_count != len(self.clips):
+            raise ValueError("subject-eligible Visual clip count is inconsistent")
+        canonical_ids = {item.identity.clip_uid for item in self.canonical_clips}
+        if any(item.identity.clip_uid not in canonical_ids for item in self.clips):
+            raise ValueError("subject-eligible clips must belong to canonical clips")
+        return self
 
 
 def _read_jsonl(path: Path) -> Iterator[dict[str, object]]:
@@ -428,6 +440,7 @@ def load_visual_production_inventory(
     else:
         raise ValueError(f"unsupported Visual samples schema: {schema_version!r}")
 
+    canonical_clips: list[VisualProductionClip] = []
     clips: list[VisualProductionClip] = []
     sample_ids: set[str] = set()
     clip_uids: set[str] = set()
@@ -521,22 +534,22 @@ def load_visual_production_inventory(
             for reference in normalized_sample.references
             if reference.kind == "subject"
         ]
-        for reference in subject_references:
+        for reference in normalized_sample.references:
             reference_path = Path(reference.artifact_path).resolve(strict=True)
             if not reference_path.is_file():
-                raise ValueError("canonical subject reference is not a file")
+                raise ValueError("canonical Visual reference is not a file")
+        canonical_clip = VisualProductionClip(
+            identity=identity,
+            sample=normalized_sample,
+            clip=clip,
+            clip_record_path=str(clip_path),
+            subject_references=subject_references,
+        )
+        canonical_clips.append(canonical_clip)
         if not subject_references:
             skipped.update(["no_subject_reference"])
             continue
-        clips.append(
-            VisualProductionClip(
-                identity=identity,
-                sample=normalized_sample,
-                clip=clip,
-                clip_record_path=str(clip_path),
-                subject_references=subject_references,
-            )
-        )
+        clips.append(canonical_clip)
 
     collection_counts = Counter(
         item.identity.media_collection_relpath for item in clips
@@ -554,6 +567,7 @@ def load_visual_production_inventory(
         media_collection_count=len(collection_counts),
         media_collection_clip_counts=dict(sorted(collection_counts.items())),
         shard_count=len({item.identity.shard_id for item in clips}),
+        canonical_clips=canonical_clips,
         clips=clips,
         skip_reason_counts=dict(sorted(skipped.items())),
     )

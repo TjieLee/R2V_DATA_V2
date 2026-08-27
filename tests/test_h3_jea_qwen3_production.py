@@ -10,13 +10,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import r2v_data_v2.h3.jea_audio_production as jea_audio
 import tools.run_h3_jea_production as jea_cli
 import tools.run_h3_qwen3_asr as qwen_cli
 from r2v_data_v2.h3.jea_audio_production import (
+    CanonicalAudioClip,
     JEAOccurrenceEmbedding,
     audio_binding_path,
     build_jea_pairs,
     full_audio_path,
+    materialize_canonical_audio_clips,
     primary_voice_path,
 )
 from r2v_data_v2.h3.qwen3_asr import (
@@ -199,6 +202,7 @@ def _sample(
     parent_video_id: str = "legacy-parent",
     with_attribute: bool = False,
     with_latest_reference_fields: bool = False,
+    with_subject: bool = True,
 ) -> tuple[dict[str, object], Path, Path]:
     production = tmp_path / "visual-production"
     runs = tmp_path / "visual-runs"
@@ -212,7 +216,7 @@ def _sample(
         {
             "image_id": "image_1",
             "image_index": 1,
-            "kind": "subject",
+            "kind": "subject" if with_subject else "object",
             "entity_id": "entity_1",
             "image_path": subject_path.relative_to(production).as_posix(),
             "source_frame_index": 0,
@@ -588,6 +592,168 @@ def test_canonical_source_loads_multiple_shards(tmp_path: Path) -> None:
     assert inventory.visual_input_schema == "r2v.v3.production_sample.1"
     assert inventory.visual_input_mode == "compacted_production"
     assert [item.identity.clip_uid for item in inventory.clips] == ["clip-a", "clip-b"]
+
+
+def test_visual_inventory_preserves_canonical_clips_without_subjects(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "subject",
+                "shard_id": "shard-a",
+                "clip_relative_path": "show/work/subject.mp4",
+                "source_relative_path": "show/work/source-a.mkv",
+            },
+            {
+                "clip_uid": "object-only",
+                "shard_id": "shard-b",
+                "clip_relative_path": "show/work/object.mp4",
+                "source_relative_path": "show/work/source-b.mkv",
+                "with_subject": False,
+            },
+        ],
+    )
+
+    assert inventory.canonical_sample_count == len(inventory.canonical_clips) == 2
+    assert inventory.eligible_clip_count == len(inventory.clips) == 1
+    assert [item.identity.clip_uid for item in inventory.canonical_clips] == [
+        "subject",
+        "object-only",
+    ]
+    assert [item.identity.clip_uid for item in inventory.clips] == ["subject"]
+    assert inventory.skip_reason_counts == {"no_subject_reference": 1}
+
+
+def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "subject",
+                "shard_id": "shard-a",
+                "clip_relative_path": "show/work/subject.mp4",
+                "source_relative_path": "show/work/source-a.mkv",
+            },
+            {
+                "clip_uid": "object-only",
+                "shard_id": "shard-b",
+                "clip_relative_path": "show/work/object.mp4",
+                "source_relative_path": "show/work/source-b.mkv",
+                "with_subject": False,
+            },
+        ],
+    )
+    calls: list[str] = []
+
+    class _AudioBackend:
+        def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
+            clip_uid = str(kwargs["clip_uid"])
+            destination = Path(kwargs["destination"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(f"audio:{clip_uid}".encode())
+            calls.append(clip_uid)
+            return SimpleNamespace(
+                path=destination,
+                stream=SimpleNamespace(duration_seconds=2.5),
+            )
+
+    audio_root = tmp_path / "audio-production" / "audio"
+    summary = materialize_canonical_audio_clips(
+        visual_inventory=inventory,
+        audio_root=audio_root,
+        audio_backend=_AudioBackend(),  # type: ignore[arg-type]
+    )
+    rows = [
+        CanonicalAudioClip.model_validate_json(line)
+        for line in (audio_root / "canonical_clips.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert calls == ["subject", "object-only"]
+    assert summary.visual_canonical_clip_count == 2
+    assert summary.canonical_audio_clip_count == 2
+    assert [row.clip_uid for row in rows] == ["subject", "object-only"]
+    no_subject = rows[1]
+    assert no_subject.subject_reference_count == 0
+    assert no_subject.target_audio_binding_path is None
+    assert no_subject.target_audio_binding_sha256 is None
+
+    sentinel = audio_root.parent / "pairs" / "keep.txt"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_text("unchanged", encoding="utf-8")
+    calls.clear()
+    materialize_canonical_audio_clips(
+        visual_inventory=inventory,
+        audio_root=audio_root,
+        audio_backend=_AudioBackend(),  # type: ignore[arg-type]
+    )
+    assert calls == []
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "subject",
+                "shard_id": "shard-a",
+                "clip_relative_path": "show/work/subject.mp4",
+                "source_relative_path": "show/work/source-a.mkv",
+            },
+            {
+                "clip_uid": "object-only",
+                "shard_id": "shard-b",
+                "clip_relative_path": "show/work/object.mp4",
+                "source_relative_path": "show/work/source-b.mkv",
+                "with_subject": False,
+            },
+        ],
+    )
+    bound: list[str] = []
+
+    def fake_pilot(**kwargs: object) -> SimpleNamespace:
+        bound.extend(
+            Path(item.clip_path).parent.name  # type: ignore[attr-defined]
+            for item in kwargs["explicit_clips"]  # type: ignore[union-attr]
+        )
+        return SimpleNamespace()
+
+    monkeypatch.setattr(jea_audio, "run_h3_audio_binding_pilot", fake_pilot)
+
+    class _AudioBackend:
+        def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
+            destination = Path(kwargs["destination"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(str(kwargs["clip_uid"]).encode())
+            return SimpleNamespace(
+                path=destination,
+                stream=SimpleNamespace(duration_seconds=2.5),
+            )
+
+    output = tmp_path / "audio-stage"
+    jea_audio.run_jea_audio_stage(
+        visual_inventory=inventory,
+        output_root=output,
+        lr_asd_backend=object(),  # type: ignore[arg-type]
+        speech_backend=object(),  # type: ignore[arg-type]
+        review_media_backend=object(),  # type: ignore[arg-type]
+        audio_backend=_AudioBackend(),  # type: ignore[arg-type]
+    )
+
+    assert bound == ["subject"]
+    rows = (output / "canonical_clips.jsonl").read_text(encoding="utf-8")
+    assert [
+        json.loads(line)["clip_uid"] for line in rows.splitlines()
+    ] == ["subject", "object-only"]
 
 
 def test_audio_loader_reads_latest_variant_aware_clip_record(

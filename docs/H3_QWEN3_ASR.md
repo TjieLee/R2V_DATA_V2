@@ -19,6 +19,11 @@ only the Visual-selected default attribute image at
 background, and accepted-base variants remains owned by Visual.
 
 Only `$VISUAL_PRODUCTION_ROOT/samples.jsonl` selects canonical Visual samples.
+Every validated row is retained in `VisualProductionInventory.canonical_clips`
+and defines the clip-level Audio universe. The existing `.clips` collection is
+the subject-reference subset used by LR-ASD, primary voice, embedding, and pair
+stages. A `no_subject_reference` count therefore means "not eligible for the
+subject pipeline", not "invalid or removed from Audio".
 The loader detects one of two supported layouts from its first non-empty row:
 
 - `r2v.v3.production_sample.1` is compacted production. In this mode
@@ -82,8 +87,16 @@ Clip artifacts use the readable path:
 ```text
 audio/clips/<clip_display_path>/audio_binding.json
 audio/full_audio/<clip_display_path>.flac
+audio/canonical_clips.jsonl
+audio/canonical_clips_summary.json
 primary_voice/<clip_display_path>/<entity_id>.flac
 ```
+
+Fresh Audio production materializes full audio for all `canonical_clips` while
+running subject binding only for `.clips`. The canonical manifest publishes one
+`r2v.h3.canonical_audio_clip.1` row per Visual canonical clip in Visual order.
+No-subject rows have null binding path/hash instead of a fabricated empty
+sidecar. Its summary requires the Visual and Audio canonical counts to match.
 
 Pair rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
 `clip_display_path`, `media_collection_relpath`, `media_collection_name`,
@@ -262,6 +275,23 @@ For a minimal ASR-only rerun:
 
 Do not use `--overwrite` unless the exact target stage directory has been
 checked and intentional replacement is required.
+
+For an existing Audio root, model-free canonical full-audio backfill is:
+
+```bash
+"$R2V_PYTHON" tools/backfill_h3_canonical_audio.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+```
+
+It does not rerun Audio binding or modify primary voice, embedding, pairs,
+diarization, ASR, specialized semantics, or H3 output.
+
+Specialized clip-level audio semantics reads `audio/canonical_clips.jsonl` and
+does not use Qwen3-ASR as an admission dependency. DiariZen speaker clusters are
+an optional subset overlay. The future exact Visual/Audio clip-level join key is
+`clip_uid`, with one specialized assembled record per Visual canonical clip.
 
 ## Model-free Qwen3 ASR human review
 

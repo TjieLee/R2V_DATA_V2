@@ -7,7 +7,7 @@ import shutil
 import uuid
 import wave
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -18,6 +18,7 @@ from pydantic import Field, model_validator
 from r2v_data_v2.h3.audio_backends import (
     AudioMediaBackend,
     FaceEmbeddingBackend,
+    MaterializedMedia,
     SpeakerEmbeddingBackend,
 )
 from r2v_data_v2.h3.audio_pairing import (
@@ -49,10 +50,13 @@ from r2v_data_v2.h3.review import ReviewMediaBackend
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 from r2v_data_v2.h3.visual_production_source import (
     ReadableClipIdentity,
+    VisualProductionClip,
     VisualProductionInventory,
 )
 
 JEA_PAIR_SCHEMA_VERSION = "r2v.h3.jea_pairs.1"
+CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.1"
+CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.1"
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,60 @@ class JEAProductionPaths:
     diarization: Path
     asr: Path
     h3: Path
+
+
+class CanonicalAudioClip(SchemaModel):
+    schema_version: Literal["r2v.h3.canonical_audio_clip.1"] = (
+        CANONICAL_AUDIO_CLIP_VERSION
+    )
+    clip_uid: str
+    clip_display_path: str
+    media_collection_relpath: str
+    media_collection_name: str
+    episode_name: str
+    clip_name: str
+    shard_id: str
+    target_video_path: str
+    target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_full_audio_path: str
+    target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    subject_reference_count: int = Field(ge=0)
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> CanonicalAudioClip:
+        if (self.target_audio_binding_path is None) != (
+            self.target_audio_binding_sha256 is None
+        ):
+            raise ValueError("canonical audio binding path/hash must be paired")
+        if self.subject_reference_count == 0 and self.target_audio_binding_path is not None:
+            raise ValueError("no-subject canonical audio cannot publish a binding")
+        return self
+
+
+class CanonicalAudioClipSummary(SchemaModel):
+    schema_version: Literal["r2v.h3.canonical_audio_clip_summary.1"] = (
+        CANONICAL_AUDIO_CLIP_SUMMARY_VERSION
+    )
+    canonical_audio_clip_schema_version: Literal[
+        "r2v.h3.canonical_audio_clip.1"
+    ] = CANONICAL_AUDIO_CLIP_VERSION
+    visual_canonical_clip_count: int = Field(gt=0)
+    canonical_audio_clip_count: int = Field(gt=0)
+    subject_binding_clip_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> CanonicalAudioClipSummary:
+        if self.visual_canonical_clip_count != self.canonical_audio_clip_count:
+            raise ValueError("canonical Visual and Audio clip counts differ")
+        if self.subject_binding_clip_count > self.canonical_audio_clip_count:
+            raise ValueError("canonical subject binding count exceeds clip count")
+        return self
 
 
 def jea_production_paths(audio_production_root: Path) -> JEAProductionPaths:
@@ -137,6 +195,161 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
     )
 
 
+def _write_json(path: Path, value: SchemaModel) -> None:
+    path.write_text(
+        json.dumps(
+            value.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _canonical_binding(
+    audio_root: Path,
+    item: VisualProductionClip,
+) -> tuple[str | None, str | None, float | None]:
+    if not item.subject_references:
+        return None, None, None
+    path = audio_binding_path(audio_root, item.identity)
+    if not path.is_file():
+        return None, None, None
+    sidecar = AudioBindingSidecar.model_validate_json(path.read_text(encoding="utf-8"))
+    if sidecar.clip_uid != item.identity.clip_uid:
+        raise ValueError("canonical audio binding clip identity differs")
+    duration = (
+        sidecar.evidence.audio.duration_seconds
+        if sidecar.evidence is not None
+        else None
+    )
+    return str(path.resolve(strict=True)), _sha256_file(path), duration
+
+
+def _publish_canonical_audio_manifest(
+    *,
+    visual_inventory: VisualProductionInventory,
+    audio_root: Path,
+    materialized_by_clip: dict[str, MaterializedMedia],
+    duration_resolver: Callable[[VisualProductionClip], float] | None = None,
+) -> CanonicalAudioClipSummary:
+    destination = audio_root.expanduser().resolve(strict=True)
+    existing_by_clip: dict[str, CanonicalAudioClip] = {}
+    existing_path = destination / "canonical_clips.jsonl"
+    if existing_path.is_file():
+        existing_by_clip = {
+            record.clip_uid: record
+            for record in (
+                CanonicalAudioClip.model_validate_json(line)
+                for line in existing_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        }
+    records: list[CanonicalAudioClip] = []
+    for item in visual_inventory.canonical_clips:
+        clip_uid = item.identity.clip_uid
+        video_path = Path(item.sample.target_video).expanduser().resolve(strict=True)
+        audio_path = full_audio_path(destination, item.identity).resolve(strict=True)
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"canonical full audio is missing: {audio_path}")
+        binding_path, binding_hash, binding_duration = _canonical_binding(
+            destination,
+            item,
+        )
+        media = materialized_by_clip.get(clip_uid)
+        existing = existing_by_clip.get(clip_uid)
+        if media is not None:
+            duration = media.stream.duration_seconds
+        elif (
+            existing is not None
+            and existing.target_full_audio_path == str(audio_path)
+            and existing.target_full_audio_sha256 == _sha256_file(audio_path)
+        ):
+            duration = existing.target_duration_seconds
+        elif binding_duration is not None:
+            duration = binding_duration
+        elif duration_resolver is not None:
+            duration = float(duration_resolver(item))
+        else:
+            raise ValueError(
+                "cannot establish existing canonical full-audio duration"
+            )
+        identity = item.identity
+        records.append(
+            CanonicalAudioClip(
+                clip_uid=clip_uid,
+                clip_display_path=identity.clip_display_path,
+                media_collection_relpath=identity.media_collection_relpath,
+                media_collection_name=identity.media_collection_name,
+                episode_name=identity.episode_name,
+                clip_name=identity.clip_name,
+                shard_id=identity.shard_id,
+                target_video_path=str(video_path),
+                target_video_sha256=_sha256_file(video_path),
+                target_full_audio_path=str(audio_path),
+                target_full_audio_sha256=_sha256_file(audio_path),
+                target_duration_seconds=duration,
+                subject_reference_count=len(item.subject_references),
+                target_audio_binding_path=binding_path,
+                target_audio_binding_sha256=binding_hash,
+            )
+        )
+    summary = CanonicalAudioClipSummary(
+        visual_canonical_clip_count=visual_inventory.canonical_sample_count,
+        canonical_audio_clip_count=len(records),
+        subject_binding_clip_count=sum(
+            record.target_audio_binding_path is not None for record in records
+        ),
+    )
+    token = uuid.uuid4().hex
+    temporary_records = destination / f".canonical_clips.jsonl.tmp-{token}"
+    temporary_summary = destination / f".canonical_clips_summary.json.tmp-{token}"
+    try:
+        _write_jsonl(temporary_records, records)
+        _write_json(temporary_summary, summary)
+        temporary_records.replace(destination / "canonical_clips.jsonl")
+        temporary_summary.replace(destination / "canonical_clips_summary.json")
+    finally:
+        temporary_records.unlink(missing_ok=True)
+        temporary_summary.unlink(missing_ok=True)
+    return summary
+
+
+def materialize_canonical_audio_clips(
+    *,
+    visual_inventory: VisualProductionInventory,
+    audio_root: Path,
+    audio_backend: AudioMediaBackend,
+    duration_resolver: Callable[[VisualProductionClip], float] | None = None,
+) -> CanonicalAudioClipSummary:
+    destination = audio_root.expanduser().resolve(strict=False)
+    destination.mkdir(parents=True, exist_ok=True)
+    materialized: dict[str, MaterializedMedia] = {}
+    for item in visual_inventory.canonical_clips:
+        expected = full_audio_path(destination, item.identity)
+        if expected.is_file():
+            continue
+        result = audio_backend.materialize_full_audio(
+            clip_uid=item.identity.clip_uid,
+            source_video_path=Path(item.sample.target_video).resolve(strict=True),
+            destination=expected,
+            sample_rate_hz=16000,
+            channels=1,
+            output_format="flac",
+        )
+        if result.path.resolve(strict=True) != expected.resolve(strict=True):
+            raise ValueError("JEA full-audio backend published an unexpected path")
+        materialized[item.identity.clip_uid] = result
+    return _publish_canonical_audio_manifest(
+        visual_inventory=visual_inventory,
+        audio_root=destination,
+        materialized_by_clip=materialized,
+        duration_resolver=duration_resolver,
+    )
+
+
 def run_jea_audio_stage(
     *,
     visual_inventory: VisualProductionInventory,
@@ -170,18 +383,11 @@ def run_jea_audio_stage(
             explicit_clips=explicit,
             workers=workers,
         )
-        for item in visual_inventory.clips:
-            expected = full_audio_path(destination, item.identity)
-            materialized = audio_backend.materialize_full_audio(
-                clip_uid=item.identity.clip_uid,
-                source_video_path=Path(item.sample.target_video).resolve(strict=True),
-                destination=expected,
-                sample_rate_hz=16000,
-                channels=1,
-                output_format="flac",
-            )
-            if materialized.path.resolve(strict=True) != expected.resolve(strict=True):
-                raise ValueError("JEA full-audio backend published an unexpected path")
+        materialize_canonical_audio_clips(
+            visual_inventory=visual_inventory,
+            audio_root=destination,
+            audio_backend=audio_backend,
+        )
         return summary
     except Exception:
         if destination.exists():

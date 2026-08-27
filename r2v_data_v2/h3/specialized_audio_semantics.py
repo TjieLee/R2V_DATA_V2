@@ -5,10 +5,11 @@ import html
 import json
 import math
 import os
+import re
 import shutil
 import threading
 import uuid
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -18,6 +19,11 @@ from typing import Any, Literal, Protocol, TypeVar
 from openai import OpenAI
 from pydantic import Field, StrictStr, ValidationError, model_validator
 
+from r2v_data_v2.h3.jea_audio_production import (
+    CanonicalAudioClip,
+    CanonicalAudioClipSummary,
+)
+from r2v_data_v2.h3.jea_diarization import JEAReadableDiarizationSegment
 from r2v_data_v2.h3.jea_target_audio_caption import (
     JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION,
     JEATargetAudioCaptionBackendFailure,
@@ -27,9 +33,10 @@ from r2v_data_v2.h3.jea_target_audio_caption import (
     JEATargetAudioCaptionJob,
     JEATargetAudioCaptionPromptAdapter,
     OpenAIJEATargetAudioCaptionBackend,
-    _inventory_fingerprint,
     _is_all_semantic_null,
-    build_jea_target_audio_caption_inventory,
+)
+from r2v_data_v2.h3.jea_target_audio_caption import (
+    _inventory_fingerprint as _legacy_inventory_fingerprint,
 )
 from r2v_data_v2.h3.jea_target_audio_caption import (
     _model_input as _local_model_input,
@@ -38,6 +45,8 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.target_audio_caption_contract import (
     ModelSpeakerDelivery,
+    SpeakerClusterEvidence,
+    SpeakerTimeRange,
     TargetAudioCaptionResponse,
     TargetSpeakerDelivery,
     TemporalAudioEvent,
@@ -52,9 +61,9 @@ SPECIALIZED_ROOT_NAME = "audio_semantics_specialized_v1"
 CAPTIONER_RECORD_VERSION = "r2v.h3.specialized_audio_captioner.1"
 GLOBAL_RECORD_VERSION = "r2v.h3.specialized_global_audio_semantics.3"
 LOCAL_RECORD_VERSION = "r2v.h3.specialized_local_audio_semantics.3"
-ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.2"
+ASSEMBLED_RECORD_VERSION = "r2v.h3.specialized_audio_semantics.3"
 STAGE_SUMMARY_VERSION = "r2v.h3.specialized_audio_stage_summary.1"
-ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.2"
+ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.3"
 BACKEND_PROVENANCE_VERSION = "r2v.h3.specialized_audio_backend_provenance.1"
 
 CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v2"
@@ -70,12 +79,12 @@ GLOBAL_RUNTIME_POLICY_VERSION = (
     f"{GLOBAL_FALLBACK_POLICY_VERSION}+{GLOBAL_RECAPTION_RESCUE_POLICY_VERSION}"
     f"+{MUSIC_RESCUE_POLICY_VERSION}"
 )
-LOCAL_PROMPT_VERSION = "h3_specialized_local_audio_semantics_v1"
-LOCAL_FALLBACK_PROMPT_VERSION = "h3_specialized_local_audio_semantics_v1_recheck"
+LOCAL_PROMPT_VERSION = "h3_specialized_local_audio_semantics_v2"
+LOCAL_FALLBACK_PROMPT_VERSION = "h3_specialized_local_audio_semantics_v2_recheck"
 LOCAL_FALLBACK_POLICY_VERSION = JEA_TARGET_AUDIO_CAPTION_FALLBACK_POLICY_VERSION
 LOCAL_FIELD_POLICY_VERSION = "specialized_local_field_salvage_v2"
 LOCAL_CAPTION_HINT_POLICY_VERSION = "specialized_local_caption_hint_audio_truth_v1"
-LOCAL_EVENT_FILTER_POLICY_VERSION = "specialized_local_drop_speech_only_events_v1"
+LOCAL_EVENT_FILTER_POLICY_VERSION = "specialized_local_drop_speech_only_events_v2"
 LOCAL_RUNTIME_POLICY_VERSION = (
     f"{LOCAL_FALLBACK_POLICY_VERSION}+{LOCAL_FIELD_POLICY_VERSION}"
     f"+{LOCAL_CAPTION_HINT_POLICY_VERSION}+{LOCAL_EVENT_FILTER_POLICY_VERSION}"
@@ -111,6 +120,75 @@ SemanticSource = Literal[
     "primary_all_null_confirmed",
     "fallback_all_null_confirmed",
 ]
+
+SPECIALIZED_INVENTORY_VERSION = "r2v.h3.specialized_audio_semantics_inventory.1"
+
+
+class SpecializedAudioSemanticsJob(SchemaModel):
+    target_clip_uid: str
+    clip_display_path: str
+    target_video_path: str
+    target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_full_audio_path: str
+    target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    speaker_clusters: list[SpeakerClusterEvidence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_job(self) -> SpecializedAudioSemanticsJob:
+        if not self.target_clip_uid.strip() or not self.clip_display_path.strip():
+            raise ValueError("specialized audio target identity must not be empty")
+        if (self.target_audio_binding_path is None) != (
+            self.target_audio_binding_sha256 is None
+        ):
+            raise ValueError("specialized audio binding path/hash must be paired")
+        cluster_ids = [item.speaker_cluster_id for item in self.speaker_clusters]
+        if len(cluster_ids) != len(set(cluster_ids)):
+            raise ValueError("specialized speaker clusters must be unique")
+        return self
+
+
+class SpecializedAudioSemanticsInventory(SchemaModel):
+    schema_version: Literal[
+        "r2v.h3.specialized_audio_semantics_inventory.1"
+    ] = SPECIALIZED_INVENTORY_VERSION
+    source_audio_production_root: str
+    source_canonical_audio_manifest_path: str
+    source_canonical_audio_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_readable_segments_path: str | None = None
+    source_readable_segments_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    target_clip_count: int = Field(gt=0)
+    readable_segment_count: int = Field(ge=0)
+    transcript_supplied_to_model: Literal[False] = False
+    entity_id_supplied_to_model: Literal[False] = False
+    donor_media_used: Literal[False] = False
+    jobs: list[SpecializedAudioSemanticsJob]
+    inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> SpecializedAudioSemanticsInventory:
+        if self.target_clip_count != len(self.jobs):
+            raise ValueError("specialized target clip count is inconsistent")
+        if (self.source_readable_segments_path is None) != (
+            self.source_readable_segments_sha256 is None
+        ):
+            raise ValueError("specialized readable path/hash must be paired")
+        if self.readable_segment_count and self.source_readable_segments_path is None:
+            raise ValueError("readable segments require source provenance")
+        clip_ids = [item.target_clip_uid for item in self.jobs]
+        if len(clip_ids) != len(set(clip_ids)):
+            raise ValueError("specialized target clips must be unique")
+        if self.inventory_fingerprint != _specialized_inventory_fingerprint(self):
+            raise ValueError("specialized inventory fingerprint is invalid")
+        return self
 
 
 GLOBAL_SYSTEM_PROMPT = """You extract reusable GLOBAL NON-VOCAL AUDIO facts from
@@ -223,6 +301,15 @@ the non-linguistic event and do not treat the speech itself as the event. Return
 an empty event list only when no localized non-linguistic event is reliably
 audible after inspecting the whole clip. Do not manufacture events for recall.
 
+Describe the audible sound itself. Do not copy or preserve uncertain source
+guesses from the Captioner hint. Prefer "sharp metallic clink" over "sharp
+metallic clink likely caused by a sword being drawn" when the source cannot be
+reliably confirmed from the audio. Background score, BGM, and non-diegetic music
+are not temporal_audio_events. Include music only when there is sufficient
+audible evidence that it is localized diegetic or in-scene playback/performance,
+such as a phone, radio, television, live performance, or another clearly
+localized musical source. Do not duplicate Global non_diegetic_music here.
+
 The supplied Captioner observation is AUXILIARY, UNTRUSTED ACOUSTIC SEARCH HINTS
 ONLY. It may contain omissions, hallucinations, incorrect source or instrument
 guesses, and false-negative statements. Use positive mentions only to remind
@@ -243,7 +330,9 @@ speaker-cluster timing evidence.
 Never transcribe, quote, paraphrase, correct, or summarize dialogue. Never infer
 identity, gender, age, nationality, intrinsic voice identity, or timbre. Do not
 emit entity_id. Return every supplied speaker_cluster_id exactly once; array
-order is not semantic. Set overall_soundscape and non_diegetic_music to null;
+order is not semantic. If no speaker clusters are supplied, do not invent any;
+return speaker_delivery as an empty array and still perform the full temporal
+non-linguistic event pass. Set overall_soundscape and non_diegetic_music to null;
 this specialized Local pass does not own those fields. Return exactly one compact
 JSON object matching the supplied schema, with no markdown or explanation."""
 
@@ -252,10 +341,23 @@ same specialized LOCAL AUDIO SEMANTICS. Audio remains the only source of truth.
 Actively check for brief, quiet, background, or speech-masked non-linguistic
 events, but publish only sounds verified by listening. Never emit ordinary
 speech, dialogue, conversation, talking, utterances, or speech turns as events.
+Describe the audible sound itself. Do not copy or preserve uncertain source
+guesses from the Captioner hint. Prefer "sharp metallic clink" over "sharp
+metallic clink likely caused by a sword being drawn" when the source cannot be
+reliably confirmed from the audio.
+
+Background score, BGM, and non-diegetic music are not temporal_audio_events.
+Include music as a temporal event only when there is sufficient audible evidence
+that it is localized diegetic or in-scene playback/performance, such as a phone,
+radio, television, live performance, or clearly localized musical source. Do not
+duplicate Global non_diegetic_music in this Local pass.
+
 The auxiliary Captioner observation is untrusted search hints only: positive
 mentions require audio verification and negative claims cannot veto audible
 sound. Ignore it completely for speaker_delivery, which must come only from the
-audio and supplied speaker timing. Preserve all identity, transcript, timing,
+audio and supplied speaker timing. If no speaker clusters are supplied, do not
+invent any; return speaker_delivery as an empty array and still perform the full
+temporal non-linguistic event pass. Preserve all identity, transcript, timing,
 and output-schema constraints from the primary pass. Set overall_soundscape and
 non_diegetic_music to null and return one compact JSON object only."""
 
@@ -387,6 +489,28 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _specialized_inventory_fingerprint(
+    inventory: SpecializedAudioSemanticsInventory | dict[str, object],
+) -> str:
+    if isinstance(inventory, SpecializedAudioSemanticsInventory):
+        values = inventory.model_dump(mode="json")
+    else:
+        payload = dict(inventory)
+        payload.pop("inventory_fingerprint", None)
+        jobs = payload.get("jobs", [])
+        if not isinstance(jobs, list):
+            raise TypeError("specialized inventory jobs must be a list")
+        payload["jobs"] = [
+            SpecializedAudioSemanticsJob.model_validate(item) for item in jobs
+        ]
+        values = SpecializedAudioSemanticsInventory.model_construct(
+            **payload,
+            inventory_fingerprint="",
+        ).model_dump(mode="json")
+    values.pop("inventory_fingerprint", None)
+    return _sha256_text(_compact_json(values))
 
 
 def _verify_file(path_value: str, expected_hash: str, *, field_name: str) -> Path:
@@ -610,6 +734,70 @@ _PURE_SPEECH_EVENT_DESCRIPTIONS = {
     "utterance",
 }
 
+_PURE_SPEECH_TEMPLATE = re.compile(
+    r"^(?:(?:male|female)\s+)?(?:person|speaker|voice)\s+"
+    r"(?:(?:continues?|continued)\s+)?(?:speaks?|speaking|talks?|talking)\b"
+    r"(?P<qualifiers>.*)$"
+)
+_SPEECH_QUALIFIER_WORDS = {
+    "a",
+    "accented",
+    "an",
+    "and",
+    "anxious",
+    "breathless",
+    "calm",
+    "cantonese",
+    "chinese",
+    "commanding",
+    "conversational",
+    "delivery",
+    "desperate",
+    "emotional",
+    "energetic",
+    "energy",
+    "english",
+    "even",
+    "falling",
+    "fast",
+    "french",
+    "hesitation",
+    "high",
+    "in",
+    "japanese",
+    "korean",
+    "language",
+    "loud",
+    "low",
+    "mandarin",
+    "measured",
+    "neutral",
+    "pace",
+    "pause",
+    "pauses",
+    "pitch",
+    "prosody",
+    "questioning",
+    "quiet",
+    "rapid",
+    "rhythm",
+    "rising",
+    "shouting",
+    "slightly",
+    "slow",
+    "soft",
+    "spanish",
+    "strained",
+    "style",
+    "subdued",
+    "the",
+    "tone",
+    "urgent",
+    "very",
+    "whispering",
+    "with",
+}
+
 
 def _is_pure_speech_event(description: str) -> bool:
     normalized = " ".join(description.strip().lower().split()).rstrip(" .,!?:;")
@@ -617,7 +805,13 @@ def _is_pure_speech_event(description: str) -> bool:
         if normalized.startswith(article):
             normalized = normalized[len(article) :]
             break
-    return normalized in _PURE_SPEECH_EVENT_DESCRIPTIONS
+    if normalized in _PURE_SPEECH_EVENT_DESCRIPTIONS:
+        return True
+    match = _PURE_SPEECH_TEMPLATE.fullmatch(normalized)
+    if match is None:
+        return False
+    qualifier_words = re.findall(r"[a-z]+(?:-[a-z]+)?", match.group("qualifiers"))
+    return all(word in _SPEECH_QUALIFIER_WORDS for word in qualifier_words)
 
 
 def _normalize_local_response(
@@ -1732,7 +1926,7 @@ class OpenAILocalSemanticsBackend:
                 raw_audio_caption,
                 primary_failure,
             )
-        if not _is_all_semantic_null(primary.response):
+        if not _is_all_semantic_null(primary.response) or not job.speaker_clusters:
             return _project_local_result(
                 primary,
                 job,
@@ -1920,7 +2114,7 @@ class LocalSemanticsRecord(SchemaModel):
 
 
 class SpecializedAudioSemanticsRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_audio_semantics.2"] = (
+    schema_version: Literal["r2v.h3.specialized_audio_semantics.3"] = (
         ASSEMBLED_RECORD_VERSION
     )
     target_clip_uid: str
@@ -1937,8 +2131,11 @@ class SpecializedAudioSemanticsRecord(SchemaModel):
     target_full_audio_path: str
     target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
-    target_audio_binding_path: str
-    target_audio_binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     captioner_status: Literal["ready", "failed"]
     global_semantics_status: StageStatus
     local_semantics_status: Literal["ready", "failed"]
@@ -1970,6 +2167,10 @@ class SpecializedAudioSemanticsRecord(SchemaModel):
         expected = "complete" if ready_count == 3 else "partial" if ready_count else "failed"
         if self.status != expected:
             raise ValueError("assembled specialized status is inconsistent")
+        if (self.target_audio_binding_path is None) != (
+            self.target_audio_binding_sha256 is None
+        ):
+            raise ValueError("assembled audio binding path/hash must be paired")
         if self.captioner_status != ("failed" if self.raw_audio_caption is None else "ready"):
             raise ValueError("assembled raw caption status is inconsistent")
         if self.global_semantics_status != "ready" and any(
@@ -2023,11 +2224,11 @@ class SpecializedStageSummary(SchemaModel):
 
 
 class SpecializedAssembledSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.specialized_audio_semantics_summary.2"] = (
+    schema_version: Literal["r2v.h3.specialized_audio_semantics_summary.3"] = (
         ASSEMBLED_SUMMARY_VERSION
     )
     assembled_record_schema_version: Literal[
-        "r2v.h3.specialized_audio_semantics.2"
+        "r2v.h3.specialized_audio_semantics.3"
     ] = ASSEMBLED_RECORD_VERSION
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     record_count: int = Field(ge=0)
@@ -2114,6 +2315,10 @@ def local_request_fingerprint(
                     else None
                 ),
                 "model_input": _local_model_input(job),
+                "speaker_cluster_evidence": [
+                    cluster.model_dump(mode="json")
+                    for cluster in job.speaker_clusters
+                ],
                 "backend_configuration_fingerprint": provenance.configuration_fingerprint,
                 "prompt_version": LOCAL_PROMPT_VERSION,
                 "fallback_prompt_version": LOCAL_FALLBACK_PROMPT_VERSION,
@@ -2173,24 +2378,47 @@ def _read_jsonl(path: Path, model: type[ResponseT]) -> list[ResponseT]:
 
 
 def _ensure_root(
-    inventory: JEATargetAudioCaptionInventory,
+    inventory: JEATargetAudioCaptionInventory | SpecializedAudioSemanticsInventory,
     output_root: Path,
 ) -> Path:
-    if inventory.inventory_fingerprint != _inventory_fingerprint(inventory):
-        raise ValueError("specialized inventory fingerprint is inconsistent")
-    for path_value, expected_hash, field_name in (
-        (inventory.source_pairs_path, inventory.source_pairs_sha256, "source pairs"),
-        (
-            inventory.source_readable_segments_path,
-            inventory.source_readable_segments_sha256,
-            "source readable segments",
-        ),
-        (
-            inventory.source_qwen3_asr_segments_path,
-            inventory.source_qwen3_asr_segments_sha256,
-            "source Qwen3 ASR segments",
-        ),
-    ):
+    if isinstance(inventory, SpecializedAudioSemanticsInventory):
+        if inventory.inventory_fingerprint != _specialized_inventory_fingerprint(
+            inventory
+        ):
+            raise ValueError("specialized inventory fingerprint is inconsistent")
+        sources = [
+            (
+                inventory.source_canonical_audio_manifest_path,
+                inventory.source_canonical_audio_manifest_sha256,
+                "source canonical audio manifest",
+            )
+        ]
+        if inventory.source_readable_segments_path is not None:
+            assert inventory.source_readable_segments_sha256 is not None
+            sources.append(
+                (
+                    inventory.source_readable_segments_path,
+                    inventory.source_readable_segments_sha256,
+                    "source readable segments",
+                )
+            )
+    else:
+        if inventory.inventory_fingerprint != _legacy_inventory_fingerprint(inventory):
+            raise ValueError("specialized inventory fingerprint is inconsistent")
+        sources = [
+            (inventory.source_pairs_path, inventory.source_pairs_sha256, "source pairs"),
+            (
+                inventory.source_readable_segments_path,
+                inventory.source_readable_segments_sha256,
+                "source readable segments",
+            ),
+            (
+                inventory.source_qwen3_asr_segments_path,
+                inventory.source_qwen3_asr_segments_sha256,
+                "source Qwen3 ASR segments",
+            ),
+        ]
+    for path_value, expected_hash, field_name in sources:
         _verify_file(path_value, expected_hash, field_name=field_name)
     production_root = Path(inventory.source_audio_production_root).resolve(strict=True)
     expected_root = production_root / SPECIALIZED_ROOT_NAME
@@ -2200,7 +2428,12 @@ def _ensure_root(
     root.mkdir(parents=True, exist_ok=True)
     inventory_path = root / "inventory.json"
     if inventory_path.exists():
-        existing = JEATargetAudioCaptionInventory.model_validate_json(
+        inventory_model = (
+            SpecializedAudioSemanticsInventory
+            if isinstance(inventory, SpecializedAudioSemanticsInventory)
+            else JEATargetAudioCaptionInventory
+        )
+        existing = inventory_model.model_validate_json(
             inventory_path.read_text(encoding="utf-8")
         )
         if existing != inventory:
@@ -3636,7 +3869,11 @@ def _review_html(
             + (
                 "<ul>" + deliveries + "</ul>"
                 if deliveries
-                else "<p>[unavailable]</p>"
+                else (
+                    "<p>[none]</p>"
+                    if record.local_semantics_status == "ready"
+                    else "<p>[unavailable]</p>"
+                )
             )
             + "<details><summary>Stage provenance</summary><ul>"
             + provenance
@@ -4229,9 +4466,135 @@ def run_specialized_pipeline(
 def build_specialized_inventory(
     *,
     audio_production_root: Path,
-) -> JEATargetAudioCaptionInventory:
-    return build_jea_target_audio_caption_inventory(
-        audio_production_root=audio_production_root
+) -> SpecializedAudioSemanticsInventory:
+    root = audio_production_root.expanduser().resolve(strict=True)
+    canonical_path = (root / "audio/canonical_clips.jsonl").resolve(strict=True)
+    canonical_summary_path = (
+        root / "audio/canonical_clips_summary.json"
+    ).resolve(strict=True)
+    canonical = [
+        CanonicalAudioClip.model_validate_json(line)
+        for line in canonical_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    summary = CanonicalAudioClipSummary.model_validate_json(
+        canonical_summary_path.read_text(encoding="utf-8")
+    )
+    if not canonical or summary.canonical_audio_clip_count != len(canonical):
+        raise ValueError("canonical audio manifest count is inconsistent")
+    canonical_ids = [item.clip_uid for item in canonical]
+    if len(canonical_ids) != len(set(canonical_ids)):
+        raise ValueError("canonical audio manifest contains duplicate clips")
+
+    readable_path = root / "diarization/readable_segments.jsonl"
+    readable: list[JEAReadableDiarizationSegment] = []
+    if readable_path.is_file():
+        readable = [
+            JEAReadableDiarizationSegment.model_validate_json(line)
+            for line in readable_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    canonical_by_clip = {item.clip_uid: item for item in canonical}
+    readable_by_clip: dict[str, list[JEAReadableDiarizationSegment]] = defaultdict(list)
+    for row in readable:
+        if row.clip_uid not in canonical_by_clip:
+            raise ValueError("DiariZen clip is outside canonical Audio universe")
+        readable_by_clip[row.clip_uid].append(row)
+
+    jobs: list[SpecializedAudioSemanticsJob] = []
+    for item in canonical:
+        _verify_file(
+            item.target_video_path,
+            item.target_video_sha256,
+            field_name="canonical target video",
+        )
+        _verify_file(
+            item.target_full_audio_path,
+            item.target_full_audio_sha256,
+            field_name="canonical target full audio",
+        )
+        if item.target_audio_binding_path is not None:
+            assert item.target_audio_binding_sha256 is not None
+            _verify_file(
+                item.target_audio_binding_path,
+                item.target_audio_binding_sha256,
+                field_name="canonical target audio binding",
+            )
+        clip_rows = sorted(
+            readable_by_clip.get(item.clip_uid, []),
+            key=lambda row: (row.source_start_sample, row.segment_id),
+        )
+        if any(row.clip_display_path != item.clip_display_path for row in clip_rows):
+            raise ValueError("canonical Audio and DiariZen clip paths differ")
+        if any(
+            row.end_time > item.target_duration_seconds + EVENT_TIME_TOLERANCE_SECONDS
+            for row in clip_rows
+        ):
+            raise ValueError("DiariZen segment exceeds canonical Audio timeline")
+        rows_by_cluster: dict[str, list[JEAReadableDiarizationSegment]] = defaultdict(
+            list
+        )
+        cluster_order: list[str] = []
+        for row in clip_rows:
+            if row.speaker_cluster_id not in rows_by_cluster:
+                cluster_order.append(row.speaker_cluster_id)
+            rows_by_cluster[row.speaker_cluster_id].append(row)
+        clusters: list[SpeakerClusterEvidence] = []
+        for cluster_id in cluster_order:
+            cluster_rows = rows_by_cluster[cluster_id]
+            bound_ids = {
+                row.entity_id for row in cluster_rows if row.entity_id is not None
+            }
+            if len(bound_ids) > 1:
+                raise ValueError("speaker cluster resolves to conflicting entity IDs")
+            clusters.append(
+                SpeakerClusterEvidence(
+                    speaker_cluster_id=cluster_id,
+                    entity_id=next(iter(bound_ids), None),
+                    active_time_ranges=[
+                        SpeakerTimeRange(
+                            start_time=row.start_time,
+                            end_time=row.end_time,
+                        )
+                        for row in cluster_rows
+                    ],
+                )
+            )
+        jobs.append(
+            SpecializedAudioSemanticsJob(
+                target_clip_uid=item.clip_uid,
+                clip_display_path=item.clip_display_path,
+                target_video_path=item.target_video_path,
+                target_video_sha256=item.target_video_sha256,
+                target_full_audio_path=item.target_full_audio_path,
+                target_full_audio_sha256=item.target_full_audio_sha256,
+                target_duration_seconds=item.target_duration_seconds,
+                target_audio_binding_path=item.target_audio_binding_path,
+                target_audio_binding_sha256=item.target_audio_binding_sha256,
+                speaker_clusters=clusters,
+            )
+        )
+    values: dict[str, object] = {
+        "schema_version": SPECIALIZED_INVENTORY_VERSION,
+        "source_audio_production_root": str(root),
+        "source_canonical_audio_manifest_path": str(canonical_path),
+        "source_canonical_audio_manifest_sha256": _sha256_file(canonical_path),
+        "source_readable_segments_path": (
+            str(readable_path.resolve(strict=True)) if readable_path.is_file() else None
+        ),
+        "source_readable_segments_sha256": (
+            _sha256_file(readable_path) if readable_path.is_file() else None
+        ),
+        "target_clip_count": len(jobs),
+        "readable_segment_count": len(readable),
+        "transcript_supplied_to_model": False,
+        "entity_id_supplied_to_model": False,
+        "donor_media_used": False,
+        "jobs": [job.model_dump(mode="json") for job in jobs],
+    }
+    return SpecializedAudioSemanticsInventory(
+        **values,
+        inventory_fingerprint=_specialized_inventory_fingerprint(values),
     )
 
 
@@ -4282,6 +4645,8 @@ __all__ = [
     "OpenAILocalSemanticsBackend",
     "OpenAIMusicRescueBackend",
     "SpecializedAssembledSummary",
+    "SpecializedAudioSemanticsInventory",
+    "SpecializedAudioSemanticsJob",
     "SpecializedAudioSemanticsRecord",
     "SpecializedBackendFailure",
     "SpecializedBackendProvenance",

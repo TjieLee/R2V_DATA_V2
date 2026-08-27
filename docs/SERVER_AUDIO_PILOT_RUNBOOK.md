@@ -1565,3 +1565,28 @@ Neither receives Qwen3-ASR transcript text, entity IDs, donor media, reference
 images, or primary voice. Outputs remain separate under
 `audio_caption/dots3/` and `audio_caption/qwen3_omni/`; never use `--overwrite`
 until the exact backend directory has been reviewed.
+
+## Canonical clip-level Audio universe
+
+Visual Production `samples.jsonl` is the sole clip-level admission source. All
+validated rows must appear in `audio/canonical_clips.jsonl` and receive canonical
+full audio, even when they have no subject reference, primary voice, pair,
+DiariZen speaker, or Qwen3-ASR segment. Those subject/speech stages are optional
+enrichment only. Subject Audio binding continues to process only the
+subject-reference subset and no empty subject, speaker, voice, or transcript is
+fabricated for other clips.
+
+For an existing production root, publish/backfill the canonical Audio manifest
+without any AI model call:
+
+```bash
+"$R2V_PYTHON" tools/backfill_h3_canonical_audio.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+```
+
+The specialized Audio semantics inventory is built from that manifest. Readable
+DiariZen speaker evidence is an optional subset overlay and Qwen3-ASR is not an
+inventory dependency. Future clip-level Visual/Audio rendering joins exactly on
+`clip_uid`.

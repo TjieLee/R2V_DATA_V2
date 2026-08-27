@@ -17,6 +17,15 @@ $AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1/
 Every phase publishes atomically and keeps raw model responses, diagnostics,
 request fingerprints, and upstream dependency fingerprints.
 
+The clip-level admission universe is every validated row in Visual Production
+`samples.jsonl`, represented by `audio/canonical_clips.jsonl`. Subject
+references, primary voice, pairs, DiariZen speakers, and Qwen3-ASR transcripts
+are optional enrichment and never remove a canonical clip from this producer.
+The specialized inventory contract is
+`r2v.h3.specialized_audio_semantics_inventory.1`; it reads the canonical Audio
+manifest directly, does not read `pairs/in_pairs.jsonl` or ASR output, and treats
+readable DiariZen rows as an optional subset overlay.
+
 ## Current architecture
 
 ```text
@@ -161,8 +170,10 @@ Program-side normalization handles harmless formatting variation:
 - a failed full Local response may conservatively salvage a complete valid
   `speaker_delivery` array without salvaging malformed event times.
 - obvious whole-string speech-only events such as `a person speaking`,
-  `someone talking`, `speech`, or `dialogue` are dropped; mixed descriptions
-  such as `metallic clink while a person is speaking` remain intact.
+  `someone talking`, `speech`, or speech-plus-language/prosody templates are
+  dropped; mixed descriptions such as `metallic clink while a person is
+  speaking` remain intact. This is
+  `specialized_local_drop_speech_only_events_v2`.
 
 The event pass actively scans the full clip for reliably audible brief, quiet,
 background, and speech-masked non-linguistic events. Ordinary dialogue is never
@@ -171,6 +182,13 @@ non-linguistic localized audio remain eligible.
 
 A failed Local record may therefore retain trusted speaker delivery while its
 `temporal_audio_events` remain unavailable.
+
+Local prompt v2 asks for generic audible event descriptions rather than
+uncertain source guesses and excludes background score/BGM/non-diegetic music
+from temporal events. Localized in-scene playback or performance remains
+eligible. When no speaker clusters are supplied, Local still runs the complete
+event pass and must return `speaker_delivery=[]`; a schema-valid empty event and
+speaker result is ready, not failed.
 
 ### Speaker/entity/time authority
 
@@ -185,6 +203,29 @@ speaker_cluster_id -> frozen entity_id
 
 and reattaches `e1`, `e2`, etc. from inventory evidence. An unbound cluster
 remains `entity_id=null`.
+
+The assembled contract is `r2v.h3.specialized_audio_semantics.3`; its
+`target_audio_binding_path` and hash are nullable for clips without subject
+binding evidence. A no-speaker clip is still `complete` when Captioner, Global,
+and Local all complete.
+
+## Model-free canonical Audio backfill
+
+Existing production roots can add missing no-subject full audio and publish the
+same canonical manifest used by fresh Audio runs without rerunning LR-ASD,
+Silero, DiariZen, ASR, or any model:
+
+```bash
+"$R2V_PYTHON" tools/backfill_h3_canonical_audio.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+```
+
+Existing valid FLAC files are reused. Only missing canonical full audio is
+materialized from the processed canonical target video. The tool updates only
+`audio/canonical_clips.jsonl` and `audio/canonical_clips_summary.json`; subject
+bindings and all downstream stage directories remain untouched.
 
 ## Current runtime topology
 

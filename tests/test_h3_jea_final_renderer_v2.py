@@ -180,6 +180,7 @@ def _visual_inventory(tmp_path: Path) -> VisualProductionInventory:
         media_collection_count=1,
         media_collection_clip_counts={"节目/集合": 2},
         shard_count=2,
+        canonical_clips=clips,
         clips=clips,
         skip_reason_counts={},
     )
@@ -685,6 +686,7 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
         media_collection_count=1,
         media_collection_clip_counts={"节目/集合": 1},
         shard_count=1,
+        canonical_clips=[visual],
         clips=[visual],
         skip_reason_counts={},
     )
