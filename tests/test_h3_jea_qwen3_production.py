@@ -4,6 +4,7 @@ import json
 import math
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -403,6 +404,7 @@ def _dataset_inventory(
     attribute_default_variant: str | None = None,
     attribute_final_selection: str = "raw",
     legacy_enriched: bool = False,
+    enriched_mutator: Callable[[dict[str, object]], None] | None = None,
 ) -> object:
     export_root = tmp_path / "visual-export"
     run_root = tmp_path / "single-visual-run"
@@ -559,6 +561,8 @@ def _dataset_inventory(
                 "accepted_base_image_path",
             ):
                 enriched_payload["accepted_attributes"][0].pop(field)
+        if enriched_mutator is not None:
+            enriched_mutator(enriched_payload)
         _jsonl(
             run_root / "subject_attributes" / "enriched_samples.jsonl",
             [enriched_payload],
@@ -857,6 +861,118 @@ def test_legacy_enriched_attribute_without_variant_fields_still_loads(
     attribute = inventory.clips[0].sample.references[1]
     assert attribute.image_path == legacy_record["image_path"]
     assert attribute.synthetic is True
+
+
+def test_historical_visual_review_checklists_are_not_h3_schema_dependencies(
+    tmp_path: Path,
+) -> None:
+    def historical_review(payload: dict[str, object]) -> None:
+        attributes = payload["accepted_attributes"]
+        assert isinstance(attributes, list)
+        record = attributes[0]
+        assert isinstance(record, dict)
+        record["review"] = {
+            "attribute_id": "a1",
+            "sufficient_source_evidence": True,
+            "historical_internal_check": "not consumed by H3",
+        }
+        record["completion_review"] = {
+            "same_physical_attribute": True,
+            "original_visible_details_preserved": True,
+            "no_wrong_new_instance": True,
+            "no_duplicate_component": True,
+            "no_unrelated_content": True,
+            "no_structural_distortion": True,
+            "target_clear_and_prominent": True,
+            "candidate_better_than_alpha": True,
+        }
+
+    inventory = _dataset_inventory(
+        tmp_path,
+        with_enriched=True,
+        attribute_final_selection="completed",
+        enriched_mutator=historical_review,
+    )
+
+    attribute = inventory.clips[0].sample.references[1]
+    assert attribute.attribute_id == "a1"
+    assert attribute.owner_entity_id == "e1"
+    assert attribute.source_frame_index == 6
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda payload: payload["accepted_attributes"][0].pop("attribute_id"),
+            "attribute_id",
+        ),
+        (
+            lambda payload: payload["accepted_attributes"][0].update(
+                {"owner_entity_id": "e2"}
+            ),
+            "attribute provenance mismatch",
+        ),
+        (
+            lambda payload: payload["references"][1].update(
+                {"image_path": "references/ordinary/different.png"}
+            ),
+            "attribute provenance mismatch",
+        ),
+        (
+            lambda payload: payload["accepted_attributes"][0].update(
+                {"source_frame_index": 7}
+            ),
+            "attribute provenance mismatch",
+        ),
+        (
+            lambda payload: payload["accepted_attributes"].append(
+                dict(payload["accepted_attributes"][0])
+            ),
+            "enriched attribute references must match accepted records",
+        ),
+        (
+            lambda payload: payload["original_visual"].update(
+                {"target_video": "/wrong/target.mp4"}
+            ),
+            "enriched target_video mismatch",
+        ),
+        (
+            lambda payload: payload.update({"source_run_root": "/wrong/run"}),
+            "enriched source_run_root mismatch",
+        ),
+    ],
+)
+def test_enriched_projection_preserves_required_provenance_failures(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, object]], object],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        _dataset_inventory(
+            tmp_path,
+            with_enriched=True,
+            enriched_mutator=lambda payload: mutation(payload),
+        )
+
+
+def test_enriched_projection_rejects_duplicate_visual_reference(
+    tmp_path: Path,
+) -> None:
+    def duplicate_reference(payload: dict[str, object]) -> None:
+        references = payload["references"]
+        assert isinstance(references, list)
+        duplicate = dict(references[0])
+        duplicate.update({"image_id": "image_6", "image_index": 6})
+        references.append(duplicate)
+        payload["enriched_instruction"] += " and <Image 6>"
+
+    with pytest.raises(ValueError, match="no export match"):
+        _dataset_inventory(
+            tmp_path,
+            with_enriched=True,
+            enriched_mutator=duplicate_reference,
+        )
 
 
 @pytest.mark.parametrize(

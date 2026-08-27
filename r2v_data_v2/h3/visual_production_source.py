@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from collections.abc import Iterator
 from itertools import chain
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.v3.production_export import (
@@ -22,13 +23,172 @@ from r2v_data_v2.v3.schemas import (
     DatasetReference,
     DatasetSample,
 )
-from r2v_data_v2.v3.subject_attributes import EnrichedSample
 
 VisualInputSchema = Literal[
     "r2v.v3.production_sample.1",
     "r2v.v3.sample.1",
 ]
 VisualInputMode = Literal["compacted_production", "single_run_export"]
+_ENRICHED_IMAGE_LABEL = re.compile(r"<Image ([1-9]\d*)>")
+
+EnrichedAttributeType = Literal[
+    "face",
+    "hair",
+    "headwear",
+    "glasses",
+    "upper_clothing",
+    "lower_clothing",
+    "dress_or_skirt",
+    "shoes",
+    "bag",
+    "accessory",
+]
+EnrichedReferenceDefaultVariant = Literal[
+    "alpha",
+    "bbox",
+    "generated_background",
+    "accepted_base",
+]
+
+
+class _EnrichedProjectionModel(SchemaModel):
+    """Strict H3-owned fields with Visual-internal diagnostics ignored."""
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class _OriginalVisualSourceProjection(_EnrichedProjectionModel):
+    parent_video_id: str
+    clip_suffix: str
+
+
+class _OriginalVisualProjection(_EnrichedProjectionModel):
+    target_video: str
+    source: _OriginalVisualSourceProjection
+
+
+class _AcceptedAttributeProjection(_EnrichedProjectionModel):
+    attribute_id: str = Field(pattern=r"^a[1-9]\d*$")
+    owner_entity_id: str = Field(pattern=r"^e[1-9]\d*$")
+    attribute_type: EnrichedAttributeType
+    status: Literal["accepted"]
+    image_path: str
+    source_frame_index: int = Field(ge=0)
+    final_selection: Literal["raw", "completed"] | None = None
+    default_variant: EnrichedReferenceDefaultVariant | None = None
+
+    @field_validator("image_path")
+    @classmethod
+    def validate_image_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("accepted attribute image_path must not be empty")
+        return value
+
+
+class _EnrichedReferenceProjection(_EnrichedProjectionModel):
+    image_id: str = Field(pattern=r"^image_[1-9]\d*$")
+    image_index: int = Field(ge=1)
+    kind: ProductionReferenceKind
+    origin: Literal["visual_run", "attribute_enrichment"]
+    entity_id: str | None = None
+    attribute_id: str | None = None
+    owner_entity_id: str | None = None
+    attribute_type: EnrichedAttributeType | None = None
+    image_path: str
+    source_frame_index: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> _EnrichedReferenceProjection:
+        if self.image_id != f"image_{self.image_index}":
+            raise ValueError("enriched reference image_id must match image_index")
+        if not self.image_path.strip():
+            raise ValueError("enriched reference image_path must not be empty")
+        if self.kind == "attribute":
+            if (
+                self.origin != "attribute_enrichment"
+                or self.attribute_id is None
+                or self.owner_entity_id is None
+                or self.attribute_type is None
+                or self.entity_id is not None
+            ):
+                raise ValueError("attribute reference requires owner-bound provenance")
+        elif (
+            self.attribute_id is not None
+            or self.owner_entity_id is not None
+            or self.attribute_type is not None
+        ):
+            raise ValueError("visual references cannot publish attribute provenance")
+        elif self.origin != "visual_run":
+            raise ValueError("non-attribute reference must originate in Visual")
+        elif self.kind == "background":
+            if self.entity_id is not None:
+                raise ValueError("background reference entity_id must be null")
+        elif self.entity_id is None:
+            raise ValueError("entity reference requires entity_id")
+        return self
+
+
+class _EnrichedSampleProjection(_EnrichedProjectionModel):
+    schema_version: Literal["r2v.v3.enriched_sample.1"]
+    sample_id: str
+    clip_uid: str
+    source_run_root: str
+    original_visual: _OriginalVisualProjection
+    enriched_instruction: str
+    references: list[_EnrichedReferenceProjection]
+    accepted_attributes: list[_AcceptedAttributeProjection]
+
+    @model_validator(mode="before")
+    @classmethod
+    def restore_legacy_attribute_types(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        accepted = payload.get("accepted_attributes")
+        references = payload.get("references")
+        if not isinstance(accepted, list) or not isinstance(references, list):
+            return payload
+        attribute_types = {
+            record.get("attribute_id"): record.get("attribute_type")
+            for record in accepted
+            if isinstance(record, dict)
+        }
+        projected_references: list[object] = []
+        for reference in references:
+            if not isinstance(reference, dict):
+                projected_references.append(reference)
+                continue
+            projected = dict(reference)
+            if (
+                projected.get("kind") == "attribute"
+                and projected.get("attribute_type") is None
+            ):
+                projected["attribute_type"] = attribute_types.get(
+                    projected.get("attribute_id")
+                )
+            projected_references.append(projected)
+        payload["references"] = projected_references
+        return payload
+
+    @model_validator(mode="after")
+    def validate_sample(self) -> _EnrichedSampleProjection:
+        if not self.sample_id.strip() or not self.clip_uid.strip():
+            raise ValueError("enriched sample identity must not be empty")
+        indexes = [reference.image_index for reference in self.references]
+        if indexes != list(range(1, len(indexes) + 1)):
+            raise ValueError("enriched reference indexes must be contiguous")
+        expected_labels = {str(index) for index in indexes}
+        if set(_ENRICHED_IMAGE_LABEL.findall(self.enriched_instruction)) != expected_labels:
+            raise ValueError("enriched instruction labels must match references")
+        accepted_ids = [record.attribute_id for record in self.accepted_attributes]
+        reference_ids = [
+            reference.attribute_id
+            for reference in self.references
+            if reference.kind == "attribute"
+        ]
+        if reference_ids != accepted_ids:
+            raise ValueError("enriched attribute references must match accepted records")
+        return self
 
 
 class ReadableClipIdentity(SchemaModel):
@@ -198,11 +358,13 @@ def _normalize_dataset_reference(
     )
 
 
-def _load_enriched_samples(run_root: Path) -> dict[str, EnrichedSample]:
+def _load_enriched_samples(
+    run_root: Path,
+) -> dict[str, _EnrichedSampleProjection]:
     path = run_root / "subject_attributes" / "enriched_samples.jsonl"
     if not path.is_file():
         return {}
-    values: dict[str, EnrichedSample] = {}
+    values: dict[str, _EnrichedSampleProjection] = {}
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
@@ -212,21 +374,7 @@ def _load_enriched_samples(run_root: Path) -> dict[str, EnrichedSample]:
                 raise TypeError(
                     f"enriched sample at {path}:{line_number} is not an object"
                 )
-            attribute_types = {
-                record.get("attribute_id"): record.get("attribute_type")
-                for record in raw.get("accepted_attributes", [])
-                if isinstance(record, dict)
-            }
-            for reference in raw.get("references", []):
-                if (
-                    isinstance(reference, dict)
-                    and reference.get("kind") == "attribute"
-                    and reference.get("attribute_type") is None
-                ):
-                    reference["attribute_type"] = attribute_types.get(
-                        reference.get("attribute_id")
-                    )
-            enriched = EnrichedSample.model_validate(raw)
+            enriched = _EnrichedSampleProjection.model_validate(raw)
             if Path(enriched.source_run_root).expanduser().resolve(strict=False) != run_root:
                 raise ValueError(
                     f"enriched source_run_root mismatch at {path}:{line_number}"
@@ -239,17 +387,15 @@ def _load_enriched_samples(run_root: Path) -> dict[str, EnrichedSample]:
 
 def _normalize_enriched_sample(
     sample: DatasetSample,
-    enriched: EnrichedSample,
+    enriched: _EnrichedSampleProjection,
     *,
     run_root: Path,
 ) -> NormalizedVisualSample:
     if enriched.clip_uid != sample.sample_id:
         raise ValueError(f"enriched clip_uid mismatch: {enriched.sample_id}")
-    original_target = enriched.original_visual.get("target_video")
-    if original_target is not None and original_target != sample.target_video:
+    if enriched.original_visual.target_video != sample.target_video:
         raise ValueError(f"enriched target_video mismatch: {enriched.sample_id}")
-    original_source = enriched.original_visual.get("source")
-    if original_source is not None and original_source != sample.source.model_dump():
+    if enriched.original_visual.source.model_dump() != sample.source.model_dump():
         raise ValueError(f"enriched source provenance mismatch: {enriched.sample_id}")
 
     entity_references: dict[str, DatasetReference] = {}
@@ -432,7 +578,7 @@ def load_visual_production_inventory(
     if schema_version == PRODUCTION_SAMPLE_SCHEMA_VERSION:
         input_schema: VisualInputSchema = PRODUCTION_SAMPLE_SCHEMA_VERSION
         input_mode: VisualInputMode = "compacted_production"
-        enriched_by_id: dict[str, EnrichedSample] = {}
+        enriched_by_id: dict[str, _EnrichedSampleProjection] = {}
     elif schema_version == SAMPLE_SCHEMA_VERSION:
         input_schema = SAMPLE_SCHEMA_VERSION
         input_mode = "single_run_export"

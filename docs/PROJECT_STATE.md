@@ -11,6 +11,11 @@ the full media collection path. See `docs/H3_QWEN3_ASR.md`. Legacy Whisper
 pilots are retained but are not selected by this production path; Dots3 remains
 paused.
 
+For ordinary single-run exports, Audio consumes a strict stable projection of
+`subject_attributes/enriched_samples.jsonl`. It validates the selected
+reference/attribute provenance needed downstream but does not depend on Visual's
+internal review or completion-review checklist schemas.
+
 # R2V_DATA_V2 Project State
 
 Last updated: 2026-08-19

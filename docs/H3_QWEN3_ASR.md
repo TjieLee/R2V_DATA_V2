@@ -39,7 +39,13 @@ The Audio path does not scan shard exports or every clip directory. In ordinary
 export mode, an optional `subject_attributes/enriched_samples.jsonl` is loaded
 once: matching clips preserve its enriched instruction and ordered attribute
 references, while clips without a matching record retain the original export
-instruction and references. Visual artifacts stay read-only.
+instruction and references. Audio validates this sidecar through an H3-owned,
+downstream-stable projection of sample identity, run/source provenance,
+instruction bindings, selected image paths, ownership, frame indexes, and
+variant selection. Visual-internal `review` and `completion_review` QA
+checklists are deliberately not parsed, so checklist evolution cannot invalidate
+otherwise compatible frozen runs. Missing or inconsistent downstream fields
+still fail closed. Visual artifacts stay read-only.
 
 For compacted production each canonical row reads exactly:
 
