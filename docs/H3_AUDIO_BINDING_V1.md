@@ -339,3 +339,9 @@ and add voice-reference extraction only after deterministic fusion. Later
 versions may add diarization, speaker embeddings, offscreen propagation,
 cross-clip identity, pose/expression control, or shot-aware H3 tasks without
 changing the V1 evidence and binding separation.
+
+LoCoNet + LASER is available only as an experimental shadow backend described
+in `docs/H3_LASER_ASD_PILOT.md`. It reuses the existing association and fusion
+contracts for manual comparison, but it does not replace the frozen LR-ASD
+production default and does not enter LR-ASD-calibrated voice-quality or
+primary-voice selection.

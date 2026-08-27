@@ -214,6 +214,7 @@ class ActiveSpeakerFaceScore(SchemaModel):
     backend_native_active: bool
     score_semantics: Literal[
         "lr_asd_native_class_1_logit",
+        "laser_loconet_native_score",
         "derived_normalized_score",
     ]
     normalized_score: Optional[float] = Field(default=None, ge=0, le=1)
@@ -225,10 +226,11 @@ class ActiveSpeakerFaceScore(SchemaModel):
         if not math.isfinite(self.raw_backend_score):
             raise ValueError("ASD raw backend score must be finite")
         if (
-            self.score_semantics == "lr_asd_native_class_1_logit"
+            self.score_semantics
+            in {"lr_asd_native_class_1_logit", "laser_loconet_native_score"}
             and self.backend_native_active != (self.raw_backend_score >= 0)
         ):
-            raise ValueError("LR-ASD active decision must preserve score >= 0")
+            raise ValueError("native ASD active decision must preserve score >= 0")
         if (
             self.score_semantics == "derived_normalized_score"
             and self.normalized_score is None

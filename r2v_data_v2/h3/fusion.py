@@ -82,6 +82,17 @@ def _binding(
     )
 
 
+def _native_decision_reason(
+    interval: ActiveSpeakerInterval,
+) -> str | None:
+    semantics = {score.score_semantics for score in interval.face_scores}
+    if not semantics:
+        return None
+    if semantics == {"laser_loconet_native_score"}:
+        return "laser_asd_native_decision_unvalidated"
+    return "lr_asd_native_decision_unvalidated"
+
+
 def fuse_audio_entity_bindings(
     evidence: AudioBindingEvidence,
     *,
@@ -133,6 +144,7 @@ def fuse_audio_entity_bindings(
             score.face_track_id: score for score in interval.face_scores
         }
         uses_native_decision = bool(native_scores)
+        native_decision_reason = _native_decision_reason(interval)
         if uses_native_decision:
             active = sorted(
                 face_track_id
@@ -170,8 +182,8 @@ def fuse_audio_entity_bindings(
                     reason_codes=[
                         "multiple_visible_speakers_active",
                         *(
-                            ["lr_asd_native_decision_unvalidated"]
-                            if uses_native_decision
+                            [native_decision_reason]
+                            if native_decision_reason is not None
                             else []
                         ),
                     ],
@@ -187,7 +199,7 @@ def fuse_audio_entity_bindings(
                     active_face_track_ids=[],
                     reason_codes=[
                         "speech_without_visible_active_speaker",
-                        "lr_asd_native_decision_unvalidated",
+                        native_decision_reason,
                     ],
                 )
             )
@@ -302,8 +314,8 @@ def fuse_audio_entity_bindings(
                 reason_codes=[
                     *([] if clean else ["speech_interval_too_short"]),
                     *(
-                        ["lr_asd_native_decision_unvalidated"]
-                        if uses_native_decision
+                        [native_decision_reason]
+                        if native_decision_reason is not None
                         else []
                     ),
                 ],

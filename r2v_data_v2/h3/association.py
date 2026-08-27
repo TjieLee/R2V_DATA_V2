@@ -5,7 +5,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from r2v_data_v2.h3.pilot_schemas import LRASDNativeSample, LRASDNativeTrack
+from r2v_data_v2.h3.pilot_schemas import (
+    LaserASDNativeSample,
+    LaserASDNativeTrack,
+    LRASDNativeSample,
+    LRASDNativeTrack,
+)
 from r2v_data_v2.h3.schemas import (
     EntityAssociationCandidateEvidence,
     EntityFaceAssociation,
@@ -37,11 +42,11 @@ class FaceEntityAssociationPolicy:
 
 
 def nearest_track_sample(
-    track: LRASDNativeTrack,
+    track: LRASDNativeTrack | LaserASDNativeTrack,
     *,
     timestamp_seconds: float,
     maximum_delta_seconds: float,
-) -> tuple[LRASDNativeSample, float] | None:
+) -> tuple[LRASDNativeSample | LaserASDNativeSample, float] | None:
     if maximum_delta_seconds <= 0:
         raise ValueError("nearest-sample tolerance must be positive")
     sample = min(
@@ -58,7 +63,7 @@ def nearest_track_sample(
 
 
 def _face_mask_metrics(
-    sample: LRASDNativeSample,
+    sample: LRASDNativeSample | LaserASDNativeSample,
     mask: np.ndarray,
 ) -> tuple[float, bool]:
     height, width = mask.shape
@@ -80,7 +85,7 @@ def associate_face_tracks_to_entities(
     *,
     frames: SampledFramesArtifact,
     masks: TrackedMasksArtifact,
-    tracks: list[LRASDNativeTrack],
+    tracks: list[LRASDNativeTrack] | list[LaserASDNativeTrack],
     policy: FaceEntityAssociationPolicy | None = None,
 ) -> list[EntityFaceAssociation]:
     active_policy = policy or FaceEntityAssociationPolicy()

@@ -106,6 +106,138 @@ class LRASDNativeArtifact(SchemaModel):
         return self
 
 
+class LaserASDNativeSample(SchemaModel):
+    frame_index: int = Field(ge=0)
+    timestamp_seconds: float = Field(ge=0)
+    bbox_xyxy: tuple[float, float, float, float]
+    detection_confidence: float | None = Field(default=None, ge=0, le=1)
+    raw_backend_score: float
+    backend_native_active: bool
+    landmark_available: bool
+
+    @model_validator(mode="after")
+    def validate_sample(self) -> LaserASDNativeSample:
+        if not math.isfinite(self.raw_backend_score):
+            raise ValueError("LASER native score must be finite")
+        if self.backend_native_active != (self.raw_backend_score >= 0):
+            raise ValueError("LASER native active decision must preserve score >= 0")
+        x1, y1, x2, y2 = self.bbox_xyxy
+        if not all(math.isfinite(value) for value in self.bbox_xyxy):
+            raise ValueError("LASER face bbox values must be finite")
+        if not (0 <= x1 < x2 and 0 <= y1 < y2):
+            raise ValueError("LASER face bbox must have positive bounded extent")
+        return self
+
+
+class LaserASDNativeTrack(SchemaModel):
+    face_track_id: str
+    samples: list[LaserASDNativeSample] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_track(self) -> LaserASDNativeTrack:
+        if _FACE_TRACK_ID.fullmatch(self.face_track_id) is None:
+            raise ValueError("LASER face_track_id must use face_N")
+        order = [
+            (sample.frame_index, sample.timestamp_seconds) for sample in self.samples
+        ]
+        if order != sorted(order) or len(order) != len(set(order)):
+            raise ValueError("LASER samples must use unique deterministic order")
+        return self
+
+
+class LaserASDNativeArtifact(SchemaModel):
+    schema_version: Literal["r2v.h3.laser_asd_native.1"] = (
+        "r2v.h3.laser_asd_native.1"
+    )
+    clip_uid: str
+    source_video_path: str
+    model_video_path: str
+    audio_path: str
+    debug_visualization_path: str | None = None
+    model_fps: Literal[25.0] = 25.0
+    audio_sample_rate_hz: Literal[16000] = 16000
+    audio_channels: Literal[1] = 1
+    face_detector: Literal["S3FD"] = "S3FD"
+    face_tracking: Literal["shot_aware_iou"] = "shot_aware_iou"
+    face_crop_preprocessing: Literal["laser_loconet_official_face_crop"] = (
+        "laser_loconet_official_face_crop"
+    )
+    landmark_backend: Literal["mediapipe_face_landmarker_82_lips"] = (
+        "mediapipe_face_landmarker_82_lips"
+    )
+    score_semantics: Literal["laser_loconet_native_score"] = (
+        "laser_loconet_native_score"
+    )
+    active_decision_rule: Literal["score_greater_than_or_equal_to_zero"] = (
+        "score_greater_than_or_equal_to_zero"
+    )
+    upstream_repository: Literal["https://github.com/plnguyen2908/LASER_ASD"] = (
+        "https://github.com/plnguyen2908/LASER_ASD"
+    )
+    upstream_commit: Literal["3703d3f396cc7b29aa704364f8a9a5ab0c8c1fb9"] = (
+        "3703d3f396cc7b29aa704364f8a9a5ab0c8c1fb9"
+    )
+    model_provenance: ASDModelProvenance
+    config_path: str
+    config_sha256: str
+    landmark_model_path: str
+    landmark_model_sha256: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    duration_seconds: float = Field(gt=0)
+    landmark_sample_count: int = Field(ge=0)
+    landmark_available_count: int = Field(ge=0)
+    deterministic_context_selection: Literal["stable_first_last"] = (
+        "stable_first_last"
+    )
+    tracks: list[LaserASDNativeTrack] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_artifact(self) -> LaserASDNativeArtifact:
+        if not self.clip_uid.strip():
+            raise ValueError("LASER clip_uid must not be empty")
+        required_paths = (
+            self.source_video_path,
+            self.model_video_path,
+            self.audio_path,
+            self.config_path,
+            self.landmark_model_path,
+        )
+        if any(not path.strip() for path in required_paths):
+            raise ValueError("LASER runtime artifact paths are required")
+        for digest in (
+            self.config_sha256,
+            self.landmark_model_sha256,
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("LASER runtime hashes must be lowercase SHA-256")
+        track_ids = [track.face_track_id for track in self.tracks]
+        expected = [f"face_{index}" for index in range(1, len(track_ids) + 1)]
+        if track_ids != expected:
+            raise ValueError("LASER face track IDs must use deterministic face_1..N")
+        samples = [sample for track in self.tracks for sample in track.samples]
+        if self.landmark_sample_count != len(samples):
+            raise ValueError("LASER landmark sample count must reconcile")
+        if self.landmark_available_count != sum(
+            sample.landmark_available for sample in samples
+        ):
+            raise ValueError("LASER available-landmark count must reconcile")
+        for sample in samples:
+            if sample.timestamp_seconds >= self.duration_seconds:
+                raise ValueError("LASER sample exceeds model-video duration")
+            if not math.isclose(
+                sample.timestamp_seconds,
+                sample.frame_index / self.model_fps,
+                rel_tol=0,
+                abs_tol=1e-9,
+            ):
+                raise ValueError("LASER timestamp must match its 25-FPS frame index")
+            _, _, x2, y2 = sample.bbox_xyxy
+            if x2 > self.width or y2 > self.height:
+                raise ValueError("LASER face bbox exceeds model-video dimensions")
+        return self
+
+
 class SpeechActivityInterval(SchemaModel):
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
@@ -175,6 +307,34 @@ class H3AudioBindingPilotSummary(SchemaModel):
             raise ValueError("pilot summary roots must not be empty")
         if self.clips_attempted != self.clips_succeeded + self.clips_failed:
             raise ValueError("pilot attempted clip count must reconcile")
+        return self
+
+
+class LaserASDPilotSummary(SchemaModel):
+    schema_version: Literal["r2v.h3.laser_asd_pilot.1"] = (
+        "r2v.h3.laser_asd_pilot.1"
+    )
+    source_run_root: str
+    output_root: str
+    clips_attempted: int = Field(ge=0)
+    clips_succeeded: int = Field(ge=0)
+    clips_failed: int = Field(ge=0)
+    clips_with_speech: int = Field(ge=0)
+    bound_intervals: int = Field(ge=0)
+    overlap_intervals: int = Field(ge=0)
+    offscreen_intervals: int = Field(ge=0)
+    ambiguous_intervals: int = Field(ge=0)
+    no_speech_intervals: int = Field(ge=0)
+    face_entity_association_failures: int = Field(ge=0)
+    asd_runtime_failures: int = Field(ge=0)
+    voice_quality_evaluated: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> LaserASDPilotSummary:
+        if not self.source_run_root.strip() or not self.output_root.strip():
+            raise ValueError("LASER pilot summary roots must not be empty")
+        if self.clips_attempted != self.clips_succeeded + self.clips_failed:
+            raise ValueError("LASER pilot attempted clip count must reconcile")
         return self
 
 
