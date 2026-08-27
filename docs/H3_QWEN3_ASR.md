@@ -151,7 +151,7 @@ main Torch/CUDA environment.
 
 ```bash
 export QWEN3_ASR_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen3-asr-venv
-export QWEN3_ASR_MODEL_PATH=<local-Qwen3-ASR-1.7B-directory>
+export QWEN3_ASR_MODEL_PATH=/mnt/workspace/public/pretrained/Qwen/Qwen3-ASR-1.7B
 export QWEN3_ASR_DEVICE=cuda:0
 export QWEN3_ASR_DTYPE=bfloat16
 export QWEN3_ASR_MAX_INFERENCE_BATCH_SIZE=1
