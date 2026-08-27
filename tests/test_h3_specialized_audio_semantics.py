@@ -21,6 +21,7 @@ from r2v_data_v2.h3.jea_target_audio_caption import (
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.specialized_audio_semantics import (
     ASSEMBLED_RECORD_VERSION,
+    CAPTIONER_POLICY_VERSION,
     GLOBAL_PROMPT_VERSION,
     GLOBAL_SYSTEM_PROMPT,
     LOCAL_PROMPT_VERSION,
@@ -247,8 +248,9 @@ def test_captioner_uses_only_canonical_audio_and_preserves_raw_text(tmp_path: Pa
     assert "transcript" not in serialized
     assert request["temperature"] == 0.6
     assert request["top_p"] == 0.95
-    assert request["top_k"] == 20
     assert request["max_tokens"] == 16384
+    assert "top_k" not in request
+    assert request["extra_body"] == {"top_k": 20}
 
 
 def test_captioner_sampling_defaults_and_structured_stage_determinism(
@@ -273,6 +275,32 @@ def test_captioner_sampling_defaults_and_structured_stage_determinism(
         assert provenance.temperature == 0
         assert provenance.top_p is None
         assert provenance.top_k is None
+
+
+def test_captioner_transport_policy_bump_changes_fingerprint(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    config = _caption_config(inventory)
+    current = config.provenance()
+    previous = specialized._provenance(
+        role="captioner",
+        served_model_name=config.served_model_name,
+        checkpoint_id=config.checkpoint_id,
+        base_url=config.base_url,
+        input_modality="canonical_full_audio_only",
+        media_resolver=config.media_resolver,
+        prompt_version="qwen3_omni_native_audio_caption_v1",
+        fallback_prompt_version=None,
+        fallback_policy_version="captioner_empty_retry_once_v1",
+        temperature=config.temperature,
+        top_p=config.top_p,
+        top_k=config.top_k,
+        max_tokens=config.max_tokens,
+    )
+    assert CAPTIONER_POLICY_VERSION == "qwen3_omni_native_audio_caption_v2"
+    assert current.configuration_fingerprint != previous.configuration_fingerprint
+    assert captioner_request_fingerprint(inventory.jobs[0], current) != (
+        captioner_request_fingerprint(inventory.jobs[0], previous)
+    )
 
 
 @pytest.mark.parametrize(
@@ -385,6 +413,30 @@ def test_global_all_null_or_whitespace_rechecks_without_field_merge(
     assert len(completions.requests) == 2
 
 
+def test_global_fallback_failure_preserves_primary_and_fallback_diagnostics(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    responses = [" ", "not-json", "still-not-json"]
+    client, completions = _client(responses.copy())
+
+    with pytest.raises(SpecializedBackendFailure) as captured:
+        OpenAIGlobalSemanticsBackend(
+            _global_config(), client=client
+        ).extract(inventory.jobs[0], "quiet room tone")
+
+    failure = captured.value
+    assert failure.code == "global_semantics_structured_output_failed"
+    assert failure.model_call_count == 3
+    assert failure.raw_responses == tuple(responses)
+    assert len(failure.diagnostics) == 3
+    assert [item.raw_content_char_count for item in failure.diagnostics] == [
+        len(item) for item in responses
+    ]
+    assert failure.issues
+    assert len(completions.requests) == 3
+
+
 def test_global_infrastructure_failure_has_no_semantic_recheck(tmp_path: Path) -> None:
     inventory = _inventory(tmp_path, clip_count=1)
     client, completions = _client([ConnectionError("down")])
@@ -477,6 +529,27 @@ def test_local_all_null_and_whitespace_recheck(tmp_path: Path) -> None:
         _local_config(inventory), client=client
     ).describe(inventory.jobs[0])
     assert result.response.speaker_delivery[0].delivery_style == "calm"
+    assert len(completions.requests) == 2
+
+
+def test_local_empty_fallback_preserves_primary_and_fallback_diagnostics(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    responses = [" ", "\t"]
+    client, completions = _client(responses.copy())
+
+    with pytest.raises(SpecializedBackendFailure) as captured:
+        OpenAILocalSemanticsBackend(
+            _local_config(inventory), client=client
+        ).describe(inventory.jobs[0])
+
+    failure = captured.value
+    assert failure.code == "local_semantics_empty_response"
+    assert failure.model_call_count == 2
+    assert failure.raw_responses == tuple(responses)
+    assert len(failure.diagnostics) == 2
+    assert all(item.whitespace_only for item in failure.diagnostics)
     assert len(completions.requests) == 2
 
 

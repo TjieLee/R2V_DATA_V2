@@ -45,7 +45,7 @@ STAGE_SUMMARY_VERSION = "r2v.h3.specialized_audio_stage_summary.1"
 ASSEMBLED_SUMMARY_VERSION = "r2v.h3.specialized_audio_semantics_summary.1"
 BACKEND_PROVENANCE_VERSION = "r2v.h3.specialized_audio_backend_provenance.1"
 
-CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v1"
+CAPTIONER_POLICY_VERSION = "qwen3_omni_native_audio_caption_v2"
 GLOBAL_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v1"
 GLOBAL_FALLBACK_PROMPT_VERSION = "qwen3_vl_global_audio_extraction_v1_recheck"
 GLOBAL_FALLBACK_POLICY_VERSION = "global_audio_all_null_or_empty_recheck_v1"
@@ -580,6 +580,23 @@ class _StaleSpecializedDependencyError(ValueError):
     pass
 
 
+def _combined_fallback_failure(
+    *,
+    primary_raw_responses: Sequence[str],
+    primary_diagnostics: Sequence[CompletionDiagnostic],
+    primary_model_call_count: int,
+    fallback: SpecializedBackendFailure,
+) -> SpecializedBackendFailure:
+    return SpecializedBackendFailure(
+        code=fallback.code,
+        reason=fallback.reason,
+        raw_responses=(*primary_raw_responses, *fallback.raw_responses),
+        diagnostics=(*primary_diagnostics, *fallback.diagnostics),
+        issues=fallback.issues,
+        model_call_count=primary_model_call_count + fallback.model_call_count,
+    )
+
+
 ResponseT = TypeVar("ResponseT", bound=SchemaModel)
 
 
@@ -728,10 +745,10 @@ class OpenAICaptionerBackend(_OpenAIBackendBase):
             ],
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
-            "top_k": self.config.top_k,
             "max_tokens": self.config.max_tokens,
             "modalities": ["text"],
             "stream": False,
+            "extra_body": {"top_k": self.config.top_k},
         }
         raw_responses: list[str] = []
         diagnostics: list[CompletionDiagnostic] = []
@@ -913,7 +930,15 @@ class OpenAIGlobalSemanticsBackend(_OpenAIBackendBase):
         except SpecializedBackendFailure as exc:
             if exc.code != "global_semantics_empty_response":
                 raise
-            fallback = self._pass(raw_audio_caption, fallback=True)
+            try:
+                fallback = self._pass(raw_audio_caption, fallback=True)
+            except SpecializedBackendFailure as fallback_exc:
+                raise _combined_fallback_failure(
+                    primary_raw_responses=exc.raw_responses,
+                    primary_diagnostics=exc.diagnostics,
+                    primary_model_call_count=exc.model_call_count,
+                    fallback=fallback_exc,
+                ) from fallback_exc
             return SpecializedBackendResult(
                 response=fallback.response,
                 raw_responses=(*exc.raw_responses, *fallback.raw_responses),
@@ -928,7 +953,15 @@ class OpenAIGlobalSemanticsBackend(_OpenAIBackendBase):
             )
         if not _is_global_null(primary.response):
             return primary
-        fallback = self._pass(raw_audio_caption, fallback=True)
+        try:
+            fallback = self._pass(raw_audio_caption, fallback=True)
+        except SpecializedBackendFailure as fallback_exc:
+            raise _combined_fallback_failure(
+                primary_raw_responses=primary.raw_responses,
+                primary_diagnostics=primary.diagnostics,
+                primary_model_call_count=primary.model_call_count,
+                fallback=fallback_exc,
+            ) from fallback_exc
         return SpecializedBackendResult(
             response=fallback.response,
             raw_responses=(*primary.raw_responses, *fallback.raw_responses),
@@ -1137,7 +1170,15 @@ class OpenAILocalSemanticsBackend(_OpenAIBackendBase):
         except SpecializedBackendFailure as exc:
             if exc.code != "local_semantics_empty_response":
                 raise
-            fallback = self._pass(job, fallback=True)
+            try:
+                fallback = self._pass(job, fallback=True)
+            except SpecializedBackendFailure as fallback_exc:
+                raise _combined_fallback_failure(
+                    primary_raw_responses=exc.raw_responses,
+                    primary_diagnostics=exc.diagnostics,
+                    primary_model_call_count=exc.model_call_count,
+                    fallback=fallback_exc,
+                ) from fallback_exc
             return SpecializedBackendResult(
                 response=fallback.response,
                 raw_responses=(*exc.raw_responses, *fallback.raw_responses),
@@ -1152,7 +1193,15 @@ class OpenAILocalSemanticsBackend(_OpenAIBackendBase):
             )
         if not _is_local_null(primary.response):
             return primary
-        fallback = self._pass(job, fallback=True)
+        try:
+            fallback = self._pass(job, fallback=True)
+        except SpecializedBackendFailure as fallback_exc:
+            raise _combined_fallback_failure(
+                primary_raw_responses=primary.raw_responses,
+                primary_diagnostics=primary.diagnostics,
+                primary_model_call_count=primary.model_call_count,
+                fallback=fallback_exc,
+            ) from fallback_exc
         return SpecializedBackendResult(
             response=fallback.response,
             raw_responses=(*primary.raw_responses, *fallback.raw_responses),
