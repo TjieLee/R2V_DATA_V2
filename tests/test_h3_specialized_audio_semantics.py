@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import r2v_data_v2.h3.specialized_audio_semantics as specialized
 from r2v_data_v2.h3.jea_target_audio_caption import (
     JEATargetAudioCaptionInventory,
     JEATargetAudioCaptionJob,
@@ -149,14 +150,34 @@ def _resolver(inventory: JEATargetAudioCaptionInventory) -> MediaURLResolver:
     )
 
 
-def _caption_config(inventory: JEATargetAudioCaptionInventory, *, model: str = "cap") -> CaptionerConfig:
+def _caption_config(
+    inventory: JEATargetAudioCaptionInventory,
+    *,
+    model: str = "cap",
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    max_tokens: int = 16384,
+) -> CaptionerConfig:
     return CaptionerConfig(
         base_url="http://captioner.invalid/v1",
         api_key="EMPTY",
         served_model_name=model,
         checkpoint_id=f"/models/{model}",
         media_resolver=_resolver(inventory),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_tokens,
     )
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 def _global_config(*, model: str = "vl") -> GlobalSemanticsConfig:
@@ -224,6 +245,63 @@ def test_captioner_uses_only_canonical_audio_and_preserves_raw_text(tmp_path: Pa
     assert "speaker_0" not in serialized
     assert "entity_id" not in serialized
     assert "transcript" not in serialized
+    assert request["temperature"] == 0.6
+    assert request["top_p"] == 0.95
+    assert request["top_k"] == 20
+    assert request["max_tokens"] == 16384
+
+
+def test_captioner_sampling_defaults_and_structured_stage_determinism(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    captioner = _caption_config(inventory)
+    assert (
+        captioner.temperature,
+        captioner.top_p,
+        captioner.top_k,
+        captioner.max_tokens,
+    ) == (0.6, 0.95, 20, 16384)
+    captioner_provenance = captioner.provenance()
+    assert captioner_provenance.temperature == 0.6
+    assert captioner_provenance.top_p == 0.95
+    assert captioner_provenance.top_k == 20
+    for provenance in (
+        _global_config().provenance(),
+        _local_config(inventory).provenance(),
+    ):
+        assert provenance.temperature == 0
+        assert provenance.top_p is None
+        assert provenance.top_k is None
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("temperature", 0.0, "temperature"),
+        ("top_p", 0.0, "top-p"),
+        ("top_p", 1.1, "top-p"),
+        ("top_k", 0, "top-k"),
+        ("max_tokens", 0, "max tokens"),
+    ],
+)
+def test_captioner_sampling_validation_fails_closed(
+    tmp_path: Path,
+    field_name: str,
+    value: float,
+    message: str,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    values: dict[str, object] = {
+        "base_url": "http://captioner.invalid/v1",
+        "api_key": "EMPTY",
+        "served_model_name": "cap",
+        "checkpoint_id": "/models/cap",
+        "media_resolver": _resolver(inventory),
+        field_name: value,
+    }
+    with pytest.raises(ValueError, match=message):
+        CaptionerConfig(**values)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("first", [" \n\t", None])
@@ -431,6 +509,19 @@ def test_request_fingerprints_cover_semantics_but_not_inflight(tmp_path: Path) -
     assert captioner_request_fingerprint(job, caption_a) != captioner_request_fingerprint(
         job, caption_b
     )
+    for changed in (
+        _caption_config(inventory, model="cap-a", temperature=0.7),
+        _caption_config(inventory, model="cap-a", top_p=0.9),
+        _caption_config(inventory, model="cap-a", top_k=30),
+        _caption_config(inventory, model="cap-a", max_tokens=8192),
+    ):
+        changed_provenance = changed.provenance()
+        assert changed_provenance.configuration_fingerprint != (
+            caption_a.configuration_fingerprint
+        )
+        assert captioner_request_fingerprint(job, changed_provenance) != (
+            captioner_request_fingerprint(job, caption_a)
+        )
     global_a = _global_config(model="vl-a").provenance()
     global_b = _global_config(model="vl-b").provenance()
     assert global_request_fingerprint("rain", global_a) != global_request_fingerprint(
@@ -448,10 +539,43 @@ def test_request_fingerprints_cover_semantics_but_not_inflight(tmp_path: Path) -
     assert LOCAL_PROMPT_VERSION in local_audio.prompt_version
 
 
+def test_review_namespace_covers_stage_configuration_only(tmp_path: Path) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    caption = _caption_config(inventory).provenance()
+    global_semantics = _global_config().provenance()
+    local = _local_config(inventory).provenance()
+    baseline = specialized.review_configuration_fingerprint(
+        caption,
+        global_semantics,
+        local,
+    )
+    assert baseline == specialized.review_configuration_fingerprint(
+        caption,
+        global_semantics,
+        local,
+    )
+    assert baseline != specialized.review_configuration_fingerprint(
+        _caption_config(inventory, temperature=0.7).provenance(),
+        global_semantics,
+        local,
+    )
+    assert baseline != specialized.review_configuration_fingerprint(
+        caption,
+        _global_config(model="vl-other").provenance(),
+        local,
+    )
+    assert baseline != specialized.review_configuration_fingerprint(
+        caption,
+        global_semantics,
+        _local_config(inventory, include_video=True).provenance(),
+    )
+
+
 @dataclass
 class _FakeCaptioner:
     config: CaptionerConfig
     failures: set[str] = field(default_factory=set)
+    caption_prefix: str = "raw"
     calls: list[str] = field(default_factory=list)
     delay_by_clip: dict[str, float] = field(default_factory=dict)
     tracker: _ActivityTracker | None = None
@@ -472,7 +596,7 @@ class _FakeCaptioner:
                     reason="fake failure",
                     model_call_count=1,
                 )
-            raw = f"raw {job.target_clip_uid}"
+            raw = f"{self.caption_prefix} {job.target_clip_uid}"
             return CaptionerBackendResult(
                 raw_audio_caption=raw,
                 raw_responses=(),
@@ -488,6 +612,7 @@ class _FakeCaptioner:
 class _FakeGlobal:
     config: GlobalSemanticsConfig
     failures: set[str] = field(default_factory=set)
+    description_prefix: str = ""
     calls: list[str] = field(default_factory=list)
     first_started: threading.Event | None = None
     tracker: _ActivityTracker | None = None
@@ -510,7 +635,7 @@ class _FakeGlobal:
                     model_call_count=1,
                 )
             response = GlobalAudioSemanticsResponse(
-                overall_audio_description=raw_audio_caption,
+                overall_audio_description=f"{self.description_prefix}{raw_audio_caption}",
                 overall_soundscape=None,
                 non_diegetic_music=None,
             )
@@ -529,6 +654,7 @@ class _FakeGlobal:
 class _FakeLocal:
     config: LocalSemanticsConfig
     failures: set[str] = field(default_factory=set)
+    style_prefix: str = ""
     calls: list[str] = field(default_factory=list)
     delay: float = 0.0
     tracker: _ActivityTracker | None = None
@@ -549,7 +675,9 @@ class _FakeLocal:
                     reason="fake failure",
                     model_call_count=1,
                 )
-            response = _local_response(style=job.target_clip_uid)
+            response = _local_response(
+                style=f"{self.style_prefix}{job.target_clip_uid}"
+            )
             return SpecializedBackendResult(
                 response=response,
                 raw_responses=(),
@@ -599,6 +727,10 @@ def test_phases_assemble_partial_results_and_preserve_upstream(tmp_path: Path) -
         for path in root.rglob("*")
         if path.is_file() and "assembled" not in path.parts
     }
+    source_audio_before = {
+        job.target_clip_uid: Path(job.target_full_audio_path).read_bytes()
+        for job in inventory.jobs
+    }
     records, summary = run_assemble_phase(inventory=inventory, output_root=root)
 
     assert [record.target_clip_uid for record in records] == [
@@ -613,14 +745,26 @@ def test_phases_assemble_partial_results_and_preserve_upstream(tmp_path: Path) -
     assert records[2].speaker_delivery[0].entity_id == "e1"
     assert summary.model_call_count == 0
     assert all(record.schema_version == ASSEMBLED_RECORD_VERSION for record in records)
-    assert "Captioner raw audio caption" in (root / "assembled/review.html").read_text()
-    assert "h3-specialized-audio-qa:" in (root / "assembled/review.html").read_text()
+    review_html = (root / "assembled/review.html").read_text()
+    assert "Captioner raw audio caption" in review_html
+    assert "h3-specialized-audio-qa:" in review_html
+    assert "file://" not in review_html
+    for job in inventory.jobs:
+        media_name = hashlib.sha256(job.target_clip_uid.encode()).hexdigest() + ".flac"
+        review_audio = root / "assembled/media" / media_name
+        assert f"src='media/{media_name}'" in review_html
+        assert review_audio.read_bytes() == Path(job.target_full_audio_path).read_bytes()
+        assert _sha256(review_audio) == job.target_full_audio_sha256
     upstream_after = {
         str(path.relative_to(root)): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file() and "assembled" not in path.parts
     }
     assert upstream_after == upstream_before
+    assert {
+        job.target_clip_uid: Path(job.target_full_audio_path).read_bytes()
+        for job in inventory.jobs
+    } == source_audio_before
 
 
 def test_pipeline_streams_roles_bounds_work_and_resumes(tmp_path: Path) -> None:
@@ -732,6 +876,300 @@ def test_pipeline_reuses_captioner_and_local_while_regenerating_global(
     assert captioner.calls == []
     assert global_backend.calls == ["clip-000", "clip-001"]
     assert local.calls == []
+
+
+def test_stale_global_fails_independently_and_pipeline_regenerates_dependencies(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=2)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(
+            _caption_config(inventory),
+            caption_prefix="changed",
+        ),
+        overwrite=True,
+    )
+
+    independent_global = _FakeGlobal(_global_config())
+    with pytest.raises(ValueError, match="stale captioner"):
+        run_global_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=independent_global,
+        )
+    assert independent_global.calls == []
+
+    captioner = _FakeCaptioner(_caption_config(inventory))
+    global_backend = _FakeGlobal(_global_config())
+    local = _FakeLocal(_local_config(inventory))
+    result = run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=captioner,
+        global_backend=global_backend,
+        local_backend=local,
+    )
+    assert result.captioner_reused is True
+    assert result.global_semantics_reused is False
+    assert result.local_semantics_reused is True
+    assert captioner.calls == []
+    assert global_backend.calls == ["clip-000", "clip-001"]
+    assert local.calls == []
+    assembled = [
+        json.loads(line)
+        for line in (root / "assembled/records.jsonl").read_text().splitlines()
+    ]
+    assert [row["overall_audio_description"] for row in assembled] == [
+        "changed clip-000",
+        "changed clip-001",
+    ]
+
+
+@pytest.mark.parametrize("changed_role", ["captioner", "global", "local"])
+def test_pipeline_configuration_changes_rerun_only_affected_dependencies(
+    tmp_path: Path,
+    changed_role: str,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=2)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+    captioner = _FakeCaptioner(
+        _caption_config(
+            inventory,
+            temperature=0.7 if changed_role == "captioner" else 0.6,
+        )
+    )
+    global_backend = _FakeGlobal(
+        _global_config(model="vl-new" if changed_role == "global" else "vl")
+    )
+    local = _FakeLocal(
+        _local_config(
+            inventory,
+            include_video=changed_role == "local",
+        )
+    )
+
+    result = run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=captioner,
+        global_backend=global_backend,
+        local_backend=local,
+    )
+
+    if changed_role == "captioner":
+        assert result.captioner_reused is False
+        assert result.global_semantics_reused is False
+        assert result.local_semantics_reused is True
+        assert captioner.calls == ["clip-000", "clip-001"]
+        assert global_backend.calls == ["clip-000", "clip-001"]
+        assert local.calls == []
+    elif changed_role == "global":
+        assert result.captioner_reused is True
+        assert result.global_semantics_reused is False
+        assert result.local_semantics_reused is True
+        assert captioner.calls == []
+        assert global_backend.calls == ["clip-000", "clip-001"]
+        assert local.calls == []
+    else:
+        assert result.captioner_reused is True
+        assert result.global_semantics_reused is True
+        assert result.local_semantics_reused is False
+        assert captioner.calls == []
+        assert global_backend.calls == []
+        assert local.calls == ["clip-000", "clip-001"]
+
+
+def test_stale_assembled_fails_independently_and_pipeline_rebuilds(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=2)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+    assembled_before = (root / "assembled/records.jsonl").read_bytes()
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(_local_config(inventory), style_prefix="changed-"),
+        overwrite=True,
+    )
+
+    with pytest.raises(ValueError, match="stale stage records"):
+        run_assemble_phase(inventory=inventory, output_root=root)
+
+    result = run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+    assert result.captioner_reused is True
+    assert result.global_semantics_reused is True
+    assert result.local_semantics_reused is True
+    assembled_after = (root / "assembled/records.jsonl").read_bytes()
+    assert assembled_after != assembled_before
+    assert b"changed-clip-000" in assembled_after
+
+
+@pytest.mark.parametrize("changed_role", ["captioner", "global", "local"])
+def test_independent_assemble_rejects_each_changed_upstream_record(
+    tmp_path: Path,
+    changed_role: str,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+    if changed_role == "captioner":
+        run_captioner_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=_FakeCaptioner(
+                _caption_config(inventory),
+                caption_prefix="changed",
+            ),
+            overwrite=True,
+        )
+        run_global_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=_FakeGlobal(_global_config()),
+            overwrite=True,
+        )
+    elif changed_role == "global":
+        run_global_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=_FakeGlobal(_global_config(), description_prefix="changed-"),
+            overwrite=True,
+        )
+    else:
+        run_local_semantics_phase(
+            inventory=inventory,
+            output_root=root,
+            backend=_FakeLocal(_local_config(inventory), style_prefix="changed-"),
+            overwrite=True,
+        )
+
+    with pytest.raises(ValueError, match="stale stage records"):
+        run_assemble_phase(inventory=inventory, output_root=root)
+
+
+def test_compatible_assembled_output_is_reused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+
+    def unexpected_publish(*args: object, **kwargs: object) -> None:
+        raise AssertionError("compatible assembled output should be reused")
+
+    monkeypatch.setattr(specialized, "_publish_assembled", unexpected_publish)
+    records, _ = run_assemble_phase(inventory=inventory, output_root=root)
+    assert len(records) == 1
+
+
+def test_assembled_publication_failure_preserves_previous_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_specialized_pipeline(
+        inventory=inventory,
+        output_root=root,
+        captioner_backend=_FakeCaptioner(_caption_config(inventory)),
+        global_backend=_FakeGlobal(_global_config()),
+        local_backend=_FakeLocal(_local_config(inventory)),
+    )
+    assembled = root / "assembled"
+    before = _tree_bytes(assembled)
+
+    def fail_hardlink(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated cross-device link")
+
+    def fail_copy(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated review media failure")
+
+    monkeypatch.setattr(specialized.os, "link", fail_hardlink)
+    monkeypatch.setattr(specialized.shutil, "copy2", fail_copy)
+    with pytest.raises(OSError, match="simulated review media failure"):
+        run_assemble_phase(
+            inventory=inventory,
+            output_root=root,
+            overwrite=True,
+        )
+    assert _tree_bytes(assembled) == before
+    assert not list(root.glob(".assembled.tmp-*"))
+
+
+def test_assembled_review_media_falls_back_to_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(tmp_path, clip_count=1)
+    root = Path(inventory.source_audio_production_root) / SPECIALIZED_ROOT_NAME
+    run_captioner_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeCaptioner(_caption_config(inventory)),
+    )
+    run_global_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeGlobal(_global_config()),
+    )
+    run_local_semantics_phase(
+        inventory=inventory,
+        output_root=root,
+        backend=_FakeLocal(_local_config(inventory)),
+    )
+
+    def fail_hardlink(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated cross-device link")
+
+    monkeypatch.setattr(specialized.os, "link", fail_hardlink)
+    run_assemble_phase(inventory=inventory, output_root=root)
+    media_name = hashlib.sha256(b"clip-000").hexdigest() + ".flac"
+    assert (root / "assembled/media" / media_name).read_bytes() == (
+        Path(inventory.jobs[0].target_full_audio_path).read_bytes()
+    )
 
 
 def test_pipeline_and_independent_phases_publish_same_semantic_bytes(tmp_path: Path) -> None:

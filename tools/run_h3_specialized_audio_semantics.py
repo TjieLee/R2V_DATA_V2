@@ -52,6 +52,13 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _top_p(value: str) -> float:
+    parsed = float(value)
+    if not 0 < parsed <= 1:
+        raise argparse.ArgumentTypeError("value must be in (0, 1]")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run independently resumable H3 specialized audio semantics",
@@ -75,7 +82,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--global-vl-max-inflight", type=_positive_int, default=4)
     parser.add_argument("--local-instruct-max-inflight", type=_positive_int, default=1)
     parser.add_argument("--timeout-seconds", type=_positive_float, default=600.0)
-    parser.add_argument("--captioner-max-tokens", type=_positive_int, default=4096)
+    parser.add_argument("--captioner-temperature", type=_positive_float, default=0.6)
+    parser.add_argument("--captioner-top-p", type=_top_p, default=0.95)
+    parser.add_argument("--captioner-top-k", type=_positive_int, default=20)
+    parser.add_argument("--captioner-max-tokens", type=_positive_int, default=16384)
     parser.add_argument("--global-vl-max-tokens", type=_positive_int, default=2048)
     parser.add_argument("--local-instruct-max-tokens", type=_positive_int, default=2048)
     return parser
@@ -112,6 +122,9 @@ def _captioner_config(arguments: argparse.Namespace) -> CaptionerConfig:
         ),
         media_resolver=_media_resolver("QWEN3_OMNI_CAPTIONER"),
         timeout_seconds=arguments.timeout_seconds,
+        temperature=arguments.captioner_temperature,
+        top_p=arguments.captioner_top_p,
+        top_k=arguments.captioner_top_k,
         max_tokens=arguments.captioner_max_tokens,
     )
 

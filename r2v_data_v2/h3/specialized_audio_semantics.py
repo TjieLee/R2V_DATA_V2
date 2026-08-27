@@ -4,6 +4,7 @@ import hashlib
 import html
 import json
 import math
+import os
 import shutil
 import threading
 import uuid
@@ -213,7 +214,9 @@ class SpecializedBackendProvenance(SchemaModel):
     prompt_version: str
     fallback_prompt_version: str | None = None
     fallback_policy_version: str
-    temperature: Literal[0.0] = 0.0
+    temperature: float = Field(ge=0, allow_inf_nan=False)
+    top_p: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
+    top_k: int | None = Field(default=None, ge=1)
     max_tokens: int = Field(gt=0)
     repair_retries: Literal[1] = 1
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -249,6 +252,11 @@ class SpecializedBackendProvenance(SchemaModel):
         }
         if self.input_modality not in expected_modalities[self.role]:
             raise ValueError("specialized backend role and modality differ")
+        if self.role == "captioner":
+            if self.temperature <= 0 or self.top_p is None or self.top_k is None:
+                raise ValueError("captioner provenance requires sampling parameters")
+        elif self.temperature != 0 or self.top_p is not None or self.top_k is not None:
+            raise ValueError("structured semantics provenance must be deterministic")
         values = self.model_dump(mode="json", exclude={"configuration_fingerprint"})
         if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("specialized backend fingerprint is invalid")
@@ -342,7 +350,10 @@ class CaptionerConfig:
     checkpoint_id: str
     media_resolver: MediaURLResolver
     timeout_seconds: float = 600.0
-    max_tokens: int = 4096
+    temperature: float = 0.6
+    top_p: float = 0.95
+    top_k: int = 20
+    max_tokens: int = 16384
 
     def __post_init__(self) -> None:
         _validate_runtime_config(self)
@@ -358,6 +369,9 @@ class CaptionerConfig:
             prompt_version=CAPTIONER_POLICY_VERSION,
             fallback_prompt_version=None,
             fallback_policy_version="captioner_empty_retry_once_v1",
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
             max_tokens=self.max_tokens,
         )
 
@@ -385,6 +399,9 @@ class GlobalSemanticsConfig:
             prompt_version=GLOBAL_PROMPT_VERSION,
             fallback_prompt_version=GLOBAL_FALLBACK_PROMPT_VERSION,
             fallback_policy_version=GLOBAL_FALLBACK_POLICY_VERSION,
+            temperature=0.0,
+            top_p=None,
+            top_k=None,
             max_tokens=self.max_tokens,
         )
 
@@ -418,6 +435,9 @@ class LocalSemanticsConfig:
             prompt_version=LOCAL_PROMPT_VERSION,
             fallback_prompt_version=LOCAL_FALLBACK_PROMPT_VERSION,
             fallback_policy_version=LOCAL_FALLBACK_POLICY_VERSION,
+            temperature=0.0,
+            top_p=None,
+            top_k=None,
             max_tokens=self.max_tokens,
         )
 
@@ -434,8 +454,33 @@ def _validate_runtime_config(
     timeout_seconds = float(config.timeout_seconds)
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("specialized backend timeout must be positive")
-    if int(config.max_tokens) <= 0:
+    if (
+        not isinstance(config.max_tokens, int)
+        or isinstance(config.max_tokens, bool)
+        or config.max_tokens < 1
+    ):
         raise ValueError("specialized backend max tokens must be positive")
+    if isinstance(config, CaptionerConfig):
+        if (
+            isinstance(config.temperature, bool)
+            or not isinstance(config.temperature, (int, float))
+            or not math.isfinite(config.temperature)
+            or config.temperature <= 0
+        ):
+            raise ValueError("captioner temperature must be positive")
+        if (
+            isinstance(config.top_p, bool)
+            or not isinstance(config.top_p, (int, float))
+            or not math.isfinite(config.top_p)
+            or not 0 < config.top_p <= 1
+        ):
+            raise ValueError("captioner top-p must be in (0, 1]")
+        if (
+            not isinstance(config.top_k, int)
+            or isinstance(config.top_k, bool)
+            or config.top_k < 1
+        ):
+            raise ValueError("captioner top-k must be positive")
 
 
 def _provenance(
@@ -449,6 +494,9 @@ def _provenance(
     prompt_version: str,
     fallback_prompt_version: str | None,
     fallback_policy_version: str,
+    temperature: float,
+    top_p: float | None,
+    top_k: int | None,
     max_tokens: int,
 ) -> SpecializedBackendProvenance:
     values: dict[str, object] = {
@@ -468,7 +516,9 @@ def _provenance(
         "prompt_version": prompt_version,
         "fallback_prompt_version": fallback_prompt_version,
         "fallback_policy_version": fallback_policy_version,
-        "temperature": 0.0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "max_tokens": max_tokens,
         "repair_retries": 1,
     }
@@ -524,6 +574,10 @@ class SpecializedBackendFailure(RuntimeError):
         self.diagnostics = tuple(diagnostics)
         self.issues = tuple(issues)
         self.model_call_count = model_call_count
+
+
+class _StaleSpecializedDependencyError(ValueError):
+    pass
 
 
 ResponseT = TypeVar("ResponseT", bound=SchemaModel)
@@ -672,7 +726,9 @@ class OpenAICaptionerBackend(_OpenAIBackendBase):
                     ],
                 }
             ],
-            "temperature": 0.0,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "top_k": self.config.top_k,
             "max_tokens": self.config.max_tokens,
             "modalities": ["text"],
             "stream": False,
@@ -1907,6 +1963,39 @@ def _load_stage(
     return records, summary
 
 
+def _validate_global_dependencies(
+    global_records: Sequence[GlobalSemanticsRecord],
+    captioner_records: Sequence[CaptionerRecord],
+) -> None:
+    if len(global_records) != len(captioner_records):
+        raise _StaleSpecializedDependencyError(
+            "existing global output depends on stale captioner records; use --overwrite"
+        )
+    for global_record, captioner_record in zip(
+        global_records,
+        captioner_records,
+        strict=True,
+    ):
+        caption = captioner_record.raw_audio_caption
+        if (
+            global_record.target_clip_uid != captioner_record.target_clip_uid
+            or global_record.captioner_record_fingerprint
+            != captioner_record.record_fingerprint
+            or (
+                global_record.status == "ready"
+                and (
+                    caption is None
+                    or global_record.raw_audio_caption_sha256
+                    != _sha256_text(caption)
+                )
+            )
+        ):
+            raise _StaleSpecializedDependencyError(
+                "existing global output depends on stale captioner records; "
+                "use --overwrite"
+            )
+
+
 def _bounded_process(
     jobs: Sequence[JEATargetAudioCaptionJob],
     process: Callable[[JEATargetAudioCaptionJob], _ProcessedRecord[RecordT]],
@@ -1988,16 +2077,6 @@ def run_global_semantics_phase(
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "global_semantics")
     provenance = backend.provenance
-    if destination.exists() and not overwrite:
-        return _load_stage(
-            destination=destination,
-            role="global_semantics",
-            inventory=inventory,
-            provenance=provenance,
-            model=GlobalSemanticsRecord,
-        )
-    if destination.exists():
-        _assert_overwrite_ownership(destination, expected_role="global_semantics")
     captioner_records, _ = _load_stage(
         destination=_stage_path(root, "captioner"),
         role="captioner",
@@ -2005,6 +2084,18 @@ def run_global_semantics_phase(
         provenance=_existing_stage_provenance(_stage_path(root, "captioner")),
         model=CaptionerRecord,
     )
+    if destination.exists() and not overwrite:
+        records, summary = _load_stage(
+            destination=destination,
+            role="global_semantics",
+            inventory=inventory,
+            provenance=provenance,
+            model=GlobalSemanticsRecord,
+        )
+        _validate_global_dependencies(records, captioner_records)
+        return records, summary
+    if destination.exists():
+        _assert_overwrite_ownership(destination, expected_role="global_semantics")
     by_clip = {record.target_clip_uid: record for record in captioner_records}
     processed = _bounded_process(
         inventory.jobs,
@@ -2189,10 +2280,33 @@ QA_FLAGS = (
 )
 
 
+def review_configuration_fingerprint(
+    captioner: SpecializedBackendProvenance,
+    global_semantics: SpecializedBackendProvenance,
+    local_semantics: SpecializedBackendProvenance,
+) -> str:
+    return _sha256_text(
+        _compact_json(
+            {
+                "captioner": captioner.configuration_fingerprint,
+                "global": global_semantics.configuration_fingerprint,
+                "local": local_semantics.configuration_fingerprint,
+            }
+        )
+    )
+
+
+def _review_media_name(job: JEATargetAudioCaptionJob) -> str:
+    suffix = Path(job.target_full_audio_path).suffix.lower() or ".audio"
+    return _sha256_text(job.target_clip_uid) + suffix
+
+
 def _review_html(
     *,
     inventory: JEATargetAudioCaptionInventory,
     records: Sequence[SpecializedAudioSemanticsRecord],
+    media_names: dict[str, str],
+    review_config_fingerprint: str,
 ) -> str:
     cards: list[str] = []
     for job, record in zip(inventory.jobs, records, strict=True):
@@ -2236,7 +2350,7 @@ def _review_html(
         cards.append(
             f"<article class='case' data-clip='{html.escape(job.target_clip_uid)}'>"
             f"<h2>{html.escape(job.clip_display_path)}</h2>"
-            f"<audio controls preload='metadata' src='{html.escape(Path(job.target_full_audio_path).as_uri())}'></audio>"
+            f"<audio controls preload='metadata' src='media/{html.escape(media_names[job.target_clip_uid])}'></audio>"
             f"<p><b>Overall:</b> {html.escape(record.status)}</p>"
             f"<p><b>Stages:</b> captioner={record.captioner_status}, "
             f"global={record.global_semantics_status}, local={record.local_semantics_status}</p>"
@@ -2265,7 +2379,7 @@ def _review_html(
     clip_order = [job.target_clip_uid for job in inventory.jobs]
     namespace = (
         f"h3-specialized-audio-qa:{ASSEMBLED_RECORD_VERSION}:"
-        f"{inventory.inventory_fingerprint}:"
+        f"{inventory.inventory_fingerprint}:{review_config_fingerprint}:"
     )
     return f"""<!doctype html><html><head><meta charset='utf-8'>
 <title>H3 Specialized Audio Semantics Review</title><style>
@@ -2283,19 +2397,71 @@ function update(){{let count=0;clipOrder.forEach(clip=>{{if(localStorage.getItem
 restore();</script></body></html>"""
 
 
+def _stage_review_media(
+    temporary: Path,
+    inventory: JEATargetAudioCaptionInventory,
+) -> dict[str, str]:
+    media_directory = temporary / "media"
+    media_directory.mkdir()
+    media_names: dict[str, str] = {}
+    for job in inventory.jobs:
+        source = _verify_file(
+            job.target_full_audio_path,
+            job.target_full_audio_sha256,
+            field_name="target full audio",
+        )
+        media_name = _review_media_name(job)
+        destination = media_directory / media_name
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+        if _sha256_file(destination) != job.target_full_audio_sha256:
+            raise ValueError("assembled review media hash differs from canonical audio")
+        media_names[job.target_clip_uid] = media_name
+    return media_names
+
+
+def _validate_review_media(
+    destination: Path,
+    inventory: JEATargetAudioCaptionInventory,
+) -> None:
+    try:
+        for job in inventory.jobs:
+            _verify_file(
+                str(destination / "media" / _review_media_name(job)),
+                job.target_full_audio_sha256,
+                field_name="assembled review audio",
+            )
+    except (OSError, ValueError) as exc:
+        raise _StaleSpecializedDependencyError(
+            "existing assembled review media is stale; use --overwrite"
+        ) from exc
+
+
 def _publish_assembled(
     *,
     destination: Path,
+    inventory: JEATargetAudioCaptionInventory,
     records: Sequence[SpecializedAudioSemanticsRecord],
     summary: SpecializedAssembledSummary,
-    review_html: str,
+    review_config_fingerprint: str,
 ) -> None:
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     try:
         temporary.mkdir(parents=True)
+        media_names = _stage_review_media(temporary, inventory)
         _write_jsonl(temporary / "records.jsonl", records)
         _write_json(temporary / "summary.json", summary)
-        (temporary / "review.html").write_text(review_html, encoding="utf-8")
+        (temporary / "review.html").write_text(
+            _review_html(
+                inventory=inventory,
+                records=records,
+                media_names=media_names,
+                review_config_fingerprint=review_config_fingerprint,
+            ),
+            encoding="utf-8",
+        )
         _replace_stage_directory(temporary, destination)
     except Exception:
         if temporary.exists():
@@ -2306,6 +2472,9 @@ def _publish_assembled(
 def _load_assembled(
     destination: Path,
     inventory: JEATargetAudioCaptionInventory,
+    captioner_records: Sequence[CaptionerRecord],
+    global_records: Sequence[GlobalSemanticsRecord],
+    local_records: Sequence[LocalSemanticsRecord],
 ) -> tuple[list[SpecializedAudioSemanticsRecord], SpecializedAssembledSummary]:
     try:
         records = _read_jsonl(
@@ -2324,6 +2493,24 @@ def _load_assembled(
         != [job.target_clip_uid for job in inventory.jobs]
     ):
         raise ValueError("existing specialized assembled output is incompatible")
+    for assembled, captioner, global_record, local in zip(
+        records,
+        captioner_records,
+        global_records,
+        local_records,
+        strict=True,
+    ):
+        if (
+            assembled.captioner_record_fingerprint != captioner.record_fingerprint
+            or assembled.global_semantics_record_fingerprint
+            != global_record.record_fingerprint
+            or assembled.local_semantics_record_fingerprint != local.record_fingerprint
+        ):
+            raise _StaleSpecializedDependencyError(
+                "existing assembled output depends on stale stage records; "
+                "use --overwrite"
+            )
+    _validate_review_media(destination, inventory)
     return records, summary
 
 
@@ -2332,34 +2519,46 @@ def run_assemble_phase(
     inventory: JEATargetAudioCaptionInventory,
     output_root: Path,
     overwrite: bool = False,
+    regenerate_stale: bool = False,
 ) -> tuple[list[SpecializedAudioSemanticsRecord], SpecializedAssembledSummary]:
     root = _ensure_root(inventory, output_root)
     destination = _stage_path(root, "assembled")
-    if destination.exists() and not overwrite:
-        return _load_assembled(destination, inventory)
-    if destination.exists():
-        _assert_overwrite_ownership(destination, expected_role="assembled")
-    captioner_records, _ = _load_stage(
+    captioner_records, captioner_summary = _load_stage(
         destination=_stage_path(root, "captioner"),
         role="captioner",
         inventory=inventory,
         provenance=_existing_stage_provenance(_stage_path(root, "captioner")),
         model=CaptionerRecord,
     )
-    global_records, _ = _load_stage(
+    global_records, global_summary = _load_stage(
         destination=_stage_path(root, "global_semantics"),
         role="global_semantics",
         inventory=inventory,
         provenance=_existing_stage_provenance(_stage_path(root, "global_semantics")),
         model=GlobalSemanticsRecord,
     )
-    local_records, _ = _load_stage(
+    local_records, local_summary = _load_stage(
         destination=_stage_path(root, "local_semantics"),
         role="local_semantics",
         inventory=inventory,
         provenance=_existing_stage_provenance(_stage_path(root, "local_semantics")),
         model=LocalSemanticsRecord,
     )
+    _validate_global_dependencies(global_records, captioner_records)
+    if destination.exists() and not overwrite:
+        try:
+            return _load_assembled(
+                destination,
+                inventory,
+                captioner_records,
+                global_records,
+                local_records,
+            )
+        except _StaleSpecializedDependencyError:
+            if not regenerate_stale:
+                raise
+    if destination.exists():
+        _assert_overwrite_ownership(destination, expected_role="assembled")
     records = [
         _assembled_record(job, captioner, global_record, local)
         for job, captioner, global_record, local in zip(
@@ -2391,9 +2590,14 @@ def run_assemble_phase(
     )
     _publish_assembled(
         destination=destination,
+        inventory=inventory,
         records=records,
         summary=summary,
-        review_html=_review_html(inventory=inventory, records=records),
+        review_config_fingerprint=review_configuration_fingerprint(
+            captioner_summary.backend_provenance,
+            global_summary.backend_provenance,
+            local_summary.backend_provenance,
+        ),
     )
     return records, summary
 
@@ -2417,7 +2621,28 @@ class SpecializedPipelineResult(SchemaModel):
     assembled_summary: SpecializedAssembledSummary
 
 
-def _optional_existing_stage(
+def _existing_configuration_fingerprint(
+    destination: Path,
+    *,
+    role: StageRole,
+) -> str:
+    _assert_overwrite_ownership(destination, expected_role=role)
+    try:
+        payload = json.loads(
+            (destination / "summary.json").read_text(encoding="utf-8")
+        )
+        provenance = payload["backend_provenance"]
+        fingerprint = provenance["configuration_fingerprint"]
+    except (KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+        raise ValueError(
+            f"cannot establish specialized stage configuration: {destination}"
+        ) from exc
+    if not isinstance(fingerprint, str):
+        raise TypeError("specialized stage configuration fingerprint is not text")
+    return fingerprint
+
+
+def _pipeline_existing_stage(
     *,
     root: Path,
     role: StageRole,
@@ -2432,6 +2657,10 @@ def _optional_existing_stage(
             _assert_overwrite_ownership(destination, expected_role=role)
         return None, None
     if not destination.exists():
+        return None, None
+    if _existing_configuration_fingerprint(destination, role=role) != (
+        provenance.configuration_fingerprint
+    ):
         return None, None
     return _load_stage(
         destination=destination,
@@ -2468,7 +2697,7 @@ def run_specialized_pipeline(
             assembled_destination,
             expected_role="assembled",
         )
-    caption_existing, caption_summary = _optional_existing_stage(
+    caption_existing, caption_summary = _pipeline_existing_stage(
         root=root,
         role="captioner",
         inventory=inventory,
@@ -2476,7 +2705,7 @@ def run_specialized_pipeline(
         model=CaptionerRecord,
         overwrite=overwrite,
     )
-    global_existing, global_summary = _optional_existing_stage(
+    global_existing, global_summary = _pipeline_existing_stage(
         root=root,
         role="global_semantics",
         inventory=inventory,
@@ -2484,7 +2713,17 @@ def run_specialized_pipeline(
         model=GlobalSemanticsRecord,
         overwrite=overwrite,
     )
-    local_existing, local_summary = _optional_existing_stage(
+    if global_existing is not None:
+        if caption_existing is None:
+            global_existing = None
+            global_summary = None
+        else:
+            try:
+                _validate_global_dependencies(global_existing, caption_existing)
+            except _StaleSpecializedDependencyError:
+                global_existing = None
+                global_summary = None
+    local_existing, local_summary = _pipeline_existing_stage(
         root=root,
         role="local_semantics",
         inventory=inventory,
@@ -2648,7 +2887,8 @@ def run_specialized_pipeline(
     _, assembled_summary = run_assemble_phase(
         inventory=inventory,
         output_root=root,
-        overwrite=True,
+        overwrite=overwrite,
+        regenerate_stale=True,
     )
     return SpecializedPipelineResult(
         inventory_fingerprint=inventory.inventory_fingerprint,

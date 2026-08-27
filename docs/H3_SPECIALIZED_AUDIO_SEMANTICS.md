@@ -10,7 +10,7 @@ $AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1/
   captioner/{records.jsonl,summary.json,raw/}
   global_semantics/{records.jsonl,summary.json,raw/}
   local_semantics/{records.jsonl,summary.json,raw/}
-  assembled/{records.jsonl,summary.json,review.html}
+  assembled/{records.jsonl,summary.json,review.html,media/}
 ```
 
 Every phase publishes atomically, validates directory ownership before an
@@ -80,6 +80,12 @@ Captioner and Local ports are deliberately not defaulted because no specialized
 serving ports have been validated. The existing Qwen3-VL endpoint at port 8000
 is the only validated default recorded here.
 
+The Captioner uses its official sampling defaults: `temperature=0.6`,
+`top_p=0.95`, `top_k=20`, and `max_tokens=16384`. These values are explicit CLI
+options and are part of stage provenance and fingerprints. Global and Local
+structured extraction remain deterministic with `temperature=0` and no
+sampling controls.
+
 ## Recommended Phased Operation
 
 Models do not need to be online simultaneously. Run only the phase whose
@@ -109,6 +115,12 @@ python tools/run_h3_specialized_audio_semantics.py \
 
 Use `--overwrite` only for the phase being regenerated. It never deletes a
 different phase.
+
+Independent phase commands fail closed when their existing output depends on a
+changed upstream record and require explicit `--overwrite`. Pipeline mode
+instead regenerates stale dependent stages automatically: a changed Captioner
+invalidates Global and Assembly, while Global-only or Local-only configuration
+changes invalidate only that stage and Assembly. Compatible stages are reused.
 
 When all three endpoints are intentionally online, the explicit pipeline mode
 uses a bounded streaming DAG. Captioner and Local work overlap, each completed
@@ -145,8 +157,14 @@ backend or writing phase artifacts.
 - Assembly fingerprints all three upstream records.
 
 Raw model responses and completion diagnostics remain in each phase's `raw/`
-directory. `assembled/review.html` exposes raw Captioner evidence, all semantic
-layers, per-stage provenance/status, and a specialized localStorage namespace.
+directory. Assembly verifies canonical audio hashes and atomically publishes a
+deterministically named hard-linked or copied review asset under
+`assembled/media/`; the HTML uses only relative media paths. A failed assembly
+does not replace the previous assembled directory. `assembled/review.html`
+exposes raw Captioner evidence, all semantic layers, per-stage provenance/status,
+and a localStorage namespace keyed by the assembled schema, inventory, and all
+three semantic configuration fingerprints. Runtime inflight limits do not alter
+that namespace.
 
 ## Deployment Status
 
