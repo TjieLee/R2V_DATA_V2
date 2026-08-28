@@ -85,7 +85,6 @@ CLOTHING_ATTRIBUTE_TYPES = frozenset(
     {"upper_clothing", "lower_clothing", "dress_or_skirt"}
 )
 _ATTRIBUTE_COMPLETION_ENTITY_NAME = {
-    "face": "人脸",
     "headwear": "帽子",
     "accessory": "配饰",
     "upper_clothing": "衣服",
@@ -2475,6 +2474,7 @@ def _accepted_record(
     completion_outcome: str,
     completion_seed: int | None = None,
     crop_padding_ratio: float,
+    bbox_variant: ReferenceVariantState | None = None,
 ) -> SubjectAttributeRecord:
     relative_path = _save_attribute_crop(
         output_root,
@@ -2497,17 +2497,35 @@ def _accepted_record(
             variant="alpha",
             image=raw_crop.convert("RGBA"),
         )
-    bbox_path = _save_attribute_variant(
-        output_root,
-        sample_id=sample_id,
-        attribute_id=candidate.attribute_id,
-        variant="bbox",
-        image=_attribute_bbox_crop(
-            candidate.source_image,
-            candidate.attribute_mask,
-            crop_padding_ratio=crop_padding_ratio,
-        ),
-    )
+    if bbox_variant is None:
+        bbox_path = _save_attribute_variant(
+            output_root,
+            sample_id=sample_id,
+            attribute_id=candidate.attribute_id,
+            variant="bbox",
+            image=_attribute_bbox_crop(
+                candidate.source_image,
+                candidate.attribute_mask,
+                crop_padding_ratio=crop_padding_ratio,
+            ),
+        )
+        bbox_variant = ReferenceVariantState(
+            image_path=bbox_path,
+            status="accepted" if final_selection == "bbox" else "available",
+            reviewed=final_selection == "bbox",
+            review_status=(
+                "accept" if final_selection == "bbox" else "not_reviewed"
+            ),
+            reason=(
+                "attribute_bbox_fallback_review_accepted"
+                if final_selection == "bbox"
+                else "source_attribute_bbox_materialized"
+            ),
+            synthetic=False,
+            source_frame_index=candidate.owner_candidate.source_frame_index,
+        )
+    else:
+        bbox_path = bbox_variant.image_path
     variants = ReferenceVariantsState(
         alpha=ReferenceVariantState(
             image_path=alpha_path,
@@ -2518,19 +2536,7 @@ def _accepted_record(
             synthetic=False,
             source_frame_index=candidate.owner_candidate.source_frame_index,
         ),
-        bbox=ReferenceVariantState(
-            image_path=bbox_path,
-            status="accepted" if final_selection == "bbox" else "available",
-            reviewed=final_selection == "bbox",
-            review_status=("accept" if final_selection == "bbox" else "not_reviewed"),
-            reason=(
-                "attribute_bbox_fallback_review_accepted"
-                if final_selection == "bbox"
-                else "source_attribute_bbox_materialized"
-            ),
-            synthetic=False,
-            source_frame_index=candidate.owner_candidate.source_frame_index,
-        ),
+        bbox=bbox_variant,
         generated_background=ReferenceVariantState(
             image_path=None,
             status="unavailable",
@@ -2545,6 +2551,8 @@ def _accepted_record(
         "bbox" if final_selection == "bbox" else "accepted_base"
     )
     if final_selection == "bbox":
+        if bbox_path is None or bbox_variant.status != "accepted":
+            raise ValueError("bbox selection requires an accepted bbox variant")
         relative_path = bbox_path
     return SubjectAttributeRecord(
         attribute_id=candidate.attribute_id,
@@ -2583,6 +2591,108 @@ def _accepted_record(
     )
 
 
+def _accepted_face_record(
+    candidate: PendingAttributeCandidate,
+    *,
+    output_root: Path,
+    sample_id: str,
+    owner_reference: EntityReferenceState,
+    review: SubjectAttributeReview,
+    judge: AttributeVariantJudge | None,
+    metrics: _AttributeVariantMetrics,
+    crop_padding_ratio: float,
+) -> SubjectAttributeRecord:
+    source_frame_index = candidate.owner_candidate.source_frame_index
+    try:
+        bbox_image = _attribute_bbox_crop(
+            candidate.source_image,
+            candidate.attribute_mask,
+            crop_padding_ratio=crop_padding_ratio,
+        )
+        bbox_path = _save_attribute_variant(
+            output_root,
+            sample_id=sample_id,
+            attribute_id=candidate.attribute_id,
+            variant="bbox",
+            image=bbox_image,
+        )
+    except Exception as exc:  # noqa: BLE001 - raw alpha remains accepted
+        bbox_variant = ReferenceVariantState(
+            image_path=None,
+            status="unavailable",
+            reviewed=False,
+            review_status="materialization_failed",
+            reason=f"attribute_bbox_materialization_failed:{type(exc).__name__}:{exc}",
+            synthetic=False,
+            source_frame_index=source_frame_index,
+        )
+    else:
+        if judge is None:
+            bbox_variant = ReferenceVariantState(
+                image_path=bbox_path,
+                status="available",
+                reviewed=False,
+                review_status="judge_unavailable",
+                reason="attribute_bbox_judge_unavailable",
+                synthetic=False,
+                source_frame_index=source_frame_index,
+            )
+        else:
+            metrics.bbox_reviews_attempted += 1
+            try:
+                owner_context = build_candidate_context_image(
+                    candidate.source_image,
+                    candidate.owner_candidate.mask,
+                )
+                bbox_review = judge.review_attribute_bbox(
+                    bbox_candidate=bbox_image,
+                    owner_context=owner_context,
+                    attribute_type=candidate.discovered.attribute_type,
+                    attribute_phrase=candidate.discovered.phrase,
+                )
+                if not isinstance(bbox_review, SubjectAttributeBboxReview):
+                    raise TypeError("attribute bbox judge returned an invalid review")
+                accepted = bbox_review.verdict == "accept"
+            except Exception as exc:  # noqa: BLE001 - raw alpha remains accepted
+                bbox_variant = ReferenceVariantState(
+                    image_path=bbox_path,
+                    status="available",
+                    reviewed=False,
+                    review_status="judge_failed",
+                    reason=(
+                        "attribute_bbox_judge_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    ),
+                    synthetic=False,
+                    source_frame_index=source_frame_index,
+                )
+            else:
+                bbox_variant = ReferenceVariantState(
+                    image_path=bbox_path,
+                    status="accepted" if accepted else "rejected",
+                    reviewed=True,
+                    review_status="accept" if accepted else "reject",
+                    reason=bbox_review.reason,
+                    synthetic=False,
+                    source_frame_index=source_frame_index,
+                )
+    final_selection: Literal["raw", "bbox"] = (
+        "bbox" if bbox_variant.status == "accepted" else "raw"
+    )
+    return _accepted_record(
+        candidate,
+        output_root=output_root,
+        sample_id=sample_id,
+        owner_reference=owner_reference,
+        review=review,
+        final_selection=final_selection,
+        completion_attempted=False,
+        completion_outcome="not_attempted",
+        crop_padding_ratio=crop_padding_ratio,
+        bbox_variant=bbox_variant,
+    )
+
+
 def _with_attribute_variants(
     record: SubjectAttributeRecord,
     candidate: PendingAttributeCandidate,
@@ -2593,8 +2703,10 @@ def _with_attribute_variants(
 ) -> SubjectAttributeRecord:
     if record.status != "accepted" or record.variants is None:
         return record
-    metrics.bbox_variants_materialized += 1
     variants = record.variants
+    metrics.bbox_variants_materialized += int(
+        variants.bbox.image_path is not None
+    )
     generated_variant = ReferenceVariantState(
         image_path=None,
         status="unavailable",
@@ -2693,6 +2805,14 @@ def _attempt_attribute_completion(
     SubjectAttributeCompletionReview | None,
     int | None,
 ]:
+    if candidate.discovered.attribute_type == "face":
+        return (
+            None,
+            "completion_disabled_by_policy:face",
+            False,
+            None,
+            None,
+        )
     metrics.attempts += 1
     metrics.attempts_by_type[candidate.discovered.attribute_type] += 1
     if raw_usable:
@@ -3217,6 +3337,12 @@ def _load_cached_owner_artifact(
             or artifact.completion_mode != expected_completion_mode
         ):
             return None
+        if artifact.metrics.completion_attempts_by_type.get("face", 0) > 0 or any(
+            record.attribute_type == "face"
+            and (record.completion_attempted or record.final_selection == "completed")
+            for record in artifact.records
+        ):
+            return None
         for record in artifact.records:
             if record.status == "accepted":
                 assert record.image_path is not None
@@ -3456,6 +3582,9 @@ def _process_owner(
     raw_fallback_pool: dict[
         str, list[tuple[PendingAttributeCandidate, SubjectAttributeReview]]
     ] = {}
+    face_bbox_pool: dict[
+        str, tuple[PendingAttributeCandidate, SubjectAttributeReview]
+    ] = {}
     semantic_candidate_pool: dict[
         str, list[tuple[PendingAttributeCandidate, SubjectAttributeReview]]
     ] = {}
@@ -3541,8 +3670,12 @@ def _process_owner(
                     (candidate, review)
                 )
 
+            face_bbox_preferred = (
+                candidate.discovered.attribute_type == "face"
+            )
             completion_eligible = bool(
                 completion_config.enabled
+                and not face_bbox_preferred
                 and candidate.discovered.attribute_type
                 in completion_config.eligible_types
             )
@@ -3574,6 +3707,10 @@ def _process_owner(
 
             if not completion_eligible:
                 if review.accepted:
+                    if face_bbox_preferred:
+                        face_bbox_pool[attribute_id] = (candidate, review)
+                        unresolved.discard(attribute_id)
+                        continue
                     selected_candidate_by_id[attribute_id] = candidate
                     records_by_id[attribute_id] = _accepted_record(
                         candidate,
@@ -3661,6 +3798,19 @@ def _process_owner(
         if callable(getattr(review_client, "review_attribute_bbox", None))
         else None
     )
+    for attribute_id, (candidate, review) in face_bbox_pool.items():
+        selected_candidate_by_id[attribute_id] = candidate
+        records_by_id[attribute_id] = _accepted_face_record(
+            candidate,
+            output_root=output_root,
+            sample_id=clip.clip_uid,
+            owner_reference=owner_reference,
+            review=review,
+            judge=variant_judge,
+            metrics=new_variant_metrics,
+            crop_padding_ratio=config.pair.crop_padding_ratio,
+        )
+
     for attribute_id in list(unresolved):
         raw_pool = raw_fallback_pool.get(attribute_id, [])
         completion_reason, completion_review, completion_seed = (
@@ -3692,6 +3842,31 @@ def _process_owner(
             continue
 
         semantic_pool = semantic_candidate_pool.get(attribute_id, [])
+        if (
+            semantic_pool
+            and semantic_pool[0][0].discovered.attribute_type == "face"
+        ):
+            candidate, review = semantic_pool[0]
+            records_by_id[attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=f"recognizability:{review.reason}",
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=(
+                    owner_reference.source_clip_uid in {None, clip.clip_uid}
+                    and candidate.owner_candidate.source_frame_index
+                    == owner_reference.source_frame_index
+                ),
+                review=review,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+            )
+            unresolved.discard(attribute_id)
+            continue
         if not semantic_pool or variant_judge is None:
             options = candidate_options_by_id[attribute_id]
             candidate = options[min(len(options) - 1, 1)]

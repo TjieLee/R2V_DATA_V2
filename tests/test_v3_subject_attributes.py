@@ -1725,7 +1725,6 @@ def test_discovery_prompt_requires_english_attribute_text() -> None:
 @pytest.mark.parametrize(
     ("attribute_type", "entity_name"),
     [
-        ("face", "人脸"),
         ("headwear", "帽子"),
         ("accessory", "配饰"),
         ("upper_clothing", "衣服"),
@@ -1742,10 +1741,18 @@ def test_attribute_completion_prompt_is_short_and_type_specific(
     )
 
 
-def test_hair_and_glasses_are_not_completion_eligible() -> None:
+def test_face_hair_glasses_shoes_and_bag_are_not_completion_eligible() -> None:
     eligible = SubjectAttributeCompletionConfig().eligible_types
+    assert "face" not in eligible
     assert "hair" not in eligible
     assert "glasses" not in eligible
+    assert "shoes" not in eligible
+    assert "bag" not in eligible
+
+
+def test_face_has_no_attribute_completion_prompt() -> None:
+    with pytest.raises(ValueError, match="not eligible for completion"):
+        subject_attributes.attribute_completion_prompt("face")
 
 
 def test_owner_processing_batches_qwen_and_prefers_different_frame(tmp_path: Path) -> None:
@@ -2114,6 +2121,48 @@ def test_valid_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
         sample_id="clip-1",
         owner_entity_id="e1",
         attribute_id_start=2,
+    ) is None
+
+
+def test_cached_face_completion_attempt_is_not_reused(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    image_path = output_root / "references" / "clip-1" / "a1.png"
+    image_path.parent.mkdir(parents=True)
+    rgba = np.full((10, 10, 4), 255, dtype=np.uint8)
+    rgba[:2, :, 3] = 0
+    Image.fromarray(rgba, mode="RGBA").save(image_path)
+    artifact = OwnerEnrichmentArtifact(
+        sample_id="clip-1",
+        owner_entity_id="e1",
+        owner_is_human=True,
+        attribute_id_start=1,
+        owner_phrase="person 1",
+        owner_grounding_prompt="the person 1",
+        records=[_attribute_record("a1", "e1", "face")],
+        metrics=OwnerEnrichmentMetrics(
+            discovery_calls=1,
+            review_calls=1,
+            sam3_attempts=1,
+            discovered_by_type={"face": 1},
+            accepted_attributes=1,
+            different_frame_accepted=1,
+            completion_attempts=1,
+            completion_rejected=1,
+            completion_attempts_by_type={"face": 1},
+        ),
+        completion_mode="boogu_completion_v1",
+    )
+    artifact_path = output_root / "owners" / "clip-1" / "e1.json"
+    artifact_path.parent.mkdir(parents=True)
+    write_json_atomic(artifact_path, artifact.model_dump(mode="json"))
+
+    assert subject_attributes._load_cached_owner_artifact(
+        artifact_path,
+        output_root=output_root,
+        sample_id="clip-1",
+        owner_entity_id="e1",
+        attribute_id_start=1,
+        expected_completion_mode="boogu_completion_v1",
     ) is None
 
 
@@ -2858,7 +2907,7 @@ def test_completion_qwen_rejects_without_repaired_candidate(tmp_path: Path) -> N
     )
 
 
-@pytest.mark.parametrize("attribute_type", ["face", "upper_clothing"])
+@pytest.mark.parametrize("attribute_type", ["headwear", "upper_clothing"])
 def test_repairable_attribute_uses_boogu_without_completion_sam(
     tmp_path: Path,
     attribute_type: str,
@@ -2940,9 +2989,9 @@ def test_alpha_coverage_does_not_control_completion_routing(
     crop = Image.new("RGBA", (64, 64), (100, 100, 100, 255))
     candidate = subject_attributes.PendingAttributeCandidate(
         discovered=DiscoveredSubjectAttribute(
-            attribute_type="face",
-            phrase="face",
-            grounding_prompt="face of person 1",
+            attribute_type="upper_clothing",
+            phrase="robe",
+            grounding_prompt="robe worn by person 1",
         ),
         attribute_id="a1",
         owner_entity_id="e1",
@@ -2979,8 +3028,79 @@ def test_alpha_coverage_does_not_control_completion_routing(
     assert completed is not None
     assert reason == "completion_identity_accepted"
     assert captured["instruction"] == (
-        "补全成完整的人脸，去除掉破碎的部分，不添加其他内容"
+        "补全成完整的衣服，去除掉破碎的部分，不添加其他内容"
     )
+
+
+def test_face_completion_hard_policy_skips_seed_backend_and_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="face",
+            phrase="face",
+            grounding_prompt="face of person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=_candidate("candidate_1", slot=1, source_frame_index=10),
+        attribute_mask=np.ones((64, 64), dtype=bool),
+        source_image=Image.new("RGB", (64, 64), "white"),
+        crop=Image.new("RGBA", (64, 64), (100, 100, 100, 255)),
+        geometry=_geometry(),
+    )
+
+    class Backend:
+        calls = 0
+
+        def attribute_completion(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("face must not call Boogu")
+
+    class Judge:
+        calls = 0
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("face must not call completion review")
+
+    monkeypatch.setattr(
+        subject_attributes,
+        "new_boogu_seed",
+        lambda: (_ for _ in ()).throw(AssertionError("face must not create seed")),
+    )
+    backend = Backend()
+    judge = Judge()
+    metrics = subject_attributes._CompletionSelectionMetrics()
+
+    completed, reason, failed, completion_review, completion_seed = (
+        subject_attributes._attempt_attribute_completion(
+            candidate,
+            clip_uid="clip-1",
+            output_root=tmp_path,
+            completion_config=replace(
+                SubjectAttributeCompletionConfig(enabled=True),
+                eligible_types=("face", "headwear"),
+            ),
+            completion_backend=backend,
+            completion_judge=judge,
+            metrics=metrics,
+            raw_usable=True,
+        )
+    )
+
+    assert completed is None
+    assert reason == "completion_disabled_by_policy:face"
+    assert failed is False
+    assert completion_review is None
+    assert completion_seed is None
+    assert backend.calls == judge.calls == 0
+    assert metrics.attempts == 0
+    assert metrics.accepted == 0
+    assert metrics.review_calls == 0
+    assert metrics.attempts_by_type == {}
+    assert metrics.accepted_by_type == {}
 
 
 def test_completion_review_rejects_fail_closed(
@@ -2990,9 +3110,9 @@ def test_completion_review_rejects_fail_closed(
     raw_mask[8:24, 8:24] = True
     candidate = subject_attributes.PendingAttributeCandidate(
         discovered=DiscoveredSubjectAttribute(
-            attribute_type="face",
-            phrase="face",
-            grounding_prompt="face of person 1",
+            attribute_type="headwear",
+            phrase="hat",
+            grounding_prompt="hat worn by person 1",
         ),
         attribute_id="a1",
         owner_entity_id="e1",
@@ -3097,7 +3217,7 @@ def _run_completion_routing_case(
     raw_kind: str,
     completion_stage: str = "success",
     attribute_count: int = 1,
-    first_attribute_type: str = "face",
+    first_attribute_type: str = "upper_clothing",
 ) -> tuple[OwnerEnrichmentArtifact, object, object, object]:
     _frames(tmp_path / "run")
 
@@ -3232,8 +3352,11 @@ def _run_two_candidate_routing_case(
     *,
     raw_kinds: tuple[str, str],
     completion_accepts: tuple[bool, ...] = (),
-    attribute_type: str = "face",
+    attribute_type: str = "upper_clothing",
     bbox_accepts: bool = False,
+    bbox_failure: bool = False,
+    bbox_judge_available: bool = True,
+    completion_eligible_types: tuple[str, ...] | None = None,
 ):
     _frames(tmp_path / "run")
 
@@ -3279,6 +3402,8 @@ def _run_two_candidate_routing_case(
 
         def review_attribute_bbox(self, **_kwargs):
             self.bbox_calls += 1
+            if bbox_failure:
+                raise RuntimeError("bbox judge unavailable")
             return _attribute_variant_review(accepted=bbox_accepts)
 
     class Backend:
@@ -3307,17 +3432,25 @@ def _run_two_candidate_routing_case(
             return (mask,)
 
     review = Review()
+    if not bbox_judge_available:
+        review.review_attribute_bbox = None  # type: ignore[method-assign]
     backend = Backend()
     judge = Judge()
     clip = _clip()
+    completion_config = replace(
+        SubjectAttributeCompletionConfig(enabled=True),
+        minimum_sharpness_score=-1.0,
+    )
+    if completion_eligible_types is not None:
+        completion_config = replace(
+            completion_config,
+            eligible_types=completion_eligible_types,
+        )
     artifact = subject_attributes._process_owner(
         config=SimpleNamespace(
             pair=SimpleNamespace(crop_padding_ratio=0.08),
             subject_attributes=SubjectAttributesConfig(
-                completion=replace(
-                    SubjectAttributeCompletionConfig(enabled=True),
-                    minimum_sharpness_score=-1.0,
-                )
+                completion=completion_config
             ),
         ),
         storage=_FakeStorage(tmp_path / "run"),
@@ -3342,6 +3475,202 @@ def _run_two_candidate_routing_case(
         completion_judge=judge,
     )
     return artifact, review, backend, judge
+
+
+def test_face_prefers_bbox_and_legacy_config_cannot_enable_completion(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        attribute_type="face",
+        bbox_accepts=True,
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.attribute_type == "face"
+    assert record.final_selection == "bbox"
+    assert record.owner_entity_id == "e1"
+    assert record.owner_candidate_id == "candidate_1"
+    assert record.source_frame_index == 10
+    assert record.completion_attempted is False
+    assert record.completion_seed is None
+    assert record.variants is not None
+    assert record.variants.bbox.status == "accepted"
+    assert record.variants.bbox.synthetic is False
+    assert review.candidate_calls == [["candidate_1"]]
+    assert review.bbox_calls == 1
+    assert backend.calls == []
+    assert judge.calls == 0
+    assert artifact.metrics.completion_attempts == 0
+    assert artifact.metrics.completion_accepted == 0
+    assert artifact.metrics.completion_review_calls == 0
+    assert artifact.metrics.completion_fallback_to_raw == 0
+    assert artifact.metrics.completion_attempts_by_type == {}
+    assert artifact.metrics.completion_accepted_by_type == {}
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 1
+
+
+def test_face_bbox_reject_falls_back_to_accepted_raw_alpha(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        attribute_type="face",
+        bbox_accepts=False,
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert record.variants is not None
+    assert record.variants.bbox.status == "rejected"
+    assert record.variants.bbox.reviewed is True
+    assert record.variants.bbox.review_status == "reject"
+    assert review.bbox_calls == 1
+    assert backend.calls == []
+    assert judge.calls == 0
+    assert artifact.metrics.completion_fallback_to_raw == 0
+    assert record.image_path is not None
+    with Image.open(tmp_path / "output" / record.image_path) as published:
+        assert published.mode == "RGBA"
+        assert set(np.unique(np.asarray(published)[..., 3])).issubset({0, 255})
+
+
+def test_face_bbox_judge_exception_falls_back_to_accepted_raw_alpha(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        attribute_type="face",
+        bbox_failure=True,
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.variants is not None
+    assert record.variants.bbox.status == "available"
+    assert record.variants.bbox.reviewed is False
+    assert record.variants.bbox.review_status == "judge_failed"
+    assert record.variants.bbox.image_path is not None
+    assert review.bbox_calls == 1
+    assert backend.calls == []
+    assert judge.calls == 0
+    assert artifact.metrics.completion_fallback_to_raw == 0
+
+
+def test_face_without_bbox_judge_falls_back_to_accepted_raw_alpha(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        attribute_type="face",
+        bbox_judge_available=False,
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.variants is not None
+    assert record.variants.bbox.status == "available"
+    assert record.variants.bbox.reviewed is False
+    assert record.variants.bbox.review_status == "judge_unavailable"
+    assert record.variants.bbox.image_path is not None
+    assert review.bbox_calls == 0
+    assert backend.calls == []
+    assert judge.calls == 0
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+    assert artifact.metrics.completion_fallback_to_raw == 0
+
+
+def test_face_bbox_materialization_failure_falls_back_to_raw_alpha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject_attributes,
+        "_attribute_bbox_crop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("cannot materialize bbox")
+        ),
+    )
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        attribute_type="face",
+        bbox_accepts=True,
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "raw"
+    assert record.variants is not None
+    assert record.variants.bbox.status == "unavailable"
+    assert record.variants.bbox.image_path is None
+    assert record.variants.bbox.review_status == "materialization_failed"
+    assert review.bbox_calls == 0
+    assert backend.calls == []
+    assert judge.calls == 0
+    assert artifact.metrics.attribute_bbox_variants_materialized == 0
+
+
+def test_face_without_accepted_raw_candidate_does_not_use_bbox_or_boogu(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("unusable_repair", "unusable_repair"),
+        attribute_type="face",
+        bbox_accepts=True,
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    assert artifact.records[0].status == "rejected"
+    assert review.candidate_calls == [["candidate_1"], ["candidate_2"]]
+    assert review.bbox_calls == 0
+    assert backend.calls == []
+    assert judge.calls == 0
+    assert artifact.metrics.completion_attempts == 0
+
+
+def test_legacy_face_eligibility_does_not_change_headwear_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject_attributes,
+        "HEADWEAR_MIN_ATTRIBUTE_LONG_SIDE_PIXELS",
+        4,
+    )
+    artifact, review, backend, judge = _run_two_candidate_routing_case(
+        tmp_path,
+        raw_kinds=("accepted_complete", "accepted_complete"),
+        completion_accepts=(True,),
+        attribute_type="headwear",
+        completion_eligible_types=("face", "headwear"),
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "completed"
+    assert record.completion_attempted is True
+    assert review.bbox_calls == 0
+    assert backend.calls == ["candidate_1"]
+    assert judge.calls == 1
+    assert artifact.metrics.completion_attempts_by_type == {"headwear": 1}
+    assert artifact.metrics.completion_accepted_by_type == {"headwear": 1}
 
 
 def test_candidate2_completion_is_tried_after_candidate1_qwen_reject(
@@ -3643,8 +3972,8 @@ def test_raw_accepted_repair_success_selects_completed(
     assert artifact.metrics.completion_sam_single_mask == 0
     assert artifact.metrics.completion_sam_multi_mask == 0
     assert artifact.metrics.completion_sam_masks_returned_total == 0
-    assert artifact.metrics.completion_attempts_by_type == {"face": 1}
-    assert artifact.metrics.completion_accepted_by_type == {"face": 1}
+    assert artifact.metrics.completion_attempts_by_type == {"upper_clothing": 1}
+    assert artifact.metrics.completion_accepted_by_type == {"upper_clothing": 1}
     assert review.calls == [["a1"]]
     assert backend.calls == 1
     assert backend.background_calls == 0
