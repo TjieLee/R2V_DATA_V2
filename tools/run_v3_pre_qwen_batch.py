@@ -24,6 +24,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
     close_backend,
     compact_execution_chunks,
     default_backend_factory,
+    enable_sam3_request_timing,
     ensure_execution_identity,
     enumerate_annotation_shards,
     execution_chunk_path,
@@ -32,6 +33,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
     load_config_identity,
     process_execution_chunk,
     process_shard,
+    sam3_worker_timing_diagnostics,
     validate_stage2_preflight,
 )
 
@@ -54,6 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--idle-exit-seconds", type=float, default=DEFAULT_STAGE2_IDLE_EXIT_SECONDS
     )
+    parser.add_argument("--sam3-request-timing", action="store_true")
     parser.add_argument("--inspect", type=Path)
     return parser
 
@@ -73,6 +76,7 @@ def run_claim_loop(
     scan_offset: int,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
     idle_exit_seconds: float = DEFAULT_STAGE2_IDLE_EXIT_SECONDS,
+    sam3_request_timing: bool = False,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
@@ -85,7 +89,7 @@ def run_claim_loop(
     paths = enumerate_annotation_shards(input_root)
     ensure_execution_identity(output_root, chunk_rows=chunk_rows)
     if all((output_root / "parts" / path.name).is_file() for path in paths):
-        return {
+        result = {
             **preflight,
             "results": [],
             "outstanding_or_busy": False,
@@ -97,9 +101,15 @@ def run_claim_loop(
             "idle_rescans": 0,
             "idle_exit_seconds": idle_exit_seconds,
         }
+        if sam3_request_timing:
+            result.update(sam3_worker_timing_diagnostics(None, None))
+        return result
     service_health = check_stage2_candidate_judge_health(identity.config)
     backend_started = time.perf_counter()
     backend = default_backend_factory(identity.config)
+    timing_collector = (
+        enable_sam3_request_timing(backend) if sam3_request_timing else None
+    )
     backend_startup_seconds = max(0.0, time.perf_counter() - backend_started)
     results: list[dict[str, object]] = []
     retryable_this_run: set[tuple[Path, str]] = set()
@@ -210,7 +220,7 @@ def run_claim_loop(
                         idle_rescans += 1
                         scan_cursor += 1
                         continue
-                return {
+                result = {
                     **preflight,
                     **service_health,
                     "results": results,
@@ -228,6 +238,11 @@ def run_claim_loop(
                     "idle_rescans": idle_rescans,
                     "idle_exit_seconds": idle_exit_seconds,
                 }
+                if sam3_request_timing:
+                    result.update(
+                        sam3_worker_timing_diagnostics(backend, timing_collector)
+                    )
+                return result
     finally:
         close_backend(backend)
 
@@ -254,6 +269,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             scan_offset=args.scan_offset,
             chunk_rows=args.chunk_rows,
             idle_exit_seconds=args.idle_exit_seconds,
+            sam3_request_timing=args.sam3_request_timing,
         )
     else:
         if args.input_shard is None:
@@ -267,6 +283,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             else check_stage2_candidate_judge_health(identity.config)
         )
         backend = None if completed.is_file() else default_backend_factory(identity.config)
+        timing_collector = (
+            enable_sam3_request_timing(backend)
+            if args.sam3_request_timing and backend is not None
+            else None
+        )
         try:
             result = {
                 **preflight,
@@ -279,6 +300,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                     chunk_rows=args.chunk_rows,
                 ),
             }
+            if args.sam3_request_timing:
+                result.update(
+                    sam3_worker_timing_diagnostics(backend, timing_collector)
+                )
         finally:
             if backend is not None:
                 close_backend(backend)

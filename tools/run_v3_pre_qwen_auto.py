@@ -44,6 +44,97 @@ def _empty_prefetch_diagnostics(workers: int) -> dict[str, object]:
     }
 
 
+def _last_worker_result(path: Path, *, offset: int) -> dict[str, object] | None:
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        lines = handle.read().splitlines()
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(value, dict) and "sam3_request_timing" in value:
+            return value
+    return None
+
+
+def _aggregate_sam3_timing(
+    worker_results: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    categories = {
+        "start_session": "handle_request.start_session",
+        "add_prompt": "handle_request.add_prompt",
+        "propagate": "handle_stream_request.propagate_in_video",
+        "close_session": "handle_request.close_session",
+    }
+    category_totals = {
+        name: {"calls": 0, "total_seconds": 0.0}
+        for name in categories
+    }
+    request_seconds = 0.0
+    track_seconds = 0.0
+    per_gpu: dict[str, object] = {}
+    performance_per_gpu: dict[str, object] = {}
+    anchor_totals: dict[str, int] = {}
+    rescue_totals: dict[str, int] = {}
+
+    for worker, value in sorted(worker_results.items()):
+        request_timing = value.get("sam3_request_timing")
+        performance = value.get("sam3_backend_performance_counters")
+        anchor = value.get("sam3_anchor_search_counters")
+        rescue = value.get("sam3_recall_rescue_counters")
+        request_timing = request_timing if isinstance(request_timing, dict) else {}
+        performance = performance if isinstance(performance, dict) else {}
+        anchor = anchor if isinstance(anchor, dict) else {}
+        rescue = rescue if isinstance(rescue, dict) else {}
+        per_gpu[worker] = request_timing
+        performance_per_gpu[worker] = performance
+
+        for timing in request_timing.values():
+            if not isinstance(timing, dict):
+                continue
+            seconds = timing.get("total_seconds")
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+                request_seconds += max(0.0, float(seconds))
+        for name, category in categories.items():
+            timing = request_timing.get(category)
+            if not isinstance(timing, dict):
+                continue
+            calls = timing.get("calls")
+            seconds = timing.get("total_seconds")
+            if isinstance(calls, int) and not isinstance(calls, bool):
+                category_totals[name]["calls"] += max(0, calls)
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool):
+                category_totals[name]["total_seconds"] += max(0.0, float(seconds))
+
+        track = performance.get("sam3_segment_model_call_time_seconds")
+        if isinstance(track, (int, float)) and not isinstance(track, bool):
+            track_seconds += max(0.0, float(track))
+        for source, target in ((anchor, anchor_totals), (rescue, rescue_totals)):
+            for name, counter in source.items():
+                if isinstance(counter, int) and not isinstance(counter, bool):
+                    target[name] = target.get(name, 0) + max(0, counter)
+
+    result: dict[str, object] = {
+        "sam3_timing_per_gpu": per_gpu,
+        "sam3_backend_performance_per_gpu": performance_per_gpu,
+        "sam3_anchor_search_totals": anchor_totals,
+        "sam3_recall_rescue_totals": rescue_totals,
+        "sam3_timing_total_request_seconds": request_seconds,
+        "sam3_timing_total_track_seconds": track_seconds,
+        "sam3_timing_request_seconds_fraction_of_track": (
+            request_seconds / track_seconds if track_seconds else 0.0
+        ),
+        "sam3_timing_unattributed_seconds": max(
+            0.0, track_seconds - request_seconds
+        ),
+    }
+    for name, totals in category_totals.items():
+        result[f"sam3_timing_total_{name}_calls"] = totals["calls"]
+        result[f"sam3_timing_total_{name}_seconds"] = totals["total_seconds"]
+    return result
+
+
 @dataclass
 class _FramePrefetchController:
     workers: int
@@ -190,6 +281,7 @@ def _parser() -> argparse.ArgumentParser:
         "--idle-exit-seconds", type=float, default=DEFAULT_STAGE2_IDLE_EXIT_SECONDS
     )
     parser.add_argument("--frame-prefetch-workers", type=int, default=0)
+    parser.add_argument("--sam3-request-timing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -223,6 +315,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     if args.dry_run:
         report.update(inventory(args.input_root, args.output_root))
         report["prepare_seconds"] = max(0.0, time.perf_counter() - prepare_started)
+        if args.sam3_request_timing:
+            report.update(_aggregate_sam3_timing({}))
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return report
     report.update(check_stage2_candidate_judge_health(config))
@@ -242,6 +336,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     processes: list[subprocess.Popen[bytes]] = []
     codes: list[int] = []
     logs = []
+    worker_logs: list[tuple[str, Path, int]] = []
     log_root = args.output_root / "logs"
     log_root.mkdir(parents=True, exist_ok=True)
     worker_startup_started = time.perf_counter()
@@ -249,29 +344,35 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         for local_slot, gpu in enumerate(gpus):
             environment = dict(os.environ)
             environment["CUDA_VISIBLE_DEVICES"] = gpu
-            log = (log_root / f"rank-{rank}-gpu-{gpu}.log").open("ab")
+            log_path = log_root / f"rank-{rank}-gpu-{gpu}.log"
+            log = log_path.open("ab")
+            log.seek(0, os.SEEK_END)
+            worker_logs.append((f"rank{rank}_gpu{gpu}", log_path, log.tell()))
             logs.append(log)
+            command = [
+                sys.executable,
+                str(tool),
+                "--input-root",
+                str(args.input_root),
+                "--base-config",
+                str(args.base_config),
+                "--output-root",
+                str(args.output_root),
+                "--gpu",
+                gpu,
+                "--claim-loop",
+                "--scan-offset",
+                str(rank * len(gpus) + local_slot),
+                "--chunk-rows",
+                str(args.chunk_rows),
+                "--idle-exit-seconds",
+                str(args.idle_exit_seconds),
+            ]
+            if args.sam3_request_timing:
+                command.append("--sam3-request-timing")
             processes.append(
                 subprocess.Popen(
-                    [
-                        sys.executable,
-                        str(tool),
-                        "--input-root",
-                        str(args.input_root),
-                        "--base-config",
-                        str(args.base_config),
-                        "--output-root",
-                        str(args.output_root),
-                        "--gpu",
-                        gpu,
-                        "--claim-loop",
-                        "--scan-offset",
-                        str(rank * len(gpus) + local_slot),
-                        "--chunk-rows",
-                        str(args.chunk_rows),
-                        "--idle-exit-seconds",
-                        str(args.idle_exit_seconds),
-                    ],
+                    command,
                     env=environment,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -286,12 +387,21 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             log.close()
         if prefetch is not None:
             prefetch_diagnostics = prefetch.stop_and_join()
+    timing_diagnostics: dict[str, object] = {}
+    if args.sam3_request_timing:
+        worker_results = {
+            worker: value
+            for worker, path, offset in worker_logs
+            if (value := _last_worker_result(path, offset=offset)) is not None
+        }
+        timing_diagnostics = _aggregate_sam3_timing(worker_results)
     result = {
         **report,
         "prepare_seconds": max(0.0, worker_startup_started - prepare_started),
         "worker_startup_seconds": worker_startup_seconds,
         "worker_exit_codes": codes,
         **prefetch_diagnostics,
+        **timing_diagnostics,
     }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if any(codes):

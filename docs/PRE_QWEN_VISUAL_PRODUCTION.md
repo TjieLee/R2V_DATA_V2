@@ -270,6 +270,25 @@ prefetch failures are diagnostic only and are recorded in
 The launcher summary reports `frame_prefetch_workers`, submitted, completed,
 skipped-existing, failed, and wall-seconds counters.
 
+For an opt-in SAM3 runtime timing diagnostic, add
+`--sam3-request-timing`. The flag defaults off and only wraps the predictor
+request interface in each Stage2 worker; it does not add, remove, reuse, or
+modify any SAM3 request or session. `handle_request` timings are grouped by
+request type, while streaming propagation is timed through complete iterator
+consumption. Each worker reports the frozen backend performance, anchor-search,
+and recall-rescue counters alongside the request timings. The auto-launcher
+aggregates start-session, add-prompt, propagation, close-session, total-track,
+request-fraction, and non-negative unattributed wall time, while retaining a
+per-GPU map. For the isolated request-timing benchmark, keep frame prefetch
+disabled so the invocation includes:
+
+```bash
+--frame-prefetch-workers 0 --sam3-request-timing
+```
+
+This is diagnostic instrumentation only; it does not implement session reuse,
+feature caching, warmup requests, or another SAM3 optimization.
+
 ## Required isolated 8 x 10 canary
 
 Prepare exactly 80 eligible samples—ten per GPU—before formal production:

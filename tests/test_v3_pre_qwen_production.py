@@ -1592,6 +1592,66 @@ def test_claim_worker_builds_one_persistent_backend_for_multiple_chunks(
     assert backend.close_calls == 1
 
 
+def test_claim_worker_timing_keeps_one_lazy_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0, status="failed")])
+    factory_calls = 0
+
+    class TimingBackend(FakeBackend):
+        _predictor = None
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.predictor_builds = 0
+
+        def _build_predictor(self, *, compile_enabled: bool) -> object:
+            del compile_enabled
+            self.predictor_builds += 1
+            return _TransparentPredictor()
+
+        def performance_counters(self) -> dict[str, object]:
+            return {"sam3_segment_model_call_time_seconds": 0.0}
+
+    backend = TimingBackend()
+
+    def factory(config: V3Config) -> TimingBackend:
+        nonlocal factory_calls
+        del config
+        factory_calls += 1
+        return backend
+
+    monkeypatch.setattr(batch_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(
+        batch_tool, "enumerate_annotation_shards", lambda root: [shard_path]
+    )
+    monkeypatch.setattr(batch_tool, "default_backend_factory", factory)
+    monkeypatch.setattr(
+        batch_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+
+    result = batch_tool.run_claim_loop(
+        input_root=fixture.input_root,
+        base_config=fixture.base_path,
+        output_root=fixture.output_root,
+        scan_offset=0,
+        chunk_rows=1,
+        sam3_request_timing=True,
+    )
+
+    assert factory_calls == 1
+    assert backend.predictor_builds == 0
+    assert backend.close_calls == 1
+    assert result["sam3_request_timing"] == {}
+    assert result["sam3_backend_performance_counters"] == {
+        "sam3_segment_model_call_time_seconds": 0.0
+    }
+
+
 def test_final_partial_sized_stage1_shard_keeps_filename(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2413,6 +2473,8 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     assert normal["worker_exit_codes"] == [0]
     assert normal["frame_prefetch_workers"] == 0
     assert normal["frame_prefetch_submitted"] == 0
+    assert "sam3_request_timing" not in normal
+    assert "sam3_timing_total_track_seconds" not in normal
     idle_flag = commands[0].index("--idle-exit-seconds")
     assert commands[0][idle_flag + 1] == "60.0"
 
@@ -2750,6 +2812,335 @@ def test_auto_frame_prefetch_pool_is_once_per_node_not_per_gpu(
     source = Path(auto_tool.__file__).read_text(encoding="utf-8")
     assert "ProcessPoolExecutor" in source
     assert "ThreadPoolExecutor" not in source
+
+
+@dataclass
+class _ManualClock:
+    value: float = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class _TransparentPredictor:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, object]] = []
+        self.return_value = object()
+        self.stream_values = (object(), object())
+
+    def handle_request(self, request: object) -> object:
+        self.requests.append(("request", request))
+        return self.return_value
+
+    def handle_stream_request(self, request: object):
+        self.requests.append(("stream", request))
+        yield from self.stream_values
+
+
+def test_timed_sam3_predictor_handle_request_is_transparent() -> None:
+    clock = _ManualClock(10.0)
+    collector = production.Sam3RequestTimingCollector()
+
+    class Predictor(_TransparentPredictor):
+        def handle_request(self, request: object) -> object:
+            result = super().handle_request(request)
+            clock.value = 15.0
+            return result
+
+    predictor = Predictor()
+    proxy = production.TimedSam3PredictorProxy(
+        predictor,
+        collector,
+        clock=clock,
+    )
+    request = {"type": "start_session", "resource_path": "/unchanged"}
+
+    clock.value = 12.0
+    result = proxy.handle_request(request)
+    assert result is predictor.return_value
+    assert predictor.requests == [("request", request)]
+    assert predictor.requests[0][1] is request
+    assert request == {"type": "start_session", "resource_path": "/unchanged"}
+    timing = collector.summary()["handle_request.start_session"]
+    assert timing["calls"] == 1
+    assert timing["total_seconds"] == 3.0
+
+
+def test_timed_sam3_stream_covers_full_iteration_and_preserves_responses() -> None:
+    clock = _ManualClock(1.0)
+    collector = production.Sam3RequestTimingCollector()
+    predictor = _TransparentPredictor()
+    proxy = production.TimedSam3PredictorProxy(
+        predictor,
+        collector,
+        clock=clock,
+    )
+    request = {"type": "propagate_in_video", "session_id": "unchanged"}
+
+    stream = proxy.handle_stream_request(request)
+    assert predictor.requests == []
+    assert collector.summary() == {}
+    clock.value = 2.0
+    first = next(stream)
+    assert collector.summary() == {}
+    clock.value = 4.0
+    second = next(stream)
+    assert collector.summary() == {}
+    clock.value = 9.0
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    assert first is predictor.stream_values[0]
+    assert second is predictor.stream_values[1]
+    assert predictor.requests == [("stream", request)]
+    assert predictor.requests[0][1] is request
+    timing = collector.summary()["handle_stream_request.propagate_in_video"]
+    assert timing == {
+        "calls": 1,
+        "total_seconds": 8.0,
+        "mean_seconds": 8.0,
+        "max_seconds": 8.0,
+    }
+
+
+def test_timed_sam3_predictor_preserves_request_and_stream_exceptions() -> None:
+    class RequestError(RuntimeError):
+        pass
+
+    class StreamError(ValueError):
+        pass
+
+    request_error = RequestError("request failed")
+    stream_error = StreamError("stream failed")
+
+    class Predictor:
+        def handle_request(self, request: object) -> object:
+            del request
+            raise request_error
+
+        def handle_stream_request(self, request: object):
+            del request
+            yield "before failure"
+            raise stream_error
+
+    clock = _ManualClock(3.0)
+    collector = production.Sam3RequestTimingCollector()
+    proxy = production.TimedSam3PredictorProxy(
+        Predictor(),
+        collector,
+        clock=clock,
+    )
+
+    with pytest.raises(RequestError) as request_info:
+        proxy.handle_request({"type": "add_prompt"})
+    assert request_info.value is request_error
+    clock.value = 5.0
+    stream = proxy.handle_stream_request({"type": "propagate_in_video"})
+    assert next(stream) == "before failure"
+    clock.value = 8.0
+    with pytest.raises(StreamError) as stream_info:
+        next(stream)
+    assert stream_info.value is stream_error
+    assert collector.summary()["handle_request.add_prompt"]["calls"] == 1
+    assert collector.summary()["handle_stream_request.propagate_in_video"] == {
+        "calls": 1,
+        "total_seconds": 3.0,
+        "mean_seconds": 3.0,
+        "max_seconds": 3.0,
+    }
+
+
+def test_sam3_timing_on_off_sequence_is_identical_and_lazy() -> None:
+    predictor = _TransparentPredictor()
+
+    class Backend:
+        _predictor = None
+
+        def __init__(self) -> None:
+            self.build_calls: list[bool] = []
+
+        def _build_predictor(self, *, compile_enabled: bool) -> object:
+            self.build_calls.append(compile_enabled)
+            return predictor
+
+    backend = Backend()
+    collector = production.enable_sam3_request_timing(backend)
+
+    assert backend.build_calls == []
+    assert predictor.requests == []
+    timed_predictor = backend._build_predictor(compile_enabled=True)
+    assert backend.build_calls == [True]
+    assert isinstance(timed_predictor, production.TimedSam3PredictorProxy)
+
+    requests = [
+        {"type": "start_session"},
+        {"type": "add_prompt"},
+        {"type": "propagate_in_video"},
+        {"type": "close_session"},
+    ]
+    raw_predictor = _TransparentPredictor()
+    raw_predictor.handle_request(requests[0])
+    raw_predictor.handle_request(requests[1])
+    list(raw_predictor.handle_stream_request(requests[2]))
+    raw_predictor.handle_request(requests[3])
+    timed_predictor.handle_request(requests[0])
+    timed_predictor.handle_request(requests[1])
+    list(timed_predictor.handle_stream_request(requests[2]))
+    timed_predictor.handle_request(requests[3])
+
+    assert predictor.requests == raw_predictor.requests
+    assert sum(value["calls"] for value in collector.summary().values()) == 4
+    assert production.enable_sam3_request_timing(backend) is collector
+    assert backend.build_calls == [True]
+
+
+def test_sam3_worker_timing_includes_frozen_backend_counters() -> None:
+    class Backend:
+        def performance_counters(self) -> dict[str, object]:
+            return {
+                "sam3_predictor_startup_seconds": 4.0,
+                "sam3_segment_model_call_time_seconds": 9.0,
+                "sam3_segment_clips": 2,
+                "sam3_segment_entities": 3,
+                "first_segment_clip_seconds": 6.0,
+                "steady_state_segment_mean_seconds": 3.0,
+            }
+
+        def anchor_search_counters(self) -> dict[str, int]:
+            return {"anchor_probe_calls": 7, "anchor_fast_path_hits": 2}
+
+        def recall_rescue_counters(self) -> dict[str, int]:
+            return {"multi_instance_rescue_attempted": 1}
+
+    collector = production.Sam3RequestTimingCollector()
+    collector.record("handle_request.start_session", 2.5)
+    diagnostics = production.sam3_worker_timing_diagnostics(Backend(), collector)
+
+    assert diagnostics["sam3_request_timing"] == {
+        "handle_request.start_session": {
+            "calls": 1,
+            "total_seconds": 2.5,
+            "mean_seconds": 2.5,
+            "max_seconds": 2.5,
+        }
+    }
+    assert diagnostics["sam3_backend_performance_counters"] == {
+        "sam3_predictor_startup_seconds": 4.0,
+        "sam3_segment_model_call_time_seconds": 9.0,
+        "sam3_segment_clips": 2,
+        "sam3_segment_entities": 3,
+        "first_segment_clip_seconds": 6.0,
+        "steady_state_segment_mean_seconds": 3.0,
+    }
+    assert diagnostics["sam3_anchor_search_counters"] == {
+        "anchor_probe_calls": 7,
+        "anchor_fast_path_hits": 2,
+    }
+    assert diagnostics["sam3_recall_rescue_counters"] == {
+        "multi_instance_rescue_attempted": 1
+    }
+
+
+def test_auto_sam3_timing_aggregates_current_worker_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    commands: list[list[str]] = []
+
+    class Process:
+        def wait(self) -> int:
+            return 0
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        commands.append(command)
+        gpu = command[command.index("--gpu") + 1]
+        multiplier = int(gpu) + 1
+        output = kwargs["stdout"]
+        payload = {
+            "sam3_request_timing": {
+                "handle_request.start_session": {
+                    "calls": multiplier,
+                    "total_seconds": 10.0 * multiplier,
+                    "mean_seconds": 10.0,
+                    "max_seconds": 10.0,
+                },
+                "handle_request.add_prompt": {
+                    "calls": multiplier,
+                    "total_seconds": 2.0 * multiplier,
+                    "mean_seconds": 2.0,
+                    "max_seconds": 2.0,
+                },
+                "handle_stream_request.propagate_in_video": {
+                    "calls": multiplier,
+                    "total_seconds": 3.0 * multiplier,
+                    "mean_seconds": 3.0,
+                    "max_seconds": 3.0,
+                },
+                "handle_request.close_session": {
+                    "calls": multiplier,
+                    "total_seconds": 1.0 * multiplier,
+                    "mean_seconds": 1.0,
+                    "max_seconds": 1.0,
+                },
+            },
+            "sam3_backend_performance_counters": {
+                "sam3_predictor_startup_seconds": 5.0 * multiplier,
+                "sam3_segment_model_call_time_seconds": 20.0 * multiplier,
+                "sam3_segment_clips": multiplier,
+                "sam3_segment_entities": multiplier,
+                "first_segment_clip_seconds": 20.0,
+                "steady_state_segment_mean_seconds": 0.0,
+            },
+            "sam3_anchor_search_counters": {
+                "anchor_probe_calls": multiplier,
+            },
+            "sam3_recall_rescue_counters": {
+                "multi_instance_rescue_attempted": multiplier,
+            },
+        }
+        output.write((json.dumps(payload) + "\n").encode())
+        output.flush()
+        return Process()
+
+    monkeypatch.setattr(auto_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(auto_tool, "enumerate_annotation_shards", lambda root: [])
+    monkeypatch.setattr(
+        auto_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+    monkeypatch.setattr(auto_tool.subprocess, "Popen", popen)
+
+    result = auto_tool.main(
+        [
+            "--input-root",
+            str(fixture.input_root),
+            "--base-config",
+            str(fixture.base_path),
+            "--output-root",
+            str(fixture.output_root),
+            "--gpus",
+            "0,1",
+            "--sam3-request-timing",
+        ]
+    )
+
+    assert all("--sam3-request-timing" in command for command in commands)
+    assert result["sam3_timing_total_start_session_calls"] == 3
+    assert result["sam3_timing_total_start_session_seconds"] == 30.0
+    assert result["sam3_timing_total_add_prompt_seconds"] == 6.0
+    assert result["sam3_timing_total_propagate_seconds"] == 9.0
+    assert result["sam3_timing_total_close_session_seconds"] == 3.0
+    assert result["sam3_timing_total_request_seconds"] == 48.0
+    assert result["sam3_timing_total_track_seconds"] == 60.0
+    assert result["sam3_timing_request_seconds_fraction_of_track"] == 0.8
+    assert result["sam3_timing_unattributed_seconds"] == 12.0
+    assert set(result["sam3_timing_per_gpu"]) == {"rank0_gpu0", "rank0_gpu1"}
+    assert result["sam3_anchor_search_totals"] == {"anchor_probe_calls": 3}
+    assert result["sam3_recall_rescue_totals"] == {
+        "multi_instance_rescue_attempted": 3
+    }
 
 
 def test_stage2_orchestration_keeps_frozen_visual_file_hashes() -> None:

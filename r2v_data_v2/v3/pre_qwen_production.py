@@ -290,6 +290,168 @@ class BackendFactory(Protocol):
     def __call__(self, config: V3Config) -> SegmentationBackend: ...
 
 
+@dataclass
+class _Sam3RequestTimingBucket:
+    calls: int = 0
+    total_seconds: float = 0.0
+    max_seconds: float = 0.0
+
+
+class Sam3RequestTimingCollector:
+    def __init__(self) -> None:
+        self._buckets: dict[str, _Sam3RequestTimingBucket] = {}
+
+    def record(self, category: str, elapsed_seconds: float) -> None:
+        elapsed = max(0.0, float(elapsed_seconds))
+        bucket = self._buckets.setdefault(category, _Sam3RequestTimingBucket())
+        bucket.calls += 1
+        bucket.total_seconds += elapsed
+        bucket.max_seconds = max(bucket.max_seconds, elapsed)
+
+    def summary(self) -> dict[str, dict[str, int | float]]:
+        return {
+            category: {
+                "calls": bucket.calls,
+                "total_seconds": bucket.total_seconds,
+                "mean_seconds": (
+                    bucket.total_seconds / bucket.calls if bucket.calls else 0.0
+                ),
+                "max_seconds": bucket.max_seconds,
+            }
+            for category, bucket in sorted(self._buckets.items())
+        }
+
+
+class _TimedSam3StreamIterator:
+    def __init__(
+        self,
+        iterator: Iterator[object],
+        *,
+        finish: Callable[[], None],
+    ) -> None:
+        self._iterator = iterator
+        self._finish_callback = finish
+        self._finished = False
+
+    def __iter__(self) -> _TimedSam3StreamIterator:
+        return self
+
+    def __next__(self) -> object:
+        try:
+            return next(self._iterator)
+        except BaseException:
+            self._finish()
+            raise
+
+    def close(self) -> None:
+        try:
+            close = getattr(self._iterator, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._finish()
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._finish_callback()
+
+
+class TimedSam3PredictorProxy:
+    def __init__(
+        self,
+        predictor: object,
+        collector: Sam3RequestTimingCollector,
+        *,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
+        self._predictor = predictor
+        self._collector = collector
+        self._clock = clock
+
+    @staticmethod
+    def _request_category(prefix: str, request: object) -> str:
+        request_type = request.get("type") if isinstance(request, dict) else None
+        label = request_type if isinstance(request_type, str) else "unknown"
+        return f"{prefix}.{label}"
+
+    def handle_request(self, request: object) -> object:
+        category = self._request_category("handle_request", request)
+        started = self._clock()
+        try:
+            return self._predictor.handle_request(request)  # type: ignore[attr-defined]
+        finally:
+            self._collector.record(category, self._clock() - started)
+
+    def handle_stream_request(self, request: object) -> Iterator[object]:
+        category = self._request_category("handle_stream_request", request)
+        started = self._clock()
+
+        def finish() -> None:
+            self._collector.record(category, self._clock() - started)
+
+        try:
+            iterator = iter(
+                self._predictor.handle_stream_request(request)  # type: ignore[attr-defined]
+            )
+        except BaseException:
+            finish()
+            raise
+        return _TimedSam3StreamIterator(iterator, finish=finish)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._predictor, name)
+
+
+def enable_sam3_request_timing(
+    backend: object,
+    *,
+    clock: Callable[[], float] = time.perf_counter,
+) -> Sam3RequestTimingCollector:
+    existing = getattr(backend, "_stage2_sam3_timing_collector", None)
+    if isinstance(existing, Sam3RequestTimingCollector):
+        return existing
+    build_predictor = getattr(backend, "_build_predictor", None)
+    if not callable(build_predictor):
+        raise TypeError("SAM3 request timing requires the Stage2 SAM3 backend")
+    collector = Sam3RequestTimingCollector()
+    predictor = getattr(backend, "_predictor", None)
+    if predictor is not None and not isinstance(predictor, TimedSam3PredictorProxy):
+        backend._predictor = TimedSam3PredictorProxy(  # type: ignore[attr-defined]
+            predictor,
+            collector,
+            clock=clock,
+        )
+
+    def timed_build_predictor(*, compile_enabled: bool) -> object:
+        built = build_predictor(compile_enabled=compile_enabled)
+        if isinstance(built, TimedSam3PredictorProxy):
+            return built
+        return TimedSam3PredictorProxy(built, collector, clock=clock)
+
+    backend._build_predictor = timed_build_predictor  # type: ignore[attr-defined]
+    backend._stage2_sam3_timing_collector = collector  # type: ignore[attr-defined]
+    return collector
+
+
+def sam3_worker_timing_diagnostics(
+    backend: object | None,
+    collector: Sam3RequestTimingCollector | None,
+) -> dict[str, object]:
+    def counters(name: str) -> dict[str, object]:
+        reader = getattr(backend, name, None)
+        values = reader() if callable(reader) else {}
+        return dict(values) if isinstance(values, dict) else {}
+
+    return {
+        "sam3_request_timing": collector.summary() if collector is not None else {},
+        "sam3_backend_performance_counters": counters("performance_counters"),
+        "sam3_anchor_search_counters": counters("anchor_search_counters"),
+        "sam3_recall_rescue_counters": counters("recall_rescue_counters"),
+    }
+
+
 _FRAME_PREFETCH_CONFIG_IDENTITY: ConfigIdentity | None = None
 _FRAME_PREFETCH_OUTPUT_ROOT: Path | None = None
 
