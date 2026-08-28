@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
@@ -57,6 +58,7 @@ CLIP_CHECKPOINT_SCHEMA_VERSION = "r2v.v3.pre_qwen_clip_checkpoint.1"
 CANARY_SCHEMA_VERSION = "r2v.v3.pre_qwen_canary.2"
 DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS = 100
 STAGE2_EXECUTION_STRATEGY = "dynamic_chunk_claim_v1"
+Sam3SessionReuseMode = Literal["off", "clip_reset_v1"]
 DEFAULT_PRODUCTION_OUTPUT_ROOT = Path(
     "/mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1"
 )
@@ -404,11 +406,171 @@ class TimedSam3PredictorProxy:
         return getattr(self._predictor, name)
 
 
+@dataclass
+class Sam3SessionReuseDiagnostics:
+    mode: Sam3SessionReuseMode = "clip_reset_v1"
+    logical_start_session_calls: int = 0
+    logical_close_session_calls: int = 0
+    physical_start_session_calls: int = 0
+    physical_reset_session_calls: int = 0
+    physical_close_session_calls: int = 0
+    reused_start_session_calls: int = 0
+    session_resource_switches: int = 0
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "sam3_session_reuse_mode": self.mode,
+            "sam3_logical_start_session_calls": self.logical_start_session_calls,
+            "sam3_logical_close_session_calls": self.logical_close_session_calls,
+            "sam3_physical_start_session_calls": self.physical_start_session_calls,
+            "sam3_physical_reset_session_calls": self.physical_reset_session_calls,
+            "sam3_physical_close_session_calls": self.physical_close_session_calls,
+            "sam3_reused_start_session_calls": self.reused_start_session_calls,
+            "sam3_session_resource_switches": self.session_resource_switches,
+        }
+
+
+class Sam3ClipSessionReuseProxy:
+    def __init__(
+        self,
+        predictor: object,
+        diagnostics: Sam3SessionReuseDiagnostics,
+    ) -> None:
+        self._predictor = predictor
+        self._diagnostics = diagnostics
+        self._physical_session_id: str | None = None
+        self._physical_resource_path: object | None = None
+        self._logical_session_active = False
+
+    @staticmethod
+    def _request_type(request: object) -> object:
+        return request.get("type") if isinstance(request, dict) else None
+
+    def _require_matching_active_session(self, request: object, operation: str) -> None:
+        if not isinstance(request, dict):
+            raise TypeError(f"SAM3 {operation} request must be a mapping")
+        session_id = request.get("session_id")
+        if (
+            not self._logical_session_active
+            or self._physical_session_id is None
+            or session_id != self._physical_session_id
+        ):
+            raise RuntimeError(f"SAM3 {operation} targeted an inactive session")
+
+    def _clear_physical_session(self) -> None:
+        self._physical_session_id = None
+        self._physical_resource_path = None
+        self._logical_session_active = False
+
+    def _close_physical_session(self, *, suppress_errors: bool = False) -> object:
+        session_id = self._physical_session_id
+        if session_id is None:
+            return {}
+        self._diagnostics.physical_close_session_calls += 1
+        try:
+            response = self._predictor.handle_request(  # type: ignore[attr-defined]
+                {"type": "close_session", "session_id": session_id}
+            )
+        except BaseException:
+            if suppress_errors:
+                self._clear_physical_session()
+                return {}
+            raise
+        self._clear_physical_session()
+        return response
+
+    def _start_logical_session(self, request: object) -> object:
+        self._diagnostics.logical_start_session_calls += 1
+        if self._logical_session_active:
+            raise RuntimeError("SAM3 logical session is already active")
+        if not isinstance(request, dict) or "resource_path" not in request:
+            raise RuntimeError("SAM3 start_session is missing resource_path")
+        resource_path = request["resource_path"]
+        if self._physical_session_id is not None:
+            if resource_path == self._physical_resource_path:
+                self._logical_session_active = True
+                self._diagnostics.reused_start_session_calls += 1
+                return {"session_id": self._physical_session_id}
+            self._close_physical_session()
+            self._diagnostics.session_resource_switches += 1
+        self._diagnostics.physical_start_session_calls += 1
+        response = self._predictor.handle_request(request)  # type: ignore[attr-defined]
+        try:
+            session_id = str(response["session_id"])
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("SAM3 start_session returned no session_id") from exc
+        self._physical_session_id = session_id
+        self._physical_resource_path = resource_path
+        self._logical_session_active = True
+        return response
+
+    def _close_logical_session(self, request: object) -> object:
+        self._diagnostics.logical_close_session_calls += 1
+        self._require_matching_active_session(request, "close_session")
+        assert self._physical_session_id is not None
+        preserved_exception = sys.exception()
+        self._diagnostics.physical_reset_session_calls += 1
+        try:
+            response = self._predictor.handle_request(  # type: ignore[attr-defined]
+                {
+                    "type": "reset_session",
+                    "session_id": self._physical_session_id,
+                }
+            )
+        except BaseException:
+            self._close_physical_session(suppress_errors=True)
+            if preserved_exception is not None:
+                return {}
+            raise
+        self._logical_session_active = False
+        return response
+
+    def handle_request(self, request: object) -> object:
+        request_type = self._request_type(request)
+        if request_type == "start_session":
+            return self._start_logical_session(request)
+        if request_type == "close_session":
+            return self._close_logical_session(request)
+        if request_type == "add_prompt":
+            self._require_matching_active_session(request, "add_prompt")
+        return self._predictor.handle_request(request)  # type: ignore[attr-defined]
+
+    def handle_stream_request(self, request: object) -> object:
+        if self._request_type(request) == "propagate_in_video":
+            self._require_matching_active_session(request, "propagate_in_video")
+        return self._predictor.handle_stream_request(request)  # type: ignore[attr-defined]
+
+    def shutdown(self) -> object:
+        preserved_exception = sys.exception()
+        cleanup_error: BaseException | None = None
+        try:
+            self._close_physical_session()
+        except BaseException as exc:  # noqa: BLE001 - cleanup preserves active error
+            cleanup_error = exc
+        try:
+            shutdown = getattr(self._predictor, "shutdown", None)
+            result = shutdown() if callable(shutdown) else None
+        except BaseException:
+            if preserved_exception is not None:
+                return None
+            if cleanup_error is not None:
+                raise cleanup_error
+            raise
+        if cleanup_error is not None and preserved_exception is None:
+            raise cleanup_error
+        return result
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._predictor, name)
+
+
 def enable_sam3_request_timing(
     backend: object,
     *,
     clock: Callable[[], float] = time.perf_counter,
 ) -> Sam3RequestTimingCollector:
+    if getattr(backend, "_stage2_sam3_session_reuse_diagnostics", None) is not None:
+        raise RuntimeError("SAM3 request timing must be enabled before session reuse")
     existing = getattr(backend, "_stage2_sam3_timing_collector", None)
     if isinstance(existing, Sam3RequestTimingCollector):
         return existing
@@ -435,6 +597,42 @@ def enable_sam3_request_timing(
     return collector
 
 
+def enable_sam3_session_reuse(
+    backend: object,
+    *,
+    mode: Sam3SessionReuseMode,
+) -> Sam3SessionReuseDiagnostics | None:
+    if mode == "off":
+        return None
+    if mode != "clip_reset_v1":
+        raise ValueError(f"unsupported SAM3 session reuse mode: {mode}")
+    existing = getattr(backend, "_stage2_sam3_session_reuse_diagnostics", None)
+    if isinstance(existing, Sam3SessionReuseDiagnostics):
+        return existing
+    build_predictor = getattr(backend, "_build_predictor", None)
+    if not callable(build_predictor):
+        raise TypeError("SAM3 session reuse requires the Stage2 SAM3 backend")
+    diagnostics = Sam3SessionReuseDiagnostics()
+    predictor = getattr(backend, "_predictor", None)
+    if predictor is not None and not isinstance(predictor, Sam3ClipSessionReuseProxy):
+        backend._predictor = Sam3ClipSessionReuseProxy(  # type: ignore[attr-defined]
+            predictor,
+            diagnostics,
+        )
+
+    def reused_build_predictor(*, compile_enabled: bool) -> object:
+        built = build_predictor(compile_enabled=compile_enabled)
+        if isinstance(built, Sam3ClipSessionReuseProxy):
+            return built
+        return Sam3ClipSessionReuseProxy(built, diagnostics)
+
+    backend._build_predictor = reused_build_predictor  # type: ignore[attr-defined]
+    backend._stage2_sam3_session_reuse_diagnostics = (  # type: ignore[attr-defined]
+        diagnostics
+    )
+    return diagnostics
+
+
 def sam3_worker_timing_diagnostics(
     backend: object | None,
     collector: Sam3RequestTimingCollector | None,
@@ -450,6 +648,18 @@ def sam3_worker_timing_diagnostics(
         "sam3_anchor_search_counters": counters("anchor_search_counters"),
         "sam3_recall_rescue_counters": counters("recall_rescue_counters"),
     }
+
+
+def sam3_worker_session_reuse_diagnostics(
+    diagnostics: Sam3SessionReuseDiagnostics | None,
+    *,
+    mode: Sam3SessionReuseMode = "off",
+) -> dict[str, object]:
+    if diagnostics is not None:
+        return diagnostics.summary()
+    if mode == "clip_reset_v1":
+        return Sam3SessionReuseDiagnostics().summary()
+    return {}
 
 
 _FRAME_PREFETCH_CONFIG_IDENTITY: ConfigIdentity | None = None
@@ -824,6 +1034,50 @@ def ensure_execution_identity(
         _safe_output_root(output_root),
         chunk_rows=chunk_rows,
     )
+
+
+def ensure_sam3_session_reuse_identity(
+    output_root: str | Path,
+    *,
+    mode: Sam3SessionReuseMode,
+) -> Path | None:
+    if mode not in {"off", "clip_reset_v1"}:
+        raise ValueError(f"unsupported SAM3 session reuse mode: {mode}")
+    root = _safe_output_root(output_root)
+    marker = root / "_internal" / "sam3-session-reuse.json"
+    with shard_lock(root / "locks" / "execution.lock", blocking=True):
+        if marker.is_file():
+            value = json.loads(marker.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise TypeError("SAM3 session reuse marker must contain an object")
+            if value.get("schema_version") != 1:
+                raise ValueError("SAM3 session reuse marker schema mismatch")
+            marker_mode = value.get("mode")
+            if marker_mode != mode:
+                raise ValueError(
+                    "Stage2 output root SAM3 session reuse mode mismatch: "
+                    f"existing={marker_mode} requested={mode}"
+                )
+            return marker
+        if mode == "off":
+            return None
+        artifacts_exist = (root / "artifacts").is_dir() and any(
+            (root / "artifacts").iterdir()
+        )
+        chunks_exist = any(
+            (root / "_internal").glob("shard-*/chunks/chunk-*")
+        )
+        parts_exist = any((root / "parts").glob("shard-*.jsonl*"))
+        if artifacts_exist or chunks_exist or parts_exist:
+            raise ValueError(
+                "existing Stage2 work has no SAM3 session reuse marker; "
+                "use mode=off or a fresh output root"
+            )
+        write_json_atomic(
+            marker,
+            {"schema_version": 1, "mode": "clip_reset_v1"},
+        )
+        return marker
 
 
 def _ensure_execution_identity_locked(

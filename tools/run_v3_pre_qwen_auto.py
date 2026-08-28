@@ -22,6 +22,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from r2v_data_v2.v3.pre_qwen_production import (
     DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
     check_stage2_candidate_judge_health,
+    ensure_sam3_session_reuse_identity,
     enumerate_annotation_shards,
     initialize_frame_prefetch_worker,
     inventory,
@@ -53,7 +54,9 @@ def _last_worker_result(path: Path, *, offset: int) -> dict[str, object] | None:
             value = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        if isinstance(value, dict) and "sam3_request_timing" in value:
+        if isinstance(value, dict) and (
+            "sam3_request_timing" in value or "sam3_session_reuse_mode" in value
+        ):
             return value
     return None
 
@@ -63,6 +66,7 @@ def _aggregate_sam3_timing(
 ) -> dict[str, object]:
     categories = {
         "start_session": "handle_request.start_session",
+        "reset_session": "handle_request.reset_session",
         "add_prompt": "handle_request.add_prompt",
         "propagate": "handle_stream_request.propagate_in_video",
         "close_session": "handle_request.close_session",
@@ -133,6 +137,38 @@ def _aggregate_sam3_timing(
         result[f"sam3_timing_total_{name}_calls"] = totals["calls"]
         result[f"sam3_timing_total_{name}_seconds"] = totals["total_seconds"]
     return result
+
+
+def _aggregate_sam3_session_reuse(
+    worker_results: dict[str, dict[str, object]],
+    *,
+    mode: str,
+) -> dict[str, object]:
+    counter_names = (
+        "sam3_logical_start_session_calls",
+        "sam3_logical_close_session_calls",
+        "sam3_physical_start_session_calls",
+        "sam3_physical_reset_session_calls",
+        "sam3_physical_close_session_calls",
+        "sam3_reused_start_session_calls",
+        "sam3_session_resource_switches",
+    )
+    totals = {name: 0 for name in counter_names}
+    per_gpu: dict[str, dict[str, object]] = {}
+    for worker, value in sorted(worker_results.items()):
+        worker_values: dict[str, object] = {"sam3_session_reuse_mode": mode}
+        for name in counter_names:
+            counter = value.get(name)
+            if isinstance(counter, int) and not isinstance(counter, bool):
+                normalized = max(0, counter)
+                totals[name] += normalized
+                worker_values[name] = normalized
+        per_gpu[worker] = worker_values
+    return {
+        "sam3_session_reuse_mode": mode,
+        "sam3_session_reuse_per_gpu": per_gpu,
+        **totals,
+    }
 
 
 @dataclass
@@ -282,6 +318,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--frame-prefetch-workers", type=int, default=0)
     parser.add_argument("--sam3-request-timing", action="store_true")
+    parser.add_argument(
+        "--sam3-session-reuse-mode",
+        choices=("off", "clip_reset_v1"),
+        default="off",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -317,8 +358,19 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         report["prepare_seconds"] = max(0.0, time.perf_counter() - prepare_started)
         if args.sam3_request_timing:
             report.update(_aggregate_sam3_timing({}))
+        if args.sam3_session_reuse_mode != "off":
+            report.update(
+                _aggregate_sam3_session_reuse(
+                    {},
+                    mode=args.sam3_session_reuse_mode,
+                )
+            )
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return report
+    ensure_sam3_session_reuse_identity(
+        args.output_root,
+        mode=args.sam3_session_reuse_mode,
+    )
     report.update(check_stage2_candidate_judge_health(config))
     prefetch: _FramePrefetchController | None = None
     prefetch_diagnostics = _empty_prefetch_diagnostics(
@@ -370,6 +422,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             ]
             if args.sam3_request_timing:
                 command.append("--sam3-request-timing")
+            if args.sam3_session_reuse_mode != "off":
+                command.extend(
+                    [
+                        "--sam3-session-reuse-mode",
+                        args.sam3_session_reuse_mode,
+                    ]
+                )
             processes.append(
                 subprocess.Popen(
                     command,
@@ -387,21 +446,29 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             log.close()
         if prefetch is not None:
             prefetch_diagnostics = prefetch.stop_and_join()
-    timing_diagnostics: dict[str, object] = {}
-    if args.sam3_request_timing:
+    runtime_diagnostics: dict[str, object] = {}
+    if args.sam3_request_timing or args.sam3_session_reuse_mode != "off":
         worker_results = {
             worker: value
             for worker, path, offset in worker_logs
             if (value := _last_worker_result(path, offset=offset)) is not None
         }
-        timing_diagnostics = _aggregate_sam3_timing(worker_results)
+        if args.sam3_request_timing:
+            runtime_diagnostics.update(_aggregate_sam3_timing(worker_results))
+        if args.sam3_session_reuse_mode != "off":
+            runtime_diagnostics.update(
+                _aggregate_sam3_session_reuse(
+                    worker_results,
+                    mode=args.sam3_session_reuse_mode,
+                )
+            )
     result = {
         **report,
         "prepare_seconds": max(0.0, worker_startup_started - prepare_started),
         "worker_startup_seconds": worker_startup_seconds,
         "worker_exit_codes": codes,
         **prefetch_diagnostics,
-        **timing_diagnostics,
+        **runtime_diagnostics,
     }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if any(codes):

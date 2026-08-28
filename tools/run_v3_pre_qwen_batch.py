@@ -25,7 +25,9 @@ from r2v_data_v2.v3.pre_qwen_production import (
     compact_execution_chunks,
     default_backend_factory,
     enable_sam3_request_timing,
+    enable_sam3_session_reuse,
     ensure_execution_identity,
+    ensure_sam3_session_reuse_identity,
     enumerate_annotation_shards,
     execution_chunk_path,
     inspect_stage2_shard,
@@ -33,6 +35,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
     load_config_identity,
     process_execution_chunk,
     process_shard,
+    sam3_worker_session_reuse_diagnostics,
     sam3_worker_timing_diagnostics,
     validate_stage2_preflight,
 )
@@ -57,6 +60,11 @@ def _parser() -> argparse.ArgumentParser:
         "--idle-exit-seconds", type=float, default=DEFAULT_STAGE2_IDLE_EXIT_SECONDS
     )
     parser.add_argument("--sam3-request-timing", action="store_true")
+    parser.add_argument(
+        "--sam3-session-reuse-mode",
+        choices=("off", "clip_reset_v1"),
+        default="off",
+    )
     parser.add_argument("--inspect", type=Path)
     return parser
 
@@ -77,6 +85,7 @@ def run_claim_loop(
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
     idle_exit_seconds: float = DEFAULT_STAGE2_IDLE_EXIT_SECONDS,
     sam3_request_timing: bool = False,
+    sam3_session_reuse_mode: str = "off",
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
@@ -87,6 +96,10 @@ def run_claim_loop(
     identity = load_config_identity(base_config)
     preflight = validate_stage2_preflight(identity.config)
     paths = enumerate_annotation_shards(input_root)
+    ensure_sam3_session_reuse_identity(
+        output_root,
+        mode=sam3_session_reuse_mode,  # type: ignore[arg-type]
+    )
     ensure_execution_identity(output_root, chunk_rows=chunk_rows)
     if all((output_root / "parts" / path.name).is_file() for path in paths):
         result = {
@@ -103,6 +116,13 @@ def run_claim_loop(
         }
         if sam3_request_timing:
             result.update(sam3_worker_timing_diagnostics(None, None))
+        if sam3_session_reuse_mode != "off":
+            result.update(
+                sam3_worker_session_reuse_diagnostics(
+                    None,
+                    mode=sam3_session_reuse_mode,  # type: ignore[arg-type]
+                )
+            )
         return result
     service_health = check_stage2_candidate_judge_health(identity.config)
     backend_started = time.perf_counter()
@@ -110,6 +130,24 @@ def run_claim_loop(
     timing_collector = (
         enable_sam3_request_timing(backend) if sam3_request_timing else None
     )
+    reuse_diagnostics = enable_sam3_session_reuse(
+        backend,
+        mode=sam3_session_reuse_mode,  # type: ignore[arg-type]
+    )
+    backend_closed = False
+
+    def finalize_runtime_diagnostics(result: dict[str, object]) -> dict[str, object]:
+        nonlocal backend_closed
+        if sam3_session_reuse_mode != "off":
+            backend_closed = True
+            close_backend(backend)
+        if sam3_request_timing:
+            result.update(sam3_worker_timing_diagnostics(backend, timing_collector))
+        if sam3_session_reuse_mode != "off":
+            result.update(
+                sam3_worker_session_reuse_diagnostics(reuse_diagnostics)
+            )
+        return result
     backend_startup_seconds = max(0.0, time.perf_counter() - backend_started)
     results: list[dict[str, object]] = []
     retryable_this_run: set[tuple[Path, str]] = set()
@@ -238,13 +276,10 @@ def run_claim_loop(
                     "idle_rescans": idle_rescans,
                     "idle_exit_seconds": idle_exit_seconds,
                 }
-                if sam3_request_timing:
-                    result.update(
-                        sam3_worker_timing_diagnostics(backend, timing_collector)
-                    )
-                return result
+                return finalize_runtime_diagnostics(result)
     finally:
-        close_backend(backend)
+        if not backend_closed:
+            close_backend(backend)
 
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
@@ -270,12 +305,17 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             chunk_rows=args.chunk_rows,
             idle_exit_seconds=args.idle_exit_seconds,
             sam3_request_timing=args.sam3_request_timing,
+            sam3_session_reuse_mode=args.sam3_session_reuse_mode,
         )
     else:
         if args.input_shard is None:
             raise ValueError("single batch mode requires --input-shard")
         identity = load_config_identity(args.base_config)
         preflight = validate_stage2_preflight(identity.config)
+        ensure_sam3_session_reuse_identity(
+            args.output_root,
+            mode=args.sam3_session_reuse_mode,
+        )
         completed = args.output_root / "parts" / args.input_shard.name
         service_health = (
             {"candidate_judge_health": "not_checked_completed"}
@@ -288,6 +328,15 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             if args.sam3_request_timing and backend is not None
             else None
         )
+        reuse_diagnostics = (
+            enable_sam3_session_reuse(
+                backend,
+                mode=args.sam3_session_reuse_mode,
+            )
+            if backend is not None
+            else None
+        )
+        backend_closed = False
         try:
             result = {
                 **preflight,
@@ -300,12 +349,22 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                     chunk_rows=args.chunk_rows,
                 ),
             }
+            if args.sam3_session_reuse_mode != "off" and backend is not None:
+                backend_closed = True
+                close_backend(backend)
             if args.sam3_request_timing:
                 result.update(
                     sam3_worker_timing_diagnostics(backend, timing_collector)
                 )
+            if args.sam3_session_reuse_mode != "off":
+                result.update(
+                    sam3_worker_session_reuse_diagnostics(
+                        reuse_diagnostics,
+                        mode=args.sam3_session_reuse_mode,
+                    )
+                )
         finally:
-            if backend is not None:
+            if backend is not None and not backend_closed:
                 close_backend(backend)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return result

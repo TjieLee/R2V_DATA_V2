@@ -1641,6 +1641,7 @@ def test_claim_worker_timing_keeps_one_lazy_backend(
         scan_offset=0,
         chunk_rows=1,
         sam3_request_timing=True,
+        sam3_session_reuse_mode="clip_reset_v1",
     )
 
     assert factory_calls == 1
@@ -1650,6 +1651,11 @@ def test_claim_worker_timing_keeps_one_lazy_backend(
     assert result["sam3_backend_performance_counters"] == {
         "sam3_segment_model_call_time_seconds": 0.0
     }
+    assert result["sam3_session_reuse_mode"] == "clip_reset_v1"
+    assert result["sam3_physical_start_session_calls"] == 0
+    assert (
+        fixture.output_root / "_internal" / "sam3-session-reuse.json"
+    ).is_file()
 
 
 def test_final_partial_sized_stage1_shard_keeps_filename(
@@ -2475,6 +2481,7 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     assert normal["frame_prefetch_submitted"] == 0
     assert "sam3_request_timing" not in normal
     assert "sam3_timing_total_track_seconds" not in normal
+    assert "sam3_session_reuse_mode" not in normal
     idle_flag = commands[0].index("--idle-exit-seconds")
     assert commands[0][idle_flag + 1] == "60.0"
 
@@ -2808,6 +2815,7 @@ def test_auto_frame_prefetch_pool_is_once_per_node_not_per_gpu(
     assert controller.stopped is True
     assert len(commands) == 8
     assert all("--frame-prefetch-workers" not in command for command in commands)
+    assert all("--sam3-session-reuse-mode" not in command for command in commands)
     assert result["frame_prefetch_completed"] == 1
     source = Path(auto_tool.__file__).read_text(encoding="utf-8")
     assert "ProcessPoolExecutor" in source
@@ -2835,6 +2843,121 @@ class _TransparentPredictor:
     def handle_stream_request(self, request: object):
         self.requests.append(("stream", request))
         yield from self.stream_values
+
+
+class _StatefulSessionPredictor:
+    def __init__(
+        self,
+        *,
+        fail_add_prompt: BaseException | None = None,
+        fail_reset: BaseException | None = None,
+    ) -> None:
+        self.fail_add_prompt = fail_add_prompt
+        self.fail_reset = fail_reset
+        self.next_session = 0
+        self.sessions: dict[str, dict[str, int]] = {}
+        self.requests: list[tuple[str, object]] = []
+        self.add_prompt_outputs: list[np.ndarray] = []
+        self.propagation_outputs: list[tuple[str, tuple[np.ndarray, ...]]] = []
+        self.shutdown_calls = 0
+
+    @staticmethod
+    def _output(mask: np.ndarray) -> dict[str, object]:
+        return {
+            "out_binary_masks": mask[None, None].astype(np.uint8),
+            "out_probs": np.asarray([0.9], dtype=np.float32),
+            "out_obj_ids": np.asarray(["object-0"]),
+        }
+
+    @staticmethod
+    def _mask(version: int) -> np.ndarray:
+        mask = np.zeros((12, 16), dtype=bool)
+        start = 5 + min(version, 3)
+        mask[4:8, start : start + 4] = True
+        return mask
+
+    def handle_request(self, request: object) -> dict[str, object]:
+        assert isinstance(request, dict)
+        request_type = str(request["type"])
+        self.requests.append((request_type, request))
+        if request_type == "start_session":
+            self.next_session += 1
+            session_id = f"session-{self.next_session}"
+            self.sessions[session_id] = {"prompts": 0, "propagations": 0}
+            return {"session_id": session_id}
+        session_id = str(request["session_id"])
+        if request_type == "close_session":
+            self.sessions.pop(session_id)
+            return {}
+        state = self.sessions[session_id]
+        if request_type == "reset_session":
+            if self.fail_reset is not None:
+                raise self.fail_reset
+            state.update(prompts=0, propagations=0)
+            return {"reset": True}
+        if request_type == "add_prompt":
+            if self.fail_add_prompt is not None:
+                raise self.fail_add_prompt
+            mask = self._mask(state["prompts"])
+            state["prompts"] += 1
+            self.add_prompt_outputs.append(mask.copy())
+            return {
+                "frame_index": int(request["frame_index"]),
+                "outputs": self._output(mask),
+            }
+        raise AssertionError(f"unexpected request type: {request_type}")
+
+    def handle_stream_request(self, request: object):
+        assert isinstance(request, dict)
+        self.requests.append(("propagate_in_video", request))
+        session_id = str(request["session_id"])
+        state = self.sessions[session_id]
+        if state["prompts"] != 1:
+            raise RuntimeError("propagation requires one fresh prompt")
+        mask = self._mask(state["prompts"] - 1)
+        state["propagations"] += 1
+        direction = str(request["propagation_direction"])
+        responses = tuple(mask.copy() for _ in range(10))
+        self.propagation_outputs.append((direction, responses))
+        for slot, current in enumerate(responses):
+            yield {"frame_index": slot, "outputs": self._output(current)}
+
+    def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+def _logical_sam3_round(
+    predictor: object,
+    *,
+    resource_path: str,
+    frame_index: int = 5,
+    direction: str = "forward",
+) -> tuple[dict[str, object], list[object]]:
+    start = predictor.handle_request(  # type: ignore[attr-defined]
+        {"type": "start_session", "resource_path": resource_path}
+    )
+    session_id = str(start["session_id"])
+    prompted = predictor.handle_request(  # type: ignore[attr-defined]
+        {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": frame_index,
+            "text": "unchanged prompt",
+        }
+    )
+    propagated = list(
+        predictor.handle_stream_request(  # type: ignore[attr-defined]
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": direction,
+            }
+        )
+    )
+    predictor.handle_request(  # type: ignore[attr-defined]
+        {"type": "close_session", "session_id": session_id}
+    )
+    return prompted, propagated
 
 
 def test_timed_sam3_predictor_handle_request_is_transparent() -> None:
@@ -2994,6 +3117,351 @@ def test_sam3_timing_on_off_sequence_is_identical_and_lazy() -> None:
     assert backend.build_calls == [True]
 
 
+def test_clip_session_reuse_matches_fresh_logical_outputs() -> None:
+    baseline = _StatefulSessionPredictor()
+    reused_raw = _StatefulSessionPredictor()
+    diagnostics = production.Sam3SessionReuseDiagnostics()
+    reused = production.Sam3ClipSessionReuseProxy(reused_raw, diagnostics)
+
+    baseline_results = [
+        _logical_sam3_round(baseline, resource_path="/frames/clip-a")
+        for _ in range(3)
+    ]
+    reused_results = [
+        _logical_sam3_round(reused, resource_path="/frames/clip-a")
+        for _ in range(3)
+    ]
+
+    for (baseline_prompt, baseline_stream), (reuse_prompt, reuse_stream) in zip(
+        baseline_results,
+        reused_results,
+    ):
+        assert baseline_prompt["frame_index"] == reuse_prompt["frame_index"]
+        assert np.array_equal(
+            baseline_prompt["outputs"]["out_binary_masks"],  # type: ignore[index]
+            reuse_prompt["outputs"]["out_binary_masks"],  # type: ignore[index]
+        )
+        assert len(baseline_stream) == len(reuse_stream)
+        for baseline_response, reuse_response in zip(
+            baseline_stream,
+            reuse_stream,
+        ):
+            assert baseline_response["frame_index"] == reuse_response["frame_index"]
+            assert np.array_equal(
+                baseline_response["outputs"]["out_binary_masks"],
+                reuse_response["outputs"]["out_binary_masks"],
+            )
+
+    assert [name for name, _ in reused_raw.requests].count("start_session") == 1
+    assert [name for name, _ in reused_raw.requests].count("reset_session") == 3
+    assert [name for name, _ in reused_raw.requests].count("close_session") == 0
+    assert diagnostics.summary() == {
+        "sam3_session_reuse_mode": "clip_reset_v1",
+        "sam3_logical_start_session_calls": 3,
+        "sam3_logical_close_session_calls": 3,
+        "sam3_physical_start_session_calls": 1,
+        "sam3_physical_reset_session_calls": 3,
+        "sam3_physical_close_session_calls": 0,
+        "sam3_reused_start_session_calls": 2,
+        "sam3_session_resource_switches": 0,
+    }
+
+
+def test_clip_session_reuse_preserves_frozen_track_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    frames_dir = tmp_path / "track-frames"
+    frames_dir.mkdir()
+    frame_paths = []
+    for slot in range(10):
+        path = frames_dir / f"{slot:02d}.jpg"
+        path.write_bytes(b"frame")
+        frame_paths.append(path)
+    baseline_predictor = _StatefulSessionPredictor()
+    reused_predictor = _StatefulSessionPredictor()
+    baseline_backend = Sam3SegmentationBackend(
+        fixture.config.sam3,
+        predictor=baseline_predictor,
+    )
+    reused_backend = Sam3SegmentationBackend(
+        fixture.config.sam3,
+        predictor=reused_predictor,
+    )
+    diagnostics = production.enable_sam3_session_reuse(
+        reused_backend,
+        mode="clip_reset_v1",
+    )
+
+    baseline_result = baseline_backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="person",
+        entity_phrase="person",
+    )
+    reused_result = reused_backend.track(
+        frame_paths=frame_paths,
+        entity_id="e1",
+        reference_type="subject",
+        grounding_prompt="person",
+        entity_phrase="person",
+    )
+
+    assert baseline_result.status == reused_result.status == "ready"
+    assert len(baseline_result.observations) == len(reused_result.observations)
+    for baseline_observation, reused_observation in zip(
+        baseline_result.observations,
+        reused_result.observations,
+    ):
+        assert baseline_observation.slot == reused_observation.slot
+        assert baseline_observation.object_id == reused_observation.object_id
+        assert baseline_observation.confidence == reused_observation.confidence
+        assert np.array_equal(baseline_observation.mask, reused_observation.mask)
+    assert diagnostics is not None
+    assert diagnostics.logical_start_session_calls == 3
+    assert diagnostics.physical_start_session_calls == 1
+    assert diagnostics.physical_reset_session_calls == 3
+    assert diagnostics.reused_start_session_calls == 2
+    assert [name for name, _ in reused_predictor.requests].count("start_session") == 1
+
+    reused_backend.close()
+    assert [name for name, _ in reused_predictor.requests].count("close_session") == 1
+    assert reused_predictor.shutdown_calls == 1
+
+
+def test_clip_session_reuse_switches_resources_and_shutdown_closes_once() -> None:
+    raw = _StatefulSessionPredictor()
+    diagnostics = production.Sam3SessionReuseDiagnostics()
+    proxy = production.Sam3ClipSessionReuseProxy(raw, diagnostics)
+
+    _logical_sam3_round(proxy, resource_path="/frames/clip-a")
+    _logical_sam3_round(proxy, resource_path="/frames/clip-b")
+    proxy.shutdown()
+
+    request_types = [name for name, _ in raw.requests]
+    assert request_types.count("start_session") == 2
+    assert request_types.count("reset_session") == 2
+    assert request_types.count("close_session") == 2
+    assert diagnostics.physical_start_session_calls == 2
+    assert diagnostics.physical_close_session_calls == 2
+    assert diagnostics.session_resource_switches == 1
+    assert raw.shutdown_calls == 1
+    assert raw.sessions == {}
+
+
+def test_clip_session_reuse_fails_closed_on_invalid_sequence() -> None:
+    raw = _StatefulSessionPredictor()
+    proxy = production.Sam3ClipSessionReuseProxy(
+        raw,
+        production.Sam3SessionReuseDiagnostics(),
+    )
+    start = proxy.handle_request(
+        {"type": "start_session", "resource_path": "/frames/clip-a"}
+    )
+    session_id = str(start["session_id"])
+
+    with pytest.raises(RuntimeError, match="already active"):
+        proxy.handle_request(
+            {"type": "start_session", "resource_path": "/frames/clip-a"}
+        )
+    with pytest.raises(RuntimeError, match="inactive session"):
+        proxy.handle_request(
+            {"type": "add_prompt", "session_id": "wrong", "frame_index": 5}
+        )
+    with pytest.raises(RuntimeError, match="inactive session"):
+        proxy.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": "wrong",
+                "propagation_direction": "forward",
+            }
+        )
+    with pytest.raises(RuntimeError, match="inactive session"):
+        proxy.handle_request({"type": "close_session", "session_id": "wrong"})
+
+    proxy.handle_request({"type": "close_session", "session_id": session_id})
+    proxy.shutdown()
+
+
+def test_clip_session_reuse_cleanup_does_not_override_original_exception() -> None:
+    original = LookupError("original add_prompt failure")
+    reset_failure = RuntimeError("reset unsupported")
+    raw = _StatefulSessionPredictor(
+        fail_add_prompt=original,
+        fail_reset=reset_failure,
+    )
+    proxy = production.Sam3ClipSessionReuseProxy(
+        raw,
+        production.Sam3SessionReuseDiagnostics(),
+    )
+    start = proxy.handle_request(
+        {"type": "start_session", "resource_path": "/frames/clip-a"}
+    )
+    session_id = str(start["session_id"])
+
+    with pytest.raises(LookupError) as exc_info:
+        try:
+            proxy.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": 5,
+                    "text": "prompt",
+                }
+            )
+        finally:
+            proxy.handle_request(
+                {"type": "close_session", "session_id": session_id}
+            )
+
+    assert exc_info.value is original
+    assert [name for name, _ in raw.requests].count("reset_session") == 1
+    assert [name for name, _ in raw.requests].count("close_session") == 1
+    assert raw.sessions == {}
+
+
+def test_clip_session_reuse_fails_if_reset_session_is_unsupported() -> None:
+    reset_failure = RuntimeError("reset_session is unsupported")
+    raw = _StatefulSessionPredictor(fail_reset=reset_failure)
+    proxy = production.Sam3ClipSessionReuseProxy(
+        raw,
+        production.Sam3SessionReuseDiagnostics(),
+    )
+    start = proxy.handle_request(
+        {"type": "start_session", "resource_path": "/frames/clip-a"}
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        proxy.handle_request(
+            {"type": "close_session", "session_id": str(start["session_id"])}
+        )
+
+    assert exc_info.value is reset_failure
+    assert [name for name, _ in raw.requests] == [
+        "start_session",
+        "reset_session",
+        "close_session",
+    ]
+    assert raw.sessions == {}
+
+
+def test_timing_and_reuse_count_only_physical_requests() -> None:
+    raw = _StatefulSessionPredictor()
+    collector = production.Sam3RequestTimingCollector()
+    timed = production.TimedSam3PredictorProxy(raw, collector)
+    diagnostics = production.Sam3SessionReuseDiagnostics()
+    reused = production.Sam3ClipSessionReuseProxy(timed, diagnostics)
+
+    add_requests: list[dict[str, object]] = []
+    stream_requests: list[dict[str, object]] = []
+    for _ in range(2):
+        start = reused.handle_request(
+            {"type": "start_session", "resource_path": "/frames/clip-a"}
+        )
+        session_id = str(start["session_id"])
+        add_request = {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 5,
+            "text": "unchanged prompt",
+        }
+        stream_request = {
+            "type": "propagate_in_video",
+            "session_id": session_id,
+            "propagation_direction": "forward",
+        }
+        add_requests.append(add_request)
+        stream_requests.append(stream_request)
+        reused.handle_request(add_request)
+        list(reused.handle_stream_request(stream_request))
+        reused.handle_request(
+            {"type": "close_session", "session_id": session_id}
+        )
+    reused.shutdown()
+
+    timing = collector.summary()
+    assert timing["handle_request.start_session"]["calls"] == 1
+    assert timing["handle_request.reset_session"]["calls"] == 2
+    assert timing["handle_request.close_session"]["calls"] == 1
+    assert timing["handle_request.add_prompt"]["calls"] == 2
+    assert timing["handle_stream_request.propagate_in_video"]["calls"] == 2
+    assert diagnostics.logical_start_session_calls == 2
+    assert diagnostics.reused_start_session_calls == 1
+    raw_add_requests = [request for name, request in raw.requests if name == "add_prompt"]
+    raw_stream_requests = [
+        request for name, request in raw.requests if name == "propagate_in_video"
+    ]
+    assert raw_add_requests == add_requests
+    assert raw_stream_requests == stream_requests
+    assert all(
+        raw_request is supplied
+        for raw_request, supplied in zip(raw_add_requests, add_requests)
+    )
+    assert all(
+        raw_request is supplied
+        for raw_request, supplied in zip(raw_stream_requests, stream_requests)
+    )
+
+
+def test_sam3_session_reuse_marker_prevents_runtime_mode_mixing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    reuse_root = fixture.writable / "reuse-root"
+
+    marker = production.ensure_sam3_session_reuse_identity(
+        reuse_root,
+        mode="clip_reset_v1",
+    )
+    assert marker is not None
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "mode": "clip_reset_v1",
+    }
+    execution = production.ensure_execution_identity(reuse_root, chunk_rows=1)
+    assert json.loads(execution.read_text(encoding="utf-8"))[
+        "execution_strategy"
+    ] == production.STAGE2_EXECUTION_STRATEGY
+    assert "sam3_session_reuse_mode" not in production.Stage2Row.model_fields
+    assert (
+        production.ensure_sam3_session_reuse_identity(
+            reuse_root,
+            mode="clip_reset_v1",
+        )
+        == marker
+    )
+    with pytest.raises(ValueError, match="reuse mode mismatch"):
+        production.ensure_sam3_session_reuse_identity(reuse_root, mode="off")
+
+    legacy_root = fixture.writable / "legacy-off-root"
+    production.ensure_execution_identity(legacy_root, chunk_rows=1)
+    assert (
+        production.ensure_sam3_session_reuse_identity(legacy_root, mode="off")
+        is None
+    )
+    assert not (legacy_root / "_internal" / "sam3-session-reuse.json").exists()
+
+
+def test_sam3_session_reuse_rejects_existing_unmarked_stage2_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    root = fixture.writable / "unmarked-stage2"
+    artifact = root / "artifacts" / "shard-000000000-000009999" / "clip-0"
+    artifact.mkdir(parents=True)
+    (artifact / "state.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no SAM3 session reuse marker"):
+        production.ensure_sam3_session_reuse_identity(
+            root,
+            mode="clip_reset_v1",
+        )
+
+
 def test_sam3_worker_timing_includes_frozen_backend_counters() -> None:
     class Backend:
         def performance_counters(self) -> dict[str, object]:
@@ -3071,6 +3539,12 @@ def test_auto_sam3_timing_aggregates_current_worker_results(
                     "mean_seconds": 2.0,
                     "max_seconds": 2.0,
                 },
+                "handle_request.reset_session": {
+                    "calls": multiplier,
+                    "total_seconds": 4.0 * multiplier,
+                    "mean_seconds": 4.0,
+                    "max_seconds": 4.0,
+                },
                 "handle_stream_request.propagate_in_video": {
                     "calls": multiplier,
                     "total_seconds": 3.0 * multiplier,
@@ -3098,6 +3572,14 @@ def test_auto_sam3_timing_aggregates_current_worker_results(
             "sam3_recall_rescue_counters": {
                 "multi_instance_rescue_attempted": multiplier,
             },
+            "sam3_session_reuse_mode": "clip_reset_v1",
+            "sam3_logical_start_session_calls": 4 * multiplier,
+            "sam3_logical_close_session_calls": 4 * multiplier,
+            "sam3_physical_start_session_calls": multiplier,
+            "sam3_physical_reset_session_calls": 4 * multiplier,
+            "sam3_physical_close_session_calls": multiplier,
+            "sam3_reused_start_session_calls": 3 * multiplier,
+            "sam3_session_resource_switches": multiplier,
         }
         output.write((json.dumps(payload) + "\n").encode())
         output.flush()
@@ -3123,24 +3605,34 @@ def test_auto_sam3_timing_aggregates_current_worker_results(
             "--gpus",
             "0,1",
             "--sam3-request-timing",
+            "--sam3-session-reuse-mode",
+            "clip_reset_v1",
         ]
     )
 
     assert all("--sam3-request-timing" in command for command in commands)
+    assert all("--sam3-session-reuse-mode" in command for command in commands)
     assert result["sam3_timing_total_start_session_calls"] == 3
     assert result["sam3_timing_total_start_session_seconds"] == 30.0
     assert result["sam3_timing_total_add_prompt_seconds"] == 6.0
+    assert result["sam3_timing_total_reset_session_calls"] == 3
+    assert result["sam3_timing_total_reset_session_seconds"] == 12.0
     assert result["sam3_timing_total_propagate_seconds"] == 9.0
     assert result["sam3_timing_total_close_session_seconds"] == 3.0
-    assert result["sam3_timing_total_request_seconds"] == 48.0
+    assert result["sam3_timing_total_request_seconds"] == 60.0
     assert result["sam3_timing_total_track_seconds"] == 60.0
-    assert result["sam3_timing_request_seconds_fraction_of_track"] == 0.8
-    assert result["sam3_timing_unattributed_seconds"] == 12.0
+    assert result["sam3_timing_request_seconds_fraction_of_track"] == 1.0
+    assert result["sam3_timing_unattributed_seconds"] == 0.0
     assert set(result["sam3_timing_per_gpu"]) == {"rank0_gpu0", "rank0_gpu1"}
     assert result["sam3_anchor_search_totals"] == {"anchor_probe_calls": 3}
     assert result["sam3_recall_rescue_totals"] == {
         "multi_instance_rescue_attempted": 3
     }
+    assert result["sam3_session_reuse_mode"] == "clip_reset_v1"
+    assert result["sam3_physical_start_session_calls"] == 3
+    assert result["sam3_physical_reset_session_calls"] == 12
+    assert result["sam3_physical_close_session_calls"] == 3
+    assert result["sam3_reused_start_session_calls"] == 9
 
 
 def test_stage2_orchestration_keeps_frozen_visual_file_hashes() -> None:

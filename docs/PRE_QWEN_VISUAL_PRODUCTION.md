@@ -289,6 +289,32 @@ disabled so the invocation includes:
 This is diagnostic instrumentation only; it does not implement session reuse,
 feature caching, warmup requests, or another SAM3 optimization.
 
+An additional strictly experimental execution flag is available for an A/B
+run:
+
+```bash
+--frame-prefetch-workers 0 \
+--sam3-request-timing \
+--sam3-session-reuse-mode clip_reset_v1
+```
+
+The default mode is `off`. `clip_reset_v1` keeps one physical predictor session
+per clip frame directory while preserving every frozen logical session
+boundary: each logical close issues the official `reset_session`, and a new
+clip or worker shutdown physically closes the cached session. It does not
+change prompt, probe, propagation, retry, selector, mask, threshold, Stage2Row,
+checkpoint, canonical-shard, or artifact-path semantics. Unexpected nesting or
+session IDs fail closed. Actual physical start/reset/close counts are included
+in worker diagnostics and the auto-launcher aggregate; request timing also
+adds `handle_request.reset_session`.
+
+Experimental runs require a fresh output root. The launcher writes
+`_internal/sam3-session-reuse.json` and refuses to mix `off` and
+`clip_reset_v1` work in one root. Old roots without this marker remain valid in
+the default `off` mode. Acceptance of this experiment requires server-side
+exact comparison of canonical rows and per-slot binary masks against the
+baseline; timing improvements alone are insufficient.
+
 ## Required isolated 8 x 10 canary
 
 Prepare exactly 80 eligible samples—ten per GPU—before formal production:
