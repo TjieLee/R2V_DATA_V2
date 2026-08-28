@@ -344,4 +344,6 @@ LoCoNet + LASER is available only as an experimental shadow backend described
 in `docs/H3_LASER_ASD_PILOT.md`. It reuses the existing association and fusion
 contracts for manual comparison, but it does not replace the frozen LR-ASD
 production default and does not enter LR-ASD-calibrated voice-quality or
-primary-voice selection.
+primary-voice selection. Its runtime requires explicit local LASER, S3FD, and
+FaceLandmarker assets, an isolated CUDA device, and strict checkpoint/config
+state compatibility; no asset is downloaded by the bridge.

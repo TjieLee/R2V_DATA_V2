@@ -146,8 +146,8 @@ class LaserASDNativeTrack(SchemaModel):
 
 
 class LaserASDNativeArtifact(SchemaModel):
-    schema_version: Literal["r2v.h3.laser_asd_native.1"] = (
-        "r2v.h3.laser_asd_native.1"
+    schema_version: Literal["r2v.h3.laser_asd_native.2"] = (
+        "r2v.h3.laser_asd_native.2"
     )
     clip_uid: str
     source_video_path: str
@@ -182,6 +182,14 @@ class LaserASDNativeArtifact(SchemaModel):
     config_sha256: str
     landmark_model_path: str
     landmark_model_sha256: str
+    s3fd_model_path: str
+    s3fd_model_sha256: str
+    resolved_n_channel: int = Field(gt=0)
+    resolved_layer: int = Field(gt=0)
+    device: str = Field(pattern=r"^cuda:\d+$")
+    cuda_visible_devices: str = Field(pattern=r"^\d+(,\d+)*$")
+    mediapipe_version: str
+    torch_version: str
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     duration_seconds: float = Field(gt=0)
@@ -202,15 +210,23 @@ class LaserASDNativeArtifact(SchemaModel):
             self.audio_path,
             self.config_path,
             self.landmark_model_path,
+            self.s3fd_model_path,
         )
         if any(not path.strip() for path in required_paths):
             raise ValueError("LASER runtime artifact paths are required")
         for digest in (
             self.config_sha256,
             self.landmark_model_sha256,
+            self.s3fd_model_sha256,
         ):
             if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise ValueError("LASER runtime hashes must be lowercase SHA-256")
+        if not self.mediapipe_version.strip() or not self.torch_version.strip():
+            raise ValueError("LASER runtime package versions are required")
+        if int(self.device.split(":", 1)[1]) >= len(
+            self.cuda_visible_devices.split(",")
+        ):
+            raise ValueError("LASER device is outside isolated CUDA visibility")
         track_ids = [track.face_track_id for track in self.tracks]
         expected = [f"face_{index}" for index in range(1, len(track_ids) + 1)]
         if track_ids != expected:

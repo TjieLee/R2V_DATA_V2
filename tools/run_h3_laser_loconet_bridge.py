@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.metadata
 import json
 import math
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 LASER_UPSTREAM_COMMIT = "3703d3f396cc7b29aa704364f8a9a5ab0c8c1fb9"
@@ -35,9 +37,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--config-path", type=Path, required=True)
     parser.add_argument("--landmark-model-path", type=Path, required=True)
+    parser.add_argument("--s3fd-model-path", type=Path, required=True)
     parser.add_argument("--checkpoint-sha256", required=True)
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--landmark-model-sha256", required=True)
+    parser.add_argument("--s3fd-model-sha256", required=True)
     parser.add_argument("--upstream-commit", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--ffmpeg", default="ffmpeg")
@@ -59,6 +63,65 @@ def _run(command: list[str], *, label: str) -> None:
         raise RuntimeError(
             f"{label} failed with code {result.returncode}: {result.stderr.strip()}"
         )
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_sha256(path: Path, expected: str, *, label: str) -> None:
+    if _sha256(path) != expected:
+        raise ValueError(f"LASER {label} SHA-256 does not match runtime provenance")
+
+
+def _stage_s3fd_model(*, runtime_root: Path, source: Path) -> Path:
+    destination = runtime_root / "model/faceDetector/s3fd/sfd_face.pth"
+    destination.parent.mkdir(parents=True, exist_ok=False)
+    destination.symlink_to(source)
+    if destination.resolve(strict=True) != source.resolve(strict=True):
+        raise ValueError("LASER S3FD runtime link does not resolve to explicit asset")
+    return destination
+
+
+def _install_gdown_blocker() -> None:
+    blocker = ModuleType("gdown")
+
+    def blocked_download(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("LASER runtime forbids gdown network downloads")
+
+    blocker.download = blocked_download  # type: ignore[attr-defined]
+    sys.modules["gdown"] = blocker
+
+
+@contextmanager
+def _offline_vggish_construction(torch_module: object, vggish_class: type[Any]):
+    original_init = vggish_class.__init__
+    original_download = torch_module.hub.load_state_dict_from_url  # type: ignore[attr-defined]
+
+    def local_init(instance: object, *args: object, **kwargs: object) -> None:
+        if args:
+            raise ValueError("LASER VGGish construction must use explicit keywords")
+        kwargs["pretrained"] = False
+        original_init(instance, **kwargs)
+
+    def blocked_download(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("LASER runtime forbids torch.hub network downloads")
+
+    vggish_class.__init__ = local_init  # type: ignore[method-assign]
+    torch_module.hub.load_state_dict_from_url = blocked_download  # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        vggish_class.__init__ = original_init  # type: ignore[method-assign]
+        torch_module.hub.load_state_dict_from_url = original_download  # type: ignore[attr-defined]
 
 
 def _iou(first: list[float], second: list[float]) -> float:
@@ -201,38 +264,89 @@ def _pad_sequence(
     return result
 
 
-def _load_verified_checkpoint(model: object, path: Path) -> None:
+def _load_verified_checkpoint(
+    model: object,
+    path: Path,
+    *,
+    n_channel: int,
+    layer: int,
+) -> None:
     import torch
 
     loaded = torch.load(path, map_location="cpu")
     if not isinstance(loaded, dict) or not loaded:
         raise ValueError("LASER checkpoint must contain a non-empty state dictionary")
-    normalized = {
-        str(key).replace("model.module.", "model."): value
-        for key, value in loaded.items()
-    }
+    normalized: dict[str, object] = {}
+    for raw_key, value in loaded.items():
+        key = str(raw_key).replace("model.module.", "model.")
+        if key in normalized:
+            raise ValueError("LASER checkpoint key normalization is ambiguous")
+        normalized[key] = value
     current = model.state_dict()  # type: ignore[attr-defined]
-    overlap = sorted(set(current) & set(normalized))
+    parameters = dict(model.named_parameters())  # type: ignore[attr-defined]
+    if not current or not parameters:
+        raise ValueError("LASER model exposes no inference state")
+    overlap = sorted(set(current).intersection(normalized))
     if not overlap:
         raise ValueError("LASER checkpoint has no keys matching the requested model")
+    for component in ("landmark_bottleneck", "bottle_neck"):
+        component_parameters = [
+            key
+            for key in parameters
+            if key.startswith(f"{component}.") or f".{component}." in key
+        ]
+        if not component_parameters:
+            raise ValueError(f"LASER model is missing required {component} parameters")
+        missing_component = [
+            key for key in component_parameters if key not in normalized
+        ]
+        if missing_component:
+            raise ValueError(
+                f"LASER checkpoint is missing required {component} parameters"
+            )
+    missing_parameters = sorted(set(parameters).difference(normalized))
+    if missing_parameters:
+        raise ValueError(
+            "LASER checkpoint leaves trainable parameters uninitialized for "
+            f"n_channel={n_channel}, layer={layer}"
+        )
+    missing_state = sorted(
+        key
+        for key in set(current).difference(normalized)
+        if not key.endswith(".num_batches_tracked")
+    )
+    if missing_state:
+        raise ValueError(
+            "LASER checkpoint is missing inference state for "
+            f"n_channel={n_channel}, layer={layer}"
+        )
     shape_mismatch = [
         key for key in overlap if tuple(current[key].shape) != tuple(normalized[key].shape)
     ]
     if shape_mismatch:
-        raise ValueError("LASER checkpoint contains incompatible model tensor shapes")
-    matched_parameters = sum(current[key].numel() for key in overlap)
-    total_parameters = sum(value.numel() for value in current.values())
-    if len(overlap) / len(current) < 0.90 or matched_parameters / total_parameters < 0.99:
-        raise ValueError("LASER checkpoint coverage is too low for verified inference")
+        raise ValueError(
+            "LASER checkpoint contains incompatible tensor shapes for "
+            f"n_channel={n_channel}, layer={layer}"
+        )
+    unexpected_state = sorted(set(normalized).difference(current))
+    if unexpected_state:
+        raise ValueError("LASER checkpoint contains unexpected model state")
     result = model.load_state_dict(normalized, strict=False)  # type: ignore[attr-defined]
     if not hasattr(result, "missing_keys") or not hasattr(result, "unexpected_keys"):
         raise ValueError("LASER checkpoint load did not return torch incompatibility data")
+    missing_after_load = [
+        key
+        for key in result.missing_keys
+        if not key.endswith(".num_batches_tracked")
+    ]
+    if missing_after_load or result.unexpected_keys:
+        raise ValueError("LASER checkpoint load returned incompatible model state")
     print(
         json.dumps(
             {
                 "checkpoint_matching_key_count": len(overlap),
-                "checkpoint_missing_key_count": len(result.missing_keys),
-                "checkpoint_unexpected_key_count": len(result.unexpected_keys),
+                "checkpoint_missing_key_count": len(missing_after_load),
+                "checkpoint_unexpected_key_count": 0,
             },
             sort_keys=True,
         ),
@@ -436,13 +550,19 @@ def _render_visualization(
             "-i",
             str(audio_path),
             "-c:v",
-            "copy",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "medium",
             "-c:a",
             "aac",
+            "-movflags",
+            "+faststart",
             "-shortest",
-            str(output),
             "-loglevel",
             "error",
+            str(output),
         ],
         label="LASER visualization mux",
     )
@@ -460,19 +580,48 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     landmark_model_path = arguments.landmark_model_path.expanduser().resolve(
         strict=True
     )
+    s3fd_model_path = arguments.s3fd_model_path.expanduser().resolve(strict=True)
     work = arguments.work_dir.expanduser().resolve(strict=True)
     loconet_root = code_root / "LoCoNet"
     if not (loconet_root / "demoLoCoNet_landmark.py").is_file():
         raise ValueError("LASER code root does not contain the pinned LoCoNet demo")
+    for path, expected, label in (
+        (model_path, arguments.checkpoint_sha256, "model checkpoint"),
+        (config_path, arguments.config_sha256, "config"),
+        (landmark_model_path, arguments.landmark_model_sha256, "landmark model"),
+        (s3fd_model_path, arguments.s3fd_model_sha256, "S3FD model"),
+    ):
+        _require_sha256(path, expected, label=label)
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not visible_devices:
+        raise ValueError("LASER subprocess requires isolated CUDA_VISIBLE_DEVICES")
+    runtime_root = work / "vendor_runtime"
+    runtime_root.mkdir(exist_ok=False)
+    _stage_s3fd_model(runtime_root=runtime_root, source=s3fd_model_path)
+    _install_gdown_blocker()
     sys.path.insert(0, str(loconet_root))
-    os.chdir(loconet_root)
+    os.chdir(runtime_root)
 
     import demoLoCoNet_landmark as vendor_demo
     import torch
     import yaml
     from landmark_loconet import loconet
-    from mediapipe.tasks import python as mp_python
-    from mediapipe.tasks.python import vision
+    from torchvggish.vggish import VGGish
+
+    try:
+        import mediapipe
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision
+    except ImportError as exc:
+        raise RuntimeError("LASER runtime requires mediapipe") from exc
+
+    try:
+        mediapipe_version = importlib.metadata.version("mediapipe")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError("LASER runtime requires an installed mediapipe package") from exc
+    if not mediapipe_version.strip() or not hasattr(mediapipe, "Image"):
+        raise RuntimeError("LASER runtime could not initialize mediapipe")
+    torch_version = str(torch.__version__)
 
     device_index = int(arguments.device.split(":", 1)[1])
     torch.cuda.set_device(device_index)
@@ -588,14 +737,27 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(config_payload, dict):
         raise TypeError("LASER config must be a YAML object")
+    try:
+        resolved_n_channel = int(config_payload["n_channel"])
+        resolved_layer = int(config_payload["layer"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("LASER config requires integer n_channel and layer") from exc
+    if resolved_n_channel <= 0 or resolved_layer <= 0:
+        raise ValueError("LASER config n_channel and layer must be positive")
     config_payload["WORKSPACE"] = str(work / "model_workspace")
     cfg = _namespace(config_payload)
-    model = loconet(
-        cfg,
-        n_channel=int(config_payload["n_channel"]),
-        layer=int(config_payload["layer"]),
+    with _offline_vggish_construction(torch, VGGish):
+        model = loconet(
+            cfg,
+            n_channel=resolved_n_channel,
+            layer=resolved_layer,
+        )
+    _load_verified_checkpoint(
+        model,
+        model_path,
+        n_channel=resolved_n_channel,
+        layer=resolved_layer,
     )
-    _load_verified_checkpoint(model, model_path)
     model = model.to(device=arguments.device)
     model.eval()
     scores: list[list[float]] = []
@@ -669,7 +831,7 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         ffmpeg=arguments.ffmpeg,
     )
     return {
-        "schema_version": "r2v.h3.laser_asd_native.1",
+        "schema_version": "r2v.h3.laser_asd_native.2",
         "clip_uid": arguments.clip_uid,
         "source_video_path": str(source),
         "model_video_path": str(model_video.resolve(strict=True)),
@@ -696,6 +858,14 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         "config_sha256": arguments.config_sha256,
         "landmark_model_path": str(landmark_model_path),
         "landmark_model_sha256": arguments.landmark_model_sha256,
+        "s3fd_model_path": str(s3fd_model_path),
+        "s3fd_model_sha256": arguments.s3fd_model_sha256,
+        "resolved_n_channel": resolved_n_channel,
+        "resolved_layer": resolved_layer,
+        "device": arguments.device,
+        "cuda_visible_devices": visible_devices,
+        "mediapipe_version": mediapipe_version,
+        "torch_version": torch_version,
         "width": width,
         "height": height,
         "duration_seconds": frame_count / 25.0,

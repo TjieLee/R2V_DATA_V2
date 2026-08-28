@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,8 +46,16 @@ from r2v_data_v2.v3.schemas import (
     TrackedMaskFrame,
     TrackedMasksArtifact,
 )
+from tools import build_h3_asd_backend_comparison_review as comparison_module
 from tools.build_h3_asd_backend_comparison_review import build_comparison_review
-from tools.run_h3_laser_loconet_bridge import LIP_LANDMARK_INDICES
+from tools.run_h3_laser_loconet_bridge import (
+    LIP_LANDMARK_INDICES,
+    _install_gdown_blocker,
+    _load_verified_checkpoint,
+    _offline_vggish_construction,
+    _render_visualization,
+    _stage_s3fd_model,
+)
 
 
 def _laser_artifact(
@@ -88,6 +98,14 @@ def _laser_artifact(
         config_sha256="b" * 64,
         landmark_model_path="/models/face_landmarker.task",
         landmark_model_sha256="c" * 64,
+        s3fd_model_path="/models/sfd_face.pth",
+        s3fd_model_sha256="d" * 64,
+        resolved_n_channel=1,
+        resolved_layer=1,
+        device="cuda:0",
+        cuda_visible_devices="6",
+        mediapipe_version="1.0.0",
+        torch_version="2.5.1+cu121",
         width=20,
         height=20,
         duration_seconds=0.4,
@@ -235,7 +253,8 @@ def _runtime_tree(root: Path) -> LaserASDRuntimeConfig:
     model = root / "laser.model"
     config = root / "multi.yaml"
     landmark = root / "face_landmarker.task"
-    for path in (python, model, config, landmark):
+    s3fd = root / "sfd_face.pth"
+    for path in (python, model, config, landmark, s3fd):
         path.write_bytes(b"fixture")
     return LaserASDRuntimeConfig(
         code_root=code_root,
@@ -243,7 +262,16 @@ def _runtime_tree(root: Path) -> LaserASDRuntimeConfig:
         model_path=model,
         config_path=config,
         landmark_model_path=landmark,
+        s3fd_model_path=s3fd,
+        device="cuda:0",
+        cuda_visible_devices="6",
     )
+
+
+def _git_result(command: list[str]) -> SimpleNamespace:
+    if command[-2:] == ["rev-parse", "HEAD"]:
+        return SimpleNamespace(returncode=0, stdout=LASER_ASD_UPSTREAM_COMMIT + "\n")
+    return SimpleNamespace(returncode=0, stdout="")
 
 
 def test_laser_runtime_config_is_local_pinned_and_fail_closed(
@@ -253,9 +281,7 @@ def test_laser_runtime_config_is_local_pinned_and_fail_closed(
     monkeypatch.setattr(
         laser_module.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=LASER_ASD_UPSTREAM_COMMIT + "\n"
-        ),
+        lambda command, **kwargs: _git_result(command),
     )
     config.validate()
     config.model_path.unlink()
@@ -265,7 +291,7 @@ def test_laser_runtime_config_is_local_pinned_and_fail_closed(
 
 @pytest.mark.parametrize(
     "field_name",
-    ["model_path", "config_path", "landmark_model_path"],
+    ["model_path", "config_path", "landmark_model_path", "s3fd_model_path"],
 )
 def test_laser_runtime_requires_every_local_asset(
     tmp_path: Path,
@@ -276,13 +302,150 @@ def test_laser_runtime_requires_every_local_asset(
     monkeypatch.setattr(
         laser_module.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=LASER_ASD_UPSTREAM_COMMIT + "\n"
-        ),
+        lambda command, **kwargs: _git_result(command),
     )
     getattr(config, field_name).unlink()
     with pytest.raises(FileNotFoundError):
         config.validate()
+
+
+def test_laser_runtime_rejects_tracked_changes_but_ignores_untracked_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _runtime_tree(tmp_path)
+    calls = 0
+
+    def clean_then_dirty(command: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        del kwargs
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            return _git_result(command)
+        calls += 1
+        return SimpleNamespace(returncode=0, stdout="" if calls == 1 else " M LoCoNet/x.py\n")
+
+    monkeypatch.setattr(laser_module.subprocess, "run", clean_then_dirty)
+    config.validate()
+    with pytest.raises(ValueError, match="modified tracked files"):
+        config.validate()
+
+
+def test_laser_runtime_requires_explicit_isolated_cuda_device(tmp_path: Path) -> None:
+    config = _runtime_tree(tmp_path)
+    invalid = LaserASDRuntimeConfig(
+        **{
+            **config.__dict__,
+            "device": "cuda:1",
+            "cuda_visible_devices": "6",
+        }
+    )
+    with pytest.raises(ValueError, match="outside isolated CUDA visibility"):
+        invalid.validate()
+
+
+def test_bridge_stages_local_s3fd_and_blocks_gdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "sfd_face.pth"
+    source.write_bytes(b"s3fd")
+    staged = _stage_s3fd_model(
+        runtime_root=tmp_path / "runtime", source=source.resolve()
+    )
+    assert staged.is_symlink()
+    assert staged.resolve() == source.resolve()
+    original = SimpleNamespace(download=lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "gdown", original)
+    _install_gdown_blocker()
+    with pytest.raises(RuntimeError, match="forbids gdown"):
+        sys.modules["gdown"].download("https://example.invalid")  # type: ignore[attr-defined]
+
+
+def test_vggish_construction_cannot_use_torch_hub_download() -> None:
+    calls: list[str] = []
+
+    class FakeVGGish:
+        def __init__(self, *, pretrained: bool = True) -> None:
+            if pretrained:
+                fake_torch.hub.load_state_dict_from_url("https://example.invalid")
+
+    fake_torch = SimpleNamespace(
+        hub=SimpleNamespace(
+            load_state_dict_from_url=lambda url: calls.append(str(url))
+        )
+    )
+    with _offline_vggish_construction(fake_torch, FakeVGGish):
+        FakeVGGish()
+    assert calls == []
+    FakeVGGish()
+    assert calls == ["https://example.invalid"]
+
+
+class _TensorShape:
+    def __init__(self, *shape: int) -> None:
+        self.shape = shape
+
+
+class _CheckpointModel:
+    def __init__(self) -> None:
+        self.state = {
+            "model.body.weight": _TensorShape(2, 2),
+            "model.landmark_bottleneck.weight": _TensorShape(1, 2),
+            "model.bottle_neck.weight": _TensorShape(1, 1),
+            "model.norm.running_mean": _TensorShape(1),
+            "model.norm.running_var": _TensorShape(1),
+            "model.norm.num_batches_tracked": _TensorShape(),
+        }
+
+    def state_dict(self) -> dict[str, _TensorShape]:
+        return self.state
+
+    def named_parameters(self) -> list[tuple[str, _TensorShape]]:
+        return [
+            (key, value)
+            for key, value in self.state.items()
+            if not key.startswith("model.norm.")
+        ]
+
+    def load_state_dict(
+        self, state: dict[str, object], *, strict: bool
+    ) -> SimpleNamespace:
+        assert strict is False
+        missing = sorted(set(self.state).difference(state))
+        unexpected = sorted(set(state).difference(self.state))
+        return SimpleNamespace(missing_keys=missing, unexpected_keys=unexpected)
+
+
+def test_checkpoint_rejects_missing_laser_landmark_parameters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _CheckpointModel()
+    checkpoint = dict(model.state)
+    checkpoint.pop("model.landmark_bottleneck.weight")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(load=lambda *args, **kwargs: checkpoint),
+    )
+    with pytest.raises(ValueError, match="landmark_bottleneck"):
+        _load_verified_checkpoint(
+            model, tmp_path / "laser.model", n_channel=1, layer=1
+        )
+
+
+def test_checkpoint_requires_all_inference_buffers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = _CheckpointModel()
+    checkpoint = dict(model.state)
+    checkpoint.pop("model.norm.running_var")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(load=lambda *args, **kwargs: checkpoint),
+    )
+    with pytest.raises(ValueError, match="missing inference state"):
+        _load_verified_checkpoint(
+            model, tmp_path / "laser.model", n_channel=1, layer=1
+        )
 
 
 def test_bridge_uses_exact_upstream_82_lip_landmark_indices() -> None:
@@ -300,6 +463,14 @@ def test_bridge_uses_exact_upstream_82_lip_landmark_indices() -> None:
         409,
         291,
     )
+
+
+def test_laser_visualization_publishes_h264_aac() -> None:
+    source = inspect.getsource(_render_visualization)
+    assert '"libx264"' in source
+    assert '"yuv420p"' in source
+    assert '"aac"' in source
+    assert '"copy"' not in source
     assert LIP_LANDMARK_INDICES[-10:] == (
         324,
         318,
@@ -320,6 +491,10 @@ def test_laser_native_schema_preserves_score_and_determinism(tmp_path: Path) -> 
     source.write_bytes(b"video")
     audio.write_bytes(b"audio")
     artifact = _laser_artifact(source_video=source, audio_path=audio)
+    assert artifact.schema_version == "r2v.h3.laser_asd_native.2"
+    assert artifact.s3fd_model_sha256 == "d" * 64
+    assert artifact.resolved_n_channel == 1
+    assert artifact.resolved_layer == 1
     assert artifact.score_semantics == "laser_loconet_native_score"
     assert artifact.tracks[0].samples[0].backend_native_active is True
     payload = artifact.model_dump(mode="json")
@@ -368,10 +543,11 @@ def test_laser_subprocess_bridge_command_records_explicit_runtime(
     source = tmp_path / "source.mp4"
     source.write_bytes(b"video")
     captured: list[str] = []
+    captured_environment: dict[str, str] = {}
 
     def fake_run(command: list[str], **kwargs: object) -> None:
-        del kwargs
         captured.extend(command)
+        captured_environment.update(kwargs["environment"])  # type: ignore[arg-type]
         output = Path(command[command.index("--output") + 1])
         audio = output.parent / "audio.wav"
         audio.write_bytes(b"audio")
@@ -394,12 +570,22 @@ def test_laser_subprocess_bridge_command_records_explicit_runtime(
         payload["landmark_model_sha256"] = command[
             command.index("--landmark-model-sha256") + 1
         ]
+        payload["s3fd_model_path"] = command[
+            command.index("--s3fd-model-path") + 1
+        ]
+        payload["s3fd_model_sha256"] = command[
+            command.index("--s3fd-model-sha256") + 1
+        ]
+        payload["device"] = command[command.index("--device") + 1]
+        payload["cuda_visible_devices"] = captured_environment[
+            "CUDA_VISIBLE_DEVICES"
+        ]
         output.write_text(
             LaserASDNativeArtifact.model_validate(payload).model_dump_json(),
             encoding="utf-8",
         )
 
-    monkeypatch.setattr(laser_module, "_run_logged_command", fake_run)
+    monkeypatch.setattr(laser_module, "_run_laser_command", fake_run)
     backend = LaserASDSubprocessBackend(config)
     backend.analyze(
         clip_uid="clip-1",
@@ -411,15 +597,21 @@ def test_laser_subprocess_bridge_command_records_explicit_runtime(
         "--model-path",
         "--config-path",
         "--landmark-model-path",
+        "--s3fd-model-path",
         "--checkpoint-sha256",
         "--config-sha256",
         "--landmark-model-sha256",
+        "--s3fd-model-sha256",
         "--upstream-commit",
+        "--device",
     ):
         assert flag in captured
     assert captured[captured.index("--upstream-commit") + 1] == (
         LASER_ASD_UPSTREAM_COMMIT
     )
+    assert captured_environment["CUDA_VISIBLE_DEVICES"] == "6"
+    assert captured_environment["HF_HUB_OFFLINE"] == "1"
+    assert captured_environment["TRANSFORMERS_OFFLINE"] == "1"
 
 
 class _FailingLaserBackend(PrecomputedLaserASDBackend):
@@ -539,7 +731,9 @@ def test_lr_asd_schema_and_native_normalization_contract_remain_unchanged() -> N
     assert score.raw_backend_score == pytest.approx(0.1)
 
 
-def test_model_free_backend_comparison_is_read_only(tmp_path: Path) -> None:
+def test_model_free_backend_comparison_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     lr_root = tmp_path / "lr"
     laser_root = tmp_path / "laser"
     for root in (lr_root, laser_root):
@@ -557,6 +751,13 @@ def test_model_free_backend_comparison_is_read_only(tmp_path: Path) -> None:
         for path in root.rglob("*")
         if path.is_file()
     }
+    monkeypatch.setattr(
+        comparison_module,
+        "_transcode_review_media",
+        lambda source, destination, **kwargs: destination.write_bytes(
+            source.read_bytes()
+        ),
+    )
     summary = build_comparison_review(
         lr_asd_root=lr_root,
         laser_root=laser_root,
@@ -566,4 +767,30 @@ def test_model_free_backend_comparison_is_read_only(tmp_path: Path) -> None:
     assert "No automatic accuracy metric" in (
         tmp_path / "comparison/review.html"
     ).read_text(encoding="utf-8")
+    assert "<h3>Source</h3>" in (
+        tmp_path / "comparison/review.html"
+    ).read_text(encoding="utf-8")
     assert all(path.read_bytes() == value for path, value in before.items())
+
+
+def test_comparison_review_transcodes_browser_compatible_media(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.mp4"
+    destination = tmp_path / "destination.mp4"
+    source.write_bytes(b"source")
+    captured: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        captured.extend(command)
+        destination.write_bytes(b"h264")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(comparison_module.subprocess, "run", fake_run)
+    comparison_module._transcode_review_media(
+        source, destination, ffmpeg="ffmpeg"
+    )
+    assert "libx264" in captured
+    assert "yuv420p" in captured
+    assert "aac" in captured

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from r2v_data_v2.h3.lr_asd import _launch_executable, _run_logged_command
+from r2v_data_v2.h3.lr_asd import _launch_executable
 from r2v_data_v2.h3.pilot_schemas import (
     LaserASDNativeArtifact,
     LaserASDNativeSample,
@@ -58,6 +59,9 @@ class LaserASDRuntimeConfig:
     model_path: Path
     config_path: Path
     landmark_model_path: Path
+    s3fd_model_path: Path
+    device: str
+    cuda_visible_devices: str
     timeout_seconds: float = 1800.0
 
     @classmethod
@@ -68,6 +72,9 @@ class LaserASDRuntimeConfig:
             "LASER_ASD_MODEL_PATH",
             "LASER_ASD_CONFIG_PATH",
             "LASER_ASD_LANDMARK_MODEL_PATH",
+            "LASER_ASD_S3FD_MODEL_PATH",
+            "LASER_ASD_DEVICE",
+            "LASER_ASD_CUDA_VISIBLE_DEVICES",
         )
         values = {name: os.environ.get(name) for name in names}
         missing = [name for name, value in values.items() if not value]
@@ -81,6 +88,9 @@ class LaserASDRuntimeConfig:
             landmark_model_path=Path(
                 values["LASER_ASD_LANDMARK_MODEL_PATH"] or ""
             ),
+            s3fd_model_path=Path(values["LASER_ASD_S3FD_MODEL_PATH"] or ""),
+            device=values["LASER_ASD_DEVICE"] or "",
+            cuda_visible_devices=values["LASER_ASD_CUDA_VISIBLE_DEVICES"] or "",
         )
 
     def validate(self) -> None:
@@ -99,25 +109,77 @@ class LaserASDRuntimeConfig:
             ("LASER_ASD_MODEL_PATH", self.model_path),
             ("LASER_ASD_CONFIG_PATH", self.config_path),
             ("LASER_ASD_LANDMARK_MODEL_PATH", self.landmark_model_path),
+            ("LASER_ASD_S3FD_MODEL_PATH", self.s3fd_model_path),
         ):
             if not path.expanduser().resolve(strict=True).is_file():
                 raise ValueError(f"{label} must be a local file")
         if self.timeout_seconds <= 0:
             raise ValueError("LASER ASD timeout must be positive")
+        if re.fullmatch(r"cuda:\d+", self.device) is None:
+            raise ValueError("LASER_ASD_DEVICE must be an explicit cuda:N device")
+        if re.fullmatch(r"\d+(,\d+)*", self.cuda_visible_devices) is None:
+            raise ValueError(
+                "LASER_ASD_CUDA_VISIBLE_DEVICES must be comma-separated GPU indices"
+            )
+        visible_device_count = len(self.cuda_visible_devices.split(","))
+        if int(self.device.split(":", 1)[1]) >= visible_device_count:
+            raise ValueError("LASER_ASD_DEVICE is outside isolated CUDA visibility")
         try:
-            result = subprocess.run(
+            head = subprocess.run(
                 ["git", "-C", str(code_root), "rev-parse", "HEAD"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
+                check=False, capture_output=True, text=True, timeout=10,
+            )
+            tracked_status = subprocess.run(
+                [
+                    "git", "-C", str(code_root), "status", "--porcelain",
+                    "--untracked-files=no",
+                ],
+                check=False, capture_output=True, text=True, timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError(f"cannot verify LASER upstream commit: {exc}") from exc
-        if result.returncode != 0 or result.stdout.strip() != LASER_ASD_UPSTREAM_COMMIT:
+        if head.returncode != 0 or head.stdout.strip() != LASER_ASD_UPSTREAM_COMMIT:
             raise ValueError(
                 "LASER checkout must be pinned to " + LASER_ASD_UPSTREAM_COMMIT
             )
+        if tracked_status.returncode != 0:
+            raise ValueError("cannot verify LASER tracked checkout integrity")
+        if tracked_status.stdout.strip():
+            raise ValueError("LASER checkout has modified tracked files")
+
+
+def _run_laser_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_seconds: float,
+    environment: dict[str, str],
+) -> None:
+    with (
+        stdout_path.open("wb") as stdout_handle,
+        stderr_path.open("wb") as stderr_handle,
+    ):
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise LaserASDRuntimeError(
+                f"subprocess execution failed: {type(exc).__name__}: {exc}"
+            ) from exc
+    if result.returncode != 0:
+        raise LaserASDRuntimeError(
+            f"subprocess exited with code {result.returncode}; stderr={stderr_path}"
+        )
 
 
 class LaserASDSubprocessBackend:
@@ -127,6 +189,7 @@ class LaserASDSubprocessBackend:
         self._checkpoint_sha256 = _sha256(config.model_path.resolve())
         self._config_sha256 = _sha256(config.config_path.resolve())
         self._landmark_model_sha256 = _sha256(config.landmark_model_path.resolve())
+        self._s3fd_model_sha256 = _sha256(config.s3fd_model_path.resolve())
 
     def analyze(
         self,
@@ -159,24 +222,38 @@ class LaserASDSubprocessBackend:
             str(self.config.config_path.resolve()),
             "--landmark-model-path",
             str(self.config.landmark_model_path.resolve()),
+            "--s3fd-model-path",
+            str(self.config.s3fd_model_path.resolve()),
             "--checkpoint-sha256",
             self._checkpoint_sha256,
             "--config-sha256",
             self._config_sha256,
             "--landmark-model-sha256",
             self._landmark_model_sha256,
+            "--s3fd-model-sha256",
+            self._s3fd_model_sha256,
             "--upstream-commit",
             LASER_ASD_UPSTREAM_COMMIT,
+            "--device",
+            self.config.device,
             "--output",
             str(output),
         ]
-        _run_logged_command(
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CUDA_VISIBLE_DEVICES": self.config.cuda_visible_devices,
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+            }
+        )
+        _run_laser_command(
             command,
             cwd=self.config.code_root.resolve(),
             stdout_path=destination / "laser_asd.stdout.log",
             stderr_path=destination / "laser_asd.stderr.log",
             timeout_seconds=self.config.timeout_seconds,
-            error_type=LaserASDRuntimeError,
+            environment=environment,
         )
         try:
             artifact = LaserASDNativeArtifact.model_validate_json(
@@ -197,6 +274,10 @@ class LaserASDSubprocessBackend:
             self._config_sha256,
             str(self.config.landmark_model_path.resolve()),
             self._landmark_model_sha256,
+            str(self.config.s3fd_model_path.resolve()),
+            self._s3fd_model_sha256,
+            self.config.device,
+            self.config.cuda_visible_devices,
         )
         actual_provenance = (
             artifact.model_provenance.checkpoint_path,
@@ -205,6 +286,10 @@ class LaserASDSubprocessBackend:
             artifact.config_sha256,
             artifact.landmark_model_path,
             artifact.landmark_model_sha256,
+            artifact.s3fd_model_path,
+            artifact.s3fd_model_sha256,
+            artifact.device,
+            artifact.cuda_visible_devices,
         )
         if actual_provenance != expected_provenance:
             raise LaserASDRuntimeError("LASER bridge runtime provenance does not match")

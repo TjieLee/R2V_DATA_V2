@@ -4,6 +4,7 @@ import argparse
 import html
 import json
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 
@@ -16,7 +17,41 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--laser-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--clip-id", action="append")
+    parser.add_argument("--ffmpeg", default="ffmpeg")
     return parser
+
+
+def _transcode_review_media(source: Path, destination: Path, *, ffmpeg: str) -> None:
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-loglevel",
+            "error",
+            str(destination),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not destination.is_file():
+        raise RuntimeError(
+            f"review media transcode failed for {source}: {result.stderr.strip()}"
+        )
 
 
 def _review_clip_ids(
@@ -42,6 +77,7 @@ def build_comparison_review(
     laser_root: Path,
     output_root: Path,
     clip_ids: list[str] | None = None,
+    ffmpeg: str = "ffmpeg",
 ) -> dict[str, object]:
     lr_root = lr_asd_root.expanduser().resolve(strict=True)
     laser = laser_root.expanduser().resolve(strict=True)
@@ -60,13 +96,17 @@ def build_comparison_review(
             lr_review = lr_root / "review" / clip_uid
             laser_review = laser / "review" / clip_uid
             source_name = f"{clip_uid}-source.mp4"
-            shutil.copyfile(lr_review / "source.mp4", media_root / source_name)
+            _transcode_review_media(
+                lr_review / "source.mp4", media_root / source_name, ffmpeg=ffmpeg
+            )
             backend_media: dict[str, str | None] = {}
             for backend, review in (("lr_asd", lr_review), ("laser", laser_review)):
                 source_visualization = review / "visualization.mp4"
                 if source_visualization.is_file():
                     name = f"{clip_uid}-{backend}.mp4"
-                    shutil.copyfile(source_visualization, media_root / name)
+                    _transcode_review_media(
+                        source_visualization, media_root / name, ffmpeg=ffmpeg
+                    )
                     backend_media[backend] = f"media/{name}"
                 else:
                     backend_media[backend] = None
@@ -111,7 +151,9 @@ def build_comparison_review(
             cards.append(
                 "<section><h2>"
                 + html.escape(str(row["clip_uid"]))
-                + "</h2><div class='grid'><article><h3>LR-ASD</h3>"
+                + "</h2><div class='grid'><article><h3>Source</h3>"
+                + video(row["source_video"])
+                + "</article><article><h3>LR-ASD</h3>"
                 + video(row["lr_asd_visualization"])
                 + "</article><article><h3>LoCoNet + LASER</h3>"
                 + video(row["laser_visualization"])
@@ -121,7 +163,7 @@ def build_comparison_review(
 <html lang='en'><head><meta charset='utf-8'><title>ASD backend comparison</title>
 <style>body{font-family:system-ui;margin:24px;background:#f4f5f7;color:#17191c}
 section{background:white;border:1px solid #ccd1d8;margin:18px 0;padding:16px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}video{width:100%;background:#111}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}video{width:100%;background:#111}
 .missing{padding:40px;background:#eee}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style>
 </head><body><h1>LR-ASD / LoCoNet + LASER shadow review</h1>
 <p>Manual evidence only. No automatic accuracy metric is computed.</p>""" + "".join(cards) + "</body></html>\n"
@@ -141,6 +183,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         laser_root=arguments.laser_root,
         output_root=arguments.output_root,
         clip_ids=arguments.clip_id,
+        ffmpeg=arguments.ffmpeg,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return result

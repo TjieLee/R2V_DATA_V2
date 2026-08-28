@@ -26,6 +26,11 @@ The R2V bridge therefore reuses the upstream 25 FPS S3FD and shot-aware IoU
 preprocessing while explicitly:
 
 - loading and checking the requested LoCoNet + LASER checkpoint;
+- requiring every trainable parameter and inference-relevant buffer, including
+  `landmark_bottleneck` and `bottle_neck`, to come from that checkpoint;
+- staging an explicit local S3FD checkpoint in a per-clip temporary runtime;
+- suppressing VGGish's upstream URL preload only during model construction,
+  followed immediately by the complete checkpoint validation above;
 - running MediaPipe FaceLandmarker with the exact upstream 82-index lip list;
 - representing unavailable landmark coordinates as `(-1, -1)`;
 - enabling landmark input in `forward_evaluation`;
@@ -47,15 +52,31 @@ export LASER_ASD_PYTHON=/path/to/laser-env/bin/python
 export LASER_ASD_MODEL_PATH=/path/to/loconet_laser.model
 export LASER_ASD_CONFIG_PATH="$LASER_ASD_CODE_ROOT/LoCoNet/configs/multi.yaml"
 export LASER_ASD_LANDMARK_MODEL_PATH=/path/to/face_landmarker_v2_with_blendshapes.task
+export LASER_ASD_S3FD_MODEL_PATH=/path/to/sfd_face.pth
+export LASER_ASD_CUDA_VISIBLE_DEVICES=6
+export LASER_ASD_DEVICE=cuda:0
 
 export SILERO_VAD_PYTHON=/path/to/audio-env/bin/python
 export SILERO_VAD_MODEL_PATH=/path/to/silero_vad.jit
 ```
 
-The code root, Python, checkpoint, config, and FaceLandmarker asset must all be
-local files. The checkout commit is verified before inference. Checkpoint,
-config, and landmark-asset SHA-256 values are recorded in the strict
-`r2v.h3.laser_asd_native.1` artifact.
+The code root, Python, checkpoint, config, FaceLandmarker asset, and S3FD asset
+must all be local. The bridge never calls `gdown` or
+`torch.hub.load_state_dict_from_url`. It creates a read-only S3FD symlink under
+the per-clip work directory and never writes model assets into the vendor
+checkout. The checkout commit and absence of modified tracked files are
+verified before inference; untracked local model assets do not fail this check.
+
+The strict `r2v.h3.laser_asd_native.2` artifact records SHA-256 values for all
+four explicit assets, isolated CUDA visibility/device, resolved `n_channel` and
+`layer`, and actual installed MediaPipe and Torch versions. The pinned
+repository's `LoCoNet/configs/multi.yaml` declares `n_channel: 1` and `layer: 1`,
+while its demo constructs LoCoNet with `n_channel=4`. R2V does not guess which
+architecture a downloaded checkpoint uses: it constructs exactly from the
+explicit config and fails on any checkpoint shape or state mismatch. The
+published checkpoint/config pair must therefore be verified in the server
+smoke; the repository config is not assumed compatible merely because it
+exists.
 
 ## Bounded Pilot
 
@@ -82,6 +103,9 @@ review/<clip_uid>/
   face_entity_association.json
 ```
 
+`visualization.mp4` is QA-only H.264/AAC with `yuv420p`; canonical source media
+is unchanged.
+
 The pilot reuses the existing Visual mask association, Silero speech presence,
 AudioBindingPolicy, and deterministic fusion. Its score is recorded honestly as
 `laser_loconet_native_score`; it is not called a probability. Native active
@@ -98,8 +122,9 @@ python tools/build_h3_asd_backend_comparison_review.py \
   --output-root /path/to/asd-comparison-review
 ```
 
-The utility copies review media into a separate output and never changes either
-source root. It intentionally computes no automatic accuracy metric. Review
+The utility transcodes source, LR-ASD, and LASER review copies to browser-safe
+H.264/AAC in a separate output and never changes either source root. It
+intentionally computes no automatic accuracy metric. Review
 clear visible-speaker misses, wrong-person activation, multi-person scenes,
 offscreen/background speech, and alternating speakers manually.
 

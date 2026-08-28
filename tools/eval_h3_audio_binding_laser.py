@@ -39,6 +39,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--laser-asd-model-path", type=Path)
     parser.add_argument("--laser-asd-config-path", type=Path)
     parser.add_argument("--laser-asd-landmark-model-path", type=Path)
+    parser.add_argument("--laser-asd-s3fd-model-path", type=Path)
+    parser.add_argument("--laser-asd-device")
+    parser.add_argument("--laser-asd-cuda-visible-devices")
     parser.add_argument("--silero-python", type=Path)
     parser.add_argument("--silero-model-path", type=Path)
     parser.add_argument("--maximum-timestamp-delta-seconds", type=float, default=0.06)
@@ -56,6 +59,15 @@ def _path(explicit: Path | None, environment_name: str) -> Path:
     if not value:
         raise ValueError(f"missing runtime input: {environment_name}")
     return Path(value)
+
+
+def _value(explicit: str | None, environment_name: str) -> str:
+    if explicit is not None:
+        return explicit
+    value = os.environ.get(environment_name)
+    if not value:
+        raise ValueError(f"missing runtime input: {environment_name}")
+    return value
 
 
 def _clip_ids(explicit: list[str] | None, path: Path | None) -> list[str] | None:
@@ -99,6 +111,15 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 landmark_model_path=_path(
                     arguments.laser_asd_landmark_model_path,
                     "LASER_ASD_LANDMARK_MODEL_PATH",
+                ),
+                s3fd_model_path=_path(
+                    arguments.laser_asd_s3fd_model_path,
+                    "LASER_ASD_S3FD_MODEL_PATH",
+                ),
+                device=_value(arguments.laser_asd_device, "LASER_ASD_DEVICE"),
+                cuda_visible_devices=_value(
+                    arguments.laser_asd_cuda_visible_devices,
+                    "LASER_ASD_CUDA_VISIBLE_DEVICES",
                 ),
             )
         ),
