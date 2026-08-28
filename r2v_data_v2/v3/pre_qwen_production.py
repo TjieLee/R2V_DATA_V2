@@ -1582,7 +1582,7 @@ def close_backend(backend: object) -> None:
 
 def default_backend_factory(config: V3Config) -> SegmentationBackend:
     return build_sam3_segment_backend(
-        replace(config, sam3=replace(config.sam3, device="cuda:0"))
+        replace(config, sam3=replace(config.sam3, device="cuda"))
     )
 
 

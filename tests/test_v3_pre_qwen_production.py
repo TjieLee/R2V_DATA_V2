@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +37,11 @@ from r2v_data_v2.v3.pre_qwen_production import (
     shard_lock,
     validate_qwen_free_preflight,
 )
-from r2v_data_v2.v3.sam3_backend import BackendMaskObservation, EntityTrackResult
+from r2v_data_v2.v3.sam3_backend import (
+    BackendMaskObservation,
+    EntityTrackResult,
+    Sam3SegmentationBackend,
+)
 from tools import run_v3_pre_qwen_batch as batch_tool
 from tools import run_v3_pre_qwen_canary as canary_tool
 
@@ -1092,6 +1096,158 @@ def test_canary_partial_worker_resumes_from_exact_next_selection(
     assert resumed["completed"] == 2
     assert second.calls == ["e1"]
     assert second_decoder.calls == []
+
+
+def test_stage2_backend_factory_uses_builder_default_cuda_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    physical_index_config = replace(
+        fixture.config,
+        sam3=replace(fixture.config.sam3, device="cuda:7"),
+    )
+
+    backend = production.default_backend_factory(physical_index_config)
+
+    assert isinstance(backend, Sam3SegmentationBackend)
+    assert backend.config.device == "cuda"
+    assert physical_index_config.sam3.device == "cuda:7"
+    assert production._workspace_config(
+        physical_index_config, fixture.writable / "workspace"
+    ).sam3.device == "cuda:0"
+
+
+def test_stage2_backend_lazy_init_supports_builder_without_device_parameter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    assert fixture.config.sam3.model_path is not None
+    fixture.config.sam3.model_path.write_bytes(b"sam3-checkpoint")
+    backend = production.default_backend_factory(
+        replace(
+            fixture.config,
+            sam3=replace(fixture.config.sam3, device="cuda:5"),
+        )
+    )
+    assert isinstance(backend, Sam3SegmentationBackend)
+    calls: list[str] = []
+    predictor = object()
+
+    def installed_builder_without_device(checkpoint_path: str) -> object:
+        calls.append(checkpoint_path)
+        return predictor
+
+    backend._builder = installed_builder_without_device
+
+    assert backend._load_predictor() is predictor
+    assert calls == [str(fixture.config.sam3.model_path.resolve())]
+
+
+def test_frames_ready_checkpoint_resumes_with_fixed_runtime_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard = _write_shard(fixture, [_row(fixture, 0)])
+    first_decoder = FakeDecoder()
+    first = process_shard(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=FakeBackend(failure=RuntimeError("SAM3 startup failed")),
+        decoder=first_decoder,
+    )
+    workspace = fixture.output_root / "artifacts" / shard.stem / "clip-0"
+    checkpoint = json.loads((workspace / "state.json").read_text(encoding="utf-8"))
+    fixed_backend = FakeBackend()
+    effective_devices: list[str] = []
+
+    def build_backend(config: V3Config) -> FakeBackend:
+        effective_devices.append(config.sam3.device)
+        return fixed_backend
+
+    monkeypatch.setattr(production, "build_sam3_segment_backend", build_backend)
+    backend = production.default_backend_factory(fixture.config)
+    resumed_decoder = FakeDecoder()
+    resumed = process_shard(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=backend,
+        decoder=resumed_decoder,
+    )
+
+    assert first["retryable"] is True
+    assert checkpoint["stage"] == "frames_ready"
+    assert first_decoder.calls
+    assert resumed["rows"] == 1
+    assert effective_devices == ["cuda"]
+    assert fixed_backend.calls == ["e1"]
+    assert resumed_decoder.calls == []
+
+
+def test_canary_launcher_isolates_physical_gpus_with_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_shard(fixture, [_row(fixture, 0), _row(fixture, 1)])
+    base = _write_loadable_config(fixture)
+    output = fixture.writable / "canary" / "gpu-isolation"
+    manifest, selection = prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=["5", "7"],
+        canary_shards=1,
+        samples_per_shard=2,
+    )
+    launched: list[dict[str, object]] = []
+
+    class Process:
+        def wait(self) -> int:
+            return 0
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        launched.append({"command": command, **kwargs})
+        return Process()
+
+    monkeypatch.setattr(
+        canary_tool,
+        "prepare_canary",
+        lambda **kwargs: (manifest, selection),
+    )
+    monkeypatch.setattr(
+        canary_tool,
+        "canary_summary",
+        lambda output_root, current_manifest: {
+            "status": "complete",
+            "selection_complete": True,
+            "functional_status": "pass",
+        },
+    )
+    monkeypatch.setattr(canary_tool.subprocess, "Popen", popen)
+
+    canary_tool.main(
+        [
+            "--input-root",
+            str(fixture.input_root),
+            "--base-config",
+            str(fixture.base_path),
+            "--output-root",
+            str(fixture.output_root),
+            "--gpus",
+            "5,7",
+            "--canary-shards",
+            "1",
+            "--samples-per-shard",
+            "2",
+        ]
+    )
+
+    assert [item["env"]["CUDA_VISIBLE_DEVICES"] for item in launched] == ["5", "7"]
 
 
 def test_new_stage1_shard_is_discovered_without_topology_state(
