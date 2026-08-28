@@ -7,8 +7,9 @@ training samples from existing clips.
 > lightweight V2/MVP flow. For current Visual/reference-image and Subject
 > Attribute behavior, read
 > `docs/VISUAL_ATTRIBUTE_DEVELOPMENT_HANDOFF.md`,
-> `docs/V3_SUBJECT_ATTRIBUTES_STATE.md`, `docs/V3_PRODUCTION_SHARDS.md`, and
-> `docs/SERVER_ENVIRONMENT_RUNBOOK.md`. Audio/H3 integration must also read
+> `docs/V3_SUBJECT_ATTRIBUTES_STATE.md`, `docs/V3_PRODUCTION_SHARDS.md`,
+> `docs/SERVER_ENVIRONMENT_RUNBOOK.md`, and
+> `docs/PRE_QWEN_VISUAL_PRODUCTION.md`. Audio/H3 integration must also read
 > `docs/V3_VISUAL_AUDIO_INTEGRATION.md`. Do not infer current V3
 > reference/background/attribute behavior solely from the legacy FLUX/V2
 > examples below.
