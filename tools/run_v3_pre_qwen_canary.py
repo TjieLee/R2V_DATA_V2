@@ -56,10 +56,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-config", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--gpus")
-    parser.add_argument("--samples-per-gpu", type=int, default=10)
+    parser.add_argument("--canary-shards", type=int, default=16)
+    parser.add_argument("--samples-per-shard", type=int, default=5)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--worker-slot", type=int, help=argparse.SUPPRESS)
     return parser
+
+
+def _canary_exit_code(
+    worker_exit_codes: list[int], summary: dict[str, object]
+) -> int:
+    nonzero_codes = [code for code in worker_exit_codes if code]
+    if nonzero_codes:
+        return max(nonzero_codes)
+    if summary.get("functional_status") != "pass":
+        return 2
+    return 0
 
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
@@ -85,18 +97,23 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             if backend is not None:
                 close_backend(backend)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        if result.get("retryable") is True:
+            raise SystemExit(2)
         return result
     if args.input_root is None or args.base_config is None or args.gpus is None:
         raise ValueError("--input-root, --base-config, and --gpus are required")
-    if args.samples_per_gpu < 1:
-        raise ValueError("--samples-per-gpu must be positive")
+    if args.canary_shards < 1:
+        raise ValueError("--canary-shards must be positive")
+    if args.samples_per_shard < 1:
+        raise ValueError("--samples-per-shard must be positive")
     gpus = _parse_gpus(args.gpus)
     manifest, selection = prepare_canary(
         input_root=args.input_root,
         base_config=args.base_config,
         output_root=args.output_root,
         gpus=gpus,
-        samples_per_gpu=args.samples_per_gpu,
+        canary_shards=args.canary_shards,
+        samples_per_shard=args.samples_per_shard,
     )
     prepared = {
         "status": "prepared",
@@ -107,6 +124,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         },
         "qwen_required": False,
         "qwen_calls": 0,
+        "duplicate_clip_uid_skipped": manifest.duplicate_clip_uid_skipped,
         "output_root": str(args.output_root.resolve(strict=False)),
     }
     if args.prepare_only:
@@ -148,8 +166,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     summary["worker_exit_codes"] = codes
     write_json_atomic(args.output_root / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-    if any(codes):
-        raise SystemExit(max(codes))
+    exit_code = _canary_exit_code(codes, summary)
+    if exit_code:
+        raise SystemExit(exit_code)
     return summary
 
 

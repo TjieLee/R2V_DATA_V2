@@ -159,13 +159,35 @@ class CanaryManifest(StrictModel):
     visual_algorithm_freeze: Literal[
         "d056c32b76db4b3d7c0358b38e996e7a91a288d1"
     ] = VISUAL_ALGORITHM_FREEZE
+    selection_policy: Literal[
+        "first_n_shards_first_k_eligible_v1"
+    ] = "first_n_shards_first_k_eligible_v1"
+    canary_shards: int = Field(gt=0)
+    samples_per_shard: int = Field(gt=0)
     gpus: list[str]
+    gpu_count: int = Field(gt=0)
     samples_per_gpu: int = Field(gt=0)
     selected_samples: int = Field(gt=0)
+    selected_shard_names: list[str]
+    duplicate_clip_uid_skipped: int = Field(default=0, ge=0)
     selection_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     qwen_required: Literal[False] = False
     qwen_calls: Literal[0] = 0
     created_at: str
+
+    @model_validator(mode="after")
+    def validate_selection_identity(self) -> CanaryManifest:
+        if self.gpu_count != len(self.gpus):
+            raise ValueError("canary gpu_count must match gpus")
+        if self.selected_samples != self.canary_shards * self.samples_per_shard:
+            raise ValueError("canary selected_samples does not match shard policy")
+        if self.selected_samples != self.gpu_count * self.samples_per_gpu:
+            raise ValueError("canary selected_samples does not match GPU quota")
+        if len(self.selected_shard_names) != self.canary_shards:
+            raise ValueError("canary selected_shard_names does not match shard count")
+        if len(self.selected_shard_names) != len(set(self.selected_shard_names)):
+            raise ValueError("canary selected_shard_names must be unique")
+        return self
 
 
 @dataclass(frozen=True)
@@ -266,8 +288,11 @@ def _safe_output_root(path: str | Path, *, canary: bool = False) -> Path:
     production_root = DEFAULT_PRODUCTION_OUTPUT_ROOT.resolve(strict=False)
     if canary and (
         resolved == production_root or production_root in resolved.parents
+        or resolved in production_root.parents
     ):
-        raise ValueError("canary output_root must not be inside production Stage2 root")
+        raise ValueError(
+            "canary output_root and production Stage2 root must be fully disjoint"
+        )
     return resolved
 
 
@@ -350,6 +375,7 @@ def load_annotation_shard(path: str | Path) -> AnnotationShard:
     resolved = Path(path).expanduser().resolve(strict=True)
     start, end = _shard_bounds(resolved)
     rows: list[dict[str, object]] = []
+    ready_clip_uids: dict[str, int] = {}
     with resolved.open("rb") as handle:
         for offset, line in enumerate(handle):
             if not line.endswith(b"\n"):
@@ -370,6 +396,14 @@ def load_annotation_shard(path: str | Path) -> AnnotationShard:
                 clip_uid = value.get("clip_uid")
                 if not isinstance(clip_uid, str) or not clip_uid.strip():
                     raise ValueError("ready annotation row requires clip_uid")
+                prior_source_index = ready_clip_uids.get(clip_uid)
+                if prior_source_index is not None:
+                    raise ValueError(
+                        "duplicate ready clip_uid within annotation shard: "
+                        f"clip_uid={clip_uid} first_source_index={prior_source_index} "
+                        f"second_source_index={expected}"
+                    )
+                ready_clip_uids[clip_uid] = expected
                 if annotation.entities:
                     _validate_video_path(value.get("video_path"))
             elif (
@@ -393,10 +427,10 @@ def load_annotation_shard(path: str | Path) -> AnnotationShard:
 def enumerate_annotation_shards(input_root: str | Path) -> list[Path]:
     root = Path(input_root).expanduser().resolve(strict=True)
     parts = root / "parts"
-    paths = sorted(path for path in parts.glob("shard-*.jsonl") if path.is_file())
+    paths = [path for path in parts.glob("shard-*.jsonl") if path.is_file()]
     for path in paths:
         _shard_bounds(path)
-    return paths
+    return sorted(paths, key=lambda path: _shard_bounds(path)[0])
 
 
 def _clip_source(row: dict[str, object], video_path: Path) -> ClipSource:
@@ -1159,17 +1193,51 @@ def select_canary_rows(
     input_root: str | Path,
     *,
     gpu_count: int,
-    samples_per_gpu: int,
+    canary_shards: int,
+    samples_per_shard: int,
 ) -> list[CanarySelectionRow]:
-    needed = gpu_count * samples_per_gpu
+    if gpu_count < 1:
+        raise ValueError("gpu_count must be positive")
+    if canary_shards < 1:
+        raise ValueError("canary_shards must be positive")
+    if samples_per_shard < 1:
+        raise ValueError("samples_per_shard must be positive")
+    needed = canary_shards * samples_per_shard
+    if needed % gpu_count:
+        raise ValueError(
+            "canary_shards * samples_per_shard must be divisible by gpu_count; "
+            "adjust --canary-shards or --samples-per-shard"
+        )
+    samples_per_gpu = needed // gpu_count
+    shard_paths = enumerate_annotation_shards(input_root)
+    if len(shard_paths) < canary_shards:
+        raise ValueError(
+            f"only {len(shard_paths)} completed Stage1 shards; "
+            f"{canary_shards} required"
+        )
     selected: list[CanarySelectionRow] = []
-    for path in enumerate_annotation_shards(input_root):
+    seen_clip_uids: dict[str, tuple[str, int]] = {}
+    for path in shard_paths[:canary_shards]:
         shard = load_annotation_shard(path)
+        shard_selected = 0
         for row in shard.rows:
             annotation = _annotation_state(row)
             if annotation.status != "ready" or not annotation.entities:
                 continue
             video_path = _validate_video_path(row.get("video_path"))
+            clip_uid = str(row["clip_uid"])
+            previous = seen_clip_uids.get(clip_uid)
+            if previous is not None:
+                first_shard, first_source_index = previous
+                raise ValueError(
+                    "duplicate clip_uid across Stage1 shards: "
+                    f"clip_uid={clip_uid} "
+                    f"first_shard={first_shard} "
+                    f"first_source_index={first_source_index} "
+                    f"second_shard={shard.path.name} "
+                    f"second_source_index={row['source_index']}"
+                )
+            seen_clip_uids[clip_uid] = (shard.path.name, int(row["source_index"]))
             position = len(selected)
             selected.append(
                 CanarySelectionRow(
@@ -1177,15 +1245,23 @@ def select_canary_rows(
                     input_annotation_shard=str(shard.path),
                     input_annotation_shard_sha256=shard.sha256,
                     source_index=int(row["source_index"]),
-                    clip_uid=str(row["clip_uid"]),
+                    clip_uid=clip_uid,
                     video_path=str(video_path),
                     entity_count=len(annotation.entities),
                     input_row_sha256=_row_sha256(row),
                 )
             )
-            if len(selected) == needed:
-                return selected
-    raise ValueError(f"only {len(selected)} eligible Stage1 rows; {needed} required")
+            shard_selected += 1
+            if shard_selected == samples_per_shard:
+                break
+        if shard_selected != samples_per_shard:
+            raise ValueError(
+                f"{shard.path.name} has only {shard_selected} eligible rows; "
+                f"{samples_per_shard} required"
+            )
+    if len(selected) != needed:
+        raise AssertionError("canary selection did not produce the required row count")
+    return selected
 
 
 def prepare_canary(
@@ -1194,13 +1270,21 @@ def prepare_canary(
     base_config: str | Path,
     output_root: str | Path,
     gpus: Sequence[str],
-    samples_per_gpu: int,
+    canary_shards: int,
+    samples_per_shard: int,
 ) -> tuple[CanaryManifest, list[CanarySelectionRow]]:
     if not gpus or len(gpus) != len(set(gpus)):
         raise ValueError("canary GPUs must be a non-empty unique list")
     root = _safe_output_root(output_root, canary=True)
     config_identity = load_config_identity(base_config)
     validate_qwen_free_preflight(config_identity.config)
+    selected_samples = canary_shards * samples_per_shard
+    if selected_samples % len(gpus):
+        raise ValueError(
+            "canary_shards * samples_per_shard must be divisible by GPU count; "
+            "adjust the canary selection parameters"
+        )
+    samples_per_gpu = selected_samples // len(gpus)
     selection_path = root / "selection.jsonl"
     manifest_path = root / "canary_manifest.json"
     if manifest_path.is_file() or selection_path.is_file():
@@ -1221,9 +1305,23 @@ def prepare_canary(
             manifest.base_config_sha256 == config_identity.sha256,
             manifest.base_config_fingerprint == config_identity.fingerprint,
             manifest.gpus == list(gpus),
+            manifest.gpu_count == len(gpus),
+            manifest.canary_shards == canary_shards,
+            manifest.samples_per_shard == samples_per_shard,
             manifest.samples_per_gpu == samples_per_gpu,
             manifest.selection_sha256 == _sha256_bytes(raw),
             manifest.selected_samples == len(selection),
+            manifest.selected_shard_names
+            == list(
+                dict.fromkeys(
+                    Path(item.input_annotation_shard).name for item in selection
+                )
+            ),
+            all(
+                sum(item.gpu_slot == slot for item in selection)
+                == manifest.samples_per_gpu
+                for slot in range(len(gpus))
+            ),
         )
         if not all(expected):
             raise ValueError("existing canary identity does not match request")
@@ -1241,7 +1339,11 @@ def prepare_canary(
     selection = select_canary_rows(
         input_root,
         gpu_count=len(gpus),
-        samples_per_gpu=samples_per_gpu,
+        canary_shards=canary_shards,
+        samples_per_shard=samples_per_shard,
+    )
+    selected_shard_names = list(
+        dict.fromkeys(Path(item.input_annotation_shard).name for item in selection)
     )
     raw = b"".join(_json_line(item.model_dump(mode="json")) for item in selection)
     _write_jsonl_atomic(
@@ -1253,9 +1355,14 @@ def prepare_canary(
         base_config_path=str(config_identity.path),
         base_config_sha256=config_identity.sha256,
         base_config_fingerprint=config_identity.fingerprint,
+        canary_shards=canary_shards,
+        samples_per_shard=samples_per_shard,
         gpus=list(gpus),
+        gpu_count=len(gpus),
         samples_per_gpu=samples_per_gpu,
         selected_samples=len(selection),
+        selected_shard_names=selected_shard_names,
+        duplicate_clip_uid_skipped=0,
         selection_sha256=_sha256_bytes(raw),
         created_at=_utc_now(),
     )
@@ -1391,27 +1498,47 @@ def canary_summary(output_root: str | Path, manifest: CanaryManifest) -> dict[st
     all_rows: list[Stage2Row] = []
     per_gpu: dict[str, dict[str, int]] = {}
     complete = True
+    outstanding_retryable_work = 0
     for slot in range(len(manifest.gpus)):
         path = root / "workers" / f"gpu-{slot}.jsonl"
-        rows = (
-            [Stage2Row.model_validate(json.loads(line)) for line in path.read_bytes().splitlines()]
-            if path.is_file()
-            else []
-        )
+        partial = path.with_name(f"{path.name}.partial")
+        row_source = path if path.is_file() else partial
+        rows: list[Stage2Row] = []
+        if row_source.is_file():
+            for line in row_source.read_bytes().splitlines(keepends=True):
+                if not line.endswith(b"\n"):
+                    break
+                rows.append(Stage2Row.model_validate(json.loads(line)))
         all_rows.extend(rows)
         per_gpu[f"gpu{slot}"] = {
             "selected": manifest.samples_per_gpu,
             "completed": len(rows),
         }
         complete = complete and len(rows) == manifest.samples_per_gpu
+        failure_log = root / "logs" / f"gpu-{slot}.failures.jsonl"
+        if len(rows) != manifest.samples_per_gpu and failure_log.is_file():
+            outstanding_retryable_work += 1
     artifacts = [path for path in (root / "artifacts").rglob("*") if path.is_file()]
     frames_bytes = sum(path.stat().st_size for path in artifacts if "/frames/" in path.as_posix())
     masks_bytes = sum(path.stat().st_size for path in artifacts if path.name == "masks.rle.json")
     total_bytes = sum(path.stat().st_size for path in artifacts)
     statuses = Counter(row.status for row in all_rows)
+    failed_input = statuses["failed_input"]
+    failed_frames = statuses["failed_frames"]
+    terminal_failures = failed_input + failed_frames
+    selection_complete = complete and len(all_rows) == manifest.selected_samples
+    functional_pass = (
+        selection_complete
+        and outstanding_retryable_work == 0
+        and failed_input == 0
+        and failed_frames == 0
+    )
     summary = {
-        "status": "complete" if complete else "partial",
+        "status": "complete" if selection_complete else "partial",
+        "selection_complete": selection_complete,
+        "functional_status": "pass" if functional_pass else "fail",
         "selected_samples": manifest.selected_samples,
+        "duplicate_clip_uid_skipped": manifest.duplicate_clip_uid_skipped,
         "per_gpu": per_gpu,
         "annotation_entities_total": sum(row.annotation_entity_count for row in all_rows),
         "frames_completed": sum(
@@ -1428,6 +1555,10 @@ def canary_summary(output_root: str | Path, manifest: CanaryManifest) -> dict[st
         "background_none": statuses["ready_no_background"],
         "background_rejected": statuses["ready_background_rejected"],
         "background_pending_remove": statuses["ready_background_pending_remove"],
+        "failed_input": failed_input,
+        "failed_frames": failed_frames,
+        "terminal_failures": terminal_failures,
+        "outstanding_retryable_work": outstanding_retryable_work,
         "retryable_failures": sum(
             len(path.read_bytes().splitlines())
             for path in (root / "logs").glob("*.failures.jsonl")

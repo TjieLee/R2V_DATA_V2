@@ -183,14 +183,20 @@ Prepare exactly 80 eligible samples—ten per GPU—before formal production:
   --base-config /absolute/path/to/qwen-free-frozen-base.yaml \
   --output-root /mnt/workspace/litengjie/data/r2v_v3_pre_qwen_canary/preqwen-8x10-test \
   --gpus 0,1,2,3,4,5,6,7 \
-  --samples-per-gpu 10 \
+  --canary-shards 16 \
+  --samples-per-shard 5 \
   --prepare-only
 ```
 
-Eligible means `status=ready` with non-empty entities. Preparation writes
-`canary_manifest.json` and `selection.jsonl`, verifies selected MP4s, Stage 1
-hashes, and Qwen-free policy, and does not load SAM3 or create artifacts.
-Repeating the exact command reuses selection; identity drift fails closed.
+Selection uses the first 16 completed canonical Stage 1 shards and the first
+five eligible rows in `source_index` order from each shard. Eligible means
+`status=ready` with non-empty entities, a unique `clip_uid`, and a valid
+processed MP4. A short selected shard, duplicate cross-shard `clip_uid`, or a
+total not divisible by the GPU count fails closed; later shards never backfill
+the quota. Preparation writes `canary_manifest.json` and `selection.jsonl`,
+verifies selected MP4s, Stage 1 hashes, and Qwen-free policy, and does not load
+SAM3 or create artifacts. Repeating the exact command reuses the persisted
+selection; identity drift fails closed.
 
 Remove `--prepare-only` to run. Canary output stays below
 `r2v_v3_pre_qwen_canary/<run-id>`, never uses production shard filenames, and
@@ -198,9 +204,14 @@ never writes to the formal Stage 2 root. GPU slots get deterministic groups of
 ten; canary deliberately does not use production work stealing.
 
 Each GPU process loads SAM3 once and runs its ten clips sequentially.
-`workers/gpu-N.jsonl.partial` resumes from the next selected row. `summary.json`
-reports per-GPU completion, SAM3/coverage/background counts, retryable failures,
-zero Qwen calls, elapsed time, and frame/mask/total bytes for storage sizing.
+`workers/gpu-N.jsonl.partial` resumes from the next selected row. A retryable
+worker failure keeps that partial state and makes the top-level command exit
+nonzero. `summary.json` separates row completion (`status`) from
+`functional_status`: functional pass requires all 80 selections complete, no
+outstanding retryable work, and zero `failed_input` or `failed_frames` rows.
+Coverage rejection and missing/rejected background are valid business outcomes.
+The summary also reports SAM3/coverage/background counts, zero Qwen calls,
+elapsed time, and frame/mask/total bytes for storage sizing.
 
 Real SAM3/GPU execution remains a server validation step and is not performed
 by local unit tests.

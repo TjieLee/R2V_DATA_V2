@@ -39,6 +39,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
 )
 from r2v_data_v2.v3.sam3_backend import BackendMaskObservation, EntityTrackResult
 from tools import run_v3_pre_qwen_batch as batch_tool
+from tools import run_v3_pre_qwen_canary as canary_tool
 
 
 @dataclass
@@ -298,6 +299,22 @@ def _write_shard(
     return path
 
 
+def _write_canary_shards(
+    fixture: Fixture,
+    *,
+    shard_count: int = 16,
+    eligible_per_shard: int = 5,
+) -> list[Path]:
+    paths = []
+    for shard_index in range(shard_count):
+        start = shard_index * 10_000
+        rows = [
+            _row(fixture, start + offset) for offset in range(eligible_per_shard)
+        ]
+        paths.append(_write_shard(fixture, rows, nominal_end=start + 9_999))
+    return paths
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
@@ -350,6 +367,19 @@ def test_full_stage2_shard_is_one_to_one_and_skips_ineligible_rows(
     assert backend.calls == ["e1"]
     assert decoder.calls == ["inspect:clip-0.mp4", "decode:clip-0.mp4"]
     assert Path(result["path"]).name == shard.name
+
+
+def test_annotation_shard_rejects_duplicate_ready_clip_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    rows = [_row(fixture, 0), _row(fixture, 1)]
+    rows[1]["clip_uid"] = rows[0]["clip_uid"]
+    shard = _write_shard(fixture, rows)
+
+    with pytest.raises(ValueError, match="duplicate ready clip_uid"):
+        load_annotation_shard(shard)
 
 
 def test_completed_shard_validates_and_skips_without_model_calls(
@@ -624,17 +654,99 @@ def test_canary_selection_is_deterministic_and_counts_only_eligible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
-    rows = [_row(fixture, 0, status="failed"), _row(fixture, 1, entities=0)]
-    rows.extend(_row(fixture, index) for index in range(2, 82))
-    _write_shard(fixture, rows, nominal_end=9999)
+    first_rows = [
+        _row(fixture, 0, status="failed"),
+        _row(fixture, 1, entities=0),
+        *[_row(fixture, index) for index in range(2, 7)],
+    ]
+    _write_shard(fixture, first_rows, nominal_end=9_999)
+    for shard_index in range(1, 17):
+        start = shard_index * 10_000
+        _write_shard(
+            fixture,
+            [_row(fixture, start + offset) for offset in range(5)],
+            nominal_end=start + 9_999,
+        )
 
-    first = select_canary_rows(fixture.input_root, gpu_count=8, samples_per_gpu=10)
-    second = select_canary_rows(fixture.input_root, gpu_count=8, samples_per_gpu=10)
+    first = select_canary_rows(
+        fixture.input_root,
+        gpu_count=8,
+        canary_shards=16,
+        samples_per_shard=5,
+    )
+    second = select_canary_rows(
+        fixture.input_root,
+        gpu_count=8,
+        canary_shards=16,
+        samples_per_shard=5,
+    )
 
     assert first == second
     assert len(first) == 80
     assert [sum(item.gpu_slot == slot for item in first) for slot in range(8)] == [10] * 8
-    assert first[0].source_index == 2
+    assert [item.source_index for item in first[:5]] == [2, 3, 4, 5, 6]
+    assert {Path(item.input_annotation_shard).name for item in first}.isdisjoint(
+        {"shard-000160000-000169999.jsonl"}
+    )
+
+
+def test_canary_selection_rejects_short_shard_without_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_canary_shards(fixture, shard_count=2, eligible_per_shard=4)
+    start = 20_000
+    _write_shard(
+        fixture,
+        [_row(fixture, start + offset) for offset in range(5)],
+        nominal_end=start + 9_999,
+    )
+
+    with pytest.raises(ValueError, match=r"shard-000000000-000009999.*4 eligible.*5 required"):
+        select_canary_rows(
+            fixture.input_root,
+            gpu_count=1,
+            canary_shards=2,
+            samples_per_shard=5,
+        )
+
+
+def test_canary_selection_rejects_cross_shard_duplicate_clip_uid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_canary_shards(fixture, shard_count=2, eligible_per_shard=5)
+    second = fixture.input_root / "parts" / "shard-000010000-000019999.jsonl"
+    rows = _read_jsonl(second)
+    rows[0]["clip_uid"] = "clip-0"
+    second.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="duplicate clip_uid across Stage1 shards"):
+        select_canary_rows(
+            fixture.input_root,
+            gpu_count=1,
+            canary_shards=2,
+            samples_per_shard=5,
+        )
+
+
+def test_canary_selection_requires_divisible_gpu_quota(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        select_canary_rows(
+            fixture.input_root,
+            gpu_count=8,
+            canary_shards=3,
+            samples_per_shard=5,
+        )
 
 
 def test_canary_output_cannot_enter_production_namespace(
@@ -647,14 +759,20 @@ def test_canary_output_cannot_enter_production_namespace(
     _write_shard(fixture, [_row(fixture, 0)])
     base = _write_loadable_config(fixture)
 
-    with pytest.raises(ValueError, match="production Stage2 root"):
-        prepare_canary(
-            input_root=fixture.input_root,
-            base_config=base,
-            output_root=production_root / "fake-canary",
-            gpus=["0"],
-            samples_per_gpu=1,
-        )
+    for output_root in (
+        production_root,
+        production_root / "fake-canary",
+        production_root.parent,
+    ):
+        with pytest.raises(ValueError, match="fully disjoint"):
+            prepare_canary(
+                input_root=fixture.input_root,
+                base_config=base,
+                output_root=output_root,
+                gpus=["0"],
+                canary_shards=1,
+                samples_per_shard=1,
+            )
 
 
 def test_prepare_canary_persists_and_reuses_exact_selection(
@@ -662,7 +780,7 @@ def test_prepare_canary_persists_and_reuses_exact_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
-    _write_shard(fixture, [_row(fixture, index) for index in range(80)], nominal_end=9999)
+    _write_canary_shards(fixture)
     base = _write_loadable_config(fixture)
     output = fixture.writable / "canary" / "run-1"
 
@@ -671,14 +789,21 @@ def test_prepare_canary_persists_and_reuses_exact_selection(
         base_config=base,
         output_root=output,
         gpus=[str(index) for index in range(8)],
-        samples_per_gpu=10,
+        canary_shards=16,
+        samples_per_shard=5,
+    )
+    monkeypatch.setattr(
+        production,
+        "select_canary_rows",
+        lambda *args, **kwargs: pytest.fail("persisted selection must be reused"),
     )
     resumed_manifest, second = prepare_canary(
         input_root=fixture.input_root,
         base_config=base,
         output_root=output,
         gpus=[str(index) for index in range(8)],
-        samples_per_gpu=10,
+        canary_shards=16,
+        samples_per_shard=5,
     )
 
     assert manifest == resumed_manifest
@@ -689,8 +814,15 @@ def test_prepare_canary_persists_and_reuses_exact_selection(
             base_config=base,
             output_root=output,
             gpus=["0", "1"],
-            samples_per_gpu=10,
+            canary_shards=16,
+            samples_per_shard=5,
         )
+    assert manifest.selection_policy == "first_n_shards_first_k_eligible_v1"
+    assert manifest.selected_shard_names == [
+        f"shard-{index * 10_000:09d}-{index * 10_000 + 9_999:09d}.jsonl"
+        for index in range(16)
+    ]
+    assert manifest.duplicate_clip_uid_skipped == 0
 
 
 def test_canary_resume_rejects_changed_input_shard_sha(
@@ -706,7 +838,8 @@ def test_canary_resume_rejects_changed_input_shard_sha(
         base_config=base,
         output_root=output,
         gpus=["0"],
-        samples_per_gpu=1,
+        canary_shards=1,
+        samples_per_shard=1,
     )
     changed = _row(fixture, 0)
     changed["warnings"] = ["mutated"]
@@ -718,7 +851,8 @@ def test_canary_resume_rejects_changed_input_shard_sha(
             base_config=base,
             output_root=output,
             gpus=["0"],
-            samples_per_gpu=1,
+            canary_shards=1,
+            samples_per_shard=1,
         )
 
 
@@ -740,7 +874,8 @@ def test_qwen_dependent_canary_fails_before_selection_or_sam_init(
             base_config=base,
             output_root=fixture.writable / "canary" / "blocked",
             gpus=["0"],
-            samples_per_gpu=10,
+            canary_shards=16,
+            samples_per_shard=5,
         )
 
 
@@ -757,7 +892,8 @@ def test_canary_worker_resume_reuses_completed_masks_and_summary_counts_bytes(
         base_config=base,
         output_root=output,
         gpus=["0"],
-        samples_per_gpu=1,
+        canary_shards=1,
+        samples_per_shard=1,
     )
     first = FakeBackend()
     result = run_canary_worker(
@@ -783,6 +919,13 @@ def test_canary_worker_resume_reuses_completed_masks_and_summary_counts_bytes(
     assert resumed["skipped"] is True
     assert second.calls == []
     assert summary["status"] == "complete"
+    assert summary["selection_complete"] is True
+    assert summary["functional_status"] == "pass"
+    assert summary["failed_input"] == 0
+    assert summary["failed_frames"] == 0
+    assert summary["terminal_failures"] == 0
+    assert summary["duplicate_clip_uid_skipped"] == 0
+    assert canary_tool._canary_exit_code([], summary) == 0
     assert summary["frames_bytes"] > 0
     assert summary["masks_bytes"] > 0
     assert summary["qwen_calls"] == 0
@@ -801,7 +944,8 @@ def test_canary_retryable_sam_failure_keeps_worker_partial_uncommitted(
         base_config=base,
         output_root=output,
         gpus=["0"],
-        samples_per_gpu=1,
+        canary_shards=1,
+        samples_per_shard=1,
     )
 
     result = run_canary_worker(
@@ -815,6 +959,93 @@ def test_canary_retryable_sam_failure_keeps_worker_partial_uncommitted(
 
     assert result["retryable"] is True
     assert not (output / "workers" / "gpu-0.jsonl").exists()
+    summary = canary_summary(output, manifest)
+    assert summary["status"] == "partial"
+    assert summary["selection_complete"] is False
+    assert summary["functional_status"] == "fail"
+    assert summary["outstanding_retryable_work"] == 1
+    assert canary_tool._canary_exit_code([], summary) == 2
+
+
+@pytest.mark.parametrize("terminal_status", ["failed_input", "failed_frames"])
+def test_canary_terminal_row_completes_selection_but_fails_functionally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_shard(fixture, [_row(fixture, 0)])
+    base = _write_loadable_config(fixture)
+    output = fixture.writable / "canary" / "terminal"
+    manifest, selection = prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=["0"],
+        canary_shards=1,
+        samples_per_shard=1,
+    )
+    item = selection[0]
+    terminal = production.Stage2Row(
+        source_index=item.source_index,
+        clip_uid=item.clip_uid,
+        input_annotation_shard=item.input_annotation_shard,
+        input_annotation_shard_sha256=item.input_annotation_shard_sha256,
+        input_row_sha256=item.input_row_sha256,
+        status=terminal_status,
+        reason="invalid input or frame stream",
+    )
+    worker_path = output / "workers" / "gpu-0.jsonl"
+    worker_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_path.write_text(
+        json.dumps(terminal.model_dump(mode="json")) + "\n", encoding="utf-8"
+    )
+
+    summary = canary_summary(output, manifest)
+
+    assert summary["status"] == "complete"
+    assert summary["selection_complete"] is True
+    assert summary["functional_status"] == "fail"
+    assert summary[terminal_status] == 1
+    assert summary["terminal_failures"] == 1
+    assert canary_tool._canary_exit_code([], summary) == 2
+
+
+def test_retryable_canary_worker_cli_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_shard(fixture, [_row(fixture, 0)])
+    base = _write_loadable_config(fixture)
+    output = fixture.writable / "canary" / "worker-exit"
+    manifest, selection = prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=["0"],
+        canary_shards=1,
+        samples_per_shard=1,
+    )
+    monkeypatch.setattr(
+        canary_tool, "_load_identity_files", lambda root: (manifest, selection)
+    )
+    monkeypatch.setattr(canary_tool, "default_backend_factory", lambda config: object())
+    monkeypatch.setattr(
+        canary_tool,
+        "run_canary_worker",
+        lambda **kwargs: {
+            "gpu_slot": 0,
+            "selected": 1,
+            "completed": 0,
+            "retryable": True,
+        },
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        canary_tool.main(["--output-root", str(output), "--worker-slot", "0"])
+
+    assert raised.value.code == 2
 
 
 def test_canary_partial_worker_resumes_from_exact_next_selection(
@@ -830,7 +1061,8 @@ def test_canary_partial_worker_resumes_from_exact_next_selection(
         base_config=base,
         output_root=output,
         gpus=["0"],
-        samples_per_gpu=2,
+        canary_shards=1,
+        samples_per_shard=2,
     )
     first = FakeBackend(
         failure=RuntimeError("CUDA OOM"),
