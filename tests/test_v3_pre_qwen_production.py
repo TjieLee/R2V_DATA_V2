@@ -58,6 +58,7 @@ from r2v_data_v2.v3.sam3_backend import (
     EntityTrackResult,
     Sam3SegmentationBackend,
 )
+from tools import run_v3_entity_mask_auto as entity_mask_tool
 from tools import run_v3_pre_qwen_auto as auto_tool
 from tools import run_v3_pre_qwen_batch as batch_tool
 from tools import run_v3_pre_qwen_canary as canary_tool
@@ -922,6 +923,103 @@ def test_canary_output_cannot_enter_production_namespace(
                 canary_shards=1,
                 samples_per_shard=1,
             )
+
+
+def test_exact_entity_mask_public_output_has_stage2_only_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+
+    assert production._safe_output_root(entity_mask_root) == entity_mask_root
+    assert production._safe_output_root(fixture.output_root) == fixture.output_root
+    for rejected in (
+        fixture.dataset,
+        entity_mask_root.parent,
+        entity_mask_root.parent / "foo",
+    ):
+        with pytest.raises(ValueError, match="writable root|public dataset"):
+            production._safe_output_root(rejected)
+    for rejected_canary in (
+        entity_mask_root,
+        entity_mask_root / "fake-canary",
+        entity_mask_root.parent,
+    ):
+        with pytest.raises(ValueError, match="fully disjoint"):
+            production._safe_output_root(rejected_canary, canary=True)
+
+
+def test_entity_mask_public_workspace_does_not_loosen_normal_v3_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    workspace = entity_mask_root / "artifacts" / "shard-0" / "clip-0"
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+
+    public_config = replace(
+        fixture.config,
+        run_root=workspace / "run",
+        export_root=workspace / "unused-export",
+    )
+    with pytest.raises(ValueError, match="run_root must be inside"):
+        public_config.validate()
+    with pytest.raises(ValueError, match="run_root must be inside"):
+        production.RunStorage(public_config)
+
+    runtime_config, storage = production._stage2_workspace_storage(
+        fixture.config,
+        workspace,
+        output_root=entity_mask_root,
+    )
+    assert runtime_config.resolved_run_root == (workspace / "run").resolve()
+    assert storage.root == (workspace / "run").resolve()
+    storage.initialize(git_commit=production.VISUAL_ALGORITHM_FREEZE)
+    assert storage.run_path.is_file()
+
+
+def test_stage2_processes_into_exact_entity_mask_public_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+    shard_path = _write_shard(fixture, [_row(fixture, 0)])
+
+    result = process_shard(
+        shard_path,
+        output_root=entity_mask_root,
+        config_identity=fixture.identity,
+        backend=FakeBackend(),
+        decoder=FakeDecoder(),
+    )
+
+    assert result["rows"] == 1
+    assert (entity_mask_root / "parts" / shard_path.name).is_file()
+    assert (
+        entity_mask_root
+        / "artifacts"
+        / shard_path.stem
+        / "clip-0"
+        / "run"
+        / "run.json"
+    ).is_file()
 
 
 def test_prepare_canary_persists_and_reuses_exact_selection(
@@ -2463,6 +2561,7 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     )
     monkeypatch.setattr(auto_tool.subprocess, "Popen", popen)
 
+    worker_log_root = fixture.writable / "entity-mask-worker-logs"
     normal = auto_tool.main(
         [
             "--input-root",
@@ -2473,7 +2572,8 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
             str(fixture.output_root),
             "--gpus",
             "0",
-        ]
+        ],
+        worker_log_root=worker_log_root,
     )
     assert inventory_calls == 0
     assert normal["worker_exit_codes"] == [0]
@@ -2484,6 +2584,7 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     assert "sam3_session_reuse_mode" not in normal
     idle_flag = commands[0].index("--idle-exit-seconds")
     assert commands[0][idle_flag + 1] == "60.0"
+    assert (worker_log_root / "rank-0-gpu-0.log").is_file()
 
     dry = auto_tool.main(
         [
@@ -2500,6 +2601,117 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     )
     assert inventory_calls == 1
     assert dry["stage1_total_rows"] == 123
+
+
+def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    private_config = fixture.writable / "entity_mask_configs" / "production.yaml"
+    private_config.parent.mkdir(parents=True)
+    private_config.write_text("validated: true\n", encoding="utf-8")
+    private_logs = fixture.writable / "entity_mask_logs"
+    service = replace(
+        fixture.config.qwen.candidate_judge,
+        base_url=entity_mask_tool.PRODUCTION_CANDIDATE_JUDGE_BASE_URL,
+        temperature=0.0,
+        max_tokens=1024,
+        timeout_seconds=3600,
+    )
+    config = replace(
+        fixture.config,
+        qwen=replace(fixture.config.qwen, candidate_judge=service),
+        sam3=replace(
+            fixture.config.sam3,
+            save_debug_overlays=False,
+            object_rescue_mode="phrase_retry_v1",
+            not_found_rescue_mode="entity_phrase_retry_v1",
+            multi_instance_rescue_mode="qwen_anchor_select_v1",
+            anchor_search_mode="progressive_v1",
+        ),
+        debug=replace(fixture.config.debug, save_diagnostics=False),
+    )
+    identity = replace(fixture.identity, path=private_config, config=config)
+    captured: dict[str, object] = {}
+
+    def run_auto(
+        arguments: list[str],
+        *,
+        worker_log_root: Path | None = None,
+    ) -> dict[str, object]:
+        captured["arguments"] = arguments
+        captured["worker_log_root"] = worker_log_root
+        return {"rank": 3, "world_size": 4}
+
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_INPUT_ROOT", fixture.input_root)
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_OUTPUT_ROOT", entity_mask_root)
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_BASE_CONFIG", private_config)
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_LOG_ROOT", private_logs)
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "PRODUCTION_CANDIDATE_JUDGE_MODEL",
+        service.model,
+    )
+    monkeypatch.setattr(entity_mask_tool, "load_config_identity", lambda path: identity)
+    monkeypatch.setattr(entity_mask_tool, "run_pre_qwen_auto", run_auto)
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+
+    result = entity_mask_tool.main([])
+
+    arguments = captured["arguments"]
+    assert isinstance(arguments, list)
+    assert arguments[arguments.index("--input-root") + 1] == str(fixture.input_root)
+    assert arguments[arguments.index("--output-root") + 1] == str(entity_mask_root)
+    assert arguments[arguments.index("--base-config") + 1] == str(private_config)
+    assert arguments[arguments.index("--chunk-rows") + 1] == "100"
+    assert arguments[arguments.index("--frame-prefetch-workers") + 1] == "0"
+    assert arguments[arguments.index("--sam3-session-reuse-mode") + 1] == (
+        "clip_reset_v1"
+    )
+    assert "--sam3-request-timing" not in arguments
+    assert "--gpus" not in arguments
+    assert "--rank" not in arguments
+    assert "--world-size" not in arguments
+    assert captured["worker_log_root"] == private_logs
+    assert result == {"rank": 3, "world_size": 4}
+
+
+def test_entity_mask_wrapper_missing_private_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "entity_mask_configs" / "production.yaml"
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_BASE_CONFIG", missing)
+
+    with pytest.raises(FileNotFoundError, match=str(missing)):
+        entity_mask_tool.main([])
+
+
+def test_entity_mask_wrapper_rejects_non_production_visual_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "PRODUCTION_CANDIDATE_JUDGE_MODEL",
+        fixture.config.qwen.candidate_judge.model,
+    )
+    invalid = replace(
+        fixture.config,
+        sam3=replace(fixture.config.sam3, save_debug_overlays=True),
+    )
+
+    with pytest.raises(ValueError, match="sam3.save_debug_overlays"):
+        entity_mask_tool.validate_entity_mask_production_config(invalid)
 
 
 def test_frame_prefetch_uses_frozen_frame_builder_and_exact_frame_config(

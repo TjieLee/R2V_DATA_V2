@@ -62,6 +62,10 @@ Sam3SessionReuseMode = Literal["off", "clip_reset_v1"]
 DEFAULT_PRODUCTION_OUTPUT_ROOT = Path(
     "/mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1"
 )
+ENTITY_MASK_PRODUCTION_OUTPUT_ROOT = Path(
+    "/mnt/workspace/public/dataset/jea-video/"
+    "moive-183t-0808_processed/entity_mask"
+)
 DEFAULT_CANARY_ROOT = Path(
     "/mnt/workspace/litengjie/data/r2v_v3_pre_qwen_canary"
 )
@@ -725,18 +729,26 @@ def _safe_output_root(path: str | Path, *, canary: bool = False) -> Path:
     resolved = Path(path).expanduser().resolve(strict=False)
     writable = ALLOWED_WRITABLE_ROOT.resolve(strict=False)
     public = ALLOWED_DATASET_ROOT.resolve(strict=False)
-    if writable not in resolved.parents:
-        raise ValueError("Stage2 output_root must be below the writable root")
-    if resolved == public or public in resolved.parents:
-        raise ValueError("Stage2 must not write below the public dataset root")
-    production_root = DEFAULT_PRODUCTION_OUTPUT_ROOT.resolve(strict=False)
-    if canary and (
-        resolved == production_root or production_root in resolved.parents
+    entity_mask_root = ENTITY_MASK_PRODUCTION_OUTPUT_ROOT.resolve(strict=False)
+    production_roots = (
+        DEFAULT_PRODUCTION_OUTPUT_ROOT.resolve(strict=False),
+        entity_mask_root,
+    )
+    if canary and any(
+        resolved == production_root
+        or production_root in resolved.parents
         or resolved in production_root.parents
+        for production_root in production_roots
     ):
         raise ValueError(
             "canary output_root and production Stage2 root must be fully disjoint"
         )
+    if resolved == entity_mask_root:
+        return resolved
+    if writable not in resolved.parents:
+        raise ValueError("Stage2 output_root must be below the writable root")
+    if resolved == public or public in resolved.parents:
+        raise ValueError("Stage2 must not write below the public dataset root")
     return resolved
 
 
@@ -1181,6 +1193,57 @@ def _workspace_config(base: V3Config, workspace: Path) -> V3Config:
     )
 
 
+class _EntityMaskRunStorage(RunStorage):
+    """Stage2-only storage for the exact standalone entity-mask output."""
+
+    def __init__(
+        self,
+        config: V3Config,
+        *,
+        output_root: Path,
+        workspace: Path,
+    ) -> None:
+        root = _safe_output_root(output_root)
+        entity_mask_root = ENTITY_MASK_PRODUCTION_OUTPUT_ROOT.resolve(strict=False)
+        resolved_workspace = workspace.resolve(strict=False)
+        if root != entity_mask_root:
+            raise ValueError("trusted entity-mask storage requires the exact root")
+        if root not in resolved_workspace.parents:
+            raise ValueError("entity-mask workspace escaped production output_root")
+        expected_run_root = (resolved_workspace / "run").resolve(strict=False)
+        expected_export_root = (
+            resolved_workspace / "unused-export"
+        ).resolve(strict=False)
+        if (
+            config.resolved_run_root != expected_run_root
+            or config.resolved_export_root != expected_export_root
+        ):
+            raise ValueError("entity-mask workspace config paths are inconsistent")
+        self.config = config
+        self.root = expected_run_root
+
+
+def _stage2_workspace_storage(
+    base: V3Config,
+    workspace: Path,
+    *,
+    output_root: Path,
+) -> tuple[V3Config, RunStorage]:
+    base.validate()
+    root = _safe_output_root(output_root)
+    resolved_workspace = workspace.resolve(strict=False)
+    if root not in resolved_workspace.parents:
+        raise ValueError("frame workspace escaped Stage2 output_root")
+    config = _workspace_config(base, resolved_workspace)
+    if root == ENTITY_MASK_PRODUCTION_OUTPUT_ROOT.resolve(strict=False):
+        return config, _EntityMaskRunStorage(
+            config,
+            output_root=root,
+            workspace=resolved_workspace,
+        )
+    return config, RunStorage(config)
+
+
 def _checkpoint_path(workspace: Path) -> Path:
     return workspace / "state.json"
 
@@ -1349,8 +1412,11 @@ def prepare_clip_frames(
         elif resolved_workspace.exists() and any(resolved_workspace.iterdir()):
             raise ValueError("clip workspace is non-empty without a checkpoint")
 
-        config = _workspace_config(config_identity.config, resolved_workspace)
-        storage = RunStorage(config)
+        config, storage = _stage2_workspace_storage(
+            config_identity.config,
+            resolved_workspace,
+            output_root=root,
+        )
         if checkpoint is None:
             storage.initialize(git_commit=VISUAL_ALGORITHM_FREEZE)
             storage.create_clip(
@@ -1435,8 +1501,11 @@ def process_ready_clip(
             reason=str(exc),
         )
     checkpoint = prepared.checkpoint
-    config = _workspace_config(config_identity.config, workspace)
-    storage = RunStorage(config)
+    config, storage = _stage2_workspace_storage(
+        config_identity.config,
+        workspace,
+        output_root=output_root,
+    )
 
     if _STAGES[checkpoint.stage] < _STAGES["masks_ready"]:
         if storage.masks_path(clip_uid).is_file():
@@ -1738,7 +1807,11 @@ def _validate_materialized_row(
     )
     if value.status == "failed_frames":
         return
-    storage = RunStorage(_workspace_config(config_identity.config, workspace))
+    _config, storage = _stage2_workspace_storage(
+        config_identity.config,
+        workspace,
+        output_root=output_root,
+    )
     expected = _terminal_from_storage(
         storage=storage,
         row=input_row,

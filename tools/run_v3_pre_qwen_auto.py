@@ -327,7 +327,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> dict[str, object]:
+def main(
+    argv: list[str] | None = None,
+    *,
+    worker_log_root: Path | None = None,
+) -> dict[str, object]:
     args = _parser().parse_args(argv)
     if args.chunk_rows < 1:
         raise ValueError("--chunk-rows must be positive")
@@ -389,7 +393,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     codes: list[int] = []
     logs = []
     worker_logs: list[tuple[str, Path, int]] = []
-    log_root = args.output_root / "logs"
+    log_root = worker_log_root or args.output_root / "logs"
     log_root.mkdir(parents=True, exist_ok=True)
     worker_startup_started = time.perf_counter()
     try:
