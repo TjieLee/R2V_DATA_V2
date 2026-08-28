@@ -8,6 +8,7 @@ import math
 import os
 import subprocess
 import sys
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -63,6 +64,16 @@ def _run(command: list[str], *, label: str) -> None:
         raise RuntimeError(
             f"{label} failed with code {result.returncode}: {result.stderr.strip()}"
         )
+
+
+def _equal_length_zip(
+    *sequences: Sequence[Any],
+    label: str,
+) -> Iterator[tuple[Any, ...]]:
+    lengths = [len(sequence) for sequence in sequences]
+    if len(set(lengths)) > 1:
+        raise ValueError(f"LASER {label} lengths differ: {lengths}")
+    return zip(*sequences)
 
 
 def _sha256(path: Path) -> str:
@@ -526,9 +537,14 @@ def _render_visualization(
         str(silent), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
     )
     by_frame: dict[int, list[tuple[list[float], float, int]]] = {}
-    for track_index, (track, track_scores) in enumerate(zip(tracks, scores, strict=True)):
-        for frame_index, bbox, score in zip(
-            track["frame"], track["bbox"], track_scores, strict=True  # type: ignore[index]
+    for track_index, (track, track_scores) in enumerate(
+        _equal_length_zip(tracks, scores, label="visualization track/score")
+    ):
+        for frame_index, bbox, score in _equal_length_zip(
+            track["frame"],  # type: ignore[arg-type]
+            track["bbox"],  # type: ignore[arg-type]
+            track_scores,
+            label="visualization frame/bbox/score",
         ):
             by_frame.setdefault(int(frame_index), []).append(
                 ([float(value) for value in bbox], float(score), track_index + 1)
@@ -783,8 +799,11 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     model.eval()
     scores: list[list[float]] = []
     with torch.no_grad():
-        for visual_item, landmark_item, audio_item in zip(
-            visual, landmarks, audio, strict=True
+        for visual_item, landmark_item, audio_item in _equal_length_zip(
+            visual,
+            landmarks,
+            audio,
+            label="visual/landmark/audio input",
         ):
             prediction = model.model.forward_evaluation(
                 audio_item.to(dtype=torch.float, device=arguments.device),
@@ -804,18 +823,26 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     landmark_sample_count = 0
     landmark_available_count = 0
     for track_index, (track, track_scores, track_landmarks) in enumerate(
-        zip(tracks, scores, availability, strict=True), start=1
+        _equal_length_zip(
+            tracks,
+            scores,
+            availability,
+            label="track/score/landmark availability",
+        ),
+        start=1,
     ):
         frame_indices = [int(value) for value in track["frame"]]  # type: ignore[index]
         bboxes = [
             [float(value) for value in bbox]
             for bbox in track["bbox"]  # type: ignore[index]
         ]
-        if not (len(frame_indices) == len(bboxes) == len(track_scores) == len(track_landmarks)):
-            raise ValueError("LASER track frames, boxes, scores, and landmarks differ")
         samples = []
-        for frame_index, raw_bbox, score, landmark_available in zip(
-            frame_indices, bboxes, track_scores, track_landmarks, strict=True
+        for frame_index, raw_bbox, score, landmark_available in _equal_length_zip(
+            frame_indices,
+            bboxes,
+            track_scores,
+            track_landmarks,
+            label="track frame/bbox/score/landmark sample",
         ):
             if not math.isfinite(score):
                 raise ValueError("LASER returned a non-finite native score")

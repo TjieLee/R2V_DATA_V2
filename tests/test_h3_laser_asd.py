@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import sys
@@ -50,6 +51,7 @@ from tools import build_h3_asd_backend_comparison_review as comparison_module
 from tools.build_h3_asd_backend_comparison_review import build_comparison_review
 from tools.run_h3_laser_loconet_bridge import (
     LIP_LANDMARK_INDICES,
+    _equal_length_zip,
     _install_gdown_blocker,
     _legacy_numpy_s3fd_compatibility,
     _load_verified_checkpoint,
@@ -358,6 +360,36 @@ def test_bridge_stages_local_s3fd_and_blocks_gdown(
     _install_gdown_blocker()
     with pytest.raises(RuntimeError, match="forbids gdown"):
         sys.modules["gdown"].download("https://example.invalid")  # type: ignore[attr-defined]
+
+
+def test_equal_length_zip_preserves_strict_alignment() -> None:
+    assert list(
+        _equal_length_zip(
+            [1, 2], ["a", "b"], [True, False], label="fixture alignment"
+        )
+    ) == [(1, "a", True), (2, "b", False)]
+
+    with pytest.raises(
+        ValueError,
+        match=r"LASER fixture alignment lengths differ: \[2, 1\]",
+    ):
+        list(_equal_length_zip([1, 2], ["a"], label="fixture alignment"))
+
+
+def test_laser_bridge_is_python39_compatible_and_never_uses_strict_zip() -> None:
+    source = Path(inspect.getsourcefile(_equal_length_zip) or "").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source, feature_version=(3, 9))
+    strict_builtin_zips = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "zip"
+        and any(keyword.arg == "strict" for keyword in node.keywords)
+    ]
+    assert strict_builtin_zips == []
 
 
 def test_legacy_numpy_int_compatibility_is_scoped_and_matches_builtin_int(
