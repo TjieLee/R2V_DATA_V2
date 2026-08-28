@@ -145,6 +145,50 @@ Do not reuse an un-reset session across probes or propagation directions.
 
 `clip_reset_v1` has its own runtime identity marker. Do not mix `off` and `clip_reset_v1` work inside the same Stage2 output root.
 
+## 3. Vectorized binary-mask RLE codec
+
+The V3 binary-mask codec now finds run boundaries with a NumPy change-point
+scan and decodes runs with `numpy.repeat`. It no longer executes a Python loop
+for every mask pixel. The existing contract is unchanged: masks are flattened
+in C / row-major order, counts begin with the zero run, and serialized
+`MaskRle` JSON remains exactly identical to the scalar implementation.
+
+Correctness coverage includes exhaustive enumeration of every binary mask up
+to 2x3 and 3x2, fixed-seed randomized masks through 720p at foreground ratios
+from 0% to 100%, and realistic checkerboard, stripe, rectangle, fragmented,
+sparse, and dense patterns. Each vectorized encoding is compared with a
+test-only copy of the old scalar algorithm before round-trip decoding.
+
+Run the local developer benchmark without a GPU or model dependency:
+
+```bash
+.venv/bin/python tools/benchmark_mask_codec.py
+```
+
+It reports scalar and vectorized encode time, vectorized decode time, encode
+speedup, throughput, and exact equality. Its timing is diagnostic only; CI does
+not assert a machine-dependent speedup.
+
+For the server A/B, retain this completed baseline:
+
+```text
+/mnt/workspace/litengjie/data/r2v_v3_stage2_canary/chunk1-nodiag-sessionreuse-80-qwen-20260828
+```
+
+Run the same persisted 80-row selection and the same base config into a fresh
+output root, retaining:
+
+```text
+--chunk-rows 1
+--frame-prefetch-workers 0
+--sam3-session-reuse-mode clip_reset_v1
+```
+
+Leave `--sam3-request-timing` disabled to avoid diagnostic overhead. After the
+run, compare all 54 `masks.rle.json` files as parsed JSON and compare the
+canonical `parts/` outputs. Promotion requires `different = 0`. Record the new
+80-row wall time only after that real GPU A/B; no speedup is assumed here.
+
 ## Recommended production combination
 
 For a throughput-oriented Stage2 or E2E run after the above checks:

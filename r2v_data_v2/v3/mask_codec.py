@@ -14,18 +14,17 @@ def encode_binary_mask(mask: np.ndarray) -> MaskRle:
     if not np.isin(value, (0, 1)).all():
         raise ValueError("mask must contain only binary values")
     flattened = value.astype(np.uint8, copy=False).reshape(-1)
-    counts: list[int] = []
-    current = 0
-    run_length = 0
-    for item in flattened:
-        pixel = int(item)
-        if pixel == current:
-            run_length += 1
-            continue
-        counts.append(run_length)
-        current = pixel
-        run_length = 1
-    counts.append(run_length)
+    changes = np.flatnonzero(flattened[1:] != flattened[:-1]) + 1
+    boundaries = np.concatenate(
+        (
+            np.array([0], dtype=changes.dtype),
+            changes,
+            np.array([flattened.size], dtype=changes.dtype),
+        )
+    )
+    counts = np.diff(boundaries).tolist()
+    if flattened[0] == 1:
+        counts.insert(0, 0)
     return MaskRle(
         size=(int(value.shape[0]), int(value.shape[1])),
         counts=counts,
@@ -38,11 +37,10 @@ def decode_binary_mask(rle: MaskRle | dict[str, object]) -> np.ndarray:
         if isinstance(rle, MaskRle)
         else MaskRle.model_validate(rle)
     )
-    values: list[np.ndarray] = []
-    for index, count in enumerate(encoded.counts):
-        values.append(
-            np.full(count, index % 2, dtype=bool)
-        )
-    flattened = np.concatenate(values)
+    counts = np.asarray(encoded.counts, dtype=np.intp)
+    flattened = np.repeat(
+        np.arange(counts.size, dtype=np.uint8) & 1,
+        counts,
+    ).astype(bool, copy=False)
     height, width = encoded.size
     return flattened.reshape((height, width))
