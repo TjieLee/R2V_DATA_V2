@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.metadata
+import io
 import json
 import math
 import os
 import subprocess
 import sys
+import tarfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +17,12 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 LASER_UPSTREAM_COMMIT = "3703d3f396cc7b29aa704364f8a9a5ab0c8c1fb9"
+REQUIRED_STAGED_VENDOR_FILES = (
+    "README.md",
+    "LoCoNet/demoLoCoNet_landmark.py",
+    "LoCoNet/landmark_loconet.py",
+    "create_landmark.py",
+)
 LIP_LANDMARK_INDICES = (
     61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291,
     375, 321, 405, 314, 17, 84, 181, 91, 146, 61,
@@ -89,6 +97,83 @@ def _sha256(path: Path) -> str:
 def _require_sha256(path: Path, expected: str, *, label: str) -> None:
     if _sha256(path) != expected:
         raise ValueError(f"LASER {label} SHA-256 does not match runtime provenance")
+
+
+def _stage_pinned_vendor_source(
+    *,
+    code_root: Path,
+    runtime_root: Path,
+    upstream_commit: str,
+) -> Path:
+    destination = runtime_root / "vendor_source"
+    if destination.exists():
+        raise FileExistsError(f"LASER staged vendor source already exists: {destination}")
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(code_root),
+                "archive",
+                "--format=tar",
+                upstream_commit,
+                "LoCoNet",
+                "create_landmark.py",
+                "README.md",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"LASER pinned source archive failed: {exc}") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"LASER pinned source archive failed with code {result.returncode}: {stderr}"
+        )
+    if not result.stdout:
+        raise RuntimeError("LASER pinned source archive is empty")
+
+    destination.mkdir(parents=False, exist_ok=False)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+            members = archive.getmembers()
+            if not members:
+                raise RuntimeError("LASER pinned source archive is empty")
+            destination_root = destination.resolve(strict=True)
+            for member in members:
+                member_path = (destination / member.name).resolve(strict=False)
+                if not member_path.is_relative_to(destination_root):
+                    raise RuntimeError("LASER pinned source archive contains unsafe path")
+                if member.isdir():
+                    member_path.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    raise RuntimeError(
+                        "LASER pinned source archive contains unsupported entry"
+                    )
+                source = archive.extractfile(member)
+                if source is None:
+                    raise RuntimeError(
+                        "LASER pinned source archive contains unreadable file"
+                    )
+                member_path.parent.mkdir(parents=True, exist_ok=True)
+                member_path.write_bytes(source.read())
+    except (tarfile.TarError, OSError) as exc:
+        raise RuntimeError(f"LASER pinned source extraction failed: {exc}") from exc
+
+    missing = [
+        relative
+        for relative in REQUIRED_STAGED_VENDOR_FILES
+        if not (destination / relative).is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            "LASER pinned source archive is missing required files: "
+            + ", ".join(missing)
+        )
+    return destination
 
 
 def _stage_s3fd_model(*, runtime_root: Path, source: Path) -> Path:
@@ -613,9 +698,6 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     )
     s3fd_model_path = arguments.s3fd_model_path.expanduser().resolve(strict=True)
     work = arguments.work_dir.expanduser().resolve(strict=True)
-    loconet_root = code_root / "LoCoNet"
-    if not (loconet_root / "demoLoCoNet_landmark.py").is_file():
-        raise ValueError("LASER code root does not contain the pinned LoCoNet demo")
     for path, expected, label in (
         (model_path, arguments.checkpoint_sha256, "model checkpoint"),
         (config_path, arguments.config_sha256, "config"),
@@ -628,8 +710,15 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         raise ValueError("LASER subprocess requires isolated CUDA_VISIBLE_DEVICES")
     runtime_root = work / "vendor_runtime"
     runtime_root.mkdir(exist_ok=False)
+    vendor_source = _stage_pinned_vendor_source(
+        code_root=code_root,
+        runtime_root=runtime_root,
+        upstream_commit=arguments.upstream_commit,
+    )
+    loconet_root = vendor_source / "LoCoNet"
     _stage_s3fd_model(runtime_root=runtime_root, source=s3fd_model_path)
     _install_gdown_blocker()
+    sys.path.insert(0, str(vendor_source))
     sys.path.insert(0, str(loconet_root))
     os.chdir(runtime_root)
 

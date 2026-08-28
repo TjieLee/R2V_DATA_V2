@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -57,6 +58,7 @@ from tools.run_h3_laser_loconet_bridge import (
     _load_verified_checkpoint,
     _offline_vggish_construction,
     _render_visualization,
+    _stage_pinned_vendor_source,
     _stage_s3fd_model,
 )
 
@@ -272,9 +274,32 @@ def _runtime_tree(root: Path) -> LaserASDRuntimeConfig:
 
 
 def _git_result(command: list[str]) -> SimpleNamespace:
-    if command[-2:] == ["rev-parse", "HEAD"]:
-        return SimpleNamespace(returncode=0, stdout=LASER_ASD_UPSTREAM_COMMIT + "\n")
-    return SimpleNamespace(returncode=0, stdout="")
+    if command[-2:] == ["rev-parse", "--git-dir"]:
+        return SimpleNamespace(returncode=0, stdout=".git\n")
+    if command[-3:-1] == ["cat-file", "-e"]:
+        return SimpleNamespace(returncode=0, stdout="")
+    raise AssertionError(f"unexpected git command: {command}")
+
+
+def _commit_git_repository(root: Path) -> str:
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.name", "Test"], check=True
+    )
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "-q", "-m", "fixture"], check=True
+    )
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def test_laser_runtime_config_is_local_pinned_and_fail_closed(
@@ -312,24 +337,106 @@ def test_laser_runtime_requires_every_local_asset(
         config.validate()
 
 
-def test_laser_runtime_rejects_tracked_changes_but_ignores_untracked_assets(
+def test_laser_runtime_accepts_modified_tracked_files_when_commit_is_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _runtime_tree(tmp_path)
-    calls = 0
+    pinned_commit = _commit_git_repository(config.code_root)
+    monkeypatch.setattr(laser_module, "LASER_ASD_UPSTREAM_COMMIT", pinned_commit)
+    modified = config.code_root / "LoCoNet/demoLoCoNet_landmark.py"
+    modified.write_text("modified working tree", encoding="utf-8")
 
-    def clean_then_dirty(command: list[str], **kwargs: object) -> SimpleNamespace:
-        nonlocal calls
-        del kwargs
-        if command[-2:] == ["rev-parse", "HEAD"]:
-            return _git_result(command)
-        calls += 1
-        return SimpleNamespace(returncode=0, stdout="" if calls == 1 else " M LoCoNet/x.py\n")
-
-    monkeypatch.setattr(laser_module.subprocess, "run", clean_then_dirty)
     config.validate()
-    with pytest.raises(ValueError, match="modified tracked files"):
+
+    assert "demoLoCoNet_landmark.py" in subprocess.run(
+        ["git", "-C", str(config.code_root), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def test_laser_runtime_requires_local_git_repository(tmp_path: Path) -> None:
+    config = _runtime_tree(tmp_path)
+
+    with pytest.raises(ValueError, match="must be a local git repository"):
         config.validate()
+
+
+def test_laser_runtime_requires_pinned_commit_object(tmp_path: Path) -> None:
+    config = _runtime_tree(tmp_path)
+    _commit_git_repository(config.code_root)
+
+    with pytest.raises(ValueError, match="does not contain pinned commit"):
+        config.validate()
+
+
+def test_pinned_vendor_source_ignores_working_tree_and_preserves_it(
+    tmp_path: Path,
+) -> None:
+    config = _runtime_tree(tmp_path)
+    pinned_commit = _commit_git_repository(config.code_root)
+    modified = config.code_root / "LoCoNet/demoLoCoNet_landmark.py"
+    modified.write_text("modified working tree", encoding="utf-8")
+    before_status = subprocess.run(
+        ["git", "-C", str(config.code_root), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    before_bytes = modified.read_bytes()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+
+    staged = _stage_pinned_vendor_source(
+        code_root=config.code_root,
+        runtime_root=runtime_root,
+        upstream_commit=pinned_commit,
+    )
+
+    assert (staged / "LoCoNet/demoLoCoNet_landmark.py").read_text(
+        encoding="utf-8"
+    ) == "fixture"
+    assert modified.read_bytes() == before_bytes
+    assert subprocess.run(
+        ["git", "-C", str(config.code_root), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == before_status
+
+
+def test_pinned_vendor_source_archive_failure_is_fail_closed(tmp_path: Path) -> None:
+    config = _runtime_tree(tmp_path)
+    _commit_git_repository(config.code_root)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="pinned source archive failed"):
+        _stage_pinned_vendor_source(
+            code_root=config.code_root,
+            runtime_root=runtime_root,
+            upstream_commit="0" * 40,
+        )
+    assert not (runtime_root / "vendor_source").exists()
+
+
+def test_pinned_vendor_source_requires_runtime_modules(tmp_path: Path) -> None:
+    code_root = tmp_path / "LASER_ASD"
+    (code_root / "LoCoNet").mkdir(parents=True)
+    (code_root / "README.md").write_text("fixture", encoding="utf-8")
+    (code_root / "create_landmark.py").write_text("fixture", encoding="utf-8")
+    (code_root / "LoCoNet/placeholder.py").write_text("fixture", encoding="utf-8")
+    pinned_commit = _commit_git_repository(code_root)
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="missing required files"):
+        _stage_pinned_vendor_source(
+            code_root=code_root,
+            runtime_root=runtime_root,
+            upstream_commit=pinned_commit,
+        )
 
 
 def test_laser_runtime_requires_explicit_isolated_cuda_device(tmp_path: Path) -> None:

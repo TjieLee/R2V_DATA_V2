@@ -64,8 +64,13 @@ The code root, Python, checkpoint, config, FaceLandmarker asset, and S3FD asset
 must all be local. The bridge never calls `gdown` or
 `torch.hub.load_state_dict_from_url`. It creates a read-only S3FD symlink under
 the per-clip work directory and never writes model assets into the vendor
-checkout. The checkout commit and absence of modified tracked files are
-verified before inference; untracked local model assets do not fail this check.
+checkout. The code root must be a local Git repository containing the pinned
+commit object. For each clip, the bridge materializes a private source snapshot
+with `git archive <pinned_commit>` and imports LoCoNet, LASER, S3FD, and related
+vendor modules only from that snapshot. Modified or untracked files in the
+vendor working tree are diagnostic state only and cannot affect inference
+semantics. Archive or staged-source validation failure is fail-closed and never
+falls back to working-tree source.
 
 The strict `r2v.h3.laser_asd_native.2` artifact records SHA-256 values for all
 four explicit assets, isolated CUDA visibility/device, resolved `n_channel` and

@@ -95,14 +95,6 @@ class LaserASDRuntimeConfig:
 
     def validate(self) -> None:
         code_root = self.code_root.expanduser().resolve(strict=True)
-        required_source_files = (
-            "README.md",
-            "LoCoNet/demoLoCoNet_landmark.py",
-            "LoCoNet/landmark_loconet.py",
-            "create_landmark.py",
-        )
-        if any(not (code_root / relative).is_file() for relative in required_source_files):
-            raise ValueError("LASER_ASD_CODE_ROOT is not the expected upstream checkout")
         if not _launch_executable(self.python_path).is_file():
             raise ValueError("LASER_ASD_PYTHON must be a local executable file")
         for label, path in (
@@ -125,27 +117,30 @@ class LaserASDRuntimeConfig:
         if int(self.device.split(":", 1)[1]) >= visible_device_count:
             raise ValueError("LASER_ASD_DEVICE is outside isolated CUDA visibility")
         try:
-            head = subprocess.run(
-                ["git", "-C", str(code_root), "rev-parse", "HEAD"],
+            repository = subprocess.run(
+                ["git", "-C", str(code_root), "rev-parse", "--git-dir"],
                 check=False, capture_output=True, text=True, timeout=10,
             )
-            tracked_status = subprocess.run(
+            pinned_commit = subprocess.run(
                 [
-                    "git", "-C", str(code_root), "status", "--porcelain",
-                    "--untracked-files=no",
+                    "git",
+                    "-C",
+                    str(code_root),
+                    "cat-file",
+                    "-e",
+                    f"{LASER_ASD_UPSTREAM_COMMIT}^{{commit}}",
                 ],
                 check=False, capture_output=True, text=True, timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError(f"cannot verify LASER upstream commit: {exc}") from exc
-        if head.returncode != 0 or head.stdout.strip() != LASER_ASD_UPSTREAM_COMMIT:
+        if repository.returncode != 0:
+            raise ValueError("LASER_ASD_CODE_ROOT must be a local git repository")
+        if pinned_commit.returncode != 0:
             raise ValueError(
-                "LASER checkout must be pinned to " + LASER_ASD_UPSTREAM_COMMIT
+                "LASER repository does not contain pinned commit "
+                + LASER_ASD_UPSTREAM_COMMIT
             )
-        if tracked_status.returncode != 0:
-            raise ValueError("cannot verify LASER tracked checkout integrity")
-        if tracked_status.stdout.strip():
-            raise ValueError("LASER checkout has modified tracked files")
 
 
 def _run_laser_command(
