@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -51,8 +52,11 @@ from r2v_data_v2.v3.storage import RunStorage
 VISUAL_ALGORITHM_FREEZE = "d056c32b76db4b3d7c0358b38e996e7a91a288d1"
 STAGE2_SCHEMA_VERSION = "r2v.v3.pre_qwen_stage2.1"
 STAGE2_META_SCHEMA_VERSION = "r2v.v3.pre_qwen_shard_meta.2"
+STAGE2_EXECUTION_SCHEMA_VERSION = "r2v.v3.pre_qwen_execution_chunks.1"
 CLIP_CHECKPOINT_SCHEMA_VERSION = "r2v.v3.pre_qwen_clip_checkpoint.1"
 CANARY_SCHEMA_VERSION = "r2v.v3.pre_qwen_canary.2"
+DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS = 100
+STAGE2_EXECUTION_STRATEGY = "dynamic_chunk_claim_v1"
 DEFAULT_PRODUCTION_OUTPUT_ROOT = Path(
     "/mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1"
 )
@@ -221,6 +225,27 @@ class AnnotationShard:
     nominal_start: int
     nominal_end: int
     rows: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class ExecutionChunk:
+    input_annotation_shard: Path
+    source_index_start: int
+    source_index_end: int
+    row_offset_start: int
+    row_offset_end: int
+
+    @property
+    def row_count(self) -> int:
+        return self.row_offset_end - self.row_offset_start
+
+    @property
+    def stem(self) -> str:
+        return f"chunk-{self.source_index_start:09d}-{self.source_index_end:09d}"
+
+    @property
+    def name(self) -> str:
+        return f"{self.stem}.jsonl"
 
 
 @dataclass(frozen=True)
@@ -503,6 +528,111 @@ def enumerate_annotation_shards(input_root: str | Path) -> list[Path]:
     for path in paths:
         _shard_bounds(path)
     return sorted(paths, key=lambda path: _shard_bounds(path)[0])
+
+
+def build_execution_chunks(
+    shard: AnnotationShard,
+    *,
+    chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+) -> tuple[ExecutionChunk, ...]:
+    if chunk_rows < 1:
+        raise ValueError("execution chunk_rows must be positive")
+    chunks: list[ExecutionChunk] = []
+    for row_offset_start in range(0, len(shard.rows), chunk_rows):
+        row_offset_end = min(row_offset_start + chunk_rows, len(shard.rows))
+        chunks.append(
+            ExecutionChunk(
+                input_annotation_shard=shard.path,
+                source_index_start=int(shard.rows[row_offset_start]["source_index"]),
+                source_index_end=int(shard.rows[row_offset_end - 1]["source_index"]),
+                row_offset_start=row_offset_start,
+                row_offset_end=row_offset_end,
+            )
+        )
+    return tuple(chunks)
+
+
+def _execution_identity_path(output_root: Path) -> Path:
+    return output_root / "_internal" / "execution.json"
+
+
+def _ensure_execution_identity(output_root: Path, *, chunk_rows: int) -> Path:
+    with shard_lock(output_root / "locks" / "execution.lock", blocking=True):
+        return _ensure_execution_identity_locked(output_root, chunk_rows=chunk_rows)
+
+
+def ensure_execution_identity(
+    output_root: str | Path,
+    *,
+    chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+) -> Path:
+    return _ensure_execution_identity(
+        _safe_output_root(output_root),
+        chunk_rows=chunk_rows,
+    )
+
+
+def _ensure_execution_identity_locked(
+    output_root: Path,
+    *,
+    chunk_rows: int,
+) -> Path:
+    if chunk_rows < 1:
+        raise ValueError("execution chunk_rows must be positive")
+    path = _execution_identity_path(output_root)
+    expected = {
+        "schema_version": STAGE2_EXECUTION_SCHEMA_VERSION,
+        "execution_strategy": STAGE2_EXECUTION_STRATEGY,
+        "execution_chunk_rows": chunk_rows,
+    }
+    if path.is_file():
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError("Stage2 execution identity must contain an object")
+        for key, expected_value in expected.items():
+            if value.get(key) != expected_value:
+                raise ValueError(f"Stage2 execution identity mismatch: {key}")
+        return path
+    legacy_partials = sorted((output_root / "parts").glob("shard-*.jsonl.partial"))
+    if legacy_partials:
+        raise ValueError(
+            "legacy unfinished whole-shard Stage2 partial cannot be reinterpreted "
+            "as chunk execution; finish it with the previous runner or use a new "
+            "output root"
+        )
+    chunk_files = list((output_root / "_internal").glob("shard-*/chunks/chunk-*"))
+    if chunk_files:
+        raise ValueError("Stage2 chunk files exist without execution identity")
+    write_json_atomic(path, {**expected, "created_at": _utc_now()})
+    value = json.loads(path.read_text(encoding="utf-8"))
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise ValueError(f"Stage2 execution identity mismatch: {key}")
+    return path
+
+
+def _chunk_directory(output_root: Path, shard: AnnotationShard) -> Path:
+    return output_root / "_internal" / shard.path.stem / "chunks"
+
+
+def execution_chunk_path(
+    output_root: Path,
+    shard: AnnotationShard,
+    chunk: ExecutionChunk,
+) -> Path:
+    return _chunk_directory(output_root, shard) / chunk.name
+
+
+def _chunk_lock_path(
+    output_root: Path,
+    shard: AnnotationShard,
+    chunk: ExecutionChunk,
+) -> Path:
+    return output_root / "locks" / shard.path.stem / f"{chunk.stem}.lock"
+
+
+def _compaction_lock_path(output_root: Path, shard: AnnotationShard) -> Path:
+    return output_root / "locks" / f"compact-{shard.path.stem}.lock"
 
 
 def _clip_source(row: dict[str, object], video_path: Path) -> ClipSource:
@@ -867,6 +997,21 @@ def _read_output_rows(
     shard: AnnotationShard,
     recover_tail: bool,
 ) -> list[Stage2Row]:
+    return _read_expected_output_rows(
+        path,
+        shard=shard,
+        expected_rows=shard.rows,
+        recover_tail=recover_tail,
+    )
+
+
+def _read_expected_output_rows(
+    path: Path,
+    *,
+    shard: AnnotationShard,
+    expected_rows: Sequence[dict[str, object]],
+    recover_tail: bool,
+) -> list[Stage2Row]:
     if not path.exists():
         return []
     mode = "r+b" if recover_tail else "rb"
@@ -886,9 +1031,9 @@ def _read_output_rows(
                 os.fsync(handle.fileno())
                 break
             value = Stage2Row.model_validate(json.loads(line))
-            if len(rows) >= len(shard.rows):
+            if len(rows) >= len(expected_rows):
                 raise ValueError("Stage2 shard contains too many rows")
-            expected = shard.rows[len(rows)]
+            expected = expected_rows[len(rows)]
             if (
                 value.source_index != expected.get("source_index")
                 or value.clip_uid
@@ -899,6 +1044,31 @@ def _read_output_rows(
                 raise ValueError("Stage2 output is not an exact annotation prefix")
             rows.append(value)
     return rows
+
+
+def _read_chunk_rows(
+    path: Path,
+    *,
+    shard: AnnotationShard,
+    chunk: ExecutionChunk,
+    recover_tail: bool,
+) -> list[Stage2Row]:
+    if chunk.input_annotation_shard != shard.path:
+        raise ValueError("execution chunk belongs to a different annotation shard")
+    expected_rows = shard.rows[chunk.row_offset_start : chunk.row_offset_end]
+    if not expected_rows:
+        raise ValueError("execution chunk cannot be empty")
+    if (
+        int(expected_rows[0]["source_index"]) != chunk.source_index_start
+        or int(expected_rows[-1]["source_index"]) != chunk.source_index_end
+    ):
+        raise ValueError("execution chunk range does not match annotation rows")
+    return _read_expected_output_rows(
+        path,
+        shard=shard,
+        expected_rows=expected_rows,
+        recover_tail=recover_tail,
+    )
 
 
 def _meta_path(output_root: Path, shard: AnnotationShard) -> Path:
@@ -939,13 +1109,18 @@ def _ensure_meta(
 ) -> Path:
     path = _meta_path(output_root, shard)
     expected = _expected_meta(shard, config_identity)
-    if path.is_file():
-        value = json.loads(path.read_text(encoding="utf-8"))
-        for key, expected_value in expected.items():
-            if value.get(key) != expected_value:
-                raise ValueError(f"Stage2 shard metadata mismatch: {key}")
-    else:
-        write_json_atomic(path, {**expected, "created_at": _utc_now(), "completed_at": None})
+    lock_path = output_root / "locks" / shard.path.stem / "metadata.lock"
+    with shard_lock(lock_path, blocking=True):
+        if path.is_file():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            for key, expected_value in expected.items():
+                if value.get(key) != expected_value:
+                    raise ValueError(f"Stage2 shard metadata mismatch: {key}")
+        else:
+            write_json_atomic(
+                path,
+                {**expected, "created_at": _utc_now(), "completed_at": None},
+            )
     return path
 
 
@@ -1033,22 +1208,46 @@ def _validate_materialized_row(
         raise ValueError("Stage2 row does not match its durable clip artifacts")
 
 
-def process_shard(
-    input_shard: str | Path,
+def _validate_completed_shard(
+    part: Path,
+    *,
+    shard: AnnotationShard,
+    output_root: Path,
+    config_identity: ConfigIdentity,
+) -> list[Stage2Row]:
+    completed = _read_output_rows(part, shard=shard, recover_tail=False)
+    if len(completed) != len(shard.rows):
+        raise ValueError("completed Stage2 shard is missing rows")
+    for value, input_row in zip(completed, shard.rows):
+        _validate_materialized_row(
+            value,
+            input_row=input_row,
+            shard=shard,
+            output_root=output_root,
+            config_identity=config_identity,
+        )
+    return completed
+
+
+def process_execution_chunk(
+    shard: AnnotationShard,
+    chunk: ExecutionChunk,
     *,
     output_root: str | Path,
     config_identity: ConfigIdentity,
     backend: SegmentationBackend | None,
     decoder: FrameDecoder | None = None,
     acquire_lock: bool = True,
+    chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
     _validate_live_config_identity(config_identity)
     root = _safe_output_root(output_root)
-    shard = load_annotation_shard(input_shard)
-    part = root / "parts" / shard.path.name
-    partial = part.with_name(f"{part.name}.partial")
-    lock_path = root / "locks" / f"{shard.path.stem}.lock"
+    _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    _ensure_meta(shard, output_root=root, config_identity=config_identity)
+    final = execution_chunk_path(root, shard, chunk)
+    partial = final.with_name(f"{final.name}.partial")
+    lock_path = _chunk_lock_path(root, shard, chunk)
 
     @contextmanager
     def maybe_lock() -> Iterator[None]:
@@ -1059,12 +1258,14 @@ def process_shard(
             yield
 
     with maybe_lock():
-        _ensure_meta(shard, output_root=root, config_identity=config_identity)
-        if part.is_file():
-            completed = _read_output_rows(part, shard=shard, recover_tail=False)
-            if len(completed) != len(shard.rows):
-                raise ValueError("completed Stage2 shard is missing rows")
-            for value, input_row in zip(completed, shard.rows):
+        expected_rows = shard.rows[chunk.row_offset_start : chunk.row_offset_end]
+        if final.is_file():
+            completed = _read_chunk_rows(
+                final, shard=shard, chunk=chunk, recover_tail=False
+            )
+            if len(completed) != chunk.row_count:
+                raise ValueError("completed Stage2 chunk is missing rows")
+            for value, input_row in zip(completed, expected_rows):
                 _validate_materialized_row(
                     value,
                     input_row=input_row,
@@ -1072,15 +1273,33 @@ def process_shard(
                     output_root=root,
                     config_identity=config_identity,
                 )
-            return {"path": str(part), "rows": len(completed), "skipped": True}
-        completed = _read_output_rows(partial, shard=shard, recover_tail=True)
-        for row in shard.rows[len(completed) :]:
+            return {
+                "path": str(final),
+                "rows": len(completed),
+                "skipped": True,
+                "chunk": chunk.stem,
+                "resumed": False,
+            }
+        started = time.perf_counter()
+        completed = _read_chunk_rows(
+            partial, shard=shard, chunk=chunk, recover_tail=True
+        )
+        resumed = bool(completed)
+        for value, input_row in zip(completed, expected_rows):
+            _validate_materialized_row(
+                value,
+                input_row=input_row,
+                shard=shard,
+                output_root=root,
+                config_identity=config_identity,
+            )
+        for row in expected_rows[len(completed) :]:
             annotation = _annotation_state(row)
             if annotation.status == "failed" or not annotation.entities:
                 result = _skipped_row(row, shard)
             else:
                 if backend is None:
-                    raise RuntimeError("unfinished Stage2 shard requires SAM3 backend")
+                    raise RuntimeError("unfinished Stage2 chunk requires SAM3 backend")
                 workspace = root / "artifacts" / shard.path.stem / str(row["clip_uid"])
                 try:
                     result = process_ready_clip(
@@ -1101,9 +1320,9 @@ def process_shard(
                         "retryable": True,
                         "source_index": row["source_index"],
                         "stage": exc.stage,
+                        "chunk": chunk.stem,
+                        "resumed": resumed,
                     }
-            _append_jsonl(partial, result.model_dump(mode="json"))
-            completed.append(result)
             if result.artifact_root is not None:
                 workspace = root / result.artifact_root
                 checkpoint = _read_checkpoint(workspace)
@@ -1115,10 +1334,14 @@ def process_shard(
                         shard_sha256=shard.sha256,
                         config_identity=config_identity,
                     )
-        validated = _read_output_rows(partial, shard=shard, recover_tail=False)
-        if len(validated) != len(shard.rows):
-            raise RuntimeError("Stage2 did not publish every annotation row")
-        for value, input_row in zip(validated, shard.rows):
+            _append_jsonl(partial, result.model_dump(mode="json"))
+            completed.append(result)
+        validated = _read_chunk_rows(
+            partial, shard=shard, chunk=chunk, recover_tail=False
+        )
+        if len(validated) != chunk.row_count:
+            raise RuntimeError("Stage2 did not publish every chunk row")
+        for value, input_row in zip(validated, expected_rows):
             _validate_materialized_row(
                 value,
                 input_row=input_row,
@@ -1128,18 +1351,186 @@ def process_shard(
             )
         if _sha256_file(shard.path) != shard.sha256:
             raise ValueError("input annotation shard changed during Stage2 processing")
+        os.replace(partial, final)
+        _fsync_directory(final.parent)
+        elapsed = max(0.0, time.perf_counter() - started)
+        write_json_atomic(
+            final.with_name(f"{chunk.stem}.meta.json"),
+            {
+                "schema_version": STAGE2_EXECUTION_SCHEMA_VERSION,
+                "execution_strategy": STAGE2_EXECUTION_STRATEGY,
+                "input_annotation_shard": str(shard.path),
+                "input_annotation_shard_sha256": shard.sha256,
+                "source_index_start": chunk.source_index_start,
+                "source_index_end": chunk.source_index_end,
+                "rows": len(validated),
+                "ready_rows": sum(
+                    row.status not in {"skipped_annotation_failed", "skipped_no_entities"}
+                    for row in validated
+                ),
+                "entities": sum(row.annotation_entity_count for row in validated),
+                "elapsed_seconds": elapsed,
+                "completed_at": _utc_now(),
+            },
+        )
+        return {
+            "path": str(final),
+            "rows": len(validated),
+            "skipped": False,
+            "chunk": chunk.stem,
+            "resumed": resumed,
+            "elapsed_seconds": elapsed,
+        }
+
+
+def compact_execution_chunks(
+    shard: AnnotationShard,
+    *,
+    output_root: str | Path,
+    config_identity: ConfigIdentity,
+    chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+    acquire_lock: bool = True,
+) -> dict[str, object] | None:
+    root = _safe_output_root(output_root)
+    _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    _ensure_meta(shard, output_root=root, config_identity=config_identity)
+    part = root / "parts" / shard.path.name
+    if part.is_file():
+        completed = _validate_completed_shard(
+            part,
+            shard=shard,
+            output_root=root,
+            config_identity=config_identity,
+        )
+        return {"path": str(part), "rows": len(completed), "skipped": True}
+    chunks = build_execution_chunks(shard, chunk_rows=chunk_rows)
+    if any(not execution_chunk_path(root, shard, chunk).is_file() for chunk in chunks):
+        return None
+
+    @contextmanager
+    def maybe_lock() -> Iterator[None]:
+        if acquire_lock:
+            with shard_lock(_compaction_lock_path(root, shard)):
+                yield
+        else:
+            yield
+
+    with maybe_lock():
+        if part.is_file():
+            completed = _validate_completed_shard(
+                part,
+                shard=shard,
+                output_root=root,
+                config_identity=config_identity,
+            )
+            return {"path": str(part), "rows": len(completed), "skipped": True}
+        compacted: list[Stage2Row] = []
+        for chunk in chunks:
+            chunk_path = execution_chunk_path(root, shard, chunk)
+            rows = _read_chunk_rows(
+                chunk_path,
+                shard=shard,
+                chunk=chunk,
+                recover_tail=False,
+            )
+            if len(rows) != chunk.row_count:
+                raise ValueError("completed Stage2 chunk is missing rows")
+            compacted.extend(rows)
+        if len(compacted) != len(shard.rows):
+            raise ValueError("Stage2 chunk compaction row count mismatch")
+        for value, input_row in zip(compacted, shard.rows):
+            if (
+                value.source_index != input_row.get("source_index")
+                or value.input_annotation_shard_sha256 != shard.sha256
+                or value.input_row_sha256 != _row_sha256(input_row)
+            ):
+                raise ValueError("Stage2 chunk compaction is not an exact annotation match")
+            _validate_materialized_row(
+                value,
+                input_row=input_row,
+                shard=shard,
+                output_root=root,
+                config_identity=config_identity,
+            )
+        if _sha256_file(shard.path) != shard.sha256:
+            raise ValueError("input annotation shard changed before compaction")
+        partial = part.with_name(f"{part.name}.partial")
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        with partial.open("wb") as handle:
+            for value in compacted:
+                handle.write(_json_line(value.model_dump(mode="json")))
+            handle.flush()
+            os.fsync(handle.fileno())
+        validated = _read_output_rows(partial, shard=shard, recover_tail=False)
+        if len(validated) != len(shard.rows):
+            raise ValueError("compacted Stage2 shard is missing rows")
         meta_path = _meta_path(root, shard)
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta.update(
             {
                 "completed_at": _utc_now(),
                 "counters": dict(Counter(row.status for row in validated)),
+                "execution_strategy": STAGE2_EXECUTION_STRATEGY,
+                "execution_chunk_rows": chunk_rows,
+                "execution_chunk_count": len(chunks),
             }
         )
         write_json_atomic(meta_path, meta)
         os.replace(partial, part)
         _fsync_directory(part.parent)
         return {"path": str(part), "rows": len(validated), "skipped": False}
+
+
+def process_shard(
+    input_shard: str | Path,
+    *,
+    output_root: str | Path,
+    config_identity: ConfigIdentity,
+    backend: SegmentationBackend | None,
+    decoder: FrameDecoder | None = None,
+    acquire_lock: bool = True,
+    chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+) -> dict[str, object]:
+    validate_stage2_preflight(config_identity.config)
+    _validate_live_config_identity(config_identity)
+    root = _safe_output_root(output_root)
+    shard = load_annotation_shard(input_shard)
+    part = root / "parts" / shard.path.name
+    if _execution_identity_path(root).is_file():
+        _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    if part.is_file():
+        _ensure_meta(shard, output_root=root, config_identity=config_identity)
+        completed = _validate_completed_shard(
+            part,
+            shard=shard,
+            output_root=root,
+            config_identity=config_identity,
+        )
+        return {"path": str(part), "rows": len(completed), "skipped": True}
+    _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    for chunk in build_execution_chunks(shard, chunk_rows=chunk_rows):
+        result = process_execution_chunk(
+            shard,
+            chunk,
+            output_root=root,
+            config_identity=config_identity,
+            backend=backend,
+            decoder=decoder,
+            acquire_lock=acquire_lock,
+            chunk_rows=chunk_rows,
+        )
+        if result.get("retryable") is True:
+            return result
+    compacted = compact_execution_chunks(
+        shard,
+        output_root=root,
+        config_identity=config_identity,
+        chunk_rows=chunk_rows,
+        acquire_lock=acquire_lock,
+    )
+    if compacted is None:
+        raise RuntimeError("Stage2 shard chunks completed without compaction readiness")
+    return compacted
 
 
 def inspect_stage2_shard(path: str | Path) -> dict[str, object]:
@@ -1206,25 +1597,55 @@ def inventory(input_root: str | Path, output_root: str | Path) -> dict[str, obje
             else:
                 stage1["annotation_ready_zero_entities"] += 1
     completed = sum((root / "parts" / path.name).is_file() for path in shards)
-    partial = sum(
+    canonical_partial = sum(
         (root / "parts" / f"{path.name}.partial").is_file() for path in shards
     )
-    busy = sum(
-        _lock_busy(root / "locks" / f"{path.stem}.lock") for path in shards
+    internal_partial_shards = {
+        path.parents[1].name
+        for path in (root / "_internal").glob(
+            "shard-*/chunks/chunk-*.jsonl.partial"
+        )
+    }
+    internal_completed_chunks = list(
+        (root / "_internal").glob("shard-*/chunks/chunk-*.jsonl")
     )
+    internal_partial_chunks = list(
+        (root / "_internal").glob("shard-*/chunks/chunk-*.jsonl.partial")
+    )
+    partial = canonical_partial + sum(
+        not (root / "parts" / f"{stem}.jsonl").is_file()
+        for stem in internal_partial_shards
+    )
+    chunk_lock_paths = list((root / "locks").glob("shard-*/chunk-*.lock"))
+    legacy_lock_paths = [
+        root / "locks" / f"{path.stem}.lock" for path in shards
+    ]
+    busy = sum(_lock_busy(path) for path in [*chunk_lock_paths, *legacy_lock_paths])
     substages = Counter[str]()
     for state_path in (root / "artifacts").glob("*/*/state.json"):
         state = ClipCheckpoint.model_validate_json(state_path.read_text(encoding="utf-8"))
         substages[state.stage] += 1
     committed_rows: list[Stage2Row] = []
-    for path in sorted((root / "parts").glob("shard-*.jsonl*")):
-        if path.name.endswith(".meta.json"):
-            continue
-        with path.open("rb") as handle:
-            for line in handle:
-                if not line.endswith(b"\n"):
-                    break
-                committed_rows.append(Stage2Row.model_validate(json.loads(line)))
+    for shard_path in shards:
+        canonical = root / "parts" / shard_path.name
+        canonical_partial_path = canonical.with_name(f"{canonical.name}.partial")
+        if canonical.is_file() or canonical_partial_path.is_file():
+            row_sources = [canonical if canonical.is_file() else canonical_partial_path]
+        else:
+            row_sources = sorted(
+                (root / "_internal" / shard_path.stem / "chunks").glob(
+                    "chunk-*.jsonl*"
+                )
+            )
+            row_sources = [
+                path for path in row_sources if not path.name.endswith(".meta.json")
+            ]
+        for path in row_sources:
+            with path.open("rb") as handle:
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        break
+                    committed_rows.append(Stage2Row.model_validate(json.loads(line)))
     committed_statuses = Counter(row.status for row in committed_rows)
     retryable_failures = sum(
         len(path.read_bytes().splitlines())
@@ -1241,8 +1662,13 @@ def inventory(input_root: str | Path, output_root: str | Path) -> dict[str, obje
         "annotation_entities_total": entities,
         "stage2_completed_shards": completed,
         "stage2_partial_shards": partial,
+        "execution_chunks_completed": len(internal_completed_chunks),
+        "execution_chunks_partial": len(internal_partial_chunks),
         "outstanding_shards": len(shards) - completed,
         "busy_shard_locks": busy,
+        "busy_execution_chunk_locks": sum(
+            _lock_busy(path) for path in chunk_lock_paths
+        ),
         "substage_checkpoints": dict(substages),
         "stage2_rows_committed": len(committed_rows),
         "frames_ready_not_committed": substages["frames_ready"],
@@ -1336,6 +1762,18 @@ def select_canary_rows(
     return selected
 
 
+def _load_annotation_shard_cached(
+    cache: dict[Path, AnnotationShard],
+    path: str | Path,
+) -> AnnotationShard:
+    resolved = Path(path).expanduser().resolve(strict=True)
+    shard = cache.get(resolved)
+    if shard is None:
+        shard = load_annotation_shard(resolved)
+        cache[resolved] = shard
+    return shard
+
+
 def prepare_canary(
     *,
     input_root: str | Path,
@@ -1404,8 +1842,11 @@ def prepare_canary(
         )
         if not all(expected):
             raise ValueError("existing canary identity does not match request")
+        shard_cache: dict[Path, AnnotationShard] = {}
         for item in selection:
-            shard = load_annotation_shard(item.input_annotation_shard)
+            shard = _load_annotation_shard_cached(
+                shard_cache, item.input_annotation_shard
+            )
             if shard.sha256 != item.input_annotation_shard_sha256:
                 raise ValueError("canary input annotation shard SHA changed")
             source_row = shard.rows[item.source_index - shard.nominal_start]
@@ -1485,8 +1926,11 @@ def run_canary_worker(
     worker_path = root / "workers" / f"gpu-{gpu_slot}.jsonl"
     partial = worker_path.with_name(f"{worker_path.name}.partial")
     expected_rows: list[dict[str, object]] = []
+    shard_cache: dict[Path, AnnotationShard] = {}
     for item in selected:
-        shard = load_annotation_shard(item.input_annotation_shard)
+        shard = _load_annotation_shard_cached(
+            shard_cache, item.input_annotation_shard
+        )
         if shard.sha256 != item.input_annotation_shard_sha256:
             raise ValueError("canary selected annotation shard SHA changed")
         row = shard.rows[item.source_index - shard.nominal_start]
@@ -1505,7 +1949,9 @@ def run_canary_worker(
                 _validate_materialized_row(
                     value,
                     input_row=row,
-                    shard=load_annotation_shard(item.input_annotation_shard),
+                    shard=_load_annotation_shard_cached(
+                        shard_cache, item.input_annotation_shard
+                    ),
                     output_root=root,
                     config_identity=config_identity,
                 )
@@ -1535,14 +1981,18 @@ def run_canary_worker(
             _validate_materialized_row(
                 value,
                 input_row=expected_rows[index],
-                shard=load_annotation_shard(item.input_annotation_shard),
+                shard=_load_annotation_shard_cached(
+                    shard_cache, item.input_annotation_shard
+                ),
                 output_root=root,
                 config_identity=config_identity,
             )
         for item, row in zip(selected[len(completed) :], expected_rows[len(completed) :]):
             if backend is None:
                 raise RuntimeError("unfinished canary worker requires SAM3 backend")
-            shard = load_annotation_shard(item.input_annotation_shard)
+            shard = _load_annotation_shard_cached(
+                shard_cache, item.input_annotation_shard
+            )
             workspace = root / "artifacts" / item.clip_uid
             try:
                 result = process_ready_clip(

@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.v3.pre_qwen_production import (
+    DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
     check_stage2_candidate_judge_health,
+    enumerate_annotation_shards,
     inventory,
     load_config_identity,
     validate_stage2_preflight,
@@ -48,25 +51,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-config", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--gpus")
+    parser.add_argument(
+        "--chunk-rows", type=int, default=DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> dict[str, object]:
     args = _parser().parse_args(argv)
+    if args.chunk_rows < 1:
+        raise ValueError("--chunk-rows must be positive")
+    prepare_started = time.perf_counter()
     gpus = parse_gpus(args.gpus)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     config = load_config_identity(args.base_config).config
     preflight = validate_stage2_preflight(config)
-    report = {
-        **inventory(args.input_root, args.output_root),
+    shard_paths = enumerate_annotation_shards(args.input_root)
+    report: dict[str, object] = {
         **preflight,
+        "stage1_completed_shards": len(shard_paths),
+        "execution_chunk_rows": args.chunk_rows,
+        "output_root": str(args.output_root.resolve(strict=False)),
         "detected_local_gpus": gpus,
         "rank": rank,
         "world_size": world_size,
     }
     if args.dry_run:
+        report.update(inventory(args.input_root, args.output_root))
+        report["prepare_seconds"] = max(0.0, time.perf_counter() - prepare_started)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return report
     report.update(check_stage2_candidate_judge_health(config))
@@ -76,6 +90,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     logs = []
     log_root = args.output_root / "logs"
     log_root.mkdir(parents=True, exist_ok=True)
+    worker_startup_started = time.perf_counter()
     try:
         for local_slot, gpu in enumerate(gpus):
             environment = dict(os.environ)
@@ -98,17 +113,27 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                         "--claim-loop",
                         "--scan-offset",
                         str(rank * len(gpus) + local_slot),
+                        "--chunk-rows",
+                        str(args.chunk_rows),
                     ],
                     env=environment,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                 )
             )
+        worker_startup_seconds = max(
+            0.0, time.perf_counter() - worker_startup_started
+        )
         codes = [process.wait() for process in processes]
     finally:
         for log in logs:
             log.close()
-    result = {**report, "worker_exit_codes": codes}
+    result = {
+        **report,
+        "prepare_seconds": max(0.0, worker_startup_started - prepare_started),
+        "worker_startup_seconds": worker_startup_seconds,
+        "worker_exit_codes": codes,
+    }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if any(codes):
         raise SystemExit(max(codes))

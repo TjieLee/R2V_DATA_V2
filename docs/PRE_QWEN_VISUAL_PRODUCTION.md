@@ -63,6 +63,38 @@ Machine count, GPU count, `RANK`, `WORLD_SIZE`, hostname, and worker name never
 enter filenames, artifact identity, metadata identity, or resume identity.
 Final partial-sized Stage 1 shards keep their nominal filename boundaries.
 
+The canonical logical shard and the execution scheduling unit are deliberately
+different:
+
+```text
+canonical logical shard: 10,000 Stage 1 source rows
+execution chunk:            100 source rows by default
+```
+
+Chunk ranges are derived only from the logical shard's contiguous
+`source_index` rows. GPU count, node count, eligible-row count, and runtime
+speed do not change chunk identity. A short final logical shard may have a
+short final chunk.
+
+```text
+Stage 1 logical shard
+        ↓
+fixed source-row execution chunks
+        ↓
+dynamic nonblocking multi-node/GPU claim
+        ↓
+existing frozen per-clip Visual pipeline
+        ↓
+durable chunk fragments
+        ↓
+deterministic validated compaction
+        ↓
+same canonical Stage 2 logical shard
+```
+
+Chunks are an internal execution detail and are never part of the Stage 3 data
+contract.
+
 ## Production output and schema
 
 Recommended writable root:
@@ -79,7 +111,15 @@ pre-qwen-v1/
     shard-000000000-000009999.jsonl
     shard-000000000-000009999.jsonl.partial
     shard-000000000-000009999.meta.json
-  locks/shard-000000000-000009999.lock
+  _internal/
+    execution.json
+    shard-000000000-000009999/chunks/
+      chunk-000000000-000000099.jsonl
+      chunk-000000100-000000199.jsonl.partial
+  locks/
+    shard-000000000-000009999/
+      chunk-000000000-000000099.lock
+    compact-shard-000000000-000009999.lock
   failures/shard-000000000-000009999.jsonl
   artifacts/
     shard-000000000-000009999/<clip_uid>/
@@ -114,6 +154,8 @@ failed_frames
 ```
 
 Coverage rejection and background `none`/`rejected` are business outcomes.
+The `_internal` tree is retained for crash audit and production validation;
+downstream readers use only the canonical `parts/` and `artifacts/` interface.
 
 ## Resume, transactions, and retryable failures
 
@@ -136,12 +178,23 @@ coverage, background state, and source mask.
 - `masks_ready`: validate frames/masks, then compute coverage.
 - `coverage_ready`: recompute and compare coverage, then build background.
 - Complete background before row append: validate and reuse it.
-- Torn JSONL tail: truncate only the incomplete last line.
+- Torn chunk JSONL tail: truncate only the incomplete last line.
 - Completed shard: validate all rows and durable artifacts before skipping.
 
-Appends flush and fsync. Completion uses atomic rename plus parent-directory
-fsync. OS `flock`, not the lock filename, owns a shard; process death releases
-ownership automatically.
+Each chunk append flushes and fsyncs. Chunk completion atomically renames its
+`.partial` file. Once every chunk is complete, one nonblocking shard-compaction
+lock validates every row against the Stage 1 shard, writes and fsyncs the
+canonical shard `.partial`, and atomically publishes the unchanged canonical
+filename. Duplicate, missing, reordered, wrong-index, or wrong-hash rows fail
+closed. OS `flock`, not a lock filename, owns a chunk; process death releases
+ownership automatically and another worker can resume its durable prefix.
+
+`_internal/execution.json` freezes the execution chunk schema and chunk size.
+Restarting an existing chunk run with another `--chunk-rows` value fails
+closed. An unfinished legacy whole-shard `.partial` is never silently
+reinterpreted as chunk output; use the previous runner to finish it or choose a
+new output root. Completed legacy canonical shards remain readable and
+validatable.
 
 CUDA OOM/context errors, SAM3 exceptions, worker death, and temporary IO
 failures do not append terminal rows. A retryable diagnostic is written and the
@@ -164,7 +217,8 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python tools/run_v3_pre_qwen_batch.py \
   --input-shard /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_annotations/parts/shard-000000000-000009999.jsonl \
   --base-config /absolute/path/to/frozen-production-base.yaml \
   --output-root /mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1 \
-  --gpu 0
+  --gpu 0 \
+  --chunk-rows 100
 ```
 
 Dry-run does not load SAM3:
@@ -181,11 +235,18 @@ Dry-run does not load SAM3:
 Remove `--dry-run` for single-node four-GPU production. Use
 `--gpus 0,1,2,3,4,5,6,7` for eight GPUs. If omitted, the launcher respects
 `CUDA_VISIBLE_DEVICES`, then queries local GPUs. Each child sees one GPU as
-`cuda:0`, loads one persistent SAM3 backend, and dynamically claims shards.
+`cuda:0`, loads one persistent SAM3 backend, and dynamically claims 100-row
+chunks. The runtime SAM3 backend still requests `device=cuda`; the process-level
+`CUDA_VISIBLE_DEVICES` mapping owns the physical GPU.
 
 For multiple nodes, run the same command with the same shared output root.
-`RANK`/`WORLD_SIZE` only rotate scan order. Restarting with fewer nodes or GPUs
-continues the same logical shards and artifacts.
+`RANK`/`WORLD_SIZE` only rotate scan order. Every worker scans all unfinished
+chunks with wraparound, skips busy locks without waiting, and immediately
+claims another chunk after completion. Restarting with fewer or more nodes or
+GPUs continues the same chunks, checkpoints, logical shards, and artifacts.
+The normal launcher performs only cheap shard enumeration plus config/Qwen
+health preflight before spawning workers; `--dry-run` retains the full
+inventory scan.
 
 ## Required isolated 8 x 10 canary
 

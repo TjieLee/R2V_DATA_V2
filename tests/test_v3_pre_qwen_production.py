@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Self
 
@@ -24,14 +25,22 @@ from r2v_data_v2.v3.config import (
 )
 from r2v_data_v2.v3.frames import DecodedFrameInfo, DecodedVideoFrame
 from r2v_data_v2.v3.pre_qwen_production import (
+    DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+    AnnotationShard,
     ConfigIdentity,
+    ExecutionChunk,
     ShardBusyError,
+    build_execution_chunks,
     canary_summary,
     check_stage2_candidate_judge_health,
+    compact_execution_chunks,
+    ensure_execution_identity,
+    execution_chunk_path,
     inspect_stage2_shard,
     inventory,
     load_annotation_shard,
     prepare_canary,
+    process_execution_chunk,
     process_ready_clip,
     process_shard,
     run_canary_worker,
@@ -45,6 +54,7 @@ from r2v_data_v2.v3.sam3_backend import (
     EntityTrackResult,
     Sam3SegmentationBackend,
 )
+from tools import run_v3_pre_qwen_auto as auto_tool
 from tools import run_v3_pre_qwen_batch as batch_tool
 from tools import run_v3_pre_qwen_canary as canary_tool
 
@@ -1490,14 +1500,15 @@ def test_new_stage1_shard_is_discovered_without_topology_state(
     assert report["outstanding_shards"] == 1
 
 
-def test_claim_worker_builds_one_persistent_backend_for_multiple_shards(
+def test_claim_worker_builds_one_persistent_backend_for_multiple_chunks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
-    shards = [
-        _write_shard(fixture, [_row(fixture, index)]) for index in range(2)
-    ]
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, index, status="failed") for index in range(2)],
+    )
     backend = FakeBackend()
     factory_calls: list[V3Config] = []
     process_backends: list[object] = []
@@ -1509,28 +1520,54 @@ def test_claim_worker_builds_one_persistent_backend_for_multiple_shards(
     monkeypatch.setattr(
         batch_tool,
         "enumerate_annotation_shards",
-        lambda root: shards,
+        lambda root: [shard_path],
     )
 
     def factory(config: V3Config) -> FakeBackend:
         factory_calls.append(config)
         return backend
 
-    def process(path: Path, **kwargs: object) -> dict[str, object]:
+    def process(
+        shard: AnnotationShard,
+        chunk: ExecutionChunk,
+        **kwargs: object,
+    ) -> dict[str, object]:
         process_backends.append(kwargs["backend"])
-        destination = fixture.output_root / "parts" / path.name
+        destination = execution_chunk_path(fixture.output_root, shard, chunk)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("done\n", encoding="utf-8")
+        return {
+            "path": str(destination),
+            "rows": 1,
+            "skipped": False,
+            "chunk": chunk.stem,
+        }
+
+    def compact(
+        shard: AnnotationShard, **kwargs: object
+    ) -> dict[str, object] | None:
+        del kwargs
+        chunks = build_execution_chunks(shard, chunk_rows=1)
+        if any(
+            not execution_chunk_path(fixture.output_root, shard, chunk).is_file()
+            for chunk in chunks
+        ):
+            return None
+        destination = fixture.output_root / "parts" / shard.path.name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text("done\n", encoding="utf-8")
         return {"path": str(destination), "rows": 1, "skipped": False}
 
     monkeypatch.setattr(batch_tool, "default_backend_factory", factory)
-    monkeypatch.setattr(batch_tool, "process_shard", process)
+    monkeypatch.setattr(batch_tool, "process_execution_chunk", process)
+    monkeypatch.setattr(batch_tool, "compact_execution_chunks", compact)
 
     batch_tool.run_claim_loop(
         input_root=fixture.input_root,
         base_config=fixture.base_path,
         output_root=fixture.output_root,
         scan_offset=1,
+        chunk_rows=1,
     )
 
     assert len(factory_calls) == 1
@@ -1598,3 +1635,626 @@ def test_no_remove_or_qwen_modules_are_constructed_by_stage2_source() -> None:
     assert "QwenSam3AnchorSelector" not in source
     assert "build_sam3_segment_backend" in source
     assert "build_background_candidates" in source
+
+
+def test_execution_chunk_identity_is_fixed_contiguous_and_topology_independent(
+    tmp_path: Path,
+) -> None:
+    rows = tuple({"source_index": index} for index in range(10_000))
+    shard = AnnotationShard(
+        path=tmp_path / "shard-000000000-000009999.jsonl",
+        sha256="0" * 64,
+        nominal_start=0,
+        nominal_end=9_999,
+        rows=rows,
+    )
+
+    chunks = build_execution_chunks(shard)
+
+    assert DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS == 100
+    assert len(chunks) == 100
+    assert chunks[0].stem == "chunk-000000000-000000099"
+    assert chunks[-1].stem == "chunk-000009900-000009999"
+    assert all(chunk.row_count == 100 for chunk in chunks)
+    assert all(
+        left.source_index_end + 1 == right.source_index_start
+        and left.row_offset_end == right.row_offset_start
+        for left, right in pairwise(chunks)
+    )
+    assert chunks == build_execution_chunks(shard)
+
+
+def test_execution_chunk_partial_final_shard_has_short_last_chunk(
+    tmp_path: Path,
+) -> None:
+    rows = tuple({"source_index": 10_000 + index} for index in range(205))
+    shard = AnnotationShard(
+        path=tmp_path / "shard-000010000-000019999.jsonl",
+        sha256="0" * 64,
+        nominal_start=10_000,
+        nominal_end=19_999,
+        rows=rows,
+    )
+
+    chunks = build_execution_chunks(shard)
+
+    assert [(chunk.source_index_start, chunk.source_index_end) for chunk in chunks] == [
+        (10_000, 10_099),
+        (10_100, 10_199),
+        (10_200, 10_204),
+    ]
+    assert [chunk.row_count for chunk in chunks] == [100, 100, 5]
+
+
+def test_chunk_claim_is_nonblocking_released_after_crash_and_reclaimable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, 0, status="failed"), _row(fixture, 1, status="failed")],
+    )
+    shard = load_annotation_shard(shard_path)
+    first, second = build_execution_chunks(shard, chunk_rows=1)
+    lock_path = production._chunk_lock_path(fixture.output_root, shard, first)
+
+    with shard_lock(lock_path), pytest.raises(ShardBusyError):
+        process_execution_chunk(
+            shard,
+            first,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            backend=None,
+            chunk_rows=1,
+        )
+    with pytest.raises(RuntimeError, match="worker crash"), shard_lock(lock_path):
+        raise RuntimeError("worker crash")
+
+    first_result = process_execution_chunk(
+        shard,
+        first,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=1,
+    )
+    second_result = process_execution_chunk(
+        shard,
+        second,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=1,
+    )
+
+    assert first_result["chunk"] == first.stem
+    assert second_result["chunk"] == second.stem
+    assert first.stem != second.stem
+
+
+def test_claim_loop_skips_busy_chunk_and_work_steals_next(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, 0, status="failed"), _row(fixture, 1, status="failed")],
+    )
+    shard = load_annotation_shard(shard_path)
+    first, second = build_execution_chunks(shard, chunk_rows=1)
+    backend = FakeBackend()
+    monkeypatch.setattr(batch_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(
+        batch_tool, "enumerate_annotation_shards", lambda root: [shard_path]
+    )
+    monkeypatch.setattr(batch_tool, "default_backend_factory", lambda config: backend)
+    monkeypatch.setattr(
+        batch_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+    first_lock = production._chunk_lock_path(fixture.output_root, shard, first)
+
+    with shard_lock(first_lock):
+        initial = batch_tool.run_claim_loop(
+            input_root=fixture.input_root,
+            base_config=fixture.base_path,
+            output_root=fixture.output_root,
+            scan_offset=0,
+            chunk_rows=1,
+        )
+
+    assert initial["chunks_completed"] == 1
+    assert not execution_chunk_path(fixture.output_root, shard, first).exists()
+    assert execution_chunk_path(fixture.output_root, shard, second).is_file()
+    resumed = batch_tool.run_claim_loop(
+        input_root=fixture.input_root,
+        base_config=fixture.base_path,
+        output_root=fixture.output_root,
+        scan_offset=999,
+        chunk_rows=1,
+    )
+    assert resumed["chunks_completed"] == 1
+    assert (fixture.output_root / "parts" / shard_path.name).is_file()
+    assert backend.close_calls == 2
+
+
+def test_chunk_partial_resumes_and_truncates_incomplete_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, index, status="failed") for index in range(3)],
+    )
+    shard = load_annotation_shard(shard_path)
+    chunk = build_execution_chunks(shard, chunk_rows=3)[0]
+    first = process_execution_chunk(
+        shard,
+        chunk,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=3,
+    )
+    final = Path(first["path"])
+    first_line = final.read_bytes().splitlines(keepends=True)[0]
+    partial = final.with_name(f"{final.name}.partial")
+    final.unlink()
+    partial.write_bytes(first_line + b'{"source_index":1')
+
+    resumed = process_execution_chunk(
+        shard,
+        chunk,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=3,
+    )
+
+    assert resumed["resumed"] is True
+    assert [row["source_index"] for row in _read_jsonl(Path(resumed["path"]))] == [
+        0,
+        1,
+        2,
+    ]
+    assert not partial.exists()
+
+
+def test_chunk_partial_row_hash_and_config_mismatch_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0, status="failed")])
+    shard = load_annotation_shard(shard_path)
+    chunk = build_execution_chunks(shard, chunk_rows=1)[0]
+    result = process_execution_chunk(
+        shard,
+        chunk,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=1,
+    )
+    final = Path(result["path"])
+    partial = final.with_name(f"{final.name}.partial")
+    payload = _read_jsonl(final)[0]
+    payload["input_row_sha256"] = "f" * 64
+    final.unlink()
+    partial.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exact annotation prefix"):
+        process_execution_chunk(
+            shard,
+            chunk,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            backend=None,
+            chunk_rows=1,
+        )
+
+    partial.unlink()
+    other_path = fixture.writable / "other-base.yaml"
+    other_path.write_text("other: config\n", encoding="utf-8")
+    other_identity = replace(
+        fixture.identity,
+        path=other_path,
+        sha256=hashlib.sha256(other_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        process_execution_chunk(
+            shard,
+            chunk,
+            output_root=fixture.output_root,
+            config_identity=other_identity,
+            backend=None,
+            chunk_rows=1,
+        )
+
+
+def test_execution_chunk_size_identity_and_legacy_partial_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    ensure_execution_identity(fixture.output_root, chunk_rows=100)
+    with pytest.raises(ValueError, match="execution_chunk_rows"):
+        ensure_execution_identity(fixture.output_root, chunk_rows=50)
+
+    legacy_root = fixture.writable / "legacy-stage2"
+    partial = legacy_root / "parts" / "shard-000000000-000009999.jsonl.partial"
+    partial.parent.mkdir(parents=True)
+    partial.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="legacy unfinished whole-shard"):
+        ensure_execution_identity(legacy_root, chunk_rows=100)
+
+
+def test_chunk_compaction_is_canonical_and_incomplete_chunks_do_not_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, index, status="failed") for index in range(3)],
+        nominal_end=9_999,
+    )
+    shard = load_annotation_shard(shard_path)
+    chunks = build_execution_chunks(shard, chunk_rows=1)
+    for chunk in chunks[:2]:
+        process_execution_chunk(
+            shard,
+            chunk,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            backend=None,
+            chunk_rows=1,
+        )
+    assert compact_execution_chunks(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        chunk_rows=1,
+    ) is None
+    assert not (fixture.output_root / "parts" / shard.path.name).exists()
+
+    process_execution_chunk(
+        shard,
+        chunks[2],
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=1,
+    )
+    compacted = compact_execution_chunks(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        chunk_rows=1,
+    )
+    assert compacted is not None
+    canonical = Path(compacted["path"])
+    rows = _read_jsonl(canonical)
+    assert canonical.name == shard.path.name
+    assert [row["source_index"] for row in rows] == [0, 1, 2]
+    assert {row["schema_version"] for row in rows} == {
+        production.STAGE2_SCHEMA_VERSION
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_index", 999),
+        ("input_row_sha256", "f" * 64),
+    ],
+)
+def test_chunk_compaction_rejects_wrong_source_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, index, status="failed") for index in range(2)],
+    )
+    shard = load_annotation_shard(shard_path)
+    chunks = build_execution_chunks(shard, chunk_rows=1)
+    for chunk in chunks:
+        process_execution_chunk(
+            shard,
+            chunk,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            backend=None,
+            chunk_rows=1,
+        )
+    corrupt = execution_chunk_path(fixture.output_root, shard, chunks[1])
+    payload = _read_jsonl(corrupt)[0]
+    payload[field] = value
+    corrupt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exact annotation prefix"):
+        compact_execution_chunks(
+            shard,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            chunk_rows=1,
+        )
+
+
+def test_chunk_compaction_rejects_duplicate_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, index, status="failed") for index in range(2)],
+    )
+    shard = load_annotation_shard(shard_path)
+    chunks = build_execution_chunks(shard, chunk_rows=1)
+    for chunk in chunks:
+        process_execution_chunk(
+            shard,
+            chunk,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            backend=None,
+            chunk_rows=1,
+        )
+    first_payload = execution_chunk_path(
+        fixture.output_root, shard, chunks[0]
+    ).read_bytes()
+    execution_chunk_path(fixture.output_root, shard, chunks[1]).write_bytes(
+        first_payload
+    )
+
+    with pytest.raises(ValueError, match="exact annotation prefix"):
+        compact_execution_chunks(
+            shard,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            chunk_rows=1,
+        )
+
+
+def test_compaction_lock_is_nonblocking_and_single_publisher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0, status="failed")])
+    shard = load_annotation_shard(shard_path)
+    chunk = build_execution_chunks(shard, chunk_rows=1)[0]
+    process_execution_chunk(
+        shard,
+        chunk,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=1,
+    )
+    lock_path = production._compaction_lock_path(fixture.output_root, shard)
+    with shard_lock(lock_path), pytest.raises(ShardBusyError):
+        compact_execution_chunks(
+            shard,
+            output_root=fixture.output_root,
+            config_identity=fixture.identity,
+            chunk_rows=1,
+        )
+    published = compact_execution_chunks(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        chunk_rows=1,
+    )
+    skipped = compact_execution_chunks(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        chunk_rows=1,
+    )
+    assert published is not None and published["skipped"] is False
+    assert skipped is not None and skipped["skipped"] is True
+
+
+def test_chunk_strategy_preserves_artifact_and_canonical_interfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard = _write_shard(fixture, [_row(fixture, 0)])
+
+    result = process_shard(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=FakeBackend(),
+        decoder=FakeDecoder(),
+        chunk_rows=1,
+    )
+    row = _read_jsonl(Path(result["path"]))[0]
+
+    assert Path(result["path"]) == fixture.output_root / "parts" / shard.name
+    assert row["artifact_root"] == f"artifacts/{shard.stem}/clip-0"
+    assert "chunk" not in row["artifact_root"]
+    assert row["schema_version"] == production.STAGE2_SCHEMA_VERSION
+
+
+def test_prepare_canary_resume_loads_each_unique_shard_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_canary_shards(fixture)
+    base = _write_loadable_config(fixture)
+    output = fixture.writable / "canary" / "cached-parent"
+    prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=[str(index) for index in range(8)],
+        canary_shards=16,
+        samples_per_shard=5,
+    )
+    original = production.load_annotation_shard
+    calls: list[Path] = []
+
+    def counting_load(path: str | Path) -> AnnotationShard:
+        calls.append(Path(path).resolve())
+        return original(path)
+
+    monkeypatch.setattr(production, "load_annotation_shard", counting_load)
+    prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=[str(index) for index in range(8)],
+        canary_shards=16,
+        samples_per_shard=5,
+    )
+
+    assert len(calls) == 16
+    assert len(set(calls)) == 16
+
+
+def test_canary_worker_loads_each_unique_shard_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    for shard_index in range(2):
+        start = shard_index * 10_000
+        _write_shard(
+            fixture,
+            [_row(fixture, start + offset) for offset in range(5)],
+            nominal_end=start + 9_999,
+        )
+    base = _write_loadable_config(fixture)
+    output = fixture.writable / "canary" / "cached-worker"
+    manifest, selection = prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=["0"],
+        canary_shards=2,
+        samples_per_shard=5,
+    )
+    original = production.load_annotation_shard
+    calls: list[Path] = []
+
+    def counting_load(path: str | Path) -> AnnotationShard:
+        calls.append(Path(path).resolve())
+        return original(path)
+
+    def terminal(**kwargs: object) -> production.Stage2Row:
+        row = kwargs["row"]
+        shard = kwargs["shard"]
+        assert isinstance(row, dict)
+        assert isinstance(shard, AnnotationShard)
+        return production.Stage2Row(
+            source_index=int(row["source_index"]),
+            clip_uid=str(row["clip_uid"]),
+            input_annotation_shard=str(shard.path),
+            input_annotation_shard_sha256=shard.sha256,
+            input_row_sha256=production._row_sha256(row),
+            status="coverage_rejected",
+            annotation_entity_count=1,
+            coverage_passed=False,
+        )
+
+    monkeypatch.setattr(production, "load_annotation_shard", counting_load)
+    monkeypatch.setattr(production, "process_ready_clip", terminal)
+    result = run_canary_worker(
+        output_root=output,
+        manifest=manifest,
+        selection=selection,
+        gpu_slot=0,
+        backend=FakeBackend(),
+    )
+
+    assert result["completed"] == 10
+    assert len(calls) == 2
+    assert len(set(calls)) == 2
+
+
+def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    inventory_calls = 0
+
+    class Process:
+        def wait(self) -> int:
+            return 0
+
+    def fake_inventory(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal inventory_calls
+        del args, kwargs
+        inventory_calls += 1
+        return {"stage1_total_rows": 123}
+
+    monkeypatch.setattr(auto_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(auto_tool, "enumerate_annotation_shards", lambda root: [])
+    monkeypatch.setattr(auto_tool, "inventory", fake_inventory)
+    monkeypatch.setattr(
+        auto_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+    monkeypatch.setattr(auto_tool.subprocess, "Popen", lambda *args, **kwargs: Process())
+
+    normal = auto_tool.main(
+        [
+            "--input-root",
+            str(fixture.input_root),
+            "--base-config",
+            str(fixture.base_path),
+            "--output-root",
+            str(fixture.output_root),
+            "--gpus",
+            "0",
+        ]
+    )
+    assert inventory_calls == 0
+    assert normal["worker_exit_codes"] == [0]
+
+    dry = auto_tool.main(
+        [
+            "--input-root",
+            str(fixture.input_root),
+            "--base-config",
+            str(fixture.base_path),
+            "--output-root",
+            str(fixture.output_root),
+            "--gpus",
+            "0",
+            "--dry-run",
+        ]
+    )
+    assert inventory_calls == 1
+    assert dry["stage1_total_rows"] == 123
+
+
+def test_stage2_orchestration_keeps_frozen_visual_file_hashes() -> None:
+    repository = Path(production.__file__).resolve().parents[2]
+    expected = {
+        "frames.py": "3f527c834205cd53de4587e1390afed932944291836ee81dc9c5af426c9efefc",
+        "segment.py": "65c3b3ec99e710cafb7c97bbc9f813ef915deb40b617bc6c0f9309b38fe31f92",
+        "sam3_backend.py": "67ea1794983a4a04b604a1a5162b0e98f17688f9403192d43ec55840b4d453a3",
+        "sam3_anchor_selector.py": "4011e01580bcf55b20bc131683d8f3a7cf25bdfc07ef4817894d97a7fdb18552",
+        "rank.py": "e93129bdbac660f45e2b970733c5e7bbf83637db01a127a789554ae9a9c6cf86",
+        "background.py": "2231a4e40b6172e053932c84b4041e3d866d2db90f07e18be1d7db4765aabb68",
+    }
+
+    for name, digest in expected.items():
+        path = repository / "r2v_data_v2" / "v3" / name
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
