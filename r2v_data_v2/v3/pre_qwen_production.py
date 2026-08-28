@@ -256,11 +256,30 @@ class ConfigIdentity:
     config: V3Config
 
 
+@dataclass(frozen=True)
+class FramePrefetchTask:
+    input_annotation_shard: str
+    input_annotation_shard_sha256: str
+    nominal_start: int
+    nominal_end: int
+    row: dict[str, object]
+
+
+@dataclass(frozen=True)
+class FramePreparationResult:
+    checkpoint: ClipCheckpoint
+    built: bool
+
+
 class RetryableStageError(RuntimeError):
     def __init__(self, stage: str, reason: str) -> None:
         super().__init__(reason)
         self.stage = stage
         self.reason = reason
+
+
+class DeterministicFrameBuildError(ValueError):
+    pass
 
 
 class ShardBusyError(RuntimeError):
@@ -269,6 +288,10 @@ class ShardBusyError(RuntimeError):
 
 class BackendFactory(Protocol):
     def __call__(self, config: V3Config) -> SegmentationBackend: ...
+
+
+_FRAME_PREFETCH_CONFIG_IDENTITY: ConfigIdentity | None = None
+_FRAME_PREFETCH_OUTPUT_ROOT: Path | None = None
 
 
 def _utc_now() -> str:
@@ -530,6 +553,75 @@ def enumerate_annotation_shards(input_root: str | Path) -> list[Path]:
     return sorted(paths, key=lambda path: _shard_bounds(path)[0])
 
 
+def iter_frame_prefetch_tasks(
+    shard_paths: Sequence[str | Path],
+) -> Iterator[FramePrefetchTask]:
+    for path in shard_paths:
+        shard = load_annotation_shard(path)
+        for row in shard.rows:
+            annotation = _annotation_state(row)
+            if annotation.status != "ready" or not annotation.entities:
+                continue
+            yield FramePrefetchTask(
+                input_annotation_shard=str(shard.path),
+                input_annotation_shard_sha256=shard.sha256,
+                nominal_start=shard.nominal_start,
+                nominal_end=shard.nominal_end,
+                row=row,
+            )
+
+
+def initialize_frame_prefetch_worker(
+    base_config: str | Path,
+    output_root: str | Path,
+) -> None:
+    global _FRAME_PREFETCH_CONFIG_IDENTITY, _FRAME_PREFETCH_OUTPUT_ROOT
+    _FRAME_PREFETCH_CONFIG_IDENTITY = load_config_identity(base_config)
+    validate_stage2_preflight(_FRAME_PREFETCH_CONFIG_IDENTITY.config)
+    _FRAME_PREFETCH_OUTPUT_ROOT = _safe_output_root(output_root)
+
+
+def run_frame_prefetch_task(task: FramePrefetchTask) -> dict[str, object]:
+    identity = _FRAME_PREFETCH_CONFIG_IDENTITY
+    output_root = _FRAME_PREFETCH_OUTPUT_ROOT
+    row = task.row
+    clip_uid = row.get("clip_uid")
+    base = {
+        "source_index": row.get("source_index"),
+        "clip_uid": clip_uid,
+        "input_annotation_shard": task.input_annotation_shard,
+    }
+    if identity is None or output_root is None:
+        return {**base, "status": "failed", "reason": "prefetch worker is uninitialized"}
+    try:
+        shard_path = Path(task.input_annotation_shard).resolve(strict=True)
+        # The parent freezes the completed shard SHA once while selecting tasks.
+        # Re-hashing a large logical shard for every clip would defeat prefetch.
+        # The authoritative SAM/chunk path still verifies the live shard before
+        # canonical publication, while this best-effort task writes frames only.
+        shard = AnnotationShard(
+            path=shard_path,
+            sha256=task.input_annotation_shard_sha256,
+            nominal_start=task.nominal_start,
+            nominal_end=task.nominal_end,
+            rows=(row,),
+        )
+        workspace = output_root / "artifacts" / shard.path.stem / str(clip_uid)
+        result = prepare_clip_frames(
+            row=row,
+            shard=shard,
+            output_root=output_root,
+            workspace=workspace,
+            config_identity=identity,
+        )
+    except Exception as exc:  # noqa: BLE001 - prefetch is best-effort only
+        return {**base, "status": "failed", "reason": str(exc)}
+    return {
+        **base,
+        "status": "completed" if result.built else "skipped_existing",
+    }
+
+
 def build_execution_chunks(
     shard: AnnotationShard,
     *,
@@ -633,6 +725,14 @@ def _chunk_lock_path(
 
 def _compaction_lock_path(output_root: Path, shard: AnnotationShard) -> Path:
     return output_root / "locks" / f"compact-{shard.path.stem}.lock"
+
+
+def frame_lock_path(
+    output_root: Path,
+    shard: AnnotationShard,
+    clip_uid: str,
+) -> Path:
+    return output_root / "locks" / shard.path.stem / "frames" / f"{clip_uid}.lock"
 
 
 def _clip_source(row: dict[str, object], video_path: Path) -> ClipSource:
@@ -802,6 +902,87 @@ def _terminal_from_storage(
     )
 
 
+def prepare_clip_frames(
+    *,
+    row: dict[str, object],
+    shard: AnnotationShard,
+    output_root: Path,
+    workspace: Path,
+    config_identity: ConfigIdentity,
+    decoder: FrameDecoder | None = None,
+) -> FramePreparationResult:
+    annotation = _annotation_state(row)
+    if annotation.status != "ready" or not annotation.entities:
+        raise ValueError("frame preparation requires ready entities")
+    _validate_live_config_identity(config_identity)
+    video_path = _validate_video_path(row.get("video_path"))
+    clip_uid = str(row["clip_uid"])
+    root = _safe_output_root(output_root)
+    resolved_workspace = workspace.resolve(strict=False)
+    if root not in resolved_workspace.parents:
+        raise ValueError("frame workspace escaped Stage2 output_root")
+    with shard_lock(frame_lock_path(root, shard, clip_uid), blocking=True):
+        checkpoint = _read_checkpoint(resolved_workspace)
+        if checkpoint is not None:
+            _validate_checkpoint_identity(
+                checkpoint,
+                row=row,
+                shard_sha256=shard.sha256,
+                config_identity=config_identity,
+            )
+        elif resolved_workspace.exists() and any(resolved_workspace.iterdir()):
+            raise ValueError("clip workspace is non-empty without a checkpoint")
+
+        config = _workspace_config(config_identity.config, resolved_workspace)
+        storage = RunStorage(config)
+        if checkpoint is None:
+            storage.initialize(git_commit=VISUAL_ALGORITHM_FREEZE)
+            storage.create_clip(
+                clip_uid=clip_uid,
+                source=_clip_source(row, video_path),
+            )
+            storage.write_annotation(clip_uid, annotation)
+            checkpoint = _write_checkpoint(
+                resolved_workspace,
+                stage="annotation_ready",
+                row=row,
+                shard_sha256=shard.sha256,
+                config_identity=config_identity,
+            )
+
+        if _STAGES[checkpoint.stage] >= _STAGES["frames_ready"]:
+            validate_sampled_frames(storage, clip_uid)
+            return FramePreparationResult(checkpoint=checkpoint, built=False)
+
+        manifest = storage.frames_manifest_path(clip_uid)
+        if manifest.is_file():
+            validate_sampled_frames(storage, clip_uid)
+            built = False
+        else:
+            try:
+                _build_clip_frames(
+                    config,
+                    storage,
+                    clip_uid=clip_uid,
+                    video_path=video_path,
+                    decoder=decoder or OpenCvFrameDecoder(),
+                )
+            except ValueError as exc:
+                raise DeterministicFrameBuildError(str(exc)) from exc
+            except Exception as exc:
+                raise RetryableStageError("frames", str(exc)) from exc
+            validate_sampled_frames(storage, clip_uid)
+            built = True
+        checkpoint = _write_checkpoint(
+            resolved_workspace,
+            stage="frames_ready",
+            row=row,
+            shard_sha256=shard.sha256,
+            config_identity=config_identity,
+        )
+        return FramePreparationResult(checkpoint=checkpoint, built=built)
+
+
 def process_ready_clip(
     *,
     row: dict[str, object],
@@ -815,72 +996,31 @@ def process_ready_clip(
     annotation = _annotation_state(row)
     if annotation.status != "ready" or not annotation.entities:
         raise ValueError("process_ready_clip requires ready entities")
-    video_path = _validate_video_path(row.get("video_path"))
-    checkpoint = _read_checkpoint(workspace)
-    if checkpoint is not None:
-        _validate_checkpoint_identity(
-            checkpoint,
+    clip_uid = str(row["clip_uid"])
+    try:
+        prepared = prepare_clip_frames(
             row=row,
-            shard_sha256=shard.sha256,
+            shard=shard,
+            output_root=output_root,
+            workspace=workspace,
             config_identity=config_identity,
+            decoder=decoder,
         )
-    elif workspace.exists() and any(workspace.iterdir()):
-        raise ValueError("clip workspace is non-empty without a checkpoint")
-
+    except DeterministicFrameBuildError as exc:
+        return Stage2Row(
+            source_index=int(row["source_index"]),
+            clip_uid=clip_uid,
+            input_annotation_shard=str(shard.path),
+            input_annotation_shard_sha256=shard.sha256,
+            input_row_sha256=_row_sha256(row),
+            status="failed_frames",
+            artifact_root=_artifact_relative(output_root, workspace),
+            annotation_entity_count=len(annotation.entities),
+            reason=str(exc),
+        )
+    checkpoint = prepared.checkpoint
     config = _workspace_config(config_identity.config, workspace)
     storage = RunStorage(config)
-    if checkpoint is None:
-        storage.initialize(git_commit=VISUAL_ALGORITHM_FREEZE)
-        storage.create_clip(
-            clip_uid=str(row["clip_uid"]),
-            source=_clip_source(row, video_path),
-        )
-        storage.write_annotation(str(row["clip_uid"]), annotation)
-        checkpoint = _write_checkpoint(
-            workspace,
-            stage="annotation_ready",
-            row=row,
-            shard_sha256=shard.sha256,
-            config_identity=config_identity,
-        )
-    clip_uid = str(row["clip_uid"])
-
-    if _STAGES[checkpoint.stage] < _STAGES["frames_ready"]:
-        manifest = storage.frames_manifest_path(clip_uid)
-        if manifest.is_file():
-            validate_sampled_frames(storage, clip_uid)
-        else:
-            try:
-                _build_clip_frames(
-                    config,
-                    storage,
-                    clip_uid=clip_uid,
-                    video_path=video_path,
-                    decoder=decoder or OpenCvFrameDecoder(),
-                )
-            except ValueError as exc:
-                return Stage2Row(
-                    source_index=int(row["source_index"]),
-                    clip_uid=clip_uid,
-                    input_annotation_shard=str(shard.path),
-                    input_annotation_shard_sha256=shard.sha256,
-                    input_row_sha256=_row_sha256(row),
-                    status="failed_frames",
-                    artifact_root=_artifact_relative(output_root, workspace),
-                    annotation_entity_count=len(annotation.entities),
-                    reason=str(exc),
-                )
-            except Exception as exc:
-                raise RetryableStageError("frames", str(exc)) from exc
-        checkpoint = _write_checkpoint(
-            workspace,
-            stage="frames_ready",
-            row=row,
-            shard_sha256=shard.sha256,
-            config_identity=config_identity,
-        )
-    else:
-        validate_sampled_frames(storage, clip_uid)
 
     if _STAGES[checkpoint.stage] < _STAGES["masks_ready"]:
         if storage.masks_path(clip_uid).is_file():

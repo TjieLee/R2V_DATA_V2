@@ -3,6 +3,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
@@ -2408,6 +2411,8 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     )
     assert inventory_calls == 0
     assert normal["worker_exit_codes"] == [0]
+    assert normal["frame_prefetch_workers"] == 0
+    assert normal["frame_prefetch_submitted"] == 0
     idle_flag = commands[0].index("--idle-exit-seconds")
     assert commands[0][idle_flag + 1] == "60.0"
 
@@ -2426,6 +2431,325 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     )
     assert inventory_calls == 1
     assert dry["stage1_total_rows"] == 123
+
+
+def test_frame_prefetch_uses_frozen_frame_builder_and_exact_frame_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard_path = _write_shard(fixture, [row])
+    shard = load_annotation_shard(shard_path)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    decoder = FakeDecoder()
+    original = production._build_clip_frames
+    calls: list[dict[str, object]] = []
+
+    def recording_builder(
+        config: V3Config,
+        storage: object,
+        **kwargs: object,
+    ) -> object:
+        calls.append(
+            {
+                "frames": config.frames,
+                "clip_uid": kwargs["clip_uid"],
+                "video_path": kwargs["video_path"],
+                "decoder": kwargs["decoder"],
+            }
+        )
+        return original(config, storage, **kwargs)
+
+    monkeypatch.setattr(production, "_build_clip_frames", recording_builder)
+    prepared = production.prepare_clip_frames(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        decoder=decoder,
+    )
+    storage = production.RunStorage(
+        production._workspace_config(fixture.config, workspace)
+    )
+    frames = production.validate_sampled_frames(storage, "clip-0")
+
+    assert prepared.built is True
+    assert prepared.checkpoint.stage == "frames_ready"
+    assert calls == [
+        {
+            "frames": fixture.config.frames,
+            "clip_uid": "clip-0",
+            "video_path": fixture.dataset / "clips" / "clip-0.mp4",
+            "decoder": decoder,
+        }
+    ]
+    assert len(frames.frames) == 10
+
+
+def test_prefetched_frames_ready_is_reused_by_sam_without_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard_path = _write_shard(fixture, [row])
+    shard = load_annotation_shard(shard_path)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    prefetch_decoder = FakeDecoder()
+    production.prepare_clip_frames(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        decoder=prefetch_decoder,
+    )
+    sam_decoder = FakeDecoder()
+    backend = FakeBackend()
+
+    result = process_ready_clip(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        backend=backend,
+        decoder=sam_decoder,
+    )
+
+    assert prefetch_decoder.calls
+    assert sam_decoder.calls == []
+    assert backend.calls == ["e1"]
+    assert result.status == "ready_no_background"
+
+
+def test_prefetch_and_sam_frame_race_builds_frames_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard_path = _write_shard(fixture, [row])
+    shard = load_annotation_shard(shard_path)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    original = production._build_clip_frames
+    build_calls = 0
+    counter_lock = threading.Lock()
+
+    def slow_builder(
+        config: V3Config,
+        storage: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal build_calls
+        with counter_lock:
+            build_calls += 1
+        time.sleep(0.05)
+        return original(config, storage, **kwargs)
+
+    monkeypatch.setattr(production, "_build_clip_frames", slow_builder)
+
+    def prepare() -> production.FramePreparationResult:
+        return production.prepare_clip_frames(
+            row=row,
+            shard=shard,
+            output_root=fixture.output_root,
+            workspace=workspace,
+            config_identity=fixture.identity,
+            decoder=FakeDecoder(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: prepare(), range(2)))
+
+    assert build_calls == 1
+    assert sorted(result.built for result in results) == [False, True]
+    assert all(result.checkpoint.stage == "frames_ready" for result in results)
+
+
+def test_existing_frames_ready_prefetch_skips_and_validates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard_path = _write_shard(fixture, [row])
+    shard = load_annotation_shard(shard_path)
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    first = production.prepare_clip_frames(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        decoder=FakeDecoder(),
+    )
+    second_decoder = FakeDecoder()
+    second = production.prepare_clip_frames(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        decoder=second_decoder,
+    )
+
+    assert first.built is True
+    assert second.built is False
+    assert second_decoder.calls == []
+
+
+def test_prefetch_failure_is_diagnostic_only_and_sam_sync_fallback_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard_path = _write_shard(fixture, [row])
+    task = next(production.iter_frame_prefetch_tasks([shard_path]))
+    monkeypatch.setattr(
+        production,
+        "_FRAME_PREFETCH_CONFIG_IDENTITY",
+        fixture.identity,
+    )
+    monkeypatch.setattr(
+        production,
+        "_FRAME_PREFETCH_OUTPUT_ROOT",
+        fixture.output_root,
+    )
+    original = production.prepare_clip_frames
+    monkeypatch.setattr(
+        production,
+        "prepare_clip_frames",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("decode unavailable")),
+    )
+
+    diagnostic = production.run_frame_prefetch_task(task)
+
+    assert diagnostic["status"] == "failed"
+    assert "decode unavailable" in str(diagnostic["reason"])
+    assert not list((fixture.output_root / "parts").glob("*.jsonl"))
+
+    monkeypatch.setattr(production, "prepare_clip_frames", original)
+    result = process_shard(
+        shard_path,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=FakeBackend(),
+        decoder=FakeDecoder(),
+        chunk_rows=1,
+    )
+    assert Path(result["path"]).name == shard_path.name
+
+
+def test_prefetch_task_identity_is_clip_level_and_independent_of_chunk_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [
+            _row(fixture, 0),
+            _row(fixture, 1, status="failed"),
+            _row(fixture, 2, entities=0),
+            _row(fixture, 3),
+        ],
+    )
+    shard = load_annotation_shard(shard_path)
+    tasks = list(production.iter_frame_prefetch_tasks([shard_path]))
+
+    assert [task.row["source_index"] for task in tasks] == [0, 3]
+    assert [task.row["clip_uid"] for task in tasks] == ["clip-0", "clip-3"]
+    assert all(task.input_annotation_shard_sha256 == shard.sha256 for task in tasks)
+    assert [task.row["source_index"] for task in tasks] == [
+        task.row["source_index"]
+        for task in production.iter_frame_prefetch_tasks([shard_path])
+    ]
+
+
+def test_auto_frame_prefetch_pool_is_once_per_node_not_per_gpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0)])
+    controllers: list[object] = []
+    commands: list[list[str]] = []
+
+    class Process:
+        def wait(self) -> int:
+            return 0
+
+    class Controller:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.started = False
+            self.stopped = False
+            controllers.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop_and_join(self) -> dict[str, object]:
+            self.stopped = True
+            return {
+                "frame_prefetch_workers": 32,
+                "frame_prefetch_submitted": 1,
+                "frame_prefetch_completed": 1,
+                "frame_prefetch_skipped_existing": 0,
+                "frame_prefetch_failed": 0,
+                "frame_prefetch_wall_seconds": 0.5,
+            }
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        del kwargs
+        commands.append(command)
+        return Process()
+
+    monkeypatch.setattr(auto_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(
+        auto_tool, "enumerate_annotation_shards", lambda root: [shard_path]
+    )
+    monkeypatch.setattr(
+        auto_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+    monkeypatch.setattr(auto_tool, "_FramePrefetchController", Controller)
+    monkeypatch.setattr(auto_tool.subprocess, "Popen", popen)
+
+    result = auto_tool.main(
+        [
+            "--input-root",
+            str(fixture.input_root),
+            "--base-config",
+            str(fixture.base_path),
+            "--output-root",
+            str(fixture.output_root),
+            "--gpus",
+            "0,1,2,3,4,5,6,7",
+            "--frame-prefetch-workers",
+            "32",
+            "--chunk-rows",
+            "1",
+        ]
+    )
+
+    assert len(controllers) == 1
+    controller = controllers[0]
+    assert controller.kwargs["workers"] == 32
+    assert controller.kwargs["shard_paths"] == [shard_path]
+    assert controller.started is True
+    assert controller.stopped is True
+    assert len(commands) == 8
+    assert all("--frame-prefetch-workers" not in command for command in commands)
+    assert result["frame_prefetch_completed"] == 1
+    source = Path(auto_tool.__file__).read_text(encoding="utf-8")
+    assert "ProcessPoolExecutor" in source
+    assert "ThreadPoolExecutor" not in source
 
 
 def test_stage2_orchestration_keeps_frozen_visual_file_hashes() -> None:

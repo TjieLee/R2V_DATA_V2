@@ -253,6 +253,23 @@ The normal launcher performs only cheap shard enumeration plus config/Qwen
 health preflight before spawning workers; `--dry-run` retains the full
 inventory scan.
 
+Stage2 can optionally overlap the unchanged CPU frame stage with persistent
+SAM3 workers by adding `--frame-prefetch-workers 32` to the auto-launcher.
+The option defaults to `0`, so existing execution is unchanged unless it is
+explicitly enabled. One node-level `ProcessPoolExecutor` scans ready rows with
+non-empty entities and calls the frozen `_build_clip_frames` path for each
+clip. It writes the same workspace, ten JPEG frame artifact, and existing
+`frames_ready` checkpoint; it does not write Stage2 rows or run SAM3, coverage,
+background, or Qwen. A filesystem `flock` per clip serializes prefetch and SAM
+frame preparation across processes and nodes. SAM workers re-check under that
+lock, reuse validated prefetched frames when available, and otherwise retain
+the synchronous frame-build fallback. After GPU workers finish, the launcher
+stops and joins the CPU pool so no prefetch child remains orphaned. Individual
+prefetch failures are diagnostic only and are recorded in
+`logs/frame-prefetch.jsonl`; canonical Stage2 processing remains authoritative.
+The launcher summary reports `frame_prefetch_workers`, submitted, completed,
+skipped-existing, failed, and wall-seconds counters.
+
 ## Required isolated 8 x 10 canary
 
 Prepare exactly 80 eligible samples—ten per GPU—before formal production:
