@@ -20,12 +20,13 @@ from r2v_data_v2.v3.pre_qwen_production import (
     CanaryManifest,
     CanarySelectionRow,
     canary_summary,
+    check_stage2_candidate_judge_health,
     close_backend,
     default_backend_factory,
     load_config_identity,
     prepare_canary,
     run_canary_worker,
-    validate_qwen_free_preflight,
+    validate_stage2_preflight,
 )
 
 
@@ -82,8 +83,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             raise ValueError("canary worker slot is outside configured GPUs")
         os.environ["CUDA_VISIBLE_DEVICES"] = manifest.gpus[args.worker_slot]
         identity = load_config_identity(manifest.base_config_path)
-        validate_qwen_free_preflight(identity.config)
+        validate_stage2_preflight(identity.config)
         completed_path = args.output_root / "workers" / f"gpu-{args.worker_slot}.jsonl"
+        if not completed_path.is_file():
+            check_stage2_candidate_judge_health(identity.config)
         backend = None if completed_path.is_file() else default_backend_factory(identity.config)
         try:
             result = run_canary_worker(
@@ -122,14 +125,21 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             f"gpu{slot}": sum(item.gpu_slot == slot for item in selection)
             for slot in range(len(gpus))
         },
-        "qwen_required": False,
-        "qwen_calls": 0,
+        "sam3_multi_instance_rescue_mode": manifest.sam3_multi_instance_rescue_mode,
+        "sam3_anchor_qwen_enabled": manifest.sam3_anchor_qwen_enabled,
+        "candidate_judge_base_url": manifest.candidate_judge_base_url,
+        "candidate_judge_model": manifest.candidate_judge_model,
+        "annotation_qwen_calls": 0,
+        "background_remove_qwen_calls": 0,
         "duplicate_clip_uid_skipped": manifest.duplicate_clip_uid_skipped,
         "output_root": str(args.output_root.resolve(strict=False)),
     }
     if args.prepare_only:
         print(json.dumps(prepared, ensure_ascii=False, sort_keys=True))
         return prepared
+    service_health = check_stage2_candidate_judge_health(
+        load_config_identity(args.base_config).config
+    )
     started = time.perf_counter()
     processes: list[subprocess.Popen[bytes]] = []
     codes: list[int] = []
@@ -162,6 +172,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         for log in logs:
             log.close()
     summary = canary_summary(args.output_root, manifest)
+    summary.update(service_health)
     summary["elapsed_seconds"] = max(0.0, time.perf_counter() - started)
     summary["worker_exit_codes"] = codes
     write_json_atomic(args.output_root / "summary.json", summary)

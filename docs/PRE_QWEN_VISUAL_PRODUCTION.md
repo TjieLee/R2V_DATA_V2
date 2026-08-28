@@ -6,6 +6,7 @@ Visual Stage 2 is a production wrapper around these frozen Visual V3 stages:
 standalone AnnotationState shard
 -> exactly 10 sampled frames
 -> SAM3 entity segment/tracking
+   -> frozen QwenSam3AnchorSelector on multi-instance ambiguity
 -> temporal coverage/rank
 -> deterministic background candidate construction
 -> stop before remove
@@ -14,22 +15,35 @@ standalone AnnotationState shard
 It never runs Qwen Annotation, remove, Boogu, a Qwen remove judge, pair,
 reference edit, reference integrity, instruction, Subject Attributes, or export.
 It directly reuses `frames.py`, `segment.py`, `rank.py`, and `background.py`.
+Here “Pre-Qwen” means stopping before the next standalone/downstream Qwen
+business stage (the Remove Judge); it does not mean zero Qwen calls. The
+targeted `QwenSam3AnchorSelector` remains part of the frozen SAM3 algorithm.
 
-## Qwen-free preflight
+## Frozen SAM3 and candidate-judge preflight
 
 Production and canary commands validate the exact base config before loading a
-GPU model. They inspect all SAM3 rescue/search modes. If
-`multi_instance_rescue_mode=qwen_anchor_select_v1`, startup fails with:
+GPU model. The production config keeps:
 
-```text
-Pre-Qwen Stage2 is not Qwen-free under current frozen SAM3 config.
+```yaml
+sam3:
+  multi_instance_rescue_mode: qwen_anchor_select_v1
+qwen:
+  candidate_judge:
+    base_url: http://6.167.57.88:8000/v1
 ```
 
-The runner never changes this mode to `off`. The formal production config
-documented elsewhere as `e2e1000-s0-samfix-20260814-101818.yaml` uses the Qwen
-anchor selector and is intentionally rejected. An explicitly approved frozen
-base config with Qwen-free SAM3 policy is required before canary or production.
-Successful metadata records `qwen_required=false` and `qwen_calls=0`.
+The runner neither disables nor reimplements this mode. It requires a valid
+`qwen.candidate_judge` service and performs a short `GET /models` availability
+check before loading SAM3. An unavailable gateway fails startup; there is no
+fallback to `off`. Metadata records the SAM3 rescue mode, logical candidate
+judge endpoint/model, and zero calls only for Annotation and Background Remove
+Qwen stages, which Stage2 does not run.
+
+The Qwen service node hosts eight TP1 replicas on ports 8001 through 8008 behind
+one OpenAI-compatible gateway at port 8000. The gateway should use least
+connections and health-check its replicas. Every SAM worker on every node uses
+the same logical `http://6.167.57.88:8000/v1` endpoint. GPU/rank topology never
+selects a replica or changes the durable config identity.
 
 ## Input and logical shard identity
 
@@ -148,7 +162,7 @@ Run one shard on one GPU:
 ```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python tools/run_v3_pre_qwen_batch.py \
   --input-shard /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_annotations/parts/shard-000000000-000009999.jsonl \
-  --base-config /absolute/path/to/qwen-free-frozen-base.yaml \
+  --base-config /absolute/path/to/frozen-production-base.yaml \
   --output-root /mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1 \
   --gpu 0
 ```
@@ -158,7 +172,7 @@ Dry-run does not load SAM3:
 ```bash
 .venv/bin/python tools/run_v3_pre_qwen_auto.py \
   --input-root /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_annotations \
-  --base-config /absolute/path/to/qwen-free-frozen-base.yaml \
+  --base-config /absolute/path/to/frozen-production-base.yaml \
   --output-root /mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1 \
   --gpus 0,1,2,3 \
   --dry-run
@@ -180,8 +194,8 @@ Prepare exactly 80 eligible samples—ten per GPU—before formal production:
 ```bash
 .venv/bin/python tools/run_v3_pre_qwen_canary.py \
   --input-root /mnt/workspace/public/dataset/jea-video/moive-183t-0808_processed/entity_annotations \
-  --base-config /absolute/path/to/qwen-free-frozen-base.yaml \
-  --output-root /mnt/workspace/litengjie/data/r2v_v3_pre_qwen_canary/preqwen-8x10-test \
+  --base-config /absolute/path/to/frozen-production-base.yaml \
+  --output-root /mnt/workspace/litengjie/data/r2v_v3_pre_qwen_canary/preqwen-8x10-qwen-anchor-20260828 \
   --gpus 0,1,2,3,4,5,6,7 \
   --canary-shards 16 \
   --samples-per-shard 5 \
@@ -194,9 +208,9 @@ five eligible rows in `source_index` order from each shard. Eligible means
 processed MP4. A short selected shard, duplicate cross-shard `clip_uid`, or a
 total not divisible by the GPU count fails closed; later shards never backfill
 the quota. Preparation writes `canary_manifest.json` and `selection.jsonl`,
-verifies selected MP4s, Stage 1 hashes, and Qwen-free policy, and does not load
-SAM3 or create artifacts. Repeating the exact command reuses the persisted
-selection; identity drift fails closed.
+verifies selected MP4s, Stage 1 hashes, and frozen SAM3/Qwen-anchor policy, and
+does not load SAM3 or create artifacts. Repeating the exact command reuses the
+persisted selection; identity drift fails closed.
 
 Remove `--prepare-only` to run. Canary output stays below
 `r2v_v3_pre_qwen_canary/<run-id>`, never uses production shard filenames, and
@@ -210,8 +224,17 @@ nonzero. `summary.json` separates row completion (`status`) from
 `functional_status`: functional pass requires all 80 selections complete, no
 outstanding retryable work, and zero `failed_input` or `failed_frames` rows.
 Coverage rejection and missing/rejected background are valid business outcomes.
-The summary also reports SAM3/coverage/background counts, zero Qwen calls,
-elapsed time, and frame/mask/total bytes for storage sizing.
+The summary reports SAM3/coverage/background counts, process-delta anchor/rescue
+counters, logical candidate-judge identity, elapsed time, and frame/mask/total
+bytes for storage sizing. Annotation and Background Remove Qwen call counts stay
+zero; targeted SAM3 anchor Qwen calls are represented by frozen profiling and
+multi-instance rescue counters.
+
+The earlier `preqwen-8x10-20260828` run used
+`multi_instance_rescue_mode=off`. Preserve it as runner/checkpoint evidence, but
+do not treat or resume its masks as frozen production-semantics results. Use the
+new output root above; the deterministic 16-by-5 selection produces the same 80
+samples for A/B comparison while the changed config identity prevents reuse.
 
 Real SAM3/GPU execution remains a server validation step and is not performed
 by local unit tests.

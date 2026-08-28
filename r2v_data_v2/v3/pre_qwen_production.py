@@ -7,12 +7,14 @@ import os
 import re
 import shutil
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -48,9 +50,9 @@ from r2v_data_v2.v3.storage import RunStorage
 
 VISUAL_ALGORITHM_FREEZE = "d056c32b76db4b3d7c0358b38e996e7a91a288d1"
 STAGE2_SCHEMA_VERSION = "r2v.v3.pre_qwen_stage2.1"
-STAGE2_META_SCHEMA_VERSION = "r2v.v3.pre_qwen_shard_meta.1"
+STAGE2_META_SCHEMA_VERSION = "r2v.v3.pre_qwen_shard_meta.2"
 CLIP_CHECKPOINT_SCHEMA_VERSION = "r2v.v3.pre_qwen_clip_checkpoint.1"
-CANARY_SCHEMA_VERSION = "r2v.v3.pre_qwen_canary.1"
+CANARY_SCHEMA_VERSION = "r2v.v3.pre_qwen_canary.2"
 DEFAULT_PRODUCTION_OUTPUT_ROOT = Path(
     "/mnt/workspace/litengjie/data/r2v_v3_stage2/jea_motion_v1/pre-qwen-v1"
 )
@@ -67,6 +69,16 @@ _STAGES = {
     "background_ready": 4,
     "row_committed": 5,
 }
+_SAM3_BACKEND_COUNTER_NAMES = (
+    "anchor_probe_calls",
+    "anchor_fast_path_hits",
+    "anchor_fallback_attempted",
+    "anchor_fallback_hits",
+    "anchor_all_frames_not_found",
+    "multi_instance_rescue_attempted",
+    "multi_instance_rescue_selected",
+    "multi_instance_rescue_rejected",
+)
 
 TerminalStatus = Literal[
     "skipped_annotation_failed",
@@ -151,7 +163,7 @@ class CanarySelectionRow(StrictModel):
 
 
 class CanaryManifest(StrictModel):
-    schema_version: Literal["r2v.v3.pre_qwen_canary.1"] = CANARY_SCHEMA_VERSION
+    schema_version: Literal["r2v.v3.pre_qwen_canary.2"] = CANARY_SCHEMA_VERSION
     input_root: str
     base_config_path: str
     base_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -171,8 +183,12 @@ class CanaryManifest(StrictModel):
     selected_shard_names: list[str]
     duplicate_clip_uid_skipped: int = Field(default=0, ge=0)
     selection_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    qwen_required: Literal[False] = False
-    qwen_calls: Literal[0] = 0
+    sam3_multi_instance_rescue_mode: str
+    sam3_anchor_qwen_enabled: bool
+    candidate_judge_base_url: str | None
+    candidate_judge_model: str | None
+    annotation_qwen_calls: Literal[0] = 0
+    background_remove_qwen_calls: Literal[0] = 0
     created_at: str
 
     @model_validator(mode="after")
@@ -187,6 +203,14 @@ class CanaryManifest(StrictModel):
             raise ValueError("canary selected_shard_names does not match shard count")
         if len(self.selected_shard_names) != len(set(self.selected_shard_names)):
             raise ValueError("canary selected_shard_names must be unique")
+        if self.sam3_anchor_qwen_enabled != (
+            self.sam3_multi_instance_rescue_mode == "qwen_anchor_select_v1"
+        ):
+            raise ValueError("canary SAM3 anchor Qwen metadata is inconsistent")
+        if self.sam3_anchor_qwen_enabled and (
+            not self.candidate_judge_base_url or not self.candidate_judge_model
+        ):
+            raise ValueError("canary anchor Qwen metadata requires service identity")
         return self
 
 
@@ -316,18 +340,66 @@ def _validate_live_config_identity(identity: ConfigIdentity) -> None:
         raise ValueError("base config changed after Stage2 startup")
 
 
-def validate_qwen_free_preflight(config: V3Config) -> dict[str, object]:
-    policy = {
-        "object_rescue_mode": config.sam3.object_rescue_mode,
-        "not_found_rescue_mode": config.sam3.not_found_rescue_mode,
-        "multi_instance_rescue_mode": config.sam3.multi_instance_rescue_mode,
-        "anchor_search_mode": config.sam3.anchor_search_mode,
-    }
-    if config.sam3.multi_instance_rescue_mode == "qwen_anchor_select_v1":
+def validate_stage2_preflight(config: V3Config) -> dict[str, object]:
+    config.validate()
+    anchor_qwen_enabled = (
+        config.sam3.multi_instance_rescue_mode == "qwen_anchor_select_v1"
+    )
+    service = config.qwen.candidate_judge if anchor_qwen_enabled else None
+    if anchor_qwen_enabled and service is None:
         raise ValueError(
-            "Pre-Qwen Stage2 is not Qwen-free under current frozen SAM3 config."
+            "qwen.candidate_judge is required when "
+            "sam3.multi_instance_rescue_mode is qwen_anchor_select_v1"
         )
-    return {**policy, "qwen_required": False, "qwen_calls": 0}
+    if service is not None:
+        parsed = urlparse(service.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("qwen.candidate_judge.base_url must be an HTTP URL")
+        if not service.model.strip():
+            raise ValueError("qwen.candidate_judge.model must be non-empty")
+    return {
+        "sam3_object_rescue_mode": config.sam3.object_rescue_mode,
+        "sam3_not_found_rescue_mode": config.sam3.not_found_rescue_mode,
+        "sam3_multi_instance_rescue_mode": config.sam3.multi_instance_rescue_mode,
+        "sam3_anchor_search_mode": config.sam3.anchor_search_mode,
+        "sam3_anchor_qwen_enabled": anchor_qwen_enabled,
+        "candidate_judge_base_url": service.base_url if service is not None else None,
+        "candidate_judge_model": service.model if service is not None else None,
+        "annotation_qwen_calls": 0,
+        "background_remove_qwen_calls": 0,
+    }
+
+
+def check_stage2_candidate_judge_health(
+    config: V3Config,
+    *,
+    opener: Callable[..., object] = urlopen,
+) -> dict[str, object]:
+    policy = validate_stage2_preflight(config)
+    if not policy["sam3_anchor_qwen_enabled"]:
+        return {"candidate_judge_health": "not_required"}
+    service = config.qwen.candidate_judge
+    assert service is not None
+    models_url = f"{service.base_url.rstrip('/')}/models"
+    request = Request(
+        models_url,
+        headers={"Authorization": f"Bearer {service.api_key}"},
+        method="GET",
+    )
+    try:
+        response = opener(request, timeout=min(5.0, float(service.timeout_seconds)))
+        with response:  # type: ignore[attr-defined]
+            status = getattr(response, "status", None)
+            if not isinstance(status, int) or not 200 <= status < 300:
+                raise RuntimeError(f"candidate judge health returned HTTP {status}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"candidate judge service unavailable at {models_url}: {exc}"
+        ) from exc
+    return {
+        "candidate_judge_health": "available",
+        "candidate_judge_models_url": models_url,
+    }
 
 
 def _shard_bounds(path: Path) -> tuple[int, int]:
@@ -837,6 +909,7 @@ def _expected_meta(
     shard: AnnotationShard,
     config_identity: ConfigIdentity,
 ) -> dict[str, object]:
+    policy = validate_stage2_preflight(config_identity.config)
     return {
         "schema_version": STAGE2_META_SCHEMA_VERSION,
         "input_annotation_shard": str(shard.path),
@@ -854,8 +927,7 @@ def _expected_meta(
         "base_config_path": str(config_identity.path),
         "base_config_sha256": config_identity.sha256,
         "base_config_fingerprint": config_identity.fingerprint,
-        "qwen_required": False,
-        "qwen_calls": 0,
+        **policy,
     }
 
 
@@ -970,7 +1042,7 @@ def process_shard(
     decoder: FrameDecoder | None = None,
     acquire_lock: bool = True,
 ) -> dict[str, object]:
-    validate_qwen_free_preflight(config_identity.config)
+    validate_stage2_preflight(config_identity.config)
     _validate_live_config_identity(config_identity)
     root = _safe_output_root(output_root)
     shard = load_annotation_shard(input_shard)
@@ -1277,7 +1349,7 @@ def prepare_canary(
         raise ValueError("canary GPUs must be a non-empty unique list")
     root = _safe_output_root(output_root, canary=True)
     config_identity = load_config_identity(base_config)
-    validate_qwen_free_preflight(config_identity.config)
+    policy = validate_stage2_preflight(config_identity.config)
     selected_samples = canary_shards * samples_per_shard
     if selected_samples % len(gpus):
         raise ValueError(
@@ -1309,6 +1381,13 @@ def prepare_canary(
             manifest.canary_shards == canary_shards,
             manifest.samples_per_shard == samples_per_shard,
             manifest.samples_per_gpu == samples_per_gpu,
+            manifest.sam3_multi_instance_rescue_mode
+            == policy["sam3_multi_instance_rescue_mode"],
+            manifest.sam3_anchor_qwen_enabled
+            == policy["sam3_anchor_qwen_enabled"],
+            manifest.candidate_judge_base_url
+            == policy["candidate_judge_base_url"],
+            manifest.candidate_judge_model == policy["candidate_judge_model"],
             manifest.selection_sha256 == _sha256_bytes(raw),
             manifest.selected_samples == len(selection),
             manifest.selected_shard_names
@@ -1364,6 +1443,20 @@ def prepare_canary(
         selected_shard_names=selected_shard_names,
         duplicate_clip_uid_skipped=0,
         selection_sha256=_sha256_bytes(raw),
+        sam3_multi_instance_rescue_mode=str(
+            policy["sam3_multi_instance_rescue_mode"]
+        ),
+        sam3_anchor_qwen_enabled=bool(policy["sam3_anchor_qwen_enabled"]),
+        candidate_judge_base_url=(
+            str(policy["candidate_judge_base_url"])
+            if policy["candidate_judge_base_url"] is not None
+            else None
+        ),
+        candidate_judge_model=(
+            str(policy["candidate_judge_model"])
+            if policy["candidate_judge_model"] is not None
+            else None
+        ),
         created_at=_utc_now(),
     )
     write_json_atomic(manifest_path, manifest.model_dump(mode="json"))
@@ -1381,13 +1474,14 @@ def run_canary_worker(
 ) -> dict[str, object]:
     root = _safe_output_root(output_root, canary=True)
     config_identity = load_config_identity(manifest.base_config_path)
-    validate_qwen_free_preflight(config_identity.config)
+    validate_stage2_preflight(config_identity.config)
     if (
         config_identity.sha256 != manifest.base_config_sha256
         or config_identity.fingerprint != manifest.base_config_fingerprint
     ):
         raise ValueError("canary base config identity changed")
     selected = [item for item in selection if item.gpu_slot == gpu_slot]
+    counter_before = _backend_counter_snapshot(backend)
     worker_path = root / "workers" / f"gpu-{gpu_slot}.jsonl"
     partial = worker_path.with_name(f"{worker_path.name}.partial")
     expected_rows: list[dict[str, object]] = []
@@ -1472,6 +1566,12 @@ def run_canary_worker(
                         "retryable": True,
                     },
                 )
+                _accumulate_canary_backend_counters(
+                    root,
+                    gpu_slot,
+                    backend,
+                    before=counter_before,
+                )
                 return {
                     "gpu_slot": gpu_slot,
                     "selected": len(selected),
@@ -1490,7 +1590,56 @@ def run_canary_worker(
         worker_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(partial, worker_path)
         _fsync_directory(worker_path.parent)
+        _accumulate_canary_backend_counters(
+            root,
+            gpu_slot,
+            backend,
+            before=counter_before,
+        )
         return {"gpu_slot": gpu_slot, "selected": len(selected), "completed": len(completed), "skipped": False}
+
+
+def _backend_counter_snapshot(backend: object) -> dict[str, int]:
+    values: dict[str, int] = {}
+    for reader_name in ("anchor_search_counters", "recall_rescue_counters"):
+        reader = getattr(backend, reader_name, None)
+        if not callable(reader):
+            continue
+        counters = reader()
+        if not isinstance(counters, dict):
+            continue
+        for name in _SAM3_BACKEND_COUNTER_NAMES:
+            value = counters.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                values[name] = value
+    return values
+
+
+def _accumulate_canary_backend_counters(
+    root: Path,
+    gpu_slot: int,
+    backend: object,
+    *,
+    before: dict[str, int],
+) -> None:
+    after = _backend_counter_snapshot(backend)
+    delta = {
+        name: max(0, after.get(name, 0) - before.get(name, 0))
+        for name in _SAM3_BACKEND_COUNTER_NAMES
+    }
+    if not any(delta.values()):
+        return
+    path = root / "workers" / f"gpu-{gpu_slot}.sam3-counters.json"
+    existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    if not isinstance(existing, dict):
+        raise TypeError("canary SAM3 counter artifact must contain an object")
+    combined: dict[str, int] = {}
+    for name in _SAM3_BACKEND_COUNTER_NAMES:
+        previous = existing.get(name, 0)
+        if not isinstance(previous, int) or isinstance(previous, bool) or previous < 0:
+            raise ValueError("canary SAM3 counter artifact contains an invalid value")
+        combined[name] = previous + delta[name]
+    write_json_atomic(path, combined)
 
 
 def canary_summary(output_root: str | Path, manifest: CanaryManifest) -> dict[str, object]:
@@ -1499,6 +1648,7 @@ def canary_summary(output_root: str | Path, manifest: CanaryManifest) -> dict[st
     per_gpu: dict[str, dict[str, int]] = {}
     complete = True
     outstanding_retryable_work = 0
+    backend_counters = Counter[str]()
     for slot in range(len(manifest.gpus)):
         path = root / "workers" / f"gpu-{slot}.jsonl"
         partial = path.with_name(f"{path.name}.partial")
@@ -1518,6 +1668,18 @@ def canary_summary(output_root: str | Path, manifest: CanaryManifest) -> dict[st
         failure_log = root / "logs" / f"gpu-{slot}.failures.jsonl"
         if len(rows) != manifest.samples_per_gpu and failure_log.is_file():
             outstanding_retryable_work += 1
+        counter_path = root / "workers" / f"gpu-{slot}.sam3-counters.json"
+        if counter_path.is_file():
+            counter_values = json.loads(counter_path.read_text(encoding="utf-8"))
+            if not isinstance(counter_values, dict):
+                raise TypeError("canary SAM3 counter artifact must contain an object")
+            for name in _SAM3_BACKEND_COUNTER_NAMES:
+                value = counter_values.get(name, 0)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise ValueError(
+                        "canary SAM3 counter artifact contains an invalid value"
+                    )
+                backend_counters[name] += value
     artifacts = [path for path in (root / "artifacts").rglob("*") if path.is_file()]
     frames_bytes = sum(path.stat().st_size for path in artifacts if "/frames/" in path.as_posix())
     masks_bytes = sum(path.stat().st_size for path in artifacts if path.name == "masks.rle.json")
@@ -1563,8 +1725,13 @@ def canary_summary(output_root: str | Path, manifest: CanaryManifest) -> dict[st
             len(path.read_bytes().splitlines())
             for path in (root / "logs").glob("*.failures.jsonl")
         ),
-        "qwen_required": False,
-        "qwen_calls": 0,
+        "sam3_multi_instance_rescue_mode": manifest.sam3_multi_instance_rescue_mode,
+        "sam3_anchor_qwen_enabled": manifest.sam3_anchor_qwen_enabled,
+        "candidate_judge_base_url": manifest.candidate_judge_base_url,
+        "candidate_judge_model": manifest.candidate_judge_model,
+        "annotation_qwen_calls": 0,
+        "background_remove_qwen_calls": 0,
+        **{name: backend_counters[name] for name in _SAM3_BACKEND_COUNTER_NAMES},
         "frames_bytes": frames_bytes,
         "masks_bytes": masks_bytes,
         "total_artifact_bytes": total_bytes,

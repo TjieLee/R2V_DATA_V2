@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 import pytest
@@ -26,6 +27,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
     ConfigIdentity,
     ShardBusyError,
     canary_summary,
+    check_stage2_candidate_judge_health,
     inspect_stage2_shard,
     inventory,
     load_annotation_shard,
@@ -35,8 +37,9 @@ from r2v_data_v2.v3.pre_qwen_production import (
     run_canary_worker,
     select_canary_rows,
     shard_lock,
-    validate_qwen_free_preflight,
+    validate_stage2_preflight,
 )
+from r2v_data_v2.v3.sam3_anchor_selector import QwenSam3AnchorSelector
 from r2v_data_v2.v3.sam3_backend import (
     BackendMaskObservation,
     EntityTrackResult,
@@ -117,6 +120,25 @@ class FakeBackend:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+@dataclass
+class CountingBackend(FakeBackend):
+    def anchor_search_counters(self) -> dict[str, int]:
+        return {
+            "anchor_probe_calls": len(self.calls) * 2,
+            "anchor_fast_path_hits": len(self.calls),
+            "anchor_fallback_attempted": 0,
+            "anchor_fallback_hits": 0,
+            "anchor_all_frames_not_found": 0,
+        }
+
+    def recall_rescue_counters(self) -> dict[str, int]:
+        return {
+            "multi_instance_rescue_attempted": len(self.calls),
+            "multi_instance_rescue_selected": len(self.calls),
+            "multi_instance_rescue_rejected": 0,
+        }
 
 
 @dataclass(frozen=True)
@@ -323,7 +345,7 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_qwen_dependent_policy_fails_preflight() -> None:
+def test_qwen_anchor_mode_without_candidate_judge_fails_preflight() -> None:
     config = V3Config(
         dataset_json=Path("/mnt/workspace/public/dataset/source.jsonl"),
         run_root=Path("/mnt/workspace/litengjie/data/run"),
@@ -332,8 +354,104 @@ def test_qwen_dependent_policy_fails_preflight() -> None:
         sam3=Sam3Config(multi_instance_rescue_mode="qwen_anchor_select_v1"),
     )
 
-    with pytest.raises(ValueError, match="not Qwen-free"):
-        validate_qwen_free_preflight(config)
+    with pytest.raises(ValueError, match="qwen.candidate_judge is required"):
+        validate_stage2_preflight(config)
+
+
+def test_qwen_anchor_mode_passes_preflight_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    config = replace(
+        fixture.config,
+        sam3=replace(
+            fixture.config.sam3,
+            multi_instance_rescue_mode="qwen_anchor_select_v1",
+        ),
+    )
+
+    policy = validate_stage2_preflight(config)
+
+    assert config.sam3.multi_instance_rescue_mode == "qwen_anchor_select_v1"
+    assert policy["sam3_multi_instance_rescue_mode"] == "qwen_anchor_select_v1"
+    assert policy["sam3_anchor_qwen_enabled"] is True
+    assert policy["candidate_judge_base_url"] == "http://127.0.0.1:8000/v1"
+    assert policy["candidate_judge_model"] == config.qwen.candidate_judge.model
+
+
+def test_candidate_judge_health_uses_models_endpoint_without_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    service = replace(
+        fixture.config.qwen.candidate_judge,
+        base_url="http://6.167.57.88:8000/v1",
+    )
+    config = replace(
+        fixture.config,
+        qwen=replace(fixture.config.qwen, candidate_judge=service),
+        sam3=replace(
+            fixture.config.sam3,
+            multi_instance_rescue_mode="qwen_anchor_select_v1",
+        ),
+    )
+    requests: list[tuple[str, float]] = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def opener(request: object, *, timeout: float) -> Response:
+        requests.append((request.full_url, timeout))
+        return Response()
+
+    health = check_stage2_candidate_judge_health(config, opener=opener)
+
+    assert requests == [("http://6.167.57.88:8000/v1/models", 5.0)]
+    assert health["candidate_judge_health"] == "available"
+
+
+def test_candidate_judge_health_failure_prevents_sam3_backend_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard = _write_shard(fixture, [_row(fixture, 0)])
+    config = replace(
+        fixture.config,
+        sam3=replace(
+            fixture.config.sam3,
+            multi_instance_rescue_mode="qwen_anchor_select_v1",
+        ),
+    )
+    identity = replace(fixture.identity, config=config)
+    monkeypatch.setattr(batch_tool, "load_config_identity", lambda path: identity)
+    monkeypatch.setattr(batch_tool, "enumerate_annotation_shards", lambda root: [shard])
+    monkeypatch.setattr(
+        batch_tool,
+        "check_stage2_candidate_judge_health",
+        lambda current: (_ for _ in ()).throw(RuntimeError("gateway unavailable")),
+    )
+    monkeypatch.setattr(
+        batch_tool,
+        "default_backend_factory",
+        lambda current: pytest.fail("SAM3 must not load before Qwen health passes"),
+    )
+
+    with pytest.raises(RuntimeError, match="gateway unavailable"):
+        batch_tool.run_claim_loop(
+            input_root=fixture.input_root,
+            base_config=fixture.base_path,
+            output_root=fixture.output_root,
+            scan_offset=0,
+        )
 
 
 def test_full_stage2_shard_is_one_to_one_and_skips_ineligible_rows(
@@ -860,26 +978,55 @@ def test_canary_resume_rejects_changed_input_shard_sha(
         )
 
 
-def test_qwen_dependent_canary_fails_before_selection_or_sam_init(
+def test_qwen_anchor_canary_uses_original_frozen_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
+    _write_shard(fixture, [_row(fixture, 0)])
     base = _write_loadable_config(fixture, qwen_rescue=True)
-    monkeypatch.setattr(
-        production,
-        "select_canary_rows",
-        lambda *args, **kwargs: pytest.fail("selection must not run"),
+    output = fixture.writable / "canary" / "qwen-anchor"
+
+    manifest, _selection = prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=["0"],
+        canary_shards=1,
+        samples_per_shard=1,
     )
 
-    with pytest.raises(ValueError, match="not Qwen-free"):
+    assert manifest.sam3_multi_instance_rescue_mode == "qwen_anchor_select_v1"
+    assert manifest.sam3_anchor_qwen_enabled is True
+    assert manifest.candidate_judge_base_url == "http://127.0.0.1:8000/v1"
+    assert "qwen_required" not in manifest.model_dump()
+    assert "qwen_calls" not in manifest.model_dump()
+
+
+def test_off_mode_canary_cannot_resume_with_qwen_anchor_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_shard(fixture, [_row(fixture, 0)])
+    output = fixture.writable / "canary" / "off-mode-history"
+    prepare_canary(
+        input_root=fixture.input_root,
+        base_config=_write_loadable_config(fixture),
+        output_root=output,
+        gpus=["0"],
+        canary_shards=1,
+        samples_per_shard=1,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
         prepare_canary(
             input_root=fixture.input_root,
-            base_config=base,
-            output_root=fixture.writable / "canary" / "blocked",
+            base_config=_write_loadable_config(fixture, qwen_rescue=True),
+            output_root=output,
             gpus=["0"],
-            canary_shards=16,
-            samples_per_shard=5,
+            canary_shards=1,
+            samples_per_shard=1,
         )
 
 
@@ -932,7 +1079,43 @@ def test_canary_worker_resume_reuses_completed_masks_and_summary_counts_bytes(
     assert canary_tool._canary_exit_code([], summary) == 0
     assert summary["frames_bytes"] > 0
     assert summary["masks_bytes"] > 0
-    assert summary["qwen_calls"] == 0
+    assert summary["annotation_qwen_calls"] == 0
+    assert summary["background_remove_qwen_calls"] == 0
+    assert "qwen_calls" not in summary
+
+
+def test_canary_sam3_counters_use_backend_deltas_not_per_clip_cumulative_sum(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _write_shard(fixture, [_row(fixture, 0), _row(fixture, 1)])
+    base = _write_loadable_config(fixture)
+    output = fixture.writable / "canary" / "counter-deltas"
+    manifest, selection = prepare_canary(
+        input_root=fixture.input_root,
+        base_config=base,
+        output_root=output,
+        gpus=["0"],
+        canary_shards=1,
+        samples_per_shard=2,
+    )
+    backend = CountingBackend()
+
+    run_canary_worker(
+        output_root=output,
+        manifest=manifest,
+        selection=selection,
+        gpu_slot=0,
+        backend=backend,
+        decoder=FakeDecoder(),
+    )
+    summary = canary_summary(output, manifest)
+
+    assert summary["anchor_probe_calls"] == 4
+    assert summary["anchor_fast_path_hits"] == 2
+    assert summary["multi_instance_rescue_attempted"] == 2
+    assert summary["multi_instance_rescue_selected"] == 2
 
 
 def test_canary_retryable_sam_failure_keeps_worker_partial_uncommitted(
@@ -1103,15 +1286,37 @@ def test_stage2_backend_factory_uses_builder_default_cuda_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
+    candidate_judge = replace(
+        fixture.config.qwen.candidate_judge,
+        base_url="http://6.167.57.88:8000/v1",
+    )
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
     physical_index_config = replace(
         fixture.config,
-        sam3=replace(fixture.config.sam3, device="cuda:7"),
+        qwen=replace(fixture.config.qwen, candidate_judge=candidate_judge),
+        sam3=replace(
+            fixture.config.sam3,
+            device="cuda:7",
+            object_rescue_mode="phrase_retry_v1",
+            not_found_rescue_mode="entity_phrase_retry_v1",
+            multi_instance_rescue_mode="qwen_anchor_select_v1",
+            anchor_search_mode="progressive_v1",
+        ),
     )
 
     backend = production.default_backend_factory(physical_index_config)
 
     assert isinstance(backend, Sam3SegmentationBackend)
     assert backend.config.device == "cuda"
+    assert backend.config.object_rescue_mode == "phrase_retry_v1"
+    assert backend.config.not_found_rescue_mode == "entity_phrase_retry_v1"
+    assert backend.config.multi_instance_rescue_mode == "qwen_anchor_select_v1"
+    assert backend.config.anchor_search_mode == "progressive_v1"
+    assert isinstance(backend._anchor_selector, QwenSam3AnchorSelector)
+    assert backend._anchor_selector.config is candidate_judge
+    assert backend._anchor_selector.config.base_url == "http://6.167.57.88:8000/v1"
     assert physical_index_config.sam3.device == "cuda:7"
     assert production._workspace_config(
         physical_index_config, fixture.writable / "workspace"
@@ -1194,7 +1399,12 @@ def test_canary_launcher_isolates_physical_gpus_with_environment(
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
     _write_shard(fixture, [_row(fixture, 0), _row(fixture, 1)])
-    base = _write_loadable_config(fixture)
+    base = _write_loadable_config(fixture, qwen_rescue=True)
+    payload = yaml.safe_load(base.read_text(encoding="utf-8"))
+    payload["qwen"]["candidate_judge"]["base_url"] = (
+        "http://6.167.57.88:8000/v1"
+    )
+    base.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     output = fixture.writable / "canary" / "gpu-isolation"
     manifest, selection = prepare_canary(
         input_root=fixture.input_root,
@@ -1228,6 +1438,11 @@ def test_canary_launcher_isolates_physical_gpus_with_environment(
             "functional_status": "pass",
         },
     )
+    monkeypatch.setattr(
+        canary_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "available"},
+    )
     monkeypatch.setattr(canary_tool.subprocess, "Popen", popen)
 
     canary_tool.main(
@@ -1235,7 +1450,7 @@ def test_canary_launcher_isolates_physical_gpus_with_environment(
             "--input-root",
             str(fixture.input_root),
             "--base-config",
-            str(fixture.base_path),
+            str(base),
             "--output-root",
             str(fixture.output_root),
             "--gpus",
@@ -1248,6 +1463,9 @@ def test_canary_launcher_isolates_physical_gpus_with_environment(
     )
 
     assert [item["env"]["CUDA_VISIBLE_DEVICES"] for item in launched] == ["5", "7"]
+    assert manifest.candidate_judge_base_url == "http://6.167.57.88:8000/v1"
+    assert all("8001" not in " ".join(item["command"]) for item in launched)
+    assert all("8008" not in " ".join(item["command"]) for item in launched)
 
 
 def test_new_stage1_shard_is_discovered_without_topology_state(
@@ -1365,7 +1583,18 @@ def test_machine_topology_is_absent_from_shard_identity(
 
 def test_no_remove_or_qwen_modules_are_constructed_by_stage2_source() -> None:
     source = Path(production.__file__).read_text(encoding="utf-8")
-    assert "QwenAnnotationClient" not in source
-    assert "QwenBackgroundRemovalJudge" not in source
-    assert "Boogu" not in source
+    for forbidden in (
+        "QwenAnnotationClient",
+        "QwenBackgroundRemovalJudge",
+        "QwenBackgroundFinalGuard",
+        "QwenCrossPairJudge",
+        "QwenReferenceEditJudge",
+        "QwenReferenceIntegrityJudge",
+        "QwenInstructionWriter",
+        "QwenSubjectAttributeClient",
+        "Boogu",
+    ):
+        assert forbidden not in source
+    assert "QwenSam3AnchorSelector" not in source
+    assert "build_sam3_segment_backend" in source
     assert "build_background_candidates" in source

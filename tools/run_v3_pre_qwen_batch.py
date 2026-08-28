@@ -15,13 +15,14 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from r2v_data_v2.v3.pre_qwen_production import (
     ShardBusyError,
+    check_stage2_candidate_judge_health,
     close_backend,
     default_backend_factory,
     enumerate_annotation_shards,
     inspect_stage2_shard,
     load_config_identity,
     process_shard,
-    validate_qwen_free_preflight,
+    validate_stage2_preflight,
 )
 
 
@@ -53,10 +54,11 @@ def run_claim_loop(
     scan_offset: int,
 ) -> dict[str, object]:
     identity = load_config_identity(base_config)
-    preflight = validate_qwen_free_preflight(identity.config)
+    preflight = validate_stage2_preflight(identity.config)
     paths = _rotated(enumerate_annotation_shards(input_root), scan_offset)
     if all((output_root / "parts" / path.name).is_file() for path in paths):
         return {**preflight, "results": [], "outstanding_or_busy": False}
+    service_health = check_stage2_candidate_judge_health(identity.config)
     backend = default_backend_factory(identity.config)
     results: list[dict[str, object]] = []
     retryable_this_run: set[Path] = set()
@@ -89,6 +91,7 @@ def run_claim_loop(
             if not claimed:
                 return {
                     **preflight,
+                    **service_health,
                     "results": results,
                     "outstanding_or_busy": outstanding,
                 }
@@ -121,12 +124,18 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         if args.input_shard is None:
             raise ValueError("single batch mode requires --input-shard")
         identity = load_config_identity(args.base_config)
-        preflight = validate_qwen_free_preflight(identity.config)
+        preflight = validate_stage2_preflight(identity.config)
         completed = args.output_root / "parts" / args.input_shard.name
+        service_health = (
+            {"candidate_judge_health": "not_checked_completed"}
+            if completed.is_file()
+            else check_stage2_candidate_judge_health(identity.config)
+        )
         backend = None if completed.is_file() else default_backend_factory(identity.config)
         try:
             result = {
                 **preflight,
+                **service_health,
                 **process_shard(
                     args.input_shard,
                     output_root=args.output_root,

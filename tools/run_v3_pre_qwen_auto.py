@@ -15,9 +15,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from r2v_data_v2.v3.pre_qwen_production import (
+    check_stage2_candidate_judge_health,
     inventory,
     load_config_identity,
-    validate_qwen_free_preflight,
+    validate_stage2_preflight,
 )
 
 
@@ -56,9 +57,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     gpus = parse_gpus(args.gpus)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    preflight = validate_qwen_free_preflight(
-        load_config_identity(args.base_config).config
-    )
+    config = load_config_identity(args.base_config).config
+    preflight = validate_stage2_preflight(config)
     report = {
         **inventory(args.input_root, args.output_root),
         **preflight,
@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     if args.dry_run:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return report
+    report.update(check_stage2_candidate_judge_health(config))
     tool = Path(__file__).with_name("run_v3_pre_qwen_batch.py")
     processes: list[subprocess.Popen[bytes]] = []
     codes: list[int] = []
