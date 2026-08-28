@@ -23,6 +23,7 @@ from r2v_data_v2.v3.pre_qwen_production import (
     load_config_identity,
     validate_stage2_preflight,
 )
+from tools.run_v3_pre_qwen_batch import DEFAULT_STAGE2_IDLE_EXIT_SECONDS
 
 
 def parse_gpus(value: str | None) -> list[str]:
@@ -54,6 +55,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chunk-rows", type=int, default=DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS
     )
+    parser.add_argument(
+        "--idle-exit-seconds", type=float, default=DEFAULT_STAGE2_IDLE_EXIT_SECONDS
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -62,6 +66,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     args = _parser().parse_args(argv)
     if args.chunk_rows < 1:
         raise ValueError("--chunk-rows must be positive")
+    if args.idle_exit_seconds < 0:
+        raise ValueError("--idle-exit-seconds must be non-negative")
     prepare_started = time.perf_counter()
     gpus = parse_gpus(args.gpus)
     rank = int(os.environ.get("RANK", "0"))
@@ -73,6 +79,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         **preflight,
         "stage1_completed_shards": len(shard_paths),
         "execution_chunk_rows": args.chunk_rows,
+        "idle_exit_seconds": args.idle_exit_seconds,
         "output_root": str(args.output_root.resolve(strict=False)),
         "detected_local_gpus": gpus,
         "rank": rank,
@@ -115,6 +122,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                         str(rank * len(gpus) + local_slot),
                         "--chunk-rows",
                         str(args.chunk_rows),
+                        "--idle-exit-seconds",
+                        str(args.idle_exit_seconds),
                     ],
                     env=environment,
                     stdout=log,

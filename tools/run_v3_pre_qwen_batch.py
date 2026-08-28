@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,9 @@ from r2v_data_v2.v3.pre_qwen_production import (
     validate_stage2_preflight,
 )
 
+DEFAULT_STAGE2_IDLE_EXIT_SECONDS = 60.0
+STAGE2_IDLE_BACKOFF_SECONDS = 1.0
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -46,6 +50,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-offset", type=int, default=0)
     parser.add_argument(
         "--chunk-rows", type=int, default=DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS
+    )
+    parser.add_argument(
+        "--idle-exit-seconds", type=float, default=DEFAULT_STAGE2_IDLE_EXIT_SECONDS
     )
     parser.add_argument("--inspect", type=Path)
     return parser
@@ -65,9 +72,14 @@ def run_claim_loop(
     output_root: Path,
     scan_offset: int,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+    idle_exit_seconds: float = DEFAULT_STAGE2_IDLE_EXIT_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, object]:
     if chunk_rows < 1:
         raise ValueError("--chunk-rows must be positive")
+    if idle_exit_seconds < 0:
+        raise ValueError("--idle-exit-seconds must be non-negative")
     identity = load_config_identity(base_config)
     preflight = validate_stage2_preflight(identity.config)
     paths = enumerate_annotation_shards(input_root)
@@ -81,6 +93,9 @@ def run_claim_loop(
             "chunks_completed": 0,
             "chunks_resumed": 0,
             "annotation_shards_loaded": 0,
+            "worker_idle_scan_seconds": 0.0,
+            "idle_rescans": 0,
+            "idle_exit_seconds": idle_exit_seconds,
         }
     service_health = check_stage2_candidate_judge_health(identity.config)
     backend_started = time.perf_counter()
@@ -92,6 +107,8 @@ def run_claim_loop(
     annotation_shard_load_seconds = 0.0
     chunks_claimed = chunks_completed = chunks_resumed = 0
     worker_idle_scan_seconds = 0.0
+    idle_rescans = 0
+    idle_started_at: float | None = None
     scan_cursor = scan_offset
     worker_started = time.perf_counter()
     try:
@@ -133,6 +150,7 @@ def run_claim_loop(
                     except ShardBusyError:
                         continue
                     claimed = True
+                    idle_started_at = None
                     chunks_claimed += 1
                     results.append(result)
                     if result.get("retryable") is True:
@@ -167,12 +185,31 @@ def run_claim_loop(
                 if compacted is not None:
                     results.append(compacted)
                     claimed = True
+                    idle_started_at = None
                     scan_cursor += 1
                     break
             if not claimed:
                 worker_idle_scan_seconds += max(
                     0.0, time.perf_counter() - scan_started
                 )
+                if outstanding:
+                    now = monotonic()
+                    if idle_started_at is None:
+                        idle_started_at = now
+                    idle_elapsed = max(0.0, now - idle_started_at)
+                    if idle_elapsed < idle_exit_seconds:
+                        sleep_seconds = min(
+                            STAGE2_IDLE_BACKOFF_SECONDS,
+                            idle_exit_seconds - idle_elapsed,
+                        )
+                        before_sleep = monotonic()
+                        sleep(sleep_seconds)
+                        worker_idle_scan_seconds += max(
+                            0.0, monotonic() - before_sleep
+                        )
+                        idle_rescans += 1
+                        scan_cursor += 1
+                        continue
                 return {
                     **preflight,
                     **service_health,
@@ -188,6 +225,8 @@ def run_claim_loop(
                     "chunks_claimed": chunks_claimed,
                     "chunks_completed": chunks_completed,
                     "chunks_resumed": chunks_resumed,
+                    "idle_rescans": idle_rescans,
+                    "idle_exit_seconds": idle_exit_seconds,
                 }
     finally:
         close_backend(backend)
@@ -214,6 +253,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             output_root=args.output_root,
             scan_offset=args.scan_offset,
             chunk_rows=args.chunk_rows,
+            idle_exit_seconds=args.idle_exit_seconds,
         )
     else:
         if args.input_shard is None:

@@ -244,6 +244,11 @@ For multiple nodes, run the same command with the same shared output root.
 chunks with wraparound, skips busy locks without waiting, and immediately
 claims another chunk after completion. Restarting with fewer or more nodes or
 GPUs continues the same chunks, checkpoints, logical shards, and artifacts.
+When a full scan finds only temporarily busy work, the worker sleeps for one
+second and rescans while retaining its persistent SAM3 backend. The default
+`--idle-exit-seconds 60` grace permits reclaim after a worker/node crash while
+allowing surplus workers to exit after 60 continuous seconds without a claim;
+any successful claim resets that timer. No worker waits on a specific lock.
 The normal launcher performs only cheap shard enumeration plus config/Qwen
 health preflight before spawning workers; `--dry-run` retains the full
 inventory scan.

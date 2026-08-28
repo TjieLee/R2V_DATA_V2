@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 from dataclasses import dataclass, field, replace
@@ -149,6 +150,19 @@ class CountingBackend(FakeBackend):
             "multi_instance_rescue_selected": len(self.calls),
             "multi_instance_rescue_rejected": 0,
         }
+
+
+@dataclass
+class FakeIdleClock:
+    current: float = 0.0
+    sleeps: list[float] = field(default_factory=list)
+
+    def monotonic(self) -> float:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += seconds
 
 
 @dataclass(frozen=True)
@@ -1764,6 +1778,7 @@ def test_claim_loop_skips_busy_chunk_and_work_steals_next(
             output_root=fixture.output_root,
             scan_offset=0,
             chunk_rows=1,
+            idle_exit_seconds=0,
         )
 
     assert initial["chunks_completed"] == 1
@@ -1779,6 +1794,167 @@ def test_claim_loop_skips_busy_chunk_and_work_steals_next(
     assert resumed["chunks_completed"] == 1
     assert (fixture.output_root / "parts" / shard_path.name).is_file()
     assert backend.close_calls == 2
+
+
+def test_claim_loop_with_all_work_complete_exits_without_idle_or_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0, status="failed")])
+    process_shard(
+        shard_path,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        chunk_rows=1,
+    )
+    monkeypatch.setattr(batch_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(
+        batch_tool, "enumerate_annotation_shards", lambda root: [shard_path]
+    )
+    monkeypatch.setattr(
+        batch_tool,
+        "default_backend_factory",
+        lambda config: pytest.fail("completed work must not create SAM3 backend"),
+    )
+    clock = FakeIdleClock()
+
+    result = batch_tool.run_claim_loop(
+        input_root=fixture.input_root,
+        base_config=fixture.base_path,
+        output_root=fixture.output_root,
+        scan_offset=0,
+        chunk_rows=1,
+        idle_exit_seconds=60,
+        sleep=lambda seconds: pytest.fail("completed work must not sleep"),
+        monotonic=clock.monotonic,
+    )
+
+    assert result["outstanding_or_busy"] is False
+    assert result["idle_rescans"] == 0
+    assert result["worker_idle_scan_seconds"] == 0.0
+
+
+@pytest.mark.parametrize("release_mode", ["unlock", "owner_crash_close"])
+def test_busy_chunk_released_during_idle_grace_is_reclaimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_mode: str,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0, status="failed")])
+    shard = load_annotation_shard(shard_path)
+    chunk = build_execution_chunks(shard, chunk_rows=1)[0]
+    lock_path = production._chunk_lock_path(fixture.output_root, shard, chunk)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    owner_handle = lock_path.open("a+b")
+    fcntl.flock(owner_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    backend = FakeBackend()
+    factory_calls = 0
+    clock = FakeIdleClock()
+
+    def factory(config: V3Config) -> FakeBackend:
+        nonlocal factory_calls
+        del config
+        factory_calls += 1
+        return backend
+
+    def release_during_backoff(seconds: float) -> None:
+        clock.sleep(seconds)
+        if release_mode == "unlock":
+            fcntl.flock(owner_handle.fileno(), fcntl.LOCK_UN)
+        else:
+            owner_handle.close()
+
+    monkeypatch.setattr(batch_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(
+        batch_tool, "enumerate_annotation_shards", lambda root: [shard_path]
+    )
+    monkeypatch.setattr(batch_tool, "default_backend_factory", factory)
+    monkeypatch.setattr(
+        batch_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+    try:
+        result = batch_tool.run_claim_loop(
+            input_root=fixture.input_root,
+            base_config=fixture.base_path,
+            output_root=fixture.output_root,
+            scan_offset=0,
+            chunk_rows=1,
+            idle_exit_seconds=5,
+            sleep=release_during_backoff,
+            monotonic=clock.monotonic,
+        )
+    finally:
+        if not owner_handle.closed:
+            owner_handle.close()
+
+    assert result["chunks_completed"] == 1
+    assert result["outstanding_or_busy"] is False
+    assert result["idle_rescans"] == 1
+    assert clock.sleeps == [1.0]
+    assert factory_calls == 1
+    assert backend.close_calls == 1
+    assert (fixture.output_root / "parts" / shard_path.name).is_file()
+
+
+def test_continuously_busy_chunk_uses_backoff_then_exits_after_idle_grace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(fixture, [_row(fixture, 0, status="failed")])
+    shard = load_annotation_shard(shard_path)
+    chunk = build_execution_chunks(shard, chunk_rows=1)[0]
+    lock_path = production._chunk_lock_path(fixture.output_root, shard, chunk)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    owner_handle = lock_path.open("a+b")
+    fcntl.flock(owner_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    backend = FakeBackend()
+    factory_calls = 0
+    clock = FakeIdleClock()
+
+    def factory(config: V3Config) -> FakeBackend:
+        nonlocal factory_calls
+        del config
+        factory_calls += 1
+        return backend
+
+    monkeypatch.setattr(batch_tool, "load_config_identity", lambda path: fixture.identity)
+    monkeypatch.setattr(
+        batch_tool, "enumerate_annotation_shards", lambda root: [shard_path]
+    )
+    monkeypatch.setattr(batch_tool, "default_backend_factory", factory)
+    monkeypatch.setattr(
+        batch_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "not_required"},
+    )
+    try:
+        result = batch_tool.run_claim_loop(
+            input_root=fixture.input_root,
+            base_config=fixture.base_path,
+            output_root=fixture.output_root,
+            scan_offset=0,
+            chunk_rows=1,
+            idle_exit_seconds=2,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+    finally:
+        owner_handle.close()
+
+    assert result["outstanding_or_busy"] is True
+    assert result["chunks_claimed"] == 0
+    assert result["idle_rescans"] == 2
+    assert result["idle_exit_seconds"] == 2
+    assert clock.sleeps == [1.0, 1.0]
+    assert result["worker_idle_scan_seconds"] >= 2.0
+    assert factory_calls == 1
+    assert backend.close_calls == 1
 
 
 def test_chunk_partial_resumes_and_truncates_incomplete_tail(
@@ -2191,6 +2367,7 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
     inventory_calls = 0
+    commands: list[list[str]] = []
 
     class Process:
         def wait(self) -> int:
@@ -2202,6 +2379,11 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
         inventory_calls += 1
         return {"stage1_total_rows": 123}
 
+    def popen(command: list[str], **kwargs: object) -> Process:
+        del kwargs
+        commands.append(command)
+        return Process()
+
     monkeypatch.setattr(auto_tool, "load_config_identity", lambda path: fixture.identity)
     monkeypatch.setattr(auto_tool, "enumerate_annotation_shards", lambda root: [])
     monkeypatch.setattr(auto_tool, "inventory", fake_inventory)
@@ -2210,7 +2392,7 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
         "check_stage2_candidate_judge_health",
         lambda config: {"candidate_judge_health": "not_required"},
     )
-    monkeypatch.setattr(auto_tool.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(auto_tool.subprocess, "Popen", popen)
 
     normal = auto_tool.main(
         [
@@ -2226,6 +2408,8 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
     )
     assert inventory_calls == 0
     assert normal["worker_exit_codes"] == [0]
+    idle_flag = commands[0].index("--idle-exit-seconds")
+    assert commands[0][idle_flag + 1] == "60.0"
 
     dry = auto_tool.main(
         [
