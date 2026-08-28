@@ -169,25 +169,50 @@ It reports scalar and vectorized encode time, vectorized decode time, encode
 speedup, throughput, and exact equality. Its timing is diagnostic only; CI does
 not assert a machine-dependent speedup.
 
-For the server A/B, retain this completed baseline:
+### Real server A/B result
+
+The server A/B used the same persisted 80 rows, the same config,
+`--chunk-rows 1`, and `--sam3-session-reuse-mode clip_reset_v1`. Debug
+diagnostics were disabled. SAM3 request timing was also disabled for the
+vectorized-RLE run.
+
+Scalar-RLE session-reuse baseline:
 
 ```text
-/mnt/workspace/litengjie/data/r2v_v3_stage2_canary/chunk1-nodiag-sessionreuse-80-qwen-20260828
+output: /mnt/workspace/litengjie/data/r2v_v3_stage2_canary/chunk1-nodiag-sessionreuse-80-qwen-20260828
+real: 3m50.727s (230.727s)
 ```
 
-Run the same persisted 80-row selection and the same base config into a fresh
-output root, retaining:
+Vectorized-RLE run:
 
 ```text
---chunk-rows 1
---frame-prefetch-workers 0
---sam3-session-reuse-mode clip_reset_v1
+real: 1m43.285s (103.285s)
+user: 15m28.505s
+sys : 1m26.107s
 ```
 
-Leave `--sam3-request-timing` disabled to avoid diagnostic overhead. After the
-run, compare all 54 `masks.rle.json` files as parsed JSON and compare the
-canonical `parts/` outputs. Promotion requires `different = 0`. Record the new
-80-row wall time only after that real GPU A/B; no speedup is assumed here.
+This reduced wall time by 127.442 seconds, approximately 55.2%, and delivered
+approximately 2.23x throughput relative to the scalar-RLE session-reuse
+baseline.
+
+Across the complete optimization sequence, the original diagnostics-enabled
+baseline improved from 5m11.471s to 1m43.285s: approximately 66.8% less wall
+time and approximately 3.02x throughput.
+
+Correctness comparison covered all 54 produced `masks.rle.json` files:
+
+```text
+compared:  54
+different: 0
+```
+
+The serialized RLE JSON was exactly identical. Canonical `parts/` equality is
+still a separate promotion check and is not claimed here until its diff result
+is confirmed.
+
+The vectorized codec can be reused by future end-to-end Visual V3 execution
+without changing mask semantics or configuration identity. Do not restore the
+Python per-pixel RLE implementation.
 
 ## Recommended production combination
 
