@@ -106,10 +106,8 @@ def _offline_vggish_construction(torch_module: object, vggish_class: type[Any]):
     original_download = torch_module.hub.load_state_dict_from_url  # type: ignore[attr-defined]
 
     def local_init(instance: object, *args: object, **kwargs: object) -> None:
-        if args:
-            raise ValueError("LASER VGGish construction must use explicit keywords")
         kwargs["pretrained"] = False
-        original_init(instance, **kwargs)
+        original_init(instance, *args, **kwargs)
 
     def blocked_download(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -742,8 +740,10 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         resolved_layer = int(config_payload["layer"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("LASER config requires integer n_channel and layer") from exc
-    if resolved_n_channel <= 0 or resolved_layer <= 0:
-        raise ValueError("LASER config n_channel and layer must be positive")
+    if resolved_n_channel <= 0 or resolved_layer < 0:
+        raise ValueError(
+            "LASER config n_channel must be positive and layer non-negative"
+        )
     config_payload["WORKSPACE"] = str(work / "model_workspace")
     cfg = _namespace(config_payload)
     with _offline_vggish_construction(torch, VGGish):

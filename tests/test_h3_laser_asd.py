@@ -361,9 +361,18 @@ def test_bridge_stages_local_s3fd_and_blocks_gdown(
 
 def test_vggish_construction_cannot_use_torch_hub_download() -> None:
     calls: list[str] = []
+    initializations: list[tuple[object, bool, bool, bool]] = []
 
     class FakeVGGish:
-        def __init__(self, *, pretrained: bool = True) -> None:
+        def __init__(
+            self,
+            urls: object,
+            *,
+            preprocess: bool = True,
+            postprocess: bool = True,
+            pretrained: bool = True,
+        ) -> None:
+            initializations.append((urls, preprocess, postprocess, pretrained))
             if pretrained:
                 fake_torch.hub.load_state_dict_from_url("https://example.invalid")
 
@@ -372,10 +381,12 @@ def test_vggish_construction_cannot_use_torch_hub_download() -> None:
             load_state_dict_from_url=lambda url: calls.append(str(url))
         )
     )
+    urls = {"vggish": "https://example.invalid/vggish.pth"}
     with _offline_vggish_construction(fake_torch, FakeVGGish):
-        FakeVGGish()
+        FakeVGGish(urls, preprocess=False, postprocess=False)
     assert calls == []
-    FakeVGGish()
+    assert initializations == [(urls, False, False, False)]
+    FakeVGGish(urls, preprocess=False, postprocess=False)
     assert calls == ["https://example.invalid"]
 
 
@@ -495,6 +506,12 @@ def test_laser_native_schema_preserves_score_and_determinism(tmp_path: Path) -> 
     assert artifact.s3fd_model_sha256 == "d" * 64
     assert artifact.resolved_n_channel == 1
     assert artifact.resolved_layer == 1
+    payload = artifact.model_dump(mode="json")
+    payload["resolved_layer"] = 0
+    assert LaserASDNativeArtifact.model_validate(payload).resolved_layer == 0
+    payload["resolved_layer"] = -1
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        LaserASDNativeArtifact.model_validate(payload)
     assert artifact.score_semantics == "laser_loconet_native_score"
     assert artifact.tracks[0].samples[0].backend_native_active is True
     payload = artifact.model_dump(mode="json")

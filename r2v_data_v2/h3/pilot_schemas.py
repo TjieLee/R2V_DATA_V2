@@ -185,7 +185,7 @@ class LaserASDNativeArtifact(SchemaModel):
     s3fd_model_path: str
     s3fd_model_sha256: str
     resolved_n_channel: int = Field(gt=0)
-    resolved_layer: int = Field(gt=0)
+    resolved_layer: int = Field(ge=0)
     device: str = Field(pattern=r"^cuda:\d+$")
     cuda_visible_devices: str = Field(pattern=r"^\d+(,\d+)*$")
     mediapipe_version: str
