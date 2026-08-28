@@ -1,6 +1,6 @@
 # Visual V3 Reference Development Handoff
 
-Last updated: 2026-08-26
+Last updated: 2026-08-28
 
 This is the entry point for future Visual/reference-image work. Read it before
 older design documents or chat history, then read:
@@ -16,7 +16,7 @@ Verify the live remote branch and HEAD before developing or running anything.
 ```text
 repository: TjieLee/R2V_DATA_V2
 Visual/reference branch: feature/v3-subject-attributes-v1
-final Visual/reference code freeze: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+final Visual/reference code freeze: d056c32b76db4b3d7c0358b38e996e7a91a288d1
 
 frozen original Visual branch: feature/v3-runtime-integrity-v1
 frozen original Visual HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
@@ -87,10 +87,14 @@ Key routing points:
 
 - at most three attributes per eligible human owner;
 - `structure_complete` and `completion_recommended` are diagnostics only;
+- face completion is hard-disabled even if legacy config lists `face`;
+- an accepted raw face tries reviewed source RGB bbox first, then falls back to
+  its accepted raw alpha on bbox reject, failure, or unavailability;
+- bbox cannot rescue a face that failed the existing raw hard gates;
 - insufficient source evidence never authorizes Boogu hallucination;
-- eligible completion compares raw alpha, source RGB bbox identity evidence,
-  and Boogu candidate;
-- same person or same physical item/component is a hard gate;
+- eligible non-face completion compares raw alpha, source RGB bbox identity
+  evidence, and Boogu candidate;
+- same physical item/component is a hard gate;
 - equivalent completion returns to alpha;
 - bbox is last resort only after no accepted completion and no accepted alpha;
 - fresh Attribute generated-background calls are zero.
@@ -130,10 +134,15 @@ attempts for both reference edit and Attributes. Detailed counts are in
 `V3_SUBJECT_ATTRIBUTES_STATE.md`.
 
 The later validator correction after `622be6807490d57aebbda76b6dcf102beded7aff`
-and candidate-2 provenance correction at the final freeze were unit-tested but
-did not rerun the fixed-100 GPU/model canary. At the final freeze, local evidence
+and candidate-2 provenance correction at the earlier `d7f3d6b...` freeze were
+unit-tested but did not rerun the fixed-100 GPU/model canary. Its local evidence
 was 368 focused tests and 1,991 full tests passing with one warning, plus clean
 diff-check and compileall results.
+
+The face bbox-first policy at the current code freeze passed 148 focused and
+2,000 full local tests with one warning, plus compileall and diff-check. Ruff
+showed the same 69 pre-existing findings on parent and updated trees, so this
+change added none. No Qwen, SAM3, Boogu, GPU, or real-model canary was run.
 
 ## Freeze boundary
 

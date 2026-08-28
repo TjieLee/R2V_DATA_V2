@@ -5,7 +5,7 @@ This file is the repository-level handoff and operating contract for Codex, Chat
 > **Branch-specific V3 override — `feature/v3-subject-attributes-v1`:** The
 > repository is `TjieLee/R2V_DATA_V2`; the
 > final Visual/reference code freeze is
-> `d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0`. A later docs-only commit may
+> `d056c32b76db4b3d7c0358b38e996e7a91a288d1`. A later docs-only commit may
 > advance branch `HEAD`, but it does not change that algorithm freeze. The
 > frozen original Visual branch is `feature/v3-runtime-integrity-v1` at
 > `87bd4e06107d7f56df550979b0e96515cb70f911`; its core original Visual
@@ -21,7 +21,9 @@ This file is the repository-level handoff and operating contract for Codex, Chat
 > and older design docs.
 > Verify branch and `HEAD` from GitHub before deciding what to develop or run;
 > never guess current server or branch state from chat history. Annotation
-> production remains frozen. Audio/H3 is developed only on its separate branch.
+> production remains frozen. Face Attributes hard-disable Boogu and route
+> accepted raw evidence through bbox first, then accepted raw alpha fallback.
+> Audio/H3 is developed only on its separate branch.
 
 ## 1. Repository identity
 

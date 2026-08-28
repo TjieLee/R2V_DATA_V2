@@ -1,6 +1,6 @@
 # V3 Server Environment Runbook
 
-Last updated: 2026-08-26
+Last updated: 2026-08-28
 
 This is the authoritative server handoff for the frozen Visual/reference line.
 Verify the live remote branch and HEAD before operating the server; do not infer
@@ -11,7 +11,7 @@ server state from old chat history.
 ```text
 repository: TjieLee/R2V_DATA_V2
 Visual/reference branch: feature/v3-subject-attributes-v1
-final Visual/reference code freeze: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+final Visual/reference code freeze: d056c32b76db4b3d7c0358b38e996e7a91a288d1
 
 frozen original Visual branch: feature/v3-runtime-integrity-v1
 frozen original Visual HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
@@ -70,7 +70,7 @@ model input.
 GPU 0-3: Qwen3-VL-32B-Instruct, BF16, TP1 x DP4
 GPU 4: Boogu background removal
 GPU 5 + 7: shared two-process SAM3 pool
-GPU 6: Boogu reference_edit and Attribute completion
+GPU 6: Boogu reference_edit and eligible non-face Attribute completion
 GME: disabled
 
 Qwen max model length: 49152
@@ -192,9 +192,11 @@ owner Top3 candidates; at most 2 different sources
 single-frame SAM3 probes only; no temporal tracking
 6 hard raw review flags, including sufficient_source_evidence
 structure_complete and completion_recommended are diagnostics only
-eligible repair uses raw alpha + source RGB bbox + Boogu candidate
-insufficient evidence -> candidate 2, then bbox last resort
-bbox reject -> Attribute reject
+face: Boogu hard-disabled, accepted raw -> reviewed bbox -> raw alpha fallback
+face without an accepted raw candidate -> reject; bbox cannot bypass raw gates
+eligible non-face repair uses raw alpha + source RGB bbox + Boogu candidate
+non-face insufficient evidence -> candidate 2, then bbox last resort
+non-face bbox reject -> Attribute reject
 fresh generated background -> disabled
 ```
 
@@ -232,9 +234,15 @@ attribute background variants: 0/0
 
 The later validator fix, prompted by a one-owner/three-attribute batch-loss bug,
 passed the full local suite but did not rerun this fixed-100 real-model canary.
-The candidate-2 source-frame provenance fix at code freeze was validated locally
-with 368 focused and 1,991 full tests passing (one warning), diff-check, and
-compileall. It also did not run a new GPU/model canary.
+The candidate-2 source-frame provenance fix at the earlier `d7f3d6b...` freeze
+was validated locally with 368 focused and 1,991 full tests passing (one
+warning), diff-check, and compileall. It also did not run a new GPU/model canary.
+
+The current face bbox-first policy was validated locally with 148 focused and
+2,000 full tests passing (one warning), compileall, and diff-check. Ruff found
+the same 69 pre-existing issues on the clean parent and updated tree, so this
+change introduced no new Ruff finding. No Qwen, SAM3, Boogu, GPU, or real-model
+canary was run for it.
 
 ## Audio/H3 handoff
 

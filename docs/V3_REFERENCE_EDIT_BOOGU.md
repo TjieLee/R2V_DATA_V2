@@ -1,13 +1,13 @@
 # V3 Boogu Reference Completion Contract
 
-Last updated: 2026-08-26
+Last updated: 2026-08-28
 
 ## Freeze identity
 
 ```text
 repository: TjieLee/R2V_DATA_V2
 Visual/reference branch: feature/v3-subject-attributes-v1
-final Visual/reference code freeze: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+final Visual/reference code freeze: d056c32b76db4b3d7c0358b38e996e7a91a288d1
 
 frozen original Visual branch: feature/v3-runtime-integrity-v1
 frozen original Visual HEAD: 87bd4e06107d7f56df550979b0e96515cb70f911
@@ -95,7 +95,6 @@ exact prompt:
 Mapping:
 
 ```text
-face -> 人脸
 headwear -> 帽子
 accessory -> 配饰
 upper_clothing -> 衣服
@@ -103,11 +102,17 @@ lower_clothing -> 下装
 dress_or_skirt -> 裙子
 ```
 
-Hair, glasses, shoes, and bag do not enter completion. Attribute comparison uses
-raw alpha, source RGB bbox as identity-only evidence, and the generated
-candidate. Face must preserve the same person; other types must preserve the
-same physical item or component. A modest improvement is enough and an
-equivalent candidate returns to alpha.
+Face, hair, glasses, shoes, and bag do not enter completion. Face is hard-blocked
+in code even if a legacy config still names it as eligible: it creates no seed
+and calls neither Boogu nor comparative completion Qwen. An accepted raw face
+instead prefers a reviewed source RGB bbox and falls back to its accepted raw
+alpha on bbox reject, failure, or unavailability. Bbox cannot rescue a face that
+failed the existing raw hard gates.
+
+Eligible non-face Attribute comparison uses raw alpha, source RGB bbox as
+identity-only evidence, and the generated candidate. It must preserve the same
+physical item or component. A modest improvement is enough and an equivalent
+candidate returns to alpha.
 
 Accepted Attribute Boogu output is published directly as RGB PNG. It receives
 no completion SAM3, alpha restoration, foreground extraction, or bbox pass.
