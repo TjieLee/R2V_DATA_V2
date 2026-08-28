@@ -101,6 +101,23 @@ def _install_gdown_blocker() -> None:
 
 
 @contextmanager
+def _legacy_numpy_s3fd_compatibility(numpy_module: object):
+    # Pinned S3FD box_utils uses only the removed np.int scalar alias.
+    namespace = numpy_module.__dict__  # type: ignore[attr-defined]
+    had_int_alias = "int" in namespace
+    original_int_alias = namespace.get("int")
+    if not had_int_alias:
+        numpy_module.int = int  # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        if had_int_alias:
+            numpy_module.int = original_int_alias  # type: ignore[attr-defined]
+        else:
+            del numpy_module.int  # type: ignore[attr-defined]
+
+
+@contextmanager
 def _offline_vggish_construction(torch_module: object, vggish_class: type[Any]):
     original_init = vggish_class.__init__
     original_download = torch_module.hub.load_state_dict_from_url  # type: ignore[attr-defined]
@@ -600,11 +617,14 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     sys.path.insert(0, str(loconet_root))
     os.chdir(runtime_root)
 
-    import demoLoCoNet_landmark as vendor_demo
+    import numpy as np
     import torch
     import yaml
-    from landmark_loconet import loconet
-    from torchvggish.vggish import VGGish
+
+    with _legacy_numpy_s3fd_compatibility(np):
+        import demoLoCoNet_landmark as vendor_demo
+        from landmark_loconet import loconet
+        from torchvggish.vggish import VGGish
 
     try:
         import mediapipe
@@ -696,18 +716,19 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         minFaceSize=1,
         ffmpeg=arguments.ffmpeg,
     )
-    scenes = vendor_demo.scene_detect(vendor_args)
-    detections = vendor_demo.inference_video(vendor_args)
-    detection_evidence = copy.deepcopy(detections)
-    tracks = []
-    for shot in scenes:
-        if shot[1].frame_num - shot[0].frame_num >= vendor_args.minTrack:
-            tracks.extend(
-                vendor_demo.track_shot(
-                    vendor_args,
-                    detections[shot[0].frame_num : shot[1].frame_num],
+    with _legacy_numpy_s3fd_compatibility(np):
+        scenes = vendor_demo.scene_detect(vendor_args)
+        detections = vendor_demo.inference_video(vendor_args)
+        detection_evidence = copy.deepcopy(detections)
+        tracks = []
+        for shot in scenes:
+            if shot[1].frame_num - shot[0].frame_num >= vendor_args.minTrack:
+                tracks.extend(
+                    vendor_demo.track_shot(
+                        vendor_args,
+                        detections[shot[0].frame_num : shot[1].frame_num],
+                    )
                 )
-            )
     tracks = _stable_tracks(tracks)
 
     base_options = mp_python.BaseOptions(

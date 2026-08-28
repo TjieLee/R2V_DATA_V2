@@ -4,7 +4,7 @@ import inspect
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -51,6 +51,7 @@ from tools.build_h3_asd_backend_comparison_review import build_comparison_review
 from tools.run_h3_laser_loconet_bridge import (
     LIP_LANDMARK_INDICES,
     _install_gdown_blocker,
+    _legacy_numpy_s3fd_compatibility,
     _load_verified_checkpoint,
     _offline_vggish_construction,
     _render_visualization,
@@ -357,6 +358,47 @@ def test_bridge_stages_local_s3fd_and_blocks_gdown(
     _install_gdown_blocker()
     with pytest.raises(RuntimeError, match="forbids gdown"):
         sys.modules["gdown"].download("https://example.invalid")  # type: ignore[attr-defined]
+
+
+def test_legacy_numpy_int_compatibility_is_scoped_and_matches_builtin_int(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(np, "int", raising=False)
+    assert "int" not in np.__dict__
+
+    with _legacy_numpy_s3fd_compatibility(np):
+        assert np.int is int  # type: ignore[attr-defined]
+        legacy = np.array([1.2, 2.8]).astype(np.int)  # type: ignore[attr-defined]
+        builtin = np.array([1.2, 2.8]).astype(int)
+        assert legacy.dtype == builtin.dtype
+        assert np.array_equal(legacy, builtin)
+
+    assert "int" not in np.__dict__
+
+
+def test_legacy_numpy_scope_preserves_existing_alias() -> None:
+    fake_numpy = ModuleType("fake_numpy")
+    original_alias = object()
+    fake_numpy.int = original_alias  # type: ignore[attr-defined]
+
+    with _legacy_numpy_s3fd_compatibility(fake_numpy):
+        assert fake_numpy.int is original_alias  # type: ignore[attr-defined]
+
+    assert fake_numpy.int is original_alias  # type: ignore[attr-defined]
+
+
+def test_legacy_numpy_scope_does_not_modify_vendor_checkout(tmp_path: Path) -> None:
+    vendor_file = tmp_path / "LoCoNet/model/faceDetector/s3fd/box_utils.py"
+    vendor_file.parent.mkdir(parents=True)
+    vendor_file.write_text(
+        "return np.array(keep).astype(np.int)\n", encoding="utf-8"
+    )
+    before = vendor_file.read_bytes()
+
+    with _legacy_numpy_s3fd_compatibility(np):
+        assert np.array([1]).astype(np.int).dtype == np.array([1]).astype(int).dtype  # type: ignore[attr-defined]
+
+    assert vendor_file.read_bytes() == before
 
 
 def test_vggish_construction_cannot_use_torch_hub_download() -> None:
