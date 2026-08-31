@@ -86,17 +86,27 @@ six hard raw review flags, evidence routing, and publication modes are frozen in
 Key routing points:
 
 - at most three attributes per eligible human owner;
-- `structure_complete` and `completion_recommended` are diagnostics only;
+- for completion-eligible non-face Attributes, accepted raw is independently
+  publishable only when `structure_complete=true` and
+  `completion_recommended=false`;
 - face completion is hard-disabled even if legacy config lists `face`;
-- an accepted raw face tries reviewed source RGB bbox first, then falls back to
-  its accepted raw alpha on bbox reject, failure, or unavailability;
+- face bypasses the generic completion-oriented raw quality precheck and relies
+  on its existing geometry gates plus the face raw Qwen review;
+- face review accepts approximately 50% or more visible frontal facial
+  structure when identity remains reasonably recognizable, including ordinary
+  three-quarter and fairly turned views; it does not require both eyes or a
+  passport-photo-like pose;
+- an accepted raw face publishes its source RGB bbox directly without a second
+  bbox Qwen review, while preserving raw alpha provenance; bbox materialization
+  failure retains the accepted raw alpha as the safest fallback;
 - bbox cannot rescue a face that failed the existing raw hard gates;
 - insufficient source evidence never authorizes Boogu hallucination;
 - eligible non-face completion compares raw alpha, source RGB bbox identity
   evidence, and Boogu candidate;
 - same physical item/component is a hard gate;
-- equivalent completion returns to alpha;
-- bbox is last resort only after no accepted completion and no accepted alpha;
+- accepted-but-incomplete raw must complete successfully and cannot fall back
+  to raw after completion failure or rejection;
+- independently publishable accepted raw is selected without completion;
 - fresh Attribute generated-background calls are zero.
 
 ## Production runtime

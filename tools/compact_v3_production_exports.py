@@ -191,13 +191,15 @@ def _validate_attribute_png(
             image.verify()
     except Exception as exc:  # noqa: BLE001 - normalize decoder failures
         raise ValueError(f"attribute reference is not a decodable image: {path}") from exc
-    expected_mode = (
-        "RGB"
+    expected_modes = (
+        {"RGB"}
         if default_variant in {"bbox", "generated_background"}
-        or final_selection == "completed"
-        else "RGBA"
+        else {"RGB", "RGBA"}
+        if final_selection == "completed"
+        else {"RGBA"}
     )
-    if image_format != "PNG" or image_mode != expected_mode:
+    if image_format != "PNG" or image_mode not in expected_modes:
+        expected_mode = " or ".join(sorted(expected_modes))
         raise ValueError(
             f"attribute reference must be an {expected_mode} PNG: {path}"
         )

@@ -10,6 +10,7 @@ from PIL import Image
 from pydantic import ValidationError
 
 import r2v_data_v2.v3.config as v3_config_module
+import run_pipeline_v3 as pipeline_module
 from r2v_data_v2.v3.config import (
     BackgroundConfig,
     FramesConfig,
@@ -42,9 +43,9 @@ from r2v_data_v2.v3.schemas import (
     PairingState,
     ReferenceEditEntityState,
     ReferenceEditState,
-    ReferenceVariantState,
-    ReferenceVariantsState,
     ReferencesState,
+    ReferenceVariantsState,
+    ReferenceVariantState,
     SampledFrame,
     SampledFramesArtifact,
     TrackedEntityMasks,
@@ -490,7 +491,12 @@ def test_v3_config_loads_32b_defaults_without_model_access(
         "  background_remove_judge:\n"
         f"    model: {config.qwen.background_remove_judge.model}\n"
         "sam3:\n"
-        f"  model_path: {config.sam3.model_path}\n",
+        f"  model_path: {config.sam3.model_path}\n"
+        "subject_attributes:\n"
+        "  completion:\n"
+        "    quality_filter:\n"
+        "      weak_alpha_ratio_max: 0.09\n"
+        "      foreground_fill_min: 0.20\n",
         encoding="utf-8",
     )
 
@@ -502,6 +508,19 @@ def test_v3_config_loads_32b_defaults_without_model_access(
     assert loaded.background.raw_foreground_area_ratio == 0.0
     assert loaded.background.max_pending_remove_area_ratio == 0.60
     assert loaded.remove.fallback_to_raw is False
+    assert loaded.subject_attributes.completion.quality_filter.enabled is True
+    assert (
+        loaded.subject_attributes.completion.quality_filter.version
+        == "completion_quality_filter_v1"
+    )
+    assert (
+        loaded.subject_attributes.completion.quality_filter.weak_alpha_ratio_max
+        == 0.09
+    )
+    assert (
+        loaded.subject_attributes.completion.quality_filter.foreground_fill_min
+        == 0.20
+    )
 
 
 @pytest.mark.parametrize(
@@ -2320,6 +2339,102 @@ def test_v3_entrypoint_initializes_storage_without_model_execution(
             config_path=config_path,
             stages=("annotate",),
             git_commit="abc123",
+        )
+
+
+def test_postprocessing_resume_reuses_existing_run_git_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    config = replace(
+        config,
+        runtime=replace(config.runtime, mode="streaming_v1"),
+    )
+    storage = RunStorage(config)
+    storage.initialize(git_commit="old-production-commit")
+    monkeypatch.setattr(pipeline_module, "load_config", lambda _path: config)
+
+    def fake_streaming(**kwargs: object) -> dict[str, object]:
+        results = kwargs["results"]
+        assert isinstance(results, dict)
+        results["completed_stages"] = ["subject_attributes", "export"]
+        return results
+
+    monkeypatch.setattr(pipeline_module, "_run_streaming_pipeline", fake_streaming)
+
+    result = pipeline_module.run_pipeline_v3(
+        config_path=tmp_path / "ignored.yaml",
+        stages=("subject_attributes", "export"),
+        git_commit="new-hotfix-commit",
+        resume_existing_run_identity=True,
+    )
+
+    assert result["completed_stages"] == ["subject_attributes", "export"]
+    assert storage.read_run().git_commit == "old-production-commit"
+
+
+def test_postprocessing_resume_rejects_frontend_stage_before_loading_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        pipeline_module,
+        "load_config",
+        lambda _path: (_ for _ in ()).throw(AssertionError("must not load config")),
+    )
+
+    with pytest.raises(ValueError, match="restricted to subject_attributes and export"):
+        pipeline_module.run_pipeline_v3(
+            config_path=tmp_path / "ignored.yaml",
+            stages=("segment", "subject_attributes"),
+            resume_existing_run_identity=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "identity_field",
+    ["run_id", "config_hash", "model_identifiers", "source_manifest_path"],
+)
+def test_postprocessing_resume_rejects_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity_field: str,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    storage = RunStorage(config)
+    storage.initialize(git_commit="old-production-commit")
+    payload = json.loads(storage.run_path.read_text(encoding="utf-8"))
+    wrong_values: dict[str, object] = {
+        "run_id": "wrong-run",
+        "config_hash": "wrong-config-hash",
+        "model_identifiers": {"qwen.annotation": "wrong-model"},
+        "source_manifest_path": "/wrong/source.jsonl",
+    }
+    payload[identity_field] = wrong_values[identity_field]
+    storage.run_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(pipeline_module, "load_config", lambda _path: config)
+
+    with pytest.raises(ValueError, match=identity_field):
+        pipeline_module.run_pipeline_v3(
+            config_path=tmp_path / "ignored.yaml",
+            stages=("export",),
+            resume_existing_run_identity=True,
+        )
+
+
+def test_postprocessing_resume_requires_existing_run_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    monkeypatch.setattr(pipeline_module, "load_config", lambda _path: config)
+
+    with pytest.raises(FileNotFoundError, match="requires an existing run.json"):
+        pipeline_module.run_pipeline_v3(
+            config_path=tmp_path / "ignored.yaml",
+            stages=("export",),
+            resume_existing_run_identity=True,
         )
 
 

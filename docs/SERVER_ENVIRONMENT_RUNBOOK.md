@@ -370,12 +370,16 @@ at most 3 per eligible human owner
 owner Top3 candidates; at most 2 different sources
 single-frame SAM3 probes only; no temporal tracking
 6 hard raw review flags, including sufficient_source_evidence
-structure_complete and completion_recommended are diagnostics only
-face: Boogu hard-disabled, accepted raw -> reviewed bbox -> raw alpha fallback
+completion-eligible non-face raw is independently publishable only when
+  structure_complete=true and completion_recommended=false
+face: Boogu hard-disabled, accepted raw -> bbox without a second Qwen review
+face: bypass generic completion raw precheck; Qwen accepts >=~50% visible
+  frontal facial structure when identity remains recognizable
+face bbox materialization failure -> accepted raw alpha safety fallback
 face without an accepted raw candidate -> reject; bbox cannot bypass raw gates
 eligible non-face repair uses raw alpha + source RGB bbox + Boogu candidate
-non-face insufficient evidence -> candidate 2, then bbox last resort
-non-face bbox reject -> Attribute reject
+eligible non-face accepted-but-incomplete completion failure/reject -> reject
+eligible non-face rejected raw review -> no Boogu or bbox rescue
 fresh generated background -> disabled
 ```
 

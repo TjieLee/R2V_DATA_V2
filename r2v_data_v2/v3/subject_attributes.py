@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import cv2
 import numpy as np
 from openai import BadRequestError, OpenAI
 from PIL import Image
@@ -32,12 +33,13 @@ from r2v_data_v2.v3.config import (
     QwenServiceConfig,
     Sam3Config,
     SubjectAttributeCompletionConfig,
+    SubjectAttributeCompletionQualityFilterConfig,
     V3Config,
 )
 from r2v_data_v2.v3.mask_codec import decode_binary_mask
 from r2v_data_v2.v3.pair import (
-    _masked_sharpness_score,
     EntityReferenceCandidate,
+    _masked_sharpness_score,
     build_candidate_context_image,
     build_entity_reference_candidates,
     build_reference_crop,
@@ -57,8 +59,8 @@ from r2v_data_v2.v3.schemas import (
     ClipRecord,
     EntityReferenceState,
     ReferenceDefaultVariant,
-    ReferenceVariantState,
     ReferenceVariantsState,
+    ReferenceVariantState,
     RunRecord,
     TrackedMasksArtifact,
     render_annotation_plain_text,
@@ -1523,15 +1525,26 @@ meaningful evidence for a conservative completion.
 recognizable requires sufficient component structure, not merely a guessable
 category. Hair needs a coherent hairstyle region or silhouette; reject fringe,
 arcs, isolated strands, or contour-only regions. Face needs enough facial
-structure to function independently and must show a front or near-front face
-with roughly at least 50% of the frontal facial structure visible. Reject a
-strong three-quarter or near-side face below that standard, a side profile,
-the back of a head, an excessively turned face, or isolated facial patches.
-Apply this frontal requirement only when attribute_type is face; do not apply
-it to hair, headwear, glasses, clothing, shoes, bags, or accessories. Upper or
-lower clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
-cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags, and
-accessories need enough of the item to identify its structure independently.
+structure to function independently. Apply this rule only when attribute_type is face:
+accept when approximately 50% or more of the frontal facial structure is visible and
+the person's identity remains reasonably recognizable. This includes frontal,
+near-frontal, ordinary three-quarter, and fairly turned faces that still retain
+roughly half or more of the frontal facial structure. Do not require both eyes
+to be fully visible and do not require a passport-photo-like frontal pose.
+Partial hair, ear, or neck context is irrelevant to rejection. For face,
+recognizable, characteristic_appearance_visible,
+usable_as_attribute_condition, and sufficient_source_evidence must not
+implicitly require a near-frontal view and should normally be true when this
+approximately-50% identity threshold is met. Reject face only when less than
+roughly half of the frontal facial structure is visible, such as an almost pure
+side profile; the back of the head or essentially no visible face; severe
+occlusion that destroys identity cues; severe motion blur that makes identity
+unreliable; an extremely small or genuinely unusable face; or the wrong person
+or a competing face. Do not apply this face-specific standard to hair,
+headwear, glasses, clothing, shoes, bags, or accessories. Upper or lower
+clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
+cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags,
+and accessories need enough of the item to identify its structure independently.
 usable_as_attribute_condition=true only when the isolated crop provides clean,
 useful appearance information beyond the main subject reference. Reject a
 generic owner or body silhouette, a pose-dominated cutout, an arbitrary subject-
@@ -1614,6 +1627,28 @@ copy-paste shortcut. The bbox must primarily teach the requested attribute, not
 the original frame. Reject a tiny, blurry, or semantically weak attribute
 region even when surrounding owner context or text makes its category
 guessable. Fail closed when uncertain.
+
+Return exactly the strict JSON schema with reason before verdict and no extra
+fields."""
+
+ATTRIBUTE_FACE_BBOX_REVIEW_SYSTEM_PROMPT = """You are reviewing an RGB bbox
+reference for one known person's face. Accept when exactly one target face is
+dominant, approximately 50% or more of the frontal facial structure is visible,
+and identity remains reasonably recognizable. Frontal, near-frontal, ordinary
+three-quarter, and fairly turned faces are acceptable when they retain roughly
+half or more of the frontal facial structure. Do not require both eyes to be
+fully visible or a passport-photo-like frontal pose. Hair, ear, and neck context
+is irrelevant to rejection, and owner identity is positive evidence rather than
+leakage.
+
+Reject only when less than roughly half of the frontal facial structure is
+visible, such as an almost pure side profile; the back of the head or
+essentially no visible face; severe occlusion or motion blur that destroys
+reliable identity cues; an extremely small or genuinely unusable face; the
+wrong person; multiple competing faces; or severe visual artifacts. Interpret
+no_strong_owner_pose_or_scene_leakage as requiring that unrelated body pose and
+scene context do not overwhelm the face; do not treat the target person's facial
+identity as leakage. Fail closed when uncertain.
 
 Return exactly the strict JSON schema with reason before verdict and no extra
 fields."""
@@ -2044,7 +2079,11 @@ class QwenSubjectAttributeClient:
         return SubjectAttributeBboxReview.model_validate(
             self._request_structured(
                 component="qwen_attribute_bbox_review",
-                system_prompt=ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT,
+                system_prompt=(
+                    ATTRIBUTE_FACE_BBOX_REVIEW_SYSTEM_PROMPT
+                    if attribute_type == "face"
+                    else ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT
+                ),
                 content=content,
                 response_model=SubjectAttributeBboxReview,
             )
@@ -2584,6 +2623,8 @@ def _accepted_record(
             if final_selection == "raw"
             else "attribute_completion_review_accepted"
             if final_selection == "completed"
+            else "face_bbox_selected_from_accepted_raw_review"
+            if candidate.discovered.attribute_type == "face"
             else "attribute_bbox_fallback_review_accepted"
         ),
         accepted_base_image_path=(relative_path if final_selection != "bbox" else None),
@@ -2598,8 +2639,6 @@ def _accepted_face_record(
     sample_id: str,
     owner_reference: EntityReferenceState,
     review: SubjectAttributeReview,
-    judge: AttributeVariantJudge | None,
-    metrics: _AttributeVariantMetrics,
     crop_padding_ratio: float,
 ) -> SubjectAttributeRecord:
     source_frame_index = candidate.owner_candidate.source_frame_index
@@ -2616,7 +2655,7 @@ def _accepted_face_record(
             variant="bbox",
             image=bbox_image,
         )
-    except Exception as exc:  # noqa: BLE001 - raw alpha remains accepted
+    except Exception as exc:  # noqa: BLE001 - safest fallback is accepted raw alpha
         bbox_variant = ReferenceVariantState(
             image_path=None,
             status="unavailable",
@@ -2627,55 +2666,15 @@ def _accepted_face_record(
             source_frame_index=source_frame_index,
         )
     else:
-        if judge is None:
-            bbox_variant = ReferenceVariantState(
-                image_path=bbox_path,
-                status="available",
-                reviewed=False,
-                review_status="judge_unavailable",
-                reason="attribute_bbox_judge_unavailable",
-                synthetic=False,
-                source_frame_index=source_frame_index,
-            )
-        else:
-            metrics.bbox_reviews_attempted += 1
-            try:
-                owner_context = build_candidate_context_image(
-                    candidate.source_image,
-                    candidate.owner_candidate.mask,
-                )
-                bbox_review = judge.review_attribute_bbox(
-                    bbox_candidate=bbox_image,
-                    owner_context=owner_context,
-                    attribute_type=candidate.discovered.attribute_type,
-                    attribute_phrase=candidate.discovered.phrase,
-                )
-                if not isinstance(bbox_review, SubjectAttributeBboxReview):
-                    raise TypeError("attribute bbox judge returned an invalid review")
-                accepted = bbox_review.verdict == "accept"
-            except Exception as exc:  # noqa: BLE001 - raw alpha remains accepted
-                bbox_variant = ReferenceVariantState(
-                    image_path=bbox_path,
-                    status="available",
-                    reviewed=False,
-                    review_status="judge_failed",
-                    reason=(
-                        "attribute_bbox_judge_failed:"
-                        f"{type(exc).__name__}:{exc}"
-                    ),
-                    synthetic=False,
-                    source_frame_index=source_frame_index,
-                )
-            else:
-                bbox_variant = ReferenceVariantState(
-                    image_path=bbox_path,
-                    status="accepted" if accepted else "rejected",
-                    reviewed=True,
-                    review_status="accept" if accepted else "reject",
-                    reason=bbox_review.reason,
-                    synthetic=False,
-                    source_frame_index=source_frame_index,
-                )
+        bbox_variant = ReferenceVariantState(
+            image_path=bbox_path,
+            status="accepted",
+            reviewed=True,
+            review_status="accepted_via_raw_face_review",
+            reason="face_bbox_selected_from_accepted_raw_review",
+            synthetic=False,
+            source_frame_index=source_frame_index,
+        )
     final_selection: Literal["raw", "bbox"] = (
         "bbox" if bbox_variant.status == "accepted" else "raw"
     )
@@ -2777,6 +2776,215 @@ def _save_completion_input(path: Path, crop: Image.Image) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class _CompletionQualityEvaluation:
+    passed: bool
+    reasons: tuple[str, ...]
+    diagnostics: dict[str, object]
+
+
+def _completion_component_labels(
+    mask: np.ndarray,
+) -> tuple[np.ndarray, list[tuple[int, int, tuple[int, int, int, int]]]]:
+    binary = np.asarray(mask, dtype=np.uint8)
+    if binary.ndim != 2:
+        raise ValueError("completion quality mask must be 2D")
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+    components = sorted(
+        (
+            (
+                label,
+                int(stats[label, cv2.CC_STAT_AREA]),
+                (
+                    int(stats[label, cv2.CC_STAT_LEFT]),
+                    int(stats[label, cv2.CC_STAT_TOP]),
+                    int(stats[label, cv2.CC_STAT_WIDTH]),
+                    int(stats[label, cv2.CC_STAT_HEIGHT]),
+                ),
+            )
+            for label in range(1, count)
+        ),
+        key=lambda item: (-item[1], item[2], item[0]),
+    )
+    return labels, components
+
+
+def _evaluate_completion_quality(
+    completed: Image.Image,
+    *,
+    config: SubjectAttributeCompletionQualityFilterConfig,
+    minimum_mean_luminance: float = 0.0,
+    minimum_sharpness_score: float = 0.0,
+) -> _CompletionQualityEvaluation:
+    if not config.enabled:
+        return _CompletionQualityEvaluation(
+            passed=True,
+            reasons=(),
+            diagnostics={"enabled": False, "version": config.version},
+        )
+    alpha = np.asarray(completed.convert("RGBA").getchannel("A"), dtype=np.uint8)
+    foreground = alpha > 0
+    foreground_pixels = int(foreground.sum())
+    if foreground_pixels == 0:
+        return _CompletionQualityEvaluation(
+            passed=False,
+            reasons=("empty_foreground",),
+            diagnostics={
+                "enabled": True,
+                "version": config.version,
+                "foreground_pixels": 0,
+            },
+        )
+
+    labels, components = _completion_component_labels(foreground)
+    main_label, main_pixels, (_, _, bbox_width, bbox_height) = components[0]
+    component_areas = [component[1] for component in components]
+    secondary_pixels = foreground_pixels - main_pixels
+    second_pixels = component_areas[1] if len(component_areas) > 1 else 0
+    soft_pixels = int(((alpha >= 8) & (alpha <= 247)).sum())
+    weak = (alpha >= 1) & (alpha <= 40)
+    weak_pixels = int(weak.sum())
+    rgb = np.asarray(completed.convert("RGB"), dtype=np.uint8)
+    luminance = (
+        0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    ) / 255.0
+    mean_luminance = float(luminance[foreground].mean())
+    sharpness_score = _masked_sharpness_score(rgb, foreground)
+
+    strong = alpha > 40
+    strong_labels, strong_components = _completion_component_labels(strong)
+    if strong_components:
+        strong_main = strong_labels == strong_components[0][0]
+    else:
+        strong_main = labels == main_label
+    dilated_main = cv2.dilate(
+        strong_main.astype(np.uint8),
+        np.ones((9, 9), dtype=np.uint8),
+        iterations=1,
+    ).astype(bool)
+    outer_weak_pixels = int((weak & ~dilated_main).sum())
+
+    diagnostics: dict[str, object] = {
+        "enabled": True,
+        "version": config.version,
+        "foreground_pixels": foreground_pixels,
+        "component_count": len(component_areas),
+        "secondary_component_ratio": secondary_pixels / foreground_pixels,
+        "second_component_ratio": second_pixels / foreground_pixels,
+        "soft_alpha_ratio": soft_pixels / foreground_pixels,
+        "weak_alpha_ratio": weak_pixels / foreground_pixels,
+        "outer_weak_alpha_ratio": outer_weak_pixels / foreground_pixels,
+        "foreground_fill": main_pixels / (bbox_width * bbox_height),
+        "mean_luminance": mean_luminance,
+        "sharpness_score": sharpness_score,
+    }
+    reasons: list[str] = []
+    comparisons = (
+        (
+            "excessive_secondary_components",
+            diagnostics["secondary_component_ratio"],
+            config.secondary_component_ratio_max,
+            "max",
+        ),
+        (
+            "large_secondary_component",
+            diagnostics["second_component_ratio"],
+            config.second_component_ratio_max,
+            "max",
+        ),
+        (
+            "excessive_soft_alpha",
+            diagnostics["soft_alpha_ratio"],
+            config.soft_alpha_ratio_max,
+            "max",
+        ),
+        (
+            "excessive_weak_alpha",
+            diagnostics["weak_alpha_ratio"],
+            config.weak_alpha_ratio_max,
+            "max",
+        ),
+        (
+            "outer_weak_alpha_trail",
+            diagnostics["outer_weak_alpha_ratio"],
+            config.outer_weak_alpha_ratio_max,
+            "max",
+        ),
+        (
+            "low_foreground_fill",
+            diagnostics["foreground_fill"],
+            config.foreground_fill_min,
+            "min",
+        ),
+    )
+    for reason, value, threshold, direction in comparisons:
+        assert isinstance(value, float)
+        if (direction == "max" and value > threshold) or (
+            direction == "min" and value < threshold
+        ):
+            reasons.append(reason)
+    if mean_luminance < minimum_mean_luminance:
+        reasons.append("near_silhouette")
+    if sharpness_score < minimum_sharpness_score:
+        reasons.append("too_blurry")
+    diagnostics["reasons"] = list(reasons)
+    return _CompletionQualityEvaluation(
+        passed=not reasons,
+        reasons=tuple(reasons),
+        diagnostics=diagnostics,
+    )
+
+
+def _completion_mask_postcheck_rejection(
+    masks: tuple[np.ndarray, ...],
+    *,
+    expected_shape: tuple[int, int],
+) -> tuple[list[np.ndarray], str | None]:
+    usable: list[np.ndarray] = []
+    for mask in masks:
+        array = np.asarray(mask)
+        if (
+            array.ndim != 2
+            or array.shape != expected_shape
+            or array.dtype.kind not in "biuf"
+            or (array.dtype.kind == "f" and not np.isfinite(array).all())
+            or not np.isin(array, (False, True, 0, 1)).all()
+        ):
+            return [], "invalid_sam_mask"
+        binary = array.astype(bool, copy=False)
+        if binary.any():
+            usable.append(binary.copy())
+    return usable, None
+
+
+def _clean_completion_mask(
+    mask: np.ndarray,
+    *,
+    config: SubjectAttributeCompletionQualityFilterConfig,
+) -> tuple[np.ndarray, dict[str, object]]:
+    binary = np.asarray(mask, dtype=bool)
+    labels, components = _completion_component_labels(binary)
+    total_pixels = int(binary.sum())
+    cleaned = binary.copy()
+    removed_labels: list[int] = []
+    for label, area, _ in components[1:]:
+        if (
+            area <= config.cleanup_component_pixels_max
+            and area / total_pixels <= config.cleanup_component_ratio_max
+        ):
+            cleaned[labels == label] = False
+            removed_labels.append(label)
+    return cleaned, {
+        "sam_union_pixels": total_pixels,
+        "cleaned_mask_pixels": int(cleaned.sum()),
+        "removed_component_count": len(removed_labels),
+        "removed_component_pixels": total_pixels - int(cleaned.sum()),
+    }
+
+
 def attribute_completion_prompt(attribute_type: AttributeType) -> str:
     try:
         entity_name = _ATTRIBUTE_COMPLETION_ENTITY_NAME[attribute_type]
@@ -2792,12 +3000,14 @@ def _attempt_attribute_completion(
     *,
     clip_uid: str,
     output_root: Path,
-    completion_config: object,
+    completion_config: SubjectAttributeCompletionConfig,
     completion_backend: AttributeCompletionBackend,
     completion_judge: AttributeCompletionJudge,
+    segmentation_backend: AttributeFrameSegmentationBackend,
     metrics: _CompletionSelectionMetrics,
     raw_usable: bool,
     crop_padding_ratio: float = 0.08,
+    save_diagnostics: bool = False,
 ) -> tuple[
     PendingAttributeCandidate | None,
     str,
@@ -2854,6 +3064,154 @@ def _attempt_attribute_completion(
         with Image.open(output_path) as opened:
             opened.load()
             completed_rgb = opened.convert("RGB")
+        failure_stage = "sam3_postcheck"
+        sam_started = time.perf_counter()
+        try:
+            completed_masks = segmentation_backend.segment_generated_frame(
+                frame_path=output_path,
+                grounding_prompt=candidate.discovered.grounding_prompt,
+            )
+        finally:
+            metrics.sam3_time_seconds += time.perf_counter() - sam_started
+        metrics.sam_masks_returned_total += len(completed_masks)
+        usable_masks, mask_rejection = _completion_mask_postcheck_rejection(
+            completed_masks,
+            expected_shape=(completed_rgb.height, completed_rgb.width),
+        )
+        if mask_rejection is not None:
+            metrics.postcheck_rejects += 1
+            if save_diagnostics:
+                write_json_atomic(
+                    candidate_root / "quality.json",
+                    {
+                        "enabled": completion_config.quality_filter.enabled,
+                        "version": completion_config.quality_filter.version,
+                        "reasons": [mask_rejection],
+                        "sam_mask_count": len(completed_masks),
+                        "sam_nonempty_mask_count": 0,
+                    },
+                )
+            return (
+                None,
+                f"completion_postcheck:{mask_rejection}",
+                False,
+                None,
+                completion_seed,
+            )
+        if not usable_masks:
+            metrics.sam_zero_mask_rejects += 1
+            metrics.postcheck_rejects += 1
+            if save_diagnostics:
+                write_json_atomic(
+                    candidate_root / "quality.json",
+                    {
+                        "enabled": completion_config.quality_filter.enabled,
+                        "version": completion_config.quality_filter.version,
+                        "reasons": ["missing_entity"],
+                        "sam_mask_count": len(completed_masks),
+                        "sam_nonempty_mask_count": 0,
+                    },
+                )
+            return (
+                None,
+                "completion_postcheck:missing_entity",
+                False,
+                None,
+                completion_seed,
+            )
+        if len(usable_masks) == 1:
+            metrics.sam_single_mask += 1
+        else:
+            metrics.sam_multi_mask += 1
+        union_mask = np.logical_or.reduce(usable_masks)
+        cleaned_mask, cleanup_diagnostics = _clean_completion_mask(
+            union_mask,
+            config=completion_config.quality_filter,
+        )
+        completed_rows, completed_columns = np.nonzero(cleaned_mask)
+        completed_long_side = max(
+            int(completed_columns.max() - completed_columns.min() + 1),
+            int(completed_rows.max() - completed_rows.min() + 1),
+        )
+        if (
+            int(cleaned_mask.sum()) < MIN_ATTRIBUTE_AREA_PIXELS
+            or completed_long_side < MIN_ATTRIBUTE_LONG_SIDE_PIXELS
+        ):
+            metrics.postcheck_rejects += 1
+            if save_diagnostics:
+                write_json_atomic(
+                    candidate_root / "quality.json",
+                    {
+                        **cleanup_diagnostics,
+                        "version": completion_config.quality_filter.version,
+                        "reasons": ["attribute_too_small"],
+                        "sam_mask_count": len(completed_masks),
+                        "sam_nonempty_mask_count": len(usable_masks),
+                    },
+                )
+            return (
+                None,
+                "completion_postcheck:attribute_too_small",
+                False,
+                None,
+                completion_seed,
+            )
+        component_diagnostics = mask_component_diagnostics(cleaned_mask)
+        if (
+            component_diagnostics.significant_component_count
+            > completion_config.maximum_completed_significant_components
+        ):
+            metrics.postcheck_rejects += 1
+            if save_diagnostics:
+                write_json_atomic(
+                    candidate_root / "quality.json",
+                    {
+                        **cleanup_diagnostics,
+                        "version": completion_config.quality_filter.version,
+                        "reasons": ["extra_entity_contours"],
+                        "sam_mask_count": len(completed_masks),
+                        "sam_nonempty_mask_count": len(usable_masks),
+                    },
+                )
+            return (
+                None,
+                "completion_postcheck:extra_entity_contours",
+                False,
+                None,
+                completion_seed,
+            )
+        completed_rgba, _ = build_reference_crop(
+            completed_rgb,
+            cleaned_mask,
+            crop_padding_ratio=crop_padding_ratio,
+        )
+        quality = _evaluate_completion_quality(
+            completed_rgba,
+            config=completion_config.quality_filter,
+            minimum_mean_luminance=completion_config.minimum_mean_luminance,
+            minimum_sharpness_score=completion_config.minimum_sharpness_score,
+        )
+        quality.diagnostics.update(cleanup_diagnostics)
+        quality.diagnostics.update(
+            {
+                "sam_mask_count": len(completed_masks),
+                "sam_nonempty_mask_count": len(usable_masks),
+            }
+        )
+        if save_diagnostics:
+            write_json_atomic(
+                candidate_root / "quality.json",
+                quality.diagnostics,
+            )
+        if not quality.passed:
+            metrics.postcheck_rejects += 1
+            return (
+                None,
+                "completion_postcheck:" + ",".join(quality.reasons),
+                False,
+                None,
+                completion_seed,
+            )
         failure_stage = "identity_review"
         review_started = time.perf_counter()
         metrics.review_calls += 1
@@ -2864,7 +3222,7 @@ def _attempt_attribute_completion(
                 candidate.attribute_mask,
                 crop_padding_ratio=crop_padding_ratio,
             ),
-            generated_candidate=completed_rgb,
+            generated_candidate=completed_rgba,
             attribute_type=candidate.discovered.attribute_type,
             attribute_phrase=candidate.discovered.phrase,
         )
@@ -2902,7 +3260,7 @@ def _attempt_attribute_completion(
             owner_candidate=candidate.owner_candidate,
             attribute_mask=candidate.attribute_mask,
             source_image=candidate.source_image,
-            crop=completed_rgb,
+            crop=completed_rgba,
             geometry=candidate.geometry,
             gme_attempts=candidate.gme_attempts,
             selected_gme_attempt_index=candidate.selected_gme_attempt_index,
@@ -3035,6 +3393,7 @@ def _collect_attribute_candidates(
             if bool(
                 completion_config is not None
                 and getattr(completion_config, "enabled", False)
+                and discovered.attribute_type != "face"
             ):
                 raw_rejection = _masked_crop_quality_rejection(
                     crop,
@@ -3294,13 +3653,15 @@ def _validate_attribute_png(
         opened.load()
         if opened.format != "PNG":
             raise ValueError("accepted attribute artifact must be PNG")
-        mode = expected_mode or (
-            "RGB" if final_selection in {"completed", "bbox"} else "RGBA"
-        )
+        mode = expected_mode or ("RGB" if final_selection == "bbox" else "RGBA")
+        if (
+            expected_mode is None
+            and final_selection == "completed"
+            and opened.mode == "RGB"
+        ):
+            return
         if mode == "RGB":
             if opened.mode != "RGB":
-                if expected_mode is None and final_selection in {"completed", "bbox"}:
-                    raise ValueError("completed attribute artifact must be RGB PNG")
                 raise ValueError("selected attribute artifact must be RGB PNG")
             return
         if opened.mode != "RGBA":
@@ -3375,12 +3736,12 @@ def _load_cached_owner_artifact(
                                 "RGBA" if variant_name == "alpha" else "RGB"
                             ),
                         )
-                    assert record.accepted_base_image_path is not None
-                    _validate_attribute_png(
-                        output_root,
-                        record.accepted_base_image_path,
-                        final_selection=record.final_selection or "raw",
-                    )
+                    if record.accepted_base_image_path is not None:
+                        _validate_attribute_png(
+                            output_root,
+                            record.accepted_base_image_path,
+                            final_selection=record.final_selection or "raw",
+                        )
         return artifact
     except (OSError, ValueError):
         return None
@@ -3665,7 +4026,12 @@ def _process_owner(
                 semantic_candidate_pool.setdefault(attribute_id, []).append(
                     (candidate, review)
                 )
-            if review.accepted:
+            raw_publishable = bool(
+                review.accepted
+                and review.structure_complete
+                and not review.completion_recommended
+            )
+            if raw_publishable:
                 raw_fallback_pool.setdefault(attribute_id, []).append(
                     (candidate, review)
                 )
@@ -3680,6 +4046,26 @@ def _process_owner(
                 in completion_config.eligible_types
             )
             if not semantic_owner_correct:
+                if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
+                    continue
+                records_by_id[attribute_id] = _rejected_record(
+                    candidate.discovered,
+                    attribute_id=attribute_id,
+                    owner_entity_id=owner.entity_id,
+                    reason=f"recognizability:{review.reason}",
+                    geometry=candidate.geometry,
+                    source_frame_index=candidate.owner_candidate.source_frame_index,
+                    source_frame_slot=candidate.owner_candidate.frame_slot,
+                    owner_candidate_id=candidate.owner_candidate.candidate_id,
+                    same_frame=same_frame,
+                    review=review,
+                    gme_attempts=candidate.gme_attempts,
+                    selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+                )
+                unresolved.discard(attribute_id)
+                continue
+
+            if completion_eligible and not review.accepted:
                 if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
                     continue
                 records_by_id[attribute_id] = _rejected_record(
@@ -3731,6 +4117,22 @@ def _process_owner(
                     pass
                 continue
 
+            if raw_publishable:
+                selected_candidate_by_id[attribute_id] = candidate
+                records_by_id[attribute_id] = _accepted_record(
+                    candidate,
+                    output_root=output_root,
+                    sample_id=clip.clip_uid,
+                    owner_reference=owner_reference,
+                    review=review,
+                    final_selection="raw",
+                    completion_attempted=False,
+                    completion_outcome="not_attempted",
+                    crop_padding_ratio=config.pair.crop_padding_ratio,
+                )
+                unresolved.discard(attribute_id)
+                continue
+
             if completion_backend is None or completion_judge is None:
                 completed = None
                 completion_review = None
@@ -3740,7 +4142,7 @@ def _process_owner(
                 completion_metrics.attempts_by_type[
                     candidate.discovered.attribute_type
                 ] += 1
-                if review.accepted:
+                if raw_publishable:
                     completion_metrics.raw_usable_attempts += 1
                 else:
                     completion_metrics.raw_unusable_attempts += 1
@@ -3760,9 +4162,17 @@ def _process_owner(
                     completion_config=completion_config,
                     completion_backend=completion_backend,
                     completion_judge=completion_judge,
+                    segmentation_backend=segmentation_backend,
                     metrics=completion_metrics,
-                    raw_usable=review.accepted,
+                    raw_usable=raw_publishable,
                     crop_padding_ratio=config.pair.crop_padding_ratio,
+                    save_diagnostics=bool(
+                        getattr(
+                            getattr(config, "debug", None),
+                            "save_diagnostics",
+                            False,
+                        )
+                    ),
                 )
             completion_provenance[attribute_id] = (
                 completion_reason,
@@ -3806,8 +4216,6 @@ def _process_owner(
             sample_id=clip.clip_uid,
             owner_reference=owner_reference,
             review=review,
-            judge=variant_judge,
-            metrics=new_variant_metrics,
             crop_padding_ratio=config.pair.crop_padding_ratio,
         )
 
@@ -3842,6 +4250,33 @@ def _process_owner(
             continue
 
         semantic_pool = semantic_candidate_pool.get(attribute_id, [])
+        if attribute_id in completion_provenance:
+            candidate, review = semantic_pool[-1]
+            completion_metrics.rejected += 1
+            records_by_id[attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=completion_reason,
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=(
+                    owner_reference.source_clip_uid in {None, clip.clip_uid}
+                    and candidate.owner_candidate.source_frame_index
+                    == owner_reference.source_frame_index
+                ),
+                review=review,
+                completion_review=completion_review,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+                completion_attempted=True,
+                completion_seed=completion_seed,
+                completion_outcome=completion_reason,
+            )
+            unresolved.discard(attribute_id)
+            continue
         if (
             semantic_pool
             and semantic_pool[0][0].discovered.attribute_type == "face"
@@ -4123,7 +4558,9 @@ def _process_owner(
                 new_variant_metrics.bbox_reviews_attempted
             ),
             attribute_bbox_fallback_accepted=sum(
-                record.status == "accepted" and record.final_selection == "bbox"
+                record.status == "accepted"
+                and record.final_selection == "bbox"
+                and record.attribute_type != "face"
                 for record in ordered_records
             ),
             failures=failures,

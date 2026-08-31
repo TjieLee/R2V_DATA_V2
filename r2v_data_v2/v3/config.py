@@ -221,6 +221,20 @@ class SubjectAttributeGmeConfig:
 
 
 @dataclass(frozen=True)
+class SubjectAttributeCompletionQualityFilterConfig:
+    enabled: bool = True
+    version: str = "completion_quality_filter_v1"
+    secondary_component_ratio_max: float = 0.03
+    second_component_ratio_max: float = 0.02
+    soft_alpha_ratio_max: float = 0.35
+    weak_alpha_ratio_max: float = 0.10
+    outer_weak_alpha_ratio_max: float = 0.015
+    foreground_fill_min: float = 0.18
+    cleanup_component_ratio_max: float = 0.005
+    cleanup_component_pixels_max: int = 16
+
+
+@dataclass(frozen=True)
 class SubjectAttributeCompletionConfig:
     enabled: bool = False
     eligible_types: tuple[str, ...] = (
@@ -241,6 +255,9 @@ class SubjectAttributeCompletionConfig:
     maximum_bbox_area_growth_ratio: float = 2.50
     face_maximum_bbox_area_growth_ratio: float = 1.60
     maximum_completed_significant_components: int = 2
+    quality_filter: SubjectAttributeCompletionQualityFilterConfig = field(
+        default_factory=SubjectAttributeCompletionQualityFilterConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -888,6 +905,44 @@ class V3Config:
                 raise ValueError(
                     f"subject_attributes.completion.{name} must be a positive integer"
                 )
+        quality_filter = completion.quality_filter
+        if not isinstance(quality_filter.enabled, bool):
+            raise TypeError(
+                "subject_attributes.completion.quality_filter.enabled must be a boolean"
+            )
+        if quality_filter.version != "completion_quality_filter_v1":
+            raise ValueError(
+                "subject_attributes.completion.quality_filter.version must be "
+                "completion_quality_filter_v1"
+            )
+        for name in (
+            "secondary_component_ratio_max",
+            "second_component_ratio_max",
+            "soft_alpha_ratio_max",
+            "weak_alpha_ratio_max",
+            "outer_weak_alpha_ratio_max",
+            "foreground_fill_min",
+            "cleanup_component_ratio_max",
+        ):
+            value = getattr(quality_filter, name)
+            if (
+                not isinstance(value, float)
+                or not math.isfinite(value)
+                or not 0 <= value <= 1
+            ):
+                raise ValueError(
+                    "subject_attributes.completion.quality_filter."
+                    f"{name} must be in [0, 1]"
+                )
+        if (
+            not isinstance(quality_filter.cleanup_component_pixels_max, int)
+            or isinstance(quality_filter.cleanup_component_pixels_max, bool)
+            or quality_filter.cleanup_component_pixels_max < 0
+        ):
+            raise ValueError(
+                "subject_attributes.completion.quality_filter."
+                "cleanup_component_pixels_max must be a non-negative integer"
+            )
         if self.runtime.mode not in {"staged_legacy", "streaming_v1"}:
             raise ValueError("runtime.mode must be staged_legacy or streaming_v1")
         if not isinstance(self.runtime.sam3_compile_enabled, bool):
@@ -1383,6 +1438,10 @@ def load_config(path: str | Path) -> V3Config:
         subject_attributes_values.pop("completion", None),
         "subject_attributes.completion",
     )
+    subject_attribute_completion_quality_filter_values = _mapping(
+        subject_attribute_completion_values.pop("quality_filter", None),
+        "subject_attributes.completion.quality_filter",
+    )
     if subject_attributes_values:
         raise ValueError(
             "unknown subject_attributes configuration keys: "
@@ -1518,7 +1577,14 @@ def load_config(path: str | Path) -> V3Config:
         subject_attributes=SubjectAttributesConfig(
             completion=_build(
                 SubjectAttributeCompletionConfig,
-                subject_attribute_completion_values,
+                {
+                    **subject_attribute_completion_values,
+                    "quality_filter": _build(
+                        SubjectAttributeCompletionQualityFilterConfig,
+                        subject_attribute_completion_quality_filter_values,
+                        "subject_attributes.completion.quality_filter",
+                    ),
+                },
                 "subject_attributes.completion",
             )
         ),

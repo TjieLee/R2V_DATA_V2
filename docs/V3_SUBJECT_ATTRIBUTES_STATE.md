@@ -54,8 +54,12 @@ usable_as_attribute_condition
 sufficient_source_evidence
 ```
 
-`structure_complete` and `completion_recommended` are diagnostics only. They
-cannot invalidate a review and do not control the Boogu route.
+The six flags above still determine whether the raw review is accepted. For
+completion-eligible non-face Attributes, an accepted raw crop is independently
+publishable only when `structure_complete=true` and
+`completion_recommended=false`. Any other accepted combination must complete
+successfully; the two fields do not change the six-flag definition of
+`review.accepted`.
 
 Completion is eligible only for:
 
@@ -70,17 +74,28 @@ dress_or_skirt
 Completion remains disabled for `face`, `hair`, `glasses`, `shoes`, and `bag`.
 `face` is also blocked by code policy even when a legacy server-local config
 still lists it in `eligible_types`; it cannot create a completion seed or call
-the Boogu backend or comparative completion review.
+the Boogu backend or comparative completion review. Face also bypasses the
+generic completion-oriented raw quality precheck; its existing geometry gates
+and face-specific raw Qwen review decide borderline quality.
+
+The face raw review accepts when approximately 50% or more of the frontal
+facial structure is visible and identity remains reasonably recognizable. This
+includes frontal, near-frontal, ordinary three-quarter, and fairly turned views.
+It does not require both eyes to be fully visible or a passport-photo-like pose,
+and partial hair, ear, or neck context is not a rejection reason. Less than
+roughly half visible, an almost pure side profile, back of head, identity-
+destroying occlusion or motion blur, an extremely small unusable face, wrong
+person, or competing face rejects.
 
 Face has a separate fixed publication route after all existing SAM3 geometry,
 ownership, semantic, and six-flag raw review gates pass:
 
 ```text
-accepted raw face -> materialize and review source RGB bbox
-  -> bbox accept: publish bbox, final_selection=bbox
-  -> bbox reject, judge failure/unavailable, or materialization failure:
+accepted raw face -> materialize source RGB bbox
+  -> publish bbox directly, final_selection=bbox
+  -> do not call the second bbox Qwen review
+  -> unexpected bbox materialization failure:
        publish the already accepted raw alpha, final_selection=raw
-  -> neither accepted raw alpha nor accepted bbox: reject
 ```
 
 Bbox preference never lets an unaccepted raw face bypass upstream quality or
@@ -111,17 +126,23 @@ Image 3: Boogu candidate
 ```
 
 For eligible types, the same physical item or component is a hard gate. A
-modest real improvement is enough for `candidate_better_than_alpha`; an
-equivalent candidate falls back to alpha. Boogu output is reviewed directly and
-published as RGB when accepted; there is no completion SAM3, alpha recovery,
-bbox extraction, or second repaired attribute review.
+modest real improvement is enough for `candidate_better_than_alpha`. For
+accepted-but-incomplete raw, an equivalent or rejected completion fails closed
+instead of falling back to raw. Boogu output is reviewed directly and
+then receives one frame-local Attribute completion SAM3 probe using the original
+grounding prompt. All usable masks are unioned, only very small floating
+components are removed, and the Boogu RGB plus cleaned binary mask is
+materialized as RGBA. The cleaned artifact must pass deterministic quality
+checks before the existing comparative completion review can accept it. There
+is no temporal SAM3 tracking or second repaired attribute review. Legacy
+completed RGB sidecars remain readable by the compactor.
 
-For non-face types, if `sufficient_source_evidence=false`, Boogu must not
-hallucinate missing evidence. The pipeline tries candidate 2. If both sources
-remain insufficient, bbox is the last resort. Bbox is otherwise the last resort
-only when there is no accepted completion and no accepted alpha. It has
-anti-copy-paste gates and rejects tiny or weak semantic evidence. If bbox
-rejects, the attribute rejects.
+For completion-eligible non-face types, a rejected raw review never authorizes
+Boogu or bbox rescue. The pipeline may try candidate 2, but it must find an
+accepted raw review. Independently publishable raw is selected directly.
+Accepted-but-incomplete raw enters completion, and any completion failure,
+postcheck rejection, or Qwen rejection rejects the Attribute rather than
+publishing that incomplete raw crop.
 
 Fresh Attribute generated backgrounds are disabled. Their shared variants slot
 is always:
@@ -139,8 +160,8 @@ is always:
 
 ## Publication contract
 
-Raw attributes remain binary-alpha RGBA PNGs. Accepted completion images remain
-native Boogu RGB PNGs. Bbox references are RGB PNGs. The production compactor
+Raw attributes and SAM3-cleaned accepted completion images remain binary-alpha
+RGBA PNGs. Bbox references are RGB PNGs. The production compactor
 validates the mode selected by `final_selection`, materializes the original
 bytes without conversion, and records completed references as synthetic.
 

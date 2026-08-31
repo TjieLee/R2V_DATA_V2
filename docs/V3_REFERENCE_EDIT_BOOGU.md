@@ -104,18 +104,30 @@ dress_or_skirt -> 裙子
 
 Face, hair, glasses, shoes, and bag do not enter completion. Face is hard-blocked
 in code even if a legacy config still names it as eligible: it creates no seed
-and calls neither Boogu nor comparative completion Qwen. An accepted raw face
-instead prefers a reviewed source RGB bbox and falls back to its accepted raw
-alpha on bbox reject, failure, or unavailability. Bbox cannot rescue a face that
-failed the existing raw hard gates.
+and calls neither Boogu nor comparative completion Qwen. It bypasses the generic
+completion raw-quality precheck; the face raw review accepts approximately 50%
+or more visible frontal facial structure when identity remains recognizable,
+including ordinary three-quarter and fairly turned views, without requiring
+both eyes or a passport-photo-like pose. An accepted raw face
+publishes its materialized source RGB bbox directly, without a second bbox Qwen
+review, and preserves the raw alpha as provenance. Unexpected bbox
+materialization failure retains the accepted raw alpha as the safest fallback.
+Bbox cannot rescue a face that failed the existing raw hard gates.
 
 Eligible non-face Attribute comparison uses raw alpha, source RGB bbox as
 identity-only evidence, and the generated candidate. It must preserve the same
-physical item or component. A modest improvement is enough and an equivalent
-candidate returns to alpha.
+physical item or component. Independently publishable accepted raw is selected
+without completion. Accepted-but-incomplete raw must complete successfully; an
+equivalent, rejected, or failed completion rejects instead of returning to the
+incomplete alpha crop.
 
-Accepted Attribute Boogu output is published directly as RGB PNG. It receives
-no completion SAM3, alpha restoration, foreground extraction, or bbox pass.
+Attribute Boogu output receives one frame-local completion SAM3 probe with the
+original attribute grounding prompt. The unioned mask is conservatively cleaned
+of only very small floating components and materialized with the Boogu RGB as a
+binary-alpha RGBA crop. This cleaned artifact must pass deterministic quality
+checks before the comparative completion review can accept it. There is no
+temporal tracking, large erosion, bbox pass, or second repaired attribute
+review. Legacy completed RGB sidecars remain readable.
 Fresh Attribute background generation is disabled with reason
 `attribute_background_disabled_by_policy`.
 
