@@ -3375,12 +3375,12 @@ def _load_cached_owner_artifact(
                                 "RGBA" if variant_name == "alpha" else "RGB"
                             ),
                         )
-                    assert record.accepted_base_image_path is not None
-                    _validate_attribute_png(
-                        output_root,
-                        record.accepted_base_image_path,
-                        final_selection=record.final_selection or "raw",
-                    )
+                    if record.accepted_base_image_path is not None:
+                        _validate_attribute_png(
+                            output_root,
+                            record.accepted_base_image_path,
+                            final_selection=record.final_selection or "raw",
+                        )
         return artifact
     except (OSError, ValueError):
         return None

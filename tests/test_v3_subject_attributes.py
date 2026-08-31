@@ -4258,3 +4258,83 @@ def test_legacy_attribute_generated_background_is_read_but_not_selected(
     assert normalized.variants is not None
     assert normalized.variants.generated_background.image_path is None
     assert normalized.variants.generated_background.status == "unavailable"
+
+
+def test_bbox_selected_owner_artifact_is_restart_safe(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    mask = np.zeros((100, 100), dtype=bool)
+    mask[20:80, 20:80] = True
+    owner_candidate = _candidate(
+        "candidate_bbox",
+        slot=1,
+        source_frame_index=10,
+        mask=mask,
+    )
+    candidate = subject_attributes.PendingAttributeCandidate(
+        discovered=DiscoveredSubjectAttribute(
+            attribute_type="lower_clothing",
+            phrase="black trousers",
+            grounding_prompt="the black trousers worn by person 1",
+        ),
+        attribute_id="a1",
+        owner_entity_id="e1",
+        owner_candidate=owner_candidate,
+        attribute_mask=mask,
+        source_image=Image.new("RGB", (100, 100), "white"),
+        crop=Image.new("RGBA", (60, 60), (255, 255, 255, 255)),
+        raw_crop=Image.new("RGBA", (60, 60), (255, 255, 255, 255)),
+        geometry=_geometry(),
+    )
+    record = subject_attributes._accepted_record(
+        candidate,
+        output_root=output_root,
+        sample_id="clip-1",
+        owner_reference=_ready_reference("e1", source_frame_index=10),
+        review=_accepted_review("a1"),
+        final_selection="bbox",
+        completion_attempted=False,
+        completion_outcome="bbox_fallback_accepted",
+        crop_padding_ratio=0.08,
+    )
+    assert record.default_variant == "bbox"
+    assert record.accepted_base_image_path is None
+
+    artifact = OwnerEnrichmentArtifact(
+        sample_id="clip-1",
+        owner_entity_id="e1",
+        owner_is_human=True,
+        attribute_id_start=1,
+        owner_phrase="person 1",
+        owner_grounding_prompt="the person 1",
+        records=[record],
+        metrics=OwnerEnrichmentMetrics(
+            discovery_calls=1,
+            review_calls=1,
+            sam3_attempts=1,
+            discovered_by_type={"lower_clothing": 1},
+            accepted_attributes=1,
+            same_frame_accepted=1,
+            raw_attribute_review_accepted=1,
+            attribute_bbox_variants_materialized=1,
+            attribute_bbox_reviews_attempted=1,
+            attribute_bbox_fallback_attempts=1,
+            attribute_bbox_fallback_accepted=1,
+        ),
+    )
+    artifact_path = output_root / "owners" / "clip-1" / "e1.json"
+    artifact_path.parent.mkdir(parents=True)
+    write_json_atomic(artifact_path, artifact.model_dump(mode="json"))
+
+    assert subject_attributes._load_cached_owner_artifact(
+        artifact_path,
+        output_root=output_root,
+        sample_id="clip-1",
+        owner_entity_id="e1",
+        attribute_id_start=1,
+    ) == artifact
+    assert subject_attributes._load_durable_owner_artifact(
+        artifact_path,
+        output_root=output_root,
+        sample_id="clip-1",
+        owner_entity_id="e1",
+    ) == artifact
