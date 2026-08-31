@@ -2,109 +2,74 @@
 
 Last updated: 2026-08-31
 
-This is the compatibility handoff Audio/H3 developers must read before
-consuming current Visual/reference outputs.
+This is the compatibility and ownership contract for the integrated Visual V3
+and Audio/H3 production line. Read it before changing cross-modal interfaces or
+consuming Visual production outputs from H3.
 
-## Verified branch relationship
+## Current integration state
 
-The refs inspected for this handoff were:
+The authoritative refs for the completed integration are:
 
 ```text
 repository: TjieLee/R2V_DATA_V2
 
-Visual/reference branch: feature/v3-subject-attributes-v1
-Visual/reference code HEAD inspected by the original handoff: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+integration branch:
+feature/visual-audio-integration-v1
 
-Standalone Visual Stage2 branch: feature/v3-sam3-production-v1
-validated Entity Mask orchestration HEAD: 8645db869892ea98a6599467882efc48b4eb7414
+integration HEAD:
+aae370157d3854d157e11468649f5f0288978b43
 
-Audio branch: feature/h3-audio-jea-qwen3-v1
-Audio remote HEAD verified on 2026-08-31: 4e831e3f4c29f52df3909af719abf94300b4f633
+integration merge commit:
+4dc497403f0aa65114a543a81a851a310a55c497
 
-Visual/Audio merge base for the inspected Audio branch:
+Visual source branch:
+feature/v3-sam3-production-v1
+Visual source HEAD:
+8001a2f3801e50c42f64e9135569b7a65017b73b
+
+Audio source branch:
+feature/h3-audio-caption-multibackend-v1
+Audio source HEAD:
+efa04668715081348df81ee25746272599a0df12
+
+Visual/Audio merge base:
 71276f976ed178242abe4db3e66e3fecce357832
 ```
 
-The Visual/reference branch may gain docs-only commits after the code HEAD
-above. The original frozen Visual branch is
+The merge commit has the Audio source commit and Visual source commit as its two
+parents. The integration completed without textual merge conflicts. The only
+post-merge compatibility commit is the H3 projection update that accepts the
+latest Visual face `bbox` attribute selection and its regression coverage.
+
+The original frozen Visual branch remains
 `feature/v3-runtime-integrity-v1` at
-`87bd4e06107d7f56df550979b0e96515cb70f911`; its core algorithm baseline is
-`3cfb11fdd1fbe4a5bbad02a775097d8ab3097288`.
+`87bd4e06107d7f56df550979b0e96515cb70f911`; its core original algorithm
+baseline is `3cfb11fdd1fbe4a5bbad02a775097d8ab3097288`. The current Subject
+Attribute face policy is represented by the later Visual algorithm commit
+`d056c32b76db4b3d7c0358b38e996e7a91a288d1` and is preserved in the
+integration branch.
 
-The standalone Stage2 branch is a separate production-orchestration line around
-frozen Visual components. It must not be treated as a new cross-modal public
-schema.
+LASER ASD experimental files are not part of this integration line. The
+production ASD direction remains the existing LR-ASD/TalkSet Audio path.
 
-At the refs used by the original Visual/Audio integration handoff, both
-branches had the same `r2v_data_v2/v3/production_export.py` Git blob:
+## Stable public integration API
+
+Both source branches and the integration branch use the same
+`r2v_data_v2/v3/production_export.py` blob:
 
 ```text
 3de3ce9277160f147903ccca804b6f28b1ec63c1
 ```
 
-Therefore there was no `r2v.v3.production_sample.1` schema delta between those
-inspected Audio and final Visual code refs.
-
-## 2026-08-31 standalone Stage2 orchestration isolation
-
-The recent Entity Mask production work was intentionally isolated from Audio/H3.
-The three hardening commits after the first formal Entity Mask launcher are:
-
-```text
-1ccd2b833fc9f7c89031062f2883e7983005f600
-511e834e590b1517e0e61670c2a95e244573ac88
-8645db869892ea98a6599467882efc48b4eb7414
-```
-
-From the Entity Mask launcher baseline
-`12737b791c636f441191841d91eaae431bd0d34e` through
-`8645db869892ea98a6599467882efc48b4eb7414`, the changed production code is
-limited to standalone Visual Stage2 orchestration and its tests/docs:
-
-```text
-r2v_data_v2/v3/pre_qwen_production.py
-tools/run_v3_entity_mask_auto.py
-tools/run_v3_entity_mask_worker.py
-tests/test_v3_entity_mask_static.py
-tests/test_v3_pre_qwen_production.py
-docs/ENTITY_MASK_PRODUCTION.md
-```
-
-No `r2v_data_v2/h3/*` file, Audio runner, Audio schema, or
-`production_export.py` was changed by this sequence. The Audio branch is a
-separate diverged branch and does not receive these commits unless they are
-explicitly merged/cherry-picked.
-
-The recent Stage2 changes therefore have no direct runtime effect on the
-current Audio/H3 branch. Their scope is:
-
-```text
-multi-node/multi-GPU Entity Mask scheduling
-static whole-shard ownership
-100-row durable Stage2 resume orchestration
-SAM3 worker persistence/session reuse orchestration
-shared-filesystem startup identity
-worker lifecycle/signal cleanup
-production docs/tests
-```
-
-If an Audio integration branch later cherry-picks or merges
-`pre_qwen_production.py`, re-run the Audio/H3 test suite because that becomes an
-explicit code integration. Do not merge the entire Visual Stage2 branch merely
-to inherit its cluster scheduler; the stable Visual/Audio data contract does
-not require that scheduler.
-
-## Stable integration API
-
-Audio/H3 should consume compacted production records with schema:
+The public cross-modal schema remains:
 
 ```text
 r2v.v3.production_sample.1
 ```
 
-Do not treat Subject Attribute owner artifacts, review payloads, enrichment
-metrics, standalone Entity Mask checkpoints, 100-row execution chunks, or
-internal sidecars as the final cross-branch API.
+Audio/H3 should prefer compacted production records using this schema. Do not
+bump the public schema merely because Visual internal sidecars or production
+orchestration evolve.
 
 Stable `ProductionSample` fields:
 
@@ -149,15 +114,57 @@ Production reference indexes are contiguous. Instruction labels may appear in
 any numeric order, but every expected index must appear and no unknown index is
 allowed.
 
-Standalone Stage2 parallelism is deliberately absent from this schema. Node
-count, GPU count, `RANK`, `WORLD_SIZE`, global worker ID, shard ownership, and
-100-row chunk identity are internal execution details and must never become
-Audio training-sample identity.
+Do not treat Subject Attribute owner artifacts, review payloads, enrichment
+metrics, standalone Entity Mask checkpoints, 100-row execution chunks, worker
+identities, or other internal sidecars as the public Visual/Audio API.
 
-## Internal sidecar delta since the merge base
+## Visual Stage1/Stage2 coexistence and runtime isolation
 
-These changes are relevant only if Audio reads Visual internal sidecars rather
-than compacted production output.
+The integration branch intentionally contains the complete latest Visual
+production line, including standalone Stage1 Annotation production and
+standalone Stage2 Entity Mask production.
+
+The Stage2 production code includes:
+
+```text
+r2v_data_v2/v3/pre_qwen_production.py
+tools/run_v3_pre_qwen_auto.py
+tools/run_v3_pre_qwen_batch.py
+tools/run_v3_entity_mask_auto.py
+tools/run_v3_entity_mask_worker.py
+```
+
+and the associated tests/docs.
+
+The integrated Visual production line preserves:
+
+```text
+static whole-shard multi-node/multi-GPU scheduling
+100-row durable checkpoint/resume
+persistent SAM3 workers
+clip_reset_v1 session reuse
+vectorized binary-mask RLE
+launcher lifecycle hardening
+shared-filesystem startup identity checks
+```
+
+These modules coexist with H3 but are not part of H3 runtime. Audio/H3
+production code must not import or invoke the standalone Visual Stage2
+scheduler merely because both now live on the same branch.
+
+Node count, GPU count, `RANK`, `WORLD_SIZE`, global worker ID, shard ownership,
+100-row chunk identity, and SAM3 worker/session state remain Visual execution
+details and must never become Audio training-sample identity.
+
+The shared V3 primitives that H3 legitimately consumes, such as
+`production_export.py`, selected V3 schemas, and `mask_codec.py`, remain normal
+library dependencies. In particular, H3 uses the latest Visual vectorized RLE
+decoder rather than maintaining a separate mask codec.
+
+## Latest Visual Subject Attribute semantics
+
+The integration branch preserves the latest Visual Subject Attribute semantics.
+Important internal deltas since the original Visual/Audio merge base include:
 
 1. `ReferenceEditEntityState` adds
    `accepted_base_image_path: Optional[str]`. When
@@ -166,115 +173,145 @@ than compacted production output.
    `variants.generated_background`.
 
 2. `ReferenceVariantsManifestRecord` remains
-   `r2v.v3.reference_variants.1`, but Subject/Object may now use
-   `default_variant="accepted_base"` with a non-null
-   `accepted_base_image_path`. An older Audio parser that requires null for
-   entity records will fail.
+   `r2v.v3.reference_variants.1`, but Subject/Object may use
+   `default_variant="accepted_base"` with non-null accepted-base provenance.
 
-3. `SubjectAttributeReview` adds required
-   `sufficient_source_evidence`. Its six hard accepted flags are the five
-   existing quality/binding flags plus that evidence flag.
-   `structure_complete` and `completion_recommended` are diagnostics only.
+3. `SubjectAttributeReview` includes required
+   `sufficient_source_evidence`. `structure_complete` and
+   `completion_recommended` remain diagnostics rather than separate public
+   production fields.
 
-4. `SubjectAttributeCompletionReview` no longer uses the old generic
-   `BooguCompletionReview` shape. It contains:
+4. `SubjectAttributeCompletionReview` uses the current attribute-specific
+   completion review shape rather than the older generic completion payload.
 
-   ```text
-   same_physical_attribute
-   original_visible_details_preserved
-   no_wrong_new_instance
-   no_duplicate_component
-   no_unrelated_content
-   no_structural_distortion
-   target_clear_and_prominent
-   candidate_better_than_alpha
-   certain
-   reason
-   verdict
-   ```
-
-5. `SubjectAttributeBboxReview` adds
+5. `SubjectAttributeBboxReview` includes
    `no_strong_owner_pose_or_scene_leakage`.
 
-6. `SubjectAttributeRecord.final_selection` now allows `raw`, `completed`, and
-   `bbox`.
-
-7. `OwnerEnrichmentMetrics` adds:
+6. `SubjectAttributeRecord.final_selection` allows exactly:
 
    ```text
-   attribute_source_candidates_considered
-   attribute_second_candidate_attempts
-   attribute_completion_candidate1_accepted
-   attribute_completion_candidate2_accepted
-   attribute_bbox_fallback_attempts
-   attribute_bbox_fallback_accepted
-   attribute_background_variants_attempted
-   attribute_background_variants_accepted
+   raw
+   completed
+   bbox
    ```
 
-8. Generic `BooguCompletionReview` renamed the verdict-driving completion flag
-   from `missing_parts_plausibly_completed` to
-   `candidate_better_than_source`. The latest Visual reader normalizes the
-   legacy name.
+7. Internal Subject Attribute metrics and completion metadata gained additional
+   source-candidate, retry, and bbox provenance fields without requiring a
+   public `ProductionSample` schema bump.
 
-9. Reference-edit completion metadata adds retry provenance:
+Several Visual internal version strings did not bump despite compatible or
+normalized payload changes. Do not infer exact old/new internal payload shape
+from an internal `schema_version` alone.
 
-   ```text
-   completion_attempt_index
-   completion_source_candidate_id
-   completion_source_frame_index
-   comparison_source_image_path
-   comparison_source_image_hash
-   ```
+## Face bbox-first policy
 
-   These fields are not public `ProductionSample` fields.
+Face attributes are special and the current Visual policy must not be reverted
+by Audio-side compatibility work.
 
-10. Several internal version strings did not bump despite these compatible or
-    normalized changes:
+`face` is excluded from
+`SubjectAttributeCompletionConfig.eligible_types`, so face does not use Boogu
+completion.
 
-    ```text
-    r2v.v3.subject_attributes.1
-    r2v.v3.subject_attribute_owner.1
-    r2v.v3.enriched_sample.1
-    r2v.v3.reference_variants.1
-    ```
-
-Do not infer old/new internal payload shape from `schema_version` alone. The
-latest Visual reader can normalize supported legacy sidecars, but an older
-Audio reader is not necessarily forward-compatible with latest Visual output.
-
-## Current `single_run_export` risk
-
-`r2v_data_v2/h3/visual_production_source.py` on the inspected Audio branch
-directly imports:
-
-```python
-from r2v_data_v2.v3.subject_attributes import EnrichedSample
-```
-
-Its `single_run_export` path strictly parses:
+The accepted face flow is:
 
 ```text
-subject_attributes/enriched_samples.jsonl
+raw semantic / ownership / review gates pass
+    -> materialize source RGB bbox candidate
+    -> bbox review
+        -> accept: final_selection = "bbox"
+        -> reject/failure/unavailable: final_selection = "raw"
 ```
 
-Reading a latest Visual run through an older Audio checkout may therefore raise
-`ValidationError` when internal fields are added or replaced even though the
-stable production schema is unchanged.
+The bbox path does not bypass raw semantic, ownership, or review gates.
 
-Production integration should use `compacted_production` and
-`r2v.v3.production_sample.1`. If `single_run_export` must remain supported, the
-Audio integration branch must synchronize the latest Visual Subject Attribute
-read schemas and compatibility normalizers, then add a regression fixture from
-a latest Visual `enriched_samples.jsonl` payload.
+A face selected with `final_selection="bbox"` remains a real source crop and is
+not synthetic.
 
-## Branch ownership
+## H3 Visual reader ownership
 
-Annotation production remains frozen. Do not develop Audio/H3 on the Visual
-branch, and do not change Visual prompts, thresholds, model topology, Stage2
-scheduler, or public production schema merely to make an old internal-sidecar
-parser accept a newer payload.
+H3 owns a projection of the Visual fields it actually needs. It must not couple
+itself to every Visual-internal diagnostic field.
+
+`r2v_data_v2/h3/visual_clip_contract.py` provides an H3-owned projection for
+`clip.json` fields and ignores unrelated Visual-internal sections.
+
+`r2v_data_v2/h3/visual_production_source.py` similarly uses private projection
+models for `single_run_export` enrichment input. These projection models use
+`extra="ignore"` so that unrelated Visual diagnostics do not break H3.
+
+Do not replace these H3-owned projections with strict parsing of the complete
+Visual internal models unless the public integration contract explicitly
+changes.
+
+## `compacted_production` and `single_run_export`
+
+`compacted_production` is the preferred production integration path:
+
+```text
+compacted production samples.jsonl
+    -> r2v.v3.production_sample.1
+    -> ProductionSample validation
+    -> H3 VisualProductionInventory
+```
+
+`single_run_export` remains a compatibility/debug path for directly consuming a
+single Visual run and its Subject Attribute enrichment sidecar.
+
+The previous forward-compatibility risk has been resolved on the integration
+branch. H3 no longer imports and strictly validates the complete Visual
+`EnrichedSample` model. It uses its own projection and accepts exactly:
+
+```text
+final_selection = raw | completed | bbox
+```
+
+The integration regression includes a latest-Visual-style accepted face
+attribute with:
+
+```text
+attribute_type = "face"
+final_selection = "bbox"
+default_variant = "bbox"
+```
+
+and verifies that H3 preserves the owner, frame index, and image path, ignores
+unconsumed Visual-internal diagnostics, and publishes:
+
+```text
+synthetic = false
+```
+
+Legacy `raw` and `completed` selections remain supported.
+
+## Branch ownership after integration
+
+The integration branch is the common line for cross-modal compatibility and
+combined production-reader validation.
+
+Ownership remains modular:
+
+```text
+r2v_data_v2/v3/*
+    -> Visual semantics/runtime ownership
+
+r2v_data_v2/h3/*
+    -> Audio/H3 semantics/runtime ownership
+
+r2v_data_v2/v3/production_export.py
+    -> stable cross-modal public contract
+```
+
+New Audio algorithms should still be developed on dedicated Audio feature
+branches and integrated deliberately. New Visual algorithms should still be
+developed on dedicated Visual feature branches and integrated deliberately.
+Do not use the integration branch as a reason to couple their internal
+orchestration.
+
+Do not change Visual prompts, thresholds, model topology, Stage2 scheduling, or
+public production schema merely to make an old Audio-side internal parser work.
+Fix the H3 projection when a new Visual internal field is legitimately part of
+the H3 compatibility surface.
 
 For standalone Entity Mask server operation, use
-`ENTITY_MASK_PRODUCTION.md`. For Audio/H3 integration, consume the stable
-compacted production interface rather than Entity Mask internal artifacts.
+`docs/ENTITY_MASK_PRODUCTION.md`. For Audio/H3 production integration, prefer
+the stable compacted production interface described above.
