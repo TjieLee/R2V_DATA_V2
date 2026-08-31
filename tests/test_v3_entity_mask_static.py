@@ -16,6 +16,19 @@ def _shards(count: int) -> list[Path]:
     ]
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += seconds
+
+
 def _global_assignments(
     num_shards: int,
     *,
@@ -201,6 +214,154 @@ def test_rank_zero_initializes_and_other_rank_only_validates_startup_identity(
     ]
 
 
+def test_nonzero_rank_retries_delayed_execution_identity_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    attempts = 0
+    sessions = 0
+    monkeypatch.setattr(auto_tool, "_safe_output_root", lambda path: path)
+    monkeypatch.setattr(auto_tool, "validate_static_topology", lambda *args: None)
+
+    def validate_execution(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileNotFoundError("execution marker not visible")
+
+    def validate_session(*args: object, **kwargs: object) -> None:
+        nonlocal sessions
+        sessions += 1
+
+    monkeypatch.setattr(auto_tool, "validate_execution_identity", validate_execution)
+    monkeypatch.setattr(
+        auto_tool,
+        "validate_sam3_session_reuse_identity",
+        validate_session,
+    )
+
+    auto_tool.coordinate_startup_identity(
+        output_root=tmp_path,
+        rank=1,
+        expected_topology={"schema_version": 1},
+        timeout_seconds=5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    assert attempts == 2
+    assert sessions == 1
+    assert clock.sleeps == [1.0]
+
+
+def test_nonzero_rank_retries_delayed_session_identity_visibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    executions = 0
+    attempts = 0
+    monkeypatch.setattr(auto_tool, "_safe_output_root", lambda path: path)
+    monkeypatch.setattr(auto_tool, "validate_static_topology", lambda *args: None)
+
+    def validate_execution(*args: object, **kwargs: object) -> None:
+        nonlocal executions
+        executions += 1
+
+    def validate_session(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileNotFoundError("session marker not visible")
+
+    monkeypatch.setattr(auto_tool, "validate_execution_identity", validate_execution)
+    monkeypatch.setattr(
+        auto_tool,
+        "validate_sam3_session_reuse_identity",
+        validate_session,
+    )
+
+    auto_tool.coordinate_startup_identity(
+        output_root=tmp_path,
+        rank=1,
+        expected_topology={"schema_version": 1},
+        timeout_seconds=5,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    assert executions == 2
+    assert attempts == 2
+    assert clock.sleeps == [1.0]
+
+
+def test_nonzero_rank_startup_identity_visibility_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(auto_tool, "_safe_output_root", lambda path: path)
+    monkeypatch.setattr(
+        auto_tool,
+        "validate_static_topology",
+        lambda *args: (_ for _ in ()).throw(FileNotFoundError("not visible")),
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match="complete Entity Mask startup identity",
+    ):
+        auto_tool.coordinate_startup_identity(
+            output_root=tmp_path,
+            rank=1,
+            expected_topology={"schema_version": 1},
+            timeout_seconds=2,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+
+    assert clock.sleeps == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("failure_stage", ["topology", "execution"])
+def test_nonzero_rank_startup_identity_mismatch_fails_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr(auto_tool, "_safe_output_root", lambda path: path)
+
+    def validate_topology(*args: object) -> None:
+        if failure_stage == "topology":
+            raise ValueError("topology mismatch")
+
+    def validate_execution(*args: object, **kwargs: object) -> None:
+        if failure_stage == "execution":
+            raise ValueError("execution mismatch")
+
+    monkeypatch.setattr(auto_tool, "validate_static_topology", validate_topology)
+    monkeypatch.setattr(auto_tool, "validate_execution_identity", validate_execution)
+    monkeypatch.setattr(
+        auto_tool,
+        "validate_sam3_session_reuse_identity",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="mismatch"):
+        auto_tool.coordinate_startup_identity(
+            output_root=tmp_path,
+            rank=1,
+            expected_topology={"schema_version": 1},
+            timeout_seconds=120,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+
+    assert clock.sleeps == []
+
+
 def test_static_topology_rejects_heterogeneous_gpu_count(
     tmp_path: Path,
 ) -> None:
@@ -301,6 +462,7 @@ def test_static_worker_reuses_one_backend_across_assigned_shards(
     assert [call["path"] for call in process_calls] == shards[:2]
     assert all(call["backend"] is backend for call in process_calls)
     assert all(call["acquire_lock"] is False for call in process_calls)
+    assert all(call["static_owner"] is True for call in process_calls)
     assert all(
         call["execution_identity_prevalidated"] is True
         for call in process_calls

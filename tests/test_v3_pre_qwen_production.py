@@ -5,7 +5,9 @@ import hashlib
 import json
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
@@ -2253,6 +2255,13 @@ def test_static_process_shard_uses_prevalidated_execution_identity_without_ensur
             "static shard processing must not acquire execution identity lock"
         ),
     )
+    monkeypatch.setattr(
+        production,
+        "shard_lock",
+        lambda *args, **kwargs: pytest.fail(
+            "static shard processing must not acquire internal locks"
+        ),
+    )
 
     result = process_shard(
         shard_path,
@@ -2261,11 +2270,70 @@ def test_static_process_shard_uses_prevalidated_execution_identity_without_ensur
         backend=None,
         acquire_lock=False,
         execution_identity_prevalidated=True,
+        static_owner=True,
         chunk_rows=1,
     )
 
     assert result["rows"] == 3
     assert (fixture.output_root / "parts" / shard_path.name).is_file()
+
+
+def test_static_ensure_meta_skips_lock_and_validates_atomic_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard = load_annotation_shard(_write_shard(fixture, [_row(fixture, 0)]))
+    monkeypatch.setattr(
+        production,
+        "shard_lock",
+        lambda *args, **kwargs: pytest.fail("static metadata must not lock"),
+    )
+
+    path = production._ensure_meta(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        static_owner=True,
+    )
+    repeated = production._ensure_meta(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        static_owner=True,
+    )
+
+    assert repeated == path
+    assert json.loads(path.read_text(encoding="utf-8"))["input_row_count"] == 1
+
+
+def test_dynamic_ensure_meta_keeps_blocking_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard = load_annotation_shard(_write_shard(fixture, [_row(fixture, 0)]))
+    calls: list[tuple[Path, bool]] = []
+
+    @contextmanager
+    def recording_lock(path: Path, *, blocking: bool = False) -> Iterator[None]:
+        calls.append((path, blocking))
+        yield
+
+    monkeypatch.setattr(production, "shard_lock", recording_lock)
+
+    production._ensure_meta(
+        shard,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+    )
+
+    assert calls == [
+        (
+            fixture.output_root / "locks" / shard.path.stem / "metadata.lock",
+            True,
+        )
+    ]
 
 
 def test_chunk_compaction_is_canonical_and_incomplete_chunks_do_not_publish(
@@ -2638,6 +2706,7 @@ def test_auto_normal_start_skips_inventory_but_dry_run_keeps_it(
 def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
     entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
@@ -2674,12 +2743,15 @@ def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
     ]
     launched: list[dict[str, object]] = []
     startup: list[dict[str, object]] = []
+    output_before_spawn: list[str] = []
 
     class Process:
         def wait(self) -> int:
             return 0
 
     def popen(command: list[str], **kwargs: object) -> Process:
+        if not launched:
+            output_before_spawn.append(capsys.readouterr().out)
         launched.append({"command": command, **kwargs})
         return Process()
 
@@ -2722,6 +2794,12 @@ def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
 
     assert len(launched) == 2
     assert len(startup) == 1
+    startup_plan = json.loads(output_before_spawn[0])
+    assert startup_plan["event"] == "startup_plan"
+    assert startup_plan["rank"] == 3
+    assert startup_plan["world_size"] == 4
+    assert startup_plan["stage1_completed_shards"] == 16
+    assert len(startup_plan["workers"]) == 2
     commands = [item["command"] for item in launched]
     assert all("run_v3_entity_mask_worker.py" in command[1] for command in commands)
     assert all("--claim-loop" not in command for command in commands)
@@ -2760,6 +2838,7 @@ def test_entity_mask_wrapper_missing_private_config_fails_closed(
 def test_entity_mask_dry_run_only_builds_lightweight_static_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = _paths(tmp_path, monkeypatch)
     entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
@@ -2817,6 +2896,9 @@ def test_entity_mask_dry_run_only_builds_lightweight_static_plan(
     assert result["stage1_completed_shards"] == 384
     assert result["global_worker_count"] == 8
     assert [worker["shard_count"] for worker in result["workers"]] == [48] * 8
+    output_lines = capsys.readouterr().out.splitlines()
+    assert len(output_lines) == 1
+    assert json.loads(output_lines[0])["event"] == "startup_plan"
 
 
 def test_entity_mask_wrapper_exits_cleanly_when_no_shards_exist(
@@ -2947,6 +3029,65 @@ def test_frame_prefetch_uses_frozen_frame_builder_and_exact_frame_config(
         }
     ]
     assert len(frames.frames) == 10
+
+
+def test_static_frame_preparation_skips_frame_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard = load_annotation_shard(_write_shard(fixture, [row]))
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    monkeypatch.setattr(
+        production,
+        "shard_lock",
+        lambda *args, **kwargs: pytest.fail("static frame preparation must not lock"),
+    )
+
+    prepared = production.prepare_clip_frames(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        decoder=FakeDecoder(),
+        static_owner=True,
+    )
+
+    assert prepared.built is True
+    assert prepared.checkpoint.stage == "frames_ready"
+
+
+def test_dynamic_frame_preparation_keeps_blocking_frame_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    row = _row(fixture, 0)
+    shard = load_annotation_shard(_write_shard(fixture, [row]))
+    workspace = fixture.output_root / "artifacts" / shard.path.stem / "clip-0"
+    calls: list[tuple[Path, bool]] = []
+
+    @contextmanager
+    def recording_lock(path: Path, *, blocking: bool = False) -> Iterator[None]:
+        calls.append((path, blocking))
+        yield
+
+    monkeypatch.setattr(production, "shard_lock", recording_lock)
+
+    production.prepare_clip_frames(
+        row=row,
+        shard=shard,
+        output_root=fixture.output_root,
+        workspace=workspace,
+        config_identity=fixture.identity,
+        decoder=FakeDecoder(),
+    )
+
+    assert calls == [
+        (production.frame_lock_path(fixture.output_root, shard, "clip-0"), True)
+    ]
 
 
 def test_prefetched_frames_ready_is_reused_by_sam_without_decode(

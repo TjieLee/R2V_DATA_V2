@@ -127,6 +127,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 backend=backend,
                 acquire_lock=False,
                 execution_identity_prevalidated=True,
+                static_owner=True,
                 chunk_rows=PRODUCTION_CHUNK_ROWS,
             )
             if shard_result.get("retryable") is True:

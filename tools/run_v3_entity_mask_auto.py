@@ -243,19 +243,23 @@ def coordinate_startup_identity(
     if timeout_seconds < 0:
         raise ValueError("startup identity timeout must be non-negative")
     deadline = monotonic() + timeout_seconds
-    while not topology_path.is_file():
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                "timed out waiting for rank 0 Entity Mask startup identity"
+    while True:
+        try:
+            validate_static_topology(root, expected_topology)
+            validate_execution_identity(root, chunk_rows=PRODUCTION_CHUNK_ROWS)
+            validate_sam3_session_reuse_identity(
+                root,
+                mode=PRODUCTION_SESSION_REUSE_MODE,
             )
-        sleep(min(1.0, remaining))
-    validate_static_topology(root, expected_topology)
-    validate_execution_identity(root, chunk_rows=PRODUCTION_CHUNK_ROWS)
-    validate_sam3_session_reuse_identity(
-        root,
-        mode=PRODUCTION_SESSION_REUSE_MODE,
-    )
+        except FileNotFoundError as exc:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "timed out waiting for complete Entity Mask startup identity"
+                ) from exc
+            sleep(min(1.0, remaining))
+        else:
+            return
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -286,6 +290,7 @@ def _plan(
     assignments: Sequence[StaticShardAssignment],
 ) -> dict[str, object]:
     return {
+        "event": "startup_plan",
         "scheduling_strategy": STATIC_ASSIGNMENT_STRATEGY,
         "rank": rank,
         "world_size": world_size,
@@ -338,11 +343,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         assignments=assignments,
     )
     if args.dry_run:
-        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
         return report
     if not shard_paths:
-        result = {**report, "worker_exit_codes": []}
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        result = {**report, "event": "completed", "worker_exit_codes": []}
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
         return result
 
     report.update(check_stage2_candidate_judge_health(identity.config))
@@ -357,6 +362,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         rank=rank,
         expected_topology=topology,
     )
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
 
     worker_tool = Path(__file__).with_name("run_v3_entity_mask_worker.py")
     PRODUCTION_LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -407,8 +413,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     finally:
         for log in logs:
             log.close()
-    result = {**report, "worker_exit_codes": codes}
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    result = {**report, "event": "completed", "worker_exit_codes": codes}
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     if any(codes):
         raise SystemExit(max(codes))
     return result

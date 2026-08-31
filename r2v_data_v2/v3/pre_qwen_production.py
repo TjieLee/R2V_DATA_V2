@@ -1440,6 +1440,7 @@ def prepare_clip_frames(
     workspace: Path,
     config_identity: ConfigIdentity,
     decoder: FrameDecoder | None = None,
+    static_owner: bool = False,
 ) -> FramePreparationResult:
     annotation = _annotation_state(row)
     if annotation.status != "ready" or not annotation.entities:
@@ -1451,7 +1452,11 @@ def prepare_clip_frames(
     resolved_workspace = workspace.resolve(strict=False)
     if root not in resolved_workspace.parents:
         raise ValueError("frame workspace escaped Stage2 output_root")
-    with shard_lock(frame_lock_path(root, shard, clip_uid), blocking=True):
+    with _maybe_shard_lock(
+        frame_lock_path(root, shard, clip_uid),
+        acquire=not static_owner,
+        blocking=True,
+    ):
         checkpoint = _read_checkpoint(resolved_workspace)
         if checkpoint is not None:
             _validate_checkpoint_identity(
@@ -1525,6 +1530,7 @@ def process_ready_clip(
     config_identity: ConfigIdentity,
     backend: SegmentationBackend,
     decoder: FrameDecoder | None = None,
+    static_owner: bool = False,
 ) -> Stage2Row:
     annotation = _annotation_state(row)
     if annotation.status != "ready" or not annotation.entities:
@@ -1538,6 +1544,7 @@ def process_ready_clip(
             workspace=workspace,
             config_identity=config_identity,
             decoder=decoder,
+            static_owner=static_owner,
         )
     except DeterministicFrameBuildError as exc:
         return Stage2Row(
@@ -1782,21 +1789,33 @@ def _ensure_meta(
     *,
     output_root: Path,
     config_identity: ConfigIdentity,
+    static_owner: bool = False,
 ) -> Path:
     path = _meta_path(output_root, shard)
     expected = _expected_meta(shard, config_identity)
     lock_path = output_root / "locks" / shard.path.stem / "metadata.lock"
-    with shard_lock(lock_path, blocking=True):
+
+    def ensure_and_validate() -> None:
         if path.is_file():
             value = json.loads(path.read_text(encoding="utf-8"))
-            for key, expected_value in expected.items():
-                if value.get(key) != expected_value:
-                    raise ValueError(f"Stage2 shard metadata mismatch: {key}")
         else:
             write_json_atomic(
                 path,
                 {**expected, "created_at": _utc_now(), "completed_at": None},
             )
+            value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError("Stage2 shard metadata must contain an object")
+        for key, expected_value in expected.items():
+            if value.get(key) != expected_value:
+                raise ValueError(f"Stage2 shard metadata mismatch: {key}")
+
+    with _maybe_shard_lock(
+        lock_path,
+        acquire=not static_owner,
+        blocking=True,
+    ):
+        ensure_and_validate()
     return path
 
 
@@ -1813,6 +1832,20 @@ def shard_lock(path: Path, *, blocking: bool = False) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _maybe_shard_lock(
+    path: Path,
+    *,
+    acquire: bool,
+    blocking: bool = False,
+) -> Iterator[None]:
+    if acquire:
+        with shard_lock(path, blocking=blocking):
+            yield
+    else:
+        yield
 
 
 def _failure_attempt(
@@ -1919,6 +1952,7 @@ def process_execution_chunk(
     decoder: FrameDecoder | None = None,
     acquire_lock: bool = True,
     execution_identity_prevalidated: bool = False,
+    static_owner: bool = False,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
@@ -1928,7 +1962,12 @@ def process_execution_chunk(
         _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
     else:
         _ensure_execution_identity(root, chunk_rows=chunk_rows)
-    _ensure_meta(shard, output_root=root, config_identity=config_identity)
+    _ensure_meta(
+        shard,
+        output_root=root,
+        config_identity=config_identity,
+        static_owner=static_owner,
+    )
     final = execution_chunk_path(root, shard, chunk)
     partial = final.with_name(f"{final.name}.partial")
     lock_path = _chunk_lock_path(root, shard, chunk)
@@ -1994,6 +2033,7 @@ def process_execution_chunk(
                         config_identity=config_identity,
                         backend=backend,
                         decoder=decoder,
+                        static_owner=static_owner,
                     )
                 except RetryableStageError as exc:
                     _failure_attempt(root, shard, row, exc)
@@ -2075,13 +2115,19 @@ def compact_execution_chunks(
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
     acquire_lock: bool = True,
     execution_identity_prevalidated: bool = False,
+    static_owner: bool = False,
 ) -> dict[str, object] | None:
     root = _safe_output_root(output_root)
     if execution_identity_prevalidated:
         _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
     else:
         _ensure_execution_identity(root, chunk_rows=chunk_rows)
-    _ensure_meta(shard, output_root=root, config_identity=config_identity)
+    _ensure_meta(
+        shard,
+        output_root=root,
+        config_identity=config_identity,
+        static_owner=static_owner,
+    )
     part = root / "parts" / shard.path.name
     if part.is_file():
         completed = _validate_completed_shard(
@@ -2178,6 +2224,7 @@ def process_shard(
     decoder: FrameDecoder | None = None,
     acquire_lock: bool = True,
     execution_identity_prevalidated: bool = False,
+    static_owner: bool = False,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
@@ -2190,7 +2237,12 @@ def process_shard(
     elif _execution_identity_path(root).is_file():
         _ensure_execution_identity(root, chunk_rows=chunk_rows)
     if part.is_file():
-        _ensure_meta(shard, output_root=root, config_identity=config_identity)
+        _ensure_meta(
+            shard,
+            output_root=root,
+            config_identity=config_identity,
+            static_owner=static_owner,
+        )
         completed = _validate_completed_shard(
             part,
             shard=shard,
@@ -2210,6 +2262,7 @@ def process_shard(
             decoder=decoder,
             acquire_lock=acquire_lock,
             execution_identity_prevalidated=execution_identity_prevalidated,
+            static_owner=static_owner,
             chunk_rows=chunk_rows,
         )
         if result.get("retryable") is True:
@@ -2221,6 +2274,7 @@ def process_shard(
         chunk_rows=chunk_rows,
         acquire_lock=acquire_lock,
         execution_identity_prevalidated=execution_identity_prevalidated,
+        static_owner=static_owner,
     )
     if compacted is None:
         raise RuntimeError("Stage2 shard chunks completed without compaction readiness")
