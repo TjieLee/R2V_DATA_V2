@@ -1,0 +1,85 @@
+# H3 Omni AV Speaker Judge Pilot V1
+
+This pilot is a read-only, segment-level Qwen3-Omni observation sidecar. It
+does not modify LR-ASD, Audio bindings, DiariZen cluster bindings, ASR, Visual
+artifacts, or final H3 samples. Proposed identities are diagnostic only.
+
+Each explicitly selected raw DiariZen segment receives a synchronized context
+window from 0.75 seconds before the segment through 0.75 seconds after it,
+clipped to the common source boundary. The same absolute boundaries drive both
+the neutral review video and the canonical full-audio trim.
+
+The video displays only neutral `eN` or `OTHER` face labels. It never displays
+LR-ASD active state, score, current draft binding, DiariZen status, audit flags,
+or ASR text. The model receives only the neutral video, canonical trimmed audio,
+target interval relative to the window, and visible mapped entity IDs. Human QA
+labels may be retained in the pilot manifest but are never included in a model
+request.
+
+Pass 1 is blind to the draft. A separately versioned blind Pass 2 runs only when
+a mapped draft disagrees with Pass 1, or when an unresolved draft receives a
+concrete visible-entity or offscreen observation. Agreement between two passes
+is published as stable diagnostic evidence; disagreement remains unresolved.
+No observation is applied to production data.
+
+## Manifest
+
+The input is non-empty JSONL with exact segment identities:
+
+```json
+{"schema_version":"r2v.h3.omni_av_speaker_judge_manifest.1","clip_uid":"03e8d3bb9744f7951e545a07","segment_id":"segment_0001","human_label":{"decision":"visible_entity","entity_id":"e1"}}
+```
+
+Human labels are optional and are used only by the static review page.
+
+## Positive Pilot
+
+```bash
+OLD_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs/production/jea_motion_v1/e2e200-random-seed20260821-20260821-143232
+POSITIVE_MANIFEST=/tmp/omni-av-positive-03e8.jsonl
+
+printf '%s\n' \
+  '{"schema_version":"r2v.h3.omni_av_speaker_judge_manifest.1","clip_uid":"03e8d3bb9744f7951e545a07","segment_id":"segment_0001","human_label":{"decision":"visible_entity","entity_id":"e1"}}' \
+  > "$POSITIVE_MANIFEST"
+
+python tools/run_h3_omni_av_speaker_judge.py \
+  --audio-production-root "$OLD_ROOT" \
+  --case-manifest "$POSITIVE_MANIFEST" \
+  --output-root "$OLD_ROOT/omni_av_speaker_judge_pilot_v1" \
+  --base-url http://127.0.0.1:8091/v1 \
+  --served-model-name Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --checkpoint-id Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --media-mode file \
+  --media-root /mnt/workspace
+```
+
+## Random200 Controls
+
+Select every raw segment belonging to the three reviewed clips without using
+audit rank or support ratio as a gate:
+
+```bash
+NEW_ROOT=/mnt/workspace/litengjie/data/r2v_audio_runs/random200/random200-src10000-19999-seed20260831-20260831-124415
+CONTROL_MANIFEST=/tmp/omni-av-random200-controls.jsonl
+
+jq -c 'select(.target_clip_uid == "a073596149def028cff1305e" or
+              .target_clip_uid == "23f996b204a2461d18c3cfea" or
+              .target_clip_uid == "c54f78ddceb866055c4114a0") |
+  {schema_version:"r2v.h3.omni_av_speaker_judge_manifest.1",
+   clip_uid:.target_clip_uid, segment_id:.segment_id, human_label:null}' \
+  "$NEW_ROOT/diarization/raw_segments.jsonl" > "$CONTROL_MANIFEST"
+
+python tools/run_h3_omni_av_speaker_judge.py \
+  --audio-production-root "$NEW_ROOT" \
+  --case-manifest "$CONTROL_MANIFEST" \
+  --output-root "$NEW_ROOT/omni_av_speaker_judge_pilot_v1" \
+  --base-url http://127.0.0.1:8091/v1 \
+  --served-model-name Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --checkpoint-id Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --media-mode file \
+  --media-root /mnt/workspace
+```
+
+Outputs are atomically published as `manifest.jsonl`, `records.jsonl`,
+`summary.json`, `raw/`, `media/`, and `review.html`. Existing output is preserved
+unless `--overwrite` is explicit.
