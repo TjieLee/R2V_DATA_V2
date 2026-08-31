@@ -30,6 +30,7 @@ ReviewPriority = Literal[
     "conflict",
     "exclusive_active_entity_contradiction",
     "mapped_entity_vs_unmatched_face_contradiction",
+    "multi_active_current_entity_and_other_face",
     "unbound_or_ambiguous",
     "fully_propagated",
     "candidate_mapped_lowest_direct_support_ratio",
@@ -57,6 +58,8 @@ class SpeakerBindingSegmentAuditFlags(SchemaModel):
     multiple_exclusive_active_face_tracks: bool
     exclusive_active_entity_contradiction: bool
     mapped_entity_vs_unmatched_face_contradiction: bool
+    has_multi_active_lr_asd_frames: bool
+    multi_active_contains_current_entity_and_other_face: bool
 
 
 class SpeakerBindingClusterAuditFlags(SchemaModel):
@@ -69,6 +72,8 @@ class SpeakerBindingClusterAuditFlags(SchemaModel):
     multiple_exclusive_active_face_tracks: bool
     exclusive_active_entity_contradiction: bool
     mapped_entity_vs_unmatched_face_contradiction: bool
+    has_multi_active_lr_asd_frames: bool
+    multi_active_contains_current_entity_and_other_face: bool
 
 
 class SpeakerBindingSegmentAudit(SchemaModel):
@@ -93,6 +98,12 @@ class SpeakerBindingSegmentAudit(SchemaModel):
     exclusive_active_faces: list[ExclusiveActiveFaceOverlap]
     exclusive_active_entities: list[ExclusiveActiveEntityOverlap]
     unmatched_exclusive_active_face_track_ids: list[str]
+    multi_active_lr_asd_seconds: float = Field(ge=0)
+    multi_active_frame_count: int = Field(ge=0)
+    max_simultaneous_active_face_count: int = Field(ge=0)
+    multi_active_face_track_ids: list[str]
+    multi_active_mapped_entity_ids: list[str]
+    multi_active_unmatched_face_track_ids: list[str]
     flags: SpeakerBindingSegmentAuditFlags
 
     @model_validator(mode="after")
@@ -116,6 +127,17 @@ class SpeakerBindingSegmentAudit(SchemaModel):
             self.direct_support_seconds_by_entity
         ):
             raise ValueError("segment supported-entity count is inconsistent")
+        _validate_multi_active_metrics(
+            seconds=self.multi_active_lr_asd_seconds,
+            frame_count=self.multi_active_frame_count,
+            maximum_face_count=self.max_simultaneous_active_face_count,
+            has_multi_active=self.flags.has_multi_active_lr_asd_frames,
+        )
+        if (
+            self.flags.multi_active_contains_current_entity_and_other_face
+            and not self.flags.has_multi_active_lr_asd_frames
+        ):
+            raise ValueError("multi-active current-entity evidence is inconsistent")
         return self
 
 
@@ -145,9 +167,15 @@ class SpeakerBindingClusterAudit(SchemaModel):
     exclusive_active_faces: list[ExclusiveActiveFaceOverlap]
     exclusive_active_entities: list[ExclusiveActiveEntityOverlap]
     unmatched_exclusive_active_face_track_ids: list[str]
+    multi_active_lr_asd_seconds: float = Field(ge=0)
+    multi_active_frame_count: int = Field(ge=0)
+    max_simultaneous_active_face_count: int = Field(ge=0)
+    multi_active_face_track_ids: list[str]
+    multi_active_mapped_entity_ids: list[str]
+    multi_active_unmatched_face_track_ids: list[str]
     flags: SpeakerBindingClusterAuditFlags
     review_priority: ReviewPriority
-    review_priority_rank: int = Field(ge=1, le=6)
+    review_priority_rank: int = Field(ge=1, le=7)
     audit_policy_version: Literal["h3_speaker_binding_structural_audit_v1"] = (
         BINDING_AUDIT_POLICY_VERSION
     )
@@ -178,7 +206,19 @@ class SpeakerBindingClusterAudit(SchemaModel):
                 raise ValueError("mapped cluster anchor durations do not reconcile")
         elif self.identity_propagated_seconds != 0:
             raise ValueError("unresolved cluster cannot claim identity propagation")
+        _validate_multi_active_metrics(
+            seconds=self.multi_active_lr_asd_seconds,
+            frame_count=self.multi_active_frame_count,
+            maximum_face_count=self.max_simultaneous_active_face_count,
+            has_multi_active=self.flags.has_multi_active_lr_asd_frames,
+        )
+        if (
+            self.flags.multi_active_contains_current_entity_and_other_face
+            and not self.flags.has_multi_active_lr_asd_frames
+        ):
+            raise ValueError("multi-active current-entity evidence is inconsistent")
         return self
+
 
 class SpeakerBindingReviewCase(SchemaModel):
     schema_version: Literal["r2v.h3.speaker_binding_audit.1"] = (
@@ -186,7 +226,7 @@ class SpeakerBindingReviewCase(SchemaModel):
     )
     review_index: int = Field(gt=0)
     review_priority: ReviewPriority
-    review_priority_rank: int = Field(ge=1, le=6)
+    review_priority_rank: int = Field(ge=1, le=7)
     clip_uid: str
     speaker_cluster_id: str
     current_mapping_status: str
@@ -219,11 +259,14 @@ class SpeakerBindingAuditSummary(SchemaModel):
     clusters_with_mapped_entity_vs_unmatched_face: int = Field(ge=0)
     clusters_with_multiple_direct_entity_support: int = Field(ge=0)
     clusters_with_fully_propagated_segments: int = Field(ge=0)
+    clusters_with_multi_active_lr_asd_frames: int = Field(ge=0)
+    clusters_with_current_entity_plus_other_active_face: int = Field(ge=0)
     multiple_exclusive_active_face_track_speaker_seconds: float = Field(ge=0)
     exclusive_active_entity_contradiction_speaker_seconds: float = Field(ge=0)
     mapped_entity_vs_unmatched_face_speaker_seconds: float = Field(ge=0)
     fully_propagated_segment_speaker_seconds: float = Field(ge=0)
     identity_propagated_speaker_seconds: float = Field(ge=0)
+    multi_active_lr_asd_speaker_seconds: float = Field(ge=0)
     review_priority_counts: dict[ReviewPriority, int]
     model_call_count: Literal[0] = 0
     bindings_modified_count: Literal[0] = 0
@@ -265,6 +308,56 @@ class _ExclusiveFrame:
         self.entity_id = entity_id
         self.start_time = start_time
         self.end_time = end_time
+
+
+class _MultiActiveFrame:
+    __slots__ = (
+        "active_faces",
+        "end_time",
+        "frame_index",
+        "start_time",
+    )
+
+    def __init__(
+        self,
+        *,
+        frame_index: int,
+        active_faces: tuple[tuple[str, str | None], ...],
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        self.frame_index = frame_index
+        self.active_faces = active_faces
+        self.start_time = start_time
+        self.end_time = end_time
+
+
+@dataclass(frozen=True)
+class _MultiActiveOverlap:
+    seconds: float
+    frame_count: int
+    maximum_face_count: int
+    face_track_ids: list[str]
+    mapped_entity_ids: list[str]
+    unmatched_face_track_ids: list[str]
+    contains_current_entity_and_other_face: bool
+
+
+def _validate_multi_active_metrics(
+    *,
+    seconds: float,
+    frame_count: int,
+    maximum_face_count: int,
+    has_multi_active: bool,
+) -> None:
+    available = frame_count > 0
+    if available != has_multi_active or available != (seconds > 0):
+        raise ValueError("multi-active LR-ASD availability is inconsistent")
+    if available:
+        if maximum_face_count < 2:
+            raise ValueError("multi-active LR-ASD frames require at least two faces")
+    elif maximum_face_count != 0:
+        raise ValueError("absent multi-active evidence cannot claim a face count")
 
 
 def _sha256(path: Path) -> str:
@@ -379,6 +472,112 @@ def _exclusive_frames(
     return output
 
 
+def _multi_active_frames(
+    native: LRASDNativeArtifact,
+    sidecar: AudioBindingSidecar,
+) -> list[_MultiActiveFrame]:
+    association_by_track = {
+        item.face_track_id: item for item in sidecar.evidence.associations
+    }
+    active_by_frame: dict[int, list[str]] = defaultdict(list)
+    for track in native.tracks:
+        for sample in track.samples:
+            if sample.backend_native_active:
+                active_by_frame[sample.frame_index].append(track.face_track_id)
+    output: list[_MultiActiveFrame] = []
+    for frame_index, track_ids in sorted(active_by_frame.items()):
+        if len(track_ids) < 2:
+            continue
+        active_faces: list[tuple[str, str | None]] = []
+        for track_id in sorted(track_ids):
+            association = association_by_track.get(track_id)
+            entity_id = (
+                association.entity_id
+                if association is not None and association.status == "matched"
+                else None
+            )
+            active_faces.append((track_id, entity_id))
+        start = frame_index / native.model_fps
+        end = min((frame_index + 1) / native.model_fps, native.duration_seconds)
+        if start < end:
+            output.append(
+                _MultiActiveFrame(
+                    frame_index=frame_index,
+                    active_faces=tuple(active_faces),
+                    start_time=start,
+                    end_time=end,
+                )
+            )
+    return output
+
+
+def _multi_active_overlap_evidence(
+    intervals: Sequence[tuple[float, float]],
+    frames: Sequence[_MultiActiveFrame],
+    *,
+    current_entity_id: str | None,
+) -> _MultiActiveOverlap:
+    overlapping_frames: list[_MultiActiveFrame] = []
+    overlap_spans: list[tuple[float, float]] = []
+    for frame in frames:
+        frame_overlaps = False
+        for start, end in intervals:
+            overlap_start = max(start, frame.start_time)
+            overlap_end = min(end, frame.end_time)
+            if overlap_start < overlap_end:
+                frame_overlaps = True
+                overlap_spans.append((overlap_start, overlap_end))
+        if frame_overlaps:
+            overlapping_frames.append(frame)
+    if not overlapping_frames:
+        return _MultiActiveOverlap(0.0, 0, 0, [], [], [], False)
+    overlap_spans.sort()
+    start, end = overlap_spans[0]
+    seconds = 0.0
+    for next_start, next_end in overlap_spans[1:]:
+        if next_start <= end:
+            end = max(end, next_end)
+        else:
+            seconds += end - start
+            start, end = next_start, next_end
+    seconds += end - start
+    faces = {
+        face
+        for frame in overlapping_frames
+        for face in frame.active_faces
+    }
+    track_ids = sorted(track_id for track_id, _ in faces)
+    mapped_entity_ids = sorted(
+        {entity_id for _, entity_id in faces if entity_id is not None}
+    )
+    unmatched_track_ids = sorted(
+        track_id for track_id, entity_id in faces if entity_id is None
+    )
+    contains_current_and_other = False
+    if current_entity_id is not None:
+        for frame in overlapping_frames:
+            if any(
+                entity_id == current_entity_id
+                for _, entity_id in frame.active_faces
+            ) and any(
+                entity_id != current_entity_id
+                for _, entity_id in frame.active_faces
+            ):
+                contains_current_and_other = True
+                break
+    return _MultiActiveOverlap(
+        seconds=seconds,
+        frame_count=len(overlapping_frames),
+        maximum_face_count=max(
+            len(frame.active_faces) for frame in overlapping_frames
+        ),
+        face_track_ids=track_ids,
+        mapped_entity_ids=mapped_entity_ids,
+        unmatched_face_track_ids=unmatched_track_ids,
+        contains_current_entity_and_other_face=contains_current_and_other,
+    )
+
+
 def _exclusive_overlap_evidence(
     intervals: Sequence[tuple[float, float]],
     frames: Sequence[_ExclusiveFrame],
@@ -437,6 +636,7 @@ def _segment_flags(
     faces: Sequence[ExclusiveActiveFaceOverlap],
     entities: Sequence[ExclusiveActiveEntityOverlap],
     unmatched: Sequence[str],
+    multi_active: _MultiActiveOverlap,
 ) -> SpeakerBindingSegmentAuditFlags:
     return SpeakerBindingSegmentAuditFlags(
         conflict=status == "conflict",
@@ -452,6 +652,10 @@ def _segment_flags(
             and current_entity_id is not None
             and bool(unmatched)
         ),
+        has_multi_active_lr_asd_frames=multi_active.frame_count > 0,
+        multi_active_contains_current_entity_and_other_face=(
+            multi_active.contains_current_entity_and_other_face
+        ),
     )
 
 
@@ -465,6 +669,7 @@ def _cluster_flags(
     faces: Sequence[ExclusiveActiveFaceOverlap],
     entities: Sequence[ExclusiveActiveEntityOverlap],
     unmatched: Sequence[str],
+    multi_active: _MultiActiveOverlap,
 ) -> SpeakerBindingClusterAuditFlags:
     return SpeakerBindingClusterAuditFlags(
         conflict=status == "conflict",
@@ -480,6 +685,10 @@ def _cluster_flags(
             and current_entity_id is not None
             and bool(unmatched)
         ),
+        has_multi_active_lr_asd_frames=multi_active.frame_count > 0,
+        multi_active_contains_current_entity_and_other_face=(
+            multi_active.contains_current_entity_and_other_face
+        ),
     )
 
 
@@ -492,11 +701,13 @@ def _review_priority(
         return "exclusive_active_entity_contradiction", 2
     if flags.mapped_entity_vs_unmatched_face_contradiction:
         return "mapped_entity_vs_unmatched_face_contradiction", 3
+    if flags.multi_active_contains_current_entity_and_other_face:
+        return "multi_active_current_entity_and_other_face", 4
     if flags.unbound or flags.ambiguous:
-        return "unbound_or_ambiguous", 4
+        return "unbound_or_ambiguous", 5
     if flags.has_fully_propagated_segments:
-        return "fully_propagated", 5
-    return "candidate_mapped_lowest_direct_support_ratio", 6
+        return "fully_propagated", 6
+    return "candidate_mapped_lowest_direct_support_ratio", 7
 
 
 def _reason_flags(flags: SpeakerBindingClusterAuditFlags) -> list[str]:
@@ -677,6 +888,7 @@ def _build_records(
         sidecar_hashes[clip_uid] = _sha256(sidecar_path)
         native_hashes[clip_uid] = _sha256(native_path)
         frames = _exclusive_frames(native, sidecar)
+        multi_active_frames = _multi_active_frames(native, sidecar)
         anchor_evidence = _binding_anchor_evidence(
             raw_segments=raw_by_clip[clip_uid],
             sidecar=sidecar,
@@ -727,6 +939,11 @@ def _build_records(
                     )
             intervals = [(item.start_time, item.end_time) for item in segments]
             faces, entities, unmatched = _exclusive_overlap_evidence(intervals, frames)
+            cluster_multi_active = _multi_active_overlap_evidence(
+                intervals,
+                multi_active_frames,
+                current_entity_id=cluster.entity_id,
+            )
             fully_propagated_seconds = 0.0
             has_fully_propagated = False
             for segment in segments:
@@ -734,6 +951,11 @@ def _build_records(
                 segment_intervals = [(segment.start_time, segment.end_time)]
                 segment_faces, segment_entities, segment_unmatched = (
                     _exclusive_overlap_evidence(segment_intervals, frames)
+                )
+                segment_multi_active = _multi_active_overlap_evidence(
+                    segment_intervals,
+                    multi_active_frames,
+                    current_entity_id=bound.entity_id,
                 )
                 duration = segment.end_time - segment.start_time
                 segment_direct_evidence = [
@@ -784,6 +1006,7 @@ def _build_records(
                     faces=segment_faces,
                     entities=segment_entities,
                     unmatched=segment_unmatched,
+                    multi_active=segment_multi_active,
                 )
                 segment_records.append(
                     SpeakerBindingSegmentAudit(
@@ -803,6 +1026,20 @@ def _build_records(
                         exclusive_active_faces=segment_faces,
                         exclusive_active_entities=segment_entities,
                         unmatched_exclusive_active_face_track_ids=segment_unmatched,
+                        multi_active_lr_asd_seconds=segment_multi_active.seconds,
+                        multi_active_frame_count=segment_multi_active.frame_count,
+                        max_simultaneous_active_face_count=(
+                            segment_multi_active.maximum_face_count
+                        ),
+                        multi_active_face_track_ids=(
+                            segment_multi_active.face_track_ids
+                        ),
+                        multi_active_mapped_entity_ids=(
+                            segment_multi_active.mapped_entity_ids
+                        ),
+                        multi_active_unmatched_face_track_ids=(
+                            segment_multi_active.unmatched_face_track_ids
+                        ),
                         flags=segment_flags,
                     )
                 )
@@ -821,6 +1058,7 @@ def _build_records(
                 faces=faces,
                 entities=entities,
                 unmatched=unmatched,
+                multi_active=cluster_multi_active,
             )
             priority, rank = _review_priority(cluster_flags)
             competing = {
@@ -858,6 +1096,18 @@ def _build_records(
                     exclusive_active_faces=faces,
                     exclusive_active_entities=entities,
                     unmatched_exclusive_active_face_track_ids=unmatched,
+                    multi_active_lr_asd_seconds=cluster_multi_active.seconds,
+                    multi_active_frame_count=cluster_multi_active.frame_count,
+                    max_simultaneous_active_face_count=(
+                        cluster_multi_active.maximum_face_count
+                    ),
+                    multi_active_face_track_ids=cluster_multi_active.face_track_ids,
+                    multi_active_mapped_entity_ids=(
+                        cluster_multi_active.mapped_entity_ids
+                    ),
+                    multi_active_unmatched_face_track_ids=(
+                        cluster_multi_active.unmatched_face_track_ids
+                    ),
                     flags=cluster_flags,
                     review_priority=priority,
                     review_priority_rank=rank,
@@ -955,6 +1205,13 @@ def _summary(
         clusters_with_fully_propagated_segments=sum(
             item.fully_propagated_seconds > 0 for item in clusters
         ),
+        clusters_with_multi_active_lr_asd_frames=sum(
+            item.flags.has_multi_active_lr_asd_frames for item in clusters
+        ),
+        clusters_with_current_entity_plus_other_active_face=sum(
+            item.flags.multi_active_contains_current_entity_and_other_face
+            for item in clusters
+        ),
         multiple_exclusive_active_face_track_speaker_seconds=sum(
             item.cluster_speaker_duration_seconds
             for item in clusters
@@ -975,6 +1232,9 @@ def _summary(
         ),
         identity_propagated_speaker_seconds=sum(
             item.identity_propagated_seconds for item in clusters
+        ),
+        multi_active_lr_asd_speaker_seconds=sum(
+            item.multi_active_lr_asd_seconds for item in clusters
         ),
         review_priority_counts=priority_counts,
     )

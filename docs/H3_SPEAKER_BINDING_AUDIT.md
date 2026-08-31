@@ -19,6 +19,14 @@ evidence. Structural contradiction flags are factual observations only; direct
 support duration, ratio, and anchor-length fields are review metrics, never new
 acceptance thresholds.
 
+Frames with two or more backend-native active face tracks are audited through a
+separate multi-active evidence path and are not counted as exclusive-active
+evidence. Segment and cluster records retain the active face-track IDs, mapped
+Visual entity IDs, unmatched tracks, overlap duration, frame count, and maximum
+simultaneous active-face count. A mapped current entity appearing alongside
+another active face is a structural review signal only: it does not label the
+binding wrong, alter the binding, or introduce a duration or support-ratio gate.
+
 Run the audit after the production Audio and DiariZen stages:
 
 ```bash

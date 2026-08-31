@@ -393,8 +393,8 @@ def _fixture(root: Path) -> tuple[Path, dict[str, bytes]]:
         duration_seconds=7,
         tracks=[
             _native_track("face_1", [*range(13), *range(25, 37), *range(50, 57)]),
-            _native_track("face_2", [*range(37, 50), *range(125, 130)]),
-            _native_track("face_3", list(range(57, 75))),
+            _native_track("face_2", [30, *range(37, 50), *range(125, 130)]),
+            _native_track("face_3", [30, 52, *range(57, 75)]),
         ],
     )
     native_path = audio / "runtime" / "clip-a" / "lr_asd" / "lr_asd_native.json"
@@ -457,6 +457,39 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
     unmatched = clusters["speaker_2"]
     assert unmatched["unmatched_exclusive_active_face_track_ids"] == ["face_3"]
     assert unmatched["flags"]["mapped_entity_vs_unmatched_face_contradiction"]
+    assert unmatched["current_mapping_status"] == "candidate_mapped"
+    assert unmatched["current_entity_id"] == "e1"
+    assert unmatched["multi_active_lr_asd_seconds"] == pytest.approx(0.04)
+    assert unmatched["multi_active_frame_count"] == 1
+    assert unmatched["max_simultaneous_active_face_count"] == 2
+    assert unmatched["multi_active_face_track_ids"] == ["face_1", "face_3"]
+    assert unmatched["multi_active_mapped_entity_ids"] == ["e1"]
+    assert unmatched["multi_active_unmatched_face_track_ids"] == ["face_3"]
+    assert unmatched["flags"]["has_multi_active_lr_asd_frames"]
+    assert unmatched["flags"][
+        "multi_active_contains_current_entity_and_other_face"
+    ]
+    face_1_exclusive = next(
+        item
+        for item in unmatched["exclusive_active_faces"]
+        if item["face_track_id"] == "face_1"
+    )
+    assert face_1_exclusive["overlap_seconds"] == pytest.approx(0.24)
+
+    assert contradiction["multi_active_lr_asd_seconds"] == pytest.approx(0.04)
+    assert contradiction["multi_active_frame_count"] == 1
+    assert contradiction["max_simultaneous_active_face_count"] == 3
+    assert contradiction["multi_active_face_track_ids"] == [
+        "face_1",
+        "face_2",
+        "face_3",
+    ]
+    assert contradiction["multi_active_mapped_entity_ids"] == ["e1", "e2"]
+    assert contradiction["multi_active_unmatched_face_track_ids"] == ["face_3"]
+    assert segments["segment_0002"]["flags"]["has_multi_active_lr_asd_frames"]
+    assert segments["segment_0002"]["max_simultaneous_active_face_count"] == 3
+    assert not segments["segment_0009"]["flags"]["has_multi_active_lr_asd_frames"]
+    assert segments["segment_0009"]["multi_active_frame_count"] == 0
 
     propagated = clusters["speaker_3"]
     assert propagated["fully_propagated_seconds"] == pytest.approx(0.8)
@@ -491,6 +524,9 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
     assert summary.clusters_with_exclusive_active_entity_contradiction == 1
     assert summary.clusters_with_mapped_entity_vs_unmatched_face == 1
     assert summary.clusters_with_fully_propagated_segments == 1
+    assert summary.clusters_with_multi_active_lr_asd_frames == 2
+    assert summary.clusters_with_current_entity_plus_other_active_face == 1
+    assert summary.multi_active_lr_asd_speaker_seconds == pytest.approx(0.08)
     assert len(summary.audio_binding_input_set_sha256) == 64
     assert len(summary.lr_asd_native_input_set_sha256) == 64
     assert "cluster_propagated_only" not in summary.review_priority_counts
