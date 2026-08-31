@@ -31,6 +31,8 @@ from r2v_data_v2.v3.subject_attributes import (
 from tools.compact_v3_production_exports import compact_production_exports
 from tools.prepare_v3_production_shards import (
     main as prepare_main,
+)
+from tools.prepare_v3_production_shards import (
     prepare_production_shards,
     probe_production_setup,
 )
@@ -1372,8 +1374,14 @@ def _write_enriched_with_attribute(
     attribute = run_root / "subject_attributes" / attribute_path
     attribute.parent.mkdir(parents=True)
     if attribute_exists:
-        mode = image_mode or ("RGB" if final_selection == "completed" else "RGBA")
-        color = (20, 30, 40) if mode == "RGB" else (20, 30, 40, 180)
+        mode = image_mode or "RGBA"
+        color = (
+            (20, 30, 40)
+            if mode == "RGB"
+            else (20, 30, 40, 255)
+            if mode == "RGBA"
+            else 20
+        )
         Image.new(mode, (16, 8), color).save(attribute)
     accepted = _accepted_attribute(
         attribute_path,
@@ -1496,9 +1504,11 @@ def test_compactor_publishes_canonical_attribute_with_owner_and_type(
     assert published_attribute.stat().st_ino == published_inode
 
 
-def test_compactor_publishes_completed_rgb_attribute_as_synthetic(
+@pytest.mark.parametrize("image_mode", ["RGBA", "RGB"])
+def test_compactor_publishes_current_and_legacy_completed_attribute_as_synthetic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    image_mode: str,
 ) -> None:
     shards, output, source, source_yaml = _compaction_roots(tmp_path, monkeypatch)
     shard_id = "shard-000000000-000000999"
@@ -1515,6 +1525,7 @@ def test_compactor_publishes_completed_rgb_attribute_as_synthetic(
         shard_id=shard_id,
         sample_id="sample-a",
         final_selection="completed",
+        image_mode=image_mode,
     )
     source_attribute = (
         runs_root
@@ -1547,14 +1558,14 @@ def test_compactor_publishes_completed_rgb_attribute_as_synthetic(
     assert _file_sha256(published_attribute) == source_sha
     with Image.open(published_attribute) as image:
         assert image.format == "PNG"
-        assert image.mode == "RGB"
+        assert image.mode == image_mode
 
 
 @pytest.mark.parametrize(
     ("final_selection", "image_mode", "expected_mode"),
     [
         ("raw", "RGB", "RGBA"),
-        ("completed", "RGBA", "RGB"),
+        ("completed", "L", "RGB or RGBA"),
     ],
 )
 def test_compactor_rejects_attribute_mode_mismatched_with_final_selection(

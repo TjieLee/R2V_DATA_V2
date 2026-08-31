@@ -114,8 +114,13 @@ identity-only evidence, and the generated candidate. It must preserve the same
 physical item or component. A modest improvement is enough and an equivalent
 candidate returns to alpha.
 
-Accepted Attribute Boogu output is published directly as RGB PNG. It receives
-no completion SAM3, alpha restoration, foreground extraction, or bbox pass.
+Attribute Boogu output receives one frame-local completion SAM3 probe with the
+original attribute grounding prompt. The unioned mask is conservatively cleaned
+of only very small floating components and materialized with the Boogu RGB as a
+binary-alpha RGBA crop. This cleaned artifact must pass deterministic quality
+checks before the comparative completion review can accept it. There is no
+temporal tracking, large erosion, bbox pass, or second repaired attribute
+review. Legacy completed RGB sidecars remain readable.
 Fresh Attribute background generation is disabled with reason
 `attribute_background_disabled_by_policy`.
 

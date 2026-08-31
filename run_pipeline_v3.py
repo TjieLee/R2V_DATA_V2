@@ -48,8 +48,8 @@ from r2v_data_v2.v3.runtime import (
     PersistentStageProcessPool,
     StreamingDAGScheduler,
     StreamingStage,
-    runtime_worker_config,
     runtime_segment_pool_worker_configs,
+    runtime_worker_config,
     streaming_model_stage_enabled,
 )
 from r2v_data_v2.v3.sam3_backend import SegmentationBackend
@@ -61,8 +61,8 @@ from r2v_data_v2.v3.subject_attributes import (
     AttributeFrameSegmentationBackend,
     AttributeGmeScreener,
     PersistentWorkerAttributeFrameSegmenter,
-    QwenSubjectAttributeCompletionJudge,
     QwenSubjectAttributeClient,
+    QwenSubjectAttributeCompletionJudge,
     SubjectAttributeDiscoveryClient,
     SubjectAttributeReviewClient,
     process_subject_attribute_clip,
@@ -104,6 +104,7 @@ _IMPLEMENTED_STAGES = frozenset(
 
 _STREAMING_GPU_STAGES = frozenset({"segment", "remove", "reference_edit"})
 _SUBJECT_ATTRIBUTE_SEGMENT_WORKER = "subject_attributes_segment"
+_RUN_IDENTITY_RESUME_STAGES = frozenset({"subject_attributes", "export"})
 
 
 def _git_commit() -> str:
@@ -633,6 +634,7 @@ def run_pipeline_v3(
     attribute_completion_backend: AttributeCompletionBackend | None = None,
     attribute_completion_judge: AttributeCompletionJudge | None = None,
     profile: bool = False,
+    resume_existing_run_identity: bool = False,
 ) -> dict[str, object]:
     unknown = sorted(set(stages) - set(STAGE_ORDER))
     if unknown:
@@ -647,6 +649,14 @@ def run_pipeline_v3(
         )
     requested = set(stages)
     ordered_stages = tuple(stage for stage in STAGE_ORDER if stage in requested)
+    if resume_existing_run_identity and not requested.issubset(
+        _RUN_IDENTITY_RESUME_STAGES
+    ):
+        disallowed = sorted(requested - _RUN_IDENTITY_RESUME_STAGES)
+        raise ValueError(
+            "resume-existing-run-identity is restricted to subject_attributes "
+            f"and export; disallowed stages: {disallowed}"
+        )
     config = load_config(config_path)
     if (
         "subject_attributes" in ordered_stages
@@ -654,7 +664,33 @@ def run_pipeline_v3(
     ):
         raise ValueError("subject_attributes is available only in streaming_v1")
     storage = RunStorage(config)
-    run = storage.initialize(git_commit=git_commit or _git_commit())
+    if resume_existing_run_identity:
+        if not storage.run_path.is_file():
+            raise FileNotFoundError(
+                "--resume-existing-run-identity requires an existing run.json"
+            )
+        existing_run = storage.read_run()
+        expected_identity = {
+            "run_id": storage.root.name,
+            "config_hash": config.fingerprint(),
+            "model_identifiers": config.model_identifiers(),
+            "source_manifest_path": str(
+                config.dataset_json.expanduser().resolve(strict=False)
+            ),
+        }
+        mismatches = [
+            name
+            for name, expected in expected_identity.items()
+            if getattr(existing_run, name) != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "existing run.json identity mismatch for postprocessing resume: "
+                + ", ".join(mismatches)
+            )
+        run = storage.initialize(git_commit=existing_run.git_commit)
+    else:
+        run = storage.initialize(git_commit=git_commit or _git_commit())
     profiler = (
         V3Profiler(
             storage.root,
@@ -853,6 +889,14 @@ def main() -> None:
         action="store_true",
         help="record observational stage and model-call profiling artifacts",
     )
+    parser.add_argument(
+        "--resume-existing-run-identity",
+        action="store_true",
+        help=(
+            "reuse the existing run.json git commit for a subject_attributes/export "
+            "postprocessing-only resume"
+        ),
+    )
     args = parser.parse_args()
     stages = tuple(part.strip() for part in args.stages.split(",") if part.strip())
     result = run_pipeline_v3(
@@ -860,6 +904,7 @@ def main() -> None:
         stages=stages,
         overwrite=args.overwrite,
         profile=args.profile,
+        resume_existing_run_identity=args.resume_existing_run_identity,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

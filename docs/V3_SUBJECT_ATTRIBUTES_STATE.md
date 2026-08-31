@@ -113,8 +113,13 @@ Image 3: Boogu candidate
 For eligible types, the same physical item or component is a hard gate. A
 modest real improvement is enough for `candidate_better_than_alpha`; an
 equivalent candidate falls back to alpha. Boogu output is reviewed directly and
-published as RGB when accepted; there is no completion SAM3, alpha recovery,
-bbox extraction, or second repaired attribute review.
+then receives one frame-local Attribute completion SAM3 probe using the original
+grounding prompt. All usable masks are unioned, only very small floating
+components are removed, and the Boogu RGB plus cleaned binary mask is
+materialized as RGBA. The cleaned artifact must pass deterministic quality
+checks before the existing comparative completion review can accept it. There
+is no temporal SAM3 tracking or second repaired attribute review. Legacy
+completed RGB sidecars remain readable by the compactor.
 
 For non-face types, if `sufficient_source_evidence=false`, Boogu must not
 hallucinate missing evidence. The pipeline tries candidate 2. If both sources
