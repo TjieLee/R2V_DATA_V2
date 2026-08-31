@@ -1525,15 +1525,26 @@ meaningful evidence for a conservative completion.
 recognizable requires sufficient component structure, not merely a guessable
 category. Hair needs a coherent hairstyle region or silhouette; reject fringe,
 arcs, isolated strands, or contour-only regions. Face needs enough facial
-structure to function independently. Accept a clear frontal, near-frontal, or
-moderate three-quarter face when the same person's key identity cues remain
-recognizable. Reject a near-pure side profile, the back of a head, a severely
-occluded or motion-blurred face, an extremely small face, or isolated facial
-patches. Apply this face-specific standard only when attribute_type is face; do
-not apply it to hair, headwear, glasses, clothing, shoes, bags, or accessories. Upper or
-lower clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
-cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags, and
-accessories need enough of the item to identify its structure independently.
+structure to function independently. Apply this rule only when attribute_type is face:
+accept when approximately 50% or more of the frontal facial structure is visible and
+the person's identity remains reasonably recognizable. This includes frontal,
+near-frontal, ordinary three-quarter, and fairly turned faces that still retain
+roughly half or more of the frontal facial structure. Do not require both eyes
+to be fully visible and do not require a passport-photo-like frontal pose.
+Partial hair, ear, or neck context is irrelevant to rejection. For face,
+recognizable, characteristic_appearance_visible,
+usable_as_attribute_condition, and sufficient_source_evidence must not
+implicitly require a near-frontal view and should normally be true when this
+approximately-50% identity threshold is met. Reject face only when less than
+roughly half of the frontal facial structure is visible, such as an almost pure
+side profile; the back of the head or essentially no visible face; severe
+occlusion that destroys identity cues; severe motion blur that makes identity
+unreliable; an extremely small or genuinely unusable face; or the wrong person
+or a competing face. Do not apply this face-specific standard to hair,
+headwear, glasses, clothing, shoes, bags, or accessories. Upper or lower
+clothing needs coherent garment structure; reject a narrow shoulder, sleeve,
+cuff, hem, trouser edge, or arbitrary strip. Headwear, glasses, shoes, bags,
+and accessories need enough of the item to identify its structure independently.
 usable_as_attribute_condition=true only when the isolated crop provides clean,
 useful appearance information beyond the main subject reference. Reject a
 generic owner or body silhouette, a pose-dominated cutout, an arbitrary subject-
@@ -1622,15 +1633,19 @@ fields."""
 
 ATTRIBUTE_FACE_BBOX_REVIEW_SYSTEM_PROMPT = """You are reviewing an RGB bbox
 reference for one known person's face. Accept when exactly one target face is
-dominant, its identity cues are clear and recognizable, and the face is complete
-or mostly complete. A large face is desirable, and owner identity is positive
-evidence rather than leakage. Frontal, near-frontal, and clear moderate
-three-quarter views are acceptable. A small amount of hair, neck, shoulders, or
-upper body is acceptable when it remains supportive and does not dominate.
+dominant, approximately 50% or more of the frontal facial structure is visible,
+and identity remains reasonably recognizable. Frontal, near-frontal, ordinary
+three-quarter, and fairly turned faces are acceptable when they retain roughly
+half or more of the frontal facial structure. Do not require both eyes to be
+fully visible or a passport-photo-like frontal pose. Hair, ear, and neck context
+is irrelevant to rejection, and owner identity is positive evidence rather than
+leakage.
 
-Reject severe blur or occlusion, a near-pure side profile or back view, an
-unrecognizable or extremely small face, multiple competing faces, a bbox whose
-dominant content is not the target face, or severe visual artifacts. Interpret
+Reject only when less than roughly half of the frontal facial structure is
+visible, such as an almost pure side profile; the back of the head or
+essentially no visible face; severe occlusion or motion blur that destroys
+reliable identity cues; an extremely small or genuinely unusable face; the
+wrong person; multiple competing faces; or severe visual artifacts. Interpret
 no_strong_owner_pose_or_scene_leakage as requiring that unrelated body pose and
 scene context do not overwhelm the face; do not treat the target person's facial
 identity as leakage. Fail closed when uncertain.
@@ -2608,6 +2623,8 @@ def _accepted_record(
             if final_selection == "raw"
             else "attribute_completion_review_accepted"
             if final_selection == "completed"
+            else "face_bbox_selected_from_accepted_raw_review"
+            if candidate.discovered.attribute_type == "face"
             else "attribute_bbox_fallback_review_accepted"
         ),
         accepted_base_image_path=(relative_path if final_selection != "bbox" else None),
@@ -2622,8 +2639,6 @@ def _accepted_face_record(
     sample_id: str,
     owner_reference: EntityReferenceState,
     review: SubjectAttributeReview,
-    judge: AttributeVariantJudge | None,
-    metrics: _AttributeVariantMetrics,
     crop_padding_ratio: float,
 ) -> SubjectAttributeRecord:
     source_frame_index = candidate.owner_candidate.source_frame_index
@@ -2640,7 +2655,7 @@ def _accepted_face_record(
             variant="bbox",
             image=bbox_image,
         )
-    except Exception as exc:  # noqa: BLE001 - raw alpha remains accepted
+    except Exception as exc:  # noqa: BLE001 - safest fallback is accepted raw alpha
         bbox_variant = ReferenceVariantState(
             image_path=None,
             status="unavailable",
@@ -2651,55 +2666,15 @@ def _accepted_face_record(
             source_frame_index=source_frame_index,
         )
     else:
-        if judge is None:
-            bbox_variant = ReferenceVariantState(
-                image_path=bbox_path,
-                status="available",
-                reviewed=False,
-                review_status="judge_unavailable",
-                reason="attribute_bbox_judge_unavailable",
-                synthetic=False,
-                source_frame_index=source_frame_index,
-            )
-        else:
-            metrics.bbox_reviews_attempted += 1
-            try:
-                owner_context = build_candidate_context_image(
-                    candidate.source_image,
-                    candidate.owner_candidate.mask,
-                )
-                bbox_review = judge.review_attribute_bbox(
-                    bbox_candidate=bbox_image,
-                    owner_context=owner_context,
-                    attribute_type=candidate.discovered.attribute_type,
-                    attribute_phrase=candidate.discovered.phrase,
-                )
-                if not isinstance(bbox_review, SubjectAttributeBboxReview):
-                    raise TypeError("attribute bbox judge returned an invalid review")
-                accepted = bbox_review.verdict == "accept"
-            except Exception as exc:  # noqa: BLE001 - raw alpha remains accepted
-                bbox_variant = ReferenceVariantState(
-                    image_path=bbox_path,
-                    status="available",
-                    reviewed=False,
-                    review_status="judge_failed",
-                    reason=(
-                        "attribute_bbox_judge_failed:"
-                        f"{type(exc).__name__}:{exc}"
-                    ),
-                    synthetic=False,
-                    source_frame_index=source_frame_index,
-                )
-            else:
-                bbox_variant = ReferenceVariantState(
-                    image_path=bbox_path,
-                    status="accepted" if accepted else "rejected",
-                    reviewed=True,
-                    review_status="accept" if accepted else "reject",
-                    reason=bbox_review.reason,
-                    synthetic=False,
-                    source_frame_index=source_frame_index,
-                )
+        bbox_variant = ReferenceVariantState(
+            image_path=bbox_path,
+            status="accepted",
+            reviewed=True,
+            review_status="accepted_via_raw_face_review",
+            reason="face_bbox_selected_from_accepted_raw_review",
+            synthetic=False,
+            source_frame_index=source_frame_index,
+        )
     final_selection: Literal["raw", "bbox"] = (
         "bbox" if bbox_variant.status == "accepted" else "raw"
     )
@@ -3418,6 +3393,7 @@ def _collect_attribute_candidates(
             if bool(
                 completion_config is not None
                 and getattr(completion_config, "enabled", False)
+                and discovered.attribute_type != "face"
             ):
                 raw_rejection = _masked_crop_quality_rejection(
                     crop,
@@ -4050,7 +4026,12 @@ def _process_owner(
                 semantic_candidate_pool.setdefault(attribute_id, []).append(
                     (candidate, review)
                 )
-            if review.accepted:
+            raw_publishable = bool(
+                review.accepted
+                and review.structure_complete
+                and not review.completion_recommended
+            )
+            if raw_publishable:
                 raw_fallback_pool.setdefault(attribute_id, []).append(
                     (candidate, review)
                 )
@@ -4065,6 +4046,26 @@ def _process_owner(
                 in completion_config.eligible_types
             )
             if not semantic_owner_correct:
+                if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
+                    continue
+                records_by_id[attribute_id] = _rejected_record(
+                    candidate.discovered,
+                    attribute_id=attribute_id,
+                    owner_entity_id=owner.entity_id,
+                    reason=f"recognizability:{review.reason}",
+                    geometry=candidate.geometry,
+                    source_frame_index=candidate.owner_candidate.source_frame_index,
+                    source_frame_slot=candidate.owner_candidate.frame_slot,
+                    owner_candidate_id=candidate.owner_candidate.candidate_id,
+                    same_frame=same_frame,
+                    review=review,
+                    gme_attempts=candidate.gme_attempts,
+                    selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+                )
+                unresolved.discard(attribute_id)
+                continue
+
+            if completion_eligible and not review.accepted:
                 if candidate_rank + 1 < len(candidate_options_by_id[attribute_id]):
                     continue
                 records_by_id[attribute_id] = _rejected_record(
@@ -4116,6 +4117,22 @@ def _process_owner(
                     pass
                 continue
 
+            if raw_publishable:
+                selected_candidate_by_id[attribute_id] = candidate
+                records_by_id[attribute_id] = _accepted_record(
+                    candidate,
+                    output_root=output_root,
+                    sample_id=clip.clip_uid,
+                    owner_reference=owner_reference,
+                    review=review,
+                    final_selection="raw",
+                    completion_attempted=False,
+                    completion_outcome="not_attempted",
+                    crop_padding_ratio=config.pair.crop_padding_ratio,
+                )
+                unresolved.discard(attribute_id)
+                continue
+
             if completion_backend is None or completion_judge is None:
                 completed = None
                 completion_review = None
@@ -4125,7 +4142,7 @@ def _process_owner(
                 completion_metrics.attempts_by_type[
                     candidate.discovered.attribute_type
                 ] += 1
-                if review.accepted:
+                if raw_publishable:
                     completion_metrics.raw_usable_attempts += 1
                 else:
                     completion_metrics.raw_unusable_attempts += 1
@@ -4147,7 +4164,7 @@ def _process_owner(
                     completion_judge=completion_judge,
                     segmentation_backend=segmentation_backend,
                     metrics=completion_metrics,
-                    raw_usable=review.accepted,
+                    raw_usable=raw_publishable,
                     crop_padding_ratio=config.pair.crop_padding_ratio,
                     save_diagnostics=bool(
                         getattr(
@@ -4199,8 +4216,6 @@ def _process_owner(
             sample_id=clip.clip_uid,
             owner_reference=owner_reference,
             review=review,
-            judge=variant_judge,
-            metrics=new_variant_metrics,
             crop_padding_ratio=config.pair.crop_padding_ratio,
         )
 
@@ -4235,6 +4250,33 @@ def _process_owner(
             continue
 
         semantic_pool = semantic_candidate_pool.get(attribute_id, [])
+        if attribute_id in completion_provenance:
+            candidate, review = semantic_pool[-1]
+            completion_metrics.rejected += 1
+            records_by_id[attribute_id] = _rejected_record(
+                candidate.discovered,
+                attribute_id=attribute_id,
+                owner_entity_id=owner.entity_id,
+                reason=completion_reason,
+                geometry=candidate.geometry,
+                source_frame_index=candidate.owner_candidate.source_frame_index,
+                source_frame_slot=candidate.owner_candidate.frame_slot,
+                owner_candidate_id=candidate.owner_candidate.candidate_id,
+                same_frame=(
+                    owner_reference.source_clip_uid in {None, clip.clip_uid}
+                    and candidate.owner_candidate.source_frame_index
+                    == owner_reference.source_frame_index
+                ),
+                review=review,
+                completion_review=completion_review,
+                gme_attempts=candidate.gme_attempts,
+                selected_gme_attempt_index=candidate.selected_gme_attempt_index,
+                completion_attempted=True,
+                completion_seed=completion_seed,
+                completion_outcome=completion_reason,
+            )
+            unresolved.discard(attribute_id)
+            continue
         if (
             semantic_pool
             and semantic_pool[0][0].discovered.attribute_type == "face"
@@ -4516,7 +4558,9 @@ def _process_owner(
                 new_variant_metrics.bbox_reviews_attempted
             ),
             attribute_bbox_fallback_accepted=sum(
-                record.status == "accepted" and record.final_selection == "bbox"
+                record.status == "accepted"
+                and record.final_selection == "bbox"
+                and record.attribute_type != "face"
                 for record in ordered_records
             ),
             failures=failures,

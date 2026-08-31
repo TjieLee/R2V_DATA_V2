@@ -881,10 +881,17 @@ def test_review_prompt_requires_canonical_batch_shape() -> None:
     assert "recognizable requires sufficient component structure" in prompt
     assert "Hair needs a coherent hairstyle region or silhouette" in prompt
     assert "Face needs enough facial structure to function independently" in prompt
-    assert "moderate three-quarter face" in prompt
-    assert "near-pure side profile" in prompt
+    assert "approximately 50% or more of the frontal facial structure" in prompt
+    assert "ordinary three-quarter" in prompt
+    assert "fairly turned faces" in prompt
+    assert "Do not require both eyes to be fully visible" in prompt
+    assert "passport-photo-like frontal pose" in prompt
+    assert "Partial hair, ear, or neck context is irrelevant" in prompt
+    assert "must not implicitly require a near-frontal view" in prompt
+    assert "almost pure side profile" in prompt
+    assert "wrong person or a competing face" in prompt
     assert "only when attribute_type is face" in prompt
-    assert "do not apply it to hair, headwear, glasses, clothing" in prompt
+    assert "Do not apply this face-specific standard to hair" in prompt
     assert "clothing needs coherent garment structure" in prompt
     assert "beyond the main subject reference" in prompt
     assert "pose-dominated cutout" in prompt
@@ -1116,9 +1123,12 @@ def test_face_bbox_review_uses_face_specific_prompt() -> None:
     assert review.verdict == "accept"
     system_prompt = completions.calls[0]["messages"][0]["content"]
     assert system_prompt == subject_attributes.ATTRIBUTE_FACE_BBOX_REVIEW_SYSTEM_PROMPT
-    assert "clear moderate\nthree-quarter views are acceptable" in system_prompt
+    assert "approximately 50% or more" in system_prompt
+    assert "ordinary\nthree-quarter" in system_prompt
+    assert "fairly turned faces" in system_prompt
+    assert "Do not require both eyes" in system_prompt
+    assert "passport-photo-like frontal pose" in system_prompt
     assert "owner identity is positive" in system_prompt
-    assert "large face is desirable" in system_prompt
     assert subject_attributes.ATTRIBUTE_BBOX_REVIEW_SYSTEM_PROMPT != system_prompt
 
 
@@ -3484,6 +3494,7 @@ def _run_completion_routing_case(
     completion_stage: str = "success",
     attribute_count: int = 1,
     first_attribute_type: str = "upper_clothing",
+    minimum_sharpness_score: float = -1.0,
 ) -> tuple[OwnerEnrichmentArtifact, object, object, object]:
     _frames(tmp_path / "run")
 
@@ -3594,7 +3605,7 @@ def _run_completion_routing_case(
             subject_attributes=SubjectAttributesConfig(
                 completion=replace(
                     SubjectAttributeCompletionConfig(enabled=True),
-                    minimum_sharpness_score=-1.0,
+                    minimum_sharpness_score=minimum_sharpness_score,
                     maximum_area_growth_ratio=4.0,
                     face_maximum_area_growth_ratio=4.0,
                     maximum_bbox_area_growth_ratio=4.0,
@@ -3786,8 +3797,18 @@ def test_face_prefers_bbox_and_legacy_config_cannot_enable_completion(
     assert record.variants is not None
     assert record.variants.bbox.status == "accepted"
     assert record.variants.bbox.synthetic is False
+    assert record.variants.bbox.reviewed is True
+    assert record.variants.bbox.review_status == "accepted_via_raw_face_review"
+    assert record.default_variant == "bbox"
+    assert record.image_path == record.variants.bbox.image_path
+    assert record.default_image_path == record.variants.bbox.image_path
+    assert record.variants.alpha.image_path is not None
+    with Image.open(
+        tmp_path / "output" / record.variants.alpha.image_path
+    ) as alpha_variant:
+        assert alpha_variant.mode == "RGBA"
     assert review.candidate_calls == [["candidate_1"]]
-    assert review.bbox_calls == 1
+    assert review.bbox_calls == 0
     assert backend.calls == []
     assert judge.calls == 0
     assert artifact.metrics.completion_attempts == 0
@@ -3796,11 +3817,11 @@ def test_face_prefers_bbox_and_legacy_config_cannot_enable_completion(
     assert artifact.metrics.completion_fallback_to_raw == 0
     assert artifact.metrics.completion_attempts_by_type == {}
     assert artifact.metrics.completion_accepted_by_type == {}
-    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
-    assert artifact.metrics.attribute_bbox_fallback_accepted == 1
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 0
 
 
-def test_face_bbox_reject_falls_back_to_accepted_raw_alpha(
+def test_face_does_not_call_rejecting_bbox_judge(
     tmp_path: Path,
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
@@ -3813,23 +3834,22 @@ def test_face_bbox_reject_falls_back_to_accepted_raw_alpha(
 
     record = artifact.records[0]
     assert record.status == "accepted"
-    assert record.final_selection == "raw"
+    assert record.final_selection == "bbox"
     assert record.completion_attempted is False
     assert record.variants is not None
-    assert record.variants.bbox.status == "rejected"
+    assert record.variants.bbox.status == "accepted"
     assert record.variants.bbox.reviewed is True
-    assert record.variants.bbox.review_status == "reject"
-    assert review.bbox_calls == 1
+    assert record.variants.bbox.review_status == "accepted_via_raw_face_review"
+    assert review.bbox_calls == 0
     assert backend.calls == []
     assert judge.calls == 0
     assert artifact.metrics.completion_fallback_to_raw == 0
     assert record.image_path is not None
     with Image.open(tmp_path / "output" / record.image_path) as published:
-        assert published.mode == "RGBA"
-        assert set(np.unique(np.asarray(published)[..., 3])).issubset({0, 255})
+        assert published.mode == "RGB"
 
 
-def test_face_bbox_judge_exception_falls_back_to_accepted_raw_alpha(
+def test_face_does_not_call_failing_bbox_judge(
     tmp_path: Path,
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
@@ -3842,19 +3862,19 @@ def test_face_bbox_judge_exception_falls_back_to_accepted_raw_alpha(
 
     record = artifact.records[0]
     assert record.status == "accepted"
-    assert record.final_selection == "raw"
+    assert record.final_selection == "bbox"
     assert record.variants is not None
-    assert record.variants.bbox.status == "available"
-    assert record.variants.bbox.reviewed is False
-    assert record.variants.bbox.review_status == "judge_failed"
+    assert record.variants.bbox.status == "accepted"
+    assert record.variants.bbox.reviewed is True
+    assert record.variants.bbox.review_status == "accepted_via_raw_face_review"
     assert record.variants.bbox.image_path is not None
-    assert review.bbox_calls == 1
+    assert review.bbox_calls == 0
     assert backend.calls == []
     assert judge.calls == 0
     assert artifact.metrics.completion_fallback_to_raw == 0
 
 
-def test_face_without_bbox_judge_falls_back_to_accepted_raw_alpha(
+def test_face_without_bbox_judge_selects_materialized_bbox(
     tmp_path: Path,
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
@@ -3867,11 +3887,11 @@ def test_face_without_bbox_judge_falls_back_to_accepted_raw_alpha(
 
     record = artifact.records[0]
     assert record.status == "accepted"
-    assert record.final_selection == "raw"
+    assert record.final_selection == "bbox"
     assert record.variants is not None
-    assert record.variants.bbox.status == "available"
-    assert record.variants.bbox.reviewed is False
-    assert record.variants.bbox.review_status == "judge_unavailable"
+    assert record.variants.bbox.status == "accepted"
+    assert record.variants.bbox.reviewed is True
+    assert record.variants.bbox.review_status == "accepted_via_raw_face_review"
     assert record.variants.bbox.image_path is not None
     assert review.bbox_calls == 0
     assert backend.calls == []
@@ -3942,7 +3962,7 @@ def test_legacy_face_eligibility_does_not_change_headwear_completion(
     )
     artifact, review, backend, judge = _run_two_candidate_routing_case(
         tmp_path,
-        raw_kinds=("accepted_complete", "accepted_complete"),
+        raw_kinds=("accepted_repair", "accepted_repair"),
         completion_accepts=(True,),
         attribute_type="headwear",
         completion_eligible_types=("face", "headwear"),
@@ -3964,7 +3984,7 @@ def test_candidate2_completion_is_tried_after_candidate1_qwen_reject(
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
         tmp_path,
-        raw_kinds=("accepted_complete", "accepted_complete"),
+        raw_kinds=("accepted_repair", "accepted_repair"),
         completion_accepts=(False, True),
     )
 
@@ -3981,21 +4001,23 @@ def test_candidate2_completion_is_tried_after_candidate1_qwen_reject(
     assert artifact.metrics.attribute_completion_candidate2_accepted == 1
 
 
-def test_two_completion_rejects_fall_back_to_highest_ranked_accepted_alpha(
+def test_two_incomplete_completion_rejects_do_not_fallback_to_raw(
     tmp_path: Path,
 ) -> None:
     artifact, review, backend, _ = _run_two_candidate_routing_case(
         tmp_path,
-        raw_kinds=("accepted_complete", "accepted_complete"),
+        raw_kinds=("accepted_repair", "accepted_repair"),
         completion_accepts=(False, False),
     )
 
     record = artifact.records[0]
-    assert record.final_selection == "raw"
-    assert record.owner_candidate_id == "candidate_1"
+    assert record.status == "rejected"
+    assert record.final_selection is None
+    assert record.owner_candidate_id == "candidate_2"
     assert review.bbox_calls == 0
     assert backend.calls == ["candidate_1", "candidate_2"]
-    assert artifact.metrics.completion_fallback_to_raw == 1
+    assert artifact.metrics.completion_fallback_to_raw == 0
+    assert artifact.metrics.completion_rejected == 1
     assert artifact.metrics.attribute_bbox_fallback_attempts == 0
 
 
@@ -4004,7 +4026,7 @@ def test_wrong_semantic_candidate1_skips_boogu_and_candidate2_can_complete(
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
         tmp_path,
-        raw_kinds=("wrong_semantic", "accepted_complete"),
+        raw_kinds=("wrong_semantic", "accepted_repair"),
         completion_accepts=(True,),
     )
 
@@ -4021,7 +4043,7 @@ def test_insufficient_candidate1_skips_boogu_and_candidate2_can_complete(
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
         tmp_path,
-        raw_kinds=("insufficient_evidence", "accepted_complete"),
+        raw_kinds=("insufficient_evidence", "accepted_repair"),
         completion_accepts=(True,),
     )
 
@@ -4033,7 +4055,7 @@ def test_insufficient_candidate1_skips_boogu_and_candidate2_can_complete(
     assert judge.calls == 1
 
 
-def test_two_insufficient_candidates_skip_boogu_and_use_bbox_last_resort(
+def test_two_insufficient_candidates_reject_without_boogu_or_bbox(
     tmp_path: Path,
 ) -> None:
     artifact, review, backend, judge = _run_two_candidate_routing_case(
@@ -4043,13 +4065,14 @@ def test_two_insufficient_candidates_skip_boogu_and_use_bbox_last_resort(
     )
 
     record = artifact.records[0]
-    assert record.final_selection == "bbox"
+    assert record.status == "rejected"
+    assert record.final_selection is None
     assert review.candidate_calls == [["candidate_1"], ["candidate_2"]]
-    assert review.bbox_calls == 1
+    assert review.bbox_calls == 0
     assert backend.calls == []
     assert judge.calls == 0
-    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
-    assert artifact.metrics.attribute_bbox_fallback_accepted == 1
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 0
 
 
 def test_noncompletion_type_uses_candidate2_without_boogu(
@@ -4071,27 +4094,26 @@ def test_noncompletion_type_uses_candidate2_without_boogu(
     assert judge.calls == 0
 
 
-def test_bbox_is_reviewed_only_after_both_candidates_lack_accepted_alpha(
+def test_rejected_raw_candidates_do_not_reach_completion_or_bbox(
     tmp_path: Path,
 ) -> None:
     artifact, review, backend, _ = _run_two_candidate_routing_case(
         tmp_path,
         raw_kinds=("unusable_repair", "unusable_repair"),
-        completion_accepts=(False, False),
         bbox_accepts=True,
     )
 
     record = artifact.records[0]
-    assert record.final_selection == "bbox"
-    assert record.default_variant == "bbox"
-    assert record.accepted_base_image_path is None
-    assert review.bbox_calls == 1
-    assert backend.calls == ["candidate_1", "candidate_2"]
-    assert artifact.metrics.attribute_bbox_fallback_attempts == 1
-    assert artifact.metrics.attribute_bbox_fallback_accepted == 1
+    assert record.status == "rejected"
+    assert record.final_selection is None
+    assert review.bbox_calls == 0
+    assert backend.calls == []
+    assert artifact.metrics.completion_attempts == 0
+    assert artifact.metrics.attribute_bbox_fallback_attempts == 0
+    assert artifact.metrics.attribute_bbox_fallback_accepted == 0
 
 
-def test_raw_accepted_complete_still_compares_boogu(tmp_path: Path) -> None:
+def test_raw_accepted_complete_is_published_without_boogu(tmp_path: Path) -> None:
     artifact, review, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="accepted_complete",
@@ -4099,10 +4121,10 @@ def test_raw_accepted_complete_still_compares_boogu(tmp_path: Path) -> None:
 
     record = artifact.records[0]
     assert record.status == "accepted"
-    assert record.final_selection == "completed"
-    assert record.completion_attempted is True
-    assert backend.calls == 1
-    assert segmenter.generated_calls == 1
+    assert record.final_selection == "raw"
+    assert record.completion_attempted is False
+    assert backend.calls == 0
+    assert segmenter.generated_calls == 0
     assert backend.background_calls == 0
     assert review.calls == [["a1"]]
 
@@ -4196,7 +4218,7 @@ def test_fresh_attribute_never_calls_background_backend(
         "identity_reject",
     ],
 )
-def test_raw_accepted_repair_failures_fallback_to_raw(
+def test_raw_accepted_but_incomplete_completion_failures_reject(
     tmp_path: Path,
     failure_stage: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -4209,11 +4231,12 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
     )
 
     record = artifact.records[0]
-    assert record.status == "accepted"
-    assert record.final_selection == "raw"
+    assert record.status == "rejected"
+    assert record.final_selection is None
     assert record.completion_attempted is True
     assert record.completion_seed == 2718
-    assert artifact.metrics.completion_fallback_to_raw == 1
+    assert artifact.metrics.completion_fallback_to_raw == 0
+    assert artifact.metrics.completion_rejected == 1
     assert artifact.metrics.completion_selected_completed == 0
     assert artifact.metrics.completion_review_calls == int(
         failure_stage == "identity_reject"
@@ -4227,9 +4250,7 @@ def test_raw_accepted_repair_failures_fallback_to_raw(
         if failure_stage == "identity_reject"
         else None
     )
-    assert record.image_path is not None
-    with Image.open(tmp_path / "output" / record.image_path) as published:
-        assert published.mode == "RGBA"
+    assert record.image_path is None
 
 
 def test_raw_accepted_repair_success_selects_completed(
@@ -4293,42 +4314,29 @@ def test_raw_review_is_owner_batched_without_repaired_review(tmp_path: Path) -> 
     assert segmenter.generated_calls == 2
 
 
-@pytest.mark.parametrize(
-    ("completion_stage", "expected_status"),
-    [
-        ("success", "accepted"),
-        ("identity_reject", "rejected"),
-        ("backend_failure", "rejected"),
-    ],
-)
-def test_raw_unusable_repair_is_completed_or_rejected_fail_closed(
+@pytest.mark.parametrize("completion_stage", ["success", "identity_reject", "backend_failure"])
+def test_rejected_raw_review_never_reaches_completion(
     tmp_path: Path,
     completion_stage: str,
-    expected_status: str,
 ) -> None:
-    artifact, _, _, _ = _run_completion_routing_case(
+    artifact, _, backend, segmenter = _run_completion_routing_case(
         tmp_path,
         raw_kind="unusable_repair",
         completion_stage=completion_stage,
     )
 
     record = artifact.records[0]
-    assert record.status == expected_status
-    assert artifact.metrics.completion_raw_unusable_attempts == 1
-    assert artifact.metrics.completion_review_calls == int(
-        completion_stage != "backend_failure"
-    )
-    if expected_status == "accepted":
-        assert record.final_selection == "completed"
-        assert record.completion_review == _completion_review(accepted=True)
-    else:
-        assert record.image_path is None
-        assert artifact.metrics.completion_rejected == 1
-        if completion_stage == "identity_reject":
-            assert record.completion_review == _completion_review(accepted=False)
+    assert record.status == "rejected"
+    assert record.image_path is None
+    assert record.completion_attempted is False
+    assert artifact.metrics.completion_attempts == 0
+    assert artifact.metrics.completion_raw_unusable_attempts == 0
+    assert artifact.metrics.completion_review_calls == 0
+    assert backend.calls == 0
+    assert segmenter.generated_calls == 0
 
 
-def test_completion_quality_reject_falls_back_to_accepted_raw(
+def test_incomplete_raw_completion_quality_reject_does_not_fallback(
     tmp_path: Path,
 ) -> None:
     artifact, review, _, _ = _run_completion_routing_case(
@@ -4338,32 +4346,52 @@ def test_completion_quality_reject_falls_back_to_accepted_raw(
     )
 
     record = artifact.records[0]
-    assert record.status == "accepted"
-    assert record.final_selection == "raw"
-    assert record.completion_outcome is not None
-    assert record.completion_outcome.startswith("completion_postcheck:")
-    assert artifact.metrics.completion_postcheck_rejects == 1
-    assert artifact.metrics.completion_fallback_to_raw == 1
-    assert review.calls == [["a1"]]
-
-
-def test_completion_quality_reject_without_usable_raw_stays_rejected(
-    tmp_path: Path,
-) -> None:
-    artifact, review, _, _ = _run_completion_routing_case(
-        tmp_path,
-        raw_kind="unusable_repair",
-        completion_stage="quality_reject",
-    )
-
-    record = artifact.records[0]
     assert record.status == "rejected"
+    assert record.final_selection is None
     assert record.completion_outcome is not None
     assert record.completion_outcome.startswith("completion_postcheck:")
     assert artifact.metrics.completion_postcheck_rejects == 1
     assert artifact.metrics.completion_fallback_to_raw == 0
     assert artifact.metrics.completion_rejected == 1
     assert review.calls == [["a1"]]
+
+
+def test_raw_precheck_rejects_before_review_or_completion(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_repair",
+        minimum_sharpness_score=1e9,
+    )
+
+    record = artifact.records[0]
+    assert record.status == "rejected"
+    assert record.reason == "completion_precheck:too_blurry"
+    assert record.completion_attempted is False
+    assert artifact.metrics.completion_attempts == 0
+    assert artifact.metrics.completion_fallback_to_raw == 0
+    assert review.calls == []
+    assert backend.calls == 0
+    assert segmenter.generated_calls == 0
+
+
+def test_face_bypasses_completion_raw_quality_precheck(
+    tmp_path: Path,
+) -> None:
+    artifact, review, backend, segmenter = _run_completion_routing_case(
+        tmp_path,
+        raw_kind="accepted_complete",
+        first_attribute_type="face",
+        minimum_sharpness_score=1e9,
+    )
+
+    record = artifact.records[0]
+    assert record.status == "accepted"
+    assert record.final_selection == "bbox"
+    assert review.calls == [["a1"]]
+    assert backend.calls == 0
+    assert segmenter.generated_calls == 0
 
 
 @pytest.mark.parametrize(
