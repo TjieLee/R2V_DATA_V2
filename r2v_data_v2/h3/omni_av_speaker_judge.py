@@ -811,6 +811,9 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
     comparison: Comparison | None = None
     proposed_entity_id: str | None = None
     proposed_non_entity_class: Literal["offscreen", "other_visible"] | None = None
+    multiple_speakers_confirmed: bool = False
+    subject_entity_binding_excluded: bool = False
+    identity_specific_voice_products_excluded: bool = False
     source_provenance: OmniAVSpeakerSourceProvenance
     media_provenance: OmniAVSpeakerMediaProvenance | None = None
     backend_provenance: OmniAVSpeakerBackendProvenance
@@ -847,6 +850,26 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
             and self.effective_absolute_segment_end > self.absolute_segment_end
         ):
             raise ValueError("effective speaker segment end exceeds source segment")
+        confirmed_multiple_speakers = (
+            self.status == "succeeded"
+            and self.stable_observation
+            and self.pass1_decision == "multiple_speakers"
+            and self.pass2_decision == "multiple_speakers"
+        )
+        if self.multiple_speakers_confirmed != confirmed_multiple_speakers:
+            raise ValueError("speaker judge multiple-speaker provenance is inconsistent")
+        if (
+            self.subject_entity_binding_excluded
+            != self.multiple_speakers_confirmed
+            or self.identity_specific_voice_products_excluded
+            != self.multiple_speakers_confirmed
+        ):
+            raise ValueError("multiple-speaker identity exclusions are inconsistent")
+        if self.multiple_speakers_confirmed and (
+            self.proposed_entity_id is not None
+            or self.proposed_non_entity_class is not None
+        ):
+            raise ValueError("multiple-speaker observation cannot propose an identity")
         return self
 
 
@@ -1389,6 +1412,14 @@ def run_omni_av_speaker_judge_pilot(
                 comparison = None
                 proposed_entity = None
                 proposed_non_entity = None
+            confirmed_multiple_speakers = (
+                failure is None
+                and stable
+                and pass1 is not None
+                and pass1.observation.decision == "multiple_speakers"
+                and pass2 is not None
+                and pass2.observation.decision == "multiple_speakers"
+            )
             record = OmniAVSpeakerPilotRecord(
                 status="failed" if failure is not None else "succeeded",
                 clip_uid=source.manifest.clip_uid,
@@ -1442,6 +1473,11 @@ def run_omni_av_speaker_judge_pilot(
                 comparison=comparison,
                 proposed_entity_id=proposed_entity,
                 proposed_non_entity_class=proposed_non_entity,
+                multiple_speakers_confirmed=confirmed_multiple_speakers,
+                subject_entity_binding_excluded=confirmed_multiple_speakers,
+                identity_specific_voice_products_excluded=(
+                    confirmed_multiple_speakers
+                ),
                 source_provenance=source_provenance,
                 media_provenance=media_provenance,
                 backend_provenance=backend.provenance,

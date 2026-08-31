@@ -29,6 +29,7 @@ from r2v_data_v2.h3.omni_av_speaker_judge import (
     OmniAVSpeakerJudgeRequest,
     OmniAVSpeakerJudgeResult,
     OmniAVSpeakerObservation,
+    OmniAVSpeakerPilotRecord,
     OpenAIOmniAVSpeakerJudge,
     build_neutral_face_timeline,
     run_omni_av_speaker_judge_pilot,
@@ -573,6 +574,9 @@ def test_read_only_pilot_runs_blind_two_pass_policy_and_preserves_sources(
     ]
     assert records[0]["comparison"] == "agree"
     assert not records[0]["pass2_called"]
+    assert not records[0]["multiple_speakers_confirmed"]
+    assert not records[0]["subject_entity_binding_excluded"]
+    assert not records[0]["identity_specific_voice_products_excluded"]
     assert records[1]["comparison"] == "disagree"
     assert records[1]["stable_observation"]
     assert records[1]["proposed_entity_id"] == "e1"
@@ -704,6 +708,43 @@ def test_e3_speech_followed_by_e1_e2_interjections_never_proposes_dominant_entit
         assert record["stable_observation"]
         assert record["proposed_entity_id"] is None
         assert record["proposed_non_entity_class"] is None
+        assert record["multiple_speakers_confirmed"]
+        assert record["subject_entity_binding_excluded"]
+        assert record["identity_specific_voice_products_excluded"]
+
+
+def test_confirmed_multiple_speakers_cannot_publish_identity_products(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0002"])
+    backend = _FakeBackend(
+        [
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+        ]
+    )
+    run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=_FakeMedia(),
+    )
+    record = _records(root / "pilot/records.jsonl")[0]
+
+    for field in (
+        "subject_entity_binding_excluded",
+        "identity_specific_voice_products_excluded",
+    ):
+        invalid = {**record, field: False}
+        with pytest.raises(ValueError, match="identity exclusions are inconsistent"):
+            OmniAVSpeakerPilotRecord.model_validate(invalid)
+    with pytest.raises(ValueError, match="cannot propose an identity"):
+        OmniAVSpeakerPilotRecord.model_validate(
+            {**record, "proposed_entity_id": "e2"}
+        )
 
 
 def test_multiple_speakers_passes_must_agree_to_be_stable(tmp_path: Path) -> None:
@@ -731,6 +772,9 @@ def test_multiple_speakers_passes_must_agree_to_be_stable(tmp_path: Path) -> Non
     assert record["comparison"] == "unresolved"
     assert not record["stable_observation"]
     assert record["proposed_entity_id"] is None
+    assert not record["multiple_speakers_confirmed"]
+    assert not record["subject_entity_binding_excluded"]
+    assert not record["identity_specific_voice_products_excluded"]
 
 
 @pytest.mark.parametrize("overflow", [0.028118, 0.0366825, 0.0423195])

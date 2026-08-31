@@ -16,11 +16,24 @@ target interval relative to the window, and visible mapped entity IDs. Human QA
 labels may be retained in the pilot manifest but are never included in a model
 request.
 
-Pass 1 is blind to the draft. A separately versioned blind Pass 2 runs only when
-a mapped draft disagrees with Pass 1, or when an unresolved draft receives a
-concrete visible-entity or offscreen observation. Agreement between two passes
-is published as stable diagnostic evidence; disagreement remains unresolved.
-No observation is applied to production data.
+Pass 1 is blind to the draft. A separately versioned blind Pass 2 runs when a
+mapped draft disagrees with Pass 1, when an unresolved draft receives a concrete
+visible-entity or offscreen observation, or whenever Pass 1 reports
+`multiple_speakers`. Agreement between two passes is published as stable
+diagnostic evidence; disagreement remains unresolved. No observation is applied
+to production data.
+
+`multiple_speakers` means at least two distinct speakers produce audible speech
+inside the marked interval, including brief interjections. A confirmed result
+requires both blind passes to agree. The segment remains an audio/speech
+observation, but the record permanently publishes
+`subject_entity_binding_excluded=true` and
+`identity_specific_voice_products_excluded=true`. It cannot publish a proposed
+entity or non-entity class, cannot correct a subject/entity binding, and cannot
+source a primary voice reference, speaker embedding, identity pair, or any other
+identity-specific voice-reference product. The current pilot has no production
+consumer; any future consumer must fail closed on these exclusion fields rather
+than selecting a dominant speaker.
 
 ## Manifest
 
