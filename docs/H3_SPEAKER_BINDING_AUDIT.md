@@ -7,10 +7,10 @@ thresholds, ASR records, or final H3 samples.
 The audit validates and reads the existing production Audio and DiariZen
 artifacts, then publishes:
 
-- `production/binding_audit_v1/summary.json`
-- `production/binding_audit_v1/clusters.jsonl`
-- `production/binding_audit_v1/segments.jsonl`
-- `production/binding_audit_v1/review_manifest.jsonl`
+- `binding_audit_v1/summary.json`
+- `binding_audit_v1/clusters.jsonl`
+- `binding_audit_v1/segments.jsonl`
+- `binding_audit_v1/review_manifest.jsonl`
 
 For each raw segment and cluster it measures overlap with every LR-ASD frame
 where exactly one backend-native active visible face exists. Both accepted
@@ -23,9 +23,13 @@ Run the audit after the production Audio and DiariZen stages:
 
 ```bash
 python tools/audit_h3_speaker_bindings.py \
-  --audio-run-root "$AUDIO_RUN_ROOT"
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
 ```
 
-The command makes zero model calls. Existing output is immutable by default;
-use `--overwrite` only to atomically replace this audit sidecar. Source
-production artifacts are never modified.
+`AUDIO_PRODUCTION_ROOT` is the active JEA root whose direct children include
+`audio/`, `diarization/`, and `h3/`; the tool does not add a second
+`production/` path component. The command makes zero model calls. Existing
+output is immutable by default; use `--overwrite` only to atomically replace
+this audit sidecar. Source production artifacts are never modified. Summary
+provenance includes aggregate hashes of every consumed Audio binding sidecar
+and LR-ASD native artifact.

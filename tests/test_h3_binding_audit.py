@@ -15,6 +15,7 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationEntitySupport,
     RawDiarizationSegment,
 )
+from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.pilot_schemas import (
     LRASDNativeArtifact,
     LRASDNativeSample,
@@ -230,16 +231,16 @@ def _write_jsonl(path: Path, rows: list[object]) -> None:
 
 
 def _fixture(root: Path) -> tuple[Path, dict[str, bytes]]:
-    production = root / "production"
-    audio = production / "audio"
-    diarization = production / "diarization"
+    audio = root / "audio"
+    diarization = root / "diarization"
     (audio / "clips" / "clip-a").mkdir(parents=True)
     (audio / "runtime" / "clip-a" / "lr_asd").mkdir(parents=True)
     diarization.mkdir(parents=True)
 
     raw = [
         _raw("speaker_0", "segment_0001", 0, 1),
-        _raw("speaker_1", "segment_0002", 1, 2),
+        _raw("speaker_1", "segment_0002", 1, 1.5),
+        _raw("speaker_1", "segment_0009", 1.5, 2),
         _raw("speaker_2", "segment_0003", 2, 3),
         _raw("speaker_3", "segment_0004", 3, 3.2),
         _raw("speaker_3", "segment_0005", 3.2, 4),
@@ -304,13 +305,14 @@ def _fixture(root: Path) -> tuple[Path, dict[str, bytes]]:
     ]
     bound = [
         _bound(raw[0], status="candidate_mapped", entity_id="e1", direct=0.4),
-        _bound(raw[1], status="ambiguous", entity_id=None, direct=0.4),
-        _bound(raw[2], status="candidate_mapped", entity_id="e1", direct=0.2),
+        _bound(raw[1], status="ambiguous", entity_id=None, direct=0.2),
+        _bound(raw[2], status="ambiguous", entity_id=None, direct=0.2),
         _bound(raw[3], status="candidate_mapped", entity_id="e1", direct=0.2),
-        _bound(raw[4], status="candidate_mapped", entity_id="e1", direct=0),
-        _bound(raw[5], status="candidate_mapped", entity_id="e1", direct=0.04),
-        _bound(raw[6], status="conflict", entity_id=None, direct=0.2),
-        _bound(raw[7], status="unbound", entity_id=None, direct=0),
+        _bound(raw[4], status="candidate_mapped", entity_id="e1", direct=0.2),
+        _bound(raw[5], status="candidate_mapped", entity_id="e1", direct=0),
+        _bound(raw[6], status="candidate_mapped", entity_id="e1", direct=0.04),
+        _bound(raw[7], status="conflict", entity_id=None, direct=0.2),
+        _bound(raw[8], status="unbound", entity_id=None, direct=0),
     ]
     bindings = [
         _binding(0, 0.4, "e1", "face_1"),
@@ -421,9 +423,13 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
 ) -> None:
     root, source_bytes = _fixture(tmp_path / "audio-run")
 
-    summary = run_speaker_binding_audit(audio_run_root=root)
+    summary = run_speaker_binding_audit(audio_production_root=root)
 
-    output = root / "production" / "binding_audit_v1"
+    output = root / "binding_audit_v1"
+    paths = jea_production_paths(root)
+    assert paths.audio == root / "audio"
+    assert paths.diarization == root / "diarization"
+    assert not (root / "production").exists()
     clusters = {
         row["speaker_cluster_id"]: row for row in _rows(output / "clusters.jsonl")
     }
@@ -442,6 +448,7 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
     contradiction = clusters["speaker_1"]
     assert contradiction["flags"]["multiple_exclusive_active_face_tracks"]
     assert contradiction["flags"]["exclusive_active_entity_contradiction"]
+    assert contradiction["flags"]["multiple_direct_entity_support"]
     assert {item["entity_id"] for item in contradiction["exclusive_active_entities"]} == {
         "e1",
         "e2",
@@ -453,9 +460,17 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
 
     propagated = clusters["speaker_3"]
     assert propagated["fully_propagated_seconds"] == pytest.approx(0.8)
-    assert propagated["flags"]["cluster_propagated_only"]
+    assert propagated["flags"]["has_fully_propagated_segments"]
     assert segments["segment_0005"]["flags"]["fully_propagated_segment"]
     assert segments["segment_0005"]["direct_anchor_seconds"] == 0
+    assert not segments["segment_0002"]["flags"]["multiple_direct_entity_support"]
+    assert not segments["segment_0009"]["flags"]["multiple_direct_entity_support"]
+    assert segments["segment_0002"]["direct_support_seconds_by_entity"] == {
+        "e1": pytest.approx(0.2)
+    }
+    assert segments["segment_0009"]["direct_support_seconds_by_entity"] == {
+        "e2": pytest.approx(0.2)
+    }
 
     tiny = clusters["speaker_4"]
     assert tiny["current_mapping_status"] == "candidate_mapped"
@@ -466,14 +481,37 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
 
     assert clusters["speaker_5"]["current_mapping_status"] == "conflict"
     assert clusters["speaker_5"]["flags"]["contested_anchor"]
+    assert not segments["segment_0007"]["flags"]["contested_anchor"]
+    assert segments["segment_0007"]["contested_anchor_seconds"] == 0
     assert clusters["speaker_6"]["current_mapping_status"] == "unbound"
     assert summary.model_call_count == 0
     assert summary.bindings_modified_count == 0
     assert summary.cluster_count == 7
-    assert summary.segment_count == 8
+    assert summary.segment_count == 9
     assert summary.clusters_with_exclusive_active_entity_contradiction == 1
     assert summary.clusters_with_mapped_entity_vs_unmatched_face == 1
     assert summary.clusters_with_fully_propagated_segments == 1
+    assert len(summary.audio_binding_input_set_sha256) == 64
+    assert len(summary.lr_asd_native_input_set_sha256) == 64
+    assert "cluster_propagated_only" not in summary.review_priority_counts
+    sidecar_path = root / "audio" / "clips" / "clip-a" / "audio_binding.json"
+    native_path = (
+        root / "audio" / "runtime" / "clip-a" / "lr_asd" / "lr_asd_native.json"
+    )
+    assert summary.audio_binding_input_set_sha256 == hashlib.sha256(
+        json.dumps(
+            [{"clip_uid": "clip-a", "artifact_sha256": _sha256(sidecar_path)}],
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    assert summary.lr_asd_native_input_set_sha256 == hashlib.sha256(
+        json.dumps(
+            [{"clip_uid": "clip-a", "artifact_sha256": _sha256(native_path)}],
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
 
     for path, before in source_bytes.items():
         assert Path(path).read_bytes() == before
@@ -483,8 +521,8 @@ def test_binding_audit_review_order_is_deterministic_and_non_gating(
     tmp_path: Path,
 ) -> None:
     root, _ = _fixture(tmp_path / "audio-run")
-    run_speaker_binding_audit(audio_run_root=root)
-    output = root / "production" / "binding_audit_v1"
+    run_speaker_binding_audit(audio_production_root=root)
+    output = root / "binding_audit_v1"
 
     review = _rows(output / "review_manifest.jsonl")
 
@@ -509,20 +547,20 @@ def test_binding_audit_cli_prints_summary_and_requires_explicit_overwrite(
 ) -> None:
     root, _ = _fixture(tmp_path / "audio-run")
 
-    result = audit_cli.main(["--audio-run-root", str(root)])
+    result = audit_cli.main(["--audio-production-root", str(root)])
 
     assert result["model_call_count"] == 0
     assert json.loads(capsys.readouterr().out)["cluster_count"] == 7
     with pytest.raises(FileExistsError, match="already exists"):
-        audit_cli.main(["--audio-run-root", str(root)])
-    audit_cli.main(["--audio-run-root", str(root), "--overwrite"])
+        audit_cli.main(["--audio-production-root", str(root)])
+    audit_cli.main(["--audio-production-root", str(root), "--overwrite"])
 
 
 def test_binding_audit_fails_closed_on_cross_artifact_identity_drift(
     tmp_path: Path,
 ) -> None:
     root, _ = _fixture(tmp_path / "audio-run")
-    bound_path = root / "production" / "diarization" / "bound_segments.jsonl"
+    bound_path = root / "diarization" / "bound_segments.jsonl"
     rows = _rows(bound_path)
     rows.pop()
     bound_path.write_text(
@@ -531,4 +569,4 @@ def test_binding_audit_fails_closed_on_cross_artifact_identity_drift(
     )
 
     with pytest.raises(ValueError, match="raw and bound segment identities differ"):
-        run_speaker_binding_audit(audio_run_root=root)
+        run_speaker_binding_audit(audio_production_root=root)
