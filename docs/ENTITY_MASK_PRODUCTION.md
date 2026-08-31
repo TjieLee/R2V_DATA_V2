@@ -37,6 +37,15 @@ central Qwen candidate judge configuration.
 
 ## Execution
 
+The external operator entry remains:
+
+```bash
+bash stage_entity_mask_run_v2.sh
+```
+
+That shell initializes the environment and invokes the same zero-argument
+Python launcher shown below.
+
 Use the same shell environment as Stage1:
 
 ```bash
@@ -87,12 +96,44 @@ binary-mask RLE:            vectorized NumPy implementation
 logical output shard rows:  10000
 ```
 
-Workers use shared-filesystem dynamic chunk claiming and nonblocking locks.
-All nodes point to the same input and output roots; `RANK` only rotates scan
-order and does not change durable chunk identity. Rerunning the same zero-arg
-command validates and skips completed shards, resumes partial execution chunks,
-and can reclaim work after a dead process releases its lock. It never reruns
-Stage1 annotation or durable-complete Stage2 work.
+Entity Mask production no longer uses dynamic cross-node chunk claiming or
+work stealing. That older `--claim-loop` scheduler remains available for other
+Stage2 uses but is deprecated for this production output.
+
+At startup, the launcher sorts completed Stage1 logical shards and computes:
+
+```text
+global_worker_count = WORLD_SIZE * visible_local_gpu_count
+global_worker_id    = RANK * visible_local_gpu_count + local_gpu_slot
+```
+
+It then applies a deterministic contiguous balanced split. Every complete
+10,000-row logical shard belongs to exactly one global GPU worker. Each worker
+loads one persistent SAM3 backend and sequentially processes its fixed shard
+range. The existing 100-row durable execution chunks, per-clip checkpoints,
+resume behavior, and canonical 10,000-row compaction remain unchanged inside
+each owned shard.
+
+Every node must expose the same number of GPUs. Rank 0 initializes the existing
+execution/session markers plus the static topology marker; other ranks wait up
+to 120 seconds and validate the same `WORLD_SIZE`, local GPU count, and ordered
+shard list. A mismatch fails closed instead of producing overlapping or missing
+assignments.
+
+Rerunning with the same topology assigns the same shard ranges, validates and
+skips completed canonical shards, and resumes valid partial chunks/checkpoints.
+There is intentionally no automatic shard stealing if a node is absent. It
+never reruns Stage1 annotation or durable-complete Stage2 work, and it never
+deletes or repairs artifacts from an earlier failed run.
+
+Use the lightweight scheduling preflight without loading SAM3, scanning
+annotation rows, or inventorying artifacts:
+
+```bash
+/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python \
+  /mnt/workspace/litengjie/data/R2V_DATA_V2/tools/run_v3_entity_mask_auto.py \
+  --dry-run
+```
 
 Durable Stage2 state remains under `entity_mask/parts`, `artifacts`,
 `_internal`, `locks`, and `failures`. Do not restore Python per-pixel RLE,

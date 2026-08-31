@@ -2236,6 +2236,38 @@ def test_execution_chunk_size_identity_and_legacy_partial_fail_closed(
         ensure_execution_identity(legacy_root, chunk_rows=100)
 
 
+def test_static_process_shard_uses_prevalidated_execution_identity_without_ensure_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    shard_path = _write_shard(
+        fixture,
+        [_row(fixture, index, status="failed") for index in range(3)],
+    )
+    ensure_execution_identity(fixture.output_root, chunk_rows=1)
+    monkeypatch.setattr(
+        production,
+        "_ensure_execution_identity",
+        lambda *args, **kwargs: pytest.fail(
+            "static shard processing must not acquire execution identity lock"
+        ),
+    )
+
+    result = process_shard(
+        shard_path,
+        output_root=fixture.output_root,
+        config_identity=fixture.identity,
+        backend=None,
+        acquire_lock=False,
+        execution_identity_prevalidated=True,
+        chunk_rows=1,
+    )
+
+    assert result["rows"] == 3
+    assert (fixture.output_root / "parts" / shard_path.name).is_file()
+
+
 def test_chunk_compaction_is_canonical_and_incomplete_chunks_do_not_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2634,16 +2666,22 @@ def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
         debug=replace(fixture.config.debug, save_diagnostics=False),
     )
     identity = replace(fixture.identity, path=private_config, config=config)
-    captured: dict[str, object] = {}
+    shard_paths = [
+        fixture.input_root
+        / "parts"
+        / f"shard-{index * 10_000:09d}-{index * 10_000 + 9_999:09d}.jsonl"
+        for index in range(16)
+    ]
+    launched: list[dict[str, object]] = []
+    startup: list[dict[str, object]] = []
 
-    def run_auto(
-        arguments: list[str],
-        *,
-        worker_log_root: Path | None = None,
-    ) -> dict[str, object]:
-        captured["arguments"] = arguments
-        captured["worker_log_root"] = worker_log_root
-        return {"rank": 3, "world_size": 4}
+    class Process:
+        def wait(self) -> int:
+            return 0
+
+    def popen(command: list[str], **kwargs: object) -> Process:
+        launched.append({"command": command, **kwargs})
+        return Process()
 
     monkeypatch.setattr(
         production,
@@ -2660,28 +2698,52 @@ def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
         service.model,
     )
     monkeypatch.setattr(entity_mask_tool, "load_config_identity", lambda path: identity)
-    monkeypatch.setattr(entity_mask_tool, "run_pre_qwen_auto", run_auto)
+    monkeypatch.setattr(entity_mask_tool, "parse_gpus", lambda value: ["5", "7"])
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "enumerate_annotation_shards",
+        lambda root: shard_paths,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "check_stage2_candidate_judge_health",
+        lambda current: {"candidate_judge_health": "available"},
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "coordinate_startup_identity",
+        lambda **kwargs: startup.append(kwargs),
+    )
+    monkeypatch.setattr(entity_mask_tool.subprocess, "Popen", popen)
     monkeypatch.setenv("RANK", "3")
     monkeypatch.setenv("WORLD_SIZE", "4")
 
     result = entity_mask_tool.main([])
 
-    arguments = captured["arguments"]
-    assert isinstance(arguments, list)
-    assert arguments[arguments.index("--input-root") + 1] == str(fixture.input_root)
-    assert arguments[arguments.index("--output-root") + 1] == str(entity_mask_root)
-    assert arguments[arguments.index("--base-config") + 1] == str(private_config)
-    assert arguments[arguments.index("--chunk-rows") + 1] == "100"
-    assert arguments[arguments.index("--frame-prefetch-workers") + 1] == "0"
-    assert arguments[arguments.index("--sam3-session-reuse-mode") + 1] == (
-        "clip_reset_v1"
-    )
-    assert "--sam3-request-timing" not in arguments
-    assert "--gpus" not in arguments
-    assert "--rank" not in arguments
-    assert "--world-size" not in arguments
-    assert captured["worker_log_root"] == private_logs
-    assert result == {"rank": 3, "world_size": 4}
+    assert len(launched) == 2
+    assert len(startup) == 1
+    commands = [item["command"] for item in launched]
+    assert all("run_v3_entity_mask_worker.py" in command[1] for command in commands)
+    assert all("--claim-loop" not in command for command in commands)
+    assert all("--scan-offset" not in command for command in commands)
+    assert [command[command.index("--global-worker-id") + 1] for command in commands] == [
+        "6",
+        "7",
+    ]
+    assert [
+        (
+            command[command.index("--shard-start-position") + 1],
+            command[command.index("--shard-end-position") + 1],
+        )
+        for command in commands
+    ] == [("12", "14"), ("14", "16")]
+    assert [item["env"]["CUDA_VISIBLE_DEVICES"] for item in launched] == ["5", "7"]
+    assert result["rank"] == 3
+    assert result["world_size"] == 4
+    assert result["global_worker_count"] == 8
+    assert result["frame_prefetch_workers"] == 0
+    assert result["sam3_request_timing"] is False
+    assert result["worker_exit_codes"] == [0, 0]
 
 
 def test_entity_mask_wrapper_missing_private_config_fails_closed(
@@ -2693,6 +2755,124 @@ def test_entity_mask_wrapper_missing_private_config_fails_closed(
 
     with pytest.raises(FileNotFoundError, match=str(missing)):
         entity_mask_tool.main([])
+
+
+def test_entity_mask_dry_run_only_builds_lightweight_static_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    shards = [
+        Path(f"shard-{index * 10_000:09d}-{index * 10_000 + 9_999:09d}.jsonl")
+        for index in range(384)
+    ]
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_OUTPUT_ROOT", entity_mask_root)
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "PRODUCTION_BASE_CONFIG",
+        fixture.base_path,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "load_config_identity",
+        lambda path: fixture.identity,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "validate_entity_mask_production_config",
+        lambda config: None,
+    )
+    monkeypatch.setattr(entity_mask_tool, "parse_gpus", lambda value: [str(i) for i in range(8)])
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "enumerate_annotation_shards",
+        lambda root: shards,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: pytest.fail("dry-run must not check Qwen health"),
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "coordinate_startup_identity",
+        lambda **kwargs: pytest.fail("dry-run must not write startup identity"),
+    )
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("dry-run must not launch workers"),
+    )
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+
+    result = entity_mask_tool.main(["--dry-run"])
+
+    assert result["stage1_completed_shards"] == 384
+    assert result["global_worker_count"] == 8
+    assert [worker["shard_count"] for worker in result["workers"]] == [48] * 8
+
+
+def test_entity_mask_wrapper_exits_cleanly_when_no_shards_exist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_OUTPUT_ROOT", entity_mask_root)
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "PRODUCTION_BASE_CONFIG",
+        fixture.base_path,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "load_config_identity",
+        lambda path: fixture.identity,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "validate_entity_mask_production_config",
+        lambda config: None,
+    )
+    monkeypatch.setattr(entity_mask_tool, "parse_gpus", lambda value: ["0", "1"])
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "enumerate_annotation_shards",
+        lambda root: [],
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: pytest.fail("zero-shard run must not check Qwen health"),
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "coordinate_startup_identity",
+        lambda **kwargs: pytest.fail("zero-shard run must not write identity"),
+    )
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("zero-shard run must not launch workers"),
+    )
+
+    result = entity_mask_tool.main([])
+
+    assert result["stage1_completed_shards"] == 0
+    assert result["nothing_to_do"] is True
+    assert result["worker_exit_codes"] == []
 
 
 def test_entity_mask_wrapper_rejects_non_production_visual_config(

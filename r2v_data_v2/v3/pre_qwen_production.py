@@ -1048,6 +1048,50 @@ def ensure_execution_identity(
     )
 
 
+def validate_execution_identity(
+    output_root: str | Path,
+    *,
+    chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
+) -> Path:
+    root = _safe_output_root(output_root)
+    return _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
+
+
+def _validate_sam3_session_reuse_marker(
+    marker: Path,
+    *,
+    mode: Sam3SessionReuseMode,
+) -> Path:
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError("SAM3 session reuse marker must contain an object")
+    if value.get("schema_version") != 1:
+        raise ValueError("SAM3 session reuse marker schema mismatch")
+    marker_mode = value.get("mode")
+    if marker_mode != mode:
+        raise ValueError(
+            "Stage2 output root SAM3 session reuse mode mismatch: "
+            f"existing={marker_mode} requested={mode}"
+        )
+    return marker
+
+
+def validate_sam3_session_reuse_identity(
+    output_root: str | Path,
+    *,
+    mode: Sam3SessionReuseMode,
+) -> Path | None:
+    if mode not in {"off", "clip_reset_v1"}:
+        raise ValueError(f"unsupported SAM3 session reuse mode: {mode}")
+    root = _safe_output_root(output_root)
+    marker = root / "_internal" / "sam3-session-reuse.json"
+    if marker.is_file():
+        return _validate_sam3_session_reuse_marker(marker, mode=mode)
+    if mode == "off":
+        return None
+    raise FileNotFoundError(f"missing SAM3 session reuse marker: {marker}")
+
+
 def ensure_sam3_session_reuse_identity(
     output_root: str | Path,
     *,
@@ -1059,18 +1103,7 @@ def ensure_sam3_session_reuse_identity(
     marker = root / "_internal" / "sam3-session-reuse.json"
     with shard_lock(root / "locks" / "execution.lock", blocking=True):
         if marker.is_file():
-            value = json.loads(marker.read_text(encoding="utf-8"))
-            if not isinstance(value, dict):
-                raise TypeError("SAM3 session reuse marker must contain an object")
-            if value.get("schema_version") != 1:
-                raise ValueError("SAM3 session reuse marker schema mismatch")
-            marker_mode = value.get("mode")
-            if marker_mode != mode:
-                raise ValueError(
-                    "Stage2 output root SAM3 session reuse mode mismatch: "
-                    f"existing={marker_mode} requested={mode}"
-                )
-            return marker
+            return _validate_sam3_session_reuse_marker(marker, mode=mode)
         if mode == "off":
             return None
         artifacts_exist = (root / "artifacts").is_dir() and any(
@@ -1097,22 +1130,13 @@ def _ensure_execution_identity_locked(
     *,
     chunk_rows: int,
 ) -> Path:
-    if chunk_rows < 1:
-        raise ValueError("execution chunk_rows must be positive")
+    expected = _execution_identity_expected(chunk_rows=chunk_rows)
     path = _execution_identity_path(output_root)
-    expected = {
-        "schema_version": STAGE2_EXECUTION_SCHEMA_VERSION,
-        "execution_strategy": STAGE2_EXECUTION_STRATEGY,
-        "execution_chunk_rows": chunk_rows,
-    }
     if path.is_file():
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise TypeError("Stage2 execution identity must contain an object")
-        for key, expected_value in expected.items():
-            if value.get(key) != expected_value:
-                raise ValueError(f"Stage2 execution identity mismatch: {key}")
-        return path
+        return _validate_existing_execution_identity(
+            output_root,
+            chunk_rows=chunk_rows,
+        )
     legacy_partials = sorted((output_root / "parts").glob("shard-*.jsonl.partial"))
     if legacy_partials:
         raise ValueError(
@@ -1124,7 +1148,34 @@ def _ensure_execution_identity_locked(
     if chunk_files:
         raise ValueError("Stage2 chunk files exist without execution identity")
     write_json_atomic(path, {**expected, "created_at": _utc_now()})
+    return _validate_existing_execution_identity(
+        output_root,
+        chunk_rows=chunk_rows,
+    )
+
+
+def _execution_identity_expected(*, chunk_rows: int) -> dict[str, object]:
+    if chunk_rows < 1:
+        raise ValueError("execution chunk_rows must be positive")
+    return {
+        "schema_version": STAGE2_EXECUTION_SCHEMA_VERSION,
+        "execution_strategy": STAGE2_EXECUTION_STRATEGY,
+        "execution_chunk_rows": chunk_rows,
+    }
+
+
+def _validate_existing_execution_identity(
+    output_root: Path,
+    *,
+    chunk_rows: int,
+) -> Path:
+    path = _execution_identity_path(output_root)
+    if not path.is_file():
+        raise FileNotFoundError(f"missing Stage2 execution identity: {path}")
     value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError("Stage2 execution identity must contain an object")
+    expected = _execution_identity_expected(chunk_rows=chunk_rows)
     for key, expected_value in expected.items():
         if value.get(key) != expected_value:
             raise ValueError(f"Stage2 execution identity mismatch: {key}")
@@ -1867,12 +1918,16 @@ def process_execution_chunk(
     backend: SegmentationBackend | None,
     decoder: FrameDecoder | None = None,
     acquire_lock: bool = True,
+    execution_identity_prevalidated: bool = False,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
     _validate_live_config_identity(config_identity)
     root = _safe_output_root(output_root)
-    _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    if execution_identity_prevalidated:
+        _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
+    else:
+        _ensure_execution_identity(root, chunk_rows=chunk_rows)
     _ensure_meta(shard, output_root=root, config_identity=config_identity)
     final = execution_chunk_path(root, shard, chunk)
     partial = final.with_name(f"{final.name}.partial")
@@ -2019,9 +2074,13 @@ def compact_execution_chunks(
     config_identity: ConfigIdentity,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
     acquire_lock: bool = True,
+    execution_identity_prevalidated: bool = False,
 ) -> dict[str, object] | None:
     root = _safe_output_root(output_root)
-    _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    if execution_identity_prevalidated:
+        _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
+    else:
+        _ensure_execution_identity(root, chunk_rows=chunk_rows)
     _ensure_meta(shard, output_root=root, config_identity=config_identity)
     part = root / "parts" / shard.path.name
     if part.is_file():
@@ -2118,6 +2177,7 @@ def process_shard(
     backend: SegmentationBackend | None,
     decoder: FrameDecoder | None = None,
     acquire_lock: bool = True,
+    execution_identity_prevalidated: bool = False,
     chunk_rows: int = DEFAULT_STAGE2_EXECUTION_CHUNK_ROWS,
 ) -> dict[str, object]:
     validate_stage2_preflight(config_identity.config)
@@ -2125,7 +2185,9 @@ def process_shard(
     root = _safe_output_root(output_root)
     shard = load_annotation_shard(input_shard)
     part = root / "parts" / shard.path.name
-    if _execution_identity_path(root).is_file():
+    if execution_identity_prevalidated:
+        _validate_existing_execution_identity(root, chunk_rows=chunk_rows)
+    elif _execution_identity_path(root).is_file():
         _ensure_execution_identity(root, chunk_rows=chunk_rows)
     if part.is_file():
         _ensure_meta(shard, output_root=root, config_identity=config_identity)
@@ -2136,7 +2198,8 @@ def process_shard(
             config_identity=config_identity,
         )
         return {"path": str(part), "rows": len(completed), "skipped": True}
-    _ensure_execution_identity(root, chunk_rows=chunk_rows)
+    if not execution_identity_prevalidated:
+        _ensure_execution_identity(root, chunk_rows=chunk_rows)
     for chunk in build_execution_chunks(shard, chunk_rows=chunk_rows):
         result = process_execution_chunk(
             shard,
@@ -2146,6 +2209,7 @@ def process_shard(
             backend=backend,
             decoder=decoder,
             acquire_lock=acquire_lock,
+            execution_identity_prevalidated=execution_identity_prevalidated,
             chunk_rows=chunk_rows,
         )
         if result.get("retryable") is True:
@@ -2156,6 +2220,7 @@ def process_shard(
         config_identity=config_identity,
         chunk_rows=chunk_rows,
         acquire_lock=acquire_lock,
+        execution_identity_prevalidated=execution_identity_prevalidated,
     )
     if compacted is None:
         raise RuntimeError("Stage2 shard chunks completed without compaction readiness")
