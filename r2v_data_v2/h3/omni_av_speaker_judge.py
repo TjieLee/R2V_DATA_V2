@@ -25,6 +25,9 @@ from r2v_data_v2.h3.jea_audio_production import (
     CanonicalAudioClip,
     jea_production_paths,
 )
+from r2v_data_v2.h3.jea_target_audio_caption import (
+    AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS,
+)
 from r2v_data_v2.h3.pilot_schemas import LRASDNativeArtifact
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
@@ -775,10 +778,13 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
     speaker_cluster_id: str
     absolute_segment_start: float = Field(ge=0)
     absolute_segment_end: float = Field(gt=0)
-    window_start: float = Field(ge=0)
-    window_end: float = Field(gt=0)
-    target_start_in_window: float = Field(ge=0)
-    target_end_in_window: float = Field(gt=0)
+    target_boundary_clipped: bool = False
+    target_boundary_clip_seconds: float = Field(default=0, ge=0)
+    effective_absolute_segment_end: float | None = Field(default=None, gt=0)
+    window_start: float | None = Field(default=None, ge=0)
+    window_end: float | None = Field(default=None, gt=0)
+    target_start_in_window: float | None = Field(default=None, ge=0)
+    target_end_in_window: float | None = Field(default=None, gt=0)
     visible_candidate_entity_ids: list[str]
     draft_binding_status: DraftStatus
     draft_entity_id: str | None = None
@@ -811,10 +817,22 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
                 or self.media_provenance is None
                 or self.failure is not None
                 or self.comparison is None
+                or self.effective_absolute_segment_end is None
+                or self.window_start is None
+                or self.window_end is None
+                or self.target_start_in_window is None
+                or self.target_end_in_window is None
             ):
                 raise ValueError("successful speaker judge record is incomplete")
         elif self.failure is None:
             raise ValueError("failed speaker judge record requires failure")
+        if self.target_boundary_clipped != (self.target_boundary_clip_seconds > 0):
+            raise ValueError("speaker judge target boundary provenance is inconsistent")
+        if (
+            self.effective_absolute_segment_end is not None
+            and self.effective_absolute_segment_end > self.absolute_segment_end
+        ):
+            raise ValueError("effective speaker segment end exceeds source segment")
         return self
 
 
@@ -855,6 +873,53 @@ class _SourceCase:
     sidecar_path: Path
     native: LRASDNativeArtifact
     native_path: Path
+
+
+@dataclass(frozen=True)
+class _SynchronizedTargetWindow:
+    effective_absolute_segment_end: float
+    window_start: float
+    window_end: float
+    target_start_in_window: float
+    target_end_in_window: float
+    boundary_clip_seconds: float
+
+
+def _synchronized_target_window(source: _SourceCase) -> _SynchronizedTargetWindow:
+    common_end = min(
+        source.canonical.target_duration_seconds,
+        source.native.duration_seconds,
+    )
+    raw = source.raw
+    if raw.start_time >= common_end:
+        raise OmniAVSpeakerJudgeFailure(
+            code="omni_av_synchronized_media_boundary_invalid",
+            reason=(
+                "selected speaker segment starts at or after synchronized media end: "
+                f"start={raw.start_time:.9f}, common_end={common_end:.9f}"
+            ),
+        )
+    if raw.end_time > common_end + AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS:
+        raise OmniAVSpeakerJudgeFailure(
+            code="omni_av_synchronized_media_boundary_invalid",
+            reason=(
+                "selected speaker segment exceeds synchronized media tolerance: "
+                f"end={raw.end_time:.9f}, common_end={common_end:.9f}, "
+                "tolerance="
+                f"{AUDIO_TIMELINE_DURATION_TOLERANCE_SECONDS:.9f}"
+            ),
+        )
+    effective_end = min(raw.end_time, common_end)
+    window_start = max(0.0, raw.start_time - CONTEXT_SECONDS)
+    window_end = min(common_end, effective_end + CONTEXT_SECONDS)
+    return _SynchronizedTargetWindow(
+        effective_absolute_segment_end=effective_end,
+        window_start=window_start,
+        window_end=window_end,
+        target_start_in_window=raw.start_time - window_start,
+        target_end_in_window=effective_end - window_start,
+        boundary_clip_seconds=max(0.0, raw.end_time - effective_end),
+    )
 
 
 def _load_manifest(path: Path) -> list[OmniAVSpeakerPilotCase]:
@@ -1221,43 +1286,33 @@ def run_omni_av_speaker_judge_pilot(
                 source=source,
                 raw_segments_path=raw_segments_path,
             )
-            available_duration = min(
-                source.canonical.target_duration_seconds,
-                source.native.duration_seconds,
-            )
-            if source.raw.end_time > available_duration + 1e-9:
-                raise ValueError("selected speaker segment exceeds synchronized media")
-            window_start = max(0.0, source.raw.start_time - CONTEXT_SECONDS)
-            window_end = min(
-                available_duration,
-                source.raw.end_time + CONTEXT_SECONDS,
-            )
-            target_start = source.raw.start_time - window_start
-            target_end = source.raw.end_time - window_start
-            timeline = build_neutral_face_timeline(
-                native=source.native,
-                sidecar=source.sidecar,
-                window_start=window_start,
-                window_end=window_end,
-            )
-            visible_entities = _visible_entities(timeline)
+            synchronized_window: _SynchronizedTargetWindow | None = None
+            visible_entities: list[str] = []
             pass1: OmniAVSpeakerJudgeResult | None = None
             pass2: OmniAVSpeakerJudgeResult | None = None
             pass2_called = False
             failure: OmniAVSpeakerJudgeFailure | None = None
             media_provenance: OmniAVSpeakerMediaProvenance | None = None
             try:
+                synchronized_window = _synchronized_target_window(source)
+                timeline = build_neutral_face_timeline(
+                    native=source.native,
+                    sidecar=source.sidecar,
+                    window_start=synchronized_window.window_start,
+                    window_end=synchronized_window.window_end,
+                )
+                visible_entities = _visible_entities(timeline)
                 media_backend.render_neutral_video(
                     source_video_path=model_video,
                     timeline=timeline,
-                    window_start=window_start,
-                    window_end=window_end,
+                    window_start=synchronized_window.window_start,
+                    window_end=synchronized_window.window_end,
                     destination_path=neutral_video,
                 )
                 media_backend.trim_canonical_audio(
                     source_audio_path=canonical_audio,
-                    window_start=window_start,
-                    window_end=window_end,
+                    window_start=synchronized_window.window_start,
+                    window_end=synchronized_window.window_end,
                     destination_path=trimmed_audio,
                 )
                 media_provenance = OmniAVSpeakerMediaProvenance(
@@ -1269,8 +1324,10 @@ def run_omni_av_speaker_judge_pilot(
                 request = OmniAVSpeakerJudgeRequest(
                     neutral_video_path=neutral_video,
                     canonical_audio_path=trimmed_audio,
-                    target_start_in_window=target_start,
-                    target_end_in_window=target_end,
+                    target_start_in_window=(
+                        synchronized_window.target_start_in_window
+                    ),
+                    target_end_in_window=synchronized_window.target_end_in_window,
                     visible_candidate_entity_ids=tuple(visible_entities),
                 )
                 pass1 = backend.decide(request, verification=False)
@@ -1316,10 +1373,40 @@ def run_omni_av_speaker_judge_pilot(
                 speaker_cluster_id=source.raw.speaker_cluster_id,
                 absolute_segment_start=source.raw.start_time,
                 absolute_segment_end=source.raw.end_time,
-                window_start=window_start,
-                window_end=window_end,
-                target_start_in_window=target_start,
-                target_end_in_window=target_end,
+                target_boundary_clipped=(
+                    synchronized_window is not None
+                    and synchronized_window.boundary_clip_seconds > 0
+                ),
+                target_boundary_clip_seconds=(
+                    0
+                    if synchronized_window is None
+                    else synchronized_window.boundary_clip_seconds
+                ),
+                effective_absolute_segment_end=(
+                    None
+                    if synchronized_window is None
+                    else synchronized_window.effective_absolute_segment_end
+                ),
+                window_start=(
+                    None
+                    if synchronized_window is None
+                    else synchronized_window.window_start
+                ),
+                window_end=(
+                    None
+                    if synchronized_window is None
+                    else synchronized_window.window_end
+                ),
+                target_start_in_window=(
+                    None
+                    if synchronized_window is None
+                    else synchronized_window.target_start_in_window
+                ),
+                target_end_in_window=(
+                    None
+                    if synchronized_window is None
+                    else synchronized_window.target_end_in_window
+                ),
                 visible_candidate_entity_ids=visible_entities,
                 draft_binding_status=source.cluster.status,
                 draft_entity_id=source.cluster.entity_id,

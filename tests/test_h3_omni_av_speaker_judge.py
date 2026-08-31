@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationBoundaryReconciliation,
@@ -345,6 +347,50 @@ def _fixture(root: Path) -> tuple[Path, list[RawDiarizationSegment], dict[str, b
     return root, raws, {str(path): path.read_bytes() for path in sources}
 
 
+def _replace_segment_times(
+    root: Path,
+    *,
+    segment_id: str,
+    start_time: float,
+    end_time: float,
+) -> None:
+    raw_path = root / "diarization/raw_segments.jsonl"
+    bound_path = root / "diarization/bound_segments.jsonl"
+    raws = [
+        RawDiarizationSegment.model_validate_json(line)
+        for line in raw_path.read_text(encoding="utf-8").splitlines()
+    ]
+    bounds = [
+        BoundDiarizationSegment.model_validate_json(line)
+        for line in bound_path.read_text(encoding="utf-8").splitlines()
+    ]
+    original = next(row for row in raws if row.segment_id == segment_id)
+    replacement = _raw(
+        segment_id,
+        original.speaker_cluster_id,
+        start_time,
+        end_time,
+        Path(original.source_audio_path),
+    )
+    raws = [replacement if row.segment_id == segment_id else row for row in raws]
+    bounds = [
+        BoundDiarizationSegment.model_validate(
+            {
+                **row.model_dump(mode="json"),
+                "start_time": replacement.start_time,
+                "end_time": replacement.end_time,
+                "source_start_sample": replacement.source_start_sample,
+                "source_end_sample": replacement.source_end_sample,
+            }
+        )
+        if row.segment_id == segment_id
+        else row
+        for row in bounds
+    ]
+    _write_jsonl(raw_path, raws)
+    _write_jsonl(bound_path, bounds)
+
+
 def _manifest(path: Path, segment_ids: list[str]) -> None:
     path.write_text(
         "".join(
@@ -590,6 +636,175 @@ def test_per_case_model_failure_does_not_destroy_other_successes(tmp_path: Path)
         )
     )
     assert raw["failure"]["raw_responses"] == ["", "bad"]
+
+
+@pytest.mark.parametrize("overflow", [0.028118, 0.0366825, 0.0423195])
+def test_synchronized_media_tail_overflow_is_clipped_for_model_only(
+    tmp_path: Path,
+    overflow: float,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    _replace_segment_times(
+        root,
+        segment_id="segment_0001",
+        start_time=4.5,
+        end_time=5.0 + overflow,
+    )
+    source_paths = [
+        root / "diarization/raw_segments.jsonl",
+        root / "diarization/bound_segments.jsonl",
+    ]
+    source_bytes = {path: path.read_bytes() for path in source_paths}
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0001"])
+    backend = _FakeBackend(
+        [OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1")]
+    )
+    media = _FakeMedia()
+
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=media,
+    )
+
+    record = _records(root / "pilot/records.jsonl")[0]
+    request = backend.calls[0][0]
+    assert summary.case_count == 1
+    assert summary.succeeded_case_count == 1
+    assert summary.failed_case_count == 0
+    assert summary.model_call_count == 1
+    assert record["absolute_segment_end"] == pytest.approx(5.0 + overflow)
+    assert record["effective_absolute_segment_end"] == pytest.approx(5.0)
+    assert record["target_boundary_clipped"]
+    assert record["target_boundary_clip_seconds"] == pytest.approx(overflow)
+    assert record["window_end"] == pytest.approx(5.0)
+    assert request.target_end_in_window == pytest.approx(
+        record["effective_absolute_segment_end"] - record["window_start"]
+    )
+    assert media.video_calls[0]["window_end"] == pytest.approx(5.0)
+    assert media.audio_calls[0]["window_end"] == pytest.approx(5.0)
+    assert all(path.read_bytes() == content for path, content in source_bytes.items())
+
+
+def test_synchronized_media_in_boundary_target_is_not_clipped(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    _replace_segment_times(
+        root,
+        segment_id="segment_0001",
+        start_time=4.5,
+        end_time=5.0,
+    )
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0001"])
+    backend = _FakeBackend(
+        [OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1")]
+    )
+
+    run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=_FakeMedia(),
+    )
+
+    record = _records(root / "pilot/records.jsonl")[0]
+    assert not record["target_boundary_clipped"]
+    assert record["target_boundary_clip_seconds"] == 0
+    assert record["absolute_segment_end"] == 5.0
+    assert record["effective_absolute_segment_end"] == 5.0
+    assert backend.calls[0][0].target_end_in_window == pytest.approx(
+        5.0 - record["window_start"]
+    )
+
+
+def test_invalid_synchronized_boundary_fails_one_case_and_continues(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    _replace_segment_times(
+        root,
+        segment_id="segment_0001",
+        start_time=4.5,
+        end_time=5.5,
+    )
+    source_paths = [
+        root / "diarization/raw_segments.jsonl",
+        root / "diarization/bound_segments.jsonl",
+    ]
+    source_bytes = {path: path.read_bytes() for path in source_paths}
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0001", "segment_0002"])
+    backend = _FakeBackend(
+        [OmniAVSpeakerObservation(decision="visible_entity", entity_id="e2")]
+    )
+    media = _FakeMedia()
+
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=media,
+    )
+
+    records = _records(root / "pilot/records.jsonl")
+    assert summary.case_count == 2
+    assert summary.failed_case_count == 1
+    assert summary.succeeded_case_count == 1
+    assert summary.model_call_count == 1
+    assert records[0]["status"] == "failed"
+    assert (
+        records[0]["failure"]["code"]
+        == "omni_av_synchronized_media_boundary_invalid"
+    )
+    assert records[0]["effective_absolute_segment_end"] is None
+    assert records[0]["window_end"] is None
+    assert records[1]["status"] == "succeeded"
+    assert [call[0].target_end_in_window for call in backend.calls] == [
+        pytest.approx(1.15)
+    ]
+    assert len(media.video_calls) == 1
+    assert len(media.audio_calls) == 1
+    assert all(path.read_bytes() == content for path, content in source_bytes.items())
+
+
+def test_segment_starting_at_synchronized_end_fails_without_model_call(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    _replace_segment_times(
+        root,
+        segment_id="segment_0001",
+        start_time=5.0,
+        end_time=5.05,
+    )
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0001"])
+    backend = _FakeBackend([])
+    media = _FakeMedia()
+
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=media,
+    )
+
+    record = _records(root / "pilot/records.jsonl")[0]
+    assert summary.case_count == 1
+    assert summary.failed_case_count == 1
+    assert summary.succeeded_case_count == 0
+    assert summary.model_call_count == 0
+    assert record["status"] == "failed"
+    assert "starts at or after" in record["failure"]["reason"]
+    assert backend.calls == []
+    assert media.video_calls == []
+    assert media.audio_calls == []
 
 
 def test_openai_request_is_blind_synchronized_text_only_and_repairs_once(
