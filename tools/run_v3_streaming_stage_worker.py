@@ -312,24 +312,6 @@ class _StageRuntime:
             operation="complete_attribute",
         )
 
-    def attribute_background(
-        self,
-        *,
-        source_path: Path,
-        output_path: Path,
-        instruction: str,
-        seed: int,
-    ) -> dict[str, object]:
-        return self._attribute_edit(
-            source_path=source_path,
-            output_path=output_path,
-            instruction=instruction,
-            seed=seed,
-            sidecar_directory="variants",
-            component="boogu_attribute_background",
-            operation="add_attribute_background",
-        )
-
     def _attribute_edit(
         self,
         *,
@@ -499,7 +481,6 @@ def serve(args: argparse.Namespace) -> int:
                         "attribute_probe",
                         "attribute_completion_probe",
                         "attribute_completion",
-                        "attribute_background",
                     }:
                         raise ValueError("unsupported worker request type")
                     if attribute_probe_only and request_type not in {
@@ -595,28 +576,18 @@ def serve(args: argparse.Namespace) -> int:
                             raise ValueError("completion instruction is required")
                         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
                             raise ValueError("completion seed must be non-negative")
-                        if request_type == "attribute_background":
-                            edit_result = runtime.attribute_background(
-                                source_path=Path(source_path),
-                                output_path=Path(output_path),
-                                instruction=instruction,
-                                seed=seed,
-                            )
-                            result_key = "background"
-                        else:
-                            edit_result = runtime.attribute_completion(
-                                source_path=Path(source_path),
-                                output_path=Path(output_path),
-                                instruction=instruction,
-                                seed=seed,
-                            )
-                            result_key = "completion"
+                        edit_result = runtime.attribute_completion(
+                            source_path=Path(source_path),
+                            output_path=Path(output_path),
+                            instruction=instruction,
+                            seed=seed,
+                        )
                         response = {
                             "schema_version": 1,
                             "type": "response",
                             "request_id": request_id,
                             "status": "ok",
-                            result_key: edit_result,
+                            "completion": edit_result,
                         }
                 except Exception as exc:  # noqa: BLE001 - process boundary response
                     response = {

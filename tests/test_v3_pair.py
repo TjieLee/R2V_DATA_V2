@@ -53,7 +53,6 @@ from r2v_data_v2.v3.reference_completion_qwen import (
     QwenImageEdit2511ReferenceCompletionBackend,
 )
 from r2v_data_v2.v3.reference_edit import (
-    BACKGROUND_PROMPT,
     COMPLETION_PROMPT_TEMPLATE,
     reference_edit_clips,
 )
@@ -4395,16 +4394,24 @@ class _ReferenceEditJudge:
         accept: bool = True,
         reject_operations: set[str] | None = None,
         background_updates: dict[str, bool] | None = None,
+        accept_sequence: list[bool] | None = None,
     ) -> None:
         self.accept = accept
         self.reject_operations = reject_operations or set()
         self.background_updates = background_updates or {}
+        self.accept_sequence = list(accept_sequence or [])
         self.calls: list[str] = []
+        self.requests: list[dict[str, object]] = []
 
     def review(self, **kwargs: object) -> object:
         operation = str(kwargs["operation"])
         self.calls.append(operation)
-        accepted = self.accept and operation not in self.reject_operations
+        self.requests.append(kwargs)
+        accepted = (
+            self.accept_sequence.pop(0)
+            if self.accept_sequence
+            else self.accept and operation not in self.reject_operations
+        )
         values = {
             field: accepted
             for field in (
@@ -4583,21 +4590,24 @@ def test_reference_edit_has_no_hash_or_modulo_form_assignment() -> None:
     assert "generated_background_to_alpha" not in fields
 
 
-def test_background_accept_keeps_all_variants_and_skips_bbox_qwen(
+@pytest.mark.parametrize("reference_type", ["subject", "object"])
+def test_complete_entity_uses_alpha_and_never_calls_boogu_background(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    reference_type: str,
 ) -> None:
     config = _enable_variant_reviews(
         _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     )
-    storage = _storage(config, entity_types=("subject",))
+    storage = _storage(config, entity_types=(reference_type,))
     pair_clips(config, storage, judge=_Judge())
+    backend = _ReferenceEditBackend()
     bbox_judge = _ReferenceFormBboxJudge()
 
     stats = reference_edit_clips(
         config,
         storage,
-        backend=_ReferenceEditBackend(),
+        backend=backend,
         judge=_ReferenceEditJudge(),
         sam_reviewer=_ReferenceEditSamReviewer(),
         bbox_route_judge=bbox_judge,
@@ -4606,63 +4616,29 @@ def test_background_accept_keeps_all_variants_and_skips_bbox_qwen(
     clip = storage.read_clip("clip-1")
     edit = clip.reference_edit.entities[0]
     assert edit.variants is not None
-    assert edit.default_variant == "generated_background"
+    assert edit.default_variant == "alpha"
     assert edit.variants.alpha.status == "accepted"
-    assert edit.variants.bbox.status == "review_skipped"
-    assert edit.variants.bbox.review_status == "skipped_due_to_background_accept"
-    assert edit.variants.generated_background.status == "accepted"
+    assert edit.variants.bbox.status == "available"
+    assert edit.variants.bbox.review_status == "not_reviewed"
+    assert edit.variants.generated_background.image_path is None
+    assert edit.variants.generated_background.status == "unavailable"
+    assert edit.variants.generated_background.reviewed is False
+    assert edit.variants.generated_background.review_status == "not_applicable"
+    assert (
+        edit.variants.generated_background.reason
+        == "entity_background_disabled_by_policy"
+    )
     assert (storage.root / edit.variants.bbox.image_path).is_file()
+    assert backend.calls == []
+    assert backend.start_calls == 0
     assert bbox_judge.calls == []
     assert len(clip.references.entities) == 1
-    assert clip.references.entities[0].synthetic is True
+    assert clip.references.entities[0].synthetic is False
     assert stats.bbox_variants_materialized == 1
     assert stats.bbox_reviews_attempted == 0
-    assert stats.bbox_reviews_skipped_background_accepted == 1
-    assert stats.background_variants_attempted == 1
-    assert stats.background_variants_accepted == 1
-
-
-@pytest.mark.parametrize(
-    ("bbox_accept", "bbox_fail", "expected_default"),
-    [(True, False, "bbox"), (False, False, "alpha"), (True, True, "alpha")],
-)
-def test_background_reject_reviews_bbox_then_falls_back_by_quality(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    bbox_accept: bool,
-    bbox_fail: bool,
-    expected_default: str,
-) -> None:
-    config = _enable_variant_reviews(
-        _config(tmp_path, monkeypatch, reference_edit_enabled=True)
-    )
-    storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
-    bbox_judge = _ReferenceFormBboxJudge(accept=bbox_accept, fail=bbox_fail)
-
-    stats = reference_edit_clips(
-        config,
-        storage,
-        backend=_ReferenceEditBackend(),
-        judge=_ReferenceEditJudge(accept=False),
-        sam_reviewer=_ReferenceEditSamReviewer(),
-        bbox_route_judge=bbox_judge,
-    )
-
-    clip = storage.read_clip("clip-1")
-    reference = clip.references.entities[0]
-    edit = clip.reference_edit.entities[0]
-    assert edit.variants is not None
-    assert edit.default_variant == expected_default
-    assert edit.variants.generated_background.status == "rejected"
-    assert edit.variants.bbox.status == (
-        "accepted" if expected_default == "bbox" else "rejected"
-    )
-    assert bbox_judge.calls[0]["trigger"] == "variant_bbox_review"
-    assert reference.source_bbox_fallback is (expected_default == "bbox")
-    assert reference.synthetic is False
-    assert len(clip.references.entities) == 1
-    assert stats.bbox_reviews_attempted == 1
+    assert stats.bbox_reviews_skipped_background_accepted == 0
+    assert stats.background_variants_attempted == 0
+    assert stats.background_variants_accepted == 0
 
 
 def test_group_references_do_not_receive_variant_bundle(
@@ -4686,13 +4662,13 @@ def test_group_references_do_not_receive_variant_bundle(
         is None
     )
     assert (
-        group_storage.read_clip("clip-1").references.entities[0].synthetic is True
+        group_storage.read_clip("clip-1").references.entities[0].synthetic is False
     )
-    assert stats.background_variants_attempted == 1
+    assert stats.background_variants_attempted == 0
     assert stats.bbox_variants_materialized == 0
 
 
-def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
+def test_reference_edit_stage_exports_alpha_variants_without_starting_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4720,25 +4696,26 @@ def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
     clip = storage.read_clip("clip-1")
     assert stats.entities_eligible == 2
     assert stats.entities_accepted == 2
-    assert stats.worker_starts == 1
-    assert backend.start_calls == 1
-    assert backend.close_calls == 1
-    assert len(backend.calls) == 2
+    assert stats.worker_starts == 0
+    assert backend.start_calls == 0
+    assert backend.close_calls == 0
+    assert backend.calls == []
     assert clip.reference_edit is not None
     assert clip.reference_edit.status == "ready"
     for reference in clip.references.entities:
         assert reference.status == "ready"
-        assert reference.synthetic is True
+        assert reference.synthetic is False
         assert reference.image_path is not None
-        assert reference.image_path.endswith("/final_reference_1k.png")
-        final_metadata = json.loads(
-            (
-                storage.reference_edit_dir("clip-1")
-                / reference.entity_id
-                / "final_metadata.json"
-            ).read_text(encoding="utf-8")
+        edit = next(
+            item
+            for item in clip.reference_edit.entities
+            if item.entity_id == reference.entity_id
         )
-        assert final_metadata["final_selection"] == "background_candidate"
+        assert edit.default_variant == "alpha"
+        assert edit.default_image_path == reference.image_path
+        assert edit.variants is not None
+        assert edit.variants.bbox.image_path is not None
+        assert edit.variants.generated_background.status == "unavailable"
         assert (
             _sha256(storage.selected_entity_path("clip-1", reference.entity_id))
             == (canonical_hashes[reference.entity_id])
@@ -4786,7 +4763,7 @@ def test_reference_edit_stage_reuses_one_worker_and_exports_native_final(
     assert len(variant_records) == 2
     assert {record["entity_id"] for record in variant_records} == {"e1", "e2"}
     assert all(
-        record["default_variant"] == "generated_background"
+        record["default_variant"] == "alpha"
         for record in variant_records
     )
     assert all(
@@ -4917,7 +4894,7 @@ def test_reference_edit_does_not_start_worker_without_eligible_entity(
     assert clip.reference_edit is None
 
 
-def test_repairable_reference_runs_completion_then_background_with_one_worker(
+def test_repairable_reference_runs_completion_only_with_one_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4951,51 +4928,46 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     assert stats.worker_starts == 1
     assert backend.start_calls == 1
     assert backend.close_calls == 1
-    assert judge.calls == ["complete_entity", "add_entity_background"]
-    assert [call["thinking_enabled"] for call in backend.calls] == [True, False]
+    assert judge.calls == ["complete_entity"]
+    assert [call["thinking_enabled"] for call in backend.calls] == [True]
     assert [
         call["instruction_rewrite_enabled"] for call in backend.calls
-    ] == [True, False]
+    ] == [True]
     entity_phrase = storage.read_clip("clip-1").annotation.entities[0].phrase
+    expected_instruction = (
+        f'Complete the missing or broken parts of the same target entity: "{entity_phrase}".\n'
+        "Preserve its identity, appearance, colors, materials, proportions, and style.\n"
+        "Do not add another entity or unrelated content.\n"
+        "Remove broken fragments and keep uncertain completion simple and consistent "
+        "with visible evidence."
+    )
     assert [call["instruction"] for call in backend.calls] == [
-        COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity_phrase),
-        BACKGROUND_PROMPT,
+        expected_instruction,
     ]
+    assert COMPLETION_PROMPT_TEMPLATE.format(entity_phrase=entity_phrase) == (
+        expected_instruction
+    )
+    assert not any("\u4e00" <= character <= "\u9fff" for character in expected_instruction)
     edit_dir = storage.reference_edit_dir("clip-1") / "e1"
     completion_path = edit_dir / "completion_candidate_1k.png"
-    background_path = edit_dir / "background_candidate_1k.png"
     assert completion_path.is_file()
-    assert background_path.is_file()
     assert (edit_dir / "completion_metadata.json").is_file()
-    assert (edit_dir / "background_metadata.json").is_file()
     assert (edit_dir / "final_metadata.json").is_file()
-    assert backend.calls[1]["source_rgb"].tobytes() == (
-        Image.open(completion_path).convert("RGB").tobytes()
-    )
-    assert len(sam_reviewer.calls) == 2
+    assert len(sam_reviewer.calls) == 1
     with Image.open(canonical) as source:
         source_size = source.size
-    assert [call["source_rgba"].size for call in sam_reviewer.calls] == [
-        source_size,
-        source_size,
-    ]
-    background_metadata = json.loads(
-        (edit_dir / "background_metadata.json").read_text(encoding="utf-8")
-    )
-    assert background_metadata["source_image_path"].endswith(
-        "/completion_candidate_1k.png"
-    )
-    assert background_metadata["source_geometry_image_path"].endswith(
-        "/selected/e1.png"
-    )
+    assert [call["source_rgba"].size for call in sam_reviewer.calls] == [source_size]
     assert (edit_dir / "final_reference_1k.png").read_bytes() == (
-        background_path.read_bytes()
+        completion_path.read_bytes()
     )
     state = storage.read_clip("clip-1").reference_edit.entities[0]
     assert state.reference_form is None
-    assert state.variants is None
-    assert stats.bbox_variants_materialized == 0
-    assert state.operations == ["complete_entity", "add_entity_background"]
+    assert state.variants is not None
+    assert state.default_variant == "accepted_base"
+    assert state.accepted_base_image_path == state.output_image_path
+    assert state.variants.generated_background.status == "unavailable"
+    assert stats.bbox_variants_materialized == 1
+    assert state.operations == ["complete_entity"]
     assert state.background_fallback == "none"
     assert (
         storage.read_clip("clip-1")
@@ -5006,7 +4978,7 @@ def test_repairable_reference_runs_completion_then_background_with_one_worker(
     assert canonical.read_bytes() == canonical_bytes
 
 
-def test_complete_reference_runs_only_background_with_exact_prompt(
+def test_complete_reference_does_not_start_boogu_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5023,26 +4995,13 @@ def test_complete_reference_runs_only_background_with_exact_prompt(
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
 
-    assert len(backend.calls) == 1
-    assert backend.calls[0]["instruction"] == BACKGROUND_PROMPT
-    assert backend.calls[0]["thinking_enabled"] is False
-    assert backend.calls[0]["instruction_rewrite_enabled"] is False
+    assert backend.calls == []
+    assert backend.start_calls == 0
     assert config.reference_edit.completion_instruction_rewrite_enabled is True
     assert config.reference_edit.background_instruction_rewrite_enabled is False
 
 
-def test_background_prompt_matches_contextual_generation_contract() -> None:
-    assert BACKGROUND_PROMPT == """Generate a contextually appropriate background for the foreground subject.
-Choose an environment that best fits the subject’s identity, visual style, clothing, action, emotion, and cinematic tone.
-Adapt the scene automatically so it feels believable and visually coherent.
-Preserve the subject exactly as it is, and focus on creating a background with matching atmosphere, perspective, lighting, and color palette.
-Make sure the subject remains the visual focal point, while the background provides depth, context, and visual coherence.
-Blend everything seamlessly into a polished final image.
-Do not add extra people, duplicate the subject, or introduce distracting foreground objects.
-Do not default to an outdoor scene; choose indoor or outdoor context only if it best matches the subject."""
-
-
-def test_reference_edit_rewrite_switches_are_independent(
+def test_reference_edit_rewrite_switch_is_completion_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5060,33 +5019,22 @@ def test_reference_edit_rewrite_switches_are_independent(
         config,
         "complete_entity",
     ) is False
-    assert reference_edit_module._instruction_rewrite_enabled(
-        config,
-        "add_entity_background",
-    ) is True
+    with pytest.raises(ValueError, match="unsupported reference-edit operation"):
+        reference_edit_module._instruction_rewrite_enabled(
+            config,
+            "add_entity_background",
+        )
 
 
 def test_reference_edit_operation_routing_distinguishes_local_and_repairable() -> None:
-    assert reference_edit_module._operations("local_usable") == (
-        "add_entity_background",
-    )
-    assert reference_edit_module._operations("repairable") == (
-        "complete_entity",
-        "add_entity_background",
-    )
+    assert reference_edit_module._operations("complete") == ()
+    assert reference_edit_module._operations("local_usable") == ()
+    assert reference_edit_module._operations("repairable") == ("complete_entity",)
 
 
-@pytest.mark.parametrize(
-    "background_updates",
-    [
-        {"background_improves_reference": False},
-        {"prefer_candidate_over_source": False},
-    ],
-)
-def test_background_not_better_than_source_uses_keep_source_fallback(
+def test_complete_source_stays_alpha_without_background_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    background_updates: dict[str, bool],
 ) -> None:
     config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     storage = _storage(config, entity_types=("subject",))
@@ -5096,34 +5044,38 @@ def test_background_not_better_than_source_uses_keep_source_fallback(
     assert source.completion_needed_for_reference_use is False
     source_bytes = (storage.root / source.image_path).read_bytes()
 
+    backend = _ReferenceEditBackend()
+    judge = _ReferenceEditJudge(
+        background_updates={"background_improves_reference": False}
+    )
     stats = reference_edit_clips(
         config,
         storage,
-        backend=_ReferenceEditBackend(),
-        judge=_ReferenceEditJudge(background_updates=background_updates),
+        backend=backend,
+        judge=judge,
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
 
     clip = storage.read_clip("clip-1")
     reference = clip.references.entities[0]
     edit = clip.reference_edit.entities[0]
-    assert stats.entities_fallback == 1
+    assert stats.entities_accepted == 1
     assert reference == source
     assert reference.synthetic is False
     assert (storage.root / reference.image_path).read_bytes() == source_bytes
-    assert edit.fallback_policy == "keep_source"
-    assert edit.reason == "background_not_beneficial"
-    metadata = json.loads((storage.root / edit.metadata_path).read_text(encoding="utf-8"))
-    assert metadata["final_selection"] == "source"
-    assert metadata["final_selection_reason"] == "background_not_beneficial"
+    assert edit.status == "not_required"
+    assert edit.default_variant == "alpha"
+    assert backend.calls == []
+    assert judge.calls == []
+    assert stats.background_variants_attempted == 0
 
 
-def test_local_reference_adds_background_without_promoting_scope(
+def test_local_reference_stays_alpha_without_boogu_background(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
-    storage = _storage(config, entity_types=("subject",))
+    storage = _storage(config, entity_types=("object",))
     pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
     source = storage.read_clip("clip-1").references.entities[0]
     _write_touching_local_reference(storage)
@@ -5138,8 +5090,9 @@ def test_local_reference_adds_background_without_promoting_scope(
     )
 
     reference = storage.read_clip("clip-1").references.entities[0]
-    assert len(backend.calls) == 1
-    assert reference.synthetic is True
+    assert backend.calls == []
+    assert backend.start_calls == 0
+    assert reference.synthetic is False
     assert reference.reference_scope == "local"
     assert reference.visible_region == source.visible_region
     assert reference.whole_entity_recognizable == source.whole_entity_recognizable
@@ -5163,6 +5116,10 @@ def test_local_reference_adds_background_without_promoting_scope(
     assert storage.read_clip("clip-1").reference_edit.entities[0].route == (
         "local_usable"
     )
+    state = storage.read_clip("clip-1").reference_edit.entities[0]
+    assert state.default_variant == "alpha"
+    assert state.variants is not None
+    assert state.variants.generated_background.status == "unavailable"
 
 
 def test_tiny_source_falls_back_without_starting_boogu_worker(
@@ -5305,12 +5262,12 @@ def test_tiny_and_normal_references_share_transactional_eligible_count(
     assert stats.entities_fallback == 1
     assert stats.entities_accepted == 1
     assert stats.entities_rejected == 0
-    assert stats.worker_starts == 1
-    assert backend.start_calls == 1
-    assert len(backend.calls) == 1
+    assert stats.worker_starts == 0
+    assert backend.start_calls == 0
+    assert backend.calls == []
     assert [item.status for item in clip.reference_edit.entities] == [
         "fallback",
-        "accepted",
+        "not_required",
     ]
     assert (
         stats.entities_accepted
@@ -5358,14 +5315,14 @@ def test_corrupt_reference_failure_is_isolated_before_lazy_runtime_start(
     assert stats.failed == 1
     assert stats.entities_eligible == 1
     assert stats.entities_accepted == 1
-    assert stats.worker_starts == 1
-    assert backend.start_calls == 1
-    assert len(backend.calls) == 1
+    assert stats.worker_starts == 0
+    assert backend.start_calls == 0
+    assert backend.calls == []
     assert storage.read_clip("clip-a").reference_edit.status == "failed"
     assert storage.read_clip("clip-b").reference_edit.status == "ready"
 
 
-def test_legacy_touching_local_completion_rejection_rejects_entity(
+def test_legacy_touching_local_completion_rejection_falls_back_to_alpha(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5396,21 +5353,22 @@ def test_legacy_touching_local_completion_rejection_rejects_entity(
 
     clip = storage.read_clip("clip-1")
     edit = clip.reference_edit.entities[0]
-    assert stats.entities_fallback == 0
-    assert stats.entities_rejected == 1
-    assert len(backend.calls) == 1
+    assert stats.entities_fallback == 1
+    assert stats.entities_rejected == 0
+    assert len(backend.calls) == 2
+    assert stats.completion_candidate2_attempts == 1
+    assert stats.completion_fallback_to_alpha == 1
     assert backend.calls[0]["thinking_enabled"] is True
     assert edit.route == "repairable"
     assert edit.operations == ["complete_entity"]
-    assert edit.status == "rejected"
-    assert edit.fallback_policy == "reject_entity"
+    assert edit.status == "fallback"
+    assert edit.fallback_policy == "keep_source"
     assert edit.reason.startswith("repairable_completion_rejected:")
-    assert clip.references.entities[0].status == "rejected"
-    assert clip.references.entities[0].image_path is None
-    assert clip.pairing.status == "rejected"
-    assert clip.pairing.reason == "no_qualifying_ready_reference"
-    assert clip.pairing.retained_entity_ids == []
-    assert clip.pairing.tokens == {}
+    assert edit.default_variant == "alpha"
+    assert clip.references.entities[0].status == "ready"
+    assert clip.references.entities[0].image_path == source.image_path
+    assert clip.pairing.status == "ready"
+    assert clip.pairing.retained_entity_ids == ["e1"]
     assert source_path.read_bytes() == source_bytes
 
 
@@ -5451,8 +5409,8 @@ def test_legacy_local_reference_publishes_with_normalized_quality_fields(
     assert stats.entities_accepted == 1
     assert clip.reference_edit is not None
     assert clip.reference_edit.status == "ready"
-    assert clip.reference_edit.entities[0].status == "accepted"
-    assert reference.synthetic is True
+    assert clip.reference_edit.entities[0].status == "not_required"
+    assert reference.synthetic is False
     assert reference.reference_scope == "local"
     assert reference.visible_region == source.visible_region
     assert reference.whole_entity_recognizable == source.whole_entity_recognizable
@@ -5466,11 +5424,11 @@ def test_legacy_local_reference_publishes_with_normalized_quality_fields(
         reference.requires_substantial_invention
         == source.requires_substantial_invention
     )
-    assert reference.completeness == "local_usable"
-    assert reference.image_quality == "acceptable"
-    assert reference.generation_metadata_path is not None
-    assert reference.generation_source_sha256 is not None
-    assert reference.generation_output_sha256 is not None
+    assert reference.completeness is None
+    assert reference.image_quality is None
+    assert reference.generation_metadata_path is None
+    assert reference.generation_source_sha256 is None
+    assert reference.generation_output_sha256 is None
 
 
 def test_failed_clip_does_not_commit_partial_reference_edit_entity_counters(
@@ -5479,7 +5437,11 @@ def test_failed_clip_does_not_commit_partial_reference_edit_entity_counters(
 ) -> None:
     config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     storage = _storage(config, entity_types=("subject", "object"))
-    pair_clips(config, storage, judge=_Judge())
+    pair_clips(
+        config,
+        storage,
+        judge=_Judge({"e1": "repairable", "e2": "repairable"}),
+    )
     original_accepted_reference = reference_edit_module._accepted_reference
     backend = _ReferenceEditBackend()
 
@@ -5520,13 +5482,14 @@ def test_failed_clip_does_not_commit_partial_reference_edit_entity_counters(
     assert clip.reference_edit.status == "failed"
 
 
-def test_repairable_background_rejection_falls_back_to_completion_candidate(
+def test_repairable_completion_accept_is_canonical_without_background_edit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0]
     assert (
         storage.read_clip("clip-1")
         .references.entities[0]
@@ -5539,34 +5502,37 @@ def test_repairable_background_rejection_falls_back_to_completion_candidate(
         config,
         storage,
         backend=backend,
-        judge=_ReferenceEditJudge(
-            background_updates={"background_improves_reference": False},
-        ),
+        judge=_ReferenceEditJudge(),
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
 
     edit_dir = storage.reference_edit_dir("clip-1") / "e1"
     completion_path = edit_dir / "completion_candidate_1k.png"
     final_path = edit_dir / "final_reference_1k.png"
-    assert stats.entities_fallback == 1
-    assert len(backend.calls) == 2
+    assert stats.entities_accepted == 1
+    assert len(backend.calls) == 1
+    assert stats.completion_candidate1_accepted == 1
+    assert stats.completion_candidate2_attempts == 0
     assert final_path.read_bytes() == completion_path.read_bytes()
     final_metadata = json.loads(
         (edit_dir / "final_metadata.json").read_text(encoding="utf-8")
     )
-    assert final_metadata["background_fallback"] == "completion_candidate"
     assert final_metadata["final_selection"] == "completion_candidate"
     clip = storage.read_clip("clip-1")
     state = clip.reference_edit.entities[0]
-    assert state.status == "fallback"
-    assert state.fallback_policy == "completion_candidate"
-    assert state.background_fallback == "completion_candidate"
+    assert state.status == "accepted"
+    assert state.default_variant == "accepted_base"
+    assert state.background_fallback == "none"
+    assert state.variants.generated_background.status == "unavailable"
     assert clip.references.entities[0].synthetic is True
+    assert clip.references.entities[0].source_frame_index == (
+        canonical.source_frame_index
+    )
     assert clip.references.entities[0].completion_needed_for_reference_use is True
     assert clip.references.entities[0].detached_target_fragments_present is True
 
 
-def test_repairable_completion_rejection_overrides_keep_source_policy(
+def test_repairable_completion_rejection_falls_back_to_source_alpha(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5600,19 +5566,172 @@ def test_repairable_completion_rejection_overrides_keep_source_policy(
 
     clip = storage.read_clip("clip-1")
     reference = clip.references.entities[0]
-    assert stats.entities_fallback == 0
-    assert stats.entities_rejected == 1
-    assert clip.pairing.status == "rejected"
-    assert clip.pairing.reason == "no_qualifying_ready_reference"
-    assert clip.reference_edit.entities[0].status == "rejected"
-    assert clip.reference_edit.entities[0].fallback_policy == "reject_entity"
-    assert len(backend.calls) == 1
+    assert stats.entities_fallback == 1
+    assert stats.entities_rejected == 0
+    assert clip.pairing.status == "ready"
+    assert clip.reference_edit.entities[0].status == "fallback"
+    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert len(backend.calls) == 2
+    assert stats.completion_candidate2_attempts == 1
+    assert stats.completion_fallback_to_alpha == 1
     assert reference.synthetic is False
-    assert reference.status == "rejected"
-    assert reference.image_path is None
-    assert reference.scope_reason.startswith("repairable_completion_rejected:")
+    assert reference.status == "ready"
+    assert reference.image_path == source_reference.image_path
     assert source_path.read_bytes() == source_bytes
     assert source_reference.status == "ready"
+
+
+def test_repairable_candidate2_completion_can_beat_canonical_alpha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0]
+    judge = _ReferenceEditJudge(accept_sequence=[False, True])
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=judge,
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert len(backend.calls) == 2
+    assert stats.completion_attempts == 2
+    assert stats.completion_candidate1_accepted == 0
+    assert stats.completion_candidate2_attempts == 1
+    assert stats.completion_candidate2_accepted == 1
+    assert stats.completion_fallback_to_alpha == 0
+    assert judge.requests[0]["comparison_source_rgb"] is None
+    assert isinstance(judge.requests[1]["comparison_source_rgb"], Image.Image)
+    edit_dir = storage.reference_edit_dir("clip-1") / "e1"
+    assert (edit_dir / "alternate_source_2.png").is_file()
+    with Image.open(edit_dir / "alternate_source_2.png") as alternate_source:
+        assert alternate_source.mode == "RGBA"
+    alternate_metadata = json.loads(
+        (edit_dir / "alternate_source_2.json").read_text(encoding="utf-8")
+    )
+    assert alternate_metadata["source_frame_index"] != canonical.source_frame_index
+    assert alternate_metadata["candidate_id"].startswith("candidate_")
+    assert isinstance(alternate_metadata["frame_slot"], int)
+    assert alternate_metadata["source_image_path"].endswith(".jpg")
+    assert len(alternate_metadata["source_image_sha256"]) == 64
+    assert len(alternate_metadata["alternate_source_sha256"]) == 64
+    completion_metadata = json.loads(
+        (edit_dir / "completion_metadata_2.json").read_text(encoding="utf-8")
+    )
+    assert completion_metadata["completion_attempt_index"] == 2
+    assert completion_metadata["completion_source_candidate_id"].startswith(
+        "candidate_"
+    )
+    assert completion_metadata["completion_source_frame_index"] == (
+        alternate_metadata["source_frame_index"]
+    )
+    assert completion_metadata["source_input_rgb_path"].endswith(
+        "completion_source_input_rgb_2.png"
+    )
+    assert completion_metadata["comparison_source_image_path"] == canonical.image_path
+    assert len(completion_metadata["comparison_source_image_sha256"]) == 64
+    state = storage.read_clip("clip-1").reference_edit.entities[0]
+    final_reference = storage.read_clip("clip-1").references.entities[0]
+    assert state.status == "accepted"
+    assert state.default_variant == "accepted_base"
+    assert state.default_reason == "completion_candidate_2_review_accepted"
+    assert state.output_image_path != canonical.image_path
+    assert final_reference.source_frame_index == (
+        alternate_metadata["source_frame_index"]
+    )
+
+
+def test_legacy_completion_metadata_falls_back_to_canonical_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0]
+    reference_edit_clips(
+        config,
+        storage,
+        backend=_ReferenceEditBackend(),
+        judge=_ReferenceEditJudge(),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+    edit_dir = storage.reference_edit_dir("clip-1") / "e1"
+    metadata_path = edit_dir / "final_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("completion_source_frame_index")
+    write_json_atomic(metadata_path, metadata)
+
+    accepted = reference_edit_module._accepted_reference(
+        storage,
+        canonical,
+        clip_uid="clip-1",
+        output_path=edit_dir / "final_reference_1k.png",
+        metadata_path=metadata_path,
+    )
+
+    assert accepted.source_frame_index == canonical.source_frame_index
+
+
+def test_cross_pair_canonical_uses_highest_ranked_local_completion_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, monkeypatch, reference_edit_enabled=True)
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    canonical = storage.read_clip("clip-1").references.entities[0].model_copy(
+        update={"source_clip_uid": "other-clip", "source_entity_id": "e1"}
+    )
+
+    alternate = reference_edit_module._alternate_completion_source(
+        config,
+        storage,
+        clip_uid="clip-1",
+        entity=storage.read_clip("clip-1").annotation.entities[0],
+        canonical_reference=canonical,
+    )
+
+    assert alternate is not None
+    assert alternate.candidate.candidate_id == "candidate_1"
+    assert alternate.candidate.source_frame_index == 10
+
+
+def test_repairable_without_alternate_source_attempts_completion_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(
+        tmp_path,
+        monkeypatch,
+        reference_edit_enabled=True,
+        pair=PairConfig(max_candidates_per_entity=1),
+    )
+    storage = _storage(config, entity_types=("subject",))
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
+    backend = _ReferenceEditBackend()
+
+    stats = reference_edit_clips(
+        config,
+        storage,
+        backend=backend,
+        judge=_ReferenceEditJudge(accept=False),
+        sam_reviewer=_ReferenceEditSamReviewer(),
+    )
+
+    assert len(backend.calls) == 1
+    assert stats.completion_attempts == 1
+    assert stats.completion_candidate2_attempts == 0
+    assert stats.completion_fallback_to_alpha == 1
+    state = storage.read_clip("clip-1").reference_edit.entities[0]
+    assert state.default_variant == "alpha"
+    assert state.output_image_path == state.source_image_path
 
 
 def test_reference_edit_overwrite_restores_immutable_source_reference(
@@ -5625,7 +5744,7 @@ def test_reference_edit_overwrite_restores_immutable_source_reference(
         reference_edit_enabled=True,
     )
     storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
     source_path = storage.selected_entity_path("clip-1", "e1")
     source_bytes = source_path.read_bytes()
     reference_edit_clips(
@@ -5667,7 +5786,7 @@ def test_reference_edit_worker_failure_is_logged_and_falls_back(
         reference_edit_enabled=True,
     )
     storage = _storage(config, entity_types=("subject",))
-    pair_clips(config, storage, judge=_Judge())
+    pair_clips(config, storage, judge=_Judge({"e1": "repairable"}))
 
     stats = reference_edit_clips(
         config,
@@ -5690,7 +5809,7 @@ def test_reference_edit_worker_failure_is_logged_and_falls_back(
     assert failures[-1]["reason"].startswith("boogu_reference_edit_failed:")
 
 
-def test_repairable_completion_backend_failure_rejects_entity(
+def test_repairable_completion_backend_failure_falls_back_to_alpha(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5710,19 +5829,18 @@ def test_repairable_completion_backend_failure_rejects_entity(
 
     clip = storage.read_clip("clip-1")
     assert stats.entities_failed == 1
-    assert stats.entities_rejected == 1
-    assert stats.entities_fallback == 0
-    assert clip.references.entities[0].status == "rejected"
-    assert clip.reference_edit.entities[0].status == "rejected"
+    assert stats.entities_rejected == 0
+    assert stats.entities_fallback == 1
+    assert clip.references.entities[0].status == "ready"
+    assert clip.reference_edit.entities[0].status == "fallback"
     assert clip.reference_edit.entities[0].reason.startswith(
         "repairable_completion_rejected:boogu_reference_edit_failed:"
     )
-    assert clip.pairing.status == "rejected"
-    assert clip.pairing.reason == "no_qualifying_ready_reference"
+    assert clip.pairing.status == "ready"
     assert source_path.read_bytes() == source_bytes
 
 
-def test_local_usable_background_rejection_keeps_source(
+def test_local_usable_never_invokes_background_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5733,24 +5851,28 @@ def test_local_usable_background_rejection_keeps_source(
     source_path = storage.selected_entity_path("clip-1", "e1")
     source_bytes = source_path.read_bytes()
 
+    backend = _ReferenceEditBackend()
+    judge = _ReferenceEditJudge(accept=False)
     stats = reference_edit_clips(
         config,
         storage,
-        backend=_ReferenceEditBackend(),
-        judge=_ReferenceEditJudge(accept=False),
+        backend=backend,
+        judge=judge,
         sam_reviewer=_ReferenceEditSamReviewer(),
     )
 
     clip = storage.read_clip("clip-1")
-    assert stats.entities_fallback == 1
+    assert stats.entities_accepted == 1
     assert stats.entities_rejected == 0
     assert clip.references.entities[0] == source
-    assert clip.reference_edit.entities[0].status == "fallback"
-    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
+    assert clip.reference_edit.entities[0].status == "not_required"
+    assert clip.reference_edit.entities[0].default_variant == "alpha"
+    assert backend.calls == []
+    assert judge.calls == []
     assert source_path.read_bytes() == source_bytes
 
 
-def test_scale_collapse_guard_off_preserves_keep_source(
+def test_legacy_scale_collapse_guard_config_does_not_enable_background_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5773,13 +5895,13 @@ def test_scale_collapse_guard_off_preserves_keep_source(
 
     clip = storage.read_clip("clip-1")
     assert clip.references.entities[0] == source
-    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
-    assert clip.reference_edit.entities[0].reason == "entity_scale_collapsed"
+    assert clip.reference_edit.entities[0].status == "not_required"
+    assert clip.reference_edit.entities[0].default_variant == "alpha"
     assert stats.scale_collapse_guard_attempted == 0
     assert guard.calls == []
 
 
-def test_scale_collapse_guard_accept_keeps_source_and_writes_diagnostic(
+def test_legacy_scale_collapse_guard_is_not_called_for_local_alpha(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5800,7 +5922,6 @@ def test_scale_collapse_guard_accept_keeps_source_and_writes_diagnostic(
     storage = _storage(config, entity_types=("subject",))
     pair_clips(config, storage, judge=_Judge({"e1": "local_incomplete"}))
     source = storage.read_clip("clip-1").references.entities[0]
-    source_path = storage.root / source.image_path
     guard = _ScaleCollapseFallbackJudge()
 
     stats = reference_edit_clips(
@@ -5817,30 +5938,19 @@ def test_scale_collapse_guard_accept_keeps_source_and_writes_diagnostic(
     clip = storage.read_clip("clip-1")
     assert clip.references.entities[0] == source
     assert clip.references.entities[0].synthetic is False
-    assert stats.scale_collapse_guard_attempted == 1
-    assert stats.scale_collapse_guard_accepted == 1
+    assert stats.scale_collapse_guard_attempted == 0
+    assert stats.scale_collapse_guard_accepted == 0
     assert stats.scale_collapse_guard_rejected == 0
     assert stats.scale_collapse_guard_failed_open == 0
-    assert len(guard.calls) == 1
-    reviewed = guard.calls[0]["image"]
-    with Image.open(source_path) as opened:
-        assert reviewed.mode == opened.mode
-        assert reviewed.size == opened.size
-        assert reviewed.tobytes() == opened.tobytes()
-    diagnostic = json.loads(
-        (
-            storage.reference_edit_dir("clip-1")
-            / "e1"
-            / "scale_collapse_fallback_guard.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert diagnostic["verdict"] == "accept"
-    assert diagnostic["final_action"] == "keep_source"
-    assert diagnostic["raw_response"]
-    assert diagnostic["error"] is None
+    assert guard.calls == []
+    assert not (
+        storage.reference_edit_dir("clip-1")
+        / "e1"
+        / "scale_collapse_fallback_guard.json"
+    ).exists()
 
 
-def test_scale_collapse_guard_rejects_only_qualifying_entity(
+def test_legacy_scale_collapse_guard_cannot_reject_local_alpha(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5870,17 +5980,16 @@ def test_scale_collapse_guard_rejects_only_qualifying_entity(
     )
 
     clip = storage.read_clip("clip-1")
-    assert stats.entities_rejected == 1
-    assert stats.entities_fallback == 0
-    assert stats.scale_collapse_guard_attempted == 1
-    assert stats.scale_collapse_guard_rejected == 1
-    assert clip.references.entities[0].status == "rejected"
-    assert clip.reference_edit.entities[0].fallback_policy == "reject_entity"
-    assert clip.pairing.status == "rejected"
-    assert clip.pairing.reason == "no_qualifying_ready_reference"
+    assert stats.entities_rejected == 0
+    assert stats.entities_accepted == 1
+    assert stats.scale_collapse_guard_attempted == 0
+    assert stats.scale_collapse_guard_rejected == 0
+    assert clip.references.entities[0].status == "ready"
+    assert clip.reference_edit.entities[0].default_variant == "alpha"
+    assert clip.pairing.status == "ready"
 
 
-def test_scale_collapse_guard_rejects_one_while_qualifying_reference_remains(
+def test_legacy_scale_collapse_guard_cannot_reject_subject_or_object_alpha(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5915,16 +6024,16 @@ def test_scale_collapse_guard_rejects_one_while_qualifying_reference_remains(
 
     clip = storage.read_clip("clip-1")
     by_id = {reference.entity_id: reference for reference in clip.references.entities}
-    assert stats.scale_collapse_guard_attempted == 2
-    assert stats.scale_collapse_guard_accepted == 1
-    assert stats.scale_collapse_guard_rejected == 1
+    assert stats.scale_collapse_guard_attempted == 0
+    assert stats.scale_collapse_guard_accepted == 0
+    assert stats.scale_collapse_guard_rejected == 0
     assert by_id["e1"].status == "ready"
-    assert by_id["e2"].status == "rejected"
+    assert by_id["e2"].status == "ready"
     assert clip.pairing.status == "ready"
-    assert clip.pairing.retained_entity_ids == ["e1"]
+    assert clip.pairing.retained_entity_ids == ["e1", "e2"]
 
 
-def test_scale_collapse_guard_technical_failure_fails_open(
+def test_legacy_scale_collapse_guard_failure_is_unreachable_without_background(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5956,9 +6065,10 @@ def test_scale_collapse_guard_technical_failure_fails_open(
 
     clip = storage.read_clip("clip-1")
     assert clip.references.entities[0] == source
-    assert clip.reference_edit.entities[0].fallback_policy == "keep_source"
-    assert stats.scale_collapse_guard_attempted == 1
-    assert stats.scale_collapse_guard_failed_open == 1
+    assert clip.reference_edit.entities[0].status == "not_required"
+    assert clip.reference_edit.entities[0].default_variant == "alpha"
+    assert stats.scale_collapse_guard_attempted == 0
+    assert stats.scale_collapse_guard_failed_open == 0
     assert stats.scale_collapse_guard_accepted == 0
     assert stats.scale_collapse_guard_rejected == 0
 

@@ -224,7 +224,6 @@ class SubjectAttributeGmeConfig:
 class SubjectAttributeCompletionConfig:
     enabled: bool = False
     eligible_types: tuple[str, ...] = (
-        "face",
         "headwear",
         "accessory",
         "upper_clothing",

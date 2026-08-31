@@ -345,6 +345,7 @@ def _run_streaming_pipeline(
         ]
         if (
             "subject_attributes" in clip_stages
+            and config.subject_attributes.completion.enabled
             and attribute_completion_backend is None
             and (
                 config.runtime.gpu_workers.reference_edit is not None
@@ -479,13 +480,16 @@ def _run_streaming_pipeline(
                         inference_lock=attribute_inference_lock,
                     )
                 )
-            if attribute_completion_backend is None:
+            if (
+                config.subject_attributes.completion.enabled
+                and attribute_completion_backend is None
+            ):
                 completion_process = processes.get(
                     "attribute_completion"
                 ) or processes.get("reference_edit")
                 if isinstance(completion_process, PersistentStageProcessPool):
                     raise ValueError(
-                        "attribute variants require persistent Boogu worker"
+                        "attribute completion requires persistent Boogu worker"
                     )
                 if completion_process is not None:
                     attribute_completion_backend = completion_process

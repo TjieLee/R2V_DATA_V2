@@ -54,7 +54,7 @@ def _completion_review(*, accept: bool = True) -> BooguCompletionReview:
         "identity_preserved": accept,
         "original_visible_attributes_preserved": accept,
         "exactly_one_entity": accept,
-        "missing_parts_plausibly_completed": accept,
+        "candidate_better_than_source": accept,
         "no_duplicate_entity": accept,
         "no_unrelated_entity": accept,
         "no_severe_structure_artifact": accept,
@@ -497,6 +497,77 @@ def test_composition_geometry_failure_rejects_candidate_publication(
     )
     rejection = json.loads(result.rejection_path.read_text(encoding="utf-8"))
     assert rejection["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("reason", "scale_ratio", "center_shift"),
+    [
+        ("entity_scale_collapsed", 0.4, 0.0),
+        ("entity_shifted_off_layout", 1.0, 0.35),
+    ],
+)
+def test_completion_source_relative_geometry_is_diagnostic_not_hard_reject(
+    tmp_path: Path,
+    reason: str,
+    scale_ratio: float,
+    center_shift: float,
+) -> None:
+    run_root, _, _ = _environment(tmp_path)
+    judge = _Judge()
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=judge,
+        sam_reviewer=_SamReviewer(
+            geometry=_geometry_diagnostics(
+                reason,
+                scale_ratio=scale_ratio,
+                center_shift=center_shift,
+            )
+        ),
+    )
+
+    assert result.status == "accepted"
+    assert len(judge.calls) == 1
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["geometry_gate_passed"] is False
+    assert metadata["geometry_rejection_reason"] == reason
+    assert metadata["qwen_review"]["verdict"] == "accept"
+
+
+def test_completion_review_prompt_allows_spatial_change_but_rejects_distortion() -> None:
+    prompt = " ".join(boogu_module._COMPLETION_REVIEW_PROMPT.split())
+    assert "A modest real improvement" in prompt
+    assert "equivalent, keep the source" in prompt
+    assert "Image 2 is alternate source evidence for Image 3" in prompt
+    assert "Reasonable spatial changes are allowed" in prompt
+    assert "recentered" in prompt
+    assert "conditioning reference" in prompt
+    assert "extreme corner or edge" in prompt
+    assert "stretched or compressed body proportions" in prompt
+    assert "warped anatomy" in prompt
+    assert "distorted object proportions" in prompt
+    assert "significantly" not in prompt.lower()
+    assert "materially" not in prompt.lower()
+    assert "substantially better" not in prompt.lower()
+
+
+def test_legacy_completion_review_maps_old_improvement_flag() -> None:
+    payload = _completion_review().model_dump(mode="json")
+    payload["missing_parts_plausibly_completed"] = payload.pop(
+        "candidate_better_than_source"
+    )
+
+    review = BooguCompletionReview.model_validate(payload)
+
+    assert review.candidate_better_than_source is True
 
 
 def test_small_composition_change_passes_geometry_gate(tmp_path: Path) -> None:
@@ -1535,6 +1606,81 @@ def test_production_qwen_boogu_reviewer_uses_structured_two_image_review() -> No
     assert not any("mask" in str(item).lower() for item in user_content)
 
 
+def test_attempt2_qwen_review_uses_canonical_alternate_and_candidate_images() -> None:
+    completions = _ReviewCompletions(_completion_review().model_dump(mode="json"))
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+    review = judge.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (12, 10), (1, 2, 3, 255)),
+        source_input_rgb=Image.new("RGB", (12, 10), (11, 12, 13)),
+        comparison_source_rgb=Image.new("RGB", (12, 10), (21, 22, 23)),
+        candidate_rgb=Image.new("RGB", (32, 32), (31, 32, 33)),
+        entity_phrase="a person in a blue coat",
+        reference_type="subject",
+    )
+
+    assert review.verdict == "accept"
+    user_content = completions.calls[0]["messages"][1]["content"]
+    labels = [
+        item["text"] for item in user_content if item.get("type") == "text"
+    ]
+    assert sum(item["type"] == "image_url" for item in user_content) == 3
+    assert labels[-3:] == [
+        "Image 1: canonical source reference",
+        "Image 2: alternate source evidence only",
+        "Image 3: generated candidate",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation", "false_flag"),
+    [
+        ("complete_entity", "no_severe_structure_artifact"),
+        ("complete_entity", "candidate_better_than_source"),
+        ("add_entity_background", "no_halo_or_seam"),
+    ],
+)
+def test_qwen_boogu_reviewer_normalizes_verdict_from_complete_flags(
+    operation: str,
+    false_flag: str,
+) -> None:
+    payload = (
+        _completion_review().model_dump(mode="json")
+        if operation == "complete_entity"
+        else _background_review().model_dump(mode="json")
+    )
+    payload[false_flag] = False
+    payload["verdict"] = "accept"
+    completions = _ReviewCompletions(payload)
+    judge = QwenBooguReferenceEditJudge(
+        QwenServiceConfig(model="/models/qwen"),
+        client=SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+            close=lambda: None,
+        ),
+    )
+
+    review = judge.review(
+        operation=operation,
+        source_rgba=Image.new("RGBA", (12, 10), (1, 2, 3, 255)),
+        source_input_rgb=Image.new("RGB", (12, 10), (1, 2, 3)),
+        candidate_rgb=Image.new("RGB", (32, 32), (4, 5, 6)),
+        entity_phrase="a person in a blue coat",
+        reference_type="subject",
+    )
+
+    assert review.verdict == "reject"
+    assert getattr(review, false_flag) is False
+    assert len(completions.calls) == 1
+
+
 def test_qwen_boogu_review_repair_and_operations_are_profiled(
     tmp_path: Path,
 ) -> None:
@@ -1680,6 +1826,60 @@ def test_production_sam3_boogu_reviewer_is_review_only_and_tracks_ten_frames(
     assert backend.calls[0]["grounding_prompt"] == "the blue object"
 
 
+def test_completion_accepts_threefold_area_growth_and_records_legacy_limit(
+    tmp_path: Path,
+) -> None:
+    run_root, canonical, _ = _environment(tmp_path, size=(10, 10))
+    source = Image.new("RGBA", (10, 10), (20, 180, 70, 0))
+    source_alpha = np.zeros((10, 10), dtype=np.uint8)
+    source_alpha[3:7, 3:7] = 255
+    source.putalpha(Image.fromarray(source_alpha, mode="L"))
+    source.save(canonical, format="PNG")
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[1:7, 1:9] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path / "sam",
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+    judge = _Judge()
+
+    result = run_boogu_reference_edit(
+        run_root=run_root,
+        clip_uid="clip-1",
+        entity_id="e1",
+        operation="complete_entity",
+        instruction="Complete the same entity.",
+        entity_phrase="the object",
+        reference_type="object",
+        backend=_Backend(),
+        judge=judge,
+        sam_reviewer=reviewer,
+        target_area=100,
+        alignment=1,
+        min_source_content_area_pixels=1,
+        min_source_content_long_side_pixels=1,
+    )
+
+    assert result.status == "accepted"
+    assert len(judge.calls) == 1
+    metadata = json.loads(result.metadata_path.read_text(encoding="utf-8"))
+    sam_review = metadata["sam_review"]
+    assert sam_review["passed"] is True
+    assert sam_review["area_growth_acceptable"] is True
+    assert sam_review["diagnostics"]["source_area_ratio"] == pytest.approx(0.16)
+    assert sam_review["diagnostics"]["candidate_area_ratio"] == pytest.approx(0.48)
+    assert sam_review["diagnostics"]["area_growth_ratio"] == pytest.approx(3.0)
+    assert (
+        sam_review["diagnostics"][
+            "source_relative_area_growth_within_legacy_limit"
+        ]
+        is False
+    )
+    assert sam_review["diagnostics"]["failure_kind"] == "none"
+
+
 def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
     tmp_path: Path,
 ) -> None:
@@ -1705,6 +1905,56 @@ def test_production_sam3_boogu_reviewer_rejects_excessive_area_growth(
     assert review.passed is False
     assert review.area_growth_acceptable is False
     assert review.diagnostics["failure_kind"] == "excessive_area_growth"
+    assert (
+        review.diagnostics["source_relative_area_growth_within_legacy_limit"]
+        is False
+    )
+
+
+def test_completion_sam_still_rejects_multiple_instances(tmp_path: Path) -> None:
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamAmbiguousInstancesBackend(),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=2,
+    )
+
+    review = reviewer.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.exactly_one_target_instance is False
+    assert review.diagnostics["failure_kind"] == "multiple_instances"
+
+
+def test_completion_sam_still_rejects_fragmentation(tmp_path: Path) -> None:
+    candidate_mask = np.zeros((10, 10), dtype=bool)
+    candidate_mask[:4, :4] = True
+    candidate_mask[6:, 6:] = True
+    reviewer = Sam3BooguReferenceReviewer(
+        _SamTrackBackend(candidate_mask),
+        temporary_root=tmp_path,
+        max_area_growth_ratio=2.0,
+        max_significant_components=1,
+    )
+
+    review = reviewer.review(
+        operation="complete_entity",
+        source_rgba=Image.new("RGBA", (10, 10), (1, 2, 3, 255)),
+        candidate_rgb=Image.new("RGB", (10, 10), (4, 5, 6)),
+        entity_phrase="the object",
+        reference_type="object",
+    )
+
+    assert review.passed is False
+    assert review.area_growth_acceptable is True
+    assert review.fragmentation_acceptable is False
+    assert review.diagnostics["failure_kind"] == "fragmented"
 
 
 def test_production_sam3_empty_mask_is_not_found_without_fake_geometry(

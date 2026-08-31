@@ -539,31 +539,6 @@ class PersistentStageProcess:
             raise TypeError("reference_edit worker omitted attribute completion")
         return completion
 
-    def attribute_background(
-        self,
-        *,
-        source_path: Path,
-        output_path: Path,
-        instruction: str,
-        seed: int,
-    ) -> dict[str, object]:
-        if self.config.stage != "reference_edit":
-            raise RuntimeError("attribute background requires reference_edit worker")
-        with self._request_lock:
-            response = self._exchange(
-                {
-                    "type": "attribute_background",
-                    "source_path": str(source_path),
-                    "output_path": str(output_path),
-                    "instruction": instruction,
-                    "seed": seed,
-                }
-            )
-        result = response.get("background")
-        if not isinstance(result, dict):
-            raise TypeError("reference_edit worker omitted attribute background")
-        return result
-
     def close(self) -> None:
         process = self._process
         if process is None:
