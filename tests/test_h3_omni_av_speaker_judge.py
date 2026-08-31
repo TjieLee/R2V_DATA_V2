@@ -51,6 +51,7 @@ from r2v_data_v2.h3.schemas import (
     H3TaskSpecification,
 )
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
+from tools.render_h3_omni_av_speaker_media import _is_target_frame
 
 _HASH = "a" * 64
 _SAMPLE_RATE = 16000
@@ -591,6 +592,10 @@ def test_read_only_pilot_runs_blind_two_pass_policy_and_preserves_sources(
     assert not records[0]["multiple_speakers_confirmed"]
     assert not records[0]["subject_entity_binding_excluded"]
     assert not records[0]["identity_specific_voice_products_excluded"]
+    assert (
+        records[0]["media_provenance"]["media_construction_policy"]
+        == "neutral_faces_with_target_interval_marker_v1"
+    )
     assert records[1]["comparison"] == "disagree"
     assert records[1]["primary_observation_stable"]
     assert records[1]["proposed_entity_id"] == "e1"
@@ -607,6 +612,10 @@ def test_read_only_pilot_runs_blind_two_pass_policy_and_preserves_sources(
     for video_call, audio_call in zip(media.video_calls, media.audio_calls, strict=True):
         assert video_call["window_start"] == audio_call["window_start"]
         assert video_call["window_end"] == audio_call["window_end"]
+        assert video_call["window_start"] <= video_call["target_start"]
+        assert video_call["target_end"] <= video_call["window_end"]
+        assert "target_start" not in audio_call
+        assert "target_end" not in audio_call
         timeline = video_call["timeline"]
         payload = timeline.model_dump(mode="json")
         assert {sample["label"] for sample in payload["samples"]} == {
@@ -721,9 +730,12 @@ def test_non_speech_vocalization_does_not_create_secondary_speech() -> None:
         assert "sighing" in normalized
         assert "speech-turn ownership" in normalized
         assert "briefly audible" in normalized
-    assert PASS1_PROMPT_VERSION.endswith("_v3")
-    assert PASS2_PROMPT_VERSION.endswith("_v3")
-    assert OMNI_AV_SPEAKER_POLICY_VERSION.endswith("_v3")
+        assert "frames marked target" in normalized
+        assert "context only" in normalized
+        assert "full context window" in normalized
+    assert PASS1_PROMPT_VERSION.endswith("_v4")
+    assert PASS2_PROMPT_VERSION.endswith("_v4")
+    assert OMNI_AV_SPEAKER_POLICY_VERSION.endswith("_v4")
 
 
 def test_true_competing_speech_excludes_subject_and_voice_products(
@@ -905,6 +917,8 @@ def test_synchronized_media_tail_overflow_is_clipped_for_model_only(
         record["effective_absolute_segment_end"] - record["window_start"]
     )
     assert media.video_calls[0]["window_end"] == pytest.approx(5.0)
+    assert media.video_calls[0]["target_start"] == pytest.approx(4.5)
+    assert media.video_calls[0]["target_end"] == pytest.approx(5.0)
     assert media.audio_calls[0]["window_end"] == pytest.approx(5.0)
     assert all(path.read_bytes() == content for path, content in source_bytes.items())
 
@@ -1307,3 +1321,16 @@ def test_neutral_timeline_and_renderer_never_expose_speaking_state(tmp_path: Pat
     assert "backend_native_active" not in helper
     assert "raw_class1_logit" not in helper
     assert "(0, 210, 0)" not in helper
+    assert '"TARGET"' in helper
+    assert "draft_entity_id" not in helper
+
+
+def test_target_marker_uses_exact_half_open_authoritative_interval() -> None:
+    assert not _is_target_frame(0.749999, target_start=0.75, target_end=1.15)
+    assert _is_target_frame(0.75, target_start=0.75, target_end=1.15)
+    assert _is_target_frame(1.149999, target_start=0.75, target_end=1.15)
+    assert not _is_target_frame(1.15, target_start=0.75, target_end=1.15)
+
+    # A raw terminal overrun is clipped to the authoritative synchronized end.
+    assert _is_target_frame(4.999999, target_start=4.5, target_end=5.0)
+    assert not _is_target_frame(5.0, target_start=4.5, target_end=5.0)

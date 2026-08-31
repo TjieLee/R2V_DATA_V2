@@ -7,14 +7,20 @@ artifacts, or final H3 samples. Proposed identities are diagnostic only.
 Each explicitly selected raw DiariZen segment receives a synchronized context
 window from 0.75 seconds before the segment through 0.75 seconds after it,
 clipped to the common source boundary. The same absolute boundaries drive both
-the neutral review video and the canonical full-audio trim.
+the neutral review video and the canonical full-audio trim. Within that video,
+source frames whose timestamps fall in the authoritative half-open target
+interval `[raw start, effective end)` receive a neutral grayscale `TARGET`
+label and border. The effective end is the existing synchronized EOF-clipped
+end; the marker does not introduce timing tolerance or alter the interval.
 
-The video displays only neutral `eN` or `OTHER` face labels. It never displays
-LR-ASD active state, score, current draft binding, DiariZen status, audit flags,
-or ASR text. The model receives only the neutral video, canonical trimmed audio,
-target interval relative to the window, and visible mapped entity IDs. Human QA
-labels may be retained in the pilot manifest but are never included in a model
-request.
+The `TARGET` marker is purely temporal. It never identifies or highlights a
+speaker. Face labels remain the same neutral `eN` or `OTHER` labels, and the
+video never displays LR-ASD active state, score, current draft binding,
+DiariZen status, audit flags, or ASR text. Context frames before and after the
+marked interval remain in the video to support AV continuity. Canonical trimmed
+audio still covers the full synchronized context window and is unchanged by the
+visual marker. Human QA labels may be retained in the pilot manifest but are
+never included in a model request.
 
 The V3 observation has two independent axes:
 
@@ -90,7 +96,8 @@ python tools/run_h3_omni_av_speaker_judge.py \
   --served-model-name Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --checkpoint-id Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --media-mode file \
-  --media-root /mnt/workspace
+  --media-root /mnt/workspace \
+  --overwrite
 ```
 
 ## Random200 Controls
@@ -117,7 +124,8 @@ python tools/run_h3_omni_av_speaker_judge.py \
   --served-model-name Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --checkpoint-id Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --media-mode file \
-  --media-root /mnt/workspace
+  --media-root /mnt/workspace \
+  --overwrite
 ```
 
 Outputs are atomically published as `manifest.jsonl`, `records.jsonl`,

@@ -29,12 +29,56 @@ def _visible_samples(
     return visible
 
 
+def _is_target_frame(
+    timestamp: float,
+    *,
+    target_start: float,
+    target_end: float,
+) -> bool:
+    return target_start <= timestamp < target_end
+
+
+def _draw_target_marker(frame: object, *, cv2: object, width: int, height: int) -> None:
+    color = (220, 220, 220)
+    cv2.rectangle(frame, (3, 3), (max(3, width - 4), max(3, height - 4)), color, 4)
+    font_scale = max(0.7, min(1.2, width / 1000))
+    thickness = max(2, round(font_scale * 2))
+    (text_width, text_height), baseline = cv2.getTextSize(
+        "TARGET",
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        thickness,
+    )
+    x = max(8, (width - text_width) // 2)
+    top = 8
+    bottom = min(height - 4, top + text_height + baseline + 12)
+    cv2.rectangle(
+        frame,
+        (max(0, x - 10), top),
+        (min(width - 1, x + text_width + 10), bottom),
+        (48, 48, 48),
+        -1,
+    )
+    cv2.putText(
+        frame,
+        "TARGET",
+        (x, min(height - 8, top + text_height + 5)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--timeline", type=Path, required=True)
     parser.add_argument("--window-start", type=float, required=True)
     parser.add_argument("--window-end", type=float, required=True)
+    parser.add_argument("--target-start", type=float, required=True)
+    parser.add_argument("--target-end", type=float, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     arguments = parser.parse_args(argv)
@@ -43,6 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         or not math.isfinite(arguments.window_end)
         or arguments.window_start < 0
         or arguments.window_end <= arguments.window_start
+        or not math.isfinite(arguments.target_start)
+        or not math.isfinite(arguments.target_end)
+        or arguments.target_start < arguments.window_start
+        or arguments.target_end <= arguments.target_start
+        or arguments.target_end > arguments.window_end
     ):
         raise ValueError("neutral review window is invalid")
 
@@ -86,6 +135,17 @@ def main(argv: list[str] | None = None) -> int:
             if not ok:
                 break
             timestamp = frame_index / fps
+            if _is_target_frame(
+                timestamp,
+                target_start=arguments.target_start,
+                target_end=arguments.target_end,
+            ):
+                _draw_target_marker(
+                    frame,
+                    cv2=cv2,
+                    width=width,
+                    height=height,
+                )
             for sample in _visible_samples(samples, timestamp):
                 x1, y1, x2, y2 = [float(value) for value in sample["bbox_xyxy"]]
                 scaled = (

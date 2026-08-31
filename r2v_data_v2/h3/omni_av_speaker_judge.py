@@ -38,12 +38,13 @@ from r2v_data_v2.structured_output import (
 )
 
 OMNI_AV_SPEAKER_MANIFEST_VERSION = "r2v.h3.omni_av_speaker_judge_manifest.1"
-OMNI_AV_SPEAKER_RECORD_VERSION = "r2v.h3.omni_av_speaker_judge_record.2"
+OMNI_AV_SPEAKER_RECORD_VERSION = "r2v.h3.omni_av_speaker_judge_record.3"
 OMNI_AV_SPEAKER_RAW_VERSION = "r2v.h3.omni_av_speaker_judge_raw.1"
-OMNI_AV_SPEAKER_SUMMARY_VERSION = "r2v.h3.omni_av_speaker_judge_summary.2"
-OMNI_AV_SPEAKER_POLICY_VERSION = "h3_omni_av_speaker_judge_pilot_v3"
-PASS1_PROMPT_VERSION = "h3_omni_av_speaker_blind_identification_v3"
-PASS2_PROMPT_VERSION = "h3_omni_av_speaker_blind_verification_v3"
+OMNI_AV_SPEAKER_SUMMARY_VERSION = "r2v.h3.omni_av_speaker_judge_summary.3"
+OMNI_AV_SPEAKER_POLICY_VERSION = "h3_omni_av_speaker_judge_pilot_v4"
+PASS1_PROMPT_VERSION = "h3_omni_av_speaker_blind_identification_v4"
+PASS2_PROMPT_VERSION = "h3_omni_av_speaker_blind_verification_v4"
+MEDIA_CONSTRUCTION_POLICY = "neutral_faces_with_target_interval_marker_v1"
 DEFAULT_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 CONTEXT_SECONDS = 0.75
 
@@ -186,8 +187,10 @@ class OmniAVSpeakerBackendProvenance(SchemaModel):
     media_mode: Literal["file", "http"]
     media_root: str
     media_base_url: str | None = None
-    input_modality: Literal["neutral_video_plus_canonical_trimmed_audio"] = (
-        "neutral_video_plus_canonical_trimmed_audio"
+    input_modality: Literal[
+        "target_marked_neutral_video_plus_canonical_trimmed_audio"
+    ] = (
+        "target_marked_neutral_video_plus_canonical_trimmed_audio"
     )
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
     temperature: Literal[0.0] = 0.0
@@ -195,12 +198,12 @@ class OmniAVSpeakerBackendProvenance(SchemaModel):
     max_tokens: int = Field(gt=0)
     repair_retries: Literal[1] = 1
     pass1_prompt_version: Literal[
-        "h3_omni_av_speaker_blind_identification_v3"
+        "h3_omni_av_speaker_blind_identification_v4"
     ] = PASS1_PROMPT_VERSION
     pass2_prompt_version: Literal[
-        "h3_omni_av_speaker_blind_verification_v3"
+        "h3_omni_av_speaker_blind_verification_v4"
     ] = PASS2_PROMPT_VERSION
-    policy_version: Literal["h3_omni_av_speaker_judge_pilot_v3"] = (
+    policy_version: Literal["h3_omni_av_speaker_judge_pilot_v4"] = (
         OMNI_AV_SPEAKER_POLICY_VERSION
     )
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -239,7 +242,9 @@ class OmniAVSpeakerJudgeConfig:
             "media_mode": self.media_resolver.mode,
             "media_root": str(self.media_resolver.media_root),
             "media_base_url": self.media_resolver.media_base_url,
-            "input_modality": "neutral_video_plus_canonical_trimmed_audio",
+            "input_modality": (
+                "target_marked_neutral_video_plus_canonical_trimmed_audio"
+            ),
             "output_modalities": ["text"],
             "temperature": 0.0,
             "enable_thinking": False,
@@ -326,6 +331,12 @@ The attached video uses neutral face labels. Labels e1, e2, and so on identify
 visible mapped entities; OTHER identifies a visible face without a mapped entity.
 The labels do not indicate speaking state.
 
+Frames marked TARGET define the interval whose speech-turn ownership must be
+judged. Frames before or after TARGET are context only. Audio remains
+synchronized to the full context window. Use context to understand continuity,
+but determine the primary speaker and secondary-speech status specifically for
+the TARGET interval.
+
 First determine the safest primary speaker attribution. Choose visible_entity
 when one supplied entity clearly owns the primary speech turn, offscreen when
 the primary speech belongs to no mapped visible subject, other_visible when the
@@ -362,6 +373,12 @@ evidence. You have not been given any prior answer.
 
 The video uses neutral labels: e1, e2, and so on are supplied visible entities;
 OTHER is an unmatched visible face. Labels never indicate speaking state.
+
+Frames marked TARGET define the interval whose speech-turn ownership must be
+judged. Frames before or after TARGET are context only. Audio remains
+synchronized to the full context window. Use context to understand continuity,
+but determine the primary speaker and secondary-speech status specifically for
+the TARGET interval.
 
 First determine the safest primary attribution: visible_entity for one mapped
 entity that clearly owns the turn, offscreen when no mapped visible subject owns
@@ -702,6 +719,8 @@ class OmniAVSpeakerMediaBackend(Protocol):
         timeline: NeutralFaceTimeline,
         window_start: float,
         window_end: float,
+        target_start: float,
+        target_end: float,
         destination_path: Path,
     ) -> None: ...
 
@@ -758,6 +777,8 @@ class SubprocessOmniAVSpeakerMediaBackend:
         timeline: NeutralFaceTimeline,
         window_start: float,
         window_end: float,
+        target_start: float,
+        target_end: float,
         destination_path: Path,
     ) -> None:
         helper = Path(__file__).resolve().parents[2] / "tools" / (
@@ -778,6 +799,10 @@ class SubprocessOmniAVSpeakerMediaBackend:
                     f"{window_start:.9f}",
                     "--window-end",
                     f"{window_end:.9f}",
+                    "--target-start",
+                    f"{target_start:.9f}",
+                    "--target-end",
+                    f"{target_end:.9f}",
                     "--output",
                     str(destination_path),
                     "--ffmpeg",
@@ -844,6 +869,9 @@ class OmniAVSpeakerMediaProvenance(SchemaModel):
     trimmed_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     labels_are_neutral: Literal[True] = True
     lr_asd_speaking_state_exposed: Literal[False] = False
+    media_construction_policy: Literal[
+        "neutral_faces_with_target_interval_marker_v1"
+    ] = MEDIA_CONSTRUCTION_POLICY
 
 
 class OmniAVSpeakerCaseFailure(SchemaModel):
@@ -853,7 +881,7 @@ class OmniAVSpeakerCaseFailure(SchemaModel):
 
 
 class OmniAVSpeakerPilotRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.omni_av_speaker_judge_record.2"] = (
+    schema_version: Literal["r2v.h3.omni_av_speaker_judge_record.3"] = (
         OMNI_AV_SPEAKER_RECORD_VERSION
     )
     status: Literal["succeeded", "failed"]
@@ -1005,7 +1033,7 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
 
 
 class OmniAVSpeakerPilotSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.omni_av_speaker_judge_summary.2"] = (
+    schema_version: Literal["r2v.h3.omni_av_speaker_judge_summary.3"] = (
         OMNI_AV_SPEAKER_SUMMARY_VERSION
     )
     source_audio_production_root: str
@@ -1535,6 +1563,10 @@ def run_omni_av_speaker_judge_pilot(
                     timeline=timeline,
                     window_start=synchronized_window.window_start,
                     window_end=synchronized_window.window_end,
+                    target_start=source.raw.start_time,
+                    target_end=(
+                        synchronized_window.effective_absolute_segment_end
+                    ),
                     destination_path=neutral_video,
                 )
                 media_backend.trim_canonical_audio(
