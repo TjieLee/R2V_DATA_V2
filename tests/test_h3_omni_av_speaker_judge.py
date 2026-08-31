@@ -421,6 +421,57 @@ class _FakeBackend:
         )
 
 
+def _openai_backend(
+    tmp_path: Path,
+    responses: list[str],
+) -> tuple[OpenAIOmniAVSpeakerJudge, list[dict[str, object]]]:
+    calls: list[dict[str, object]] = []
+
+    class _Completions:
+        def create(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            content = responses.pop(0)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=content),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    total_tokens=15,
+                ),
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_Completions()))
+    return (
+        OpenAIOmniAVSpeakerJudge(
+            OmniAVSpeakerJudgeConfig(
+                base_url="http://127.0.0.1:8091/v1",
+                media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
+            ),
+            client=client,
+        ),
+        calls,
+    )
+
+
+def _judge_request(tmp_path: Path) -> OmniAVSpeakerJudgeRequest:
+    video = tmp_path / "neutral.mp4"
+    audio = tmp_path / "canonical.wav"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    return OmniAVSpeakerJudgeRequest(
+        neutral_video_path=video,
+        canonical_audio_path=audio,
+        target_start_in_window=0.75,
+        target_end_in_window=1.15,
+        visible_candidate_entity_ids=("e1", "e2"),
+    )
+
+
 def _records(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
@@ -616,6 +667,131 @@ def test_openai_request_is_blind_synchronized_text_only_and_repairs_once(
             "asr",
         ):
             assert forbidden not in request_text
+
+
+def test_exact_entity_decision_alias_normalizes_without_model_repair(
+    tmp_path: Path,
+) -> None:
+    for entity_id in ("e1", "e2"):
+        case_root = tmp_path / entity_id
+        case_root.mkdir()
+        backend, calls = _openai_backend(
+            case_root,
+            [json.dumps({"decision": entity_id, "entity_id": entity_id})],
+        )
+
+        result = backend.decide(_judge_request(case_root), verification=False)
+
+        assert result.observation == OmniAVSpeakerObservation(
+            decision="visible_entity",
+            entity_id=entity_id,
+        )
+        assert result.model_call_count == 1
+        assert len(calls) == 1
+        assert result.normalization_applied
+        assert (
+            result.normalization_kind
+            == "entity_decision_alias_to_visible_entity"
+        )
+
+
+def test_entity_decision_alias_does_not_guess_conflicts_or_invisible_entities(
+    tmp_path: Path,
+) -> None:
+    invalid_aliases = [
+        {"decision": "e1", "entity_id": "e2"},
+        {"decision": "e9", "entity_id": "e9"},
+    ]
+    for index, invalid in enumerate(invalid_aliases):
+        case_root = tmp_path / str(index)
+        case_root.mkdir()
+        backend, calls = _openai_backend(
+            case_root,
+            [
+                json.dumps(invalid),
+                '{"decision":"uncertain","entity_id":null}',
+            ],
+        )
+
+        result = backend.decide(_judge_request(case_root), verification=False)
+
+        assert result.observation == OmniAVSpeakerObservation(
+            decision="uncertain",
+            entity_id=None,
+        )
+        assert result.model_call_count == 2
+        assert len(calls) == 2
+        assert not result.normalization_applied
+        assert result.normalization_kind is None
+
+
+def test_canonical_response_is_unchanged_and_true_malformed_output_repairs(
+    tmp_path: Path,
+) -> None:
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    backend, calls = _openai_backend(
+        canonical_root,
+        ['{"decision":"visible_entity","entity_id":"e1"}'],
+    )
+    canonical = backend.decide(_judge_request(canonical_root), verification=False)
+    assert canonical.observation.entity_id == "e1"
+    assert canonical.model_call_count == 1
+    assert len(calls) == 1
+    assert not canonical.normalization_applied
+
+    malformed_root = tmp_path / "malformed"
+    malformed_root.mkdir()
+    backend, calls = _openai_backend(
+        malformed_root,
+        ["not json", '{"decision":"offscreen","entity_id":null}'],
+    )
+    repaired = backend.decide(_judge_request(malformed_root), verification=False)
+    assert repaired.observation.decision == "offscreen"
+    assert repaired.model_call_count == 2
+    assert len(calls) == 2
+    assert not repaired.normalization_applied
+
+
+def test_real_positive_alias_shape_uses_two_total_calls_and_stable_e1(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "positive.jsonl"
+    _manifest(manifest, ["segment_0002"])
+    backend, calls = _openai_backend(
+        tmp_path,
+        [
+            '{"decision":"e1","entity_id":"e1"}',
+            '{"decision":"e1","entity_id":"e1"}',
+        ],
+    )
+
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "positive-pilot",
+        backend=backend,
+        media_backend=_FakeMedia(),
+    )
+
+    record = _records(root / "positive-pilot/records.jsonl")[0]
+    assert len(calls) == 2
+    assert summary.model_call_count == 2
+    assert record["pass1_decision"] == "visible_entity"
+    assert record["pass1_entity_id"] == "e1"
+    assert record["pass2_decision"] == "visible_entity"
+    assert record["pass2_entity_id"] == "e1"
+    assert record["stable_observation"]
+    assert record["comparison"] == "disagree"
+    assert record["proposed_entity_id"] == "e1"
+    raw = json.loads(
+        next((root / "positive-pilot/raw").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw["pass1"]["normalization_applied"]
+    assert raw["pass2"]["normalization_applied"]
 
 
 def test_neutral_timeline_and_renderer_never_expose_speaking_state(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.structured_output import (
     ValidationIssue,
+    normalize_structured_json_envelope,
     parse_structured_json_issues,
 )
 
@@ -237,6 +238,14 @@ class OmniAVSpeakerJudgeResult:
     raw_responses: tuple[str, ...]
     completion_diagnostics: tuple[OmniAVCompletionDiagnostic, ...]
     model_call_count: int
+    normalization_applied: bool = False
+    normalization_kind: Literal[
+        "entity_decision_alias_to_visible_entity"
+    ] | None = None
+
+    def __post_init__(self) -> None:
+        if self.normalization_applied != (self.normalization_kind is not None):
+            raise ValueError("Omni AV speaker normalization provenance is inconsistent")
 
 
 class OmniAVSpeakerJudgeFailure(ValueError):
@@ -346,6 +355,31 @@ def _decision_issues(
             )
         ]
     return []
+
+
+def _normalize_entity_decision_alias(
+    raw: str,
+    request: OmniAVSpeakerJudgeRequest,
+) -> OmniAVSpeakerObservation | None:
+    try:
+        payload = json.loads(normalize_structured_json_envelope(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"decision", "entity_id"}:
+        return None
+    decision = payload["decision"]
+    entity_id = payload["entity_id"]
+    if (
+        not isinstance(decision, str)
+        or re.fullmatch(r"e[1-9]\d*", decision) is None
+        or entity_id != decision
+        or decision not in request.visible_candidate_entity_ids
+    ):
+        return None
+    return OmniAVSpeakerObservation(
+        decision="visible_entity",
+        entity_id=decision,
+    )
 
 
 def _optional_value(value: object, field: str) -> object | None:
@@ -477,6 +511,18 @@ class OpenAIOmniAVSpeakerJudge:
                 ) from exc
             raw_responses.append(raw)
             diagnostics.append(diagnostic)
+            normalized = _normalize_entity_decision_alias(raw, request)
+            if normalized is not None:
+                return OmniAVSpeakerJudgeResult(
+                    observation=normalized,
+                    raw_responses=tuple(raw_responses),
+                    completion_diagnostics=tuple(diagnostics),
+                    model_call_count=attempt + 1,
+                    normalization_applied=True,
+                    normalization_kind=(
+                        "entity_decision_alias_to_visible_entity"
+                    ),
+                )
             observation, issues = parse_structured_json_issues(
                 raw,
                 OmniAVSpeakerObservation,
@@ -1026,6 +1072,8 @@ def _raw_payload(
                 item.model_dump(mode="json") for item in value.completion_diagnostics
             ],
             "model_call_count": value.model_call_count,
+            "normalization_applied": value.normalization_applied,
+            "normalization_kind": value.normalization_kind,
         }
 
     return {
