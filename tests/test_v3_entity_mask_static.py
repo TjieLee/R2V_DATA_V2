@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,38 @@ class FakeClock:
         self.current += seconds
 
 
+class FakeWorkerProcess:
+    def __init__(
+        self,
+        returncode: int | None,
+        *,
+        exit_on_terminate: bool = True,
+    ) -> None:
+        self.returncode = returncode
+        self.exit_on_terminate = exit_on_terminate
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls: list[float | None] = []
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        if self.exit_on_terminate:
+            self.returncode = -15
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake-worker", timeout)
+        return self.returncode
+
+
 def _global_assignments(
     num_shards: int,
     *,
@@ -47,6 +80,67 @@ def _global_assignments(
             gpus=gpus,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("codes", "expected"),
+    [
+        ([0, 0, 0], 0),
+        ([0, 2, 0], 2),
+        ([0, -9, 0], 137),
+        ([-15, 0], 143),
+        ([0, -9, 2], 137),
+    ],
+)
+def test_normalized_worker_exit_code(
+    codes: list[int],
+    expected: int,
+) -> None:
+    assert auto_tool.normalized_worker_exit_code(codes) == expected
+
+
+def test_worker_cleanup_terminates_and_reaps_active_children() -> None:
+    processes = [FakeWorkerProcess(None), FakeWorkerProcess(None)]
+
+    result = auto_tool.terminate_worker_processes(processes)
+
+    assert result["terminate_requested"] == 2
+    assert result["killed"] == 0
+    assert result["reaped"] == 2
+    assert [process.terminate_calls for process in processes] == [1, 1]
+    assert [process.kill_calls for process in processes] == [0, 0]
+
+
+def test_worker_cleanup_kills_after_one_shared_grace_deadline() -> None:
+    clock = FakeClock()
+    processes = [
+        FakeWorkerProcess(None, exit_on_terminate=False),
+        FakeWorkerProcess(None, exit_on_terminate=False),
+    ]
+
+    result = auto_tool.terminate_worker_processes(
+        processes,
+        grace_seconds=0.2,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert clock.current == pytest.approx(0.2)
+    assert result["terminate_requested"] == 2
+    assert result["killed"] == 2
+    assert result["reaped"] == 2
+    assert [process.kill_calls for process in processes] == [1, 1]
+
+
+def test_worker_cleanup_only_reaps_already_exited_child() -> None:
+    process = FakeWorkerProcess(0)
+
+    result = auto_tool.terminate_worker_processes([process])
+
+    assert result["already_exited"] == 1
+    assert result["reaped"] == 1
+    assert process.terminate_calls == 0
+    assert process.kill_calls == 0
 
 
 @pytest.mark.parametrize(

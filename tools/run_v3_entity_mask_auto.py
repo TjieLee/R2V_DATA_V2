@@ -6,12 +6,15 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -53,6 +56,142 @@ PRODUCTION_SESSION_REUSE_MODE = "clip_reset_v1"
 STATIC_ASSIGNMENT_SCHEMA_VERSION = 1
 STATIC_ASSIGNMENT_STRATEGY = "static_whole_shard_v1"
 STARTUP_IDENTITY_TIMEOUT_SECONDS = 120.0
+WORKER_TERMINATION_GRACE_SECONDS = 10.0
+
+
+class LauncherTermination(Exception):
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"Entity Mask launcher received signal {signum}")
+        self.signum = signum
+
+
+def normalized_worker_exit_code(codes: Sequence[int]) -> int:
+    for code in codes:
+        if code > 0:
+            return code
+        if code < 0:
+            return 128 + abs(code)
+    return 0
+
+
+def terminate_worker_processes(
+    processes: Sequence[subprocess.Popen[bytes]],
+    *,
+    grace_seconds: float = WORKER_TERMINATION_GRACE_SECONDS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    if grace_seconds < 0:
+        raise ValueError("worker termination grace must be non-negative")
+    errors: list[dict[str, object]] = []
+    active: list[tuple[int, subprocess.Popen[bytes]]] = []
+    already_exited = 0
+    terminate_requested = 0
+    killed = 0
+    reaped = 0
+
+    def record_error(index: int, action: str, exc: BaseException) -> None:
+        errors.append(
+            {
+                "worker_index": index,
+                "action": action,
+                "error_type": type(exc).__name__,
+                "reason": str(exc),
+            }
+        )
+
+    for index, process in enumerate(processes):
+        try:
+            returncode = process.poll()
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue
+            record_error(index, "poll_before_terminate", exc)
+            returncode = None
+        if returncode is not None:
+            already_exited += 1
+            try:
+                process.wait(timeout=0)
+                reaped += 1
+            except Exception as exc:  # noqa: BLE001 - cleanup must continue
+                record_error(index, "reap_already_exited", exc)
+            continue
+        active.append((index, process))
+        try:
+            process.terminate()
+            terminate_requested += 1
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue
+            record_error(index, "terminate", exc)
+
+    deadline = monotonic() + grace_seconds
+    pending = active
+    while pending:
+        still_running: list[tuple[int, subprocess.Popen[bytes]]] = []
+        for index, process in pending:
+            try:
+                returncode = process.poll()
+            except Exception as exc:  # noqa: BLE001 - cleanup must continue
+                record_error(index, "poll_after_terminate", exc)
+                returncode = None
+            if returncode is None:
+                still_running.append((index, process))
+                continue
+            try:
+                process.wait(timeout=0)
+                reaped += 1
+            except Exception as exc:  # noqa: BLE001 - cleanup must continue
+                record_error(index, "reap_after_terminate", exc)
+        pending = still_running
+        if not pending:
+            break
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(0.05, remaining))
+
+    killed_processes: list[tuple[int, subprocess.Popen[bytes]]] = []
+    for index, process in pending:
+        try:
+            process.kill()
+            killed += 1
+            killed_processes.append((index, process))
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue
+            record_error(index, "kill", exc)
+    for index, process in killed_processes:
+        try:
+            process.wait()
+            reaped += 1
+        except Exception as exc:  # noqa: BLE001 - cleanup must continue
+            record_error(index, "reap_after_kill", exc)
+
+    return {
+        "workers": len(processes),
+        "already_exited": already_exited,
+        "terminate_requested": terminate_requested,
+        "killed": killed,
+        "reaped": reaped,
+        "errors": errors,
+    }
+
+
+@contextmanager
+def _launcher_signal_handlers() -> Iterator[None]:
+    signums = (signal.SIGTERM, signal.SIGINT)
+    previous = {signum: signal.getsignal(signum) for signum in signums}
+    requested: int | None = None
+
+    def handle(signum: int, frame: FrameType | None) -> None:
+        del frame
+        nonlocal requested
+        if requested is None:
+            requested = signum
+            raise LauncherTermination(signum)
+
+    try:
+        for signum in signums:
+            signal.signal(signum, handle)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 @dataclass(frozen=True)
@@ -346,7 +485,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
         return report
     if not shard_paths:
-        result = {**report, "event": "completed", "worker_exit_codes": []}
+        result = {
+            **report,
+            "event": "completed",
+            "worker_exit_codes": [],
+            "success": True,
+            "parent_exit_code": 0,
+        }
         print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
         return result
 
@@ -368,55 +513,96 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     PRODUCTION_LOG_ROOT.mkdir(parents=True, exist_ok=True)
     processes: list[subprocess.Popen[bytes]] = []
     logs = []
-    try:
-        for assignment in assignments:
-            environment = dict(os.environ)
-            environment["CUDA_VISIBLE_DEVICES"] = assignment.gpu
-            log_path = PRODUCTION_LOG_ROOT / f"rank-{rank}-gpu-{assignment.gpu}.log"
-            log = log_path.open("ab")
-            logs.append(log)
-            command = [
-                sys.executable,
-                str(worker_tool),
-                "--input-root",
-                str(PRODUCTION_INPUT_ROOT),
-                "--base-config",
-                str(PRODUCTION_BASE_CONFIG),
-                "--output-root",
-                str(root),
-                "--rank",
-                str(rank),
-                "--world-size",
-                str(world_size),
-                "--local-gpu-count",
-                str(len(gpus)),
-                "--local-slot",
-                str(assignment.local_slot),
-                "--gpu",
-                assignment.gpu,
-                "--global-worker-id",
-                str(assignment.global_worker_id),
-                "--shard-start-position",
-                str(assignment.shard_start_position),
-                "--shard-end-position",
-                str(assignment.shard_end_position),
-            ]
-            processes.append(
-                subprocess.Popen(
-                    command,
-                    env=environment,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
+    codes: list[int] = []
+    with _launcher_signal_handlers():
+        try:
+            for assignment in assignments:
+                environment = dict(os.environ)
+                environment["CUDA_VISIBLE_DEVICES"] = assignment.gpu
+                log_path = (
+                    PRODUCTION_LOG_ROOT / f"rank-{rank}-gpu-{assignment.gpu}.log"
                 )
+                log = log_path.open("ab")
+                logs.append(log)
+                command = [
+                    sys.executable,
+                    str(worker_tool),
+                    "--input-root",
+                    str(PRODUCTION_INPUT_ROOT),
+                    "--base-config",
+                    str(PRODUCTION_BASE_CONFIG),
+                    "--output-root",
+                    str(root),
+                    "--rank",
+                    str(rank),
+                    "--world-size",
+                    str(world_size),
+                    "--local-gpu-count",
+                    str(len(gpus)),
+                    "--local-slot",
+                    str(assignment.local_slot),
+                    "--gpu",
+                    assignment.gpu,
+                    "--global-worker-id",
+                    str(assignment.global_worker_id),
+                    "--shard-start-position",
+                    str(assignment.shard_start_position),
+                    "--shard-end-position",
+                    str(assignment.shard_end_position),
+                ]
+                processes.append(
+                    subprocess.Popen(
+                        command,
+                        env=environment,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                    )
+                )
+            codes = [process.wait() for process in processes]
+        except LauncherTermination as exc:
+            cleanup = terminate_worker_processes(processes)
+            parent_exit_code = 128 + exc.signum
+            interrupted = {
+                "event": "interrupted",
+                "signal": exc.signum,
+                "parent_exit_code": parent_exit_code,
+                "worker_cleanup": cleanup,
+            }
+            print(json.dumps(interrupted, ensure_ascii=False, sort_keys=True), flush=True)
+            raise SystemExit(parent_exit_code) from exc
+        except KeyboardInterrupt as exc:
+            cleanup = terminate_worker_processes(processes)
+            interrupted = {
+                "event": "interrupted",
+                "signal": signal.SIGINT,
+                "parent_exit_code": 128 + signal.SIGINT,
+                "worker_cleanup": cleanup,
+            }
+            print(json.dumps(interrupted, ensure_ascii=False, sort_keys=True), flush=True)
+            raise SystemExit(128 + signal.SIGINT) from exc
+        except BaseException:
+            cleanup = terminate_worker_processes(processes)
+            failure = {"event": "launcher_failure", "worker_cleanup": cleanup}
+            print(
+                json.dumps(failure, ensure_ascii=False, sort_keys=True),
+                file=sys.stderr,
+                flush=True,
             )
-        codes = [process.wait() for process in processes]
-    finally:
-        for log in logs:
-            log.close()
-    result = {**report, "event": "completed", "worker_exit_codes": codes}
+            raise
+        finally:
+            for log in logs:
+                log.close()
+    parent_exit_code = normalized_worker_exit_code(codes)
+    result = {
+        **report,
+        "event": "completed",
+        "worker_exit_codes": codes,
+        "success": parent_exit_code == 0,
+        "parent_exit_code": parent_exit_code,
+    }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
-    if any(codes):
-        raise SystemExit(max(codes))
+    if parent_exit_code != 0:
+        raise SystemExit(parent_exit_code)
     return result
 
 

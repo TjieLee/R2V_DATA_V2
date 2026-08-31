@@ -84,6 +84,24 @@ http://6.167.57.88:8000/v1
 Startup fails if its `/models` health check is unavailable. The launcher never
 turns off Qwen anchor selection as a fallback.
 
+To stop a node manually, terminate its launcher first:
+
+```bash
+pkill -TERM -f 'run_v3_entity_mask_auto.py'
+```
+
+The launcher handles `SIGTERM`/`SIGINT`, terminates and reaps only the static
+workers it started, and escalates surviving children to `SIGKILL` after the
+shared cleanup grace period. Normally no worker remains. As a fallback check
+for workers left by an externally forced launcher death such as `SIGKILL`:
+
+```bash
+pkill -TERM -f 'run_v3_entity_mask_worker.py'
+```
+
+Run these commands only for the intended node/job. The Python launcher itself
+never uses `pkill`, `killall`, or command-string process discovery.
+
 ## Fixed production settings and restart
 
 ```text

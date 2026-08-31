@@ -3,6 +3,8 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import signal
+import subprocess
 import threading
 import time
 from collections.abc import Iterator
@@ -137,6 +139,46 @@ class FakeBackend:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class LifecycleProcess:
+    def __init__(
+        self,
+        returncode: int | None,
+        *,
+        signal_on_first_wait: int | None = None,
+        interrupt_on_first_wait: BaseException | None = None,
+    ) -> None:
+        self.returncode = returncode
+        self.signal_on_first_wait = signal_on_first_wait
+        self.interrupt_on_first_wait = interrupt_on_first_wait
+        self.wait_calls: list[float | None] = []
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.returncode = -signal.SIGTERM
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -signal.SIGKILL
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if len(self.wait_calls) == 1 and timeout is None:
+            if self.signal_on_first_wait is not None:
+                handler = signal.getsignal(self.signal_on_first_wait)
+                assert callable(handler)
+                handler(self.signal_on_first_wait, None)
+            if self.interrupt_on_first_wait is not None:
+                raise self.interrupt_on_first_wait
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake-worker", timeout)
+        return self.returncode
 
 
 @dataclass
@@ -2822,6 +2864,244 @@ def test_zero_argument_entity_mask_wrapper_uses_fixed_production_contract(
     assert result["frame_prefetch_workers"] == 0
     assert result["sam3_request_timing"] is False
     assert result["worker_exit_codes"] == [0, 0]
+
+
+def _configure_entity_mask_lifecycle_test(
+    fixture: Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    gpu_count: int,
+) -> None:
+    entity_mask_root = fixture.dataset / "jea" / "processed" / "entity_mask"
+    shard_paths = [
+        fixture.input_root
+        / "parts"
+        / f"shard-{index * 10_000:09d}-{index * 10_000 + 9_999:09d}.jsonl"
+        for index in range(gpu_count)
+    ]
+    monkeypatch.setattr(
+        production,
+        "ENTITY_MASK_PRODUCTION_OUTPUT_ROOT",
+        entity_mask_root,
+    )
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_INPUT_ROOT", fixture.input_root)
+    monkeypatch.setattr(entity_mask_tool, "PRODUCTION_OUTPUT_ROOT", entity_mask_root)
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "PRODUCTION_BASE_CONFIG",
+        fixture.base_path,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "PRODUCTION_LOG_ROOT",
+        fixture.writable / "entity-mask-logs",
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "load_config_identity",
+        lambda path: fixture.identity,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "validate_entity_mask_production_config",
+        lambda config: None,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "parse_gpus",
+        lambda value: [str(index) for index in range(gpu_count)],
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "enumerate_annotation_shards",
+        lambda root: shard_paths,
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "check_stage2_candidate_judge_health",
+        lambda config: {"candidate_judge_health": "available"},
+    )
+    monkeypatch.setattr(
+        entity_mask_tool,
+        "coordinate_startup_identity",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+
+
+def test_entity_mask_worker_signal_exit_is_nonzero_parent_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _configure_entity_mask_lifecycle_test(fixture, monkeypatch, gpu_count=3)
+    processes = [
+        LifecycleProcess(0),
+        LifecycleProcess(-signal.SIGKILL),
+        LifecycleProcess(0),
+    ]
+    spawned = iter(processes)
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: next(spawned),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        entity_mask_tool.main([])
+
+    assert exc_info.value.code == 137
+    assert [process.wait_calls for process in processes] == [[None], [None], [None]]
+    assert all(process.terminate_calls == 0 for process in processes)
+    completed = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert completed["event"] == "completed"
+    assert completed["worker_exit_codes"] == [0, -9, 0]
+    assert completed["success"] is False
+    assert completed["parent_exit_code"] == 137
+
+
+def test_entity_mask_worker_failure_waits_for_other_fixed_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _configure_entity_mask_lifecycle_test(fixture, monkeypatch, gpu_count=2)
+    processes = [LifecycleProcess(2), LifecycleProcess(0)]
+    spawned = iter(processes)
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: next(spawned),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        entity_mask_tool.main([])
+
+    assert exc_info.value.code == 2
+    assert [process.wait_calls for process in processes] == [[None], [None]]
+    assert all(process.terminate_calls == 0 for process in processes)
+
+
+@pytest.mark.parametrize(
+    ("termination_signal", "expected_exit"),
+    [(signal.SIGTERM, 143), (signal.SIGINT, 130)],
+)
+def test_entity_mask_launcher_signal_cleans_workers_and_restores_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination_signal: int,
+    expected_exit: int,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _configure_entity_mask_lifecycle_test(fixture, monkeypatch, gpu_count=2)
+    processes = [
+        LifecycleProcess(None, signal_on_first_wait=termination_signal),
+        LifecycleProcess(None),
+    ]
+    spawned = iter(processes)
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: next(spawned),
+    )
+    previous = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+
+    with pytest.raises(SystemExit) as exc_info:
+        entity_mask_tool.main([])
+
+    assert exc_info.value.code == expected_exit
+    assert [process.terminate_calls for process in processes] == [1, 1]
+    assert all(process.kill_calls == 0 for process in processes)
+    assert {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    } == previous
+
+
+def test_entity_mask_launcher_keyboard_interrupt_cleans_all_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _configure_entity_mask_lifecycle_test(fixture, monkeypatch, gpu_count=2)
+    processes = [
+        LifecycleProcess(None, interrupt_on_first_wait=KeyboardInterrupt()),
+        LifecycleProcess(None),
+    ]
+    spawned = iter(processes)
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: next(spawned),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        entity_mask_tool.main([])
+
+    assert exc_info.value.code == 130
+    assert [process.terminate_calls for process in processes] == [1, 1]
+    assert all(process.kill_calls == 0 for process in processes)
+
+
+def test_entity_mask_partial_spawn_failure_cleans_started_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _configure_entity_mask_lifecycle_test(fixture, monkeypatch, gpu_count=3)
+    processes = [LifecycleProcess(None), LifecycleProcess(None)]
+    popen_calls = 0
+
+    def popen(*args: object, **kwargs: object) -> LifecycleProcess:
+        nonlocal popen_calls
+        del args, kwargs
+        popen_calls += 1
+        if popen_calls > len(processes):
+            raise RuntimeError("spawn exploded")
+        return processes[popen_calls - 1]
+
+    monkeypatch.setattr(entity_mask_tool.subprocess, "Popen", popen)
+
+    with pytest.raises(RuntimeError, match="spawn exploded"):
+        entity_mask_tool.main([])
+
+    assert [process.terminate_calls for process in processes] == [1, 1]
+    assert all(process.kill_calls == 0 for process in processes)
+
+
+def test_entity_mask_success_does_not_terminate_workers_and_restores_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _paths(tmp_path, monkeypatch)
+    _configure_entity_mask_lifecycle_test(fixture, monkeypatch, gpu_count=2)
+    processes = [LifecycleProcess(0), LifecycleProcess(0)]
+    spawned = iter(processes)
+    monkeypatch.setattr(
+        entity_mask_tool.subprocess,
+        "Popen",
+        lambda *args, **kwargs: next(spawned),
+    )
+    previous = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    }
+
+    result = entity_mask_tool.main([])
+
+    assert result["success"] is True
+    assert result["parent_exit_code"] == 0
+    assert all(process.terminate_calls == 0 for process in processes)
+    assert all(process.kill_calls == 0 for process in processes)
+    assert {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGTERM, signal.SIGINT)
+    } == previous
 
 
 def test_entity_mask_wrapper_missing_private_config_fails_closed(
