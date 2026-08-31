@@ -41,13 +41,19 @@ OMNI_AV_SPEAKER_MANIFEST_VERSION = "r2v.h3.omni_av_speaker_judge_manifest.1"
 OMNI_AV_SPEAKER_RECORD_VERSION = "r2v.h3.omni_av_speaker_judge_record.1"
 OMNI_AV_SPEAKER_RAW_VERSION = "r2v.h3.omni_av_speaker_judge_raw.1"
 OMNI_AV_SPEAKER_SUMMARY_VERSION = "r2v.h3.omni_av_speaker_judge_summary.1"
-OMNI_AV_SPEAKER_POLICY_VERSION = "h3_omni_av_speaker_judge_pilot_v1"
-PASS1_PROMPT_VERSION = "h3_omni_av_speaker_blind_identification_v1"
-PASS2_PROMPT_VERSION = "h3_omni_av_speaker_blind_verification_v1"
+OMNI_AV_SPEAKER_POLICY_VERSION = "h3_omni_av_speaker_judge_pilot_v2"
+PASS1_PROMPT_VERSION = "h3_omni_av_speaker_blind_identification_v2"
+PASS2_PROMPT_VERSION = "h3_omni_av_speaker_blind_verification_v2"
 DEFAULT_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 CONTEXT_SECONDS = 0.75
 
-Decision = Literal["visible_entity", "offscreen", "other_visible", "uncertain"]
+Decision = Literal[
+    "visible_entity",
+    "multiple_speakers",
+    "offscreen",
+    "other_visible",
+    "uncertain",
+]
 DraftStatus = Literal["candidate_mapped", "conflict", "unbound", "ambiguous"]
 Comparison = Literal["agree", "disagree", "unresolved", "draft_unresolved"]
 
@@ -159,12 +165,12 @@ class OmniAVSpeakerBackendProvenance(SchemaModel):
     max_tokens: int = Field(gt=0)
     repair_retries: Literal[1] = 1
     pass1_prompt_version: Literal[
-        "h3_omni_av_speaker_blind_identification_v1"
+        "h3_omni_av_speaker_blind_identification_v2"
     ] = PASS1_PROMPT_VERSION
     pass2_prompt_version: Literal[
-        "h3_omni_av_speaker_blind_verification_v1"
+        "h3_omni_av_speaker_blind_verification_v2"
     ] = PASS2_PROMPT_VERSION
-    policy_version: Literal["h3_omni_av_speaker_judge_pilot_v1"] = (
+    policy_version: Literal["h3_omni_av_speaker_judge_pilot_v2"] = (
         OMNI_AV_SPEAKER_POLICY_VERSION
     )
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -294,6 +300,10 @@ Choose visible_entity only when exactly one supplied visible entity is producing
 the target speech. Choose offscreen when speech is audible but no visible face is
 producing it. Choose other_visible when a visible OTHER face is producing it.
 Choose uncertain when synchronized evidence does not support one answer.
+If two or more distinct speakers produce audible speech anywhere inside the
+marked target interval, including short interjections, fillers, or brief
+responses, return {"decision":"multiple_speakers","entity_id":null}. Do not
+choose the dominant, longest, loudest, or most central speaker.
 
 Do not infer identity from gender, age, clothing, dialogue meaning, character
 semantics, or visual appearance. Never transcribe, quote, or paraphrase speech.
@@ -309,6 +319,10 @@ OTHER is an unmatched visible face. Labels never indicate speaking state.
 Choose visible_entity only for exactly one supplied visible entity producing the
 target speech; choose offscreen for audible speech produced by no visible face;
 choose other_visible for a speaking OTHER face; otherwise choose uncertain.
+If two or more distinct speakers produce audible speech anywhere inside the
+marked target interval, including short interjections, fillers, or brief
+responses, return {"decision":"multiple_speakers","entity_id":null}. Do not
+choose the dominant, longest, loudest, or most central speaker.
 
 Do not infer identity from gender, age, clothing, dialogue meaning, character
 semantics, or visual appearance. Never transcribe, quote, or paraphrase speech.
@@ -1039,6 +1053,8 @@ def _needs_verification(
     draft_entity_id: str | None,
     pass1: OmniAVSpeakerObservation,
 ) -> bool:
+    if pass1.decision == "multiple_speakers":
+        return True
     if draft_status == "candidate_mapped":
         return not (
             pass1.decision == "visible_entity"
@@ -1054,6 +1070,13 @@ def _final_comparison(
     pass1: OmniAVSpeakerObservation,
     pass2: OmniAVSpeakerObservation | None,
 ) -> tuple[bool, Comparison, str | None, str | None]:
+    if pass1.decision == "multiple_speakers":
+        comparison: Comparison = (
+            "unresolved"
+            if draft_status == "candidate_mapped"
+            else "draft_unresolved"
+        )
+        return pass2 == pass1, comparison, None, None
     if pass2 is not None and pass2 != pass1:
         return False, "unresolved", None, None
     stable = pass2 is not None or (

@@ -17,6 +17,11 @@ from r2v_data_v2.h3.diarization_binding import (
 from r2v_data_v2.h3.jea_audio_production import CanonicalAudioClip
 from r2v_data_v2.h3.omni_av_speaker_judge import (
     DEFAULT_MODEL,
+    OMNI_AV_SPEAKER_POLICY_VERSION,
+    PASS1_PROMPT_VERSION,
+    PASS1_SYSTEM_PROMPT,
+    PASS2_PROMPT_VERSION,
+    PASS2_SYSTEM_PROMPT,
     OmniAVCompletionDiagnostic,
     OmniAVSpeakerBackendProvenance,
     OmniAVSpeakerJudgeConfig,
@@ -636,6 +641,96 @@ def test_per_case_model_failure_does_not_destroy_other_successes(tmp_path: Path)
         )
     )
     assert raw["failure"]["raw_responses"] == ["", "bad"]
+
+
+def test_multiple_speakers_requires_null_entity_and_explicit_prompt_rule() -> None:
+    observation = OmniAVSpeakerObservation(
+        decision="multiple_speakers",
+        entity_id=None,
+    )
+    assert observation.entity_id is None
+    with pytest.raises(ValueError, match="non-visible decision requires null"):
+        OmniAVSpeakerObservation(
+            decision="multiple_speakers",
+            entity_id="e1",
+        )
+    for prompt in (PASS1_SYSTEM_PROMPT, PASS2_SYSTEM_PROMPT):
+        assert '{"decision":"multiple_speakers","entity_id":null}' in prompt
+        assert "short interjections, fillers, or brief" in prompt
+        assert "dominant, longest, loudest, or most central" in prompt
+    assert PASS1_PROMPT_VERSION.endswith("_v2")
+    assert PASS2_PROMPT_VERSION.endswith("_v2")
+    assert OMNI_AV_SPEAKER_POLICY_VERSION.endswith("_v2")
+
+
+def test_e3_speech_followed_by_e1_e2_interjections_never_proposes_dominant_entity(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0002", "segment_0004"])
+    backend = _FakeBackend(
+        [
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+        ]
+    )
+
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=_FakeMedia(),
+    )
+
+    records = _records(root / "pilot/records.jsonl")
+    assert summary.case_count == 2
+    assert summary.succeeded_case_count == 2
+    assert summary.pass2_case_count == 2
+    assert summary.stable_observation_count == 2
+    assert summary.model_call_count == 4
+    assert records[0]["draft_entity_id"] == "e2"
+    assert records[0]["comparison"] == "unresolved"
+    assert records[1]["draft_binding_status"] == "conflict"
+    assert records[1]["comparison"] == "draft_unresolved"
+    for record in records:
+        assert record["pass1_decision"] == "multiple_speakers"
+        assert record["pass2_decision"] == "multiple_speakers"
+        assert record["pass1_entity_id"] is None
+        assert record["pass2_entity_id"] is None
+        assert record["stable_observation"]
+        assert record["proposed_entity_id"] is None
+        assert record["proposed_non_entity_class"] is None
+
+
+def test_multiple_speakers_passes_must_agree_to_be_stable(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0002"])
+    backend = _FakeBackend(
+        [
+            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
+            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e2"),
+        ]
+    )
+
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=_FakeMedia(),
+    )
+
+    record = _records(root / "pilot/records.jsonl")[0]
+    assert summary.pass2_case_count == 1
+    assert summary.stable_observation_count == 0
+    assert record["comparison"] == "unresolved"
+    assert not record["stable_observation"]
+    assert record["proposed_entity_id"] is None
 
 
 @pytest.mark.parametrize("overflow", [0.028118, 0.0366825, 0.0423195])
