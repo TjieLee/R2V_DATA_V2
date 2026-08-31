@@ -17,15 +17,18 @@ integration branch:
 feature/visual-audio-integration-v1
 
 integration HEAD:
-aae370157d3854d157e11468649f5f0288978b43
+56cf57b933ff4614643aedab57e67824504037d5
 
-integration merge commit:
+initial integration merge commit:
 4dc497403f0aa65114a543a81a851a310a55c497
+
+latest Visual refresh merge commit:
+56cf57b933ff4614643aedab57e67824504037d5
 
 Visual source branch:
 feature/v3-sam3-production-v1
 Visual source HEAD:
-8001a2f3801e50c42f64e9135569b7a65017b73b
+21a6fe5eebc33f8d35b8434600d860c2550ba8e6
 
 Audio source branch:
 feature/h3-audio-caption-multibackend-v1
@@ -36,18 +39,23 @@ Visual/Audio merge base:
 71276f976ed178242abe4db3e66e3fecce357832
 ```
 
-The merge commit has the Audio source commit and Visual source commit as its two
-parents. The integration completed without textual merge conflicts. The only
-post-merge compatibility commit is the H3 projection update that accepts the
-latest Visual face `bbox` attribute selection and its regression coverage.
+The initial integration merge has the Audio source commit and the then-current
+Visual source commit `8001a2f3801e50c42f64e9135569b7a65017b73b` as its two
+parents and completed without textual merge conflicts. H3 then received one
+narrow compatibility commit that accepts the Visual face `bbox` attribute
+selection in its private projection and adds regression coverage. After Visual
+advanced by five additional commits, the integration branch merged Visual again
+at `21a6fe5eebc33f8d35b8434600d860c2550ba8e6`; that refresh also completed
+without conflicts and changed no H3 production code.
 
 The original frozen Visual branch remains
 `feature/v3-runtime-integrity-v1` at
 `87bd4e06107d7f56df550979b0e96515cb70f911`; its core original algorithm
 baseline is `3cfb11fdd1fbe4a5bbad02a775097d8ab3097288`. The current Subject
 Attribute face policy is represented by the later Visual algorithm commit
-`d056c32b76db4b3d7c0358b38e996e7a91a288d1` and is preserved in the
-integration branch.
+`d056c32b76db4b3d7c0358b38e996e7a91a288d1` and subsequent Visual
+postprocessing/publication fixes through `21a6fe5eebc33f8d35b8434600d860c2550ba8e6`.
+All are preserved in the integration branch.
 
 LASER ASD experimental files are not part of this integration line. The
 production ASD direction remains the existing LR-ASD/TalkSet Audio path.
@@ -196,8 +204,8 @@ Important internal deltas since the original Visual/Audio merge base include:
    ```
 
 7. Internal Subject Attribute metrics and completion metadata gained additional
-   source-candidate, retry, and bbox provenance fields without requiring a
-   public `ProductionSample` schema bump.
+   source-candidate, retry, bbox, resume, and publication-routing provenance
+   without requiring a public `ProductionSample` schema bump.
 
 Several Visual internal version strings did not bump despite compatible or
 normalized payload changes. Do not infer exact old/new internal payload shape
