@@ -539,13 +539,27 @@ def test_read_only_pilot_runs_blind_two_pass_policy_and_preserves_sources(
     )
     backend = _FakeBackend(
         [
-            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1"),
-            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1"),
-            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1"),
-            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1"),
-            OmniAVSpeakerObservation(decision="uncertain", entity_id=None),
-            OmniAVSpeakerObservation(decision="offscreen", entity_id=None),
-            OmniAVSpeakerObservation(decision="offscreen", entity_id=None),
+            OmniAVSpeakerObservation(
+                decision="visible_entity", entity_id="e1", secondary_speech_status="none"
+            ),
+            OmniAVSpeakerObservation(
+                decision="visible_entity", entity_id="e1", secondary_speech_status="none"
+            ),
+            OmniAVSpeakerObservation(
+                decision="visible_entity", entity_id="e1", secondary_speech_status="none"
+            ),
+            OmniAVSpeakerObservation(
+                decision="visible_entity", entity_id="e1", secondary_speech_status="none"
+            ),
+            OmniAVSpeakerObservation(
+                decision="uncertain", entity_id=None, secondary_speech_status="none"
+            ),
+            OmniAVSpeakerObservation(
+                decision="offscreen", entity_id=None, secondary_speech_status="none"
+            ),
+            OmniAVSpeakerObservation(
+                decision="offscreen", entity_id=None, secondary_speech_status="none"
+            ),
         ]
     )
     media = _FakeMedia()
@@ -578,11 +592,11 @@ def test_read_only_pilot_runs_blind_two_pass_policy_and_preserves_sources(
     assert not records[0]["subject_entity_binding_excluded"]
     assert not records[0]["identity_specific_voice_products_excluded"]
     assert records[1]["comparison"] == "disagree"
-    assert records[1]["stable_observation"]
+    assert records[1]["primary_observation_stable"]
     assert records[1]["proposed_entity_id"] == "e1"
     assert records[1]["draft_entity_id"] == "e2"
     assert records[2]["comparison"] == "unresolved"
-    assert not records[2]["stable_observation"]
+    assert not records[2]["primary_observation_stable"]
     assert records[2]["proposed_entity_id"] is None
     assert records[3]["comparison"] == "draft_unresolved"
     assert records[3]["proposed_non_entity_class"] == "offscreen"
@@ -621,7 +635,9 @@ def test_per_case_model_failure_does_not_destroy_other_successes(tmp_path: Path)
                 raw_responses=("", "bad"),
                 model_call_count=2,
             ),
-            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e2"),
+            OmniAVSpeakerObservation(
+                decision="visible_entity", entity_id="e2", secondary_speech_status="none"
+            ),
         ]
     )
 
@@ -647,73 +663,7 @@ def test_per_case_model_failure_does_not_destroy_other_successes(tmp_path: Path)
     assert raw["failure"]["raw_responses"] == ["", "bad"]
 
 
-def test_multiple_speakers_requires_null_entity_and_explicit_prompt_rule() -> None:
-    observation = OmniAVSpeakerObservation(
-        decision="multiple_speakers",
-        entity_id=None,
-    )
-    assert observation.entity_id is None
-    with pytest.raises(ValueError, match="non-visible decision requires null"):
-        OmniAVSpeakerObservation(
-            decision="multiple_speakers",
-            entity_id="e1",
-        )
-    for prompt in (PASS1_SYSTEM_PROMPT, PASS2_SYSTEM_PROMPT):
-        assert '{"decision":"multiple_speakers","entity_id":null}' in prompt
-        assert "short interjections, fillers, or brief" in prompt
-        assert "dominant, longest, loudest, or most central" in prompt
-    assert PASS1_PROMPT_VERSION.endswith("_v2")
-    assert PASS2_PROMPT_VERSION.endswith("_v2")
-    assert OMNI_AV_SPEAKER_POLICY_VERSION.endswith("_v2")
-
-
-def test_e3_speech_followed_by_e1_e2_interjections_never_proposes_dominant_entity(
-    tmp_path: Path,
-) -> None:
-    root, _, _ = _fixture(tmp_path / "production")
-    manifest = tmp_path / "cases.jsonl"
-    _manifest(manifest, ["segment_0002", "segment_0004"])
-    backend = _FakeBackend(
-        [
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-        ]
-    )
-
-    summary = run_omni_av_speaker_judge_pilot(
-        audio_production_root=root,
-        case_manifest_path=manifest,
-        output_root=root / "pilot",
-        backend=backend,
-        media_backend=_FakeMedia(),
-    )
-
-    records = _records(root / "pilot/records.jsonl")
-    assert summary.case_count == 2
-    assert summary.succeeded_case_count == 2
-    assert summary.pass2_case_count == 2
-    assert summary.stable_observation_count == 2
-    assert summary.model_call_count == 4
-    assert records[0]["draft_entity_id"] == "e2"
-    assert records[0]["comparison"] == "unresolved"
-    assert records[1]["draft_binding_status"] == "conflict"
-    assert records[1]["comparison"] == "draft_unresolved"
-    for record in records:
-        assert record["pass1_decision"] == "multiple_speakers"
-        assert record["pass2_decision"] == "multiple_speakers"
-        assert record["pass1_entity_id"] is None
-        assert record["pass2_entity_id"] is None
-        assert record["stable_observation"]
-        assert record["proposed_entity_id"] is None
-        assert record["proposed_non_entity_class"] is None
-        assert record["multiple_speakers_confirmed"]
-        assert record["subject_entity_binding_excluded"]
-        assert record["identity_specific_voice_products_excluded"]
-
-
-def test_confirmed_multiple_speakers_cannot_publish_identity_products(
+def test_clear_visible_primary_with_confirmed_incidental_speech_keeps_binding(
     tmp_path: Path,
 ) -> None:
     root, _, _ = _fixture(tmp_path / "production")
@@ -721,40 +671,16 @@ def test_confirmed_multiple_speakers_cannot_publish_identity_products(
     _manifest(manifest, ["segment_0002"])
     backend = _FakeBackend(
         [
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-        ]
-    )
-    run_omni_av_speaker_judge_pilot(
-        audio_production_root=root,
-        case_manifest_path=manifest,
-        output_root=root / "pilot",
-        backend=backend,
-        media_backend=_FakeMedia(),
-    )
-    record = _records(root / "pilot/records.jsonl")[0]
-
-    for field in (
-        "subject_entity_binding_excluded",
-        "identity_specific_voice_products_excluded",
-    ):
-        invalid = {**record, field: False}
-        with pytest.raises(ValueError, match="identity exclusions are inconsistent"):
-            OmniAVSpeakerPilotRecord.model_validate(invalid)
-    with pytest.raises(ValueError, match="cannot propose an identity"):
-        OmniAVSpeakerPilotRecord.model_validate(
-            {**record, "proposed_entity_id": "e2"}
-        )
-
-
-def test_multiple_speakers_passes_must_agree_to_be_stable(tmp_path: Path) -> None:
-    root, _, _ = _fixture(tmp_path / "production")
-    manifest = tmp_path / "cases.jsonl"
-    _manifest(manifest, ["segment_0002"])
-    backend = _FakeBackend(
-        [
-            OmniAVSpeakerObservation(decision="multiple_speakers", entity_id=None),
-            OmniAVSpeakerObservation(decision="visible_entity", entity_id="e2"),
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e2",
+                secondary_speech_status="incidental",
+            ),
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e2",
+                secondary_speech_status="incidental",
+            ),
         ]
     )
 
@@ -768,13 +694,162 @@ def test_multiple_speakers_passes_must_agree_to_be_stable(tmp_path: Path) -> Non
 
     record = _records(root / "pilot/records.jsonl")[0]
     assert summary.pass2_case_count == 1
-    assert summary.stable_observation_count == 0
-    assert record["comparison"] == "unresolved"
-    assert not record["stable_observation"]
+    assert record["primary_observation_stable"]
+    assert record["secondary_speech_stable"]
+    assert record["confirmed_secondary_speech_status"] == "incidental"
+    assert record["proposed_entity_id"] == "e2"
+    assert not record["subject_entity_binding_excluded"]
+    assert record["identity_specific_voice_products_excluded"]
+
+
+def test_non_speech_vocalization_does_not_create_secondary_speech() -> None:
+    assert set(OmniAVSpeakerObservation.model_json_schema()["required"]) == {
+        "decision",
+        "entity_id",
+        "secondary_speech_status",
+    }
+    observation = OmniAVSpeakerObservation(
+        decision="visible_entity",
+        entity_id="e1",
+        secondary_speech_status="none",
+    )
+    assert observation.decision == "visible_entity"
+    assert observation.secondary_speech_status == "none"
+    for prompt in (PASS1_SYSTEM_PROMPT, PASS2_SYSTEM_PROMPT):
+        normalized = prompt.lower()
+        assert "non-linguistic" in normalized
+        assert "sighing" in normalized
+        assert "speech-turn ownership" in normalized
+        assert "briefly audible" in normalized
+    assert PASS1_PROMPT_VERSION.endswith("_v3")
+    assert PASS2_PROMPT_VERSION.endswith("_v3")
+    assert OMNI_AV_SPEAKER_POLICY_VERSION.endswith("_v3")
+
+
+def test_true_competing_speech_excludes_subject_and_voice_products(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0002"])
+    competing = OmniAVSpeakerObservation(
+        decision="multiple_speakers",
+        entity_id=None,
+        secondary_speech_status="competing",
+    )
+    run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=_FakeBackend([competing, competing]),
+        media_backend=_FakeMedia(),
+    )
+    record = _records(root / "pilot/records.jsonl")[0]
+
+    assert record["multiple_speakers_confirmed"]
+    assert record["subject_entity_binding_excluded"]
+    assert record["identity_specific_voice_products_excluded"]
     assert record["proposed_entity_id"] is None
+    for field in (
+        "subject_entity_binding_excluded",
+        "identity_specific_voice_products_excluded",
+    ):
+        with pytest.raises(ValueError, match="derived observation state"):
+            OmniAVSpeakerPilotRecord.model_validate({**record, field: False})
+    with pytest.raises(ValueError, match="derived observation state"):
+        OmniAVSpeakerPilotRecord.model_validate(
+            {**record, "proposed_entity_id": "e2"}
+        )
+
+
+def test_multiple_offscreen_speakers_remain_offscreen(tmp_path: Path) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0004"])
+    offscreen = OmniAVSpeakerObservation(
+        decision="offscreen",
+        entity_id=None,
+        secondary_speech_status="competing",
+    )
+    run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=_FakeBackend([offscreen, offscreen]),
+        media_backend=_FakeMedia(),
+    )
+    record = _records(root / "pilot/records.jsonl")[0]
+
+    assert record["primary_observation_stable"]
+    assert record["proposed_non_entity_class"] == "offscreen"
     assert not record["multiple_speakers_confirmed"]
     assert not record["subject_entity_binding_excluded"]
+    assert record["identity_specific_voice_products_excluded"]
+
+
+def test_primary_agreement_survives_secondary_status_disagreement(
+    tmp_path: Path,
+) -> None:
+    root, _, _ = _fixture(tmp_path / "production")
+    manifest = tmp_path / "cases.jsonl"
+    _manifest(manifest, ["segment_0002"])
+    backend = _FakeBackend(
+        [
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e2",
+                secondary_speech_status="incidental",
+            ),
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e2",
+                secondary_speech_status="none",
+            ),
+        ]
+    )
+    summary = run_omni_av_speaker_judge_pilot(
+        audio_production_root=root,
+        case_manifest_path=manifest,
+        output_root=root / "pilot",
+        backend=backend,
+        media_backend=_FakeMedia(),
+    )
+    record = _records(root / "pilot/records.jsonl")[0]
+
+    assert summary.primary_observation_stable_count == 1
+    assert summary.secondary_speech_stable_count == 0
+    assert record["primary_observation_stable"]
+    assert not record["secondary_speech_stable"]
+    assert record["confirmed_secondary_speech_status"] is None
+    assert record["proposed_entity_id"] == "e2"
+    assert record["comparison"] == "agree"
+    assert not record["subject_entity_binding_excluded"]
     assert not record["identity_specific_voice_products_excluded"]
+
+
+@pytest.mark.parametrize(
+    ("decision", "entity_id", "secondary_status"),
+    [
+        ("multiple_speakers", None, "none"),
+        ("multiple_speakers", None, "incidental"),
+        ("multiple_speakers", "e1", "competing"),
+        ("visible_entity", None, "none"),
+        ("visible_entity", "e1", "competing"),
+    ],
+)
+def test_observation_schema_rejects_inconsistent_combinations(
+    decision: str,
+    entity_id: str | None,
+    secondary_status: str,
+) -> None:
+    with pytest.raises(ValueError):
+        OmniAVSpeakerObservation.model_validate(
+            {
+                "decision": decision,
+                "entity_id": entity_id,
+                "secondary_speech_status": secondary_status,
+            }
+        )
 
 
 @pytest.mark.parametrize("overflow", [0.028118, 0.0366825, 0.0423195])
@@ -797,7 +872,13 @@ def test_synchronized_media_tail_overflow_is_clipped_for_model_only(
     manifest = tmp_path / "cases.jsonl"
     _manifest(manifest, ["segment_0001"])
     backend = _FakeBackend(
-        [OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1")]
+        [
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e1",
+                secondary_speech_status="none",
+            )
+        ]
     )
     media = _FakeMedia()
 
@@ -839,7 +920,13 @@ def test_synchronized_media_in_boundary_target_is_not_clipped(tmp_path: Path) ->
     manifest = tmp_path / "cases.jsonl"
     _manifest(manifest, ["segment_0001"])
     backend = _FakeBackend(
-        [OmniAVSpeakerObservation(decision="visible_entity", entity_id="e1")]
+        [
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e1",
+                secondary_speech_status="none",
+            )
+        ]
     )
 
     run_omni_av_speaker_judge_pilot(
@@ -878,7 +965,13 @@ def test_invalid_synchronized_boundary_fails_one_case_and_continues(
     manifest = tmp_path / "cases.jsonl"
     _manifest(manifest, ["segment_0001", "segment_0002"])
     backend = _FakeBackend(
-        [OmniAVSpeakerObservation(decision="visible_entity", entity_id="e2")]
+        [
+            OmniAVSpeakerObservation(
+                decision="visible_entity",
+                entity_id="e2",
+                secondary_speech_status="none",
+            )
+        ]
     )
     media = _FakeMedia()
 
@@ -959,9 +1052,11 @@ def test_openai_request_is_blind_synchronized_text_only_and_repairs_once(
         def create(self, **kwargs: object) -> object:
             calls.append(kwargs)
             content = (
-                '{"decision":"visible_entity","entity_id":"unknown"}'
+                '{"decision":"visible_entity","entity_id":"unknown",'
+                '"secondary_speech_status":"none"}'
                 if len(calls) == 1
-                else '{"decision":"visible_entity","entity_id":"e1"}'
+                else '{"decision":"visible_entity","entity_id":"e1",'
+                '"secondary_speech_status":"none"}'
             )
             return SimpleNamespace(
                 choices=[
@@ -1031,7 +1126,15 @@ def test_exact_entity_decision_alias_normalizes_without_model_repair(
         case_root.mkdir()
         backend, calls = _openai_backend(
             case_root,
-            [json.dumps({"decision": entity_id, "entity_id": entity_id})],
+            [
+                json.dumps(
+                    {
+                        "decision": entity_id,
+                        "entity_id": entity_id,
+                        "secondary_speech_status": "none",
+                    }
+                )
+            ],
         )
 
         result = backend.decide(_judge_request(case_root), verification=False)
@@ -1039,6 +1142,7 @@ def test_exact_entity_decision_alias_normalizes_without_model_repair(
         assert result.observation == OmniAVSpeakerObservation(
             decision="visible_entity",
             entity_id=entity_id,
+            secondary_speech_status="none",
         )
         assert result.model_call_count == 1
         assert len(calls) == 1
@@ -1053,8 +1157,16 @@ def test_entity_decision_alias_does_not_guess_conflicts_or_invisible_entities(
     tmp_path: Path,
 ) -> None:
     invalid_aliases = [
-        {"decision": "e1", "entity_id": "e2"},
-        {"decision": "e9", "entity_id": "e9"},
+        {
+            "decision": "e1",
+            "entity_id": "e2",
+            "secondary_speech_status": "none",
+        },
+        {
+            "decision": "e9",
+            "entity_id": "e9",
+            "secondary_speech_status": "none",
+        },
     ]
     for index, invalid in enumerate(invalid_aliases):
         case_root = tmp_path / str(index)
@@ -1063,7 +1175,10 @@ def test_entity_decision_alias_does_not_guess_conflicts_or_invisible_entities(
             case_root,
             [
                 json.dumps(invalid),
-                '{"decision":"uncertain","entity_id":null}',
+                (
+                    '{"decision":"uncertain","entity_id":null,'
+                    '"secondary_speech_status":"none"}'
+                ),
             ],
         )
 
@@ -1072,6 +1187,7 @@ def test_entity_decision_alias_does_not_guess_conflicts_or_invisible_entities(
         assert result.observation == OmniAVSpeakerObservation(
             decision="uncertain",
             entity_id=None,
+            secondary_speech_status="none",
         )
         assert result.model_call_count == 2
         assert len(calls) == 2
@@ -1086,7 +1202,12 @@ def test_canonical_response_is_unchanged_and_true_malformed_output_repairs(
     canonical_root.mkdir()
     backend, calls = _openai_backend(
         canonical_root,
-        ['{"decision":"visible_entity","entity_id":"e1"}'],
+        [
+            (
+                '{"decision":"visible_entity","entity_id":"e1",'
+                '"secondary_speech_status":"none"}'
+            )
+        ],
     )
     canonical = backend.decide(_judge_request(canonical_root), verification=False)
     assert canonical.observation.entity_id == "e1"
@@ -1098,7 +1219,13 @@ def test_canonical_response_is_unchanged_and_true_malformed_output_repairs(
     malformed_root.mkdir()
     backend, calls = _openai_backend(
         malformed_root,
-        ["not json", '{"decision":"offscreen","entity_id":null}'],
+        [
+            "not json",
+            (
+                '{"decision":"offscreen","entity_id":null,'
+                '"secondary_speech_status":"none"}'
+            ),
+        ],
     )
     repaired = backend.decide(_judge_request(malformed_root), verification=False)
     assert repaired.observation.decision == "offscreen"
@@ -1116,8 +1243,14 @@ def test_real_positive_alias_shape_uses_two_total_calls_and_stable_e1(
     backend, calls = _openai_backend(
         tmp_path,
         [
-            '{"decision":"e1","entity_id":"e1"}',
-            '{"decision":"e1","entity_id":"e1"}',
+            (
+                '{"decision":"e1","entity_id":"e1",'
+                '"secondary_speech_status":"none"}'
+            ),
+            (
+                '{"decision":"e1","entity_id":"e1",'
+                '"secondary_speech_status":"none"}'
+            ),
         ],
     )
 
@@ -1136,7 +1269,7 @@ def test_real_positive_alias_shape_uses_two_total_calls_and_stable_e1(
     assert record["pass1_entity_id"] == "e1"
     assert record["pass2_decision"] == "visible_entity"
     assert record["pass2_entity_id"] == "e1"
-    assert record["stable_observation"]
+    assert record["primary_observation_stable"]
     assert record["comparison"] == "disagree"
     assert record["proposed_entity_id"] == "e1"
     raw = json.loads(

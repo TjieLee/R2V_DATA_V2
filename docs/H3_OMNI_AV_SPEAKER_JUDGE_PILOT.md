@@ -16,24 +16,51 @@ target interval relative to the window, and visible mapped entity IDs. Human QA
 labels may be retained in the pilot manifest but are never included in a model
 request.
 
-Pass 1 is blind to the draft. A separately versioned blind Pass 2 runs when a
-mapped draft disagrees with Pass 1, when an unresolved draft receives a concrete
-visible-entity or offscreen observation, or whenever Pass 1 reports
-`multiple_speakers`. Agreement between two passes is published as stable
-diagnostic evidence; disagreement remains unresolved. No observation is applied
-to production data.
+The V3 observation has two independent axes:
 
-`multiple_speakers` means at least two distinct speakers produce audible speech
-inside the marked interval, including brief interjections. A confirmed result
-requires both blind passes to agree. The segment remains an audio/speech
-observation, but the record permanently publishes
-`subject_entity_binding_excluded=true` and
-`identity_specific_voice_products_excluded=true`. It cannot publish a proposed
-entity or non-entity class, cannot correct a subject/entity binding, and cannot
-source a primary voice reference, speaker embedding, identity pair, or any other
-identity-specific voice-reference product. The current pilot has no production
-consumer; any future consumer must fail closed on these exclusion fields rather
-than selecting a dominant speaker.
+```json
+{
+  "decision": "visible_entity|offscreen|other_visible|multiple_speakers|uncertain",
+  "entity_id": "eN or null",
+  "secondary_speech_status": "none|incidental|competing"
+}
+```
+
+The primary axis answers who safely owns the speech turn. The secondary axis
+describes linguistic speech from other speakers. `none` means no meaningful
+secondary linguistic speech; non-linguistic vocalizations alone do not count.
+`incidental` means another speaker is audible but one primary still clearly owns
+the turn. `competing` means meaningful contributions prevent a reliable single
+primary. These are semantic distinctions, not duration, word-count, overlap, or
+loudness thresholds.
+
+`multiple_speakers` is reserved for materially competing speech where no
+reliable primary owns the target turn, and therefore requires
+`secondary_speech_status=competing`. Merely hearing more than one voice is not
+enough. A clear mapped primary with a brief interjection remains
+`visible_entity + incidental`. Multiple offscreen speakers remain
+`offscreen + competing` when the important binding fact is that no mapped
+visible subject owns the speech.
+
+Pass 1 is blind to the draft. A separately versioned blind Pass 2 runs under the
+existing verification conditions and whenever Pass 1 reports `incidental` or
+`competing`. Primary-attribution stability compares only `(decision, entity_id)`;
+secondary-speech stability compares `secondary_speech_status` independently.
+Thus `visible_entity/e2/incidental` followed by `visible_entity/e2/none` retains
+the stable proposed entity `e2`, but does not confirm contamination.
+
+The exclusion flags are also independent. A confirmed
+`multiple_speakers + competing` has no primary and publishes
+`subject_entity_binding_excluded=true`. Confirmed `incidental` or `competing`
+secondary speech publishes `identity_specific_voice_products_excluded=true`,
+while a clear primary may still retain its entity binding. Unconfirmed one-pass
+or pass-disagreement contamination does not set the voice-product exclusion.
+
+A DiariZen segment therefore need not be acoustically single-speaker to retain a
+valid primary subject/entity attribution. Identity-specific voice-reference
+cleanliness is a separate question. This remains a read-only pilot sidecar with
+no production consumer: it does not rewrite primary voice references, speaker
+embeddings, identity pairs, bindings, ASR inputs, or final H3 samples.
 
 ## Manifest
 

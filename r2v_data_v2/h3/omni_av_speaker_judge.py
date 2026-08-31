@@ -38,12 +38,12 @@ from r2v_data_v2.structured_output import (
 )
 
 OMNI_AV_SPEAKER_MANIFEST_VERSION = "r2v.h3.omni_av_speaker_judge_manifest.1"
-OMNI_AV_SPEAKER_RECORD_VERSION = "r2v.h3.omni_av_speaker_judge_record.1"
+OMNI_AV_SPEAKER_RECORD_VERSION = "r2v.h3.omni_av_speaker_judge_record.2"
 OMNI_AV_SPEAKER_RAW_VERSION = "r2v.h3.omni_av_speaker_judge_raw.1"
-OMNI_AV_SPEAKER_SUMMARY_VERSION = "r2v.h3.omni_av_speaker_judge_summary.1"
-OMNI_AV_SPEAKER_POLICY_VERSION = "h3_omni_av_speaker_judge_pilot_v2"
-PASS1_PROMPT_VERSION = "h3_omni_av_speaker_blind_identification_v2"
-PASS2_PROMPT_VERSION = "h3_omni_av_speaker_blind_verification_v2"
+OMNI_AV_SPEAKER_SUMMARY_VERSION = "r2v.h3.omni_av_speaker_judge_summary.2"
+OMNI_AV_SPEAKER_POLICY_VERSION = "h3_omni_av_speaker_judge_pilot_v3"
+PASS1_PROMPT_VERSION = "h3_omni_av_speaker_blind_identification_v3"
+PASS2_PROMPT_VERSION = "h3_omni_av_speaker_blind_verification_v3"
 DEFAULT_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 CONTEXT_SECONDS = 0.75
 
@@ -54,6 +54,7 @@ Decision = Literal[
     "other_visible",
     "uncertain",
 ]
+SecondarySpeechStatus = Literal["none", "incidental", "competing"]
 DraftStatus = Literal["candidate_mapped", "conflict", "unbound", "ambiguous"]
 Comparison = Literal["agree", "disagree", "unresolved", "draft_unresolved"]
 
@@ -109,7 +110,8 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
 
 class OmniAVSpeakerObservation(SchemaModel):
     decision: Decision
-    entity_id: str | None = None
+    entity_id: str | None
+    secondary_speech_status: SecondarySpeechStatus
 
     @model_validator(mode="after")
     def validate_entity(self) -> OmniAVSpeakerObservation:
@@ -120,11 +122,39 @@ class OmniAVSpeakerObservation(SchemaModel):
                 raise ValueError("visible_entity requires an eN entity_id")
         elif self.entity_id is not None:
             raise ValueError("non-visible decision requires null entity_id")
+        if self.decision == "multiple_speakers" and (
+            self.secondary_speech_status != "competing"
+        ):
+            raise ValueError("multiple_speakers requires competing secondary speech")
+        if (
+            self.decision == "visible_entity"
+            and self.secondary_speech_status == "competing"
+        ):
+            raise ValueError("visible_entity cannot have competing secondary speech")
         return self
 
 
-class OmniAVSpeakerHumanLabel(OmniAVSpeakerObservation):
-    pass
+class OmniAVSpeakerHumanLabel(SchemaModel):
+    decision: Decision
+    entity_id: str | None = None
+    secondary_speech_status: SecondarySpeechStatus | None = None
+
+    @model_validator(mode="after")
+    def validate_label(self) -> OmniAVSpeakerHumanLabel:
+        if self.decision == "visible_entity":
+            if self.entity_id is None or re.fullmatch(
+                r"e[1-9]\d*", self.entity_id
+            ) is None:
+                raise ValueError("visible_entity requires an eN entity_id")
+        elif self.entity_id is not None:
+            raise ValueError("non-visible decision requires null entity_id")
+        if self.secondary_speech_status is not None:
+            OmniAVSpeakerObservation(
+                decision=self.decision,
+                entity_id=self.entity_id,
+                secondary_speech_status=self.secondary_speech_status,
+            )
+        return self
 
 
 class OmniAVSpeakerPilotCase(SchemaModel):
@@ -165,12 +195,12 @@ class OmniAVSpeakerBackendProvenance(SchemaModel):
     max_tokens: int = Field(gt=0)
     repair_retries: Literal[1] = 1
     pass1_prompt_version: Literal[
-        "h3_omni_av_speaker_blind_identification_v2"
+        "h3_omni_av_speaker_blind_identification_v3"
     ] = PASS1_PROMPT_VERSION
     pass2_prompt_version: Literal[
-        "h3_omni_av_speaker_blind_verification_v2"
+        "h3_omni_av_speaker_blind_verification_v3"
     ] = PASS2_PROMPT_VERSION
-    policy_version: Literal["h3_omni_av_speaker_judge_pilot_v2"] = (
+    policy_version: Literal["h3_omni_av_speaker_judge_pilot_v3"] = (
         OMNI_AV_SPEAKER_POLICY_VERSION
     )
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -289,44 +319,74 @@ class OmniAVSpeakerJudgeBackend(Protocol):
     ) -> OmniAVSpeakerJudgeResult: ...
 
 
-PASS1_SYSTEM_PROMPT = """Identify the visible active speaker during one marked
-target interval using only synchronized audio-video speaking evidence.
+PASS1_SYSTEM_PROMPT = """Judge speech-turn ownership during one marked target
+interval using only synchronized audio-video speaking evidence.
 
 The attached video uses neutral face labels. Labels e1, e2, and so on identify
 visible mapped entities; OTHER identifies a visible face without a mapped entity.
 The labels do not indicate speaking state.
 
-Choose visible_entity only when exactly one supplied visible entity is producing
-the target speech. Choose offscreen when speech is audible but no visible face is
-producing it. Choose other_visible when a visible OTHER face is producing it.
-Choose uncertain when synchronized evidence does not support one answer.
-If two or more distinct speakers produce audible speech anywhere inside the
-marked target interval, including short interjections, fillers, or brief
-responses, return {"decision":"multiple_speakers","entity_id":null}. Do not
-choose the dominant, longest, loudest, or most central speaker.
+First determine the safest primary speaker attribution. Choose visible_entity
+when one supplied entity clearly owns the primary speech turn, offscreen when
+the primary speech belongs to no mapped visible subject, other_visible when the
+primary speaker is a visible OTHER face, and uncertain when attribution is not
+reliable. Use multiple_speakers only when speakers contribute materially and no
+reliable single primary owns the turn. Multiple offscreen speakers remain
+offscreen when no mapped visible subject owns the speech.
+
+Separately report secondary_speech_status. Use none when there is no meaningful
+linguistic speech from another speaker, incidental when another speaker is
+audible but one primary still clearly owns the turn, and competing when speech
+is material enough that no reliable single primary owns the turn. Breathing,
+sighing, laughter, coughing, gasping, grunting, and other non-linguistic
+vocalizations alone are none, not secondary speech.
+
+Generic examples: a mapped subject owns the main utterance while another person
+briefly interjects -> visible_entity + incidental; materially alternating or
+overlapping speakers with no reliable primary -> multiple_speakers + competing;
+several offscreen speakers while no mapped subject owns the speech -> offscreen
++ competing; another person only sighs or coughs -> none.
+
+Do not choose a primary merely because someone is louder, longer, visually
+central, first, or last. Conversely, do not reject a clear primary merely
+because a second voice is briefly audible.
 
 Do not infer identity from gender, age, clothing, dialogue meaning, character
 semantics, or visual appearance. Never transcribe, quote, or paraphrase speech.
-Return exactly one compact JSON object with decision and entity_id only."""
+Return exactly one compact JSON object with decision, entity_id, and
+secondary_speech_status only."""
 
-PASS2_SYSTEM_PROMPT = """Independently verify the visible active speaker during
-one marked target interval using only the attached synchronized audio-video
-speaking evidence. You have not been given any prior answer.
+PASS2_SYSTEM_PROMPT = """Independently verify speech-turn ownership during one
+marked target interval using only the attached synchronized audio-video speaking
+evidence. You have not been given any prior answer.
 
 The video uses neutral labels: e1, e2, and so on are supplied visible entities;
 OTHER is an unmatched visible face. Labels never indicate speaking state.
 
-Choose visible_entity only for exactly one supplied visible entity producing the
-target speech; choose offscreen for audible speech produced by no visible face;
-choose other_visible for a speaking OTHER face; otherwise choose uncertain.
-If two or more distinct speakers produce audible speech anywhere inside the
-marked target interval, including short interjections, fillers, or brief
-responses, return {"decision":"multiple_speakers","entity_id":null}. Do not
-choose the dominant, longest, loudest, or most central speaker.
+First determine the safest primary attribution: visible_entity for one mapped
+entity that clearly owns the turn, offscreen when no mapped visible subject owns
+the primary speech, other_visible for a visible OTHER primary, and uncertain
+when attribution is unreliable. Reserve multiple_speakers for materially
+competing speech with no reliable single primary. Multiple offscreen speakers
+remain offscreen when no mapped visible subject owns the speech.
+
+Separately classify secondary_speech_status as none, incidental, or competing.
+Incidental means another speaker is audible while one primary still clearly
+owns the turn. Competing means no reliable primary owns the turn. Non-linguistic
+breathing, sighing, laughter, coughing, gasping, or grunting alone count as none.
+
+Generic examples: clear mapped primary plus a brief interjection ->
+visible_entity + incidental; materially alternating or overlapping speech with
+no reliable primary -> multiple_speakers + competing; several offscreen voices
+with no mapped primary -> offscreen + competing; a second person only coughs ->
+none. Do not choose by loudness, duration, visual centrality, firstness, or
+lastness, and do not discard a clear primary merely because another voice is
+briefly audible.
 
 Do not infer identity from gender, age, clothing, dialogue meaning, character
 semantics, or visual appearance. Never transcribe, quote, or paraphrase speech.
-Return exactly one compact JSON object with decision and entity_id only."""
+Return exactly one compact JSON object with decision, entity_id, and
+secondary_speech_status only."""
 
 
 def _user_prompt(request: OmniAVSpeakerJudgeRequest) -> str:
@@ -336,7 +396,8 @@ def _user_prompt(request: OmniAVSpeakerJudgeRequest) -> str:
         f"{request.target_start_in_window:.6f} to "
         f"{request.target_end_in_window:.6f} seconds.\n"
         f"Visible mapped entity IDs in the window: {candidates}.\n"
-        "Which visible entity, if any, is producing the target speech?"
+        "Who, if anyone, safely owns the primary speech turn, and what is the "
+        "secondary speech status?"
     )
 
 
@@ -382,10 +443,15 @@ def _normalize_entity_decision_alias(
         payload = json.loads(normalize_structured_json_envelope(raw))
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
-    if not isinstance(payload, dict) or set(payload) != {"decision", "entity_id"}:
+    if not isinstance(payload, dict) or set(payload) != {
+        "decision",
+        "entity_id",
+        "secondary_speech_status",
+    }:
         return None
     decision = payload["decision"]
     entity_id = payload["entity_id"]
+    secondary_speech_status = payload["secondary_speech_status"]
     if (
         not isinstance(decision, str)
         or re.fullmatch(r"e[1-9]\d*", decision) is None
@@ -393,10 +459,14 @@ def _normalize_entity_decision_alias(
         or decision not in request.visible_candidate_entity_ids
     ):
         return None
-    return OmniAVSpeakerObservation(
-        decision="visible_entity",
-        entity_id=decision,
-    )
+    try:
+        return OmniAVSpeakerObservation(
+            decision="visible_entity",
+            entity_id=decision,
+            secondary_speech_status=secondary_speech_status,
+        )
+    except ValueError:
+        return None
 
 
 def _optional_value(value: object, field: str) -> object | None:
@@ -783,7 +853,7 @@ class OmniAVSpeakerCaseFailure(SchemaModel):
 
 
 class OmniAVSpeakerPilotRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.omni_av_speaker_judge_record.1"] = (
+    schema_version: Literal["r2v.h3.omni_av_speaker_judge_record.2"] = (
         OMNI_AV_SPEAKER_RECORD_VERSION
     )
     status: Literal["succeeded", "failed"]
@@ -804,10 +874,14 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
     draft_entity_id: str | None = None
     pass1_decision: Decision | None = None
     pass1_entity_id: str | None = None
+    pass1_secondary_speech_status: SecondarySpeechStatus | None = None
     pass2_called: bool
     pass2_decision: Decision | None = None
     pass2_entity_id: str | None = None
-    stable_observation: bool
+    pass2_secondary_speech_status: SecondarySpeechStatus | None = None
+    primary_observation_stable: bool
+    secondary_speech_stable: bool
+    confirmed_secondary_speech_status: SecondarySpeechStatus | None = None
     comparison: Comparison | None = None
     proposed_entity_id: str | None = None
     proposed_non_entity_class: Literal["offscreen", "other_visible"] | None = None
@@ -826,11 +900,37 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
         mapped = self.draft_binding_status == "candidate_mapped"
         if mapped != (self.draft_entity_id is not None):
             raise ValueError("speaker judge draft mapping is inconsistent")
+        if (self.pass1_decision is None) != (
+            self.pass1_secondary_speech_status is None
+        ):
+            raise ValueError("speaker judge pass-1 state is inconsistent")
+        if (self.pass2_decision is None) != (
+            self.pass2_secondary_speech_status is None
+        ):
+            raise ValueError("speaker judge pass-2 state is inconsistent")
         if self.pass2_decision is not None and not self.pass2_called:
             raise ValueError("speaker judge pass-2 state is inconsistent")
+        pass1 = (
+            None
+            if self.pass1_decision is None
+            else OmniAVSpeakerObservation(
+                decision=self.pass1_decision,
+                entity_id=self.pass1_entity_id,
+                secondary_speech_status=self.pass1_secondary_speech_status,
+            )
+        )
+        pass2 = (
+            None
+            if self.pass2_decision is None
+            else OmniAVSpeakerObservation(
+                decision=self.pass2_decision,
+                entity_id=self.pass2_entity_id,
+                secondary_speech_status=self.pass2_secondary_speech_status,
+            )
+        )
         if self.status == "succeeded":
             if (
-                self.pass1_decision is None
+                pass1 is None
                 or self.media_provenance is None
                 or self.failure is not None
                 or self.comparison is None
@@ -841,8 +941,55 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
                 or self.target_end_in_window is None
             ):
                 raise ValueError("successful speaker judge record is incomplete")
-        elif self.failure is None:
-            raise ValueError("failed speaker judge record requires failure")
+            if self.pass2_called != (pass2 is not None):
+                raise ValueError("successful speaker judge pass-2 state is incomplete")
+            resolution = _resolve_observations(
+                draft_status=self.draft_binding_status,
+                draft_entity_id=self.draft_entity_id,
+                pass1=pass1,
+                pass2=pass2,
+            )
+            published = (
+                self.primary_observation_stable,
+                self.secondary_speech_stable,
+                self.confirmed_secondary_speech_status,
+                self.comparison,
+                self.proposed_entity_id,
+                self.proposed_non_entity_class,
+                self.multiple_speakers_confirmed,
+                self.subject_entity_binding_excluded,
+                self.identity_specific_voice_products_excluded,
+            )
+            expected = (
+                resolution.primary_observation_stable,
+                resolution.secondary_speech_stable,
+                resolution.confirmed_secondary_speech_status,
+                resolution.comparison,
+                resolution.proposed_entity_id,
+                resolution.proposed_non_entity_class,
+                resolution.multiple_speakers_confirmed,
+                resolution.subject_entity_binding_excluded,
+                resolution.identity_specific_voice_products_excluded,
+            )
+            if published != expected:
+                raise ValueError("speaker judge derived observation state is inconsistent")
+        else:
+            if self.failure is None:
+                raise ValueError("failed speaker judge record requires failure")
+            if any(
+                (
+                    self.primary_observation_stable,
+                    self.secondary_speech_stable,
+                    self.confirmed_secondary_speech_status is not None,
+                    self.comparison is not None,
+                    self.proposed_entity_id is not None,
+                    self.proposed_non_entity_class is not None,
+                    self.multiple_speakers_confirmed,
+                    self.subject_entity_binding_excluded,
+                    self.identity_specific_voice_products_excluded,
+                )
+            ):
+                raise ValueError("failed speaker judge record cannot publish conclusions")
         if self.target_boundary_clipped != (self.target_boundary_clip_seconds > 0):
             raise ValueError("speaker judge target boundary provenance is inconsistent")
         if (
@@ -850,31 +997,15 @@ class OmniAVSpeakerPilotRecord(SchemaModel):
             and self.effective_absolute_segment_end > self.absolute_segment_end
         ):
             raise ValueError("effective speaker segment end exceeds source segment")
-        confirmed_multiple_speakers = (
-            self.status == "succeeded"
-            and self.stable_observation
-            and self.pass1_decision == "multiple_speakers"
-            and self.pass2_decision == "multiple_speakers"
-        )
-        if self.multiple_speakers_confirmed != confirmed_multiple_speakers:
-            raise ValueError("speaker judge multiple-speaker provenance is inconsistent")
-        if (
-            self.subject_entity_binding_excluded
-            != self.multiple_speakers_confirmed
-            or self.identity_specific_voice_products_excluded
-            != self.multiple_speakers_confirmed
-        ):
-            raise ValueError("multiple-speaker identity exclusions are inconsistent")
-        if self.multiple_speakers_confirmed and (
+        if self.subject_entity_binding_excluded and (
             self.proposed_entity_id is not None
-            or self.proposed_non_entity_class is not None
         ):
-            raise ValueError("multiple-speaker observation cannot propose an identity")
+            raise ValueError("excluded subject binding cannot propose an entity")
         return self
 
 
 class OmniAVSpeakerPilotSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.omni_av_speaker_judge_summary.1"] = (
+    schema_version: Literal["r2v.h3.omni_av_speaker_judge_summary.2"] = (
         OMNI_AV_SPEAKER_SUMMARY_VERSION
     )
     source_audio_production_root: str
@@ -883,7 +1014,8 @@ class OmniAVSpeakerPilotSummary(SchemaModel):
     succeeded_case_count: int = Field(ge=0)
     failed_case_count: int = Field(ge=0)
     pass2_case_count: int = Field(ge=0)
-    stable_observation_count: int = Field(ge=0)
+    primary_observation_stable_count: int = Field(ge=0)
+    secondary_speech_stable_count: int = Field(ge=0)
     comparison_counts: dict[str, int]
     model_call_count: int = Field(ge=0)
     bindings_modified_count: Literal[0] = 0
@@ -896,6 +1028,11 @@ class OmniAVSpeakerPilotSummary(SchemaModel):
             raise ValueError("speaker judge case counts do not reconcile")
         if sum(self.comparison_counts.values()) != self.succeeded_case_count:
             raise ValueError("speaker judge comparison counts do not reconcile")
+        if max(
+            self.primary_observation_stable_count,
+            self.secondary_speech_stable_count,
+        ) > self.succeeded_case_count:
+            raise ValueError("speaker judge stability counts exceed successes")
         return self
 
 
@@ -1076,7 +1213,7 @@ def _needs_verification(
     draft_entity_id: str | None,
     pass1: OmniAVSpeakerObservation,
 ) -> bool:
-    if pass1.decision == "multiple_speakers":
+    if pass1.secondary_speech_status in {"incidental", "competing"}:
         return True
     if draft_status == "candidate_mapped":
         return not (
@@ -1086,42 +1223,79 @@ def _needs_verification(
     return pass1.decision in {"visible_entity", "offscreen"}
 
 
-def _final_comparison(
+@dataclass(frozen=True)
+class _ObservationResolution:
+    primary_observation_stable: bool
+    secondary_speech_stable: bool
+    confirmed_secondary_speech_status: SecondarySpeechStatus | None
+    comparison: Comparison
+    proposed_entity_id: str | None
+    proposed_non_entity_class: Literal["offscreen", "other_visible"] | None
+    multiple_speakers_confirmed: bool
+    subject_entity_binding_excluded: bool
+    identity_specific_voice_products_excluded: bool
+
+
+def _resolve_observations(
     *,
     draft_status: DraftStatus,
     draft_entity_id: str | None,
     pass1: OmniAVSpeakerObservation,
     pass2: OmniAVSpeakerObservation | None,
-) -> tuple[bool, Comparison, str | None, str | None]:
-    if pass1.decision == "multiple_speakers":
-        comparison: Comparison = (
-            "unresolved"
-            if draft_status == "candidate_mapped"
-            else "draft_unresolved"
-        )
-        return pass2 == pass1, comparison, None, None
-    if pass2 is not None and pass2 != pass1:
-        return False, "unresolved", None, None
-    stable = pass2 is not None or (
+) -> _ObservationResolution:
+    pass1_primary = (pass1.decision, pass1.entity_id)
+    pass2_primary = (
+        None if pass2 is None else (pass2.decision, pass2.entity_id)
+    )
+    primary_stable = pass2_primary == pass1_primary if pass2 is not None else (
         draft_status == "candidate_mapped"
         and pass1.decision == "visible_entity"
         and pass1.entity_id == draft_entity_id
     )
+    secondary_stable = (
+        pass2 is not None
+        and pass2.secondary_speech_status == pass1.secondary_speech_status
+    )
+    confirmed_secondary = (
+        pass1.secondary_speech_status if secondary_stable else None
+    )
+    multiple_speakers_confirmed = (
+        primary_stable
+        and pass2 is not None
+        and pass1.decision == "multiple_speakers"
+        and pass2.decision == "multiple_speakers"
+    )
     if draft_status != "candidate_mapped":
         comparison: Comparison = "draft_unresolved"
-    elif not stable:
+    elif not primary_stable or multiple_speakers_confirmed:
         comparison = "unresolved"
     elif pass1.decision == "visible_entity" and pass1.entity_id == draft_entity_id:
         comparison = "agree"
     else:
         comparison = "disagree"
-    proposed_entity = pass1.entity_id if stable and pass1.decision == "visible_entity" else None
-    proposed_non_entity = (
-        pass1.decision
-        if stable and pass1.decision in {"offscreen", "other_visible"}
+    proposed_entity = (
+        pass1.entity_id
+        if primary_stable and pass1.decision == "visible_entity"
         else None
     )
-    return stable, comparison, proposed_entity, proposed_non_entity
+    proposed_non_entity = (
+        pass1.decision
+        if primary_stable and pass1.decision in {"offscreen", "other_visible"}
+        else None
+    )
+    return _ObservationResolution(
+        primary_observation_stable=primary_stable,
+        secondary_speech_stable=secondary_stable,
+        confirmed_secondary_speech_status=confirmed_secondary,
+        comparison=comparison,
+        proposed_entity_id=proposed_entity,
+        proposed_non_entity_class=proposed_non_entity,
+        multiple_speakers_confirmed=multiple_speakers_confirmed,
+        subject_entity_binding_excluded=multiple_speakers_confirmed,
+        identity_specific_voice_products_excluded=(
+            confirmed_secondary in {"incidental", "competing"}
+        ),
+    )
 
 
 def _source_provenance(
@@ -1240,9 +1414,17 @@ def _review_html(
             f"status={html.escape(record.status)} | comparison="
             f"{html.escape(record.comparison or '-')}</p>"
             f"<p>pass1={html.escape(str(record.pass1_decision))}/"
-            f"{html.escape(record.pass1_entity_id or '-')} | pass2="
+            f"{html.escape(record.pass1_entity_id or '-')}/"
+            f"{html.escape(record.pass1_secondary_speech_status or '-')} | pass2="
             f"{html.escape(str(record.pass2_decision))}/"
-            f"{html.escape(record.pass2_entity_id or '-')}</p>"
+            f"{html.escape(record.pass2_entity_id or '-')}/"
+            f"{html.escape(record.pass2_secondary_speech_status or '-')}</p>"
+            f"<p>primary stable={record.primary_observation_stable} | "
+            f"secondary stable={record.secondary_speech_stable} | confirmed "
+            f"secondary={html.escape(record.confirmed_secondary_speech_status or '-')}"
+            f" | subject excluded={record.subject_entity_binding_excluded} | "
+            "identity-specific voice excluded="
+            f"{record.identity_specific_voice_products_excluded}</p>"
             f"<p>human QA={html.escape(human.model_dump_json() if human else '-')}</p>"
             f"{video}{audio}"
             "</section>"
@@ -1399,27 +1581,14 @@ def run_omni_av_speaker_judge_pilot(
             ) + (len(failure.raw_responses) if failure is not None else 0)
             if failure is None:
                 assert pass1 is not None
-                stable, comparison, proposed_entity, proposed_non_entity = (
-                    _final_comparison(
-                        draft_status=source.cluster.status,
-                        draft_entity_id=source.cluster.entity_id,
-                        pass1=pass1.observation,
-                        pass2=(None if pass2 is None else pass2.observation),
-                    )
+                resolution = _resolve_observations(
+                    draft_status=source.cluster.status,
+                    draft_entity_id=source.cluster.entity_id,
+                    pass1=pass1.observation,
+                    pass2=(None if pass2 is None else pass2.observation),
                 )
             else:
-                stable = False
-                comparison = None
-                proposed_entity = None
-                proposed_non_entity = None
-            confirmed_multiple_speakers = (
-                failure is None
-                and stable
-                and pass1 is not None
-                and pass1.observation.decision == "multiple_speakers"
-                and pass2 is not None
-                and pass2.observation.decision == "multiple_speakers"
-            )
+                resolution = None
             record = OmniAVSpeakerPilotRecord(
                 status="failed" if failure is not None else "succeeded",
                 clip_uid=source.manifest.clip_uid,
@@ -1466,17 +1635,55 @@ def run_omni_av_speaker_judge_pilot(
                 draft_entity_id=source.cluster.entity_id,
                 pass1_decision=(None if pass1 is None else pass1.observation.decision),
                 pass1_entity_id=(None if pass1 is None else pass1.observation.entity_id),
+                pass1_secondary_speech_status=(
+                    None
+                    if pass1 is None
+                    else pass1.observation.secondary_speech_status
+                ),
                 pass2_called=pass2_called,
                 pass2_decision=(None if pass2 is None else pass2.observation.decision),
                 pass2_entity_id=(None if pass2 is None else pass2.observation.entity_id),
-                stable_observation=stable,
-                comparison=comparison,
-                proposed_entity_id=proposed_entity,
-                proposed_non_entity_class=proposed_non_entity,
-                multiple_speakers_confirmed=confirmed_multiple_speakers,
-                subject_entity_binding_excluded=confirmed_multiple_speakers,
+                pass2_secondary_speech_status=(
+                    None
+                    if pass2 is None
+                    else pass2.observation.secondary_speech_status
+                ),
+                primary_observation_stable=(
+                    False
+                    if resolution is None
+                    else resolution.primary_observation_stable
+                ),
+                secondary_speech_stable=(
+                    False if resolution is None else resolution.secondary_speech_stable
+                ),
+                confirmed_secondary_speech_status=(
+                    None
+                    if resolution is None
+                    else resolution.confirmed_secondary_speech_status
+                ),
+                comparison=(None if resolution is None else resolution.comparison),
+                proposed_entity_id=(
+                    None if resolution is None else resolution.proposed_entity_id
+                ),
+                proposed_non_entity_class=(
+                    None
+                    if resolution is None
+                    else resolution.proposed_non_entity_class
+                ),
+                multiple_speakers_confirmed=(
+                    False
+                    if resolution is None
+                    else resolution.multiple_speakers_confirmed
+                ),
+                subject_entity_binding_excluded=(
+                    False
+                    if resolution is None
+                    else resolution.subject_entity_binding_excluded
+                ),
                 identity_specific_voice_products_excluded=(
-                    confirmed_multiple_speakers
+                    False
+                    if resolution is None
+                    else resolution.identity_specific_voice_products_excluded
                 ),
                 source_provenance=source_provenance,
                 media_provenance=media_provenance,
@@ -1514,7 +1721,12 @@ def run_omni_av_speaker_judge_pilot(
             succeeded_case_count=sum(record.status == "succeeded" for record in records),
             failed_case_count=sum(record.status == "failed" for record in records),
             pass2_case_count=sum(record.pass2_called for record in records),
-            stable_observation_count=sum(record.stable_observation for record in records),
+            primary_observation_stable_count=sum(
+                record.primary_observation_stable for record in records
+            ),
+            secondary_speech_stable_count=sum(
+                record.secondary_speech_stable for record in records
+            ),
             comparison_counts=dict(sorted(comparisons.items())),
             model_call_count=sum(record.model_call_count for record in records),
             backend_provenance=backend.provenance,
