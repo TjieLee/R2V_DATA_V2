@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import shutil
@@ -10,6 +11,11 @@ from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from r2v_data_v2.h3.binding_audit import (
+    BINDING_AUDIT_POLICY_VERSION,
+    SpeakerBindingAuditSummary,
+    SpeakerBindingSegmentAudit,
+)
 from r2v_data_v2.h3.diarization_binding import BoundDiarizationSegment
 from r2v_data_v2.h3.jea_audio_production import JEACrossPair, JEAInPair
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
@@ -21,7 +27,7 @@ from r2v_data_v2.h3.visual_production_source import (
 from r2v_data_v2.v3.production_export import ProductionReference
 
 FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.3"
-FINAL_SUMMARY_VERSION = "r2v.h3.final_summary.3"
+FINAL_SUMMARY_VERSION = "r2v.h3.final_summary.4"
 
 
 class FinalVisualReference(ProductionReference):
@@ -137,7 +143,7 @@ class FinalH3SampleV2(SchemaModel):
 
 
 class FinalH3SummaryV2(SchemaModel):
-    schema_version: Literal["r2v.h3.final_summary.3"] = FINAL_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.final_summary.4"] = FINAL_SUMMARY_VERSION
     final_sample_schema_version: Literal[
         "r2v.h3.final_sample.3"
     ] = FINAL_SAMPLE_VERSION
@@ -146,7 +152,13 @@ class FinalH3SummaryV2(SchemaModel):
     cross_pair_sample_count: int = Field(ge=0)
     final_sample_count: int = Field(ge=0)
     speech_segment_count: int = Field(ge=0)
+    entity_bindings_removed_by_direct_anchor_gate: int = Field(ge=0)
     visual_reference_kind_counts: dict[str, int]
+    speaker_binding_audit_policy_version: Literal[
+        "h3_speaker_binding_structural_audit_v1"
+    ] = BINDING_AUDIT_POLICY_VERSION
+    source_binding_audit_summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_binding_audit_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     asr_model: Literal["Qwen/Qwen3-ASR-1.7B"] = "Qwen/Qwen3-ASR-1.7B"
     whisper_rows_consumed: Literal[0] = 0
     language_probability_gate_applied: Literal[False] = False
@@ -156,6 +168,53 @@ class FinalH3SummaryV2(SchemaModel):
 def _read_rows(path: Path) -> list[dict[str, object]]:
     with path.open("r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_binding_audit(
+    *,
+    binding_audit_root: Path,
+    diarization_root: Path,
+) -> tuple[
+    dict[tuple[str, str], SpeakerBindingSegmentAudit],
+    str,
+    str,
+]:
+    root = binding_audit_root.expanduser().resolve(strict=True)
+    summary_path = root / "summary.json"
+    segments_path = root / "segments.jsonl"
+    if not summary_path.is_file() or not segments_path.is_file():
+        raise ValueError("speaker-binding audit artifacts are incomplete")
+    summary = SpeakerBindingAuditSummary.model_validate_json(
+        summary_path.read_text(encoding="utf-8")
+    )
+    expected_production_root = root.parent.resolve(strict=True)
+    expected_diarization_root = diarization_root.expanduser().resolve(strict=True)
+    if (
+        Path(summary.source_audio_production_root).expanduser().resolve(strict=True)
+        != expected_production_root
+        or Path(summary.source_diarization_root).expanduser().resolve(strict=True)
+        != expected_diarization_root
+    ):
+        raise ValueError("speaker-binding audit production provenance is inconsistent")
+    bound_path = expected_diarization_root / "bound_segments.jsonl"
+    if summary.source_artifact_sha256.get("bound_segments") != _sha256(bound_path):
+        raise ValueError("speaker-binding audit differs from bound DiariZen evidence")
+    segments = [
+        SpeakerBindingSegmentAudit.model_validate(row)
+        for row in _read_rows(segments_path)
+    ]
+    by_key = {(item.clip_uid, item.segment_id): item for item in segments}
+    if len(by_key) != len(segments) or summary.segment_count != len(segments):
+        raise ValueError("speaker-binding audit segment inventory is inconsistent")
+    return by_key, _sha256(summary_path), _sha256(segments_path)
 
 
 def _target_voices(pair: JEAInPair) -> list[FinalSubjectVoice]:
@@ -190,20 +249,43 @@ def _cross_voices(pair: JEAInPair, cross: JEACrossPair) -> list[FinalSubjectVoic
     ]
 
 
-def _speech(value: Qwen3ASRSegment) -> FinalQwen3SpeechSegment:
+def _speech(
+    value: Qwen3ASRSegment,
+    audit: SpeakerBindingSegmentAudit,
+) -> tuple[FinalQwen3SpeechSegment, bool]:
     assert value.text is not None
-    return FinalQwen3SpeechSegment(
-        segment_id=value.segment_id,
-        speaker_cluster_id=value.speaker_cluster_id,
-        entity_id=value.entity_id,
-        entity_occurrence_id=value.entity_occurrence_id,
-        source_start_sample=value.source_start_sample,
-        source_end_sample=value.source_end_sample,
-        source_sample_rate_hz=value.source_sample_rate_hz,
-        start_time=value.start_time,
-        end_time=value.end_time,
-        text=value.text,
-        language=value.language,
+    directly_anchored = (
+        audit.current_mapping_status == "candidate_mapped"
+        and audit.direct_anchor_seconds > 0
+    )
+    fully_propagated = (
+        audit.current_mapping_status == "candidate_mapped"
+        and audit.direct_anchor_seconds == 0
+        and audit.flags.fully_propagated_segment
+    )
+    if audit.current_mapping_status == "candidate_mapped" and not (
+        directly_anchored or fully_propagated
+    ):
+        raise ValueError("mapped speaker-binding audit eligibility is inconsistent")
+    if directly_anchored and audit.flags.fully_propagated_segment:
+        raise ValueError("directly anchored segment cannot be fully propagated")
+    entity_id = value.entity_id if directly_anchored else None
+    entity_occurrence_id = value.entity_occurrence_id if directly_anchored else None
+    return (
+        FinalQwen3SpeechSegment(
+            segment_id=value.segment_id,
+            speaker_cluster_id=value.speaker_cluster_id,
+            entity_id=entity_id,
+            entity_occurrence_id=entity_occurrence_id,
+            source_start_sample=value.source_start_sample,
+            source_end_sample=value.source_end_sample,
+            source_sample_rate_hz=value.source_sample_rate_hz,
+            start_time=value.start_time,
+            end_time=value.end_time,
+            text=value.text,
+            language=value.language,
+        ),
+        value.entity_id is not None and entity_id is None,
     )
 
 
@@ -212,6 +294,7 @@ def render_jea_final_samples(
     visual_inventory: VisualProductionInventory,
     pairs_root: Path,
     diarization_root: Path,
+    binding_audit_root: Path,
     qwen3_asr_root: Path,
     output_root: Path,
     overwrite: bool = False,
@@ -234,6 +317,22 @@ def render_jea_final_samples(
         for row in _read_rows(diarization / "bound_segments.jsonl")
     ]
     bound_by_key = {(item.target_clip_uid, item.segment_id): item for item in bound}
+    audit_by_key, audit_summary_sha256, audit_segments_sha256 = _load_binding_audit(
+        binding_audit_root=binding_audit_root,
+        diarization_root=diarization,
+    )
+    if set(audit_by_key) != set(bound_by_key):
+        raise ValueError("speaker-binding audit does not cover bound DiariZen segments")
+    for key, source in bound_by_key.items():
+        audit = audit_by_key[key]
+        if (
+            audit.speaker_cluster_id != source.speaker_cluster_id
+            or audit.current_mapping_status != source.cluster_binding_status
+            or audit.current_entity_id != source.entity_id
+            or audit.start_time != source.start_time
+            or audit.end_time != source.end_time
+        ):
+            raise ValueError("speaker-binding audit differs from DiariZen identity")
     qwen_rows = [
         Qwen3ASRSegment.model_validate(row)
         for row in _read_rows(
@@ -255,10 +354,14 @@ def render_jea_final_samples(
         ):
             raise ValueError("Qwen3 row differs from its exact DiariZen segment")
     speech_by_clip: dict[str, list[FinalQwen3SpeechSegment]] = {}
+    removed_entity_binding_count = 0
     for row in qwen_rows:
         if row.status != "transcribed":
             continue
-        speech_by_clip.setdefault(row.clip_uid, []).append(_speech(row))
+        audit = audit_by_key[(row.clip_uid, row.segment_id)]
+        speech, removed = _speech(row, audit)
+        removed_entity_binding_count += int(removed)
+        speech_by_clip.setdefault(row.clip_uid, []).append(speech)
     for rows in speech_by_clip.values():
         rows.sort(key=lambda item: (item.source_start_sample, item.segment_id))
 
@@ -309,7 +412,10 @@ def render_jea_final_samples(
         cross_pair_sample_count=sum(item.pair_type == "cross_pair" for item in samples),
         final_sample_count=len(samples),
         speech_segment_count=sum(len(item.speech_segments) for item in samples),
+        entity_bindings_removed_by_direct_anchor_gate=removed_entity_binding_count,
         visual_reference_kind_counts=dict(sorted(kind_counts.items())),
+        source_binding_audit_summary_sha256=audit_summary_sha256,
+        source_binding_audit_segments_sha256=audit_segments_sha256,
     )
     destination = output_root.expanduser().resolve(strict=False)
     if destination.exists() and not overwrite:

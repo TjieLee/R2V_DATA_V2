@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
+from r2v_data_v2.h3.binding_audit import (
+    SpeakerBindingAuditSummary,
+    SpeakerBindingSegmentAudit,
+)
 from r2v_data_v2.h3.diarization_binding import BoundDiarizationSegment
 from r2v_data_v2.h3.jea_audio_production import (
     JEAOccurrenceEmbedding,
@@ -219,6 +224,127 @@ def _jsonl(path: Path, values: list[object]) -> None:
     )
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_binding_audit(
+    tmp_path: Path,
+    bound: list[BoundDiarizationSegment],
+) -> Path:
+    root = tmp_path / "binding_audit_v1"
+    root.mkdir()
+    segments = []
+    for item in bound:
+        duration = item.end_time - item.start_time
+        direct_support = (
+            {item.entity_id: item.direct_anchor_seconds}
+            if item.entity_id is not None and item.direct_anchor_seconds > 0
+            else {}
+        )
+        segments.append(
+            SpeakerBindingSegmentAudit(
+                clip_uid=item.target_clip_uid,
+                segment_id=item.segment_id,
+                speaker_cluster_id=item.speaker_cluster_id,
+                current_mapping_status=item.cluster_binding_status,
+                current_entity_id=item.entity_id,
+                start_time=item.start_time,
+                end_time=item.end_time,
+                speaker_duration_seconds=duration,
+                direct_anchor_seconds=item.direct_anchor_seconds,
+                direct_support_seconds_by_entity=direct_support,
+                directly_supported_entity_count=len(direct_support),
+                contested_anchor_seconds=0,
+                identity_propagated_seconds=(
+                    duration - item.direct_anchor_seconds
+                    if item.cluster_binding_status == "candidate_mapped"
+                    else 0
+                ),
+                exclusive_active_faces=[],
+                exclusive_active_entities=[],
+                unmatched_exclusive_active_face_track_ids=[],
+                multi_active_lr_asd_seconds=0,
+                multi_active_frame_count=0,
+                max_simultaneous_active_face_count=0,
+                multi_active_face_track_ids=[],
+                multi_active_mapped_entity_ids=[],
+                multi_active_unmatched_face_track_ids=[],
+                flags={
+                    "conflict": item.cluster_binding_status == "conflict",
+                    "ambiguous": item.cluster_binding_status == "ambiguous",
+                    "unbound": item.cluster_binding_status == "unbound",
+                    "fully_propagated_segment": (
+                        item.identity_scope == "cluster_propagated_only"
+                    ),
+                    "multiple_direct_entity_support": False,
+                    "contested_anchor": False,
+                    "multiple_exclusive_active_face_tracks": False,
+                    "exclusive_active_entity_contradiction": False,
+                    "mapped_entity_vs_unmatched_face_contradiction": False,
+                    "has_multi_active_lr_asd_frames": False,
+                    "multi_active_contains_current_entity_and_other_face": False,
+                },
+            )
+        )
+    _jsonl(root / "segments.jsonl", segments)
+    cluster_statuses = {
+        (item.target_clip_uid, item.speaker_cluster_id): item.cluster_binding_status
+        for item in bound
+    }
+    status_counts = {
+        status: sum(value == status for value in cluster_statuses.values())
+        for status in ("candidate_mapped", "conflict", "ambiguous", "unbound")
+    }
+    summary = SpeakerBindingAuditSummary(
+        source_audio_production_root=str(tmp_path),
+        source_diarization_root=str(tmp_path / "diarization"),
+        source_artifact_sha256={
+            "bound_segments": _sha256(tmp_path / "diarization/bound_segments.jsonl")
+        },
+        audio_binding_input_set_sha256="a" * 64,
+        lr_asd_native_input_set_sha256="b" * 64,
+        clip_count=len({item.target_clip_uid for item in bound}),
+        cluster_count=len(cluster_statuses),
+        segment_count=len(segments),
+        candidate_mapped_count=status_counts["candidate_mapped"],
+        conflict_count=status_counts["conflict"],
+        ambiguous_count=status_counts["ambiguous"],
+        unbound_count=status_counts["unbound"],
+        clusters_with_multiple_exclusive_active_face_tracks=0,
+        clusters_with_exclusive_active_entity_contradiction=0,
+        clusters_with_mapped_entity_vs_unmatched_face=0,
+        clusters_with_multiple_direct_entity_support=0,
+        clusters_with_fully_propagated_segments=sum(
+            item.identity_scope == "cluster_propagated_only" for item in bound
+        ),
+        clusters_with_multi_active_lr_asd_frames=0,
+        clusters_with_current_entity_plus_other_active_face=0,
+        multiple_exclusive_active_face_track_speaker_seconds=0,
+        exclusive_active_entity_contradiction_speaker_seconds=0,
+        mapped_entity_vs_unmatched_face_speaker_seconds=0,
+        fully_propagated_segment_speaker_seconds=sum(
+            item.end_time - item.start_time
+            for item in bound
+            if item.identity_scope == "cluster_propagated_only"
+        ),
+        identity_propagated_speaker_seconds=sum(
+            item.end_time - item.start_time - item.direct_anchor_seconds
+            for item in bound
+            if item.cluster_binding_status == "candidate_mapped"
+        ),
+        multi_active_lr_asd_speaker_seconds=0,
+        review_priority_counts={
+            "candidate_mapped_lowest_direct_support_ratio": len(cluster_statuses)
+        },
+    )
+    (root / "summary.json").write_text(
+        summary.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
 def _final_sample(
     tmp_path: Path,
     voices: list[FinalSubjectVoice],
@@ -332,10 +458,12 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
         )
     _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
     _jsonl(tmp_path / "asr/segments.jsonl", qwen)
+    audit_root = _write_binding_audit(tmp_path, bound)
     render_jea_final_samples(
         visual_inventory=inventory,
         pairs_root=tmp_path / "pairs",
         diarization_root=tmp_path / "diarization",
+        binding_audit_root=audit_root,
         qwen3_asr_root=tmp_path / "asr",
         output_root=tmp_path / "h3",
     )
@@ -647,7 +775,7 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     rows = _render(tmp_path)
     assert {row["schema_version"] for row in rows} == {"r2v.h3.final_sample.3"}
     summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
-    assert summary["schema_version"] == "r2v.h3.final_summary.3"
+    assert summary["schema_version"] == "r2v.h3.final_summary.4"
     assert summary["final_sample_schema_version"] == "r2v.h3.final_sample.3"
     first = next(row for row in rows if row["sample_id"] == "clip-a/in_pair")
     assert first["r2v_instruction"] == "canonical clip-a: Image 1 and Image 2"
@@ -741,11 +869,13 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
         )
     _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
     _jsonl(tmp_path / "asr/segments.jsonl", qwen)
+    audit_root = _write_binding_audit(tmp_path, bound)
 
     render_jea_final_samples(
         visual_inventory=inventory,
         pairs_root=tmp_path / "pairs",
         diarization_root=tmp_path / "diarization",
+        binding_audit_root=audit_root,
         qwen3_asr_root=tmp_path / "asr",
         output_root=tmp_path / "h3",
     )
@@ -762,6 +892,127 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
         "entity_1",
         "entity_2",
     ]
+
+
+def test_final_renderer_only_publishes_directly_anchored_segment_identity(
+    tmp_path: Path,
+) -> None:
+    inventory = _visual_inventory(tmp_path)
+    build_jea_pairs(
+        visual_inventory=inventory,
+        occurrences=_occurrences(inventory),
+        audio_root=tmp_path / "audio",
+        output_root=tmp_path / "pairs",
+    )
+    identity = inventory.clips[0].identity
+    statuses = (
+        ("direct", "candidate_mapped", "entity_1", 100, "direct_anchor_present"),
+        (
+            "propagated",
+            "candidate_mapped",
+            "entity_1",
+            0,
+            "cluster_propagated_only",
+        ),
+        ("conflict", "conflict", None, 0, "unresolved"),
+        ("ambiguous", "ambiguous", None, 0, "unresolved"),
+        ("unbound", "unbound", None, 0, "unresolved"),
+    )
+    bound = []
+    qwen = []
+    for index, (name, status, entity_id, direct_samples, scope) in enumerate(
+        statuses, start=1
+    ):
+        segment_id = f"segment_{index:04d}"
+        start_sample = (index - 1) * 1600
+        end_sample = index * 1600
+        occurrence_id = (
+            f"{identity.clip_uid}/{entity_id}" if entity_id is not None else None
+        )
+        bound.append(
+            BoundDiarizationSegment(
+                target_clip_uid=identity.clip_uid,
+                segment_id=segment_id,
+                speaker_cluster_id=f"speaker_{name}",
+                start_time=(index - 1) * 0.1,
+                end_time=index * 0.1,
+                source_start_sample=start_sample,
+                source_end_sample=end_sample,
+                cluster_binding_status=status,
+                entity_id=entity_id,
+                entity_occurrence_id=occurrence_id,
+                direct_anchor_samples=direct_samples,
+                direct_anchor_seconds=direct_samples / 16000,
+                identity_scope=scope,
+            )
+        )
+        qwen.append(
+            Qwen3ASRSegment(
+                **identity.model_dump(mode="python"),
+                segment_id=segment_id,
+                speaker_cluster_id=f"speaker_{name}",
+                entity_id=entity_id,
+                entity_occurrence_id=occurrence_id,
+                source_audio_path=str(tmp_path / f"{identity.clip_uid}.flac"),
+                source_start_sample=start_sample,
+                source_end_sample=end_sample,
+                source_sample_rate_hz=16000,
+                start_time=(index - 1) * 0.1,
+                end_time=index * 0.1,
+                status="transcribed",
+                text=f"speech {name}",
+                language="en",
+                configuration=Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+            )
+        )
+    _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
+    _jsonl(tmp_path / "asr/segments.jsonl", qwen)
+    audit_root = _write_binding_audit(tmp_path, bound)
+
+    render_jea_final_samples(
+        visual_inventory=inventory,
+        pairs_root=tmp_path / "pairs",
+        diarization_root=tmp_path / "diarization",
+        binding_audit_root=audit_root,
+        qwen3_asr_root=tmp_path / "asr",
+        output_root=tmp_path / "h3",
+    )
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "h3/samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    sample = next(row for row in rows if row["sample_id"] == "clip-a/in_pair")
+    assert [item["entity_id"] for item in sample["speech_segments"]] == [
+        "entity_1",
+        None,
+        None,
+        None,
+        None,
+    ]
+    assert [item["entity_occurrence_id"] for item in sample["speech_segments"]] == [
+        "clip-a/entity_1",
+        None,
+        None,
+        None,
+        None,
+    ]
+    propagated = sample["speech_segments"][1]
+    assert propagated["speaker_cluster_id"] == "speaker_propagated"
+    assert propagated["start_time"] == 0.1
+    assert propagated["end_time"] == 0.2
+    assert propagated["text"] == "speech propagated"
+    assert propagated["language"] == "en"
+    assert "subject_id" not in propagated
+    assert "rendered_dialogue" not in propagated
+    summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
+    assert summary["schema_version"] == "r2v.h3.final_summary.4"
+    assert summary["entity_bindings_removed_by_direct_anchor_gate"] == 1
+    assert summary["speaker_binding_audit_policy_version"] == (
+        "h3_speaker_binding_structural_audit_v1"
+    )
 
 
 def test_final_cross_pair_swaps_only_donor_voice(tmp_path: Path) -> None:

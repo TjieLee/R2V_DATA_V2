@@ -1547,6 +1547,9 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
     for run_root in run_roots:
         (run_root / "run.json").write_text("{}")
     output = tmp_path / "audio-production"
+    binding_audit = output / "binding_audit_v1"
+    binding_audit.mkdir(parents=True)
+    (binding_audit / "segments.jsonl").write_text("{}\n", encoding="utf-8")
     calls: list[str] = []
 
     monkeypatch.setattr(jea_cli, "load_visual_production_inventory", lambda **_: inventory)
@@ -1659,6 +1662,7 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
 
     def h3_stage(**kwargs: object) -> _StageResult:
         calls.append("h3")
+        assert kwargs["binding_audit_root"] == binding_audit
         Path(kwargs["output_root"]).mkdir(parents=True)
         return _StageResult(sample_count=2)
 

@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         visual_inventory=visual,
         pairs_root=paths.pairs,
         diarization_root=paths.diarization,
+        binding_audit_root=paths.root / "binding_audit_v1",
         qwen3_asr_root=paths.asr,
         output_root=paths.h3,
         overwrite=arguments.overwrite,

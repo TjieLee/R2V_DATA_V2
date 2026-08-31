@@ -121,7 +121,7 @@ Pair rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
 paths first.
 
 The active resolved-path output contracts are `r2v.h3.final_sample.3` and
-`r2v.h3.final_summary.3`; the summary declares
+`r2v.h3.final_summary.4`; the summary declares
 `final_sample_schema_version=r2v.h3.final_sample.3`. Final H3 samples publish
 media paths with explicit ownership semantics:
 
@@ -293,6 +293,9 @@ export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --stages qwen3-asr
 
+"$R2V_PYTHON" tools/audit_h3_speaker_bindings.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+
 "$R2V_PYTHON" tools/run_h3_jea_production.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
@@ -301,9 +304,12 @@ export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
 ```
 
 The active order is `audio -> primary-voice -> embedding -> pair ->
-diarization -> qwen3-asr -> h3`. Every stage reads only its canonical upstream
-artifacts. Existing stage directories are not silently reused; inspect them and
-pass `--overwrite` only for an intentional replacement.
+diarization -> qwen3-asr -> binding_audit_v1 -> h3`. The binding audit remains
+the existing model-free sidecar rather than a new production inference stage;
+the final renderer requires its canonical segment evidence. Every stage reads
+only its canonical upstream artifacts. Existing stage directories are not
+silently reused; inspect them and pass `--overwrite` only for an intentional
+replacement.
 
 For a minimal ASR-only rerun:
 

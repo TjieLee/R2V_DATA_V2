@@ -68,6 +68,15 @@ cleanliness is a separate question. This remains a read-only pilot sidecar with
 no production consumer: it does not rewrite primary voice references, speaker
 embeddings, identity pairs, bindings, ASR inputs, or final H3 samples.
 
+Production final rendering is independent of this pilot. It consumes the
+canonical segment evidence in `binding_audit_v1/segments.jsonl`: a
+`candidate_mapped` segment retains its entity only when
+`direct_anchor_seconds > 0`; a segment with zero direct-anchor seconds and
+`fully_propagated_segment=true` publishes a null entity, as do conflict,
+ambiguous, and unbound segments. Omni observations remain diagnostic and can
+never fill a missing production entity. The final summary records how many
+source segment bindings this gate removed.
+
 ## Manifest
 
 The input is non-empty JSONL with exact segment identities:
