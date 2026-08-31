@@ -1,6 +1,6 @@
 # Visual V3 and Audio/H3 Integration Contract
 
-Last updated: 2026-08-26
+Last updated: 2026-08-31
 
 This is the compatibility handoff Audio/H3 developers must read before
 consuming current Visual/reference outputs.
@@ -12,30 +12,87 @@ The refs inspected for this handoff were:
 ```text
 repository: TjieLee/R2V_DATA_V2
 
-Visual branch: feature/v3-subject-attributes-v1
-Visual/reference code HEAD: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+Visual/reference branch: feature/v3-subject-attributes-v1
+Visual/reference code HEAD inspected by the original handoff: d7f3d6b99e5da02bd8ef275ab53cd47cd649cfa0
+
+Standalone Visual Stage2 branch: feature/v3-sam3-production-v1
+validated Entity Mask orchestration HEAD: 8645db869892ea98a6599467882efc48b4eb7414
 
 Audio branch: feature/h3-audio-jea-qwen3-v1
-Audio remote HEAD: 4e831e3f4c29f52df3909af719abf94300b4f633
+Audio remote HEAD verified on 2026-08-31: 4e831e3f4c29f52df3909af719abf94300b4f633
 
-merge base: 71276f976ed178242abe4db3e66e3fecce357832
+Visual/Audio merge base for the inspected Audio branch:
+71276f976ed178242abe4db3e66e3fecce357832
 ```
 
-The Visual branch may gain docs-only commits after the code HEAD above. The
-final Visual/reference algorithm freeze remains `d7f3d6b...`. The original
-frozen Visual branch is `feature/v3-runtime-integrity-v1` at
+The Visual/reference branch may gain docs-only commits after the code HEAD
+above. The original frozen Visual branch is
+`feature/v3-runtime-integrity-v1` at
 `87bd4e06107d7f56df550979b0e96515cb70f911`; its core algorithm baseline is
 `3cfb11fdd1fbe4a5bbad02a775097d8ab3097288`.
 
-At the inspected refs, both branches have the same
-`r2v_data_v2/v3/production_export.py` Git blob:
+The standalone Stage2 branch is a separate production-orchestration line around
+frozen Visual components. It must not be treated as a new cross-modal public
+schema.
+
+At the refs used by the original Visual/Audio integration handoff, both
+branches had the same `r2v_data_v2/v3/production_export.py` Git blob:
 
 ```text
 3de3ce9277160f147903ccca804b6f28b1ec63c1
 ```
 
-Therefore there is no `r2v.v3.production_sample.1` schema delta between these
+Therefore there was no `r2v.v3.production_sample.1` schema delta between those
 inspected Audio and final Visual code refs.
+
+## 2026-08-31 standalone Stage2 orchestration isolation
+
+The recent Entity Mask production work was intentionally isolated from Audio/H3.
+The three hardening commits after the first formal Entity Mask launcher are:
+
+```text
+1ccd2b833fc9f7c89031062f2883e7983005f600
+511e834e590b1517e0e61670c2a95e244573ac88
+8645db869892ea98a6599467882efc48b4eb7414
+```
+
+From the Entity Mask launcher baseline
+`12737b791c636f441191841d91eaae431bd0d34e` through
+`8645db869892ea98a6599467882efc48b4eb7414`, the changed production code is
+limited to standalone Visual Stage2 orchestration and its tests/docs:
+
+```text
+r2v_data_v2/v3/pre_qwen_production.py
+tools/run_v3_entity_mask_auto.py
+tools/run_v3_entity_mask_worker.py
+tests/test_v3_entity_mask_static.py
+tests/test_v3_pre_qwen_production.py
+docs/ENTITY_MASK_PRODUCTION.md
+```
+
+No `r2v_data_v2/h3/*` file, Audio runner, Audio schema, or
+`production_export.py` was changed by this sequence. The Audio branch is a
+separate diverged branch and does not receive these commits unless they are
+explicitly merged/cherry-picked.
+
+The recent Stage2 changes therefore have no direct runtime effect on the
+current Audio/H3 branch. Their scope is:
+
+```text
+multi-node/multi-GPU Entity Mask scheduling
+static whole-shard ownership
+100-row durable Stage2 resume orchestration
+SAM3 worker persistence/session reuse orchestration
+shared-filesystem startup identity
+worker lifecycle/signal cleanup
+production docs/tests
+```
+
+If an Audio integration branch later cherry-picks or merges
+`pre_qwen_production.py`, re-run the Audio/H3 test suite because that becomes an
+explicit code integration. Do not merge the entire Visual Stage2 branch merely
+to inherit its cluster scheduler; the stable Visual/Audio data contract does
+not require that scheduler.
 
 ## Stable integration API
 
@@ -46,7 +103,8 @@ r2v.v3.production_sample.1
 ```
 
 Do not treat Subject Attribute owner artifacts, review payloads, enrichment
-metrics, or internal sidecars as the final cross-branch API.
+metrics, standalone Entity Mask checkpoints, 100-row execution chunks, or
+internal sidecars as the final cross-branch API.
 
 Stable `ProductionSample` fields:
 
@@ -90,6 +148,11 @@ attribute
 Production reference indexes are contiguous. Instruction labels may appear in
 any numeric order, but every expected index must appear and no unknown index is
 allowed.
+
+Standalone Stage2 parallelism is deliberately absent from this schema. Node
+count, GPU count, `RANK`, `WORLD_SIZE`, global worker ID, shard ownership, and
+100-row chunk identity are internal execution details and must never become
+Audio training-sample identity.
 
 ## Internal sidecar delta since the merge base
 
@@ -208,6 +271,10 @@ a latest Visual `enriched_samples.jsonl` payload.
 ## Branch ownership
 
 Annotation production remains frozen. Do not develop Audio/H3 on the Visual
-branch, and do not change Visual prompts, thresholds, model topology, or public
-production schema merely to make an old internal-sidecar parser accept a newer
-payload.
+branch, and do not change Visual prompts, thresholds, model topology, Stage2
+scheduler, or public production schema merely to make an old internal-sidecar
+parser accept a newer payload.
+
+For standalone Entity Mask server operation, use
+`ENTITY_MASK_PRODUCTION.md`. For Audio/H3 integration, consume the stable
+compacted production interface rather than Entity Mask internal artifacts.
