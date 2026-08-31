@@ -77,7 +77,7 @@ class _AcceptedAttributeProjection(_EnrichedProjectionModel):
     status: Literal["accepted"]
     image_path: str
     source_frame_index: int = Field(ge=0)
-    final_selection: Literal["raw", "completed"] | None = None
+    final_selection: Literal["raw", "completed", "bbox"] | None = None
     default_variant: EnrichedReferenceDefaultVariant | None = None
 
     @field_validator("image_path")

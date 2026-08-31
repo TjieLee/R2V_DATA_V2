@@ -68,6 +68,7 @@ def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 def _attribute_record(
     *,
     image_path: str,
+    attribute_type: str = "hair",
     default_variant: str | None = None,
     final_selection: str = "raw",
 ) -> SubjectAttributeRecord:
@@ -75,16 +76,20 @@ def _attribute_record(
     payload: dict[str, object] = {
         "attribute_id": "a1",
         "owner_entity_id": "e1",
-        "attribute_type": "hair",
-        "phrase": "dark hair",
-        "grounding_prompt": "the person's dark hair",
+        "attribute_type": attribute_type,
+        "phrase": "visible face" if attribute_type == "face" else "dark hair",
+        "grounding_prompt": (
+            "the person's visible face"
+            if attribute_type == "face"
+            else "the person's dark hair"
+        ),
         "status": "accepted",
         "image_path": image_path,
         "source_frame_index": 6,
         "source_frame_slot": 6,
         "owner_candidate_id": "candidate_1",
         "same_frame_as_owner_reference": False,
-        "sam3_prompt": "dark hair",
+        "sam3_prompt": "visible face" if attribute_type == "face" else "dark hair",
         "ownership_geometry": {
             "passed": True,
             "reason": "passed",
@@ -415,6 +420,7 @@ def _dataset_inventory(
     tmp_path: Path,
     *,
     with_enriched: bool = False,
+    attribute_type: str = "hair",
     attribute_default_variant: str | None = None,
     attribute_final_selection: str = "raw",
     legacy_enriched: bool = False,
@@ -491,12 +497,13 @@ def _dataset_inventory(
             )
             visual_reference.parent.mkdir(parents=True, exist_ok=True)
             visual_reference.write_bytes(f"enriched-{kind}".encode())
-        attribute_path = "references/ordinary/hair.png"
+        attribute_path = f"references/ordinary/{attribute_type}.png"
         attribute = run_root / "subject_attributes" / attribute_path
         attribute.parent.mkdir(parents=True)
-        attribute.write_bytes(b"hair")
+        attribute.write_bytes(attribute_type.encode())
         record = _attribute_record(
             image_path=attribute_path,
+            attribute_type=attribute_type,
             default_variant=attribute_default_variant,
             final_selection=attribute_final_selection,
         )
@@ -530,7 +537,7 @@ def _dataset_inventory(
                     "origin": "attribute_enrichment",
                     "attribute_id": "a1",
                     "owner_entity_id": "e1",
-                    "attribute_type": "hair",
+                    "attribute_type": attribute_type,
                     "image_path": attribute_path,
                     "source_frame_index": 6,
                 },
@@ -564,6 +571,22 @@ def _dataset_inventory(
             accepted_attributes=[record],
         )
         enriched_payload = enriched.model_dump(mode="json")
+        projected_attribute = enriched_payload["accepted_attributes"][0]
+        projected_reference = enriched_payload["references"][1]
+        projected_attribute.update(
+            {
+                "attribute_type": attribute_type,
+                "image_path": attribute_path,
+                "final_selection": attribute_final_selection,
+                "default_variant": attribute_default_variant,
+            }
+        )
+        projected_reference.update(
+            {
+                "attribute_type": attribute_type,
+                "image_path": attribute_path,
+            }
+        )
         if legacy_enriched:
             enriched_payload["references"][1].pop("attribute_type")
             for field in (
@@ -964,6 +987,41 @@ def test_dataset_sample_enriched_sidecar_preserves_attribute_provenance(
     assert attribute.image_path == "references/ordinary/hair.png"
     assert Path(attribute.artifact_path).read_bytes() == b"hair"
     assert [reference.entity_id for reference in clip.subject_references] == ["e1"]
+
+
+def test_latest_visual_face_bbox_enrichment_loads_as_real_attribute(
+    tmp_path: Path,
+) -> None:
+    def add_unconsumed_visual_fields(payload: dict[str, object]) -> None:
+        attributes = payload["accepted_attributes"]
+        assert isinstance(attributes, list)
+        record = attributes[0]
+        assert isinstance(record, dict)
+        record.pop("review")
+        record.pop("ownership_geometry")
+        record["bbox_review_diagnostics"] = {
+            "internal_policy": "bbox_first",
+            "accepted": True,
+        }
+        payload["visual_internal_diagnostics"] = {"worker_rank": 7}
+
+    inventory = _dataset_inventory(
+        tmp_path,
+        with_enriched=True,
+        attribute_type="face",
+        attribute_default_variant="bbox",
+        attribute_final_selection="bbox",
+        enriched_mutator=add_unconsumed_visual_fields,
+    )
+
+    attribute = inventory.clips[0].sample.references[1]
+    assert attribute.kind == "attribute"
+    assert attribute.attribute_type == "face"
+    assert attribute.owner_entity_id == "e1"
+    assert attribute.source_frame_index == 6
+    assert attribute.image_path == "references/ordinary/face.png"
+    assert Path(attribute.artifact_path).read_bytes() == b"face"
+    assert attribute.synthetic is False
 
 
 def test_legacy_enriched_attribute_without_variant_fields_still_loads(
