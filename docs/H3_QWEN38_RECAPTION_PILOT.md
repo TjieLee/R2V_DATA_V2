@@ -48,7 +48,7 @@ was inspected, but is not copied here.
 The local system-prompt version is:
 
 ```text
-h3_qwen38_ref2va_recaption_v4
+h3_qwen38_ref2va_recaption_v5
 ```
 
 The deterministic renderer publishes these exact sections in this exact order:
@@ -145,8 +145,10 @@ One structured repair is allowed. The current visible retention marker set is
 `attribute_transfer` is unassigned by this conditioning contract and remains a
 fail-closed validation error. Unknown labels, `<Video N>`, changed or duplicated
 dialogue, incompatible task/retention markers, and invented Audio facts fail
-closed. The official 350-500-word generation guidance is recorded as a warning
-rather than an arbitrary hard gate.
+closed. Information-rich recaptions target roughly 300-450 words when the video
+supports that detail. Materialized descriptions below 250 or above 500 words
+receive separate review warnings, never an automatic rejection; visually simple
+clips must not be padded to meet a word target.
 
 ## Qwen3.8 Server Runtime
 
@@ -362,3 +364,46 @@ python -m http.server 8765 --directory "$QWEN38_OUTPUT"
 Open `http://127.0.0.1:8765/review.html`. The page shows the target video, all
 Pictures in canonical order, deterministic contracts, rough Visual hints,
 normalized Audio facts, rendered prompt, audit metadata, and warnings.
+
+### Fresh Unseen V5 Canary
+
+Before changing production behavior based on description length, prepare a new
+five-case manifest from examples not used for prompt development. Inspect the
+manifest to confirm all five cases are genuinely unseen and cover useful visual
+variation, then run the normal command above with a fresh `--output-root` so no
+v3/v4 result is overwritten. Do not alter sampling, repair, Audio, or contract
+settings for this canary.
+
+```bash
+export QWEN38_V5_CASES=/absolute/path/to/qwen38-v5-unseen5.jsonl
+export QWEN38_V5_CANARY_OUTPUT=/absolute/path/to/qwen38-v5-unseen5-output
+
+"$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --prepare-manifest "$QWEN38_V5_CASES" \
+  --manifest-size 5 \
+  --conditioning-variant visual_only
+```
+
+Review and, if needed, edit only the explicit case manifest to select five
+unseen samples. Run the normal inference command with
+`--case-manifest "$QWEN38_V5_CASES"` and
+`--output-root "$QWEN38_V5_CANARY_OUTPUT"`; keep every documented sampling and
+media argument unchanged.
+
+Serve that fresh output with the existing static review workflow:
+
+```bash
+python -m http.server 8765 --directory "$QWEN38_V5_CANARY_OUTPUT"
+```
+
+For each case, use `review.html` to compare the target video and canonical
+Pictures against the rendered prompt. Review visual coverage across the early,
+middle, and late shot portions; subject appearance and motion; spatial layout;
+objects and environment; lighting and camera behavior; and placement of locked
+speech. Separately flag unsupported psychology, intent, causality, identity,
+offscreen events, invented sounds, or fabricated object details. Record whether
+the description is usefully dense rather than judging it by word count alone.
+Finally reconcile ready/failed status, model-call count, warnings, and raw
+responses. Treat the five-case result as manual evidence only; do not change
+production gates or rerun upstream stages solely to optimize length.

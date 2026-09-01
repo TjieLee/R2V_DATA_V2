@@ -28,7 +28,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v4"
+QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v5"
 QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v3"
 QWEN38_RECAPTION_DRAFT_VERSION = "r2v.h3.qwen38_recaption_draft.1"
 QWEN38_RECAPTION_MATERIALIZER_VERSION = "h3_qwen38_materializer_v1"
@@ -432,7 +432,7 @@ class Qwen38BackendProvenance(SchemaModel):
         "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     ] = "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v4"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v5"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     policy_version: Literal["h3_qwen38_ref2va_contract_v3"] = (
@@ -523,7 +523,7 @@ class Qwen38RecaptionRecord(SchemaModel):
     audio_fact_provenance: dict[str, str] = Field(default_factory=dict)
     audio_grounding_complete: bool
     backend_provenance: Qwen38BackendProvenance
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v4"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v5"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     official_h3_source_files: list[str] = Field(
@@ -941,16 +941,38 @@ overall_soundscape, non_diegetic_music, and audio_fact_audit. The pipeline, not
 you, materializes the final detailed_description from shots. Write English except
 lyrics and visible scene text.
 
-Make shot description_template fields rich and concrete rather than a plot
-summary. Describe style, composition, shot scale, appearance, position, spatial
-relationships, foreground/background, pose, body and hand action, head movement,
-expression, gaze, interactions, object state, environment, lighting, camera angle
-and natural camera movement, motion progression, state changes, readable text,
-and synchronized grounded events. Current clips are expected to be single-shot.
-Add a later shot only for a real hard cut and supply its start_time in seconds.
-Never write [Shot N] syntax; the pipeline owns shot headers and timestamps. For
-generation tasks, aim for roughly 350-500 English words when observed information
-supports it.
+Treat every shot description_template as a generation-quality dense video
+description, not an ordinary caption or plot summary. For each observed shot,
+systematically cover every applicable dimension in this visual checklist:
+- visual style
+- shot scale and framing
+- camera angle
+- foreground, midground, and background composition
+- every salient visible subject's appearance
+- spatial positions and relationships
+- pose
+- body, arm, and hand motion
+- head motion
+- gaze
+- facial expression and visible expression changes
+- interactions
+- object state and state changes
+- environment, materials, and readable text
+- lighting and color
+- camera motion, or an explicit stable/static camera
+- temporal progression from the early through middle to late portions of the shot
+- speech placeholders at their correct observed temporal positions
+
+Use observed evidence, not plausible filler. Do not infer psychology or emotion
+that is not visually supported, intent, causality, relationships, identity not
+supplied upstream, sounds from visible actions, invisible or offscreen events, or
+invented object details. For information-rich generation recaption, target roughly
+300-450 English words across the materialized detailed_description when the video
+supports it. Do not pad a visually simple clip merely to hit the target; prefer
+concrete temporal and visual detail over repetition. Current clips are expected to
+be single-shot. Add a later shot only for a real hard cut and supply its start_time
+in seconds. Never write [Shot N] syntax; the pipeline owns shot headers and
+timestamps.
 
 Pictures are content references, not first/last frames or keyframes. Use only the
 supplied labels. Summary must begin with the supplied task prefix. For the current
@@ -1536,8 +1558,10 @@ def validate_h3_response(
         )
     word_count = len(re.findall(r"\b[\w'-]+\b", response.detailed_description))
     warnings = []
-    if not 350 <= word_count <= 500:
-        warnings.append("detailed_description_outside_approximate_350_500_words")
+    if word_count < 250:
+        warnings.append("detailed_description_below_250_words")
+    if word_count > 500:
+        warnings.append("detailed_description_above_500_words")
     return issues, warnings
 
 

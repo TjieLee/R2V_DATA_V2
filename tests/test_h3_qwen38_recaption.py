@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -935,7 +936,7 @@ def test_manifest_helper_and_sidecar_are_read_only(tmp_path: Path) -> None:
 
 
 def test_prompt_version_is_frozen() -> None:
-    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v4"
+    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v5"
     assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v3"
     assert QWEN38_RECAPTION_DRAFT_VERSION == "r2v.h3.qwen38_recaption_draft.1"
     assert QWEN38_RECAPTION_MATERIALIZER_VERSION == "h3_qwen38_materializer_v1"
@@ -982,3 +983,81 @@ def test_attribute_transfer_remains_fail_closed(tmp_path: Path) -> None:
     assert "unassigned_attribute_transfer" in _codes(
         response.model_copy(update={"retention_analysis": retention}), request
     )
+
+
+def test_prompt_requires_dense_observed_visual_recaption() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    required_dimensions = (
+        "visual style",
+        "shot scale and framing",
+        "camera angle",
+        "foreground, midground, and background composition",
+        "every salient visible subject's appearance",
+        "spatial positions and relationships",
+        "body, arm, and hand motion",
+        "head motion",
+        "gaze",
+        "facial expression and visible expression changes",
+        "object state and state changes",
+        "environment, materials, and readable text",
+        "lighting and color",
+        "explicit stable/static camera",
+        "early through middle to late portions of the shot",
+        "speech placeholders at their correct observed temporal positions",
+    )
+    assert "generation-quality dense video description" in prompt
+    for dimension in required_dimensions:
+        assert dimension in prompt
+    assert "300-450 English words" in prompt
+    assert "Do not pad a visually simple clip" in prompt
+
+
+def test_prompt_forbids_unsupported_visual_filler() -> None:
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "Use observed evidence, not plausible filler" in prompt
+    for forbidden_inference in (
+        "psychology or emotion",
+        "intent",
+        "causality",
+        "relationships",
+        "identity not supplied upstream",
+        "sounds from visible actions",
+        "invisible or offscreen events",
+        "invented object details",
+    ):
+        assert forbidden_inference in prompt
+
+
+def _response_with_word_count(
+    response: Qwen38H3StructuredResponse,
+    word_count: int,
+) -> Qwen38H3StructuredResponse:
+    current = len(re.findall(r"\b[\w'-]+\b", response.detailed_description))
+    assert current <= word_count
+    padding = " ".join(f"detail{index}" for index in range(word_count - current))
+    description = response.detailed_description
+    if padding:
+        description += " " + padding
+    assert len(re.findall(r"\b[\w'-]+\b", description)) == word_count
+    return response.model_copy(update={"detailed_description": description})
+
+
+@pytest.mark.parametrize(
+    ("word_count", "expected_warnings"),
+    [
+        (249, ["detailed_description_below_250_words"]),
+        (250, []),
+        (500, []),
+        (501, ["detailed_description_above_500_words"]),
+    ],
+)
+def test_description_word_count_warnings_are_non_blocking_boundaries(
+    tmp_path: Path,
+    word_count: int,
+    expected_warnings: list[str],
+) -> None:
+    request = _request(tmp_path)
+    response = _response_with_word_count(_response(request), word_count)
+    issues, warnings = validate_h3_response(response, request)
+    assert issues == []
+    assert warnings == expected_warnings
