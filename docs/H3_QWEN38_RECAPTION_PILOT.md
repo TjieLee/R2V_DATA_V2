@@ -125,34 +125,44 @@ a warning rather than an arbitrary hard gate.
 
 ## One-Time Server Setup
 
-The checkpoint is immutable input:
+The validated backend is SGLang, using the local Qwen3.8 integration from
+`sgl-project/sglang#36497` at commit
+`78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385`. The checkpoint is immutable
+input:
 
 ```bash
 export QWEN38_CHECKPOINT=/mnt/workspace/guocong/model/Qwen/Qwen3.8-Flash-Next
 export QWEN38_MODEL=Qwen/Qwen3.8-Flash-Next
 export QWEN38_PORT=8000
-export QWEN38_TP_SIZE=8
-export QWEN38_MEDIA_ROOT=/mnt/workspace
+export QWEN38_SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
+export QWEN38_SGLANG_SOURCE=/mnt/workspace/litengjie/data/audio_deps/sglang-qwen38-src
 
-export HF_HOME=/mnt/workspace/litengjie/data/audio_deps/qwen38-cache/huggingface
-export XDG_CACHE_HOME=/mnt/workspace/litengjie/data/audio_deps/qwen38-cache/xdg
-export VLLM_CACHE_ROOT=/mnt/workspace/litengjie/data/audio_deps/qwen38-cache/vllm
-export QWEN38_LOG_ROOT=/mnt/workspace/litengjie/data/audio_deps/qwen38-logs
-
-mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" "$QWEN38_LOG_ROOT"
-
-vllm serve "$QWEN38_CHECKPOINT" \
+"$QWEN38_SGLANG_ENV/bin/sglang" serve \
+  --model-path "$QWEN38_CHECKPOINT" \
   --served-model-name "$QWEN38_MODEL" \
   --host 127.0.0.1 \
   --port "$QWEN38_PORT" \
-  --tensor-parallel-size "$QWEN38_TP_SIZE" \
-  --allowed-local-media-path "$QWEN38_MEDIA_ROOT" \
-  >"$QWEN38_LOG_ROOT/server.log" 2>&1
+  --tp 8 \
+  --context-length 49152 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 8192 \
+  --linear-attn-prefill-backend flashinfer \
+  --linear-attn-decode-backend flashinfer \
+  --linear-attn-verify-backend triton \
+  --mamba-ssm-dtype bfloat16 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --max-running-requests 96 \
+  --reasoning-parser auto
 ```
 
-This command does not edit the checkpoint. Video sampling is sent per request
-through `mm_processor_kwargs`; no processor config is written into the model
-directory.
+The server exposes the OpenAI-compatible `/v1/chat/completions` endpoint.
+`response_format=json_schema` and non-thinking
+`chat_template_kwargs={"enable_thinking": false}` were validated against this
+runtime. The client uses SGLang/Qwen3.8's default video processing behavior; it
+does not send an unverified FPS override.
 
 ## Random200 Pilot
 
@@ -182,9 +192,20 @@ Review and edit the explicit manifest before inference. Then run:
   --checkpoint-id "$QWEN38_CHECKPOINT" \
   --media-mode file \
   --media-root /mnt/workspace \
-  --video-fps 4 \
+  --temperature 0.7 \
+  --top-p 0.8 \
+  --top-k 20 \
+  --min-p 0.0 \
+  --presence-penalty 1.5 \
+  --repetition-penalty 1.0 \
   --max-tokens 8192
 ```
+
+The non-thinking sampling contract is `temperature=0.7`, `top_p=0.8`,
+`top_k=20`, `min_p=0.0`, `presence_penalty=1.5`,
+`repetition_penalty=1.0`, and `enable_thinking=false`. The last four SGLang
+extensions are transported through the OpenAI client's `extra_body` where
+needed; no `mm_processor_kwargs` are sent.
 
 When a frozen full-clip Audio semantics root is available, add only the explicit
 argument:

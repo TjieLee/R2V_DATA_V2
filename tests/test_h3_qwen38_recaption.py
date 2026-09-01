@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     validate_h3_response,
 )
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
+from tools.run_h3_qwen38_recaption import _parser
 
 
 def _reference(
@@ -487,9 +489,60 @@ def test_openai_request_labels_media_and_never_sends_audio(tmp_path: Path) -> No
     assert "audio_url" not in types
     assert payload["extra_body"] == {
         "top_k": 20,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
         "chat_template_kwargs": {"enable_thinking": False},
-        "mm_processor_kwargs": {"fps": 4.0},
     }
+    assert "mm_processor_kwargs" not in payload["extra_body"]
+    assert payload["temperature"] == 0.7
+    assert payload["top_p"] == 0.8
+    assert payload["presence_penalty"] == 1.5
+    assert payload["max_tokens"] == 8192
+
+
+def test_sglang_provenance_records_non_thinking_sampling(tmp_path: Path) -> None:
+    provenance = _provenance(tmp_path)
+    assert provenance.backend == "sglang"
+    assert provenance.temperature == 0.7
+    assert provenance.top_p == 0.8
+    assert provenance.top_k == 20
+    assert provenance.min_p == 0.0
+    assert provenance.presence_penalty == 1.5
+    assert provenance.repetition_penalty == 1.0
+    assert provenance.enable_thinking is False
+    assert "video_fps" not in provenance.model_dump(mode="json")
+
+
+def test_cli_exposes_sglang_sampling_without_video_fps(tmp_path: Path) -> None:
+    arguments = _parser().parse_args(["--audio-production-root", str(tmp_path)])
+    assert arguments.min_p == 0.0
+    assert arguments.repetition_penalty == 1.0
+    assert "video_fps" not in vars(arguments)
+
+
+def test_legacy_vllm_backend_literal_remains_parseable(tmp_path: Path) -> None:
+    values = _provenance(tmp_path).model_dump(
+        mode="json", exclude={"configuration_fingerprint"}
+    )
+    values["backend"] = "vllm"
+    values.pop("min_p")
+    values.pop("repetition_penalty")
+    values["video_fps"] = 4.0
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    provenance = Qwen38BackendProvenance.model_validate(
+        {**values, "configuration_fingerprint": fingerprint}
+    )
+    assert provenance.backend == "vllm"
+    assert provenance.min_p is None
+    assert provenance.repetition_penalty is None
+    assert "video_fps" not in provenance.model_dump(mode="json")
 
 
 def test_true_malformed_response_uses_exactly_one_repair(tmp_path: Path) -> None:

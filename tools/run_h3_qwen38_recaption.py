@@ -53,13 +53,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-mode", choices=("file", "http"), default="file")
     parser.add_argument("--media-root", type=Path)
     parser.add_argument("--media-base-url")
-    parser.add_argument("--video-fps", type=float, default=4.0)
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--min-p", type=float, default=0.0)
     parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -100,13 +101,14 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             api_key=arguments.api_key,
             served_model_name=arguments.served_model_name,
             checkpoint_id=arguments.checkpoint_id,
-            video_fps=arguments.video_fps,
             timeout_seconds=arguments.timeout_seconds,
             max_tokens=arguments.max_tokens,
             temperature=arguments.temperature,
             top_p=arguments.top_p,
             top_k=arguments.top_k,
+            min_p=arguments.min_p,
             presence_penalty=arguments.presence_penalty,
+            repetition_penalty=arguments.repetition_penalty,
         )
     )
     summary = run_qwen38_h3_recaption_pilot(

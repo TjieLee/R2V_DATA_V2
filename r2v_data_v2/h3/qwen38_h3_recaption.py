@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import math
 import re
 import shutil
 import uuid
@@ -364,7 +365,7 @@ class Qwen38BackendProvenance(SchemaModel):
     schema_version: Literal["r2v.h3.qwen38_recaption_backend.1"] = (
         QWEN38_RECAPTION_BACKEND_VERSION
     )
-    backend: Literal["vllm"] = "vllm"
+    backend: Literal["vllm", "sglang"] = "sglang"
     served_model_name: str
     checkpoint_id: str
     base_url: str
@@ -385,18 +386,43 @@ class Qwen38BackendProvenance(SchemaModel):
     official_h3_source_files: list[str] = Field(
         default_factory=lambda: list(OFFICIAL_H3_SOURCE_FILES)
     )
-    video_fps: float = Field(gt=0, allow_inf_nan=False)
     enable_thinking: Literal[False] = False
     temperature: float = Field(gt=0, allow_inf_nan=False)
     top_p: float = Field(gt=0, le=1, allow_inf_nan=False)
     top_k: int = Field(gt=0)
+    min_p: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     presence_penalty: float = Field(allow_inf_nan=False)
+    repetition_penalty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     max_tokens: int = Field(gt=0)
     repair_retries: Literal[1] = 1
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_vllm_provenance(cls, value: object) -> object:
+        if not isinstance(value, dict) or value.get("backend") != "vllm":
+            return value
+        if "video_fps" not in value:
+            return value
+        legacy_values = dict(value)
+        fingerprint = legacy_values.pop("configuration_fingerprint", None)
+        if fingerprint != _sha256_text(_compact_json(legacy_values)):
+            raise ValueError("Qwen3.8 backend configuration fingerprint is invalid")
+        normalized = dict(legacy_values)
+        normalized.pop("video_fps")
+        normalized.setdefault("min_p", None)
+        normalized.setdefault("repetition_penalty", None)
+        normalized["configuration_fingerprint"] = _sha256_text(
+            _compact_json(normalized)
+        )
+        return normalized
+
     @model_validator(mode="after")
     def validate_provenance(self) -> Qwen38BackendProvenance:
+        if self.backend == "sglang" and (
+            self.min_p is None or self.repetition_penalty is None
+        ):
+            raise ValueError("SGLang sampling provenance is incomplete")
         values = self.model_dump(mode="json", exclude={"configuration_fingerprint"})
         if self.configuration_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("Qwen3.8 backend configuration fingerprint is invalid")
@@ -1160,27 +1186,42 @@ class Qwen38RecaptionConfig:
     api_key: str = "EMPTY"
     served_model_name: str = DEFAULT_MODEL
     checkpoint_id: str = DEFAULT_CHECKPOINT_ID
-    video_fps: float = 4.0
     timeout_seconds: float = 900.0
     max_tokens: int = 8192
     temperature: float = 0.7
     top_p: float = 0.8
     top_k: int = 20
+    min_p: float = 0.0
     presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
 
     def __post_init__(self) -> None:
         strings = (self.base_url, self.api_key, self.served_model_name, self.checkpoint_id)
         if any(not value.strip() for value in strings):
             raise ValueError("Qwen3.8 recaption backend configuration is incomplete")
-        if self.video_fps <= 0 or self.timeout_seconds <= 0 or self.max_tokens <= 0:
+        if self.timeout_seconds <= 0 or self.max_tokens <= 0:
             raise ValueError("Qwen3.8 recaption runtime limits must be positive")
-        if self.temperature <= 0 or not 0 < self.top_p <= 1 or self.top_k <= 0:
+        sampling_values = (
+            self.temperature,
+            self.top_p,
+            self.min_p,
+            self.presence_penalty,
+            self.repetition_penalty,
+        )
+        if (
+            any(not math.isfinite(value) for value in sampling_values)
+            or self.temperature <= 0
+            or not 0 < self.top_p <= 1
+            or self.top_k <= 0
+            or not 0 <= self.min_p <= 1
+            or self.repetition_penalty <= 0
+        ):
             raise ValueError("Qwen3.8 recaption sampling configuration is invalid")
 
     def provenance(self) -> Qwen38BackendProvenance:
         values = {
             "schema_version": QWEN38_RECAPTION_BACKEND_VERSION,
-            "backend": "vllm",
+            "backend": "sglang",
             "served_model_name": self.served_model_name,
             "checkpoint_id": self.checkpoint_id,
             "base_url": self.base_url,
@@ -1195,12 +1236,13 @@ class Qwen38RecaptionConfig:
             "policy_version": QWEN38_RECAPTION_POLICY_VERSION,
             "official_h3_contract_version": OFFICIAL_H3_CONTRACT_VERSION,
             "official_h3_source_files": list(OFFICIAL_H3_SOURCE_FILES),
-            "video_fps": self.video_fps,
             "enable_thinking": False,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
+            "min_p": self.min_p,
             "presence_penalty": self.presence_penalty,
+            "repetition_penalty": self.repetition_penalty,
             "max_tokens": self.max_tokens,
             "repair_retries": 1,
         }
@@ -1271,8 +1313,9 @@ class OpenAIQwen38RecaptionBackend:
             "modalities": ["text"],
             "extra_body": {
                 "top_k": self.config.top_k,
+                "min_p": self.config.min_p,
+                "repetition_penalty": self.config.repetition_penalty,
                 "chat_template_kwargs": {"enable_thinking": False},
-                "mm_processor_kwargs": {"fps": self.config.video_fps},
             },
         }
         completion = self.client.chat.completions.create(**payload)
