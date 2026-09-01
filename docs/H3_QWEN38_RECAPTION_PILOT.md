@@ -123,36 +123,164 @@ duplicated dialogue, incompatible task/retention markers, and invented Audio
 facts fail closed. The official 350-500-word generation guidance is recorded as
 a warning rather than an arbitrary hard gate.
 
-## One-Time Server Setup
+## Qwen3.8 Server Runtime
 
-The checkpoint is immutable input:
+Validated server runtime as of 2026-09-01 uses **SGLang**, not the earlier vLLM
+prototype. The Qwen3.8 checkpoint is immutable input:
 
-```bash
-export QWEN38_CHECKPOINT=/mnt/workspace/guocong/model/Qwen/Qwen3.8-Flash-Next
-export QWEN38_MODEL=Qwen/Qwen3.8-Flash-Next
-export QWEN38_PORT=8000
-export QWEN38_TP_SIZE=8
-export QWEN38_MEDIA_ROOT=/mnt/workspace
-
-export HF_HOME=/mnt/workspace/litengjie/data/audio_deps/qwen38-cache/huggingface
-export XDG_CACHE_HOME=/mnt/workspace/litengjie/data/audio_deps/qwen38-cache/xdg
-export VLLM_CACHE_ROOT=/mnt/workspace/litengjie/data/audio_deps/qwen38-cache/vllm
-export QWEN38_LOG_ROOT=/mnt/workspace/litengjie/data/audio_deps/qwen38-logs
-
-mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" "$QWEN38_LOG_ROOT"
-
-vllm serve "$QWEN38_CHECKPOINT" \
-  --served-model-name "$QWEN38_MODEL" \
-  --host 127.0.0.1 \
-  --port "$QWEN38_PORT" \
-  --tensor-parallel-size "$QWEN38_TP_SIZE" \
-  --allowed-local-media-path "$QWEN38_MEDIA_ROOT" \
-  >"$QWEN38_LOG_ROOT/server.log" 2>&1
+```text
+checkpoint: /mnt/workspace/guocong/model/Qwen/Qwen3.8-Flash-Next
+served model: Qwen/Qwen3.8-Flash-Next
+SGLang env: /mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
+SGLang source: /mnt/workspace/litengjie/data/audio_deps/sglang-qwen38-src
+Qwen3.8 SGLang PR: sgl-project/sglang#36497
+pinned PR HEAD used for install: 78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385
 ```
 
-This command does not edit the checkpoint. Video sampling is sent per request
-through `mm_processor_kwargs`; no processor config is written into the model
-directory.
+The old `qwen38-vllm-env` and source checkout are not the production runtime for
+this pilot. The vLLM route required a dedicated Qwen3.8 runtime/image and was
+abandoned on this notebook because Docker/Podman/Apptainer/Singularity are not
+available.
+
+### Recreate the SGLang environment
+
+Use an independent persistent environment; do not modify the repo `.venv` or
+the known-working Dots3/vLLM environments.
+
+```bash
+export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
+export SGLANG_SRC=/mnt/workspace/litengjie/data/audio_deps/sglang-qwen38-src
+
+uv venv --python 3.12 --seed "$SGLANG_ENV"
+
+git clone https://github.com/sgl-project/sglang.git "$SGLANG_SRC"
+cd "$SGLANG_SRC"
+git fetch origin pull/36497/head
+git checkout --detach FETCH_HEAD
+git rev-parse HEAD
+```
+
+Expected pinned HEAD:
+
+```text
+78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385
+```
+
+The source build probes optional Rust extensions by default. This server does
+not provide `cargo`; Rust extensions are not required for the current Qwen3.8
+CUDA inference path. Install with the repository-supported opt-out:
+
+```bash
+SGLANG_BUILD_RUST_EXTS=none \
+uv pip install \
+  --python "$SGLANG_ENV/bin/python" \
+  -e python
+```
+
+Do not install a Rust toolchain only to satisfy editable-install metadata.
+
+### Start Qwen3.8 in a fresh terminal
+
+The current launch follows the Qwen3.8 SGLang recommended configuration, with
+three task/machine-specific differences: TP is 8 instead of 4, context is
+capped at 49,152 for the H3 pilot, and the service is bound to localhost.
+Port choice is operational only.
+
+```bash
+export SGLANG_ENV=/mnt/workspace/litengjie/data/audio_deps/qwen38-sglang-env
+export QWEN38_CHECKPOINT=/mnt/workspace/guocong/model/Qwen/Qwen3.8-Flash-Next
+export QWEN38_MODEL=Qwen/Qwen3.8-Flash-Next
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+cd /mnt/workspace/litengjie/data
+
+"$SGLANG_ENV/bin/sglang" serve \
+  --model-path "$QWEN38_CHECKPOINT" \
+  --served-model-name "$QWEN38_MODEL" \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --tp 8 \
+  --context-length 49152 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 8192 \
+  --linear-attn-prefill-backend flashinfer \
+  --linear-attn-decode-backend flashinfer \
+  --linear-attn-verify-backend triton \
+  --mamba-ssm-dtype bfloat16 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --max-running-requests 96 \
+  --reasoning-parser auto
+```
+
+For BF16 on CUDA, the documented Qwen3.8 SGLang path auto-enables PLE offload;
+do not add an independent PLE override unless debugging an actual load/runtime
+failure.
+
+Do **not** add `--enable-mixed-chunk` to the current Qwen3.8 runtime. The
+Qwen3.8/QSA path has had a mixed-chunk stability issue; the current operational
+launch intentionally leaves it disabled.
+
+### Non-thinking request contract
+
+`--reasoning-parser auto` only parses reasoning when the model emits it; it does
+not disable thinking. H3 recaption must explicitly request non-thinking mode.
+The Qwen3.8 recommended non-thinking sampling contract is:
+
+```text
+temperature: 0.7
+top_p: 0.80
+top_k: 20
+min_p: 0.0
+presence_penalty: 1.5
+repetition_penalty: 1.0
+chat_template_kwargs.enable_thinking: false
+```
+
+Minimal API smoke test:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3.8-Flash-Next",
+    "messages": [
+      {"role": "user", "content": "Reply with exactly: OK"}
+    ],
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repetition_penalty": 1.0,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "max_tokens": 128
+  }'
+```
+
+A prior text smoke test without `enable_thinking=false` returned separate
+`reasoning_content`, proving thinking was active. For H3 recaption, require
+`reasoning_content` to be null/absent and use only the final content/structured
+response.
+
+### Current adapter boundary
+
+The current `qwen38_h3_recaption.py` client was originally written for vLLM and
+still contains a vLLM-specific per-request multimedia processor field:
+
+```text
+mm_processor_kwargs={"fps": video_fps}
+```
+
+Do not treat the SGLang server migration as a completed client migration. Before
+running the formal recaption pilot against SGLang, remove/replace that
+vLLM-specific field and smoke-test SGLang `video_url`, `image_url`, strict JSON
+schema, and the non-thinking request contract. The frozen prompt/reference/audio
+authority rules above do not change.
 
 ## Random200 Pilot
 
@@ -171,13 +299,17 @@ export QWEN38_OUTPUT="$AUDIO_PRODUCTION_ROOT/qwen38_h3_recaption_v1"
   --conditioning-variant visual_only
 ```
 
-Review and edit the explicit manifest before inference. Then run:
+Review and edit the explicit manifest before inference. Do not run the inference
+step against SGLang until the adapter boundary described above has been patched
+and smoke-tested.
+
+After that compatibility patch, the intended pilot invocation remains:
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --case-manifest "$QWEN38_CASES" \
-  --base-url "http://127.0.0.1:${QWEN38_PORT}/v1" \
+  --base-url "http://127.0.0.1:8000/v1" \
   --served-model-name "$QWEN38_MODEL" \
   --checkpoint-id "$QWEN38_CHECKPOINT" \
   --media-mode file \
