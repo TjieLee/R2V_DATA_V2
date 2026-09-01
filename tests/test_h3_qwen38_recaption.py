@@ -3,9 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from http.server import HTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
+from urllib.request import Request, urlopen
 
 import pytest
 from pydantic import ValidationError
@@ -33,10 +39,12 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     Qwen38H3StructuredResponse,
     Qwen38RecaptionConfig,
     Qwen38RecaptionManifestCase,
+    Qwen38RecaptionRecord,
     Qwen38RecaptionRequest,
     RecaptionCompletionDiagnostic,
     RecaptionNonSpeechFact,
     build_audio_facts,
+    build_qwen38_full_manifest,
     build_qwen38_pilot_manifest,
     build_reference_contract,
     materialize_h3_draft,
@@ -44,6 +52,13 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     run_qwen38_h3_recaption_pilot,
     validate_h3_draft,
     validate_h3_response,
+)
+from r2v_data_v2.h3.qwen38_human_review import (
+    Qwen38HumanReviewAnnotation,
+    current_human_review_summary,
+    current_human_reviews,
+    make_review_handler,
+    save_human_review,
 )
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from tools.run_h3_qwen38_recaption import _parser
@@ -246,6 +261,10 @@ def _same_speaker_request(
 
 
 def _response(request: Qwen38RecaptionRequest) -> Qwen38H3StructuredResponse:
+    return materialize_h3_draft(_draft(request), request)
+
+
+def _draft(request: Qwen38RecaptionRequest) -> Qwen38H3DraftResponse:
     definitions = []
     for subject in request.reference_contract.subjects:
         definitions.append(
@@ -253,33 +272,19 @@ def _response(request: Qwen38RecaptionRequest) -> Qwen38H3StructuredResponse:
             + " and ".join(subject.source_picture_labels)
             + "."
         )
-    for audio in request.reference_contract.audios:
-        owner = "" if audio.subject_label is None else f" for {audio.subject_label}"
-        speaker = "" if audio.speaker_id is None else f" ({audio.speaker_id})"
-        definitions.append(
-            f"{audio.audio_label} is the supplied audio condition{owner}{speaker}."
-        )
     retention = [
         f"{subject.subject_label} (appears in [Shot 1]): fully_preserved - the referenced content is retained."
         for subject in request.reference_contract.subjects
     ]
-    retention.extend(
-        f"{audio.audio_label}: {audio.retention_marker} - the declared audio role is retained."
-        for audio in request.reference_contract.audios
-    )
-    speech_parts = []
-    for fact in request.audio_facts.speech:
-        source = (
-            f"{fact.entity_subject_label} ({fact.speaker_id})"
-            if fact.entity_subject_label is not None
-            else f"An unidentified voice ({fact.speaker_id})"
-        )
-        speech_parts.append(f"{source} says, {fact.locked_dialogue_block}")
     audits = [
         AudioFactAuditItem(fact_id=item.fact_id, action="preserved")
         for item in request.audio_facts.non_speech_events
     ]
-    return Qwen38H3StructuredResponse(
+    placeholders = " ".join(
+        f"A visible action continues. [[{fact.fact_id}]]"
+        for fact in request.audio_facts.speech
+    )
+    return Qwen38H3DraftResponse(
         subject_definitions=definitions,
         summary=(
             {
@@ -291,26 +296,6 @@ def _response(request: Qwen38RecaptionRequest) -> Qwen38H3StructuredResponse:
             + " The target preserves all frozen referenced content."
         ),
         retention_analysis=retention,
-        detailed_description=(
-            "The target uses a natural observational style.\n[Shot 1] "
-            + " ".join(speech_parts)
-        ),
-        overall_soundscape=UNGROUNDED_OVERALL_SOUNDSCAPE,
-        non_diegetic_music=UNGROUNDED_NON_DIEGETIC_MUSIC,
-        audio_fact_audit=audits,
-    )
-
-
-def _draft(request: Qwen38RecaptionRequest) -> Qwen38H3DraftResponse:
-    response = _response(request)
-    placeholders = " ".join(
-        f"A visible action continues. [[{fact.fact_id}]]"
-        for fact in request.audio_facts.speech
-    )
-    return Qwen38H3DraftResponse(
-        subject_definitions=response.subject_definitions,
-        summary=response.summary,
-        retention_analysis=response.retention_analysis,
         shots=[
             Qwen38DraftShot(
                 shot_index=1,
@@ -319,9 +304,9 @@ def _draft(request: Qwen38RecaptionRequest) -> Qwen38H3DraftResponse:
                 ),
             )
         ],
-        overall_soundscape=response.overall_soundscape,
-        non_diegetic_music=response.non_diegetic_music,
-        audio_fact_audit=response.audio_fact_audit,
+        overall_soundscape=UNGROUNDED_OVERALL_SOUNDSCAPE,
+        non_diegetic_music=UNGROUNDED_NON_DIEGETIC_MUSIC,
+        audio_fact_audit=audits,
     )
 
 
@@ -443,9 +428,133 @@ def test_speaker_ids_follow_first_cluster_appearance_and_binding(tmp_path: Path)
     assert request.audio_facts.speech[0].entity_subject_label is None
     assert request.audio_facts.speech[1].entity_subject_label == "<Subject 1>"
     response = _response(request)
-    assert "An unidentified voice (S1)" in response.detailed_description
+    assert "(S1) says," in response.detailed_description
     assert "<Subject 1> (S2)" in response.detailed_description
     assert _codes(response, request) == set()
+
+
+@pytest.mark.parametrize(
+    ("variant", "voice_source"),
+    [
+        ("target_voice_reference", "target"),
+        ("cross_voice_reference", "cross_donor"),
+    ],
+)
+def test_voice_audio_contract_is_materialized_deterministically(
+    tmp_path: Path,
+    variant: str,
+    voice_source: str,
+) -> None:
+    request = _request(tmp_path, variant=variant, voice_source=voice_source)
+    draft = _draft(request)
+    assert all("<Audio " not in item for item in draft.subject_definitions)
+    assert all("<Audio " not in item for item in draft.retention_analysis)
+    response = materialize_h3_draft(draft, request)
+    assert (
+        "<Audio 1> is the voice-timbre reference for <Subject 1> (S2)."
+        in response.subject_definitions
+    )
+    retention = next(
+        item for item in response.retention_analysis if item.startswith("<Audio 1>")
+    )
+    assert retention == (
+        "<Audio 1>: reference - its voice timbre and delivery guide "
+        "<Subject 1>'s speech without copying the source signal."
+    )
+    assert "(S2)" not in retention
+    assert (
+        "<Subject 1> (S2), using the voice timbre referenced from <Audio 1>, "
+        "says,"
+    ) in response.detailed_description
+    first_dialogue_prefix = response.detailed_description.split(
+        request.audio_facts.speech[0].locked_dialogue_block, maxsplit=1
+    )[0]
+    assert "<Audio 1>" not in first_dialogue_prefix
+    assert _codes(response, request) == set()
+
+
+def test_voice_audio_definition_does_not_invent_unknown_speaker_id(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path, variant="target_voice_reference")
+    audio = request.reference_contract.audios[0].model_copy(
+        update={"speaker_id": None}
+    )
+    contract = request.reference_contract.model_copy(update={"audios": [audio]})
+    adjusted = Qwen38RecaptionRequest(
+        sample=request.sample,
+        case=request.case,
+        reference_contract=contract,
+        audio_facts=request.audio_facts,
+        request_fingerprint=request.request_fingerprint,
+    )
+    response = materialize_h3_draft(_draft(adjusted), adjusted)
+    definition = next(
+        item for item in response.subject_definitions if item.startswith("<Audio 1>")
+    )
+    assert definition == "<Audio 1> is the voice-timbre reference for <Subject 1>."
+    assert "referenced from <Audio 1>" in response.detailed_description
+    assert _codes(response, adjusted) == set()
+
+
+def test_full_audio_reuse_materializes_canonical_definition_and_retention(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path, variant="full_audio_reuse")
+    response = _response(request)
+    assert (
+        "<Audio 1> is the supplied full-audio reference for the target."
+        in response.subject_definitions
+    )
+    assert (
+        "<Audio 1>: fully_copy - the supplied full audio is reused in full."
+        in response.retention_analysis
+    )
+    assert "referenced from <Audio 1>" not in response.detailed_description
+    assert _codes(response, request) == set()
+
+
+def test_draft_cannot_emit_pipeline_owned_audio_lines(tmp_path: Path) -> None:
+    request = _request(tmp_path, variant="target_voice_reference")
+    draft = _draft(request).model_copy(
+        update={
+            "subject_definitions": [
+                *_draft(request).subject_definitions,
+                "<Audio 1> is a model-authored Audio definition.",
+            ]
+        }
+    )
+    assert "draft_contains_pipeline_owned_audio_reference" in {
+        item.code for item in validate_h3_draft(draft, request)
+    }
+
+
+def test_music_absence_distinguishes_grounded_from_unknown(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    grounded_request = Qwen38RecaptionRequest(
+        sample=request.sample,
+        case=request.case,
+        reference_contract=request.reference_contract,
+        audio_facts=request.audio_facts.model_copy(
+            update={"audio_grounding_complete": True}
+        ),
+        request_fingerprint=request.request_fingerprint,
+    )
+    grounded = materialize_h3_draft(_draft(grounded_request), grounded_request)
+    assert grounded.non_diegetic_music == "N/A"
+    assert _codes(grounded, grounded_request) == set()
+    unknown = materialize_h3_draft(_draft(request), request)
+    assert unknown.non_diegetic_music == UNGROUNDED_NON_DIEGETIC_MUSIC
+    assert unknown.non_diegetic_music != "N/A"
+
+
+def test_speech_timestamps_remain_internal_placement_evidence(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    response = _response(request)
+    for speech in request.audio_facts.speech:
+        assert str(speech.start_time) not in response.detailed_description
+        assert str(speech.end_time) not in response.detailed_description
+    assert "start_time" in request.audio_facts.model_dump(mode="json")["speech"][0]
 
 
 def test_every_same_speaker_turn_repeats_exact_source(tmp_path: Path) -> None:
@@ -795,6 +904,21 @@ def test_cli_exposes_sglang_sampling_without_video_fps(tmp_path: Path) -> None:
     assert "video_fps" not in vars(arguments)
 
 
+def test_cli_exposes_full_inventory_manifest_policy(tmp_path: Path) -> None:
+    arguments = _parser().parse_args(
+        [
+            "--audio-production-root",
+            str(tmp_path),
+            "--prepare-all-manifest",
+            str(tmp_path / "all.jsonl"),
+            "--conditioning-policy",
+            "sample_pair_type",
+        ]
+    )
+    assert arguments.prepare_all_manifest == tmp_path / "all.jsonl"
+    assert arguments.conditioning_policy == "sample_pair_type"
+
+
 def test_legacy_vllm_backend_literal_remains_parseable(tmp_path: Path) -> None:
     values = _provenance(tmp_path).model_dump(
         mode="json", exclude={"configuration_fingerprint"}
@@ -928,18 +1052,73 @@ def test_manifest_helper_and_sidecar_are_read_only(tmp_path: Path) -> None:
     assert (output / "records.jsonl").is_file()
     assert (output / "summary.json").is_file()
     assert (output / "review.html").is_file()
+    for name in ("annotations.jsonl", "annotations.csv", "summary.json", "report.md"):
+        assert (output / "human_review" / name).is_file()
+    assert (output / "human_review/annotations.jsonl").read_text() == ""
     assert list((output / "raw_responses").glob("*.json"))
     review = (output / "review.html").read_text(encoding="utf-8")
-    assert "media/0000/target.mp4" in review
-    assert "media/0000/picture-1.png" in review
+    assert "media/0000/" not in review
+    target_sha = hashlib.sha256(b"video").hexdigest()
+    assert f"target-{target_sha[:12]}.mp4?v={target_sha}" in review
+    assert "picture-1-" in review
+    assert "?v=" in review
     assert "file://" not in review
 
 
+def test_full_manifest_preserves_all_pair_samples_and_maps_conditioning(
+    tmp_path: Path,
+) -> None:
+    in_root = tmp_path / "in"
+    cross_root = tmp_path / "cross"
+    in_root.mkdir()
+    cross_root.mkdir()
+    in_sample = _sample(in_root, voice_source="target")
+    cross_sample = _sample(cross_root, voice_source="cross_donor").model_copy(
+        update={
+            "sample_id": "clip-1/cross_pair/1",
+            "pair_id": "cross_pair/clip-1/1",
+            "pair_type": "cross_pair",
+        }
+    )
+    production = tmp_path / "production"
+    samples_path = _write_samples(production, [in_sample, cross_sample])
+    before = samples_path.read_bytes()
+    manifest_path = tmp_path / "all.jsonl"
+    cases = build_qwen38_full_manifest(
+        h3_samples_path=samples_path,
+        output_path=manifest_path,
+        conditioning_policy="sample_pair_type",
+    )
+    assert [item.sample_id for item in cases] == [
+        in_sample.sample_id,
+        cross_sample.sample_id,
+    ]
+    assert [item.conditioning_variant for item in cases] == [
+        "target_voice_reference",
+        "cross_voice_reference",
+    ]
+    assert all("not canonical-wide coverage" in (item.note or "") for item in cases)
+    assert samples_path.read_bytes() == before
+
+
+def test_full_manifest_fails_closed_without_required_voice_contract(
+    tmp_path: Path,
+) -> None:
+    sample = _sample(tmp_path).model_copy(update={"subject_voices": []})
+    samples_path = _write_samples(tmp_path / "production", [sample])
+    with pytest.raises(ValueError, match="cannot satisfy target_voice_reference"):
+        build_qwen38_full_manifest(
+            h3_samples_path=samples_path,
+            output_path=tmp_path / "all.jsonl",
+            conditioning_policy="sample_pair_type",
+        )
+
+
 def test_prompt_version_is_frozen() -> None:
-    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v5"
-    assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v3"
+    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v6"
+    assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v4"
     assert QWEN38_RECAPTION_DRAFT_VERSION == "r2v.h3.qwen38_recaption_draft.1"
-    assert QWEN38_RECAPTION_MATERIALIZER_VERSION == "h3_qwen38_materializer_v1"
+    assert QWEN38_RECAPTION_MATERIALIZER_VERSION == "h3_qwen38_materializer_v2"
 
 
 def test_prompt_allows_only_current_visible_retention_markers() -> None:
@@ -1061,3 +1240,346 @@ def test_description_word_count_warnings_are_non_blocking_boundaries(
     issues, warnings = validate_h3_response(response, request)
     assert issues == []
     assert warnings == expected_warnings
+
+
+def _review_output_fixture(
+    tmp_path: Path,
+    *,
+    variant: str = "target_voice_reference",
+) -> tuple[Path, Path, _FakeBackend]:
+    production = tmp_path / "production"
+    sample = _sample(
+        tmp_path,
+        voice_source=("cross_donor" if variant == "cross_voice_reference" else "target"),
+    )
+    samples_path = _write_samples(production, [sample])
+    manifest = tmp_path / "manifest.jsonl"
+    build_qwen38_pilot_manifest(
+        h3_samples_path=samples_path,
+        output_path=manifest,
+        size=1,
+        conditioning_variant=variant,  # type: ignore[arg-type]
+    )
+    backend = _FakeBackend(provenance=_provenance(tmp_path), calls=[])
+    output = tmp_path / "review-output"
+    run_qwen38_h3_recaption_pilot(
+        audio_production_root=production,
+        case_manifest_path=manifest,
+        backend=backend,
+        output_root=output,
+    )
+    return output, manifest, backend
+
+
+def _review_identity(output: Path) -> tuple[str, str, str]:
+    record = json.loads((output / "records.jsonl").read_text(encoding="utf-8"))
+    return record["sample_id"], record["clip_uid"], record["request_fingerprint"]
+
+
+def test_human_review_annotation_schema_is_strict() -> None:
+    annotation = Qwen38HumanReviewAnnotation(
+        sample_id="sample",
+        clip_uid="clip",
+        request_fingerprint="a" * 64,
+        decision="issue",
+        severity="major",
+        issue_tags=["audio_hallucination"],
+        notes="Repeated unsupported events.",
+        reviewed_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    assert annotation.schema_version == "r2v.h3.qwen38_human_review.1"
+    with pytest.raises(ValidationError):
+        Qwen38HumanReviewAnnotation.model_validate(
+            {**annotation.model_dump(mode="json"), "decision": "accept"}
+        )
+    with pytest.raises(ValidationError):
+        Qwen38HumanReviewAnnotation.model_validate(
+            {
+                **annotation.model_dump(mode="json"),
+                "decision": "issue",
+                "severity": None,
+            }
+        )
+
+
+def test_human_review_save_reload_update_and_reports(tmp_path: Path) -> None:
+    output, _, _ = _review_output_fixture(tmp_path)
+    sample_id, clip_uid, fingerprint = _review_identity(output)
+    first_time = datetime(2026, 9, 1, 1, 2, 3, tzinfo=UTC)
+    annotation, summary = save_human_review(
+        output,
+        {
+            "sample_id": sample_id,
+            "clip_uid": clip_uid,
+            "request_fingerprint": fingerprint,
+            "decision": "pass",
+            "severity": None,
+            "issue_tags": [],
+            "notes": "Looks correct.",
+        },
+        reviewed_at=first_time,
+    )
+    assert annotation.reviewed_at == first_time
+    assert summary.human_review["pass"] == 1
+    second_time = datetime(2026, 9, 1, 2, 3, 4, tzinfo=UTC)
+    updated, summary = save_human_review(
+        output,
+        {
+            "sample_id": sample_id,
+            "clip_uid": clip_uid,
+            "request_fingerprint": fingerprint,
+            "decision": "issue",
+            "severity": "major",
+            "issue_tags": ["audio_event_oversegmentation", "audio_hallucination"],
+            "notes": "Repeated unsupported events.",
+        },
+        reviewed_at=second_time,
+    )
+    assert updated.reviewed_at == second_time
+    annotations = (output / "human_review/annotations.jsonl").read_text().splitlines()
+    assert len(annotations) == 1
+    assert current_human_reviews(output)["annotations"][0]["decision"] == "issue"
+    assert summary.human_review["pass"] == 0
+    assert summary.human_review["issue"] == 1
+    assert summary.human_review["severity_counts"] == {"major": 1}
+    assert summary.human_review["issue_tag_counts"] == {
+        "audio_event_oversegmentation": 1,
+        "audio_hallucination": 1,
+    }
+    assert summary.batch["prompt_version"] == QWEN38_RECAPTION_PROMPT_VERSION
+    assert summary.batch["policy_version"] == QWEN38_RECAPTION_POLICY_VERSION
+    assert summary.batch["materializer_version"] == (
+        QWEN38_RECAPTION_MATERIALIZER_VERSION
+    )
+    assert summary.scope["inventory_scope"] == "current_h3_samples_inventory_only"
+    assert summary.scope["canonical_wide_coverage"] is False
+    csv_text = (output / "human_review/annotations.csv").read_text()
+    assert "request_fingerprint" in csv_text
+    assert "audio_event_oversegmentation;audio_hallucination" in csv_text
+    report = (output / "human_review/report.md").read_text()
+    assert "H3 Full Review Progress" in report
+    assert "Issue #11 canonical-wide migration pending" in report
+
+
+def test_stale_fingerprint_is_not_counted_as_current_review(tmp_path: Path) -> None:
+    output, _, _ = _review_output_fixture(tmp_path)
+    sample_id, clip_uid, fingerprint = _review_identity(output)
+    save_human_review(
+        output,
+        {
+            "sample_id": sample_id,
+            "clip_uid": clip_uid,
+            "request_fingerprint": fingerprint,
+            "decision": "pass",
+            "severity": None,
+            "issue_tags": [],
+            "notes": "Old output.",
+        },
+        reviewed_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    record = json.loads((output / "records.jsonl").read_text())
+    record["request_fingerprint"] = "b" * 64
+    (output / "records.jsonl").write_text(json.dumps(record) + "\n")
+    reviews = current_human_reviews(output)
+    summary = current_human_review_summary(output)
+    assert reviews == {"annotations": [], "stale_annotation_count": 1}
+    assert summary["human_review"]["reviewed"] == 0
+    assert summary["human_review"]["unreviewed"] == 1
+    with pytest.raises(ValueError, match="fingerprint is stale"):
+        save_human_review(
+            output,
+            {
+                "sample_id": sample_id,
+                "clip_uid": clip_uid,
+                "request_fingerprint": fingerprint,
+                "decision": "pass",
+                "severity": None,
+                "issue_tags": [],
+                "notes": "Must not bind to stale output.",
+            },
+        )
+
+
+def test_review_media_urls_are_content_and_sample_addressed(tmp_path: Path) -> None:
+    from r2v_data_v2.h3.qwen38_human_review import materialize_review_media
+
+    output, _, _ = _review_output_fixture(tmp_path)
+    record = Qwen38RecaptionRecord.model_validate(
+        json.loads((output / "records.jsonl").read_text())
+    )
+    first = materialize_review_media(tmp_path / "media-a", [record])[record.sample_id]
+    repeated = materialize_review_media(tmp_path / "media-b", [record])[record.sample_id]
+    assert first == repeated
+    other_sample = record.model_copy(update={"sample_id": "different/sample"})
+    other = materialize_review_media(tmp_path / "media-c", [other_sample])[
+        other_sample.sample_id
+    ]
+    assert first["target"] != other["target"]
+    changed_target = tmp_path / "changed.mp4"
+    changed_target.write_bytes(b"changed-video")
+    changed_sha = hashlib.sha256(b"changed-video").hexdigest()
+    changed_record = record.model_copy(
+        update={
+            "target_video_path": str(changed_target),
+            "target_video_sha256": changed_sha,
+        }
+    )
+    changed = materialize_review_media(tmp_path / "media-d", [changed_record])[
+        record.sample_id
+    ]
+    assert first["target"] != changed["target"]
+    assert changed_sha in changed["target"]
+    assert first["audios"]
+
+
+def test_review_html_controls_and_collapsed_audit_are_present(tmp_path: Path) -> None:
+    output, _, _ = _review_output_fixture(tmp_path)
+    review = (output / "review.html").read_text()
+    for label in ("Reviewed", "Pass", "Issue", "Skip", "Unreviewed"):
+        assert label in review
+    assert "Model failed" in review
+    assert "Issue tag" in review
+    assert "Save Review" in review
+    assert "audio_event_oversegmentation" in review
+    assert "<details><summary>Audio fact audit:" in review
+    assert "<details open><summary>Audio fact audit:" not in review
+    assert "This batch covers the current H3 samples inventory only" in review
+    assert "audio_fact_audit:" not in render_h3_prompt(
+        _response(_request(tmp_path))
+    )
+    assert "raw_responses" not in render_h3_prompt(_response(_request(tmp_path)))
+
+
+def test_generated_review_javascript_is_valid(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is unavailable for JavaScript syntax validation")
+    output, _, _ = _review_output_fixture(tmp_path)
+    review = (output / "review.html").read_text(encoding="utf-8")
+    match = re.search(r"<script>(.*?)</script>", review, flags=re.DOTALL)
+    assert match is not None
+    script_path = tmp_path / "qwen38-review.js"
+    script_path.write_text(match.group(1), encoding="utf-8")
+    result = subprocess.run(
+        [node, "--check", str(script_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_review_server_cache_headers_and_persisted_post(tmp_path: Path) -> None:
+    output, _, _ = _review_output_fixture(tmp_path)
+    sample_id, clip_uid, fingerprint = _review_identity(output)
+    server = HTTPServer(("127.0.0.1", 0), make_review_handler(output))
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urlopen(base + "/review.html", timeout=5) as response:
+            review = response.read().decode()
+            assert response.headers["Cache-Control"] == (
+                "no-store, no-cache, must-revalidate"
+            )
+            assert response.headers["Pragma"] == "no-cache"
+            assert response.headers["Expires"] == "0"
+        target_url = re.search(r"<video[^>]+src='([^']+)'", review)
+        assert target_url is not None
+        with urlopen(base + "/" + target_url.group(1), timeout=5) as response:
+            assert response.status == 200
+            assert response.headers["Cache-Control"].startswith("no-store")
+        payload = json.dumps(
+            {
+                "sample_id": sample_id,
+                "clip_uid": clip_uid,
+                "request_fingerprint": fingerprint,
+                "decision": "issue",
+                "severity": "minor",
+                "issue_tags": ["visual_caption_issue"],
+                "notes": "Small visual omission.",
+            }
+        ).encode()
+        request = Request(
+            base + "/api/review",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=5) as response:
+            saved = json.loads(response.read())
+        assert saved["annotation"]["decision"] == "issue"
+        with urlopen(base + "/api/reviews", timeout=5) as response:
+            reviews = json.loads(response.read())
+        assert reviews["annotations"][0]["notes"] == "Small visual omission."
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_review_writes_use_atomic_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import r2v_data_v2.h3.qwen38_human_review as review_module
+
+    output, _, _ = _review_output_fixture(tmp_path)
+    sample_id, clip_uid, fingerprint = _review_identity(output)
+    replacements: list[tuple[Path, Path]] = []
+    original_replace = review_module.os.replace
+
+    def recording_replace(source: object, destination: object) -> None:
+        replacements.append((Path(source), Path(destination)))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(review_module.os, "replace", recording_replace)
+    save_human_review(
+        output,
+        {
+            "sample_id": sample_id,
+            "clip_uid": clip_uid,
+            "request_fingerprint": fingerprint,
+            "decision": "skip",
+            "severity": None,
+            "issue_tags": [],
+            "notes": "Not reviewable.",
+        },
+        reviewed_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    assert {destination.name for _, destination in replacements} == {
+        "annotations.jsonl",
+        "annotations.csv",
+        "summary.json",
+        "report.md",
+    }
+    assert not list((output / "human_review").glob(".*.tmp-*"))
+
+
+def test_reviewed_output_cannot_be_overwritten(tmp_path: Path) -> None:
+    output, manifest, _ = _review_output_fixture(tmp_path)
+    sample_id, clip_uid, fingerprint = _review_identity(output)
+    save_human_review(
+        output,
+        {
+            "sample_id": sample_id,
+            "clip_uid": clip_uid,
+            "request_fingerprint": fingerprint,
+            "decision": "pass",
+            "severity": None,
+            "issue_tags": [],
+            "notes": "Approved.",
+        },
+        reviewed_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    records_before = (output / "records.jsonl").read_bytes()
+    reviews_before = (output / "human_review/annotations.jsonl").read_bytes()
+    blocked_backend = _FakeBackend(provenance=_provenance(tmp_path), calls=[])
+    with pytest.raises(ValueError, match="reviewed Qwen3.8 output"):
+        run_qwen38_h3_recaption_pilot(
+            audio_production_root=tmp_path / "production",
+            case_manifest_path=manifest,
+            backend=blocked_backend,
+            output_root=output,
+            overwrite=True,
+        )
+    assert blocked_backend.calls == []
+    assert (output / "records.jsonl").read_bytes() == records_before
+    assert (output / "human_review/annotations.jsonl").read_bytes() == reviews_before

@@ -48,7 +48,7 @@ was inspected, but is not copied here.
 The local system-prompt version is:
 
 ```text
-h3_qwen38_ref2va_recaption_v5
+h3_qwen38_ref2va_recaption_v6
 ```
 
 The deterministic renderer publishes these exact sections in this exact order:
@@ -86,7 +86,7 @@ This pilot currently defines zero H3 Video reference assets.
 
 ## Conditioning Variants
 
-| Variant | Summary prefix | Audio retention |
+| Variant | Summary prefix | Pipeline-owned Audio retention |
 | --- | --- | --- |
 | `visual_only` | `[reference generation]` | no Audio label |
 | `target_voice_reference` | `[reference generation + audio reference]` | `reference` |
@@ -96,6 +96,15 @@ This pilot currently defines zero H3 Video reference assets.
 Voice-reference and full-audio-reuse conditions are never combined by the
 default contract. Donor dialogue is not target dialogue. Locked target ASR text
 is the only dialogue authority.
+
+`<Audio N>` always denotes an independent reference or reused Audio asset, not
+a speech segment. Qwen does not emit Audio definitions or retention lines. The
+deterministic `h3_qwen38_materializer_v2` appends canonical definitions and
+retention from `RecaptionAudioContract`. Voice references name their frozen
+Subject and known `(Sx)` in the definition, while retention never carries `(Sx)`.
+A bound speech clause cites its exactly matched `<Audio N>`; unbound or unrelated
+speech cannot borrow another Subject's voice reference. Full-audio reuse remains
+an unbound `fully_copy` asset.
 
 ## Audio Authority
 
@@ -121,11 +130,16 @@ Every locked dialogue block must appear exactly once:
 Qwen now returns `r2v.h3.qwen38_recaption_draft.1`. Each shot contains a
 `description_template` with exactly one chronological `[[speech_N]]`
 placeholder per frozen speech fact. Qwen does not serialize `[Shot N]`, speaker
-sources, or `<d>` dialogue. The deterministic `h3_qwen38_materializer_v1`
+sources, or `<d>` dialogue. The deterministic `h3_qwen38_materializer_v2`
 renders shot headers and replaces each placeholder with the pipeline-owned
-bound `<Subject N> (Sx)` or unbound `(Sx)` source plus exact locked dialogue.
+bound `<Subject N> (Sx)` or unbound `(Sx)` source plus exact locked dialogue and,
+when deterministically matched, its voice-reference `<Audio N>` relationship.
 The published structured sections and H3 prompt contain only this materialized
 final text; raw sidecars preserve the original model draft.
+
+Speech start/end times remain internal chronological and placement evidence.
+They are not narrated as per-dialogue numeric timestamps. Numeric H3 timing
+syntax remains owned by later shots such as `[Shot 2] At 00:03.125, ...`.
 
 Missing, duplicate, unknown, or reordered placeholders fail draft validation.
 Direct shot headers, speaker serialization, or dialogue in a model draft also
@@ -149,6 +163,14 @@ closed. Information-rich recaptions target roughly 300-450 words when the video
 supports that detail. Materialized descriptions below 250 or above 500 words
 receive separate review warnings, never an automatic rejection; visually simple
 clips must not be padded to meet a word target.
+
+When complete upstream Audio grounding confirms that no non-diegetic music is
+present, the materializer publishes canonical `N/A`. Missing or incomplete Audio
+grounding remains unknown and uses the conservative "not established" wording;
+it must never be converted to `N/A`. `overall_soundscape` retains the existing
+grounded/conservative contract. This stage intentionally does not deduplicate or
+repair questionable upstream events, music, soundscape, ASR, or speaker binding:
+those remain visible human-review evidence.
 
 ## Qwen3.8 Server Runtime
 
@@ -326,6 +348,7 @@ Review and edit the explicit manifest before inference. Then run:
 "$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --case-manifest "$QWEN38_CASES" \
+  --output-root "$QWEN38_OUTPUT" \
   --base-url "http://127.0.0.1:8000/v1" \
   --served-model-name "$QWEN38_MODEL" \
   --checkpoint-id "$QWEN38_CHECKPOINT" \
@@ -358,43 +381,69 @@ Do not infer that path from another stage.
 ## Review
 
 ```bash
-python -m http.server 8765 --directory "$QWEN38_OUTPUT"
+"$R2V_PYTHON" tools/serve_h3_qwen38_review.py \
+  --output-root "$QWEN38_OUTPUT" \
+  --host 127.0.0.1 \
+  --port 8765
 ```
 
 Open `http://127.0.0.1:8765/review.html`. The page shows the target video, all
 Pictures in canonical order, deterministic contracts, rough Visual hints,
-normalized Audio facts, rendered prompt, audit metadata, and warnings.
+normalized Audio facts, rendered prompt, audit metadata, warnings, and persisted
+review controls. Media URLs include sample identity and content SHA, and the
+server also sends no-cache headers.
 
-### Fresh Unseen V5 Canary
+Each save atomically refreshes:
+
+```text
+human_review/
+  annotations.jsonl
+  annotations.csv
+  summary.json
+  report.md
+```
+
+Annotations bind `sample_id` to the exact current `request_fingerprint`. A prior
+fingerprint remains historical evidence but does not count as current review.
+Reviewed output roots refuse ordinary inference overwrite; use a new output root
+for a new prompt/backend result. The dashboard and reports explicitly cover only
+the current pair-rooted `h3/samples.jsonl` inventory, not Issue #11 canonical-wide
+coverage. `audio_fact_audit`, raw responses, review annotations, and debug
+provenance never enter rendered H3 training text.
+
+### Fresh Unseen V6 Canary
 
 Before changing production behavior based on description length, prepare a new
 five-case manifest from examples not used for prompt development. Inspect the
 manifest to confirm all five cases are genuinely unseen and cover useful visual
 variation, then run the normal command above with a fresh `--output-root` so no
-v3/v4 result is overwritten. Do not alter sampling, repair, Audio, or contract
+v3/v4/v5 result is overwritten. Do not alter sampling, repair, Audio, or contract
 settings for this canary.
 
 ```bash
-export QWEN38_V5_CASES=/absolute/path/to/qwen38-v5-unseen5.jsonl
-export QWEN38_V5_CANARY_OUTPUT=/absolute/path/to/qwen38-v5-unseen5-output
+export QWEN38_V6_CASES=/absolute/path/to/qwen38-v6-unseen5.jsonl
+export QWEN38_V6_CANARY_OUTPUT=/absolute/path/to/qwen38-v6-unseen5-output
 
 "$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --prepare-manifest "$QWEN38_V5_CASES" \
+  --prepare-manifest "$QWEN38_V6_CASES" \
   --manifest-size 5 \
   --conditioning-variant visual_only
 ```
 
 Review and, if needed, edit only the explicit case manifest to select five
 unseen samples. Run the normal inference command with
-`--case-manifest "$QWEN38_V5_CASES"` and
-`--output-root "$QWEN38_V5_CANARY_OUTPUT"`; keep every documented sampling and
+`--case-manifest "$QWEN38_V6_CASES"` and
+`--output-root "$QWEN38_V6_CANARY_OUTPUT"`; keep every documented sampling and
 media argument unchanged.
 
 Serve that fresh output with the existing static review workflow:
 
 ```bash
-python -m http.server 8765 --directory "$QWEN38_V5_CANARY_OUTPUT"
+"$R2V_PYTHON" tools/serve_h3_qwen38_review.py \
+  --output-root "$QWEN38_V6_CANARY_OUTPUT" \
+  --host 127.0.0.1 \
+  --port 8765
 ```
 
 For each case, use `review.html` to compare the target video and canonical
@@ -407,3 +456,78 @@ the description is usefully dense rather than judging it by word count alone.
 Finally reconcile ready/failed status, model-call count, warnings, and raw
 responses. Treat the five-case result as manual evidence only; do not change
 production gates or rerun upstream stages solely to optimize length.
+
+For a small three-case preview, use a distinct manifest and output root, then
+reuse the exact inference arguments above plus the frozen Audio semantics root:
+
+```bash
+export QWEN38_PREVIEW_CASES=/absolute/path/to/qwen38-v6-preview3.jsonl
+export QWEN38_PREVIEW_OUTPUT=/absolute/path/to/qwen38-v6-preview3-output
+
+"$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --prepare-manifest "$QWEN38_PREVIEW_CASES" \
+  --manifest-size 3 \
+  --conditioning-variant target_voice_reference
+
+"$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --case-manifest "$QWEN38_PREVIEW_CASES" \
+  --audio-semantics-root "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1" \
+  --output-root "$QWEN38_PREVIEW_OUTPUT" \
+  --base-url "http://127.0.0.1:8000/v1" \
+  --served-model-name "$QWEN38_MODEL" \
+  --checkpoint-id "$QWEN38_CHECKPOINT" \
+  --media-mode file \
+  --media-root /mnt/workspace \
+  --temperature 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 \
+  --presence-penalty 1.5 --repetition-penalty 1.0 --max-tokens 8192
+
+"$R2V_PYTHON" tools/serve_h3_qwen38_review.py \
+  --output-root "$QWEN38_PREVIEW_OUTPUT" \
+  --host 127.0.0.1 \
+  --port 8765
+```
+
+## Full Current-Inventory Review
+
+Create one manifest row for every current H3 sample in deterministic source
+order. Pair type selects conditioning with no visual-only fallback:
+
+```bash
+export QWEN38_ALL_CASES=/absolute/path/to/qwen38-current-h3-all.jsonl
+export QWEN38_FULL_OUTPUT=/absolute/path/to/qwen38-current-h3-full-review
+
+"$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --prepare-all-manifest "$QWEN38_ALL_CASES" \
+  --conditioning-policy sample_pair_type
+```
+
+`in_pair` maps to `target_voice_reference`; `cross_pair` maps to
+`cross_voice_reference`. Missing required target/donor voice contracts fail
+manifest preparation rather than silently falling back. The manifest contains
+each current `h3/samples.jsonl` row exactly once, including cross-pair rows, and
+does not expand the inventory.
+
+Run the full current-inventory review with the frozen specialized Audio sidecar:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_qwen38_recaption.py \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --case-manifest "$QWEN38_ALL_CASES" \
+  --audio-semantics-root "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1" \
+  --output-root "$QWEN38_FULL_OUTPUT" \
+  --base-url "http://127.0.0.1:8000/v1" \
+  --served-model-name "$QWEN38_MODEL" \
+  --checkpoint-id "$QWEN38_CHECKPOINT" \
+  --media-mode file \
+  --media-root /mnt/workspace \
+  --temperature 0.7 --top-p 0.8 --top-k 20 --min-p 0.0 \
+  --presence-penalty 1.5 --repetition-penalty 1.0 --max-tokens 8192
+
+"$R2V_PYTHON" tools/serve_h3_qwen38_review.py \
+  --output-root "$QWEN38_FULL_OUTPUT" \
+  --host 127.0.0.1 \
+  --port 8765
+```

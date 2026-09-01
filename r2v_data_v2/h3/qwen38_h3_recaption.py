@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import math
 import re
@@ -28,10 +27,10 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v5"
-QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v3"
+QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v6"
+QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v4"
 QWEN38_RECAPTION_DRAFT_VERSION = "r2v.h3.qwen38_recaption_draft.1"
-QWEN38_RECAPTION_MATERIALIZER_VERSION = "h3_qwen38_materializer_v1"
+QWEN38_RECAPTION_MATERIALIZER_VERSION = "h3_qwen38_materializer_v2"
 QWEN38_RECAPTION_MANIFEST_VERSION = "r2v.h3.qwen38_recaption_manifest.1"
 QWEN38_RECAPTION_RECORD_VERSION = "r2v.h3.qwen38_recaption_record.1"
 QWEN38_RECAPTION_SUMMARY_VERSION = "r2v.h3.qwen38_recaption_summary.1"
@@ -432,16 +431,16 @@ class Qwen38BackendProvenance(SchemaModel):
         "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     ] = "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v5"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v6"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
-    policy_version: Literal["h3_qwen38_ref2va_contract_v3"] = (
+    policy_version: Literal["h3_qwen38_ref2va_contract_v4"] = (
         QWEN38_RECAPTION_POLICY_VERSION
     )
     draft_schema_version: Literal["r2v.h3.qwen38_recaption_draft.1"] = (
         QWEN38_RECAPTION_DRAFT_VERSION
     )
-    materializer_version: Literal["h3_qwen38_materializer_v1"] = (
+    materializer_version: Literal["h3_qwen38_materializer_v2"] = (
         QWEN38_RECAPTION_MATERIALIZER_VERSION
     )
     official_h3_contract_version: str = OFFICIAL_H3_CONTRACT_VERSION
@@ -523,7 +522,7 @@ class Qwen38RecaptionRecord(SchemaModel):
     audio_fact_provenance: dict[str, str] = Field(default_factory=dict)
     audio_grounding_complete: bool
     backend_provenance: Qwen38BackendProvenance
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v5"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v6"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     official_h3_source_files: list[str] = Field(
@@ -593,6 +592,10 @@ class Qwen38RecaptionSummary(SchemaModel):
     target_video_reference_count: Literal[0] = 0
     checkpoint_written: Literal[False] = False
     production_h3_modified: Literal[False] = False
+    inventory_scope: Literal["current_h3_samples_inventory_only"] = (
+        "current_h3_samples_inventory_only"
+    )
+    canonical_wide_coverage: Literal[False] = False
 
     @model_validator(mode="after")
     def validate_counts(self) -> Qwen38RecaptionSummary:
@@ -905,13 +908,11 @@ UNGROUNDED_NON_DIEGETIC_MUSIC = (
 SYNTHETIC_FORMAT_EXAMPLE = """subject_definitions:
 <Subject 1> is a cyclist sourced from <Picture 1>.
 <Subject 2> is the riverside environment sourced from <Picture 2>.
-<Audio 1> is the voice-timbre reference for <Subject 1>.
 summary:
-[reference generation + audio reference] A cyclist pauses in the referenced riverside setting and speaks once.
+[reference generation] A cyclist pauses in the referenced riverside setting and speaks once.
 retention_analysis:
 <Subject 1> (appears in [Shot 1]): fully_preserved - the cyclist's referenced appearance is retained.
 <Subject 2> (appears in [Shot 1]): fully_preserved - the riverside environment is retained.
-<Audio 1>: reference - the speaker follows the referenced delivery without copying the signal.
 shots:
 - shot_index: 1
   start_time: null
@@ -981,8 +982,9 @@ recaption contract, the only allowed visible retention markers are:
 - partially_preserved
 - weak_reference
 attribute_transfer is not assigned by the current conditioning contract and MUST
-NOT be emitted. Audio markers are fully_copy, partially_copy, reference,
-weak_reference.
+NOT be emitted. Audio definitions, Audio retention lines, and Audio-to-speech
+relationships are pipeline-owned. Never emit an <Audio N> label anywhere in the
+draft; the deterministic materializer appends the exact canonical Audio contract.
 
 Insert every supplied [[speech_N]] placeholder exactly once in chronological
 order. A placeholder represents the complete source-and-dialogue clause; never
@@ -990,6 +992,9 @@ prefix it with says, speaks, a pronoun, a role, or a character name. Never write
 pipeline-owned (Sx), <Subject N> (Sx), <d> dialogue, transcript text, or unknown
 speech placeholders. The pipeline deterministically materializes each complete
 speech clause after validating your draft. Do not copy donor/reference dialogue.
+Speech start/end timestamps are internal placement evidence. Use them to place
+placeholders in temporal order, but do not narrate their numeric timestamps in a
+shot description.
 
 Audio text facts are trusted. Do not invent sounds from visible actions. Preserve
 an audible event even when its source is not visible. Visual evidence may only
@@ -1031,6 +1036,7 @@ def _speech_placeholder_contract(request: Qwen38RecaptionRequest) -> str:
             "- placeholders must appear in the listed chronological order",
             "- a placeholder is the complete speech clause; do not prefix it with says or a speaker description",
             "- do not emit unknown placeholders, (Sx), <d> dialogue, or transcript text",
+            "- start/end timestamps are placement evidence; do not narrate numeric speech timestamps",
         )
     )
     return "\n".join(lines)
@@ -1058,7 +1064,12 @@ def _audio_fact_audit_contract(request: Qwen38RecaptionRequest) -> str:
 def _audio_grounding_contract(request: Qwen38RecaptionRequest) -> str:
     facts = request.audio_facts
     if facts.audio_grounding_complete:
-        return "AUDIO GROUNDING CONTRACT: Use only supplied upstream Audio facts."
+        lines = ["AUDIO GROUNDING CONTRACT: Use only supplied upstream Audio facts."]
+        if facts.non_diegetic_music_hint is None:
+            lines.append(
+                "non_diegetic_music is confirmed absent and will be materialized as N/A."
+            )
+        return "\n".join(lines)
     lines = [
         "AUDIO GROUNDING CONTRACT: INCOMPLETE",
         "Only supplied speech facts may be asserted as audible.",
@@ -1191,6 +1202,14 @@ def validate_h3_draft(
             )
         )
     all_draft_text = "\n".join((*templates, non_shot_text))
+    if "<Audio " in all_draft_text:
+        issues.append(
+            ValidationIssue(
+                "draft_contains_pipeline_owned_audio_reference",
+                None,
+                "Audio definitions, retention, and speech relationships are materialized",
+            )
+        )
     if "<d>" in all_draft_text or "</d>" in all_draft_text:
         issues.append(
             ValidationIssue(
@@ -1242,9 +1261,60 @@ def validate_h3_draft(
     return issues
 
 
-def _render_locked_speech(speech: RecaptionSpeechFact) -> str:
+def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
+    if audio.kind == "full_audio_reuse":
+        return f"{audio.audio_label} is the supplied full-audio reference for the target."
+    assert audio.subject_label is not None
+    speaker = "" if audio.speaker_id is None else f" ({audio.speaker_id})"
     return (
-        f"{_speech_exact_source(speech)} says, {speech.locked_dialogue_block}"
+        f"{audio.audio_label} is the voice-timbre reference for "
+        f"{audio.subject_label}{speaker}."
+    )
+
+
+def _canonical_audio_retention(audio: RecaptionAudioContract) -> str:
+    if audio.kind == "full_audio_reuse":
+        return (
+            f"{audio.audio_label}: fully_copy - the supplied full audio is reused "
+            "in full."
+        )
+    assert audio.subject_label is not None
+    return (
+        f"{audio.audio_label}: reference - its voice timbre and delivery guide "
+        f"{audio.subject_label}'s speech without copying the source signal."
+    )
+
+
+def _matching_voice_audio(
+    speech: RecaptionSpeechFact,
+    contract: RecaptionReferenceContract,
+) -> RecaptionAudioContract | None:
+    if speech.entity_id is None or speech.entity_subject_label is None:
+        return None
+    matches = [
+        audio
+        for audio in contract.audios
+        if audio.kind in {"target_voice", "cross_voice"}
+        and audio.entity_id == speech.entity_id
+        and audio.subject_label == speech.entity_subject_label
+        and (audio.speaker_id is None or audio.speaker_id == speech.speaker_id)
+    ]
+    if len(matches) > 1:
+        raise ValueError("speech matches multiple voice-reference Audio assets")
+    return None if not matches else matches[0]
+
+
+def _render_locked_speech(
+    speech: RecaptionSpeechFact,
+    contract: RecaptionReferenceContract,
+) -> str:
+    source = _speech_exact_source(speech)
+    audio = _matching_voice_audio(speech, contract)
+    if audio is None:
+        return f"{source} says, {speech.locked_dialogue_block}"
+    return (
+        f"{source}, using the voice timbre referenced from {audio.audio_label}, "
+        f"says, {speech.locked_dialogue_block}"
     )
 
 
@@ -1271,7 +1341,9 @@ def materialize_h3_draft(
     rendered_shots = []
     for shot in draft.shots:
         description = _SPEECH_PLACEHOLDER.sub(
-            lambda match: _render_locked_speech(speech_by_id[match.group(1)]),
+            lambda match: _render_locked_speech(
+                speech_by_id[match.group(1)], request.reference_contract
+            ),
             shot.description_template.strip(),
         )
         if shot.shot_index == 1:
@@ -1285,12 +1357,29 @@ def materialize_h3_draft(
             )
         rendered_shots.append(f"{header} {description}")
     return Qwen38H3StructuredResponse(
-        subject_definitions=draft.subject_definitions,
+        subject_definitions=[
+            *draft.subject_definitions,
+            *(
+                _canonical_audio_definition(audio)
+                for audio in request.reference_contract.audios
+            ),
+        ],
         summary=draft.summary,
-        retention_analysis=draft.retention_analysis,
+        retention_analysis=[
+            *draft.retention_analysis,
+            *(
+                _canonical_audio_retention(audio)
+                for audio in request.reference_contract.audios
+            ),
+        ],
         detailed_description="\n".join(rendered_shots),
         overall_soundscape=draft.overall_soundscape,
-        non_diegetic_music=draft.non_diegetic_music,
+        non_diegetic_music=(
+            "N/A"
+            if request.audio_facts.audio_grounding_complete
+            and request.audio_facts.non_diegetic_music_hint is None
+            else draft.non_diegetic_music
+        ),
         audio_fact_audit=draft.audio_fact_audit,
     )
 
@@ -1394,10 +1483,7 @@ def validate_h3_response(
             for item in response.subject_definitions
             if item.lstrip().startswith(audio.audio_label)
         ]
-        if len(definitions) != 1 or (
-            audio.subject_label is not None
-            and audio.subject_label not in definitions[0]
-        ):
+        if definitions != [_canonical_audio_definition(audio)]:
             issues.append(
                 ValidationIssue(
                     "audio_definition_contract_mismatch",
@@ -1479,7 +1565,16 @@ def validate_h3_response(
         )
 
     facts = request.audio_facts
-    if not facts.audio_grounding_complete:
+    if facts.audio_grounding_complete and facts.non_diegetic_music_hint is None:
+        if response.non_diegetic_music != "N/A":
+            issues.append(
+                ValidationIssue(
+                    "grounded_absent_music_not_canonical",
+                    "non_diegetic_music",
+                    "confirmed absent music must be materialized as N/A",
+                )
+            )
+    elif not facts.audio_grounding_complete:
         if facts.non_diegetic_music_hint is None and _normalized_contract_text(
             response.non_diegetic_music
         ) != _normalized_contract_text(UNGROUNDED_NON_DIEGETIC_MUSIC):
@@ -1506,10 +1601,12 @@ def validate_h3_response(
 
     retention = "\n".join(response.retention_analysis)
     for audio in request.reference_contract.audios:
-        pattern = re.compile(
-            re.escape(audio.audio_label) + r"[^\n]*:\s*" + audio.retention_marker + r"\b"
-        )
-        if pattern.search(retention) is None:
+        lines = [
+            item
+            for item in response.retention_analysis
+            if item.lstrip().startswith(audio.audio_label)
+        ]
+        if lines != [_canonical_audio_retention(audio)]:
             issues.append(
                 ValidationIssue(
                     "audio_retention_mismatch",
@@ -1855,113 +1952,66 @@ def build_qwen38_pilot_manifest(
     return cases
 
 
-def _link_or_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        destination.symlink_to(source.resolve(strict=True))
-    except OSError:
-        shutil.copy2(source, destination)
+def build_qwen38_full_manifest(
+    *,
+    h3_samples_path: Path,
+    output_path: Path,
+    conditioning_policy: Literal["sample_pair_type"],
+) -> list[Qwen38RecaptionManifestCase]:
+    if conditioning_policy != "sample_pair_type":
+        raise ValueError("unsupported Qwen3.8 full-manifest conditioning policy")
+    samples = [
+        FinalH3SampleV2.model_validate(row) for row in _read_jsonl(h3_samples_path)
+    ]
+    if not samples:
+        raise ValueError("current H3 samples inventory is empty")
+    sample_ids = [sample.sample_id for sample in samples]
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError("current H3 samples inventory contains duplicate sample IDs")
+    cases: list[Qwen38RecaptionManifestCase] = []
+    for sample in samples:
+        variant: ConditioningVariant = (
+            "target_voice_reference"
+            if sample.pair_type == "in_pair"
+            else "cross_voice_reference"
+        )
+        try:
+            build_reference_contract(sample, variant)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"sample {sample.sample_id} cannot satisfy {variant}: {exc}"
+            ) from exc
+        cases.append(
+            Qwen38RecaptionManifestCase(
+                sample_id=sample.sample_id,
+                conditioning_variant=variant,
+                note="current H3 samples inventory only; not canonical-wide coverage",
+            )
+        )
+    output = output_path.expanduser().resolve(strict=False)
+    if output.exists():
+        raise FileExistsError(f"full recaption manifest already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(output, cases)
+    return cases
 
 
 def _materialize_review_media(
     root: Path,
     records: Sequence[Qwen38RecaptionRecord],
-) -> dict[str, tuple[str, dict[int, str]]]:
-    result: dict[str, tuple[str, dict[int, str]]] = {}
-    for case_index, record in enumerate(records):
-        case_root = root / "media" / f"{case_index:04d}"
-        target = Path(record.target_video_path)
-        target_name = "target" + (target.suffix or ".mp4")
-        _link_or_copy(target, case_root / target_name)
-        picture_paths: dict[int, str] = {}
-        if record.reference_contract is not None:
-            for picture in record.reference_contract.pictures:
-                source = Path(picture.image_path)
-                picture_name = (
-                    f"picture-{picture.image_index}" + (source.suffix or ".png")
-                )
-                _link_or_copy(source, case_root / picture_name)
-                picture_paths[picture.image_index] = (
-                    f"media/{case_index:04d}/{picture_name}"
-                )
-        result[record.sample_id] = (
-            f"media/{case_index:04d}/{target_name}",
-            picture_paths,
-        )
-    return result
+) -> dict[str, dict[str, object]]:
+    from r2v_data_v2.h3.qwen38_human_review import materialize_review_media
+
+    return materialize_review_media(root, list(records))
 
 
 def _review_html(
     records: Sequence[Qwen38RecaptionRecord],
-    media_by_sample: dict[str, tuple[str, dict[int, str]]],
+    media_by_sample: dict[str, dict[str, object]],
 ) -> str:
-    cards = []
-    for record in records:
-        target_media, picture_media = media_by_sample[record.sample_id]
-        pictures = ""
-        if record.reference_contract is not None:
-            pictures = "".join(
-                "<figure><img src='"
-                + html.escape(picture_media[item.image_index], quote=True)
-                + "'><figcaption>"
-                + html.escape(item.picture_label)
-                + "</figcaption></figure>"
-                for item in record.reference_contract.pictures
-            )
-        prompt = record.rendered_h3_prompt or "[unavailable]"
-        audit = (
-            "[unavailable]"
-            if record.structured_h3_sections is None
-            else json.dumps(
-                [
-                    item.model_dump(mode="json")
-                    for item in record.structured_h3_sections.audio_fact_audit
-                ],
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        facts = (
-            "[unavailable]"
-            if record.audio_facts is None
-            else json.dumps(record.audio_facts.model_dump(mode="json"), ensure_ascii=False, indent=2)
-        )
-        contract = (
-            "[unavailable]"
-            if record.reference_contract is None
-            else json.dumps(
-                record.reference_contract.model_dump(mode="json"),
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        cards.append(
-            "<article><h2>"
-            + html.escape(record.sample_id)
-            + "</h2><p><b>status:</b> "
-            + record.status
-            + " &nbsp; <b>variant:</b> "
-            + record.conditioning_variant
-            + "</p><video controls src='"
-            + html.escape(target_media, quote=True)
-            + "'></video><div class='pictures'>"
-            + pictures
-            + "</div><details><summary>Reference contract</summary><pre>"
-            + html.escape(contract)
-            + "</pre></details><details><summary>Rough Visual instruction</summary><pre>"
-            + html.escape(record.rough_r2v_instruction)
-            + "</pre></details><details><summary>Audio facts</summary><pre>"
-            + html.escape(facts)
-            + "</pre></details><h3>Rendered H3 prompt</h3><pre>"
-            + html.escape(prompt)
-            + "</pre><h3>Audio fact audit</h3><pre>"
-            + html.escape(audit)
-            + "</pre><h3>Warnings</h3><pre>"
-            + html.escape("\n".join(record.validation_warnings) or "[none]")
-            + "</pre></article>"
-        )
-    return """<!doctype html><html><head><meta charset='utf-8'><title>Qwen3.8 H3 recaption pilot</title><style>
-body{font:14px system-ui;margin:24px;background:#f4f4f1;color:#171717}article{background:white;border:1px solid #ccc;margin:0 0 24px;padding:18px;max-width:1200px}video{width:min(720px,100%)}.pictures{display:flex;gap:12px;overflow:auto}.pictures figure{margin:12px 0}.pictures img{height:180px;max-width:300px;object-fit:contain;background:#eee}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f7f7f7;padding:12px}</style></head><body><h1>Qwen3.8 H3 recaption pilot</h1>""" + "".join(cards) + "</body></html>"
+    from r2v_data_v2.h3.qwen38_human_review import render_review_html
+
+    return render_review_html(list(records), media_by_sample)
 
 
 def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -> None:
@@ -1970,6 +2020,9 @@ def _publish_directory(temporary: Path, destination: Path, *, overwrite: bool) -
         return
     if not overwrite:
         raise FileExistsError(f"recaption output already exists: {destination}")
+    annotations = destination / "human_review/annotations.jsonl"
+    if annotations.is_file() and annotations.read_text(encoding="utf-8").strip():
+        raise ValueError("reviewed Qwen3.8 output cannot be overwritten")
     backup = destination.with_name(f".{destination.name}.backup-{uuid.uuid4().hex}")
     destination.replace(backup)
     try:
@@ -2017,6 +2070,14 @@ def run_qwen38_h3_recaption_pilot(
     )
     if destination.exists() and not overwrite:
         raise FileExistsError(f"recaption output already exists: {destination}")
+    existing_reviews = destination / "human_review/annotations.jsonl"
+    if (
+        destination.exists()
+        and overwrite
+        and existing_reviews.is_file()
+        and existing_reviews.read_text(encoding="utf-8").strip()
+    ):
+        raise ValueError("reviewed Qwen3.8 output cannot be overwritten")
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     records: list[Qwen38RecaptionRecord] = []
@@ -2181,6 +2242,12 @@ def run_qwen38_h3_recaption_pilot(
         (temporary / "review.html").write_text(
             _review_html(records, review_media), encoding="utf-8"
         )
+        from r2v_data_v2.h3.qwen38_human_review import initialize_human_review
+
+        initialize_human_review(
+            data_root=temporary,
+            source_output_root=destination,
+        )
         _publish_directory(temporary, destination, overwrite=overwrite)
         return summary
     except Exception:
@@ -2214,6 +2281,7 @@ __all__ = [
     "RecaptionReferenceContract",
     "RecaptionSpeechFact",
     "build_audio_facts",
+    "build_qwen38_full_manifest",
     "build_qwen38_pilot_manifest",
     "build_reference_contract",
     "materialize_h3_draft",

@@ -17,6 +17,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     DEFAULT_MODEL,
     OpenAIQwen38RecaptionBackend,
     Qwen38RecaptionConfig,
+    build_qwen38_full_manifest,
     build_qwen38_pilot_manifest,
     run_qwen38_h3_recaption_pilot,
 )
@@ -32,7 +33,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-semantics-root", type=Path)
     parser.add_argument("--output-root", type=Path)
     parser.add_argument("--prepare-manifest", type=Path)
+    parser.add_argument("--prepare-all-manifest", type=Path)
     parser.add_argument("--manifest-size", type=int, default=5)
+    parser.add_argument(
+        "--conditioning-policy",
+        choices=("sample_pair_type",),
+    )
     parser.add_argument(
         "--conditioning-variant",
         choices=(
@@ -68,6 +74,40 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
+    preparation_modes = sum(
+        value is not None
+        for value in (arguments.prepare_manifest, arguments.prepare_all_manifest)
+    )
+    if preparation_modes > 1:
+        raise ValueError(
+            "--prepare-manifest and --prepare-all-manifest are mutually exclusive"
+        )
+    if arguments.prepare_all_manifest is not None:
+        if arguments.case_manifest is not None:
+            raise ValueError(
+                "--prepare-all-manifest and --case-manifest are mutually exclusive"
+            )
+        if arguments.conditioning_policy != "sample_pair_type":
+            raise ValueError(
+                "--prepare-all-manifest requires --conditioning-policy sample_pair_type"
+            )
+        cases = build_qwen38_full_manifest(
+            h3_samples_path=paths.h3 / "samples.jsonl",
+            output_path=arguments.prepare_all_manifest,
+            conditioning_policy=arguments.conditioning_policy,
+        )
+        result = {
+            "manifest_path": str(
+                arguments.prepare_all_manifest.expanduser().resolve()
+            ),
+            "case_count": len(cases),
+            "inventory_scope": "current_h3_samples_inventory_only",
+            "canonical_wide_coverage": False,
+            "model_loaded": False,
+            "model_calls": 0,
+        }
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return result
     if arguments.prepare_manifest is not None:
         if arguments.case_manifest is not None:
             raise ValueError("--prepare-manifest and --case-manifest are mutually exclusive")
@@ -86,7 +126,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return result
     if arguments.case_manifest is None:
-        raise ValueError("--case-manifest is required unless --prepare-manifest is used")
+        raise ValueError(
+            "--case-manifest is required unless a manifest preparation mode is used"
+        )
     if arguments.media_root is None:
         raise ValueError("--media-root is required for recaption inference")
     resolver = MediaURLResolver(
