@@ -534,15 +534,21 @@ def initialize_review(
 
 
 def current_reviews(context: VoiceConsistencyReviewContext) -> dict[str, object]:
-    annotations = _load_annotations(context.audit_root)
-    current = _current_annotations(context, annotations)
+    current_values, stale_count = load_current_review_annotations(context)
     return {
         "annotations": [
-            current[key].model_dump(mode="json")
-            for key in sorted(current)
+            item.model_dump(mode="json") for item in current_values
         ],
-        "stale_annotation_count": len(annotations) - len(current),
+        "stale_annotation_count": stale_count,
     }
+
+
+def load_current_review_annotations(
+    context: VoiceConsistencyReviewContext,
+) -> tuple[list[VoiceConsistencyReviewAnnotation], int]:
+    annotations = _load_annotations(context.audit_root)
+    current = _current_annotations(context, annotations)
+    return [current[key] for key in sorted(current)], len(annotations) - len(current)
 
 
 def save_review(
@@ -925,6 +931,7 @@ __all__ = [
     "build_review_summary",
     "current_reviews",
     "initialize_review",
+    "load_current_review_annotations",
     "load_review_context",
     "make_review_handler",
     "record_fingerprint",
