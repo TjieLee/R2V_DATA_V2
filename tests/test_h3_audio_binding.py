@@ -4,9 +4,14 @@ import hashlib
 import inspect
 import json
 import math
+import os
+import queue
+import threading
+import time
 import wave
 from array import array
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +54,8 @@ from r2v_data_v2.h3.lr_asd import (
 from r2v_data_v2.h3.pilot import (
     ExplicitPilotClip,
     _load_clip_artifacts,
+    _lr_asd_gpu_slot,
+    resolve_lr_asd_parallelism,
     run_h3_audio_binding_pilot,
 )
 from r2v_data_v2.h3.pilot_schemas import (
@@ -2282,3 +2289,157 @@ def test_pilot_canonical_sidecar_is_directly_consumed_by_bind_dataset(
     )
 
     assert [item.clip_uid for item in outputs] == ["clip-1"]
+
+
+def test_lr_asd_parallelism_resolves_legacy_and_eight_by_four_slots() -> None:
+    assert resolve_lr_asd_parallelism(
+        workers=None,
+        gpu_ids=None,
+        workers_per_gpu=4,
+        legacy_default_workers=4,
+    ) == (4, (), 4, 0)
+    assert resolve_lr_asd_parallelism(
+        workers=None,
+        gpu_ids=[str(index) for index in range(8)],
+        workers_per_gpu=4,
+    ) == (32, tuple(str(index) for index in range(8)), 4, 32)
+    assert resolve_lr_asd_parallelism(
+        workers=17,
+        gpu_ids=[str(index) for index in range(8)],
+        workers_per_gpu=4,
+    )[0] == 17
+
+
+def test_lr_asd_gpu_slots_reuse_dynamically_and_release_after_error() -> None:
+    slots: queue.Queue[str] = queue.Queue()
+    for gpu_id in ("0", "1"):
+        for _ in range(2):
+            slots.put(gpu_id)
+    active = {"0": 0, "1": 0}
+    maximum = {"0": 0, "1": 0}
+    assignments: list[str] = []
+    lock = threading.Lock()
+
+    def work(index: int) -> None:
+        with _lr_asd_gpu_slot(slots) as gpu_id:
+            assert gpu_id is not None
+            with lock:
+                active[gpu_id] += 1
+                maximum[gpu_id] = max(maximum[gpu_id], active[gpu_id])
+                assignments.append(gpu_id)
+            try:
+                time.sleep(0.005)
+                if index == 3:
+                    raise RuntimeError("fake LR-ASD failure")
+            finally:
+                with lock:
+                    active[gpu_id] -= 1
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(work, index) for index in range(12)]
+        for index, future in enumerate(futures):
+            if index == 3:
+                with pytest.raises(RuntimeError, match="fake LR-ASD failure"):
+                    future.result()
+            else:
+                future.result()
+
+    assert maximum == {"0": 2, "1": 2}
+    assert active == {"0": 0, "1": 0}
+    assert len(assignments) == 12
+    assert slots.qsize() == 4
+
+
+def test_lr_asd_gpu_environment_is_subprocess_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    observed: dict[str, str] = {}
+    parent_value = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        del command
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        observed.update(environment)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(lr_asd_module.subprocess, "run", fake_run)
+    lr_asd_module._run_logged_command(
+        ["fake-lr-asd"],
+        cwd=tmp_path,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        timeout_seconds=1.0,
+        error_type=LRASDRuntimeError,
+        environment_override={"CUDA_VISIBLE_DEVICES": "7"},
+    )
+
+    assert observed["CUDA_VISIBLE_DEVICES"] == "7"
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == parent_value
+
+
+def test_review_media_none_preserves_canonical_binding_and_writes_performance(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source = tmp_path / "clip-1.mp4"
+    audio = tmp_path / "clip-1.wav"
+    source.write_bytes(b"video")
+    _write_pcm16_wav(audio, [100] * 16000)
+    _write_pilot_clip(
+        run_root,
+        _pilot_clip("clip-1", source),
+        masks_by_entity={"e1": _full_entity_mask()},
+    )
+    native = _native_artifact(
+        clip_uid="clip-1",
+        source_video=source,
+        audio_path=audio,
+        logits_by_track=[[0.7] * 10],
+    )
+    before = _tree_hashes(run_root)
+
+    def run(output: Path, mode: str) -> None:
+        run_h3_audio_binding_pilot(
+            run_root=run_root,
+            output_root=output,
+            lr_asd_backend=PrecomputedLRASDBackend({"clip-1": native}),
+            speech_backend=PrecomputedSpeechActivityBackend(
+                {"clip-1": _speech_artifact("clip-1", audio, speech=True)}
+            ),
+            review_media_backend=_FakeReviewMediaBackend(),
+            clip_ids=["clip-1"],
+            review_media_mode=mode,  # type: ignore[arg-type]
+        )
+
+    all_root = tmp_path / "all"
+    none_root = tmp_path / "none"
+    run(all_root, "all")
+    run(none_root, "none")
+
+    assert (all_root / "review/clip-1/timeline.json").is_file()
+    assert not (none_root / "review").exists()
+    assert (all_root / "audio_bindings.jsonl").read_bytes() == (
+        none_root / "audio_bindings.jsonl"
+    ).read_bytes()
+    assert (all_root / "voice_reference_quality.jsonl").read_bytes() == (
+        none_root / "voice_reference_quality.jsonl"
+    ).read_bytes()
+    performance = json.loads((none_root / "performance.json").read_text())
+    assert performance["effective_workers"] == 1
+    assert performance["review_media_mode"] == "none"
+    assert performance["review_media_enabled"] is False
+    assert performance["clip_count"] == 1
+    assert performance["success_count"] == 1
+    assert set(performance["stage_timings"]) == {
+        "lr_asd",
+        "face_entity_association",
+        "silero_vad",
+        "fusion",
+        "voice_quality",
+        "review_media",
+    }
+    assert _tree_hashes(run_root) == before

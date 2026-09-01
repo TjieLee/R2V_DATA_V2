@@ -127,7 +127,12 @@ def _run_logged_command(
     stderr_path: Path,
     timeout_seconds: float,
     error_type: type[RuntimeError],
+    environment_override: dict[str, str] | None = None,
 ) -> None:
+    environment = None
+    if environment_override is not None:
+        environment = os.environ.copy()
+        environment.update(environment_override)
     with (
         stdout_path.open("wb") as stdout_handle,
         stderr_path.open("wb") as stderr_handle,
@@ -141,6 +146,7 @@ def _run_logged_command(
                 stderr=stderr_handle,
                 check=False,
                 timeout=timeout_seconds,
+                env=environment,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise error_type(
@@ -167,6 +173,38 @@ class LRASDSubprocessBackend:
         source_video_path: Path,
         work_dir: Path,
     ) -> LRASDNativeArtifact:
+        return self._analyze(
+            clip_uid=clip_uid,
+            source_video_path=source_video_path,
+            work_dir=work_dir,
+            command_environment=None,
+        )
+
+    def analyze_on_gpu(
+        self,
+        *,
+        clip_uid: str,
+        source_video_path: Path,
+        work_dir: Path,
+        gpu_id: str,
+    ) -> LRASDNativeArtifact:
+        if not gpu_id.strip() or "," in gpu_id:
+            raise ValueError("LR-ASD assigned GPU must be one physical device ID")
+        return self._analyze(
+            clip_uid=clip_uid,
+            source_video_path=source_video_path,
+            work_dir=work_dir,
+            command_environment={"CUDA_VISIBLE_DEVICES": gpu_id},
+        )
+
+    def _analyze(
+        self,
+        *,
+        clip_uid: str,
+        source_video_path: Path,
+        work_dir: Path,
+        command_environment: dict[str, str] | None,
+    ) -> LRASDNativeArtifact:
         source = source_video_path.expanduser().resolve(strict=True)
         destination = work_dir.expanduser().resolve(strict=False)
         destination.mkdir(parents=True, exist_ok=False)
@@ -184,14 +222,16 @@ class LRASDSubprocessBackend:
             "--pretrainModel",
             str(self.config.model_path.resolve()),
         ]
-        _run_logged_command(
-            command,
-            cwd=self.config.code_root.resolve(),
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout_seconds=self.config.timeout_seconds,
-            error_type=LRASDRuntimeError,
-        )
+        command_arguments = {
+            "cwd": self.config.code_root.resolve(),
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "timeout_seconds": self.config.timeout_seconds,
+            "error_type": LRASDRuntimeError,
+        }
+        if command_environment is not None:
+            command_arguments["environment_override"] = command_environment
+        _run_logged_command(command, **command_arguments)
         native_path = destination / "lr_asd_native.json"
         converter = Path(__file__).resolve().parents[2] / "tools" / (
             "convert_lr_asd_native.py"

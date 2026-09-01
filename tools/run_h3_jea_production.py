@@ -33,6 +33,7 @@ from r2v_data_v2.h3.lr_asd import (
     SileroVADRuntimeConfig,
     SileroVADSubprocessBackend,
 )
+from r2v_data_v2.h3.pilot import resolve_lr_asd_parallelism
 from r2v_data_v2.h3.qwen3_asr import (
     QWEN3_ASR_MODEL_IDENTIFIER,
     Qwen3ASRSummary,
@@ -63,7 +64,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--stages", default=",".join(_STAGES))
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int)
+    parser.add_argument("--lr-asd-gpus")
+    parser.add_argument("--lr-asd-workers-per-gpu", type=int)
+    parser.add_argument("--review-media", choices=("all", "none"), default="all")
     parser.add_argument("--lr-asd-code-root", type=Path)
     parser.add_argument("--lr-asd-python", type=Path)
     parser.add_argument("--lr-asd-model-path", type=Path)
@@ -97,6 +101,26 @@ def _parse_stages(value: str) -> tuple[str, ...]:
     if not stages or unknown:
         raise ValueError(f"invalid JEA production stages: {sorted(unknown)}")
     return tuple(stage for stage in _STAGES if stage in stages)
+
+
+def _audio_parallelism(arguments: argparse.Namespace) -> tuple[int, tuple[str, ...], int, int]:
+    raw_gpu_ids = arguments.lr_asd_gpus
+    if raw_gpu_ids is None:
+        raw_gpu_ids = os.environ.get("LR_ASD_GPUS")
+    gpu_ids = (
+        None
+        if raw_gpu_ids is None
+        else [part.strip() for part in raw_gpu_ids.split(",")]
+    )
+    workers_per_gpu = arguments.lr_asd_workers_per_gpu
+    if workers_per_gpu is None:
+        workers_per_gpu = int(os.environ.get("LR_ASD_WORKERS_PER_GPU", "4"))
+    return resolve_lr_asd_parallelism(
+        workers=arguments.workers,
+        gpu_ids=gpu_ids,
+        workers_per_gpu=workers_per_gpu,
+        legacy_default_workers=4,
+    )
 
 
 def _read_occurrences(path: Path) -> list[JEAOccurrenceEmbedding]:
@@ -170,6 +194,9 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         visual_runs_root=arguments.visual_runs_root,
     )
     paths = jea_production_paths(arguments.audio_production_root)
+    effective_workers, gpu_ids, workers_per_gpu, gpu_slot_capacity = (
+        _audio_parallelism(arguments)
+    )
     plan: dict[str, object] = {
         "visual_production_root": visual.visual_production_root,
         "visual_runs_root": visual.visual_runs_root,
@@ -185,6 +212,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         "requested_stages": list(stages),
         "bounded_limit_applied": False,
         "quota_applied": False,
+        "audio_effective_workers": effective_workers,
+        "lr_asd_gpu_ids": list(gpu_ids),
+        "lr_asd_workers_per_gpu": workers_per_gpu,
+        "lr_asd_gpu_slot_capacity": gpu_slot_capacity,
+        "review_media_mode": arguments.review_media,
     }
     if arguments.dry_run:
         print(json.dumps(plan, ensure_ascii=False, sort_keys=True))
@@ -196,8 +228,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ffprobe=arguments.ffprobe,
     )
     if "audio" in stages:
-        if arguments.workers <= 0:
-            raise ValueError("JEA audio workers must be positive")
         lr_python = _path_argument(arguments.lr_asd_python, "LR_ASD_PYTHON")
         stage_results["audio"] = atomic_replace_stage(
             paths.audio,
@@ -233,7 +263,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                     ffmpeg_path=arguments.ffmpeg,
                 ),
                 audio_backend=media_backend,
-                workers=arguments.workers,
+                workers=effective_workers,
+                lr_asd_gpu_ids=list(gpu_ids),
+                lr_asd_workers_per_gpu=workers_per_gpu,
+                review_media_mode=arguments.review_media,
             ),
         ).model_dump(mode="json")
     if "primary-voice" in stages:

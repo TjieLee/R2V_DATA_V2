@@ -359,6 +359,9 @@ def run_jea_audio_stage(
     review_media_backend: ReviewMediaBackend,
     audio_backend: AudioMediaBackend,
     workers: int = 1,
+    lr_asd_gpu_ids: list[str] | None = None,
+    lr_asd_workers_per_gpu: int = 4,
+    review_media_mode: Literal["all", "none"] = "all",
 ) -> H3AudioBindingPilotSummary:
     """Run frozen Audio binding for exactly the canonical multi-shard clips."""
     destination = output_root.expanduser().resolve(strict=False)
@@ -382,6 +385,9 @@ def run_jea_audio_stage(
             review_media_backend=review_media_backend,
             explicit_clips=explicit,
             workers=workers,
+            lr_asd_gpu_ids=lr_asd_gpu_ids,
+            lr_asd_workers_per_gpu=lr_asd_workers_per_gpu,
+            review_media_mode=review_media_mode,
         )
         materialize_canonical_audio_clips(
             visual_inventory=visual_inventory,

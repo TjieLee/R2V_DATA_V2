@@ -9,6 +9,40 @@ legacy pilot procedures, not the active JEA production ASR path.
 
 # Server Audio Pilot Runbook
 
+## LR-ASD multi-GPU production throughput
+
+The production Audio stage can schedule LR-ASD subprocesses through dynamic
+per-GPU slots without changing vendor inference. `--workers` remains an optional
+total cap; when GPU IDs are supplied and it is omitted, effective workers equal
+`GPU count * workers per GPU`. GPU assignment is scoped only to each official
+LR-ASD subprocess via `CUDA_VISIBLE_DEVICES`; association, Silero, fusion,
+quality diagnostics, and review rendering do not hold the slot.
+
+```bash
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages audio \
+  --lr-asd-gpus 0,1,2,3,4,5,6,7 \
+  --lr-asd-workers-per-gpu 4 \
+  --review-media none \
+  --lr-asd-code-root "$LR_ASD_CODE_ROOT" \
+  --lr-asd-python "$LR_ASD_PYTHON" \
+  --lr-asd-model-path "$LR_ASD_MODEL_PATH" \
+  --silero-python "$SILERO_VAD_PYTHON" \
+  --silero-model-path "$SILERO_VAD_MODEL_PATH" \
+  --ffmpeg "$FFMPEG" \
+  --ffprobe "$FFPROBE" \
+  --overwrite
+```
+
+The equivalent environment fallbacks are `LR_ASD_GPUS` and
+`LR_ASD_WORKERS_PER_GPU`. Production can disable review media because it is
+diagnostic only; canonical Audio artifacts remain unchanged. Timing and
+throughput diagnostics are written to `audio/performance.json` and never enter
+model decisions or canonical schemas.
+
 This is the operational runbook for the server-side Audio/H3 pilot. Keep the
 layout small and stable. Do not create a timestamped directory for every smoke
 attempt.

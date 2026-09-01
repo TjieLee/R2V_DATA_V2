@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import re
 import shutil
+import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 from r2v_data_v2.h3.association import (
     FaceEntityAssociationPolicy,
@@ -223,6 +227,123 @@ class _PilotClipResult:
     sidecar_payload: dict[str, object] | None = None
     voice_quality_payload: dict[str, object] | None = None
     failure: dict[str, object] | None = None
+    stage_timings: dict[str, float] | None = None
+
+
+ReviewMediaMode = Literal["all", "none"]
+
+
+def resolve_lr_asd_parallelism(
+    *,
+    workers: int | None,
+    gpu_ids: list[str] | None,
+    workers_per_gpu: int = 4,
+    legacy_default_workers: int = 4,
+) -> tuple[int, tuple[str, ...], int, int]:
+    if workers is not None and workers <= 0:
+        raise ValueError("LR-ASD workers must be positive")
+    normalized_gpu_ids = tuple(gpu_id.strip() for gpu_id in (gpu_ids or []))
+    if any(not gpu_id or "," in gpu_id for gpu_id in normalized_gpu_ids):
+        raise ValueError("LR-ASD GPU IDs must be non-empty physical device IDs")
+    if len(normalized_gpu_ids) != len(set(normalized_gpu_ids)):
+        raise ValueError("LR-ASD GPU IDs must be unique")
+    if workers_per_gpu <= 0:
+        raise ValueError("LR-ASD workers per GPU must be positive")
+    if not normalized_gpu_ids:
+        effective = legacy_default_workers if workers is None else workers
+        if effective <= 0:
+            raise ValueError("legacy LR-ASD worker count must be positive")
+        return effective, (), workers_per_gpu, 0
+    capacity = len(normalized_gpu_ids) * workers_per_gpu
+    effective = capacity if workers is None else min(workers, capacity)
+    return effective, normalized_gpu_ids, workers_per_gpu, capacity
+
+
+def _analyze_lr_asd(
+    backend: LRASDBackend,
+    *,
+    clip_uid: str,
+    source_video_path: Path,
+    work_dir: Path,
+    gpu_id: str | None,
+) -> LRASDNativeArtifact:
+    gpu_method = getattr(backend, "analyze_on_gpu", None)
+    if gpu_id is not None and callable(gpu_method):
+        return gpu_method(
+            clip_uid=clip_uid,
+            source_video_path=source_video_path,
+            work_dir=work_dir,
+            gpu_id=gpu_id,
+        )
+    return backend.analyze(
+        clip_uid=clip_uid,
+        source_video_path=source_video_path,
+        work_dir=work_dir,
+    )
+
+
+@contextmanager
+def _lr_asd_gpu_slot(gpu_slot_queue: Any | None):
+    if gpu_slot_queue is None:
+        yield None
+        return
+    gpu_id = gpu_slot_queue.get()
+    try:
+        yield gpu_id
+    finally:
+        gpu_slot_queue.put(gpu_id)
+
+
+def _performance_payload(
+    *,
+    results: list[_PilotClipResult],
+    effective_workers: int,
+    gpu_ids: tuple[str, ...],
+    workers_per_gpu: int,
+    gpu_slot_capacity: int,
+    review_media_mode: ReviewMediaMode,
+    wall_time_seconds: float,
+) -> dict[str, object]:
+    stage_names = (
+        "lr_asd",
+        "face_entity_association",
+        "silero_vad",
+        "fusion",
+        "voice_quality",
+        "review_media",
+    )
+    stage_timings: dict[str, object] = {}
+    for name in stage_names:
+        values = [
+            result.stage_timings[name]
+            for result in results
+            if result.stage_timings is not None and name in result.stage_timings
+        ]
+        total = sum(values)
+        stage_timings[name] = {
+            "count": len(values),
+            "total_seconds": total,
+            "mean_seconds": 0.0 if not values else total / len(values),
+            "max_seconds": 0.0 if not values else max(values),
+        }
+    success_count = sum(result.counters["clips_succeeded"] for result in results)
+    failure_count = sum(result.counters["clips_failed"] for result in results)
+    return {
+        "effective_workers": effective_workers,
+        "gpu_ids": list(gpu_ids),
+        "workers_per_gpu": workers_per_gpu,
+        "gpu_slot_capacity": gpu_slot_capacity,
+        "review_media_mode": review_media_mode,
+        "review_media_enabled": review_media_mode == "all",
+        "clip_count": len(results),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "wall_time_seconds": wall_time_seconds,
+        "clips_per_second": (
+            0.0 if wall_time_seconds <= 0 else len(results) / wall_time_seconds
+        ),
+        "stage_timings": stage_timings,
+    }
 
 
 @dataclass(frozen=True)
@@ -277,9 +398,12 @@ def _run_pilot_clip(
     association_policy: FaceEntityAssociationPolicy | None,
     binding_policy: AudioBindingPolicy | None,
     artifact_relpath: Path | None = None,
+    gpu_slot_queue: Any | None = None,
+    review_media_mode: ReviewMediaMode = "all",
 ) -> _PilotClipResult:
     clip_uid = clip_path.parent.name
     counters = _empty_clip_counters()
+    stage_timings: dict[str, float] = {}
     stage = "load_visual_evidence"
     try:
         clip, frames, masks = _load_clip_artifacts(clip_path)
@@ -288,29 +412,40 @@ def _run_pilot_clip(
             raise ValueError("pilot source video path must be absolute")
         source_video = source_video.resolve(strict=True)
         stage = "lr_asd"
-        runtime_native = lr_asd_backend.analyze(
-            clip_uid=clip_uid,
-            source_video_path=source_video,
-            work_dir=temporary / "runtime" / clip_uid / "lr_asd",
-        )
+        started = time.perf_counter()
+        try:
+            with _lr_asd_gpu_slot(gpu_slot_queue) as assigned_gpu:
+                runtime_native = _analyze_lr_asd(
+                    lr_asd_backend,
+                    clip_uid=clip_uid,
+                    source_video_path=source_video,
+                    work_dir=temporary / "runtime" / clip_uid / "lr_asd",
+                    gpu_id=assigned_gpu,
+                )
+        finally:
+            stage_timings["lr_asd"] = time.perf_counter() - started
         if runtime_native.clip_uid != clip_uid:
             raise ValueError("LR-ASD artifact clip UID does not match")
         if runtime_native.source_video_path != str(source_video):
             raise ValueError("LR-ASD artifact source video does not match")
         stage = "face_entity_association"
+        started = time.perf_counter()
         associations = associate_face_tracks_to_entities(
             frames=frames,
             masks=masks,
             tracks=runtime_native.tracks,
             policy=association_policy,
         )
+        stage_timings["face_entity_association"] = time.perf_counter() - started
         stage = "speech_activity"
+        started = time.perf_counter()
         speech = speech_backend.detect(
             clip_uid=clip_uid,
             audio_path=Path(runtime_native.audio_path),
             duration_seconds=runtime_native.duration_seconds,
             work_dir=temporary / "runtime" / clip_uid / "vad",
         )
+        stage_timings["silero_vad"] = time.perf_counter() - started
         native = _published_native_artifact(
             runtime_native,
             temporary=temporary,
@@ -328,8 +463,9 @@ def _run_pilot_clip(
             temporary / "runtime" / clip_uid / "vad" / "speech_activity.json",
             speech.model_dump(mode="json"),
         )
-        evidence = normalize_lr_asd_evidence(native, speech, associations)
         stage = "fusion"
+        started = time.perf_counter()
+        evidence = normalize_lr_asd_evidence(native, speech, associations)
         sidecar = build_audio_binding_sidecar(
             clip,
             evidence,
@@ -342,6 +478,8 @@ def _run_pilot_clip(
                 f"pilot reference-generation sidecar is {sidecar.status}: "
                 f"{sidecar.reason}"
             )
+        stage_timings["fusion"] = time.perf_counter() - started
+        started = time.perf_counter()
         try:
             voice_quality = build_voice_reference_quality_diagnostics(
                 native=native,
@@ -356,6 +494,7 @@ def _run_pilot_clip(
                 status="failed",
                 reason=f"{type(exc).__name__}: {exc}",
             )
+        stage_timings["voice_quality"] = time.perf_counter() - started
         sidecar_payload = sidecar.model_dump(mode="json")
         voice_quality_payload = voice_quality.model_dump(mode="json")
         clip_output = artifact_relpath or Path(clip_uid)
@@ -368,31 +507,34 @@ def _run_pilot_clip(
             voice_quality_payload,
         )
         stage = "review_bundle"
-        try:
-            write_review_bundle(
-                destination=temporary / "review" / clip_uid,
-                source_video_path=source_video,
-                native=native,
-                associations=associations,
-                sidecar=sidecar,
-                media_backend=review_media_backend,
-                source_audio_path=Path(runtime_native.audio_path),
-            )
-        except Exception as exc:  # noqa: BLE001 - review media is diagnostic only
-            published_reason = str(exc).replace(str(temporary), str(destination))
-            _write_json(
-                temporary / "review" / clip_uid / "review_error.json",
-                {
-                    "clip_uid": clip_uid,
-                    "error_type": type(exc).__name__,
-                    "reason": published_reason,
-                },
-            )
-        else:
-            _write_json(
-                temporary / "review" / clip_uid / "voice_reference_quality.json",
-                voice_quality_payload,
-            )
+        started = time.perf_counter()
+        if review_media_mode == "all":
+            try:
+                write_review_bundle(
+                    destination=temporary / "review" / clip_uid,
+                    source_video_path=source_video,
+                    native=native,
+                    associations=associations,
+                    sidecar=sidecar,
+                    media_backend=review_media_backend,
+                    source_audio_path=Path(runtime_native.audio_path),
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostic only
+                published_reason = str(exc).replace(str(temporary), str(destination))
+                _write_json(
+                    temporary / "review" / clip_uid / "review_error.json",
+                    {
+                        "clip_uid": clip_uid,
+                        "error_type": type(exc).__name__,
+                        "reason": published_reason,
+                    },
+                )
+            else:
+                _write_json(
+                    temporary / "review" / clip_uid / "voice_reference_quality.json",
+                    voice_quality_payload,
+                )
+        stage_timings["review_media"] = time.perf_counter() - started
         counters["clips_succeeded"] = 1
         counters["clips_with_speech"] = int(bool(speech.intervals))
         counters["face_entity_association_failures"] = sum(
@@ -413,6 +555,7 @@ def _run_pilot_clip(
             counters=counters,
             sidecar_payload=sidecar_payload,
             voice_quality_payload=voice_quality_payload,
+            stage_timings=stage_timings,
         )
     except Exception as exc:  # noqa: BLE001 - isolate pilot clips
         counters["clips_failed"] = 1
@@ -429,6 +572,7 @@ def _run_pilot_clip(
                 "error_type": type(exc).__name__,
                 "reason": str(exc),
             },
+            stage_timings=stage_timings,
         )
 
 
@@ -445,9 +589,22 @@ def run_h3_audio_binding_pilot(
     association_policy: FaceEntityAssociationPolicy | None = None,
     binding_policy: AudioBindingPolicy | None = None,
     explicit_clips: list[ExplicitPilotClip] | None = None,
+    lr_asd_gpu_ids: list[str] | None = None,
+    lr_asd_workers_per_gpu: int = 4,
+    review_media_mode: ReviewMediaMode = "all",
 ) -> H3AudioBindingPilotSummary:
     if workers <= 0:
         raise ValueError("pilot workers must be positive")
+    if review_media_mode not in {"all", "none"}:
+        raise ValueError("review media mode must be all or none")
+    gpu_ids = tuple(lr_asd_gpu_ids or ())
+    if len(gpu_ids) != len(set(gpu_ids)) or any(not value.strip() for value in gpu_ids):
+        raise ValueError("LR-ASD GPU IDs must be unique and non-empty")
+    if lr_asd_workers_per_gpu <= 0:
+        raise ValueError("LR-ASD workers per GPU must be positive")
+    gpu_slot_capacity = len(gpu_ids) * lr_asd_workers_per_gpu
+    if gpu_ids and workers > gpu_slot_capacity:
+        raise ValueError("pilot workers cannot exceed LR-ASD GPU slot capacity")
     if explicit_clips is None:
         source, destination = _validate_roots(run_root, output_root)
         selected = [
@@ -498,8 +655,17 @@ def run_h3_audio_binding_pilot(
     failures: list[dict[str, object]] = []
     canonical_sidecars: list[dict[str, object]] = []
     voice_quality_reports: list[VoiceReferenceClipDiagnostics] = []
+    wall_started = time.perf_counter()
+    manager = None
     try:
         temporary.mkdir()
+        gpu_slot_queue = None
+        if gpu_ids:
+            manager = multiprocessing.Manager()
+            gpu_slot_queue = manager.Queue()
+            for gpu_id in gpu_ids:
+                for _ in range(lr_asd_workers_per_gpu):
+                    gpu_slot_queue.put(gpu_id)
         clip_arguments = [
             {
                 "clip_path": item.clip_path,
@@ -512,6 +678,8 @@ def run_h3_audio_binding_pilot(
                 "association_policy": association_policy,
                 "binding_policy": binding_policy,
                 "artifact_relpath": item.artifact_relpath,
+                "gpu_slot_queue": gpu_slot_queue,
+                "review_media_mode": review_media_mode,
             }
             for item in selected
         ]
@@ -571,9 +739,24 @@ def run_h3_audio_binding_pilot(
             temporary / "voice_reference_quality_summary.json",
             voice_quality_summary.model_dump(mode="json"),
         )
+        _write_json(
+            temporary / "performance.json",
+            _performance_payload(
+                results=results,
+                effective_workers=workers,
+                gpu_ids=gpu_ids,
+                workers_per_gpu=lr_asd_workers_per_gpu,
+                gpu_slot_capacity=gpu_slot_capacity,
+                review_media_mode=review_media_mode,
+                wall_time_seconds=time.perf_counter() - wall_started,
+            ),
+        )
         temporary.replace(destination)
         return summary
     except Exception:
         if temporary.exists():
             shutil.rmtree(temporary)
         raise
+    finally:
+        if manager is not None:
+            manager.shutdown()
