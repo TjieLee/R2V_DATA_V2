@@ -16,7 +16,10 @@ from r2v_data_v2.h3.jea_final_renderer import (
     FinalVisualReference,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
+    QWEN38_RECAPTION_POLICY_VERSION,
     QWEN38_RECAPTION_PROMPT_VERSION,
+    UNGROUNDED_NON_DIEGETIC_MUSIC,
+    UNGROUNDED_OVERALL_SOUNDSCAPE,
     AudioFactAuditItem,
     OpenAIQwen38RecaptionBackend,
     Qwen38BackendProvenance,
@@ -207,6 +210,33 @@ def _request(
     )
 
 
+def _same_speaker_request(
+    tmp_path: Path,
+    *,
+    with_event: bool = False,
+) -> Qwen38RecaptionRequest:
+    request = _request(tmp_path, with_event=with_event)
+    first, second = request.audio_facts.speech
+    speech = [
+        first.model_copy(
+            update={
+                "speaker_cluster_id": second.speaker_cluster_id,
+                "entity_id": second.entity_id,
+                "entity_subject_label": second.entity_subject_label,
+                "speaker_id": "S1",
+            }
+        ),
+        second.model_copy(update={"speaker_id": "S1"}),
+    ]
+    return Qwen38RecaptionRequest(
+        sample=request.sample,
+        case=request.case,
+        reference_contract=request.reference_contract,
+        audio_facts=request.audio_facts.model_copy(update={"speech": speech}),
+        request_fingerprint=request.request_fingerprint,
+    )
+
+
 def _response(request: Qwen38RecaptionRequest) -> Qwen38H3StructuredResponse:
     definitions = []
     for subject in request.reference_contract.subjects:
@@ -257,8 +287,8 @@ def _response(request: Qwen38RecaptionRequest) -> Qwen38H3StructuredResponse:
             "The target uses a natural observational style.\n[Shot 1] "
             + " ".join(speech_parts)
         ),
-        overall_soundscape="Only the supplied speech and grounded events are asserted.",
-        non_diegetic_music="Audio grounding is incomplete; music is not asserted.",
+        overall_soundscape=UNGROUNDED_OVERALL_SOUNDSCAPE,
+        non_diegetic_music=UNGROUNDED_NON_DIEGETIC_MUSIC,
         audio_fact_audit=audits,
     )
 
@@ -386,6 +416,35 @@ def test_speaker_ids_follow_first_cluster_appearance_and_binding(tmp_path: Path)
     assert _codes(response, request) == set()
 
 
+def test_every_same_speaker_turn_repeats_exact_source(tmp_path: Path) -> None:
+    request = _same_speaker_request(tmp_path)
+    response = _response(request)
+    source = "<Subject 1> (S1)"
+    assert response.detailed_description.count(source) == 2
+    assert _codes(response, request) == set()
+
+
+def test_pronoun_on_second_same_speaker_turn_rejects_source_mismatch(
+    tmp_path: Path,
+) -> None:
+    request = _same_speaker_request(tmp_path)
+    response = _response(request)
+    second = request.audio_facts.speech[1]
+    exact_clause = (
+        f"<Subject 1> (S1) says, {second.locked_dialogue_block}"
+    )
+    changed = response.model_copy(
+        update={
+            "detailed_description": response.detailed_description.replace(
+                exact_clause,
+                f"She says, {second.locked_dialogue_block}",
+                1,
+            )
+        }
+    )
+    assert "locked_dialogue_source_mismatch" in _codes(changed, request)
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [
@@ -434,6 +493,64 @@ def test_audio_attribution_can_generalize_but_not_delete(tmp_path: Path) -> None
         AudioFactAuditItem.model_validate(
             {"fact_id": "non_speech_1", "action": "deleted", "rewritten_description": None}
         )
+
+
+def test_speech_fact_cannot_enter_empty_non_speech_audit(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    response = _response(request).model_copy(
+        update={
+            "audio_fact_audit": [
+                AudioFactAuditItem(fact_id="speech_1", action="preserved")
+            ]
+        }
+    )
+    assert "audio_fact_audit_mismatch" in _codes(response, request)
+
+
+@pytest.mark.parametrize("claim", ["N/A", "none", "no music", "no background music"])
+def test_ungrounded_music_cannot_claim_absence(tmp_path: Path, claim: str) -> None:
+    request = _request(tmp_path)
+    response = _response(request).model_copy(update={"non_diegetic_music": claim})
+    assert "ungrounded_non_diegetic_music" in _codes(response, request)
+
+
+def test_ungrounded_soundscape_cannot_invent_office_ambience(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    response = _response(request).model_copy(
+        update={
+            "overall_soundscape": (
+                "Subtle ambient room tone typical of an office environment."
+            )
+        }
+    )
+    assert "ungrounded_overall_soundscape" in _codes(response, request)
+
+
+def test_grounded_audio_semantics_remain_eligible_for_specific_soundscape(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    grounded_facts = request.audio_facts.model_copy(
+        update={
+            "audio_grounding_complete": True,
+            "overall_soundscape_hint": "Office room tone is audible.",
+            "non_diegetic_music_hint": "Soft instrumental music is audible.",
+        }
+    )
+    grounded_request = Qwen38RecaptionRequest(
+        sample=request.sample,
+        case=request.case,
+        reference_contract=request.reference_contract,
+        audio_facts=grounded_facts,
+        request_fingerprint=request.request_fingerprint,
+    )
+    response = _response(grounded_request).model_copy(
+        update={
+            "overall_soundscape": "Office room tone remains audible under speech.",
+            "non_diegetic_music": "Soft instrumental music continues in the background.",
+        }
+    )
+    assert _codes(response, grounded_request) == set()
 
 
 def test_missing_audio_semantics_stays_explicit_and_invents_nothing(tmp_path: Path) -> None:
@@ -487,6 +604,11 @@ def test_openai_request_labels_media_and_never_sends_audio(tmp_path: Path) -> No
     assert types[:2] == ["text", "video_url"]
     assert types.count("image_url") == 3
     assert "audio_url" not in types
+    user_prompt = content[-1]["text"]  # type: ignore[index]
+    assert "LOCKED SPEECH RENDER CONTRACT:" in user_prompt
+    assert "exact_source: (S1)" in user_prompt
+    assert "allowed_fact_ids=[]" in user_prompt
+    assert "audio_fact_audit MUST be exactly []." in user_prompt
     assert payload["extra_body"] == {
         "top_k": 20,
         "min_p": 0.0,
@@ -561,6 +683,39 @@ def test_true_malformed_response_uses_exactly_one_repair(tmp_path: Path) -> None
     assert len(completions.requests) == 2
 
 
+def test_repair_repeats_exact_speech_and_audit_contracts(tmp_path: Path) -> None:
+    request = _same_speaker_request(tmp_path, with_event=True)
+    valid = _response(request)
+    second = request.audio_facts.speech[1]
+    invalid = valid.model_copy(
+        update={
+            "detailed_description": valid.detailed_description.replace(
+                f"<Subject 1> (S1) says, {second.locked_dialogue_block}",
+                f"She says, {second.locked_dialogue_block}",
+                1,
+            )
+        }
+    )
+    completions = _FakeCompletions([invalid.model_dump_json(), valid.model_dump_json()])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    backend = OpenAIQwen38RecaptionBackend(
+        Qwen38RecaptionConfig(
+            base_url="http://127.0.0.1:8000/v1",
+            media_resolver=MediaURLResolver(mode="file", media_root=tmp_path),
+        ),
+        client=client,
+    )
+    assert backend.recaption(request).model_call_count == 2
+    repair_content = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
+    repair_prompt = repair_content[-1]["text"]  # type: ignore[index]
+    assert "Do not merely add missing dialogue text" in repair_prompt
+    assert "LOCKED SPEECH RENDER CONTRACT:" in repair_prompt
+    assert "exact_source: <Subject 1> (S1)" in repair_prompt
+    assert f"exact_dialogue: {second.locked_dialogue_block}" in repair_prompt
+    assert 'allowed_fact_ids=["non_speech_1"]' in repair_prompt
+    assert "Speech fact IDs are never audit entries." in repair_prompt
+
+
 @dataclass
 class _FakeBackend:
     provenance: Qwen38BackendProvenance
@@ -631,4 +786,5 @@ def test_manifest_helper_and_sidecar_are_read_only(tmp_path: Path) -> None:
 
 
 def test_prompt_version_is_frozen() -> None:
-    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v1"
+    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v2"
+    assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v2"

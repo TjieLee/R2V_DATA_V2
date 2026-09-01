@@ -48,7 +48,7 @@ was inspected, but is not copied here.
 The local system-prompt version is:
 
 ```text
-h3_qwen38_ref2va_recaption_v1
+h3_qwen38_ref2va_recaption_v2
 ```
 
 The deterministic renderer publishes these exact sections in this exact order:
@@ -117,6 +117,18 @@ Every locked dialogue block must appear exactly once:
 ```text
 <d>[Language] EXACT_ASR_TEXT</d>
 ```
+
+The deterministic user contract also lists every speech fact with its exact
+source and dialogue. Each local dialogue clause must repeat its literal
+`<Subject N> (Sx)` or unbound `(Sx)` source, including repeated turns by the
+same speaker. Pronouns, roles, and character names cannot replace that source.
+
+`audio_fact_audit` is restricted to the exact supplied non-speech fact IDs;
+speech IDs are never audit entries. When upstream Audio grounding is
+incomplete and supplies neither non-speech events nor soundscape/music hints,
+the two rendered Audio fields use fixed conservative wording that says those
+facts are not established. The model cannot infer room tone, ambience, music,
+or other sounds from the target video's visible content.
 
 One structured repair is allowed. Unknown labels, `<Video N>`, changed or
 duplicated dialogue, incompatible task/retention markers, and invented Audio

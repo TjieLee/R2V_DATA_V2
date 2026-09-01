@@ -28,8 +28,8 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v1"
-QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v1"
+QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v2"
+QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v2"
 QWEN38_RECAPTION_MANIFEST_VERSION = "r2v.h3.qwen38_recaption_manifest.1"
 QWEN38_RECAPTION_RECORD_VERSION = "r2v.h3.qwen38_recaption_record.1"
 QWEN38_RECAPTION_SUMMARY_VERSION = "r2v.h3.qwen38_recaption_summary.1"
@@ -376,10 +376,10 @@ class Qwen38BackendProvenance(SchemaModel):
         "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     ] = "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v1"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v2"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
-    policy_version: Literal["h3_qwen38_ref2va_contract_v1"] = (
+    policy_version: Literal["h3_qwen38_ref2va_contract_v2"] = (
         QWEN38_RECAPTION_POLICY_VERSION
     )
     official_h3_contract_version: str = OFFICIAL_H3_CONTRACT_VERSION
@@ -461,7 +461,7 @@ class Qwen38RecaptionRecord(SchemaModel):
     audio_fact_provenance: dict[str, str] = Field(default_factory=dict)
     audio_grounding_complete: bool
     backend_provenance: Qwen38BackendProvenance
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v1"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v2"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     official_h3_source_files: list[str] = Field(
@@ -832,6 +832,14 @@ def _reference_contract_text(contract: RecaptionReferenceContract) -> str:
     return _compact_json(payload)
 
 
+UNGROUNDED_OVERALL_SOUNDSCAPE = (
+    "No additional soundscape is established by the supplied upstream Audio facts."
+)
+UNGROUNDED_NON_DIEGETIC_MUSIC = (
+    "Non-diegetic music is not established by the supplied upstream Audio facts."
+)
+
+
 SYNTHETIC_FORMAT_EXAMPLE = """subject_definitions:
 <Subject 1> is a cyclist sourced from <Picture 1>.
 <Subject 2> is the riverside environment sourced from <Picture 2>.
@@ -846,9 +854,9 @@ detailed_description:
 The target uses a natural daylight documentary style.
 [Shot 1] <Subject 1> (S1) stops beside <Subject 2>, looks across the river, and says, <d>[English] We made it before sunset.</d>
 overall_soundscape:
-Light riverside ambience continues under the speech.
+The supplied upstream Audio facts establish light riverside ambience under the speech.
 non_diegetic_music:
-N/A"""
+The supplied upstream Audio facts establish that no non-diegetic music is present."""
 
 
 SYSTEM_PROMPT = f"""You are a MiniMax H3 full-reference (Ref2VA) recaptioner.
@@ -887,26 +895,100 @@ weak_reference. Do not use attribute_transfer merely because an image is an
 attribute crop.
 
 Use every precomputed (Sx) exactly. Render each locked dialogue block exactly once
-as supplied. A bound speaker is <Subject N> (Sx); an unbound speaker keeps (Sx)
-without an invented Subject. Do not copy donor/reference dialogue into the target.
+as supplied. Every occurrence must be introduced in its local clause by its exact
+supplied source label. Repeat that exact source for repeated turns by the same
+speaker; never replace it with a pronoun, role, or character name. A bound speaker
+is <Subject N> (Sx); an unbound speaker keeps (Sx) without an invented Subject. Do
+not copy donor/reference dialogue into the target.
 
 Audio text facts are trusted. Do not invent sounds from visible actions. Preserve
 an audible event even when its source is not visible. Visual evidence may only
 generalize an obviously wrong visual source attribution, such as changing "the
 visible woman slams the door" to "a door slam is heard"; it may not delete the
-event or alter ASR, speaker, entity, or timing. overall_soundscape summarizes
-ambience, physical sounds, and non-verbal human sounds without repeating full
-dialogue. non_diegetic_music is audience-only BGM; write N/A only when upstream
-facts establish absence, not merely when grounding is missing.
+event or alter ASR, speaker, entity, or timing. When Audio grounding is incomplete,
+only supplied speech facts may be asserted as audible. Do not infer ambience,
+footsteps, room tone, clothing noise, or other sounds from visible actions. When
+the supplied overall soundscape or music hint is absent, use the exact conservative
+wording supplied in the user contract rather than writing N/A or claiming absence.
+overall_soundscape summarizes grounded ambience, physical sounds, and non-verbal
+human sounds without repeating full dialogue. non_diegetic_music is audience-only
+BGM.
 
 Return one compact JSON object matching the supplied schema. audio_fact_audit is
 diagnostic only: include every supplied non-speech fact exactly once with action
-preserved or attribution_generalized. Never emit deleted/rejected/removed. No
-markdown, explanation, or chain-of-thought.
+preserved or attribution_generalized. Speech fact IDs are never audit entries.
+Never emit deleted/rejected/removed. No markdown, explanation, or chain-of-thought.
 
 Small format-only synthetic example (do not copy its scene content):
 {SYNTHETIC_FORMAT_EXAMPLE}
 """
+
+
+def _speech_exact_source(speech: RecaptionSpeechFact) -> str:
+    if speech.entity_subject_label is None:
+        return f"({speech.speaker_id})"
+    return f"{speech.entity_subject_label} ({speech.speaker_id})"
+
+
+def _locked_speech_render_contract(request: Qwen38RecaptionRequest) -> str:
+    lines = ["LOCKED SPEECH RENDER CONTRACT:"]
+    for speech in request.audio_facts.speech:
+        lines.extend(
+            (
+                f"- {speech.fact_id}",
+                f"  exact_source: {_speech_exact_source(speech)}",
+                f"  exact_dialogue: {speech.locked_dialogue_block}",
+            )
+        )
+    lines.extend(
+        (
+            "Rules:",
+            "- every item must appear exactly once in detailed_description",
+            "- exact_source must appear explicitly in the local clause introducing its exact_dialogue",
+            "- never replace exact_source with a pronoun, role, or character name",
+            "- repeated turns by the same speaker still require exact_source on every occurrence",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _audio_fact_audit_contract(request: Qwen38RecaptionRequest) -> str:
+    fact_ids = [item.fact_id for item in request.audio_facts.non_speech_events]
+    lines = [
+        "AUDIO FACT AUDIT CONTRACT:",
+        f"allowed_fact_ids={_compact_json(fact_ids)}",
+    ]
+    if not fact_ids:
+        lines.append("audio_fact_audit MUST be exactly [].")
+    else:
+        lines.append("Each allowed fact_id must appear exactly once.")
+    lines.extend(
+        (
+            "No other fact_id is permitted.",
+            "Speech fact IDs are never audit entries.",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _audio_grounding_contract(request: Qwen38RecaptionRequest) -> str:
+    facts = request.audio_facts
+    if facts.audio_grounding_complete:
+        return "AUDIO GROUNDING CONTRACT: Use only supplied upstream Audio facts."
+    lines = [
+        "AUDIO GROUNDING CONTRACT: INCOMPLETE",
+        "Only supplied speech facts may be asserted as audible.",
+        "Do not infer ambience or non-speech sounds from visual evidence.",
+    ]
+    if facts.overall_soundscape_hint is None and not facts.non_speech_events:
+        lines.append(
+            f"overall_soundscape MUST be exactly: {UNGROUNDED_OVERALL_SOUNDSCAPE}"
+        )
+    if facts.non_diegetic_music_hint is None:
+        lines.append(
+            f"non_diegetic_music MUST be exactly: {UNGROUNDED_NON_DIEGETIC_MUSIC}"
+        )
+    return "\n".join(lines)
 
 
 def _user_contract(request: Qwen38RecaptionRequest) -> str:
@@ -920,6 +1002,9 @@ def _user_contract(request: Qwen38RecaptionRequest) -> str:
         f"t2v_caption=null\nr2v_instruction={request.sample.r2v_instruction}\n"
         "LOCKED AUDIO TEXT FACTS:\n"
         f"{_compact_json(request.audio_facts.model_dump(mode='json'))}\n"
+        f"{_locked_speech_render_contract(request)}\n"
+        f"{_audio_fact_audit_contract(request)}\n"
+        f"{_audio_grounding_contract(request)}\n"
         "Return this strict schema:\n"
         f"{_compact_json(Qwen38H3StructuredResponse.model_json_schema())}"
     )
@@ -931,11 +1016,30 @@ def _repair_prompt(
     invalid_response: str,
     issues: Sequence[ValidationIssue],
 ) -> str:
+    issue_codes = {item.code for item in issues}
+    exact_speech_correction = ""
+    if issue_codes & {
+        "missing_speaker_id",
+        "locked_dialogue_source_mismatch",
+        "locked_dialogue_mismatch",
+    }:
+        exact_speech_correction = (
+            "Do not merely add missing dialogue text. For every locked speech item, "
+            "copy its exact_source literally into the local dialogue clause.\n"
+        )
     return (
         _user_contract(request)
         + "\nRepair only the listed format/contract errors. Preserve visual meaning and "
         "all locked labels, facts, timestamps, speaker IDs, entity bindings, and exact "
         "dialogue. Return one compact JSON object only.\n"
+        + exact_speech_correction
+        + "REPAIR EXACT CONTRACTS:\n"
+        + _locked_speech_render_contract(request)
+        + "\n"
+        + _audio_fact_audit_contract(request)
+        + "\n"
+        + _audio_grounding_contract(request)
+        + "\n"
         + f"issues={_compact_json([item.to_dict() for item in issues])}\n"
         + f"invalid_response={invalid_response}"
     )
@@ -969,6 +1073,10 @@ def _all_section_text(response: Qwen38H3StructuredResponse) -> str:
             response.non_diegetic_music,
         )
     )
+
+
+def _normalized_contract_text(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 def validate_h3_response(
@@ -1065,16 +1173,30 @@ def validate_h3_response(
                 "every exact locked dialogue block must appear once",
             )
         )
+    dialogue_occurrences: dict[str, list[tuple[int, int]]] = {}
+    for match in _DIALOGUE_BLOCK.finditer(response.detailed_description):
+        dialogue_occurrences.setdefault(match.group(0), []).append(match.span())
+    used_occurrences: Counter[str] = Counter()
+    all_dialogue_ends = sorted(
+        end
+        for occurrences in dialogue_occurrences.values()
+        for _, end in occurrences
+    )
     for speech in request.audio_facts.speech:
-        block_index = response.detailed_description.find(speech.locked_dialogue_block)
-        if block_index < 0:
+        occurrence_index = used_occurrences[speech.locked_dialogue_block]
+        used_occurrences[speech.locked_dialogue_block] += 1
+        occurrences = dialogue_occurrences.get(speech.locked_dialogue_block, [])
+        if occurrence_index >= len(occurrences):
             continue
-        prefix = response.detailed_description[max(0, block_index - 180) : block_index]
-        expected_source = (
-            f"{speech.entity_subject_label} ({speech.speaker_id})"
-            if speech.entity_subject_label is not None
-            else f"({speech.speaker_id})"
+        block_index, _ = occurrences[occurrence_index]
+        previous_dialogue_end = max(
+            (end for end in all_dialogue_ends if end <= block_index),
+            default=0,
         )
+        prefix = response.detailed_description[
+            max(previous_dialogue_end, block_index - 180) : block_index
+        ]
+        expected_source = _speech_exact_source(speech)
         if expected_source not in prefix:
             issues.append(
                 ValidationIssue(
@@ -1105,6 +1227,32 @@ def validate_h3_response(
                 "every supplied non-speech fact must be audited exactly once",
             )
         )
+
+    facts = request.audio_facts
+    if not facts.audio_grounding_complete:
+        if facts.non_diegetic_music_hint is None and _normalized_contract_text(
+            response.non_diegetic_music
+        ) != _normalized_contract_text(UNGROUNDED_NON_DIEGETIC_MUSIC):
+            issues.append(
+                ValidationIssue(
+                    "ungrounded_non_diegetic_music",
+                    "non_diegetic_music",
+                    "music status is not established by upstream Audio facts",
+                )
+            )
+        if (
+            facts.overall_soundscape_hint is None
+            and not facts.non_speech_events
+            and _normalized_contract_text(response.overall_soundscape)
+            != _normalized_contract_text(UNGROUNDED_OVERALL_SOUNDSCAPE)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "ungrounded_overall_soundscape",
+                    "overall_soundscape",
+                    "additional soundscape is not established by upstream Audio facts",
+                )
+            )
 
     retention = "\n".join(response.retention_analysis)
     for audio in request.reference_contract.audios:
