@@ -16,6 +16,8 @@ from r2v_data_v2.h3.jea_final_renderer import (
     FinalVisualReference,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
+    QWEN38_RECAPTION_DRAFT_VERSION,
+    QWEN38_RECAPTION_MATERIALIZER_VERSION,
     QWEN38_RECAPTION_POLICY_VERSION,
     QWEN38_RECAPTION_PROMPT_VERSION,
     UNGROUNDED_NON_DIEGETIC_MUSIC,
@@ -24,6 +26,8 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     OpenAIQwen38RecaptionBackend,
     Qwen38BackendProvenance,
     Qwen38BackendResult,
+    Qwen38DraftShot,
+    Qwen38H3DraftResponse,
     Qwen38H3StructuredResponse,
     Qwen38RecaptionConfig,
     Qwen38RecaptionManifestCase,
@@ -33,8 +37,10 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     build_audio_facts,
     build_qwen38_pilot_manifest,
     build_reference_contract,
+    materialize_h3_draft,
     render_h3_prompt,
     run_qwen38_h3_recaption_pilot,
+    validate_h3_draft,
     validate_h3_response,
 )
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
@@ -293,6 +299,30 @@ def _response(request: Qwen38RecaptionRequest) -> Qwen38H3StructuredResponse:
     )
 
 
+def _draft(request: Qwen38RecaptionRequest) -> Qwen38H3DraftResponse:
+    response = _response(request)
+    placeholders = " ".join(
+        f"A visible action continues. [[{fact.fact_id}]]"
+        for fact in request.audio_facts.speech
+    )
+    return Qwen38H3DraftResponse(
+        subject_definitions=response.subject_definitions,
+        summary=response.summary,
+        retention_analysis=response.retention_analysis,
+        shots=[
+            Qwen38DraftShot(
+                shot_index=1,
+                description_template=(
+                    "The target uses a natural observational style. " + placeholders
+                ),
+            )
+        ],
+        overall_soundscape=response.overall_soundscape,
+        non_diegetic_music=response.non_diegetic_music,
+        audio_fact_audit=response.audio_fact_audit,
+    )
+
+
 def _codes(
     response: Qwen38H3StructuredResponse,
     request: Qwen38RecaptionRequest,
@@ -418,10 +448,53 @@ def test_speaker_ids_follow_first_cluster_appearance_and_binding(tmp_path: Path)
 
 def test_every_same_speaker_turn_repeats_exact_source(tmp_path: Path) -> None:
     request = _same_speaker_request(tmp_path)
-    response = _response(request)
+    response = materialize_h3_draft(_draft(request), request)
     source = "<Subject 1> (S1)"
     assert response.detailed_description.count(source) == 2
     assert _codes(response, request) == set()
+
+
+def test_same_speaker_materialization_preserves_mixed_binding_per_turn(
+    tmp_path: Path,
+) -> None:
+    request = _same_speaker_request(tmp_path)
+    first, second = request.audio_facts.speech
+    speech = [
+        first,
+        second.model_copy(
+            update={
+                "fact_id": "speech_2",
+                "entity_id": None,
+                "entity_subject_label": None,
+            }
+        ),
+        first.model_copy(
+            update={
+                "fact_id": "speech_3",
+                "segment_id": "segment-third",
+                "start_time": 0.5,
+                "end_time": 0.6,
+                "text": "Third line.",
+                "locked_dialogue_block": "<d>[English] Third line.</d>",
+            }
+        ),
+    ]
+    mixed_request = Qwen38RecaptionRequest(
+        sample=request.sample,
+        case=request.case,
+        reference_contract=request.reference_contract,
+        audio_facts=request.audio_facts.model_copy(update={"speech": speech}),
+        request_fingerprint=request.request_fingerprint,
+    )
+    response = materialize_h3_draft(_draft(mixed_request), mixed_request)
+    description = response.detailed_description
+    first_position = description.index("<d>[English] Wait here.</d>")
+    second_position = description.index("<d>[English] I am ready.</d>")
+    third_position = description.index("<d>[English] Third line.</d>")
+    assert "<Subject 1> (S1) says," in description[:first_position]
+    assert description[first_position:second_position].rstrip().endswith("(S1) says,")
+    assert "<Subject 1> (S1) says," in description[second_position:third_position]
+    assert _codes(response, mixed_request) == set()
 
 
 def test_pronoun_on_second_same_speaker_turn_rejects_source_mismatch(
@@ -443,6 +516,71 @@ def test_pronoun_on_second_same_speaker_turn_rejects_source_mismatch(
         }
     )
     assert "locked_dialogue_source_mismatch" in _codes(changed, request)
+
+
+@pytest.mark.parametrize(
+    ("templates", "expected_code"),
+    [
+        (["Only [[speech_1]] appears."], "missing_speech_placeholder"),
+        (
+            ["[[speech_1]] then [[speech_1]] then [[speech_2]]"],
+            "duplicate_speech_placeholder",
+        ),
+        (["[[speech_2]] then [[speech_1]]"], "speech_placeholder_order_mismatch"),
+        (
+            ["[[speech_1]] then [[speech_2]] then [[speech_99]]"],
+            "unknown_speech_placeholder",
+        ),
+        (
+            ["[Shot 1] [[speech_1]] then [[speech_2]]"],
+            "draft_contains_shot_header",
+        ),
+        (
+            ["<d>[English] copied</d> [[speech_1]] then [[speech_2]]"],
+            "draft_contains_dialogue_markup",
+        ),
+        (
+            ["She says [[speech_1]] then pauses before [[speech_2]]"],
+            "draft_prefixes_complete_speech_placeholder",
+        ),
+    ],
+)
+def test_draft_rejects_pipeline_owned_or_invalid_placeholder_content(
+    tmp_path: Path,
+    templates: list[str],
+    expected_code: str,
+) -> None:
+    request = _same_speaker_request(tmp_path)
+    draft = _draft(request).model_copy(
+        update={
+            "shots": [
+                Qwen38DraftShot(
+                    shot_index=index,
+                    start_time=None if index == 1 else float(index),
+                    description_template=template,
+                )
+                for index, template in enumerate(templates, start=1)
+            ]
+        }
+    )
+    codes = {item.code for item in validate_h3_draft(draft, request)}
+    assert expected_code in codes
+
+
+def test_materializer_owns_single_and_later_shot_headers(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    draft = _draft(request)
+    single = materialize_h3_draft(draft, request)
+    assert single.detailed_description.startswith("[Shot 1] ")
+    second = Qwen38DraftShot(
+        shot_index=2,
+        start_time=3.125,
+        description_template="A hard cut reveals the opposite side of the room.",
+    )
+    two_shots = draft.model_copy(update={"shots": [draft.shots[0], second]})
+    materialized = materialize_h3_draft(two_shots, request)
+    assert "[Shot 2] At 00:03.125," in materialized.detailed_description
+    assert _codes(materialized, request) == set()
 
 
 @pytest.mark.parametrize(
@@ -586,7 +724,7 @@ class _FakeCompletions:
 
 def test_openai_request_labels_media_and_never_sends_audio(tmp_path: Path) -> None:
     request = _request(tmp_path)
-    valid = _response(request).model_dump_json()
+    valid = _draft(request).model_dump_json()
     completions = _FakeCompletions([valid])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     backend = OpenAIQwen38RecaptionBackend(
@@ -598,6 +736,14 @@ def test_openai_request_labels_media_and_never_sends_audio(tmp_path: Path) -> No
     )
     result = backend.recaption(request)
     assert result.model_call_count == 1
+    assert result.response.detailed_description.startswith("[Shot 1] ")
+    assert "[[speech_" not in result.response.detailed_description
+    assert request.audio_facts.speech[0].locked_dialogue_block in (
+        result.response.detailed_description
+    )
+    raw_draft = json.loads(result.raw_responses[0])
+    assert "shots" in raw_draft
+    assert "detailed_description" not in raw_draft
     payload = completions.requests[0]
     content = payload["messages"][1]["content"]  # type: ignore[index]
     types = [item["type"] for item in content]  # type: ignore[index]
@@ -605,8 +751,8 @@ def test_openai_request_labels_media_and_never_sends_audio(tmp_path: Path) -> No
     assert types.count("image_url") == 3
     assert "audio_url" not in types
     user_prompt = content[-1]["text"]  # type: ignore[index]
-    assert "LOCKED SPEECH RENDER CONTRACT:" in user_prompt
-    assert "exact_source: (S1)" in user_prompt
+    assert "SPEECH PLACEHOLDER CONTRACT:" in user_prompt
+    assert "speech_1: [[speech_1]]" in user_prompt
     assert "allowed_fact_ids=[]" in user_prompt
     assert "audio_fact_audit MUST be exactly []." in user_prompt
     assert payload["extra_body"] == {
@@ -620,6 +766,9 @@ def test_openai_request_labels_media_and_never_sends_audio(tmp_path: Path) -> No
     assert payload["top_p"] == 0.8
     assert payload["presence_penalty"] == 1.5
     assert payload["max_tokens"] == 8192
+    schema = payload["response_format"]["json_schema"]["schema"]  # type: ignore[index]
+    assert "shots" in schema["properties"]
+    assert "detailed_description" not in schema["properties"]
 
 
 def test_sglang_provenance_records_non_thinking_sampling(tmp_path: Path) -> None:
@@ -632,6 +781,8 @@ def test_sglang_provenance_records_non_thinking_sampling(tmp_path: Path) -> None
     assert provenance.presence_penalty == 1.5
     assert provenance.repetition_penalty == 1.0
     assert provenance.enable_thinking is False
+    assert provenance.draft_schema_version == QWEN38_RECAPTION_DRAFT_VERSION
+    assert provenance.materializer_version == QWEN38_RECAPTION_MATERIALIZER_VERSION
     assert "video_fps" not in provenance.model_dump(mode="json")
 
 
@@ -669,7 +820,7 @@ def test_legacy_vllm_backend_literal_remains_parseable(tmp_path: Path) -> None:
 
 def test_true_malformed_response_uses_exactly_one_repair(tmp_path: Path) -> None:
     request = _request(tmp_path)
-    valid = _response(request).model_dump_json()
+    valid = _draft(request).model_dump_json()
     completions = _FakeCompletions(["not-json", valid])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     backend = OpenAIQwen38RecaptionBackend(
@@ -685,17 +836,15 @@ def test_true_malformed_response_uses_exactly_one_repair(tmp_path: Path) -> None
 
 def test_repair_repeats_exact_speech_and_audit_contracts(tmp_path: Path) -> None:
     request = _same_speaker_request(tmp_path, with_event=True)
-    valid = _response(request)
-    second = request.audio_facts.speech[1]
-    invalid = valid.model_copy(
+    valid = _draft(request)
+    invalid_shot = valid.shots[0].model_copy(
         update={
-            "detailed_description": valid.detailed_description.replace(
-                f"<Subject 1> (S1) says, {second.locked_dialogue_block}",
-                f"She says, {second.locked_dialogue_block}",
-                1,
+            "description_template": valid.shots[0].description_template.replace(
+                "[[speech_2]]", ""
             )
         }
     )
+    invalid = valid.model_copy(update={"shots": [invalid_shot]})
     completions = _FakeCompletions([invalid.model_dump_json(), valid.model_dump_json()])
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     backend = OpenAIQwen38RecaptionBackend(
@@ -708,10 +857,9 @@ def test_repair_repeats_exact_speech_and_audit_contracts(tmp_path: Path) -> None
     assert backend.recaption(request).model_call_count == 2
     repair_content = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
     repair_prompt = repair_content[-1]["text"]  # type: ignore[index]
-    assert "Do not merely add missing dialogue text" in repair_prompt
-    assert "LOCKED SPEECH RENDER CONTRACT:" in repair_prompt
-    assert "exact_source: <Subject 1> (S1)" in repair_prompt
-    assert f"exact_dialogue: {second.locked_dialogue_block}" in repair_prompt
+    assert "SPEECH PLACEHOLDER CONTRACT:" in repair_prompt
+    assert "speech_1: [[speech_1]]" in repair_prompt
+    assert "speech_2: [[speech_2]]" in repair_prompt
     assert 'allowed_fact_ids=["non_speech_1"]' in repair_prompt
     assert "Speech fact IDs are never audit entries." in repair_prompt
 
@@ -786,5 +934,7 @@ def test_manifest_helper_and_sidecar_are_read_only(tmp_path: Path) -> None:
 
 
 def test_prompt_version_is_frozen() -> None:
-    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v2"
-    assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v2"
+    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v3"
+    assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v3"
+    assert QWEN38_RECAPTION_DRAFT_VERSION == "r2v.h3.qwen38_recaption_draft.1"
+    assert QWEN38_RECAPTION_MATERIALIZER_VERSION == "h3_qwen38_materializer_v1"

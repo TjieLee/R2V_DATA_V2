@@ -28,8 +28,10 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v2"
-QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v2"
+QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v3"
+QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v3"
+QWEN38_RECAPTION_DRAFT_VERSION = "r2v.h3.qwen38_recaption_draft.1"
+QWEN38_RECAPTION_MATERIALIZER_VERSION = "h3_qwen38_materializer_v1"
 QWEN38_RECAPTION_MANIFEST_VERSION = "r2v.h3.qwen38_recaption_manifest.1"
 QWEN38_RECAPTION_RECORD_VERSION = "r2v.h3.qwen38_recaption_record.1"
 QWEN38_RECAPTION_SUMMARY_VERSION = "r2v.h3.qwen38_recaption_summary.1"
@@ -59,6 +61,11 @@ AudioKind = Literal["target_voice", "cross_voice", "full_audio_reuse"]
 _REFERENCE_LABEL = re.compile(r"<(Picture|Subject|Video|Audio)\s+([1-9]\d*)>")
 _SPEAKER_LABEL = re.compile(r"\(S([1-9]\d*)\)")
 _DIALOGUE_BLOCK = re.compile(r"<d>\[[^\]\r\n]+\][\s\S]*?</d>")
+_SPEECH_PLACEHOLDER = re.compile(r"\[\[([^\[\]\r\n]+)\]\]")
+_SPEECH_LEAD_IN = re.compile(
+    r"\b(?:says?|speaks?|asks?|replies?|shouts?|whispers?)\s*,?\s*$",
+    flags=re.IGNORECASE,
+)
 _SHOT_LABEL = re.compile(r"\[Shot\s+([1-9]\d*)\]")
 _KEYFRAME_ROLE = re.compile(
     r"<Picture\s+[1-9]\d*>[^.\n]{0,100}\b(first frame|last frame|keyframe)\b"
@@ -361,6 +368,55 @@ class Qwen38H3StructuredResponse(SchemaModel):
         return self
 
 
+class Qwen38DraftShot(SchemaModel):
+    shot_index: int = Field(ge=1)
+    start_time: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    description_template: StrictStr
+
+    @model_validator(mode="after")
+    def validate_description(self) -> Qwen38DraftShot:
+        if not self.description_template.strip():
+            raise ValueError("Qwen3.8 draft shot description must not be empty")
+        return self
+
+
+class Qwen38H3DraftResponse(SchemaModel):
+    subject_definitions: list[StrictStr] = Field(min_length=1)
+    summary: StrictStr
+    retention_analysis: list[StrictStr] = Field(min_length=1)
+    shots: list[Qwen38DraftShot] = Field(min_length=1)
+    overall_soundscape: StrictStr
+    non_diegetic_music: StrictStr
+    audio_fact_audit: list[AudioFactAuditItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_draft(self) -> Qwen38H3DraftResponse:
+        strings = (
+            *self.subject_definitions,
+            self.summary,
+            *self.retention_analysis,
+            *(shot.description_template for shot in self.shots),
+            self.overall_soundscape,
+            self.non_diegetic_music,
+        )
+        if any(not value.strip() for value in strings):
+            raise ValueError("H3 draft sections must not be empty")
+        indices = [shot.shot_index for shot in self.shots]
+        if indices != list(range(1, len(self.shots) + 1)):
+            raise ValueError("Qwen3.8 draft shot indices must be contiguous")
+        if self.shots[0].start_time is not None:
+            raise ValueError("Qwen3.8 draft Shot 1 cannot have a start time")
+        later_times = [shot.start_time for shot in self.shots[1:]]
+        if any(value is None for value in later_times):
+            raise ValueError("later Qwen3.8 draft shots require start times")
+        numeric_times = [value for value in later_times if value is not None]
+        if numeric_times != sorted(numeric_times) or len(numeric_times) != len(
+            set(numeric_times)
+        ):
+            raise ValueError("Qwen3.8 draft shot start times must increase")
+        return self
+
+
 class Qwen38BackendProvenance(SchemaModel):
     schema_version: Literal["r2v.h3.qwen38_recaption_backend.1"] = (
         QWEN38_RECAPTION_BACKEND_VERSION
@@ -376,11 +432,17 @@ class Qwen38BackendProvenance(SchemaModel):
         "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     ] = "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v2"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v3"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
-    policy_version: Literal["h3_qwen38_ref2va_contract_v2"] = (
+    policy_version: Literal["h3_qwen38_ref2va_contract_v3"] = (
         QWEN38_RECAPTION_POLICY_VERSION
+    )
+    draft_schema_version: Literal["r2v.h3.qwen38_recaption_draft.1"] = (
+        QWEN38_RECAPTION_DRAFT_VERSION
+    )
+    materializer_version: Literal["h3_qwen38_materializer_v1"] = (
+        QWEN38_RECAPTION_MATERIALIZER_VERSION
     )
     official_h3_contract_version: str = OFFICIAL_H3_CONTRACT_VERSION
     official_h3_source_files: list[str] = Field(
@@ -461,7 +523,7 @@ class Qwen38RecaptionRecord(SchemaModel):
     audio_fact_provenance: dict[str, str] = Field(default_factory=dict)
     audio_grounding_complete: bool
     backend_provenance: Qwen38BackendProvenance
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v2"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v3"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     official_h3_source_files: list[str] = Field(
@@ -843,16 +905,17 @@ UNGROUNDED_NON_DIEGETIC_MUSIC = (
 SYNTHETIC_FORMAT_EXAMPLE = """subject_definitions:
 <Subject 1> is a cyclist sourced from <Picture 1>.
 <Subject 2> is the riverside environment sourced from <Picture 2>.
-<Audio 1> is the voice-timbre reference for <Subject 1> (S1).
+<Audio 1> is the voice-timbre reference for <Subject 1>.
 summary:
 [reference generation + audio reference] A cyclist pauses in the referenced riverside setting and speaks once.
 retention_analysis:
 <Subject 1> (appears in [Shot 1]): fully_preserved - the cyclist's referenced appearance is retained.
 <Subject 2> (appears in [Shot 1]): fully_preserved - the riverside environment is retained.
 <Audio 1>: reference - the speaker follows the referenced delivery without copying the signal.
-detailed_description:
-The target uses a natural daylight documentary style.
-[Shot 1] <Subject 1> (S1) stops beside <Subject 2>, looks across the river, and says, <d>[English] We made it before sunset.</d>
+shots:
+- shot_index: 1
+  start_time: null
+  description_template: The target uses a natural daylight documentary style. <Subject 1> stops beside <Subject 2> and looks across the river. [[speech_1]]
 overall_soundscape:
 The supplied upstream Audio facts establish light riverside ambience under the speech.
 non_diegetic_music:
@@ -872,20 +935,22 @@ entity bindings, timestamps, and transcripts are pipeline-owned. Never renumber,
 remap, merge, split, delete, correct, translate, or invent them. The target video is
 the visual truth; rough captions are hints only.
 
-Follow the current official MiniMax H3 Ref2VA format. Return structured JSON for
-exactly these rendered sections in this order: subject_definitions, summary,
-retention_analysis, detailed_description, overall_soundscape,
-non_diegetic_music. Write English except dialogue, lyrics, and visible scene text.
+Follow the current official MiniMax H3 Ref2VA format. Return a structured draft
+with subject_definitions, summary, retention_analysis, shots,
+overall_soundscape, non_diegetic_music, and audio_fact_audit. The pipeline, not
+you, materializes the final detailed_description from shots. Write English except
+lyrics and visible scene text.
 
-Make detailed_description rich and concrete rather than a plot summary. Describe
-style, composition, shot scale, appearance, position, spatial relationships,
-foreground/background, pose, body and hand action, head movement, expression,
-gaze, interactions, object state, environment, lighting, camera angle and natural
-camera movement, motion progression, state changes, readable text, synchronized
-diegetic events, and dialogue at the correct point. Current clips are expected to
-be single-shot. Use [Shot 1] without a timestamp. Add a later shot only for a real
-hard cut, using [Shot N] At MM:SS.mmm, .... For generation tasks, aim for roughly
-350-500 English words when the observed information supports it.
+Make shot description_template fields rich and concrete rather than a plot
+summary. Describe style, composition, shot scale, appearance, position, spatial
+relationships, foreground/background, pose, body and hand action, head movement,
+expression, gaze, interactions, object state, environment, lighting, camera angle
+and natural camera movement, motion progression, state changes, readable text,
+and synchronized grounded events. Current clips are expected to be single-shot.
+Add a later shot only for a real hard cut and supply its start_time in seconds.
+Never write [Shot N] syntax; the pipeline owns shot headers and timestamps. For
+generation tasks, aim for roughly 350-500 English words when observed information
+supports it.
 
 Pictures are content references, not first/last frames or keyframes. Use only the
 supplied labels. Summary must begin with the supplied task prefix. Visible
@@ -894,12 +959,12 @@ weak_reference. Audio markers are fully_copy, partially_copy, reference,
 weak_reference. Do not use attribute_transfer merely because an image is an
 attribute crop.
 
-Use every precomputed (Sx) exactly. Render each locked dialogue block exactly once
-as supplied. Every occurrence must be introduced in its local clause by its exact
-supplied source label. Repeat that exact source for repeated turns by the same
-speaker; never replace it with a pronoun, role, or character name. A bound speaker
-is <Subject N> (Sx); an unbound speaker keeps (Sx) without an invented Subject. Do
-not copy donor/reference dialogue into the target.
+Insert every supplied [[speech_N]] placeholder exactly once in chronological
+order. A placeholder represents the complete source-and-dialogue clause; never
+prefix it with says, speaks, a pronoun, a role, or a character name. Never write
+pipeline-owned (Sx), <Subject N> (Sx), <d> dialogue, transcript text, or unknown
+speech placeholders. The pipeline deterministically materializes each complete
+speech clause after validating your draft. Do not copy donor/reference dialogue.
 
 Audio text facts are trusted. Do not invent sounds from visible actions. Preserve
 an audible event even when its source is not visible. Visual evidence may only
@@ -930,23 +995,17 @@ def _speech_exact_source(speech: RecaptionSpeechFact) -> str:
     return f"{speech.entity_subject_label} ({speech.speaker_id})"
 
 
-def _locked_speech_render_contract(request: Qwen38RecaptionRequest) -> str:
-    lines = ["LOCKED SPEECH RENDER CONTRACT:"]
+def _speech_placeholder_contract(request: Qwen38RecaptionRequest) -> str:
+    lines = ["SPEECH PLACEHOLDER CONTRACT:"]
     for speech in request.audio_facts.speech:
-        lines.extend(
-            (
-                f"- {speech.fact_id}",
-                f"  exact_source: {_speech_exact_source(speech)}",
-                f"  exact_dialogue: {speech.locked_dialogue_block}",
-            )
-        )
+        lines.append(f"- {speech.fact_id}: [[{speech.fact_id}]]")
     lines.extend(
         (
             "Rules:",
-            "- every item must appear exactly once in detailed_description",
-            "- exact_source must appear explicitly in the local clause introducing its exact_dialogue",
-            "- never replace exact_source with a pronoun, role, or character name",
-            "- repeated turns by the same speaker still require exact_source on every occurrence",
+            "- every placeholder must appear exactly once across shot description_template fields",
+            "- placeholders must appear in the listed chronological order",
+            "- a placeholder is the complete speech clause; do not prefix it with says or a speaker description",
+            "- do not emit unknown placeholders, (Sx), <d> dialogue, or transcript text",
         )
     )
     return "\n".join(lines)
@@ -1002,11 +1061,11 @@ def _user_contract(request: Qwen38RecaptionRequest) -> str:
         f"t2v_caption=null\nr2v_instruction={request.sample.r2v_instruction}\n"
         "LOCKED AUDIO TEXT FACTS:\n"
         f"{_compact_json(request.audio_facts.model_dump(mode='json'))}\n"
-        f"{_locked_speech_render_contract(request)}\n"
+        f"{_speech_placeholder_contract(request)}\n"
         f"{_audio_fact_audit_contract(request)}\n"
         f"{_audio_grounding_contract(request)}\n"
         "Return this strict schema:\n"
-        f"{_compact_json(Qwen38H3StructuredResponse.model_json_schema())}"
+        f"{_compact_json(Qwen38H3DraftResponse.model_json_schema())}"
     )
 
 
@@ -1016,25 +1075,14 @@ def _repair_prompt(
     invalid_response: str,
     issues: Sequence[ValidationIssue],
 ) -> str:
-    issue_codes = {item.code for item in issues}
-    exact_speech_correction = ""
-    if issue_codes & {
-        "missing_speaker_id",
-        "locked_dialogue_source_mismatch",
-        "locked_dialogue_mismatch",
-    }:
-        exact_speech_correction = (
-            "Do not merely add missing dialogue text. For every locked speech item, "
-            "copy its exact_source literally into the local dialogue clause.\n"
-        )
     return (
         _user_contract(request)
         + "\nRepair only the listed format/contract errors. Preserve visual meaning and "
-        "all locked labels, facts, timestamps, speaker IDs, entity bindings, and exact "
-        "dialogue. Return one compact JSON object only.\n"
-        + exact_speech_correction
+        "all locked labels, facts, placeholder IDs/order, entity bindings, and shot "
+        "semantics. Do not emit pipeline-owned dialogue or speaker serialization. "
+        "Return one compact JSON object only.\n"
         + "REPAIR EXACT CONTRACTS:\n"
-        + _locked_speech_render_contract(request)
+        + _speech_placeholder_contract(request)
         + "\n"
         + _audio_fact_audit_contract(request)
         + "\n"
@@ -1042,6 +1090,183 @@ def _repair_prompt(
         + "\n"
         + f"issues={_compact_json([item.to_dict() for item in issues])}\n"
         + f"invalid_response={invalid_response}"
+    )
+
+
+def _draft_non_shot_text(draft: Qwen38H3DraftResponse) -> str:
+    return "\n".join(
+        (
+            *draft.subject_definitions,
+            draft.summary,
+            *draft.retention_analysis,
+            draft.overall_soundscape,
+            draft.non_diegetic_music,
+        )
+    )
+
+
+def validate_h3_draft(
+    draft: Qwen38H3DraftResponse,
+    request: Qwen38RecaptionRequest,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    templates = [shot.description_template for shot in draft.shots]
+    actual_placeholders = [
+        match.group(1)
+        for template in templates
+        for match in _SPEECH_PLACEHOLDER.finditer(template)
+    ]
+    expected_placeholders = [speech.fact_id for speech in request.audio_facts.speech]
+    expected_set = set(expected_placeholders)
+    actual_counts = Counter(actual_placeholders)
+    unknown = sorted(set(actual_placeholders) - expected_set)
+    missing = [item for item in expected_placeholders if actual_counts[item] == 0]
+    duplicate = sorted(item for item, count in actual_counts.items() if count > 1)
+    if unknown:
+        issues.append(
+            ValidationIssue(
+                "unknown_speech_placeholder",
+                "shots",
+                f"unknown placeholders: {unknown}",
+            )
+        )
+    if missing:
+        issues.append(
+            ValidationIssue(
+                "missing_speech_placeholder",
+                "shots",
+                f"missing placeholders: {missing}",
+            )
+        )
+    if duplicate:
+        issues.append(
+            ValidationIssue(
+                "duplicate_speech_placeholder",
+                "shots",
+                f"duplicate placeholders: {duplicate}",
+            )
+        )
+    if not unknown and not missing and not duplicate and (
+        actual_placeholders != expected_placeholders
+    ):
+        issues.append(
+            ValidationIssue(
+                "speech_placeholder_order_mismatch",
+                "shots",
+                "speech placeholders must follow chronological fact order",
+            )
+        )
+    non_shot_text = _draft_non_shot_text(draft)
+    if _SPEECH_PLACEHOLDER.search(non_shot_text):
+        issues.append(
+            ValidationIssue(
+                "speech_placeholder_outside_shot",
+                None,
+                "speech placeholders are allowed only in shot descriptions",
+            )
+        )
+    all_draft_text = "\n".join((*templates, non_shot_text))
+    if "<d>" in all_draft_text or "</d>" in all_draft_text:
+        issues.append(
+            ValidationIssue(
+                "draft_contains_dialogue_markup",
+                None,
+                "draft contains pipeline-owned dialogue markup",
+            )
+        )
+    if any(
+        speech.text and speech.text in all_draft_text
+        for speech in request.audio_facts.speech
+    ):
+        issues.append(
+            ValidationIssue(
+                "draft_contains_locked_dialogue",
+                None,
+                "draft copies pipeline-owned dialogue text",
+            )
+        )
+    if _SPEAKER_LABEL.search(all_draft_text):
+        issues.append(
+            ValidationIssue(
+                "draft_contains_speech_source",
+                None,
+                "draft contains pipeline-owned speaker syntax",
+            )
+        )
+    for shot in draft.shots:
+        template = shot.description_template
+        if "[Shot " in template:
+            issues.append(
+                ValidationIssue(
+                    "draft_contains_shot_header",
+                    "shots",
+                    f"shot {shot.shot_index} contains pipeline-owned shot syntax",
+                )
+            )
+        if any(
+            _SPEECH_LEAD_IN.search(template[max(0, match.start() - 80) : match.start()])
+            for match in _SPEECH_PLACEHOLDER.finditer(template)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "draft_prefixes_complete_speech_placeholder",
+                    "shots",
+                    f"shot {shot.shot_index} prefixes a complete speech clause",
+                )
+            )
+    return issues
+
+
+def _render_locked_speech(speech: RecaptionSpeechFact) -> str:
+    return (
+        f"{_speech_exact_source(speech)} says, {speech.locked_dialogue_block}"
+    )
+
+
+def _format_shot_timestamp(seconds: float) -> str:
+    total_milliseconds = math.floor(seconds * 1000.0 + 0.5)
+    minutes, remainder = divmod(total_milliseconds, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return f"{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
+
+
+def materialize_h3_draft(
+    draft: Qwen38H3DraftResponse,
+    request: Qwen38RecaptionRequest,
+) -> Qwen38H3StructuredResponse:
+    issues = validate_h3_draft(draft, request)
+    if issues:
+        raise ValueError(
+            "Qwen3.8 draft cannot be materialized: "
+            + _compact_json([item.to_dict() for item in issues])
+        )
+    speech_by_id = {
+        speech.fact_id: speech for speech in request.audio_facts.speech
+    }
+    rendered_shots = []
+    for shot in draft.shots:
+        description = _SPEECH_PLACEHOLDER.sub(
+            lambda match: _render_locked_speech(speech_by_id[match.group(1)]),
+            shot.description_template.strip(),
+        )
+        if shot.shot_index == 1:
+            header = "[Shot 1]"
+        else:
+            if shot.start_time is None:
+                raise AssertionError("validated later shot is missing start_time")
+            header = (
+                f"[Shot {shot.shot_index}] At "
+                f"{_format_shot_timestamp(shot.start_time)},"
+            )
+        rendered_shots.append(f"{header} {description}")
+    return Qwen38H3StructuredResponse(
+        subject_definitions=draft.subject_definitions,
+        summary=draft.summary,
+        retention_analysis=draft.retention_analysis,
+        detailed_description="\n".join(rendered_shots),
+        overall_soundscape=draft.overall_soundscape,
+        non_diegetic_music=draft.non_diegetic_music,
+        audio_fact_audit=draft.audio_fact_audit,
     )
 
 
@@ -1382,6 +1607,8 @@ class Qwen38RecaptionConfig:
             "output_modalities": ["text"],
             "prompt_version": QWEN38_RECAPTION_PROMPT_VERSION,
             "policy_version": QWEN38_RECAPTION_POLICY_VERSION,
+            "draft_schema_version": QWEN38_RECAPTION_DRAFT_VERSION,
+            "materializer_version": QWEN38_RECAPTION_MATERIALIZER_VERSION,
             "official_h3_contract_version": OFFICIAL_H3_CONTRACT_VERSION,
             "official_h3_source_files": list(OFFICIAL_H3_SOURCE_FILES),
             "enable_thinking": False,
@@ -1448,9 +1675,9 @@ class OpenAIQwen38RecaptionBackend:
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "qwen38_h3_recaption",
+                    "name": "qwen38_h3_recaption_draft",
                     "strict": True,
-                    "schema": Qwen38H3StructuredResponse.model_json_schema(),
+                    "schema": Qwen38H3DraftResponse.model_json_schema(),
                 },
             },
             "temperature": self.config.temperature,
@@ -1504,10 +1731,12 @@ class OpenAIQwen38RecaptionBackend:
                 ) from exc
             raw_responses.append(raw)
             diagnostics.append(diagnostic)
-            response, issues = parse_structured_json_issues(
-                raw, Qwen38H3StructuredResponse
-            )
-            if response is not None:
+            draft, issues = parse_structured_json_issues(raw, Qwen38H3DraftResponse)
+            response = None
+            if draft is not None:
+                issues = validate_h3_draft(draft, request)
+            if draft is not None and not issues:
+                response = materialize_h3_draft(draft, request)
                 issues, warnings = validate_h3_response(response, request)
             if response is not None and not issues:
                 return Qwen38BackendResult(
@@ -1938,12 +2167,17 @@ __all__ = [
     "DEFAULT_MODEL",
     "OFFICIAL_H3_SOURCE_FILES",
     "OUTPUT_DIRECTORY_NAME",
+    "QWEN38_RECAPTION_DRAFT_VERSION",
+    "QWEN38_RECAPTION_MATERIALIZER_VERSION",
+    "QWEN38_RECAPTION_POLICY_VERSION",
     "QWEN38_RECAPTION_PROMPT_VERSION",
     "SYSTEM_PROMPT",
     "AudioFactAuditItem",
     "OpenAIQwen38RecaptionBackend",
     "Qwen38BackendFailure",
     "Qwen38BackendResult",
+    "Qwen38DraftShot",
+    "Qwen38H3DraftResponse",
     "Qwen38H3StructuredResponse",
     "Qwen38RecaptionConfig",
     "Qwen38RecaptionManifestCase",
@@ -1955,7 +2189,9 @@ __all__ = [
     "build_audio_facts",
     "build_qwen38_pilot_manifest",
     "build_reference_contract",
+    "materialize_h3_draft",
     "render_h3_prompt",
     "run_qwen38_h3_recaption_pilot",
+    "validate_h3_draft",
     "validate_h3_response",
 ]

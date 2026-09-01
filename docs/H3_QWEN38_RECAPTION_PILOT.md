@@ -48,7 +48,7 @@ was inspected, but is not copied here.
 The local system-prompt version is:
 
 ```text
-h3_qwen38_ref2va_recaption_v2
+h3_qwen38_ref2va_recaption_v3
 ```
 
 The deterministic renderer publishes these exact sections in this exact order:
@@ -118,10 +118,20 @@ Every locked dialogue block must appear exactly once:
 <d>[Language] EXACT_ASR_TEXT</d>
 ```
 
-The deterministic user contract also lists every speech fact with its exact
-source and dialogue. Each local dialogue clause must repeat its literal
-`<Subject N> (Sx)` or unbound `(Sx)` source, including repeated turns by the
-same speaker. Pronouns, roles, and character names cannot replace that source.
+Qwen now returns `r2v.h3.qwen38_recaption_draft.1`. Each shot contains a
+`description_template` with exactly one chronological `[[speech_N]]`
+placeholder per frozen speech fact. Qwen does not serialize `[Shot N]`, speaker
+sources, or `<d>` dialogue. The deterministic `h3_qwen38_materializer_v1`
+renders shot headers and replaces each placeholder with the pipeline-owned
+bound `<Subject N> (Sx)` or unbound `(Sx)` source plus exact locked dialogue.
+The published structured sections and H3 prompt contain only this materialized
+final text; raw sidecars preserve the original model draft.
+
+Missing, duplicate, unknown, or reordered placeholders fail draft validation.
+Direct shot headers, speaker serialization, or dialogue in a model draft also
+fail. The materialized result still passes the complete final H3 validator, so
+reference, retention, speaker, exact-dialogue, and shot syntax gates remain in
+force.
 
 `audio_fact_audit` is restricted to the exact supplied non-speech fact IDs;
 speech IDs are never audit entries. When upstream Audio grounding is
