@@ -28,7 +28,7 @@ from r2v_data_v2.structured_output import (
     parse_structured_json_issues,
 )
 
-QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v3"
+QWEN38_RECAPTION_PROMPT_VERSION = "h3_qwen38_ref2va_recaption_v4"
 QWEN38_RECAPTION_POLICY_VERSION = "h3_qwen38_ref2va_contract_v3"
 QWEN38_RECAPTION_DRAFT_VERSION = "r2v.h3.qwen38_recaption_draft.1"
 QWEN38_RECAPTION_MATERIALIZER_VERSION = "h3_qwen38_materializer_v1"
@@ -432,7 +432,7 @@ class Qwen38BackendProvenance(SchemaModel):
         "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     ] = "target_video_observation_plus_frozen_reference_images_plus_audio_text"
     output_modalities: list[Literal["text"]] = Field(default_factory=lambda: ["text"])
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v3"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v4"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     policy_version: Literal["h3_qwen38_ref2va_contract_v3"] = (
@@ -523,7 +523,7 @@ class Qwen38RecaptionRecord(SchemaModel):
     audio_fact_provenance: dict[str, str] = Field(default_factory=dict)
     audio_grounding_complete: bool
     backend_provenance: Qwen38BackendProvenance
-    prompt_version: Literal["h3_qwen38_ref2va_recaption_v3"] = (
+    prompt_version: Literal["h3_qwen38_ref2va_recaption_v4"] = (
         QWEN38_RECAPTION_PROMPT_VERSION
     )
     official_h3_source_files: list[str] = Field(
@@ -953,11 +953,14 @@ generation tasks, aim for roughly 350-500 English words when observed informatio
 supports it.
 
 Pictures are content references, not first/last frames or keyframes. Use only the
-supplied labels. Summary must begin with the supplied task prefix. Visible
-retention markers are fully_preserved, partially_preserved, attribute_transfer,
-weak_reference. Audio markers are fully_copy, partially_copy, reference,
-weak_reference. Do not use attribute_transfer merely because an image is an
-attribute crop.
+supplied labels. Summary must begin with the supplied task prefix. For the current
+recaption contract, the only allowed visible retention markers are:
+- fully_preserved
+- partially_preserved
+- weak_reference
+attribute_transfer is not assigned by the current conditioning contract and MUST
+NOT be emitted. Audio markers are fully_copy, partially_copy, reference,
+weak_reference.
 
 Insert every supplied [[speech_N]] placeholder exactly once in chronological
 order. A placeholder represents the complete source-and-dialogue clause; never

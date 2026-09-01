@@ -48,7 +48,7 @@ was inspected, but is not copied here.
 The local system-prompt version is:
 
 ```text
-h3_qwen38_ref2va_recaption_v3
+h3_qwen38_ref2va_recaption_v4
 ```
 
 The deterministic renderer publishes these exact sections in this exact order:
@@ -140,10 +140,13 @@ the two rendered Audio fields use fixed conservative wording that says those
 facts are not established. The model cannot infer room tone, ambience, music,
 or other sounds from the target video's visible content.
 
-One structured repair is allowed. Unknown labels, `<Video N>`, changed or
-duplicated dialogue, incompatible task/retention markers, and invented Audio
-facts fail closed. The official 350-500-word generation guidance is recorded as
-a warning rather than an arbitrary hard gate.
+One structured repair is allowed. The current visible retention marker set is
+`fully_preserved`, `partially_preserved`, and `weak_reference`;
+`attribute_transfer` is unassigned by this conditioning contract and remains a
+fail-closed validation error. Unknown labels, `<Video N>`, changed or duplicated
+dialogue, incompatible task/retention markers, and invented Audio facts fail
+closed. The official 350-500-word generation guidance is recorded as a warning
+rather than an arbitrary hard gate.
 
 ## Qwen3.8 Server Runtime
 

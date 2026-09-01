@@ -20,6 +20,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     QWEN38_RECAPTION_MATERIALIZER_VERSION,
     QWEN38_RECAPTION_POLICY_VERSION,
     QWEN38_RECAPTION_PROMPT_VERSION,
+    SYSTEM_PROMPT,
     UNGROUNDED_NON_DIEGETIC_MUSIC,
     UNGROUNDED_OVERALL_SOUNDSCAPE,
     AudioFactAuditItem,
@@ -934,7 +935,50 @@ def test_manifest_helper_and_sidecar_are_read_only(tmp_path: Path) -> None:
 
 
 def test_prompt_version_is_frozen() -> None:
-    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v3"
+    assert QWEN38_RECAPTION_PROMPT_VERSION == "h3_qwen38_ref2va_recaption_v4"
     assert QWEN38_RECAPTION_POLICY_VERSION == "h3_qwen38_ref2va_contract_v3"
     assert QWEN38_RECAPTION_DRAFT_VERSION == "r2v.h3.qwen38_recaption_draft.1"
     assert QWEN38_RECAPTION_MATERIALIZER_VERSION == "h3_qwen38_materializer_v1"
+
+
+def test_prompt_allows_only_current_visible_retention_markers() -> None:
+    allowed_contract = (
+        "the only allowed visible retention markers are:\n"
+        "- fully_preserved\n"
+        "- partially_preserved\n"
+        "- weak_reference"
+    )
+    assert allowed_contract in SYSTEM_PROMPT
+    assert (
+        "attribute_transfer is not assigned by the current conditioning contract "
+        "and MUST\nNOT be emitted"
+    ) in SYSTEM_PROMPT
+    assert "markers are fully_preserved, partially_preserved, attribute_transfer" not in (
+        SYSTEM_PROMPT
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["fully_preserved", "partially_preserved", "weak_reference"],
+)
+def test_current_visible_retention_markers_remain_valid(
+    tmp_path: Path,
+    marker: str,
+) -> None:
+    request = _request(tmp_path)
+    response = _response(request)
+    retention = list(response.retention_analysis)
+    retention[0] = retention[0].replace("fully_preserved", marker)
+    normalized = response.model_copy(update={"retention_analysis": retention})
+    assert _codes(normalized, request) == set()
+
+
+def test_attribute_transfer_remains_fail_closed(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    response = _response(request)
+    retention = list(response.retention_analysis)
+    retention[0] = retention[0].replace("fully_preserved", "attribute_transfer")
+    assert "unassigned_attribute_transfer" in _codes(
+        response.model_copy(update={"retention_analysis": retention}), request
+    )
