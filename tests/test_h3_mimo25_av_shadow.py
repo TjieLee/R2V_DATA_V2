@@ -23,6 +23,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MIMO25_RECORD_VERSION,
     MimoClipJob,
     MimoFailure,
+    MimoRawResponse,
     MimoRecord,
     MimoReferenceImage,
     MimoSegmentEvidence,
@@ -57,6 +58,8 @@ from r2v_data_v2.h3.mimo25_human_review import (
     MimoHumanReviewAnnotation,
     MimoReviewCase,
     MimoReviewStore,
+    _review_case_fingerprint,
+    build_review_cases,
     make_review_server,
     render_review_html,
 )
@@ -1939,6 +1942,74 @@ def _materializer_fixture(
     )
 
 
+def _review_fixture(
+    tmp_path: Path,
+    *,
+    source_sample_count: int = 1,
+) -> SimpleNamespace:
+    fixture = _materializer_fixture(
+        tmp_path,
+        source_sample_count=source_sample_count,
+    )
+    materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+    )
+    raw = MimoRawResponse(
+        clip_uid=fixture.job.clip_uid,
+        request_fingerprint=fixture.job.request_fingerprint,
+        raw_responses=["raw response must not enter review HTML"],
+        diagnostics=[
+            MimoCompletionDiagnostic(
+                input_modality="target_video_with_embedded_audio",
+                finish_reason="stop",
+                usage=MimoUsage(
+                    image_tokens=2,
+                    video_tokens=8,
+                    audio_tokens=3,
+                    reasoning_tokens=0,
+                ),
+                http_attempt_count=1,
+                warnings=["image_tokens_unavailable"],
+            ).model_dump(mode="json")
+        ],
+    )
+    raw_path = fixture.mimo_root / "raw_responses" / f"{fixture.job.clip_uid}.json"
+    raw_path.parent.mkdir()
+    raw_path.write_text(raw.model_dump_json(), encoding="utf-8")
+    return fixture
+
+
+def _shadow_records(fixture: SimpleNamespace) -> list[object]:
+    return [
+        mimo25_materializer.MimoH3ShadowRecord.model_validate(row)
+        for row in (
+            json.loads(line)
+            for line in (fixture.output_root / "records.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+    ]
+
+
+def _write_shadow_records(
+    fixture: SimpleNamespace,
+    records: list[object],
+) -> None:
+    _write_models_jsonl(fixture.output_root / "records.jsonl", records)
+    summary_path = fixture.output_root / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["sample_count"] = len(records)
+    summary["ready_count"] = sum(record.status == "ready" for record in records)
+    summary["failed_count"] = sum(record.status == "failed" for record in records)
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     sample = _sample(tmp_path)
     job = _job_fixture(tmp_path)
@@ -2216,6 +2287,40 @@ class _FailingBackend(_FakeBackend):
         )
 
 
+class _WarningBackend(_FakeBackend):
+    def reconcile(self, job: MimoClipJob, **_: object) -> MimoBackendResult:
+        self.calls.append(job.clip_uid)
+        annotation = _annotation()
+        return MimoBackendResult(
+            annotation=annotation,
+            raw_responses=(annotation.model_dump_json(), annotation.model_dump_json()),
+            diagnostics=(
+                MimoCompletionDiagnostic(
+                    input_modality="target_video_with_embedded_audio",
+                    finish_reason="stop",
+                    usage=MimoUsage(image_tokens=2, video_tokens=4, audio_tokens=3),
+                    http_attempt_count=1,
+                    warnings=[
+                        "image_tokens_unavailable",
+                        "audio_tokens_unavailable",
+                    ],
+                ),
+                MimoCompletionDiagnostic(
+                    input_modality="full_av_recheck_embedded_audio",
+                    finish_reason="stop",
+                    usage=MimoUsage(image_tokens=2, video_tokens=4, audio_tokens=3),
+                    http_attempt_count=1,
+                    warnings=["image_tokens_unavailable"],
+                ),
+            ),
+            model_call_count=2,
+            http_attempt_count=2,
+            http_retry_count=0,
+            recheck_count=1,
+            input_modality="target_video_with_embedded_audio",
+        )
+
+
 def test_shadow_runner_is_atomic_and_does_not_modify_inputs(tmp_path: Path) -> None:
     job = _job_fixture(tmp_path)
     inventory_values = {
@@ -2241,7 +2346,7 @@ def test_shadow_runner_is_atomic_and_does_not_modify_inputs(tmp_path: Path) -> N
             Path(job.reference_images[0].image_artifact_path),
         )
     }
-    backend = _FakeBackend(tmp_path)
+    backend = _WarningBackend(tmp_path)
     output = tmp_path / "mimo-output"
     summary = run_mimo25_av_reconcile(
         inventory=inventory,
@@ -2250,7 +2355,11 @@ def test_shadow_runner_is_atomic_and_does_not_modify_inputs(tmp_path: Path) -> N
     )
     assert backend.calls == ["clip-1"]
     assert summary.ready_count == 1
-    assert summary.usage_totals["image_tokens"] == 2
+    assert summary.usage_totals["image_tokens"] == 4
+    assert summary.diagnostic_warning_counts == {
+        "audio_tokens_unavailable": 1,
+        "image_tokens_unavailable": 2,
+    }
     assert summary.production_binding_modified is False
     assert summary.production_diarization_modified is False
     assert summary.production_asr_modified is False
@@ -2295,6 +2404,212 @@ def test_failed_issue_with_null_field_persists_and_reasoning_is_summarized(
     assert summary.model_call_count == 2
     assert summary.http_attempt_count == 2
     assert summary.responses_with_nonzero_reasoning_tokens == 1
+    assert summary.diagnostic_warning_counts == {
+        "reasoning_tokens_nonzero_under_disabled_thinking": 1
+    }
+
+
+def test_review_cases_validate_provenance_and_include_runtime_diagnostics(
+    tmp_path: Path,
+) -> None:
+    fixture = _review_fixture(tmp_path)
+    cases, _ = build_review_cases(
+        mimo_root=fixture.mimo_root,
+        shadow_root=fixture.output_root,
+    )
+    repeated, _ = build_review_cases(
+        mimo_root=fixture.mimo_root,
+        shadow_root=fixture.output_root,
+    )
+    assert cases[0].record_fingerprint == repeated[0].record_fingerprint
+    assert cases[0].payload["mimo_runtime_diagnostics"] == [
+        {
+            "input_modality": "target_video_with_embedded_audio",
+            "finish_reason": "stop",
+            "usage": {
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "image_tokens": 2,
+                "video_tokens": 8,
+                "audio_tokens": 3,
+                "cached_tokens": None,
+                "reasoning_tokens": 0,
+            },
+            "http_attempt_count": 1,
+            "warnings": ["image_tokens_unavailable"],
+            "request_error": None,
+        }
+    ]
+    assert "raw response must not enter review HTML" not in json.dumps(
+        cases[0].payload
+    )
+
+
+def test_review_fingerprint_changes_with_mimo_or_shadow_record(
+    tmp_path: Path,
+) -> None:
+    fixture = _review_fixture(tmp_path)
+    variants = _shadow_records(fixture)
+    original = _review_case_fingerprint(fixture.record, variants)
+    changed_mimo = _replace_record(fixture.record, model_call_count=2)
+    changed_mimo_fingerprint = _review_case_fingerprint(changed_mimo, variants)
+    assert changed_mimo_fingerprint != original
+    review_root = tmp_path / "mimo-fingerprint-review"
+    original_store = MimoReviewStore(
+        review_root,
+        [MimoReviewCase("clip-1", original, {"clip_uid": "clip-1"})],
+    )
+    original_store.save(
+        MimoHumanReviewAnnotation(
+            clip_uid="clip-1",
+            record_fingerprint=original,
+            decision="PASS",
+            issue_tags=[],
+            notes="current",
+            reviewed_at="2026-09-02T00:00:00Z",
+        )
+    )
+    changed_store = MimoReviewStore(
+        review_root,
+        [
+            MimoReviewCase(
+                "clip-1",
+                changed_mimo_fingerprint,
+                {"clip_uid": "clip-1"},
+            )
+        ],
+    )
+    assert changed_store.current_annotations() == {}
+    shadow_values = variants[0].model_dump(
+        mode="json", exclude={"record_fingerprint"}
+    )
+    shadow_values["warnings"] = ["rerendered"]
+    changed_shadow = mimo25_materializer._record(shadow_values)
+    assert _review_case_fingerprint(fixture.record, [changed_shadow]) != original
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["inventory_fingerprint", "request_fingerprint"],
+)
+def test_review_rejects_stale_av_record_provenance(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    fixture = _review_fixture(tmp_path)
+    changed = _replace_record(fixture.record, **{field: "f" * 64})
+    _write_models_jsonl(fixture.mimo_root / "records.jsonl", [changed])
+    with pytest.raises(ValueError, match="AV annotation provenance mismatch"):
+        build_review_cases(
+            mimo_root=fixture.mimo_root,
+            shadow_root=fixture.output_root,
+        )
+
+
+def test_changed_shadow_fingerprint_makes_old_review_stale(tmp_path: Path) -> None:
+    fixture = _review_fixture(tmp_path)
+    cases, _ = build_review_cases(
+        mimo_root=fixture.mimo_root,
+        shadow_root=fixture.output_root,
+    )
+    review_root = tmp_path / "human-review"
+    store = MimoReviewStore(review_root, cases)
+    store.save(
+        MimoHumanReviewAnnotation(
+            clip_uid="clip-1",
+            record_fingerprint=cases[0].record_fingerprint,
+            decision="PASS",
+            issue_tags=[],
+            notes="current",
+            reviewed_at="2026-09-02T00:00:00Z",
+        )
+    )
+    records = _shadow_records(fixture)
+    values = records[0].model_dump(mode="json", exclude={"record_fingerprint"})
+    values["warnings"] = ["rerendered"]
+    _write_shadow_records(fixture, [mimo25_materializer._record(values)])
+    changed_cases, _ = build_review_cases(
+        mimo_root=fixture.mimo_root,
+        shadow_root=fixture.output_root,
+    )
+    assert changed_cases[0].record_fingerprint != cases[0].record_fingerprint
+    stale_store = MimoReviewStore(review_root, changed_cases)
+    assert stale_store.current_annotations() == {}
+    assert stale_store.publish_derived().stale_annotation_count == 1
+
+
+def test_review_rejects_stale_shadow_record_provenance(tmp_path: Path) -> None:
+    fixture = _review_fixture(tmp_path)
+    records = _shadow_records(fixture)
+    values = records[0].model_dump(mode="json", exclude={"record_fingerprint"})
+    values["source_mimo_record_fingerprint"] = "f" * 64
+    _write_shadow_records(fixture, [mimo25_materializer._record(values)])
+    with pytest.raises(
+        ValueError,
+        match="MiMo review shadow provenance differs from current AV annotation",
+    ):
+        build_review_cases(
+            mimo_root=fixture.mimo_root,
+            shadow_root=fixture.output_root,
+        )
+
+
+@pytest.mark.parametrize("variant_change", ["missing", "duplicate"])
+def test_review_rejects_missing_or_extra_shadow_variant(
+    tmp_path: Path,
+    variant_change: str,
+) -> None:
+    fixture = _review_fixture(tmp_path)
+    records = _shadow_records(fixture)
+    changed = [] if variant_change == "missing" else [records[0], records[0]]
+    _write_shadow_records(fixture, changed)
+    with pytest.raises(
+        ValueError,
+        match="MiMo review shadow provenance differs from current AV annotation",
+    ):
+        build_review_cases(
+            mimo_root=fixture.mimo_root,
+            shadow_root=fixture.output_root,
+        )
+
+
+@pytest.mark.parametrize("summary_change", ["inventory", "count"])
+def test_review_rejects_stale_shadow_summary(
+    tmp_path: Path,
+    summary_change: str,
+) -> None:
+    fixture = _review_fixture(tmp_path)
+    summary_path = fixture.output_root / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary_change == "inventory":
+        summary["source_mimo_inventory_fingerprint"] = "f" * 64
+    else:
+        summary["sample_count"] = 2
+        summary["ready_count"] = 2
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="MiMo review shadow provenance differs from current AV annotation",
+    ):
+        build_review_cases(
+            mimo_root=fixture.mimo_root,
+            shadow_root=fixture.output_root,
+        )
+
+
+def test_review_rejects_runtime_diagnostics_provenance_drift(tmp_path: Path) -> None:
+    fixture = _review_fixture(tmp_path)
+    raw_path = fixture.mimo_root / "raw_responses" / "clip-1.json"
+    raw = MimoRawResponse.model_validate_json(raw_path.read_text(encoding="utf-8"))
+    payload = raw.model_dump(mode="json")
+    payload["request_fingerprint"] = "f" * 64
+    raw_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime diagnostics provenance mismatch"):
+        build_review_cases(
+            mimo_root=fixture.mimo_root,
+            shadow_root=fixture.output_root,
+        )
 
 
 def test_review_persistence_and_stale_fingerprint(tmp_path: Path) -> None:
@@ -2329,6 +2644,14 @@ def test_review_html_contains_required_panels() -> None:
         "references": [],
         "source_segments": [],
         "mimo_record": {"record_fingerprint": "a" * 64, "annotation": None},
+        "mimo_runtime_diagnostics": [
+            {
+                "input_modality": "target_video_with_embedded_audio",
+                "finish_reason": "stop",
+                "usage": {"image_tokens": 2, "video_tokens": 8, "audio_tokens": 3},
+                "warnings": ["image_tokens_unavailable"],
+            }
+        ],
         "shadow_variants": [],
         "legacy_qwen38": {},
     }
@@ -2336,6 +2659,9 @@ def test_review_html_contains_required_panels() -> None:
     assert "speaker_grouping_issue" in page
     assert "MiMo H3 shadow" in page
     assert "Legacy Qwen3.8" in page
+    assert "MiMo runtime diagnostics" in page
+    assert "image_tokens" in page
+    assert "review_case_fingerprint" in page
     assert "Cache-Control" not in page
 
 

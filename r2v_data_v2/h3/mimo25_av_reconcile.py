@@ -308,6 +308,7 @@ class MimoSummary(SchemaModel):
     recheck_count: int = Field(ge=0)
     input_modality_counts: dict[str, int]
     usage_totals: dict[str, int]
+    diagnostic_warning_counts: dict[str, int]
     responses_with_nonzero_reasoning_tokens: int = Field(ge=0)
     correction_counts: dict[str, int]
     audio_event_count: int = Field(ge=0)
@@ -686,6 +687,7 @@ def run_mimo25_av_reconcile(
     failures: list[MimoFailure] = []
     modality_counts: Counter[str] = Counter()
     usage_totals: Counter[str] = Counter()
+    diagnostic_warning_counts: Counter[str] = Counter()
     corrections: Counter[str] = Counter()
     music_counts: Counter[str] = Counter()
     audio_event_count = 0
@@ -778,6 +780,7 @@ def run_mimo25_av_reconcile(
                 for field, value in diagnostic.usage.model_dump(mode="python").items():
                     if value is not None:
                         usage_totals[field] += value
+                diagnostic_warning_counts.update(diagnostic.warnings)
                 if (diagnostic.usage.reasoning_tokens or 0) > 0:
                     nonzero_reasoning_count += 1
             _write_json(raw_root / f"{job.clip_uid}.json", raw.model_dump(mode="json"))
@@ -804,6 +807,9 @@ def run_mimo25_av_reconcile(
             recheck_count=sum(item.recheck_count for item in records),
             input_modality_counts=dict(sorted(modality_counts.items())),
             usage_totals=dict(sorted(usage_totals.items())),
+            diagnostic_warning_counts=dict(
+                sorted(diagnostic_warning_counts.items())
+            ),
             responses_with_nonzero_reasoning_tokens=nonzero_reasoning_count,
             correction_counts=dict(sorted(corrections.items())),
             audio_event_count=audio_event_count,
