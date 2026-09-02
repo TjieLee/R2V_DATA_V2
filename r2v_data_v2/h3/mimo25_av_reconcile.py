@@ -37,11 +37,11 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
-MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.2"
-MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.2"
-MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.2"
-MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.2"
-MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.2"
+MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.3"
+MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.3"
+MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.3"
+MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.3"
+MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.3"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
 MIMO25_INVENTORY_SCOPE = "current_diarization_asr_target_inventory"
 
@@ -205,7 +205,7 @@ class MimoCaseManifest(SchemaModel):
 
 
 class MimoInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_inventory.2"] = MIMO25_INVENTORY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_inventory.3"] = MIMO25_INVENTORY_VERSION
     inventory_scope: Literal["current_diarization_asr_target_inventory"] = (
         MIMO25_INVENTORY_SCOPE
     )
@@ -235,19 +235,19 @@ class MimoInventory(SchemaModel):
 
 
 class MimoFailure(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_failure.2"] = MIMO25_FAILURE_VERSION
+    schema_version: Literal["r2v.h3.mimo25_failure.3"] = MIMO25_FAILURE_VERSION
     clip_uid: str
     code: str
     reason: str
     attempt_count: int = Field(ge=0)
     http_attempt_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
-    repair_count: int = Field(ge=0)
+    recheck_count: int = Field(ge=0, le=1)
     issues: list[dict[str, str | None]]
 
 
 class MimoRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_record.2"] = MIMO25_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_record.3"] = MIMO25_RECORD_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -263,7 +263,7 @@ class MimoRecord(SchemaModel):
     http_attempt_count: int = Field(ge=0)
     raw_response_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
-    repair_count: int = Field(ge=0)
+    recheck_count: int = Field(ge=0, le=1)
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -280,7 +280,7 @@ class MimoRecord(SchemaModel):
 
 
 class MimoRawResponse(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_raw_response.2"] = MIMO25_RAW_VERSION
+    schema_version: Literal["r2v.h3.mimo25_raw_response.3"] = MIMO25_RAW_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_responses: list[str]
@@ -288,7 +288,7 @@ class MimoRawResponse(SchemaModel):
 
 
 class MimoSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_summary.2"] = MIMO25_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_summary.3"] = MIMO25_SUMMARY_VERSION
     inventory_scope: Literal["current_diarization_asr_target_inventory"] = (
         MIMO25_INVENTORY_SCOPE
     )
@@ -305,7 +305,7 @@ class MimoSummary(SchemaModel):
     model_call_count: int = Field(ge=0)
     http_attempt_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
-    repair_count: int = Field(ge=0)
+    recheck_count: int = Field(ge=0)
     input_modality_counts: dict[str, int]
     usage_totals: dict[str, int]
     responses_with_nonzero_reasoning_tokens: int = Field(ge=0)
@@ -724,7 +724,7 @@ def run_mimo25_av_reconcile(
                     "http_attempt_count": result.http_attempt_count,
                     "raw_response_count": len(result.raw_responses),
                     "http_retry_count": result.http_retry_count,
-                    "repair_count": result.repair_count,
+                    "recheck_count": result.recheck_count,
                 }
                 records.append(_record(values))
                 modality_counts[result.input_modality] += 1
@@ -746,7 +746,7 @@ def run_mimo25_av_reconcile(
                     attempt_count=exc.model_call_count,
                     http_attempt_count=exc.http_attempt_count,
                     http_retry_count=exc.http_retry_count,
-                    repair_count=exc.repair_count,
+                    recheck_count=exc.recheck_count,
                     issues=[item.to_dict() for item in exc.issues],
                 )
                 failures.append(failure)
@@ -764,7 +764,7 @@ def run_mimo25_av_reconcile(
                     "http_attempt_count": exc.http_attempt_count,
                     "raw_response_count": len(exc.raw_responses),
                     "http_retry_count": exc.http_retry_count,
-                    "repair_count": exc.repair_count,
+                    "recheck_count": exc.recheck_count,
                 }
                 records.append(_record(values))
                 case_diagnostics = exc.diagnostics
@@ -801,7 +801,7 @@ def run_mimo25_av_reconcile(
             model_call_count=sum(item.model_call_count for item in records),
             http_attempt_count=sum(item.http_attempt_count for item in records),
             http_retry_count=sum(item.http_retry_count for item in records),
-            repair_count=sum(item.repair_count for item in records),
+            recheck_count=sum(item.recheck_count for item in records),
             input_modality_counts=dict(sorted(modality_counts.items())),
             usage_totals=dict(sorted(usage_totals.items())),
             responses_with_nonzero_reasoning_tokens=nonzero_reasoning_count,

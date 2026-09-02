@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         case_manifest_path=arguments.case_manifest,
         case_manifest=(known_case_manifest() if arguments.known_case_pilot else None),
     )
-    output_root = paths.root / "mimo25_av_reconcile_v2"
+    output_root = paths.root / "mimo25_av_reconcile_v3"
     if arguments.dry_run:
         result = {
             "dry_run": True,

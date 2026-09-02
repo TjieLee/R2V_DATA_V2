@@ -8,6 +8,7 @@ import mimetypes
 import random
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -24,15 +25,16 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v2"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v2"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.2"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.2"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v2"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v3"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v3"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.3"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.3"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v3"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 
 _GROUP = re.compile(r"g([1-9]\d*)")
 _PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
+_AUDIO_EVENT_PLACEHOLDER = re.compile(r"\[\[audio_event:([^\[\]\r\n]+)\]\]")
 _PICTURE_OR_SUBJECT = re.compile(r"<(Picture|Subject) (\d+)>")
 _PIPELINE_OWNED = re.compile(
     r"<Audio \d+>|<Video \d+>|\(S\d+\)|<d>|</d>|\[Shot \d+\]"
@@ -55,6 +57,9 @@ _ALLOWED_RETENTION_MARKERS = {
     "partially_preserved",
     "weak_reference",
 }
+_ALLOWED_RETENTION_MARKER_OCCURRENCE = re.compile(
+    r"\b(?:fully_preserved|partially_preserved|weak_reference)\b"
+)
 _TRUNCATED_FINISH_REASONS = {
     "length",
     "max_tokens",
@@ -97,6 +102,17 @@ def _compact_json(value: object) -> str:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _significant_transcript(value: str) -> bool:
+    normalized = _normalized_text(value)
+    cjk_count = sum("\u3400" <= character <= "\u9fff" for character in normalized)
+    alphanumeric_count = sum(character.isalnum() for character in normalized)
+    return cjk_count >= 4 or alphanumeric_count >= 12
 
 
 def sha256_file(path: Path) -> str:
@@ -195,6 +211,7 @@ class MimoSegmentDecision(SchemaModel):
 
 
 class MimoAudioEvent(SchemaModel):
+    event_id: str = Field(pattern=r"^ae[1-9]\d*$")
     approximate_start_time: float = Field(ge=0, allow_inf_nan=False)
     approximate_end_time: float = Field(gt=0, allow_inf_nan=False)
     category: Literal[
@@ -218,6 +235,16 @@ class MimoAudioEvent(SchemaModel):
             raise ValueError("MiMo Audio event must have positive duration")
         if not self.description.strip():
             raise ValueError("MiMo Audio event description must not be empty")
+        if (
+            re.search(r"\b\d{1,2}:\d{2}(?:\.\d+)?\b", self.description)
+            or _PIPELINE_OWNED.search(self.description)
+            or _PICTURE_OR_SUBJECT.search(self.description)
+            or _PLACEHOLDER.search(self.description)
+            or _AUDIO_EVENT_PLACEHOLDER.search(self.description)
+            or "[[" in self.description
+            or "]]" in self.description
+        ):
+            raise ValueError("MiMo Audio event description contains forbidden syntax")
         return self
 
 
@@ -238,7 +265,7 @@ class MimoAudioSemantics(SchemaModel):
     overall_soundscape: StrictStr | None = None
     non_diegetic_music_status: Literal["present", "absent", "unknown"]
     non_diegetic_music: StrictStr | None = None
-    audiovisual_summary: StrictStr | None = None
+    audiovisual_summary: StrictStr
 
     @model_validator(mode="after")
     def validate_semantics(self) -> MimoAudioSemantics:
@@ -247,14 +274,25 @@ class MimoAudioSemantics(SchemaModel):
                 raise ValueError("present music requires a concise description")
         elif self.non_diegetic_music is not None:
             raise ValueError("absent or unknown music cannot publish a description")
-        rows = [event.model_dump(mode="json") for event in self.temporal_non_speech_events]
+        events = self.temporal_non_speech_events
+        rows = [event.model_dump(mode="json") for event in events]
         if len({_compact_json(row) for row in rows}) != len(rows):
             raise ValueError("exact duplicate MiMo Audio events are forbidden")
+        event_ids = [event.event_id for event in events]
+        if event_ids != [f"ae{index}" for index in range(1, len(events) + 1)]:
+            raise ValueError("MiMo Audio event IDs must be contiguous")
+        event_order = [
+            (event.approximate_start_time, event.approximate_end_time, event.event_id)
+            for event in events
+        ]
+        if event_order != sorted(event_order):
+            raise ValueError("MiMo Audio events must be chronological")
         groups = [item.speaker_group for item in self.speaker_delivery]
         if len(groups) != len(set(groups)):
             raise ValueError("MiMo speaker delivery groups must be unique")
-        optional_strings = (self.overall_soundscape, self.audiovisual_summary)
-        if any(value is not None and not value.strip() for value in optional_strings):
+        if not self.audiovisual_summary.strip():
+            raise ValueError("MiMo audiovisual summary must not be empty")
+        if self.overall_soundscape is not None and not self.overall_soundscape.strip():
             raise ValueError("optional MiMo Audio text must be non-empty or null")
         return self
 
@@ -313,7 +351,7 @@ class MimoAnnotationWarning(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.2"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.3"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     audio_semantics: MimoAudioSemantics
     h3_draft: MimoH3Draft
@@ -325,7 +363,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.2"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.3"] = MIMO25_BACKEND_VERSION
     backend: Literal["xiaomi_openai_compatible"] = "xiaomi_openai_compatible"
     model: Literal["mimo-v2.5"] = MIMO25_MODEL
     base_url: str
@@ -339,20 +377,20 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v2"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v3"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v2"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v3"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.2"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.3"] = (
         MIMO25_SCHEMA_VERSION
     )
-    materializer_version: Literal["h3_mimo25_materializer_v2"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v3"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     http_max_attempts: int = Field(ge=1, le=5)
-    structured_repair_retries: Literal[1] = 1
+    full_av_recheck_limit: Literal[1] = 1
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -381,7 +419,8 @@ class MimoCompletionDiagnostic(SchemaModel):
     input_modality: Literal[
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
-        "structure_only_repair",
+        "full_av_recheck_embedded_audio",
+        "full_av_recheck_with_canonical_audio",
     ]
     finish_reason: str | None = None
     usage: MimoUsage
@@ -398,7 +437,7 @@ class MimoBackendResult:
     model_call_count: int
     http_attempt_count: int
     http_retry_count: int
-    repair_count: int
+    recheck_count: int
     input_modality: Literal[
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
@@ -417,7 +456,7 @@ class MimoBackendFailure(ValueError):
         model_call_count: int = 0,
         http_attempt_count: int = 0,
         http_retry_count: int = 0,
-        repair_count: int = 0,
+        recheck_count: int = 0,
     ) -> None:
         super().__init__(reason)
         self.code = code
@@ -428,7 +467,7 @@ class MimoBackendFailure(ValueError):
         self.model_call_count = model_call_count
         self.http_attempt_count = http_attempt_count
         self.http_retry_count = http_retry_count
-        self.repair_count = repair_count
+        self.recheck_count = recheck_count
 
 
 class MimoBackendJob(Protocol):
@@ -516,7 +555,7 @@ class MimoBackendConfig:
             or self.timeout_seconds <= 0
             or not 1 <= self.http_max_attempts <= 5
         ):
-            raise ValueError("MiMo backend configuration violates the v2 contract")
+            raise ValueError("MiMo backend configuration violates the v3 contract")
 
     def provenance(self) -> MimoBackendProvenance:
         values = {
@@ -539,7 +578,7 @@ class MimoBackendConfig:
             "annotation_schema_version": MIMO25_SCHEMA_VERSION,
             "materializer_version": MIMO25_MATERIALIZER_VERSION,
             "http_max_attempts": self.http_max_attempts,
-            "structured_repair_retries": 1,
+            "full_av_recheck_limit": 1,
         }
         return MimoBackendProvenance(
             **values,
@@ -565,7 +604,7 @@ Return exactly one decision for every supplied segment ID, no more and no fewer.
 Do NOT interpret more than one audible vocal event as evidence that an upstream segment is invalid. A valid segment may include discourse particles or interjections from its primary speaker; sighing, breathing, laughter, coughing, hesitation, or other non-lexical vocalization from the same speaker; a brief non-speech vocalization from another person; overlapping secondary speech; or sequential speech by two speakers. Short particles such as 嗯, 啊, 唉, 哦, 诶, uh, um, hm, oh, and ah do not by themselves prove a speaker change. same_speaker_nonlexical preserves the group. secondary_non_speech_vocalization preserves primary dialogue ownership. overlapping_secondary_speech and sequential_multi_speaker_speech preserve the source segment but require needs_acoustic_refinement; never invent an internal change timestamp.
 
 PASS 2 - AV AUDIO SEMANTICS
-Describe only meaningfully audible non-speech events, delivery, soundscape, and music. Synchronized video may ground an audible door close, cup placement, or other source; visible action alone cannot establish sound. Use generic impact/clink when the source is uncertain. Coalesce repeated acoustically similar micro-events from one action into one event with pattern=repeated. Split only genuinely distinct sources, meanings, or times. Do not guess HVAC, room acoustics, ventilation, machinery, or material source from scene plausibility. Music requires audible musical structure; visual context may distinguish diegetic from non-diegetic music. Speaker delivery describes only audible pace, energy, loudness, articulation, hesitation, questioning, shouting, whispering, rhythm, and pauses, never transcript, gender, age, nationality, role, or identity.
+Describe only meaningfully audible non-speech events, delivery, soundscape, and music. Synchronized video may ground an audible door close, cup placement, or other source; visible action alone cannot establish sound. Use generic impact/clink when the source is uncertain. Coalesce repeated acoustically similar micro-events from one action into one event with pattern=repeated. Split only genuinely distinct sources, meanings, or times. Assign every temporal_non_speech_event a stable contiguous event_id ae1, ae2, ... in chronological order. Each event description must be one concise standalone English audible clause with no timestamp text, transcript, reference label, speaker syntax, dialogue markup, or placeholder. Do not guess HVAC, room acoustics, ventilation, machinery, or material source from scene plausibility. Music requires audible musical structure; visual context may distinguish diegetic from non-diegetic music. Speaker delivery describes only audible pace, energy, loudness, articulation, hesitation, questioning, shouting, whispering, rhythm, and pauses, never transcript, gender, age, nationality, role, or identity. For every resolved primary speaker group owning an authoritative transcribed segment, speaker_delivery must include that group exactly once; never emit an unknown group.
 
 audiovisual_summary is a concise summary of directly observed audiovisual context. It must not quote or paraphrase dialogue and must not infer plot, relationship, intention, causality, or psychology.
 
@@ -580,8 +619,12 @@ The only allowed visual retention markers are fully_preserved, partially_preserv
 
 Each supplied transcribed segment must appear exactly once as [[segment:<segment_id>]] in shot description_template fields, in authoritative chronological order and at its observed temporal position. A placeholder represents the complete speech clause. Never prefix it with says, speaks, asks, replies, shouts, whispers, "the woman says", "the man replies", a character name, a pronoun, or a role. Do not place a placeholder in subject_definitions, summary, or visual_retention_analysis. Do not copy dialogue.
 
+Insert every emitted Audio event exactly once as [[audio_event:<event_id>]] at its approximate observed position in the appropriate shot. Audio-event placeholders must follow event chronological order, may overlap speech placeholders, and are allowed only in shot description_template fields. Each placeholder represents the complete grounded Audio-event clause. Do not restate or paraphrase that event elsewhere in the shot.
+
+Every supplied <Subject N> must have exactly one visual_retention_analysis line beginning with that exact Subject label and containing exactly one allowed retention marker. Do not use Picture labels as retention owners and do not emit unknown or duplicate Subject retention lines.
+
 PASS 4 - CONSISTENCY CHECK BEFORE JSON
-Check: every source segment exactly once; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; every transcribed placeholder exactly once in chronological order and only in shots; all supplied Subject definitions retain their source Pictures; no pipeline-owned syntax; JSON only with no markdown or extra fields."""
+Check: every source segment exactly once; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; every transcribed placeholder exactly once in chronological order and only in shots; every Audio-event placeholder exactly once in event order and only in shots; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; no pipeline-owned syntax; JSON only with no markdown or extra fields."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -604,7 +647,8 @@ def _completion_diagnostic(
     modality: Literal[
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
-        "structure_only_repair",
+        "full_av_recheck_embedded_audio",
+        "full_av_recheck_with_canonical_audio",
     ],
     http_attempt_count: int,
 ) -> MimoCompletionDiagnostic:
@@ -643,11 +687,49 @@ def _completion_diagnostic(
     )
 
 
-def _finish_reason_is_truncated(value: str | None) -> bool:
+def _validate_finish_reason(diagnostic: MimoCompletionDiagnostic) -> None:
+    value = diagnostic.finish_reason
     if value is None:
-        return False
+        diagnostic.warnings.append("finish_reason_unavailable")
+        return
     normalized = value.strip().lower().replace("-", "_")
-    return normalized in _TRUNCATED_FINISH_REASONS or "token_limit" in normalized
+    if normalized == "stop":
+        return
+    if normalized in _TRUNCATED_FINISH_REASONS or "token_limit" in normalized:
+        raise MimoBackendFailure(
+            code="mimo_output_truncated",
+            reason="MiMo AV response ended at the token limit",
+        )
+    raise MimoBackendFailure(
+        code="mimo_incomplete_finish_reason",
+        reason=f"MiMo AV response did not finish normally: {value}",
+    )
+
+
+def _validate_av_observation_usage(
+    diagnostic: MimoCompletionDiagnostic,
+    *,
+    require_explicit_audio: bool,
+) -> None:
+    if diagnostic.usage.video_tokens == 0:
+        raise MimoBackendFailure(
+            code="mimo_target_video_not_observed",
+            reason="MiMo reported zero target-video tokens",
+        )
+    if diagnostic.usage.video_tokens is None:
+        diagnostic.warnings.append("video_tokens_unavailable")
+    if require_explicit_audio:
+        if diagnostic.usage.audio_tokens == 0:
+            raise MimoBackendFailure(
+                code="mimo_target_audio_not_observed",
+                reason="MiMo reported zero explicit canonical-audio tokens",
+            )
+        if diagnostic.usage.audio_tokens is None:
+            diagnostic.warnings.append(
+                "audio_tokens_unavailable_after_explicit_fallback"
+            )
+    elif diagnostic.usage.audio_tokens is None:
+        diagnostic.warnings.append("audio_tokens_unavailable")
 
 
 class _MimoHTTPAttemptsExhausted(RuntimeError):
@@ -671,6 +753,7 @@ def validate_annotation(
     *,
     segment_ids: list[str],
     transcribed_segment_ids: list[str],
+    authoritative_transcripts: list[str],
     allowed_entity_ids: set[str],
     allowed_reference_labels: set[str],
     reference_subjects: list[Any],
@@ -767,6 +850,25 @@ def validate_annotation(
                     delivery.speaker_group,
                 )
             )
+    required_delivery_groups = {
+        item.primary_speaker_group
+        for item in decisions
+        if item.segment_id in transcribed_segment_ids
+        and item.resolution == "resolved"
+        and item.primary_speaker_group is not None
+    }
+    actual_delivery_groups = {
+        item.speaker_group for item in annotation.audio_semantics.speaker_delivery
+    }
+    missing_delivery_groups = sorted(required_delivery_groups - actual_delivery_groups)
+    if missing_delivery_groups:
+        issues.append(
+            ValidationIssue(
+                "missing_resolved_transcribed_speaker_delivery",
+                "audio_semantics.speaker_delivery",
+                str(missing_delivery_groups),
+            )
+        )
     for event in annotation.audio_semantics.temporal_non_speech_events:
         if event.approximate_end_time > target_duration_seconds + 1e-6:
             issues.append(
@@ -795,6 +897,57 @@ def validate_annotation(
                 "transcribed segment placeholders must appear exactly once in order",
             )
         )
+    event_placeholders = [
+        match.group(1)
+        for template in shot_templates
+        for match in _AUDIO_EVENT_PLACEHOLDER.finditer(template)
+    ]
+    expected_event_ids = [
+        event.event_id
+        for event in annotation.audio_semantics.temporal_non_speech_events
+    ]
+    event_counts = {
+        item: event_placeholders.count(item) for item in set(event_placeholders)
+    }
+    unknown_events = sorted(set(event_placeholders) - set(expected_event_ids))
+    missing_events = [item for item in expected_event_ids if event_counts.get(item, 0) == 0]
+    duplicate_events = sorted(
+        item for item, count in event_counts.items() if count > 1
+    )
+    if unknown_events:
+        issues.append(
+            ValidationIssue(
+                "unknown_audio_event_placeholder",
+                "h3_draft.shots",
+                str(unknown_events),
+            )
+        )
+    if missing_events:
+        issues.append(
+            ValidationIssue(
+                "missing_audio_event_placeholder",
+                "h3_draft.shots",
+                str(missing_events),
+            )
+        )
+    if duplicate_events:
+        issues.append(
+            ValidationIssue(
+                "duplicate_audio_event_placeholder",
+                "h3_draft.shots",
+                str(duplicate_events),
+            )
+        )
+    if not unknown_events and not missing_events and not duplicate_events and (
+        event_placeholders != expected_event_ids
+    ):
+        issues.append(
+            ValidationIssue(
+                "audio_event_placeholder_order_mismatch",
+                "h3_draft.shots",
+                "Audio-event placeholders must follow chronological event order",
+            )
+        )
     non_shot_text = "\n".join(
         (
             *draft.subject_definitions,
@@ -808,6 +961,14 @@ def validate_annotation(
                 "speech_placeholder_outside_shot",
                 "h3_draft",
                 "speech placeholders are allowed only in shot descriptions",
+            )
+        )
+    if _AUDIO_EVENT_PLACEHOLDER.search(non_shot_text):
+        issues.append(
+            ValidationIssue(
+                "audio_event_placeholder_outside_shot",
+                "h3_draft",
+                "Audio-event placeholders are allowed only in shot descriptions",
             )
         )
     for shot in draft.shots:
@@ -890,6 +1051,42 @@ def validate_annotation(
                 str(unknown_markers),
             )
         )
+    supplied_subject_labels = {str(item.subject_label) for item in reference_subjects}
+    retention_subject_labels: list[str] = []
+    for line in draft.visual_retention_analysis:
+        match = re.match(r"^\s*(<Subject [1-9]\d*>)", line)
+        if match is not None:
+            retention_subject_labels.append(match.group(1))
+    unknown_retention_subjects = sorted(
+        set(retention_subject_labels) - supplied_subject_labels
+    )
+    if unknown_retention_subjects:
+        issues.append(
+            ValidationIssue(
+                "unknown_subject_retention",
+                "h3_draft.visual_retention_analysis",
+                str(unknown_retention_subjects),
+            )
+        )
+    for subject_label in sorted(supplied_subject_labels):
+        rows = [
+            line
+            for line in draft.visual_retention_analysis
+            if line.lstrip().startswith(subject_label)
+        ]
+        markers = [
+            marker
+            for line in rows
+            for marker in _ALLOWED_RETENTION_MARKER_OCCURRENCE.findall(line)
+        ]
+        if len(rows) != 1 or len(markers) != 1:
+            issues.append(
+                ValidationIssue(
+                    "subject_retention_contract_mismatch",
+                    "h3_draft.visual_retention_analysis",
+                    f"{subject_label} requires exactly one allowed retention line",
+                )
+            )
     for subject in reference_subjects:
         subject_label = str(subject.subject_label)
         expected_pictures = set(subject.source_picture_labels)
@@ -915,6 +1112,37 @@ def validate_annotation(
                     f"{subject_label} must retain exactly its source Pictures",
                 )
             )
+    model_owned_shots = [
+        _AUDIO_EVENT_PLACEHOLDER.sub(
+            " ", _PLACEHOLDER.sub(" ", shot.description_template)
+        )
+        for shot in draft.shots
+    ]
+    model_owned_text = _normalized_text(
+        "\n".join(
+            (
+                *draft.subject_definitions,
+                draft.summary,
+                *draft.visual_retention_analysis,
+                *model_owned_shots,
+            )
+        )
+    )
+    for transcript in authoritative_transcripts:
+        normalized_transcript = _normalized_text(transcript)
+        if (
+            _significant_transcript(transcript)
+            and normalized_transcript
+            and normalized_transcript in model_owned_text
+        ):
+            issues.append(
+                ValidationIssue(
+                    "draft_contains_authoritative_transcript",
+                    "h3_draft",
+                    "model-authored draft copies exact authoritative ASR text",
+                )
+            )
+            break
     return issues
 
 
@@ -1082,14 +1310,24 @@ class OpenAIMimo25Backend:
         job: MimoBackendJob,
         *,
         include_audio_fallback: bool,
+        recheck_prompt: str | None = None,
     ) -> tuple[str, MimoCompletionDiagnostic, int]:
-        modality = (
-            "target_video_plus_canonical_full_audio_fallback"
-            if include_audio_fallback
-            else "target_video_with_embedded_audio"
-        )
+        if recheck_prompt is not None:
+            modality = (
+                "full_av_recheck_with_canonical_audio"
+                if include_audio_fallback
+                else "full_av_recheck_embedded_audio"
+            )
+        else:
+            modality = (
+                "target_video_plus_canonical_full_audio_fallback"
+                if include_audio_fallback
+                else "target_video_with_embedded_audio"
+            )
         content = self._media_content(job, include_audio_fallback=include_audio_fallback)
-        content.append({"type": "text", "text": self._prompt(job)})
+        content.append(
+            {"type": "text", "text": recheck_prompt or self._prompt(job)}
+        )
         payload: dict[str, object] = {
             "model": self.config.model,
             "messages": [
@@ -1125,6 +1363,30 @@ class OpenAIMimo25Backend:
             http_attempt_count=attempts,
         ), retries
 
+    def _full_av_recheck_prompt(
+        self,
+        job: MimoBackendJob,
+        *,
+        invalid_response: str,
+        issues: list[ValidationIssue],
+    ) -> str:
+        return (
+            "Reinspect the SAME audiovisual evidence. Do not merely edit fields to "
+            "satisfy validation. Resolve speaker/entity/audio-semantic contradictions "
+            "from the audiovisual evidence while preserving all authoritative DiariZen "
+            "timing and Qwen3-ASR text. Do not change segment boundaries, sample "
+            "boundaries, ASR text, ASR language, or the reference inventory. Return "
+            "exactly one compact JSON object with no markdown or extra fields."
+            "\nCOMPACT AUTHORITATIVE TASK CONTRACT: "
+            + _compact_json(self.build_compact_task_contract(job))
+            + "\nSCHEMA: "
+            + _compact_json(MimoAVAnnotationDraft.model_json_schema())
+            + "\nVALIDATION ISSUES: "
+            + _compact_json([item.to_dict() for item in issues])
+            + "\nPREVIOUS INVALID RESPONSE: "
+            + invalid_response
+        )
+
     def reconcile(
         self,
         job: MimoBackendJob,
@@ -1136,254 +1398,136 @@ class OpenAIMimo25Backend:
     ) -> MimoBackendResult:
         raw_responses: list[str] = []
         diagnostics: list[MimoCompletionDiagnostic] = []
-        issues: list[ValidationIssue] = []
         modality: Literal[
             "target_video_with_embedded_audio",
             "target_video_plus_canonical_full_audio_fallback",
         ] = "target_video_with_embedded_audio"
-        attempted_modality: Literal[
-            "target_video_with_embedded_audio",
-            "target_video_plus_canonical_full_audio_fallback",
-            "structure_only_repair",
-        ] = modality
-        try:
-            raw, diagnostic, _ = self._request(
-                job, include_audio_fallback=False
-            )
-            raw_responses.append(raw)
-            diagnostics.append(diagnostic)
-            if _finish_reason_is_truncated(diagnostic.finish_reason):
-                raise MimoBackendFailure(
-                    code="mimo_output_truncated",
-                    reason="MiMo primary AV response ended at the token limit",
-                    raw_responses=tuple(raw_responses),
-                    diagnostics=tuple(diagnostics),
-                    model_call_count=len(diagnostics),
-                    http_attempt_count=sum(
-                        item.http_attempt_count for item in diagnostics
-                    ),
-                    http_retry_count=sum(
-                        item.http_attempt_count - 1 for item in diagnostics
-                    ),
-                )
-            if diagnostic.usage.audio_tokens == 0:
-                attempted_modality = (
-                    "target_video_plus_canonical_full_audio_fallback"
-                )
-                raw, diagnostic, _ = self._request(
-                    job, include_audio_fallback=True
-                )
-                raw_responses.append(raw)
-                diagnostics.append(diagnostic)
-                modality = "target_video_plus_canonical_full_audio_fallback"
-                if _finish_reason_is_truncated(diagnostic.finish_reason):
-                    raise MimoBackendFailure(
-                        code="mimo_output_truncated",
-                        reason="MiMo audio-fallback AV response ended at the token limit",
-                        raw_responses=tuple(raw_responses),
-                        diagnostics=tuple(diagnostics),
-                        model_call_count=len(diagnostics),
-                        http_attempt_count=sum(
-                            item.http_attempt_count for item in diagnostics
-                        ),
-                        http_retry_count=sum(
-                            item.http_attempt_count - 1 for item in diagnostics
-                        ),
-                    )
-        except MimoBackendFailure:
-            raise
-        except (_MimoHTTPAttemptsExhausted, _MimoResponseContractError) as exc:
-            diagnostics.append(
-                MimoCompletionDiagnostic(
-                    input_modality=attempted_modality,
-                    usage=MimoUsage(),
-                    http_attempt_count=exc.attempts,
-                    warnings=["http_request_failed"],
-                    request_error=str(exc),
-                )
-            )
-            raise MimoBackendFailure(
-                code="mimo_request_failed",
-                reason=str(exc),
+        recheck_count = 0
+
+        def contextual_failure(
+            failure: MimoBackendFailure,
+            *,
+            validation_issues: list[ValidationIssue] | None = None,
+        ) -> MimoBackendFailure:
+            return MimoBackendFailure(
+                code=failure.code,
+                reason=failure.reason,
                 raw_responses=tuple(raw_responses),
                 diagnostics=tuple(diagnostics),
+                issues=tuple(validation_issues or failure.issues),
                 model_call_count=len(diagnostics),
                 http_attempt_count=sum(item.http_attempt_count for item in diagnostics),
                 http_retry_count=sum(
                     item.http_attempt_count - 1 for item in diagnostics
                 ),
-            ) from exc.original
-        except Exception as exc:
-            raise MimoBackendFailure(
-                code="mimo_request_failed",
-                reason=f"{type(exc).__name__}: {exc}",
-                raw_responses=tuple(raw_responses),
-                diagnostics=tuple(diagnostics),
-                model_call_count=len(diagnostics) + 1,
-                http_attempt_count=sum(
-                    item.http_attempt_count for item in diagnostics
-                )
-                + 1,
-                http_retry_count=sum(
-                    item.http_attempt_count - 1 for item in diagnostics
-                ),
-            ) from exc
-        annotation, issues = parse_structured_json_issues(
-            raw_responses[-1], MimoAVAnnotationDraft
-        )
-        if annotation is not None:
-            issues = validate_annotation(
-                annotation,
-                segment_ids=segment_ids,
-                transcribed_segment_ids=transcribed_segment_ids,
-                allowed_entity_ids=allowed_entity_ids,
-                allowed_reference_labels=allowed_reference_labels,
-                reference_subjects=job.reference_subjects,
-                target_duration_seconds=job.target_duration_seconds,
+                recheck_count=recheck_count,
             )
-        if annotation is None or issues:
-            repair_prompt = (
-                "Repair only the previous response's JSON structure and listed contract errors. "
-                "DO NOT reinterpret missing audiovisual evidence. DO NOT add new semantic facts. "
-                "Do not change transcript evidence, timestamps, segment IDs, entities, speaker "
-                "meaning, or the authoritative task contract. Return one JSON object only."
-                "\nCOMPACT AUTHORITATIVE TASK CONTRACT: "
-                + _compact_json(self.build_compact_task_contract(job))
-                + "\nSCHEMA: "
-                + _compact_json(MimoAVAnnotationDraft.model_json_schema())
-                + "\nISSUES: "
-                + _compact_json([item.to_dict() for item in issues])
-                + "\nINVALID JSON: "
-                + raw_responses[-1]
+
+        def perform_request(
+            *,
+            include_audio: bool,
+            recheck_prompt: str | None = None,
+        ) -> tuple[str, MimoCompletionDiagnostic]:
+            attempted_modality = (
+                "full_av_recheck_with_canonical_audio"
+                if recheck_prompt is not None and include_audio
+                else "full_av_recheck_embedded_audio"
+                if recheck_prompt is not None
+                else "target_video_plus_canonical_full_audio_fallback"
+                if include_audio
+                else "target_video_with_embedded_audio"
             )
-            payload = {
-                "model": self.config.model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": repair_prompt},
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": self.config.temperature,
-                "max_completion_tokens": self.config.max_completion_tokens,
-                "stream": False,
-                "extra_body": {"thinking": {"type": "disabled"}},
-            }
-            repair_attempts = 0
-            _repair_retries = 0
             try:
-                completion, repair_attempts, _repair_retries = self._call(payload)
-                choices = _value(completion, "choices")
-                if not isinstance(choices, list) or not choices:
-                    raise TypeError("MiMo repair response has no choices")
-                choice = choices[0]
-                raw = _value(_value(choice, "message"), "content")
-                if not isinstance(raw, str):
-                    raise TypeError("MiMo repair response must be text")
-                raw_responses.append(raw)
-                diagnostics.append(
-                    _completion_diagnostic(
-                        completion,
-                        choice,
-                        modality="structure_only_repair",
-                        http_attempt_count=repair_attempts,
-                    )
+                raw, diagnostic, _ = self._request(
+                    job,
+                    include_audio_fallback=include_audio,
+                    recheck_prompt=recheck_prompt,
                 )
-                if _finish_reason_is_truncated(diagnostics[-1].finish_reason):
-                    raise MimoBackendFailure(
-                        code="mimo_output_truncated",
-                        reason="MiMo structure-repair response ended at the token limit",
-                        raw_responses=tuple(raw_responses),
-                        diagnostics=tuple(diagnostics),
-                        issues=tuple(issues),
-                        model_call_count=len(diagnostics),
-                        http_attempt_count=sum(
-                            item.http_attempt_count for item in diagnostics
-                        ),
-                        http_retry_count=sum(
-                            item.http_attempt_count - 1 for item in diagnostics
-                        ),
-                        repair_count=1,
-                    )
-            except MimoBackendFailure:
-                raise
-            except _MimoHTTPAttemptsExhausted as exc:
+            except MimoBackendFailure as failure:
+                raise contextual_failure(failure) from failure
+            except (_MimoHTTPAttemptsExhausted, _MimoResponseContractError) as exc:
                 diagnostics.append(
                     MimoCompletionDiagnostic(
-                        input_modality="structure_only_repair",
+                        input_modality=attempted_modality,
                         usage=MimoUsage(),
                         http_attempt_count=exc.attempts,
                         warnings=["http_request_failed"],
                         request_error=str(exc),
                     )
                 )
-                raise MimoBackendFailure(
-                    code="mimo_repair_request_failed",
-                    reason=str(exc),
-                    raw_responses=tuple(raw_responses),
-                    diagnostics=tuple(diagnostics),
-                    issues=tuple(issues),
-                    model_call_count=len(diagnostics),
-                    http_attempt_count=sum(
-                        item.http_attempt_count for item in diagnostics
-                    ),
-                    http_retry_count=sum(
-                        item.http_attempt_count - 1 for item in diagnostics
-                    ),
-                    repair_count=1,
+                raise contextual_failure(
+                    MimoBackendFailure(code="mimo_request_failed", reason=str(exc))
                 ) from exc.original
             except Exception as exc:
-                if repair_attempts:
-                    diagnostics.append(
-                        MimoCompletionDiagnostic(
-                            input_modality="structure_only_repair",
-                            usage=MimoUsage(),
-                            http_attempt_count=repair_attempts,
-                            warnings=["response_contract_failed"],
-                            request_error=f"{type(exc).__name__}: {exc}",
-                        )
+                raise contextual_failure(
+                    MimoBackendFailure(
+                        code="mimo_request_failed",
+                        reason=f"{type(exc).__name__}: {exc}",
                     )
-                raise MimoBackendFailure(
-                    code="mimo_repair_request_failed",
-                    reason=f"{type(exc).__name__}: {exc}",
-                    raw_responses=tuple(raw_responses),
-                    diagnostics=tuple(diagnostics),
-                    issues=tuple(issues),
-                    model_call_count=len(diagnostics) + int(not repair_attempts),
-                    http_attempt_count=sum(
-                        item.http_attempt_count for item in diagnostics
-                    )
-                    + int(not repair_attempts),
-                    http_retry_count=sum(
-                        item.http_attempt_count - 1 for item in diagnostics
-                    ),
-                    repair_count=1,
                 ) from exc
-            annotation, issues = parse_structured_json_issues(
-                raw_responses[-1], MimoAVAnnotationDraft
+            raw_responses.append(raw)
+            diagnostics.append(diagnostic)
+            try:
+                _validate_finish_reason(diagnostic)
+                _validate_av_observation_usage(
+                    diagnostic,
+                    require_explicit_audio=include_audio,
+                )
+                if recheck_prompt is not None and diagnostic.usage.audio_tokens == 0:
+                    raise MimoBackendFailure(
+                        code="mimo_target_audio_not_observed",
+                        reason="MiMo full AV recheck reported zero target-audio tokens",
+                    )
+            except MimoBackendFailure as failure:
+                raise contextual_failure(failure) from failure
+            return raw, diagnostic
+
+        raw, diagnostic = perform_request(include_audio=False)
+        include_audio = diagnostic.usage.audio_tokens == 0
+        if include_audio:
+            raw, _ = perform_request(include_audio=True)
+            modality = "target_video_plus_canonical_full_audio_fallback"
+
+        def parse_and_validate(value: str) -> tuple[MimoAVAnnotationDraft | None, list[ValidationIssue]]:
+            annotation, validation_issues = parse_structured_json_issues(
+                value, MimoAVAnnotationDraft
             )
             if annotation is not None:
-                issues = validate_annotation(
+                validation_issues = validate_annotation(
                     annotation,
                     segment_ids=segment_ids,
                     transcribed_segment_ids=transcribed_segment_ids,
+                    authoritative_transcripts=[
+                        item.asr_text
+                        for item in job.segments
+                        if item.asr_status == "transcribed" and item.asr_text is not None
+                    ],
                     allowed_entity_ids=allowed_entity_ids,
                     allowed_reference_labels=allowed_reference_labels,
                     reference_subjects=job.reference_subjects,
                     target_duration_seconds=job.target_duration_seconds,
                 )
+            return annotation, validation_issues
+
+        annotation, issues = parse_and_validate(raw)
         if annotation is None or issues:
-            raise MimoBackendFailure(
-                code="mimo_structured_output_failed",
-                reason="MiMo AV annotation failed after one structural repair",
-                raw_responses=tuple(raw_responses),
-                diagnostics=tuple(diagnostics),
-                issues=tuple(issues),
-                model_call_count=len(diagnostics),
-                http_attempt_count=sum(item.http_attempt_count for item in diagnostics),
-                http_retry_count=sum(
-                    item.http_attempt_count - 1 for item in diagnostics
+            recheck_count = 1
+            raw, _ = perform_request(
+                include_audio=include_audio,
+                recheck_prompt=self._full_av_recheck_prompt(
+                    job,
+                    invalid_response=raw,
+                    issues=issues,
                 ),
-                repair_count=1,
+            )
+            annotation, issues = parse_and_validate(raw)
+        if annotation is None or issues:
+            raise contextual_failure(
+                MimoBackendFailure(
+                    code="mimo_structured_output_failed",
+                    reason="MiMo AV annotation failed after one full AV recheck",
+                ),
+                validation_issues=issues,
             )
         return MimoBackendResult(
             annotation=annotation,
@@ -1394,7 +1538,7 @@ class OpenAIMimo25Backend:
             http_retry_count=sum(
                 item.http_attempt_count - 1 for item in diagnostics
             ),
-            repair_count=int(any(item.input_modality == "structure_only_repair" for item in diagnostics)),
+            recheck_count=recheck_count,
             input_modality=modality,
         )
 

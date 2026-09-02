@@ -41,9 +41,12 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.2"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.2"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.3"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.3"
 _MIMO_SEGMENT_PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
+_MIMO_AUDIO_EVENT_PLACEHOLDER = re.compile(
+    r"\[\[audio_event:([^\[\]\r\n]+)\]\]"
+)
 
 
 def _compact_json(value: object) -> str:
@@ -81,7 +84,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.2"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.3"] = (
         MIMO25_SHADOW_RECORD_VERSION
     )
     sample_id: str
@@ -90,7 +93,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v2"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v3"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -113,7 +116,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.2"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.3"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -258,7 +261,7 @@ def _audio_facts(
         )
     events = [
         RecaptionNonSpeechFact(
-            fact_id=f"mimo_audio_event_{index}",
+            fact_id=item.event_id,
             start_time=item.approximate_start_time,
             end_time=item.approximate_end_time,
             category=item.category,
@@ -266,9 +269,7 @@ def _audio_facts(
             source_attribution=item.source_grounding,
             provenance="mimo25.audio_semantics.temporal_non_speech_events",
         )
-        for index, item in enumerate(
-            record.annotation.audio_semantics.temporal_non_speech_events, start=1
-        )
+        for item in record.annotation.audio_semantics.temporal_non_speech_events
     ]
     semantics = record.annotation.audio_semantics
     return RecaptionAudioFacts(
@@ -317,6 +318,10 @@ def _materialize_sample(
         request_fingerprint=record.request_fingerprint,
     )
     semantics = record.annotation.audio_semantics
+    audio_event_by_id = {
+        item.event_id: item.description
+        for item in semantics.temporal_non_speech_events
+    }
     prefix = (
         "[reference generation + audio reference]"
         if variant in {"target_voice_reference", "cross_voice_reference"}
@@ -339,7 +344,10 @@ def _materialize_sample(
                 start_time=item.start_time,
                 description_template=_MIMO_SEGMENT_PLACEHOLDER.sub(
                     lambda match: f"[[{match.group(1)}]]",
-                    item.description_template,
+                    _MIMO_AUDIO_EVENT_PLACEHOLDER.sub(
+                        lambda match: audio_event_by_id[match.group(1)],
+                        item.description_template,
+                    ),
                 ),
             )
             for item in record.annotation.h3_draft.shots
@@ -355,6 +363,8 @@ def _materialize_sample(
         ],
     )
     structured = materialize_h3_draft(draft, request)
+    if "[[audio_event:" in structured.detailed_description:
+        raise ValueError("MiMo Audio-event placeholder survived materialization")
     issues, validation_warnings = validate_h3_response(structured, request)
     if issues:
         raise ValueError(

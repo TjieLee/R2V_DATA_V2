@@ -105,6 +105,7 @@ def _annotation(
             "audio_semantics": {
                 "temporal_non_speech_events": [
                     {
+                        "event_id": "ae1",
                         "approximate_start_time": 0.1,
                         "approximate_end_time": 0.2,
                         "category": "physical",
@@ -127,14 +128,15 @@ def _annotation(
                 ],
                 "summary": "A person speaks while remaining visible.",
                 "visual_retention_analysis": [
-                    "<Picture 1>: fully_preserved - the person remains visible."
+                    "<Subject 1>: fully_preserved - the person remains visible."
                 ],
                 "shots": [
                     {
                         "shot_index": 1,
                         "start_time": None,
                         "description_template": (
-                            "<Subject 1> faces the camera. [[segment:segment_1]]"
+                            "<Subject 1> faces the camera. [[audio_event:ae1]] "
+                            "[[segment:segment_1]]"
                         ),
                     }
                 ],
@@ -210,6 +212,8 @@ def _validate(
     transcribed_segment_ids: list[str] | None = None,
     allowed_entity_ids: set[str] | None = None,
     allowed_reference_labels: set[str] | None = None,
+    authoritative_transcripts: list[str] | None = None,
+    reference_subjects: list[RecaptionSubjectContract] | None = None,
     target_duration_seconds: float = 1.0,
 ) -> list[ValidationIssue]:
     return validate_annotation(
@@ -220,21 +224,30 @@ def _validate(
             if transcribed_segment_ids is None
             else transcribed_segment_ids
         ),
+        authoritative_transcripts=(
+            ["Exact, text!"]
+            if authoritative_transcripts is None
+            else authoritative_transcripts
+        ),
         allowed_entity_ids=allowed_entity_ids or {"e1"},
         allowed_reference_labels=(
             {"<Picture 1>", "<Subject 1>"}
             if allowed_reference_labels is None
             else allowed_reference_labels
         ),
-        reference_subjects=[
-            RecaptionSubjectContract(
-                subject_index=1,
-                subject_label="<Subject 1>",
-                kind="entity",
-                entity_id="e1",
-                source_picture_labels=["<Picture 1>"],
-            )
-        ],
+        reference_subjects=(
+            [
+                RecaptionSubjectContract(
+                    subject_index=1,
+                    subject_label="<Subject 1>",
+                    kind="entity",
+                    entity_id="e1",
+                    source_picture_labels=["<Picture 1>"],
+                )
+            ]
+            if reference_subjects is None
+            else reference_subjects
+        ),
         target_duration_seconds=target_duration_seconds,
     )
 
@@ -246,6 +259,7 @@ class _Completions:
             tuple[str, int | None]
             | tuple[str, int | None, str]
             | tuple[str, int | None, str, int | None]
+            | tuple[str, int | None, str, int | None, int | None]
         ],
     ) -> None:
         self.responses = responses
@@ -257,7 +271,15 @@ class _Completions:
         raw, audio_tokens = response[:2]
         finish_reason = response[2] if len(response) >= 3 else "stop"
         reasoning_tokens = response[3] if len(response) >= 4 else 0
-        details = None if audio_tokens is None else {"audio_tokens": audio_tokens, "video_tokens": 10}
+        video_tokens = response[4] if len(response) >= 5 else 10
+        details = {
+            key: value
+            for key, value in {
+                "audio_tokens": audio_tokens,
+                "video_tokens": video_tokens,
+            }.items()
+            if value is not None
+        } or None
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -296,6 +318,7 @@ def _backend(
         tuple[str, int | None]
         | tuple[str, int | None, str]
         | tuple[str, int | None, str, int | None]
+        | tuple[str, int | None, str, int | None, int | None]
     ],
 ) -> tuple[OpenAIMimo25Backend, _Completions]:
     completions = _Completions(responses)
@@ -342,10 +365,10 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
 
 
-def test_mimo_v2_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v2"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v2"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.2"
+def test_mimo_v3_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v3"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v3"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.3"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -363,7 +386,7 @@ def test_mimo_v2_prompt_restores_dense_visual_and_audio_authority_contract() -> 
 def test_audio_token_zero_uses_one_canonical_audio_fallback(tmp_path: Path) -> None:
     job = _job_fixture(tmp_path)
     raw = _annotation().model_dump_json()
-    backend, completions = _backend(tmp_path, [(raw, 0), (raw, 0)])
+    backend, completions = _backend(tmp_path, [(raw, 0), (raw, 4)])
     result = backend.reconcile(
         job,
         segment_ids=["segment_1"],
@@ -429,7 +452,98 @@ def test_unknown_audio_token_usage_does_not_loop(tmp_path: Path) -> None:
     )
     assert result.model_call_count == 1
     assert len(completions.requests) == 1
-    assert "prompt_tokens_details_unavailable" in result.diagnostics[0].warnings
+    assert "audio_tokens_unavailable" in result.diagnostics[0].warnings
+
+
+def test_unknown_av_token_usage_warns_without_loop(tmp_path: Path) -> None:
+    job = _job_fixture(tmp_path)
+    backend, completions = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), None, "stop", 0, None)],
+    )
+    result = backend.reconcile(
+        job,
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert len(completions.requests) == 1
+    assert {
+        "prompt_tokens_details_unavailable",
+        "video_tokens_unavailable",
+        "audio_tokens_unavailable",
+    } <= set(result.diagnostics[0].warnings)
+
+
+def test_explicit_zero_video_tokens_fail_closed(tmp_path: Path) -> None:
+    backend, completions = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), 5, "stop", 0, 0)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_target_video_not_observed"
+    assert len(completions.requests) == 1
+
+
+def test_audio_fallback_zero_video_tokens_fail_closed(tmp_path: Path) -> None:
+    raw = _annotation().model_dump_json()
+    backend, _ = _backend(
+        tmp_path,
+        [(raw, 0, "stop", 0, 10), (raw, 4, "stop", 0, 0)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_target_video_not_observed"
+
+
+def test_explicit_audio_fallback_zero_audio_tokens_fail_closed(tmp_path: Path) -> None:
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(tmp_path, [(raw, 0), (raw, 0)])
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_target_audio_not_observed"
+    assert len(completions.requests) == 2
+
+
+def test_explicit_audio_fallback_unknown_usage_warns_without_loop(
+    tmp_path: Path,
+) -> None:
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path,
+        [(raw, 0), (raw, None, "stop", 0, 10)],
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert len(completions.requests) == 2
+    assert "audio_tokens_unavailable_after_explicit_fallback" in (
+        result.diagnostics[1].warnings
+    )
 
 
 def test_http_retry_is_bounded_and_diagnostic(tmp_path: Path) -> None:
@@ -550,7 +664,7 @@ def test_reasoning_token_diagnostic_under_disabled_thinking(tmp_path: Path) -> N
     )
 
 
-def test_length_finish_reason_fails_without_structure_repair(tmp_path: Path) -> None:
+def test_length_finish_reason_fails_without_full_av_recheck(tmp_path: Path) -> None:
     job = _job_fixture(tmp_path)
     backend, completions = _backend(
         tmp_path,
@@ -565,11 +679,11 @@ def test_length_finish_reason_fails_without_structure_repair(tmp_path: Path) -> 
             allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
         )
     assert exc_info.value.code == "mimo_output_truncated"
-    assert exc_info.value.repair_count == 0
+    assert exc_info.value.recheck_count == 0
     assert len(completions.requests) == 1
 
 
-def test_audio_fallback_length_also_fails_without_structure_repair(
+def test_audio_fallback_length_also_fails_without_full_av_recheck(
     tmp_path: Path,
 ) -> None:
     job = _job_fixture(tmp_path)
@@ -591,11 +705,51 @@ def test_audio_fallback_length_also_fails_without_structure_repair(
     assert len(completions.requests) == 2
 
 
-def test_true_malformed_output_uses_exactly_one_structure_repair(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "finish_reason",
+    ["content_filter", "tool_calls", "function_call", "cancelled", "custom_reason"],
+)
+def test_explicit_non_stop_finish_reason_fails_without_recheck(
+    tmp_path: Path,
+    finish_reason: str,
+) -> None:
+    backend, completions = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), 5, finish_reason)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_incomplete_finish_reason"
+    assert exc_info.value.recheck_count == 0
+    assert len(completions.requests) == 1
+
+
+def test_missing_finish_reason_warns_and_accepts(tmp_path: Path) -> None:
+    backend, _ = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), 5, None)],  # type: ignore[list-item]
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert "finish_reason_unavailable" in result.diagnostics[0].warnings
+
+
+def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) -> None:
     job = _job_fixture(tmp_path)
     backend, completions = _backend(
         tmp_path,
-        [("not json", 5), (_annotation().model_dump_json(), 0)],
+        [("not json", 5), (_annotation().model_dump_json(), 5)],
     )
     result = backend.reconcile(
         job,
@@ -605,17 +759,18 @@ def test_true_malformed_output_uses_exactly_one_structure_repair(tmp_path: Path)
         allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
     )
     assert result.model_call_count == 2
-    assert result.repair_count == 1
+    assert result.recheck_count == 1
     assert len(completions.requests) == 2
-    assert completions.requests[1]["messages"][1]["content"].startswith(  # type: ignore[index]
-        "Repair only the previous response's JSON structure"
-    )
+    content = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
+    assert any(item["type"] == "video_url" for item in content)
+    assert any(item["type"] == "image_url" for item in content)
+    assert "Reinspect the SAME audiovisual evidence" in content[-1]["text"]
     assert completions.requests[1]["extra_body"] == {
         "thinking": {"type": "disabled"}
     }
-    repair = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
-    assert job.r2v_instruction in repair
-    assert job.target_video_path not in repair
+    recheck = content[-1]["text"]
+    assert job.r2v_instruction in recheck
+    assert job.target_video_path not in recheck
 
 
 def test_both_malformed_responses_fail_with_nullable_issue_field(
@@ -624,7 +779,7 @@ def test_both_malformed_responses_fail_with_nullable_issue_field(
     job = _job_fixture(tmp_path)
     backend, completions = _backend(
         tmp_path,
-        [("not json", 5), ("still not json", 0)],
+        [("not json", 5), ("still not json", 5)],
     )
     with pytest.raises(MimoBackendFailure) as exc_info:
         backend.reconcile(
@@ -637,9 +792,121 @@ def test_both_malformed_responses_fail_with_nullable_issue_field(
     failure = exc_info.value
     assert failure.code == "mimo_structured_output_failed"
     assert failure.model_call_count == 2
-    assert failure.repair_count == 1
+    assert failure.recheck_count == 1
     assert len(completions.requests) == 2
     assert failure.issues[0].field is None
+
+
+def test_semantic_issue_triggers_full_media_recheck(tmp_path: Path) -> None:
+    invalid = _annotation().model_dump(mode="json")
+    invalid["segment_decisions"][0]["entity_id"] = "e9"
+    backend, completions = _backend(
+        tmp_path,
+        [
+            (json.dumps(invalid), 5),
+            (_annotation().model_dump_json(), 5),
+        ],
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert result.recheck_count == 1
+    assert result.diagnostics[-1].input_modality == "full_av_recheck_embedded_audio"
+    content = completions.requests[-1]["messages"][1]["content"]  # type: ignore[index]
+    assert {item["type"] for item in content} >= {"image_url", "video_url", "text"}
+
+
+def test_audio_fallback_recheck_preserves_explicit_audio_modality(
+    tmp_path: Path,
+) -> None:
+    invalid = _annotation().model_dump(mode="json")
+    invalid["segment_decisions"][0]["entity_id"] = "e9"
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path,
+        [(raw, 0), (json.dumps(invalid), 4), (raw, 4)],
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert result.model_call_count == 3
+    assert result.recheck_count == 1
+    assert result.diagnostics[-1].input_modality == (
+        "full_av_recheck_with_canonical_audio"
+    )
+    content = completions.requests[-1]["messages"][1]["content"]  # type: ignore[index]
+    assert any(item["type"] == "video_url" for item in content)
+    assert any(item["type"] == "input_audio" for item in content)
+    assert all(isinstance(request["messages"][1]["content"], list) for request in completions.requests)  # type: ignore[index]
+
+
+def test_full_av_recheck_zero_video_tokens_fails_closed(tmp_path: Path) -> None:
+    backend, _ = _backend(
+        tmp_path,
+        [("not json", 5), (_annotation().model_dump_json(), 5, "stop", 0, 0)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_target_video_not_observed"
+    assert exc_info.value.recheck_count == 1
+
+
+def test_explicit_audio_recheck_zero_audio_tokens_fails_closed(
+    tmp_path: Path,
+) -> None:
+    invalid = _annotation().model_dump(mode="json")
+    invalid["segment_decisions"][0]["entity_id"] = "e9"
+    raw = _annotation().model_dump_json()
+    backend, _ = _backend(
+        tmp_path,
+        [(raw, 0), (json.dumps(invalid), 4), (raw, 0)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_target_audio_not_observed"
+    assert exc_info.value.recheck_count == 1
+
+
+def test_speaker_entity_contradiction_triggers_full_media_recheck(
+    tmp_path: Path,
+) -> None:
+    invalid = _two_segment_annotation(second_group="g1", second_entity="e2")
+    valid = _two_segment_annotation(second_group="g1", second_entity=None)
+    backend, completions = _backend(
+        tmp_path,
+        [(invalid.model_dump_json(), 5), (valid.model_dump_json(), 5)],
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1", "segment_2"],
+        transcribed_segment_ids=["segment_1", "segment_2"],
+        allowed_entity_ids={"e1", "e2"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert result.recheck_count == 1
+    content = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
+    assert any(item["type"] == "video_url" for item in content)
+    assert "speaker_group_entity_contradiction" in content[-1]["text"]
 
 
 def test_base64_oversize_fails_closed(tmp_path: Path) -> None:
@@ -953,7 +1220,7 @@ def test_h3_draft_rejects_pipeline_owned_or_ambiguous_syntax(
 def test_allowed_visual_retention_markers_pass(marker: str) -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["visual_retention_analysis"] = [
-        f"<Picture 1>: {marker} - observed appearance remains grounded."
+        f"<Subject 1>: {marker} - observed appearance remains grounded."
     ]
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
     assert not {
@@ -969,10 +1236,178 @@ def test_attribute_transfer_and_unknown_retention_marker_reject() -> None:
     ):
         payload = _annotation().model_dump(mode="json")
         payload["h3_draft"]["visual_retention_analysis"] = [
-            f"<Picture 1>: {marker} - invalid."
+            f"<Subject 1>: {marker} - invalid."
         ]
         issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
         assert expected in {item.code for item in issues}
+
+
+def _two_audio_event_annotation() -> MimoAVAnnotationDraft:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["temporal_non_speech_events"].append(
+        {
+            "event_id": "ae2",
+            "approximate_start_time": 0.3,
+            "approximate_end_time": 0.4,
+            "category": "environmental",
+            "pattern": "single",
+            "description": "A brief distant horn is audible.",
+            "source_grounding": "audible_only",
+        }
+    )
+    payload["h3_draft"]["shots"][0]["description_template"] = (
+        "<Subject 1> remains visible. [[audio_event:ae1]] "
+        "[[segment:segment_1]] [[audio_event:ae2]]"
+    )
+    return MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_audio_event_ids_are_contiguous_and_chronological() -> None:
+    annotation = _two_audio_event_annotation()
+    assert [
+        item.event_id for item in annotation.audio_semantics.temporal_non_speech_events
+    ] == ["ae1", "ae2"]
+    payload = annotation.model_dump(mode="json")
+    payload["audio_semantics"]["temporal_non_speech_events"][1]["event_id"] = "ae3"
+    with pytest.raises(ValidationError, match="IDs must be contiguous"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("template", "issue_code"),
+    [
+        (
+            "[[audio_event:ae1]] [[segment:segment_1]]",
+            "missing_audio_event_placeholder",
+        ),
+        (
+            "[[audio_event:ae1]] [[audio_event:ae1]] "
+            + "[[segment:segment_1]] [[audio_event:ae2]]",
+            "duplicate_audio_event_placeholder",
+        ),
+        (
+            "[[audio_event:ae1]] [[segment:segment_1]] [[audio_event:ae3]]",
+            "unknown_audio_event_placeholder",
+        ),
+        (
+            "[[audio_event:ae2]] [[segment:segment_1]] [[audio_event:ae1]]",
+            "audio_event_placeholder_order_mismatch",
+        ),
+    ],
+)
+def test_audio_event_placeholder_coverage_is_exact(
+    template: str,
+    issue_code: str,
+) -> None:
+    payload = _two_audio_event_annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["description_template"] = template
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+    assert issue_code in {item.code for item in issues}
+
+
+def test_audio_event_placeholder_is_allowed_only_in_shots() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["summary"] += " [[audio_event:ae1]]"
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+    assert "audio_event_placeholder_outside_shot" in {item.code for item in issues}
+
+
+def test_audiovisual_summary_is_required_and_nonempty() -> None:
+    payload = _annotation().model_dump(mode="json")
+    del payload["audio_semantics"]["audiovisual_summary"]
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(payload)
+    payload["audio_semantics"]["audiovisual_summary"] = " "
+    with pytest.raises(ValidationError, match="summary must not be empty"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_resolved_transcribed_speaker_delivery_requires_full_group_coverage() -> None:
+    annotation = _two_segment_annotation(second_group="g2", second_entity="e2")
+    payload = annotation.model_dump(mode="json")
+    payload["audio_semantics"]["speaker_delivery"] = payload["audio_semantics"][
+        "speaker_delivery"
+    ][:1]
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        segment_ids=["segment_1", "segment_2"],
+        transcribed_segment_ids=["segment_1", "segment_2"],
+        allowed_entity_ids={"e1", "e2"},
+    )
+    assert "missing_resolved_transcribed_speaker_delivery" in {
+        item.code for item in issues
+    }
+
+
+def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
+    subjects = [
+        RecaptionSubjectContract(
+            subject_index=1,
+            subject_label="<Subject 1>",
+            kind="entity",
+            entity_id="e1",
+            source_picture_labels=["<Picture 1>"],
+        ),
+        RecaptionSubjectContract(
+            subject_index=2,
+            subject_label="<Subject 2>",
+            kind="entity",
+            entity_id="e2",
+            source_picture_labels=["<Picture 2>"],
+        ),
+    ]
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"].append(
+        "<Subject 2> is sourced from <Picture 2>."
+    )
+    payload["h3_draft"]["visual_retention_analysis"].append(
+        "<Subject 2>: weak_reference - only limited observed structure is retained."
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert not _validate(
+        annotation,
+        allowed_entity_ids={"e1", "e2"},
+        allowed_reference_labels={
+            "<Picture 1>",
+            "<Picture 2>",
+            "<Subject 1>",
+            "<Subject 2>",
+        },
+        reference_subjects=subjects,
+    )
+    payload = annotation.model_dump(mode="json")
+    payload["h3_draft"]["visual_retention_analysis"] = [
+        "<Subject 1>: fully_preserved - retained.",
+        "<Subject 1>: weak_reference - duplicated.",
+    ]
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        allowed_reference_labels={
+            "<Picture 1>",
+            "<Picture 2>",
+            "<Subject 1>",
+            "<Subject 2>",
+        },
+        reference_subjects=subjects,
+    )
+    assert "subject_retention_contract_mismatch" in {item.code for item in issues}
+
+
+def test_significant_authoritative_transcript_cannot_leak_into_draft() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["summary"] = "请把这扇门轻轻关上"
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        authoritative_transcripts=["请把这扇门轻轻关上"],
+    )
+    assert "draft_contains_authoritative_transcript" in {item.code for item in issues}
+    assert "draft_contains_authoritative_transcript" not in {
+        item.code
+        for item in _validate(
+            _annotation(),
+            authoritative_transcripts=["嗯"],
+        )
+    }
 
 
 def test_subject_definition_and_shot_bounds_fail_closed() -> None:
@@ -1108,7 +1543,7 @@ def _record_fixture(tmp_path: Path, annotation: MimoAVAnnotationDraft) -> MimoRe
         "http_attempt_count": 1,
         "raw_response_count": 1,
         "http_retry_count": 0,
-        "repair_count": 0,
+        "recheck_count": 0,
     }
     fingerprint = __import__("hashlib").sha256(
         json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -1127,8 +1562,24 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert corrected[0].start_time == 0.0
     assert corrected[0].end_time == 1.0
     assert "<d>[English] Exact, text!</d>" in rendered
+    assert "A short repeated clink is audible." in rendered
+    assert "[[audio_event:" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert not warnings or all("words" in item for item in warnings)
+
+
+def test_materializer_inserts_every_audio_event_description_exactly_once(
+    tmp_path: Path,
+) -> None:
+    annotation = _two_audio_event_annotation()
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+    for event in annotation.audio_semantics.temporal_non_speech_events:
+        assert rendered.count(event.description) == 1
+    assert "[[audio_event:" not in rendered
 
 
 def test_materializer_retains_refinement_segment_without_entity(tmp_path: Path) -> None:
@@ -1209,7 +1660,7 @@ class _FakeBackend:
             model_call_count=1,
             http_attempt_count=1,
             http_retry_count=0,
-            repair_count=0,
+            recheck_count=0,
             input_modality="target_video_with_embedded_audio",
         )
 
@@ -1232,7 +1683,7 @@ class _FailingBackend(_FakeBackend):
                     ],
                 ),
                 MimoCompletionDiagnostic(
-                    input_modality="structure_only_repair",
+                    input_modality="full_av_recheck_embedded_audio",
                     finish_reason="stop",
                     usage=MimoUsage(reasoning_tokens=0),
                     http_attempt_count=1,
@@ -1241,7 +1692,7 @@ class _FailingBackend(_FakeBackend):
             issues=(ValidationIssue("invalid_json", None, "bad JSON"),),
             model_call_count=2,
             http_attempt_count=2,
-            repair_count=1,
+            recheck_count=1,
         )
 
 
