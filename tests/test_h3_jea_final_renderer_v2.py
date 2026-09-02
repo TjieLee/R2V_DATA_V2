@@ -239,7 +239,10 @@ def _occurrences(inventory: VisualProductionInventory) -> list[JEAOccurrenceEmbe
                 / clip.subject_references[0].image_path
             ),
             primary_voice_reference_path=str(
-                Path("primary_voice") / clip.identity.clip_display_path / "e1.flac"
+                Path(inventory.visual_production_root)
+                / "primary_voice"
+                / clip.identity.clip_display_path
+                / "e1.flac"
             ),
             face_embedding=[1.0, 0.0],
             voice_embedding=[1.0, 0.0],
@@ -252,7 +255,11 @@ def _jsonl(path: Path, values: list[object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "".join(
-            json.dumps(value.model_dump(mode="json"), ensure_ascii=False) + "\n"
+            json.dumps(
+                value if isinstance(value, dict) else value.model_dump(mode="json"),
+                ensure_ascii=False,
+            )
+            + "\n"
             for value in values
         ),
         encoding="utf-8",
@@ -419,9 +426,9 @@ def _write_canonical_sources(
                 target_video_path=str(video),
                 source_audio_path=str(audio),
                 source_audio_sha256=_sha256(audio),
-                source_sample_rate_hz=16000,
-                source_channels=1,
-                source_frame_count=1600,
+                source_sample_rate_hz=32000,
+                source_channels=2,
+                source_frame_count=3200,
                 visual_references=[],
             )
         )
@@ -443,6 +450,63 @@ def _write_canonical_sources(
             )
         )
     _jsonl(tmp_path / "audio/canonical_clips.jsonl", canonical)
+    primary_voices = []
+    voice_sources: dict[str, str] = {}
+    pairs_path = tmp_path / "pairs/in_pairs.jsonl"
+    if pairs_path.is_file():
+        for pair in (json.loads(line) for line in pairs_path.read_text().splitlines()):
+            for subject in pair["subjects"]:
+                voice_sources[subject["target_occurrence_id"]] = subject[
+                    "target_primary_voice_reference_path"
+                ]
+    cross_path = tmp_path / "pairs/cross_pairs.jsonl"
+    if cross_path.is_file():
+        for pair in (json.loads(line) for line in cross_path.read_text().splitlines()):
+            for mapping in pair["mappings"]:
+                voice_sources[mapping["donor_occurrence_id"]] = mapping[
+                    "donor_primary_voice_reference_path"
+                ]
+    for occurrence_id, voice_path_value in sorted(voice_sources.items()):
+        clip_uid, entity_id = occurrence_id.split("/", maxsplit=1)
+        voice_path = Path(voice_path_value)
+        voice_path.parent.mkdir(parents=True, exist_ok=True)
+        voice_path.write_bytes(f"canonical-voice:{occurrence_id}".encode())
+        relative = voice_path.relative_to(tmp_path / "primary_voice").as_posix()
+        primary_voices.append(
+            {
+                "schema_version": "r2v.h3.primary_voice_reference_selection.1",
+                "clip_uid": clip_uid,
+                "entity_id": entity_id,
+                "entity_occurrence_id": occurrence_id,
+                "primary_voice_reference": {
+                    "voice_reference_id": "voice_ref_1",
+                    "entity_occurrence_id": occurrence_id,
+                    "source_turn_id": "turn_1",
+                    "source_start": 0.0,
+                    "source_end": 0.1,
+                    "source_start_sample": 0,
+                    "source_end_sample": 3200,
+                    "asset": {
+                        "path": relative,
+                        "sha256": _sha256(voice_path),
+                        "byte_size": voice_path.stat().st_size,
+                        "media_type": "audio/flac",
+                    },
+                    "quality_score": 1.0,
+                    "quality_metadata": {
+                        "source_sample_rate_hz": 32000,
+                        "source_channels": 2,
+                        "sample_mapping_policy": "round_time_seconds_times_32000_v1",
+                    },
+                },
+                "reason_codes": [],
+                "candidate_turn_ids": ["turn_1"],
+                "accepted_turn_ids": ["turn_1"],
+                "policy_version": "fixture",
+                "policy_fingerprint": "f" * 64,
+            }
+        )
+    _jsonl(tmp_path / "primary_voice/primary_voice_references.jsonl", primary_voices)
     diarization = DiarizationInventory(
         mode="production",
         source_inventory_kind="canonical_audio_manifest",
@@ -640,6 +704,7 @@ def _final_sample(
         shard_id="shard-a",
         target_video=f"{clip_uid}.mp4",
         target_full_audio_path=f"{clip_uid}.flac",
+        target_full_audio_sha256="a" * 64,
         r2v_instruction="Image 1 and Image 2",
         visual_references=references,
         subject_voices=voices,
@@ -661,6 +726,12 @@ def _voice(
         target_occurrence_id=target_occurrence_id
         or f"{clip_uid}/{entity_id}",
         voice_reference_path=f"voices/{entity_id}.flac",
+        voice_reference_sha256="c" * 64,
+        source_start=0.0,
+        source_end=1.0,
+        source_start_sample=0,
+        source_end_sample=32000,
+        sample_mapping_policy="round_time_seconds_times_32000_v1",
         voice_source="target",
     )
 
@@ -684,7 +755,7 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
                 start_time=0.0,
                 end_time=0.1,
                 source_start_sample=0,
-                source_end_sample=1600,
+                source_end_sample=3200,
                 cluster_binding_status="candidate_mapped",
                 entity_id="entity_1",
                 entity_occurrence_id=f"{clip.identity.clip_uid}/entity_1",
@@ -702,8 +773,8 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
                 entity_occurrence_id=f"{clip.identity.clip_uid}/entity_1",
                 source_audio_path=str(tmp_path / f"{clip.identity.clip_uid}.flac"),
                 source_start_sample=0,
-                source_end_sample=1600,
-                source_sample_rate_hz=16000,
+                source_end_sample=3200,
+                source_sample_rate_hz=32000,
                 start_time=0.0,
                 end_time=0.1,
                 status="transcribed",
@@ -982,7 +1053,7 @@ def test_resolved_path_contract_requires_new_final_sample_schema(
     sample = _final_sample(tmp_path, [_voice(1)])
     payload = sample.model_dump(mode="json")
 
-    assert sample.schema_version == "r2v.h3.final_sample.4"
+    assert sample.schema_version == "r2v.h3.final_sample.5"
     without_artifact = json.loads(json.dumps(payload))
     without_artifact["visual_references"][0].pop("image_artifact_path")
     with pytest.raises(ValueError, match="image_artifact_path"):
@@ -990,14 +1061,14 @@ def test_resolved_path_contract_requires_new_final_sample_schema(
 
     old_version = json.loads(json.dumps(payload))
     old_version["schema_version"] = "r2v.h3.final_sample.2"
-    with pytest.raises(ValueError, match="r2v.h3.final_sample.4"):
+    with pytest.raises(ValueError, match="r2v.h3.final_sample.5"):
         FinalH3SampleV2.model_validate(old_version)
 
 
 def test_final_sample_allows_partial_subject_voice_coverage(tmp_path: Path) -> None:
     sample = _final_sample(tmp_path, [_voice(1)])
 
-    assert sample.schema_version == "r2v.h3.final_sample.4"
+    assert sample.schema_version == "r2v.h3.final_sample.5"
     assert [item.entity_id for item in sample.visual_references] == [
         "entity_1",
         "entity_2",
@@ -1039,10 +1110,10 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     tmp_path: Path,
 ) -> None:
     rows = _render(tmp_path)
-    assert {row["schema_version"] for row in rows} == {"r2v.h3.final_sample.4"}
+    assert {row["schema_version"] for row in rows} == {"r2v.h3.final_sample.5"}
     summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
-    assert summary["schema_version"] == "r2v.h3.final_summary.5"
-    assert summary["final_sample_schema_version"] == "r2v.h3.final_sample.4"
+    assert summary["schema_version"] == "r2v.h3.final_summary.6"
+    assert summary["final_sample_schema_version"] == "r2v.h3.final_sample.5"
     first = next(row for row in rows if row["sample_id"] == "clip-a/in_pair")
     assert first["r2v_instruction"] == "canonical clip-a: Image 1 and Image 2"
     assert [item["kind"] for item in first["visual_references"]] == [
@@ -1056,10 +1127,29 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     assert not isinstance(first["visual_references"][0]["visible_region"], dict)
     assert first["visual_references"][0]["image_path"].endswith("subject-1.png")
     assert Path(first["visual_references"][0]["image_artifact_path"]).is_file()
+    assert "full_audio" in Path(first["target_full_audio_path"]).parts
+    assert first["target_audio_sample_rate_hz"] == 32000
+    assert first["target_audio_channels"] == 2
+    target_voice = first["subject_voices"][0]
+    assert "primary_voice" in Path(target_voice["voice_reference_path"]).parts
+    assert target_voice["voice_sample_rate_hz"] == 32000
+    assert target_voice["voice_channels"] == 2
+    assert target_voice["source_start_sample"] == round(
+        target_voice["source_start"] * 32000
+    )
+    assert target_voice["source_end_sample"] == round(
+        target_voice["source_end"] * 32000
+    )
     second = next(row for row in rows if row["sample_id"] == "clip-b/in_pair")
     assert second["visual_references"][0]["scope"] == "full"
     assert second["visual_references"][0]["visible_region"] == "whole"
     assert len(first["subject_voices"]) == 1
+    cross = next(row for row in rows if row["sample_id"] == "clip-a/cross_pair/1")
+    donor_voice = cross["subject_voices"][0]
+    assert donor_voice["voice_source"] == "cross_donor"
+    assert "primary_voice" in Path(donor_voice["voice_reference_path"]).parts
+    assert donor_voice["voice_sample_rate_hz"] == 32000
+    assert donor_voice["voice_channels"] == 2
 
 
 def test_final_renderer_projects_canonical_audio_semantics_for_every_variant(
@@ -1156,7 +1246,7 @@ def test_final_renderer_publishes_all_canonical_clips_with_optional_voice_varian
                 start_time=0.0,
                 end_time=0.1,
                 source_start_sample=0,
-                source_end_sample=1600,
+                source_end_sample=3200,
                 cluster_binding_status="candidate_mapped",
                 entity_id="entity_1",
                 entity_occurrence_id=f"{clip_uid}/entity_1",
@@ -1174,8 +1264,8 @@ def test_final_renderer_publishes_all_canonical_clips_with_optional_voice_varian
                 entity_occurrence_id=f"{clip_uid}/entity_1",
                 source_audio_path=str(tmp_path / f"{clip_uid}.flac"),
                 source_start_sample=0,
-                source_end_sample=1600,
-                source_sample_rate_hz=16000,
+                source_end_sample=3200,
+                source_sample_rate_hz=32000,
                 start_time=0.0,
                 end_time=0.1,
                 status="transcribed",
@@ -1273,8 +1363,8 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
     for index in (1, 2):
         entity_id = f"entity_{index}"
         segment_id = f"segment_{index:04d}"
-        start_sample = (index - 1) * 1600
-        end_sample = index * 1600
+        start_sample = (index - 1) * 3200
+        end_sample = index * 3200
         bound.append(
             BoundDiarizationSegment(
                 target_clip_uid="clip-a",
@@ -1302,7 +1392,7 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
                 source_audio_path=str(tmp_path / "clip-a.flac"),
                 source_start_sample=start_sample,
                 source_end_sample=end_sample,
-                source_sample_rate_hz=16000,
+                source_sample_rate_hz=32000,
                 start_time=(index - 1) * 0.1,
                 end_time=index * 0.1,
                 status="transcribed",
@@ -1382,8 +1472,8 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
         statuses, start=1
     ):
         segment_id = f"segment_{index:04d}"
-        start_sample = (index - 1) * 1600
-        end_sample = index * 1600
+        start_sample = (index - 1) * 3200
+        end_sample = index * 3200
         occurrence_id = (
             f"{identity.clip_uid}/{entity_id}" if entity_id is not None else None
         )
@@ -1400,7 +1490,7 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
                 entity_id=entity_id,
                 entity_occurrence_id=occurrence_id,
                 direct_anchor_samples=direct_samples,
-                direct_anchor_seconds=direct_samples / 16000,
+                direct_anchor_seconds=direct_samples / 32000,
                 identity_scope=scope,
             )
         )
@@ -1414,7 +1504,7 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
                 source_audio_path=str(tmp_path / f"{identity.clip_uid}.flac"),
                 source_start_sample=start_sample,
                 source_end_sample=end_sample,
-                source_sample_rate_hz=16000,
+                source_sample_rate_hz=32000,
                 start_time=(index - 1) * 0.1,
                 end_time=index * 0.1,
                 status="transcribed",
@@ -1476,7 +1566,7 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
     assert "subject_id" not in propagated
     assert "rendered_dialogue" not in propagated
     summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
-    assert summary["schema_version"] == "r2v.h3.final_summary.5"
+    assert summary["schema_version"] == "r2v.h3.final_summary.6"
     assert summary["entity_bindings_removed_by_direct_anchor_gate"] == 1
     assert summary["speaker_binding_audit_policy_version"] == (
         "h3_speaker_binding_structural_audit_v1"
@@ -1526,7 +1616,12 @@ def test_multi_subject_cross_mapping_is_one_to_one_and_capped_at_one(
                     subject_index=index,
                     identity=clip.identity,
                     visual_reference_path=f"visual/{clip.identity.clip_uid}/e{index}.png",
-                    primary_voice_reference_path=f"voice/{clip.identity.clip_uid}/e{index}.flac",
+                    primary_voice_reference_path=str(
+                        tmp_path
+                        / "primary_voice"
+                        / clip.identity.clip_uid
+                        / f"e{index}.flac"
+                    ),
                     face_embedding=[1.0, 0.0],
                     voice_embedding=[1.0, 0.0],
                 )

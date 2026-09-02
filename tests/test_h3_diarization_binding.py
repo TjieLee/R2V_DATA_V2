@@ -6,6 +6,7 @@ import json
 import sys
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Self
 
 import numpy as np
@@ -47,6 +48,7 @@ from r2v_data_v2.h3.schemas import (
     PictureAsset,
     SemanticSubject,
 )
+from tools.diarizen_worker import _prepare_analysis_audio
 
 
 def _sha256(path: Path) -> str:
@@ -1152,7 +1154,7 @@ for line in sys.stdin:
     if request['operation'] == 'shutdown':
         print(json.dumps({'request_id':request['request_id'],'status':'shutdown'}), flush=True)
         break
-    print(json.dumps({'request_id':request['request_id'],'status':'ready','model_identifier':model,'segments':[{'start_time':0.0,'end_time':1.0,'speaker_label':'a'}]}), flush=True)
+    print(json.dumps({'request_id':request['request_id'],'status':'ready','model_identifier':model,'backend_metadata':{'input_preprocessing':'h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1','source_sample_rate_hz':32000,'source_channels':2,'model_input_sample_rate_hz':16000,'model_input_channels':1},'segments':[{'start_time':0.0,'end_time':1.0,'speaker_label':'a'}]}), flush=True)
 """,
         encoding="utf-8",
     )
@@ -1180,6 +1182,75 @@ for line in sys.stdin:
 
     assert len(first) == len(second) == 1
     assert load_marker.read_text(encoding="utf-8").splitlines() == ["loaded"]
+
+
+def test_diarizen_runtime_preprocessing_downmixes_and_resamples_ephemerally(
+    tmp_path: Path,
+) -> None:
+    class _Truth:
+        @staticmethod
+        def item() -> bool:
+            return True
+
+    class _Finite:
+        @staticmethod
+        def all() -> _Truth:
+            return _Truth()
+
+    class _Waveform:
+        ndim = 2
+        shape = (2, 64000)
+
+        def mean(self, *, dim: int, keepdim: bool) -> str:
+            assert (dim, keepdim) == (0, True)
+            return "mono-32k"
+
+    calls: list[tuple[str, object]] = []
+
+    class _Functional:
+        @staticmethod
+        def resample(value: object, **kwargs: object) -> str:
+            calls.append(("resample", (value, kwargs)))
+            return "mono-16k"
+
+    class _Audio:
+        functional = _Functional()
+
+        @staticmethod
+        def load(path: str) -> tuple[_Waveform, int]:
+            calls.append(("load", path))
+            return _Waveform(), 32000
+
+        @staticmethod
+        def save(path: str, value: object, rate: int, **kwargs: object) -> None:
+            calls.append(("save", (path, value, rate, kwargs)))
+
+    torch = SimpleNamespace(isfinite=lambda _value: _Finite())
+    source = tmp_path / "canonical.flac"
+    destination = tmp_path / "ephemeral" / "analysis.wav"
+    _prepare_analysis_audio(
+        source=source,
+        destination=destination,
+        torch=torch,
+        torchaudio=_Audio(),
+    )
+
+    assert calls[0] == ("load", str(source))
+    assert calls[1][0] == "resample"
+    value, options = calls[1][1]
+    assert value == "mono-32k"
+    assert options["orig_freq"] == 32000
+    assert options["new_freq"] == 16000
+    assert options["resampling_method"] == "sinc_interp_kaiser"
+    assert calls[2] == (
+        "save",
+        (
+            str(destination),
+            "mono-16k",
+            16000,
+            {"encoding": "PCM_S", "bits_per_sample": 16},
+        ),
+    )
 
 
 def test_backend_failure_is_isolated_and_empty_output_is_not_failure(

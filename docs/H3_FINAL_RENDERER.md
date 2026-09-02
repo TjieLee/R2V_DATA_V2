@@ -16,12 +16,20 @@ DiariZen target coverage, a model-free `binding_audit_v1`, and Qwen3-ASR rows
 for every actual DiariZen segment. A DiariZen `empty` result is a valid
 no-speech target; a DiariZen `failed` result blocks final publication.
 
-The current contracts are `r2v.h3.final_sample.4` and
-`r2v.h3.final_summary.5`. Every canonical clip produces exactly one
+The current contracts are `r2v.h3.final_sample.5` and
+`r2v.h3.final_summary.6`. Every canonical clip produces exactly one
 `pair_type="canonical"` base sample with no voice reference. Valid in-pairs and
 cross-pairs add optional target-voice and donor-voice variants without deciding
 whether the canonical target survives. Pair artifacts are therefore an
 optional strict subset of the canonical target inventory.
+
+Final `.5` publishes one canonical audio representation.
+`target_full_audio_path` is the directly readable 32 kHz stereo lossless FLAC
+decoded from the original target video stream, and
+`subject_voices[].voice_reference_path` is a 32 kHz stereo crop from the target
+or donor canonical audio. DiariZen, Qwen3-ASR, and ECAPA derive deterministic
+16 kHz mono runtime views without publishing another canonical audio tree. All
+persisted source sample indices use the canonical 32 kHz domain.
 
 `full_clip_audio_semantics` is a backend-neutral projection of a validated
 specialized assembled record. It carries final descriptions, temporal

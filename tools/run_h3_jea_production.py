@@ -149,6 +149,7 @@ def _run_isolated_qwen3_asr(
     visual_production_root: str,
     visual_runs_root: str,
     audio_production_root: Path,
+    ffmpeg: str,
     overwrite: bool,
 ) -> Qwen3ASRSummary:
     environment_root = os.environ.get("QWEN3_ASR_ENV")
@@ -166,6 +167,8 @@ def _run_isolated_qwen3_asr(
         visual_runs_root,
         "--audio-production-root",
         str(audio_production_root),
+        "--ffmpeg",
+        ffmpeg,
     ]
     if overwrite:
         command.append("--overwrite")
@@ -351,6 +354,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         )
         stage_results["binding-audit"] = run_speaker_binding_audit(
             audio_production_root=paths.root,
+            ffmpeg=arguments.ffmpeg,
             overwrite=arguments.overwrite,
         ).model_dump(mode="json")
     if "qwen3-asr" in stages:
@@ -363,6 +367,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             visual_production_root=visual.visual_production_root,
             visual_runs_root=visual.visual_runs_root,
             audio_production_root=paths.root,
+            ffmpeg=arguments.ffmpeg,
             overwrite=arguments.overwrite,
         ).model_dump(mode="json")
     if "h3" in stages:
@@ -388,6 +393,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             binding_audit_root=paths.root / "binding_audit_v1",
             qwen3_asr_root=paths.asr,
             output_root=paths.h3,
+            primary_voice_root=paths.primary_voice,
             audio_semantics_root=semantics_root,
             overwrite=arguments.overwrite,
         ).model_dump(mode="json")

@@ -313,9 +313,22 @@ def build_voice_reference_artifact(
     assessment: VoiceReferenceQualityAssessment,
     asset_path: Path,
     output_root: Path,
+    source_sample_rate_hz: int = 16000,
+    source_channels: int = 1,
+    sample_mapping_policy: str = "native_16k_turn_sample_extent_v1",
+    source_start_sample: int | None = None,
+    source_end_sample: int | None = None,
 ) -> VoiceReferenceArtifact:
     turn = assessment.metrics
-    start_sample, end_sample = voice_turn_sample_range(turn)
+    if source_start_sample is None and source_end_sample is None:
+        start_sample, end_sample = voice_turn_sample_range(
+            turn,
+            sample_rate_hz=source_sample_rate_hz,
+        )
+    elif source_start_sample is not None and source_end_sample is not None:
+        start_sample, end_sample = source_start_sample, source_end_sample
+    else:
+        raise ValueError("voice reference source sample extent must be complete")
     return VoiceReferenceArtifact(
         voice_reference_id="voice_ref_1",
         entity_occurrence_id=assessment.entity_occurrence_id,
@@ -335,7 +348,9 @@ def build_voice_reference_artifact(
             "selection_policy": (
                 "snr_lr_asd_p10_lr_asd_mean_duration_association_time_v1"
             ),
-            "source_sample_rate_hz": 16000,
+            "source_sample_rate_hz": source_sample_rate_hz,
+            "source_channels": source_channels,
+            "sample_mapping_policy": sample_mapping_policy,
         },
     )
 
@@ -380,6 +395,10 @@ def export_primary_voice_references(
     policy: VoiceReferenceQualityPolicy | None = None,
     overwrite: bool = False,
     output_path_for_entity: Callable[[str, str], Path] | None = None,
+    source_audio_for_clip: Callable[[str], Path] | None = None,
+    output_sample_rate_hz: int = 16000,
+    output_channels: int = 1,
+    sample_mapping_policy: str = "native_16k_turn_sample_extent_v1",
 ) -> PrimaryVoiceReferenceExportSummary:
     source = pilot_root.expanduser().resolve(strict=True)
     destination = output_root.expanduser().resolve(strict=False)
@@ -427,9 +446,13 @@ def export_primary_voice_references(
                 clip_assessments,
                 entity_order=subject_ids,
             )
-            source_audio = resolve_voice_quality_audio_path(
-                pilot_root=source,
-                source_audio_path=report.source_audio_path,
+            source_audio = (
+                source_audio_for_clip(clip_uid).expanduser().resolve(strict=True)
+                if source_audio_for_clip is not None
+                else resolve_voice_quality_audio_path(
+                    pilot_root=source,
+                    source_audio_path=report.source_audio_path,
+                )
             )
             for entity_id in subject_ids:
                 occurrence_id = f"{clip_uid}/{entity_id}"
@@ -456,7 +479,18 @@ def export_primary_voice_references(
                         if any(code in item.reason_codes for item in entity_assessments)
                     )
                 else:
-                    start_sample, end_sample = voice_turn_sample_range(chosen.metrics)
+                    if source_audio_for_clip is None:
+                        start_sample, end_sample = voice_turn_sample_range(
+                            chosen.metrics,
+                            sample_rate_hz=output_sample_rate_hz,
+                        )
+                    else:
+                        start_sample = round(
+                            chosen.metrics.start_time * output_sample_rate_hz
+                        )
+                        end_sample = round(
+                            chosen.metrics.end_time * output_sample_rate_hz
+                        )
                     relative_voice_path = (
                         output_path_for_entity(clip_uid, entity_id)
                         if output_path_for_entity is not None
@@ -471,6 +505,15 @@ def export_primary_voice_references(
                     ):
                         raise ValueError("primary voice output path must be safe and relative")
                     voice_path = temporary / relative_voice_path
+                    exact_source = (
+                        {
+                            "source_audio_path": source_audio,
+                            "source_start_sample": start_sample,
+                            "source_end_sample": end_sample,
+                        }
+                        if source_audio_for_clip is None
+                        else {}
+                    )
                     audio_backend.extract_voice_reference(
                         clip_uid=clip_uid,
                         entity_id=entity_id,
@@ -478,16 +521,20 @@ def export_primary_voice_references(
                         start_time=chosen.metrics.start_time,
                         end_time=chosen.metrics.end_time,
                         destination=voice_path,
-                        sample_rate_hz=16000,
+                        sample_rate_hz=output_sample_rate_hz,
+                        channels=output_channels,
                         output_format="flac",
-                        source_audio_path=source_audio,
-                        source_start_sample=start_sample,
-                        source_end_sample=end_sample,
+                        **exact_source,
                     )
                     artifact = build_voice_reference_artifact(
                         assessment=chosen,
                         asset_path=voice_path,
                         output_root=temporary,
+                        source_sample_rate_hz=output_sample_rate_hz,
+                        source_channels=output_channels,
+                        sample_mapping_policy=sample_mapping_policy,
+                        source_start_sample=start_sample,
+                        source_end_sample=end_sample,
                     )
                     selected_rows.append(
                         {

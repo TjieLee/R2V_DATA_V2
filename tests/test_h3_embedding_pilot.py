@@ -42,7 +42,10 @@ from tools.run_h3_face_embedding_worker import (
     InsightFaceWorker,
     validate_face_model_pack,
 )
-from tools.run_h3_speaker_embedding_worker import validate_speaker_model_path
+from tools.run_h3_speaker_embedding_worker import (
+    _prepare_model_input,
+    validate_speaker_model_path,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -736,3 +739,45 @@ def test_worker_launch_preserves_python_symlink_text(tmp_path: Path) -> None:
     )
 
     assert backend.executable[0] == str(link)
+
+
+def test_speaker_worker_preprocesses_32k_stereo_for_ecapa() -> None:
+    class _Truth:
+        @staticmethod
+        def item() -> bool:
+            return True
+
+    class _Finite:
+        @staticmethod
+        def all() -> _Truth:
+            return _Truth()
+
+    class _Waveform:
+        ndim = 2
+        shape = (2, 64000)
+
+        def mean(self, *, dim: int, keepdim: bool) -> str:
+            assert (dim, keepdim) == (0, True)
+            return "mono-32k"
+
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    def resample(value: object, **kwargs: object) -> str:
+        calls.append((value, kwargs))
+        return "mono-16k"
+
+    prepared, policy = _prepare_model_input(
+        _Waveform(),
+        32000,
+        torch=SimpleNamespace(isfinite=lambda _value: _Finite()),
+        torchaudio=SimpleNamespace(
+            functional=SimpleNamespace(resample=resample)
+        ),
+    )
+
+    assert prepared == "mono-16k"
+    assert policy == "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    assert calls[0][0] == "mono-32k"
+    assert calls[0][1]["orig_freq"] == 32000
+    assert calls[0][1]["new_freq"] == 16000
+    assert calls[0][1]["resampling_method"] == "sinc_interp_kaiser"

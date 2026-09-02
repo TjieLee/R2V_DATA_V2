@@ -72,6 +72,8 @@ def _sample(root: Path, primary_voice: Path) -> FinalH3SampleV2:
     video.write_bytes(b"target-video")
     image = root / "entity.png"
     image.write_bytes(b"entity-image")
+    canonical_audio = root / "full-audio.flac"
+    canonical_audio.write_bytes(b"canonical-audio")
     return FinalH3SampleV2(
         sample_id="clip-a/in_pair",
         pair_id="in_pair/clip-a",
@@ -84,7 +86,8 @@ def _sample(root: Path, primary_voice: Path) -> FinalH3SampleV2:
         clip_name="clip-a",
         shard_id="shard-a",
         target_video=str(video),
-        target_full_audio_path=str(root / "full.flac"),
+        target_full_audio_path=str(canonical_audio),
+        target_full_audio_sha256=_sha256(canonical_audio),
         r2v_instruction="Use Image 1.",
         visual_references=[
             FinalVisualReference(
@@ -106,6 +109,12 @@ def _sample(root: Path, primary_voice: Path) -> FinalH3SampleV2:
                 entity_id="e1",
                 target_occurrence_id="clip-a/e1",
                 voice_reference_path=str(primary_voice),
+                voice_reference_sha256=_sha256(primary_voice),
+                source_start=0.0,
+                source_end=1.0,
+                source_start_sample=0,
+                source_end_sample=32000,
+                sample_mapping_policy="round_time_seconds_times_32000_v1",
                 voice_source="target",
             )
         ],

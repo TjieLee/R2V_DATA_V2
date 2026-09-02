@@ -117,10 +117,18 @@ Qwen3-ASR segment coverage, and one base Final H3 sample. Missing/non-ready
 LR-ASD binding evidence produces unbound clusters rather than target loss, and
 no-speech clips produce no fake ASR row. PairPolicy outputs only add optional
 target-voice and cross-voice variants. Final contracts are
-`r2v.h3.final_sample.4` and `r2v.h3.final_summary.5`; the latter reports exact
+`r2v.h3.final_sample.5` and `r2v.h3.final_summary.6`; the latter reports exact
 canonical/variant/speech and full-clip Audio-semantics coverage. Issue #11 is
 structurally fixed in code but remains open pending the real canonical-wide
 server rerun and artifact-count/semantics validation.
+
+JEA Audio uses one persisted canonical representation:
+`audio/full_audio/` is 32 kHz stereo lossless FLAC decoded directly from each
+original target video stream. Final target audio and target/cross voice
+conditioning use this source. DiariZen, Qwen3-ASR, and ECAPA receive only
+deterministic runtime 16 kHz mono views under the versioned preprocessing
+policy; persisted segment and voice sample coordinates remain in the canonical
+32 kHz domain.
 
 The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and

@@ -22,11 +22,15 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationInventory,
 )
 from r2v_data_v2.h3.jea_audio_production import (
+    CANONICAL_AUDIO_CHANNELS,
+    CANONICAL_AUDIO_SAMPLE_RATE_HZ,
     CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS,
+    VOICE_SAMPLE_MAPPING_POLICY,
     CanonicalAudioClip,
     JEACrossPair,
     JEAInPair,
 )
+from r2v_data_v2.h3.primary_voice import PrimaryVoiceReferenceSelection
 from r2v_data_v2.h3.qwen3_asr import Qwen3ASRSegment
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.specialized_audio_semantics import (
@@ -42,8 +46,8 @@ from r2v_data_v2.h3.visual_production_source import (
 )
 from r2v_data_v2.v3.production_export import ProductionReference
 
-FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.4"
-FINAL_SUMMARY_VERSION = "r2v.h3.final_summary.5"
+FINAL_SAMPLE_VERSION = "r2v.h3.final_sample.5"
+FINAL_SUMMARY_VERSION = "r2v.h3.final_summary.6"
 
 
 class FinalVisualReference(ProductionReference):
@@ -71,6 +75,14 @@ class FinalSubjectVoice(SchemaModel):
     entity_id: str
     target_occurrence_id: str
     voice_reference_path: str
+    voice_reference_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    voice_sample_rate_hz: Literal[32000] = CANONICAL_AUDIO_SAMPLE_RATE_HZ
+    voice_channels: Literal[2] = CANONICAL_AUDIO_CHANNELS
+    source_start: float = Field(ge=0, allow_inf_nan=False)
+    source_end: float = Field(gt=0, allow_inf_nan=False)
+    source_start_sample: int = Field(ge=0)
+    source_end_sample: int = Field(gt=0)
+    sample_mapping_policy: Literal["round_time_seconds_times_32000_v1"]
     voice_source: Literal["target", "cross_donor"]
     donor_occurrence_id: str | None = None
     donor_clip_uid: str | None = None
@@ -78,6 +90,16 @@ class FinalSubjectVoice(SchemaModel):
 
     @model_validator(mode="after")
     def validate_voice(self) -> FinalSubjectVoice:
+        if (
+            self.source_end <= self.source_start
+            or self.source_end_sample <= self.source_start_sample
+        ):
+            raise ValueError("final H3 voice interval is invalid")
+        if (self.source_start_sample, self.source_end_sample) != (
+            round(self.source_start * self.voice_sample_rate_hz),
+            round(self.source_end * self.voice_sample_rate_hz),
+        ):
+            raise ValueError("final H3 voice samples differ from authoritative times")
         donor_values = (
             self.donor_occurrence_id,
             self.donor_clip_uid,
@@ -101,12 +123,23 @@ class FinalQwen3SpeechSegment(SchemaModel):
     entity_occurrence_id: str | None = None
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = CANONICAL_AUDIO_SAMPLE_RATE_HZ
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
     text: str
     language: str | None = None
     asr_model: Literal["Qwen/Qwen3-ASR-1.7B"] = "Qwen/Qwen3-ASR-1.7B"
+
+    @model_validator(mode="after")
+    def validate_canonical_sample_domain(self) -> FinalQwen3SpeechSegment:
+        if self.source_end_sample <= self.source_start_sample:
+            raise ValueError("final speech segment sample range must be positive")
+        if (self.source_start_sample, self.source_end_sample) != (
+            round(self.start_time * self.source_sample_rate_hz),
+            round(self.end_time * self.source_sample_rate_hz),
+        ):
+            raise ValueError("final speech samples must use canonical 32 kHz time")
+        return self
 
 
 class FinalFullClipAudioSemantics(SchemaModel):
@@ -124,7 +157,7 @@ class FinalFullClipAudioSemantics(SchemaModel):
 
 
 class FinalH3SampleV2(SchemaModel):
-    schema_version: Literal["r2v.h3.final_sample.4"] = FINAL_SAMPLE_VERSION
+    schema_version: Literal["r2v.h3.final_sample.5"] = FINAL_SAMPLE_VERSION
     sample_id: str
     pair_id: str
     pair_type: Literal["canonical", "in_pair", "cross_pair"]
@@ -137,6 +170,9 @@ class FinalH3SampleV2(SchemaModel):
     shard_id: str
     target_video: str
     target_full_audio_path: str
+    target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_audio_sample_rate_hz: Literal[32000] = CANONICAL_AUDIO_SAMPLE_RATE_HZ
+    target_audio_channels: Literal[2] = CANONICAL_AUDIO_CHANNELS
     r2v_instruction: str
     visual_references: list[FinalVisualReference]
     subject_voices: list[FinalSubjectVoice]
@@ -176,9 +212,9 @@ class FinalH3SampleV2(SchemaModel):
 
 
 class FinalH3SummaryV2(SchemaModel):
-    schema_version: Literal["r2v.h3.final_summary.5"] = FINAL_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.final_summary.6"] = FINAL_SUMMARY_VERSION
     final_sample_schema_version: Literal[
-        "r2v.h3.final_sample.4"
+        "r2v.h3.final_sample.5"
     ] = FINAL_SAMPLE_VERSION
     canonical_clip_count: int = Field(ge=0)
     canonical_base_sample_count: int = Field(ge=0)
@@ -325,6 +361,38 @@ def _load_canonical_audio(
     return by_clip, _sha256(records_path)
 
 
+def _load_primary_voice_references(
+    root: Path,
+) -> dict[str, tuple[PrimaryVoiceReferenceSelection, Path]]:
+    resolved_root = root.expanduser().resolve(strict=True)
+    records_path = resolved_root / "primary_voice_references.jsonl"
+    records = [
+        PrimaryVoiceReferenceSelection.model_validate(row)
+        for row in _read_rows(records_path)
+    ]
+    occurrence_ids = [item.entity_occurrence_id for item in records]
+    if len(occurrence_ids) != len(set(occurrence_ids)):
+        raise ValueError("primary voice selections contain duplicate occurrences")
+    by_occurrence: dict[str, tuple[PrimaryVoiceReferenceSelection, Path]] = {}
+    for item in records:
+        artifact = item.primary_voice_reference
+        if artifact is None:
+            continue
+        path = (resolved_root / artifact.asset.path).resolve(strict=True)
+        path.relative_to(resolved_root)
+        metadata = artifact.quality_metadata
+        if (
+            _sha256(path) != artifact.asset.sha256
+            or metadata.get("source_sample_rate_hz")
+            != CANONICAL_AUDIO_SAMPLE_RATE_HZ
+            or metadata.get("source_channels") != CANONICAL_AUDIO_CHANNELS
+            or metadata.get("sample_mapping_policy") != VOICE_SAMPLE_MAPPING_POLICY
+        ):
+            raise ValueError("primary voice canonical Audio provenance differs")
+        by_occurrence[item.entity_occurrence_id] = (item, path)
+    return by_occurrence
+
+
 def _load_audio_semantics(
     *,
     root: Path | None,
@@ -422,29 +490,77 @@ def _validate_pair_target(
             raise ValueError("pair subject differs from canonical Visual reference")
 
 
-def _target_voices(pair: JEAInPair) -> list[FinalSubjectVoice]:
+def _final_voice(
+    *,
+    subject_index: int,
+    entity_id: str,
+    target_occurrence_id: str,
+    pair_voice_path: str,
+    source: tuple[PrimaryVoiceReferenceSelection, Path],
+    voice_source: Literal["target", "cross_donor"],
+    donor_occurrence_id: str | None = None,
+    donor_clip_uid: str | None = None,
+    donor_clip_display_path: str | None = None,
+) -> FinalSubjectVoice:
+    selection, source_path = source
+    artifact = selection.primary_voice_reference
+    assert artifact is not None
+    if selection.entity_occurrence_id != (
+        target_occurrence_id if voice_source == "target" else donor_occurrence_id
+    ):
+        raise ValueError("pair voice occurrence differs from H3 voice provenance")
+    if Path(pair_voice_path).expanduser().resolve(strict=True) != source_path:
+        raise ValueError("pair voice differs from primary voice provenance")
+    return FinalSubjectVoice(
+        subject_index=subject_index,
+        entity_id=entity_id,
+        target_occurrence_id=target_occurrence_id,
+        voice_reference_path=str(source_path),
+        voice_reference_sha256=artifact.asset.sha256,
+        source_start=artifact.source_start,
+        source_end=artifact.source_end,
+        source_start_sample=artifact.source_start_sample,
+        source_end_sample=artifact.source_end_sample,
+        sample_mapping_policy=VOICE_SAMPLE_MAPPING_POLICY,
+        voice_source=voice_source,
+        donor_occurrence_id=donor_occurrence_id,
+        donor_clip_uid=donor_clip_uid,
+        donor_clip_display_path=donor_clip_display_path,
+    )
+
+
+def _target_voices(
+    pair: JEAInPair,
+    voices: dict[str, tuple[PrimaryVoiceReferenceSelection, Path]],
+) -> list[FinalSubjectVoice]:
     return [
-        FinalSubjectVoice(
+        _final_voice(
             subject_index=item.subject_index,
             entity_id=item.target_entity_id,
             target_occurrence_id=item.target_occurrence_id,
-            voice_reference_path=item.target_primary_voice_reference_path,
+            pair_voice_path=item.target_primary_voice_reference_path,
+            source=voices[item.target_occurrence_id],
             voice_source="target",
         )
         for item in pair.subjects
     ]
 
 
-def _cross_voices(pair: JEAInPair, cross: JEACrossPair) -> list[FinalSubjectVoice]:
+def _cross_voices(
+    pair: JEAInPair,
+    cross: JEACrossPair,
+    voices: dict[str, tuple[PrimaryVoiceReferenceSelection, Path]],
+) -> list[FinalSubjectVoice]:
     entity_by_occurrence = {
         item.target_occurrence_id: item.target_entity_id for item in pair.subjects
     }
     return [
-        FinalSubjectVoice(
+        _final_voice(
             subject_index=item.subject_index,
             entity_id=entity_by_occurrence[item.target_occurrence_id],
             target_occurrence_id=item.target_occurrence_id,
-            voice_reference_path=item.donor_primary_voice_reference_path,
+            pair_voice_path=item.donor_primary_voice_reference_path,
+            source=voices[item.donor_occurrence_id],
             voice_source="cross_donor",
             donor_occurrence_id=item.donor_occurrence_id,
             donor_clip_uid=item.donor_clip_uid,
@@ -503,6 +619,7 @@ def render_jea_final_samples(
     binding_audit_root: Path,
     qwen3_asr_root: Path,
     output_root: Path,
+    primary_voice_root: Path | None = None,
     audio_semantics_root: Path | None = None,
     overwrite: bool = False,
 ) -> FinalH3SummaryV2:
@@ -515,6 +632,15 @@ def render_jea_final_samples(
         canonical_by_clip=canonical_by_clip,
     )
     in_pairs, cross_pairs = _load_optional_pairs(pairs_root)
+    primary_voices = (
+        {}
+        if not in_pairs
+        else _load_primary_voice_references(
+            primary_voice_root
+            if primary_voice_root is not None
+            else audio_root.expanduser().resolve(strict=True).parent / "primary_voice"
+        )
+    )
     in_by_clip = {item.target_clip_uid: item for item in in_pairs}
     if len(in_by_clip) != len(in_pairs) or not set(in_by_clip).issubset(
         canonical_by_clip
@@ -654,6 +780,7 @@ def render_jea_final_samples(
             "clip_uid": clip_uid,
             "target_video": visual.sample.target_video,
             "target_full_audio_path": canonical.target_full_audio_path,
+            "target_full_audio_sha256": canonical.target_full_audio_sha256,
             "r2v_instruction": visual.sample.r2v_instruction,
             "visual_references": references,
             "speech_segments": speech_by_clip.get(clip_uid, []),
@@ -674,7 +801,7 @@ def render_jea_final_samples(
                     sample_id=f"{visual.sample.sample_id}/in_pair",
                     pair_id=pair.pair_id,
                     pair_type="in_pair",
-                    subject_voices=_target_voices(pair),
+                    subject_voices=_target_voices(pair, primary_voices),
                     **common,
                 )
             )
@@ -695,7 +822,7 @@ def render_jea_final_samples(
                     sample_id=f"{visual.sample.sample_id}/cross_pair/1",
                     pair_id=cross.pair_id,
                     pair_type="cross_pair",
-                    subject_voices=_cross_voices(pair, cross),
+                    subject_voices=_cross_voices(pair, cross, primary_voices),
                     **common,
                 )
             )

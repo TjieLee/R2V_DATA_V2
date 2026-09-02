@@ -1070,7 +1070,7 @@ def build_jea_target_audio_caption_inventory(
             raise ValueError("JEA pair and readable DiariZen clip paths differ")
         video_path = _resolved_file(pair.target_video_path, field_name="target video")
         audio_path = _resolved_file(
-            pair.target_full_audio_path, field_name="target full audio"
+            pair.target_full_audio_path, field_name="canonical target full audio"
         )
         binding_path = _resolved_file(
             pair.target_audio_binding_path, field_name="target audio binding"
@@ -1082,6 +1082,10 @@ def build_jea_target_audio_caption_inventory(
             next(iter(readable_audio_values)),
             field_name="readable source audio",
         )
+        if readable_audio_path != audio_path:
+            raise ValueError(
+                "readable DiariZen source audio must be canonical target full audio"
+            )
         target_duration_seconds = _validate_audio_timelines(
             clip_rows=clip_rows,
             readable_audio_path=readable_audio_path,

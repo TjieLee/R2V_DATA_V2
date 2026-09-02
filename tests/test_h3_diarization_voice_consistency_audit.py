@@ -151,6 +151,7 @@ def _sample(
         shard_id="shard-a",
         target_video=str(video),
         target_full_audio_path=str(source_audio),
+        target_full_audio_sha256=_sha256(source_audio),
         r2v_instruction="Use Image 1 and Image 2.",
         visual_references=[
             _reference(tmp_path, "e1", 1),
@@ -162,6 +163,12 @@ def _sample(
                 entity_id="e1",
                 target_occurrence_id="clip-a/e1",
                 voice_reference_path=str(voice_path),
+                voice_reference_sha256=_sha256(voice_path),
+                source_start=0.0,
+                source_end=1.0,
+                source_start_sample=0,
+                source_end_sample=32000,
+                sample_mapping_policy="round_time_seconds_times_32000_v1",
                 voice_source="target",
             )
         ],

@@ -119,12 +119,16 @@ ranges and retain overlapping speakers.
 
 Active JEA production roots the `.3` inventory in the exact canonical Visual
 inventory and `audio/canonical_clips.jsonl`, not in pairs. Every canonical clip
-is a target, and its actual 16 kHz mono canonical FLAC extent is established by
-ffprobe. An Audio binding sidecar is optional evidence: a missing or non-ready
-sidecar supplies no frozen anchors, so resulting clusters remain unbound rather
-than dropping the clip. Empty DiariZen output is a valid empty clip result;
-backend failure remains distinct and fail-closed. The pair-rooted commands below
-describe the retained historical pilot/legacy production entry point only.
+is a target, and its actual 32 kHz stereo canonical FLAC extent is established
+by ffprobe. The DiariZen worker derives a temporary 16 kHz mono analysis view
+under `h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1`; it does not
+publish a second canonical audio artifact. Persisted source sample coordinates
+remain in the 32 kHz canonical domain. An Audio binding sidecar is optional
+evidence: a missing or non-ready sidecar supplies no frozen anchors, so
+resulting clusters remain unbound rather than dropping the clip. Empty DiariZen
+output is a valid empty clip result; backend failure remains distinct and
+fail-closed. The pair-rooted commands below describe the retained historical
+pilot/legacy production entry point only.
 
 The pilot inventory reuses the exact ordered 20 targets in
 `$AUDIO_RUN_ROOT/asr_pilot20/inventory.json`. It validates that the source is
@@ -198,9 +202,11 @@ stdout. A requested CUDA device never falls back to CPU.
 The official pipeline reads the supplied audio path with `torchaudio`, selects
 the first channel, and preserves its time coordinate. The historical pilot
 passes its immutable Audio V1 PCM16 WAV. Active JEA canonical-wide production
-passes the immutable canonical 16 kHz mono FLAC from
-`audio/canonical_clips.jsonl`; both paths verify the source hash and perform no
-denoising, enhancement, interpolation, or timestamp shift.
+stages the immutable canonical 32 kHz stereo FLAC from
+`audio/canonical_clips.jsonl`, verifies its source hash, and creates a private
+16 kHz mono runtime view before invoking DiariZen. That deterministic channel
+mix and resample is analysis preprocessing only; it performs no denoising,
+enhancement, interpolation of segment boundaries, or timestamp shift.
 
 ## Server Staging Reference
 

@@ -33,6 +33,7 @@ from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRConfiguration,
     Qwen3ASRSegment,
     load_official_diarizen_waveform,
+    load_qwen3_asr_model_input,
     run_qwen3_asr,
 )
 from r2v_data_v2.h3.schemas import (
@@ -695,7 +696,7 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
             },
         ],
     )
-    calls: list[str] = []
+    calls: list[dict[str, object]] = []
 
     class _AudioBackend:
         def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
@@ -703,10 +704,13 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
             destination = Path(kwargs["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(f"audio:{clip_uid}".encode())
-            calls.append(clip_uid)
+            calls.append(dict(kwargs))
             return SimpleNamespace(
                 path=destination,
                 stream=SimpleNamespace(duration_seconds=2.5),
+                sample_rate_hz=kwargs["sample_rate_hz"],
+                channels=kwargs["channels"],
+                output_format=kwargs["output_format"],
             )
 
     audio_root = tmp_path / "audio-production" / "audio"
@@ -722,10 +726,21 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
         .splitlines()
     ]
 
-    assert calls == ["subject", "object-only"]
+    assert [call["clip_uid"] for call in calls] == ["subject", "object-only"]
+    assert [
+        (call["sample_rate_hz"], call["channels"]) for call in calls
+    ] == [(32000, 2), (32000, 2)]
+    assert all(
+        Path(str(call["source_video_path"])).is_file() for call in calls
+    )
     assert summary.visual_canonical_clip_count == 2
     assert summary.canonical_audio_clip_count == 2
     assert [row.clip_uid for row in rows] == ["subject", "object-only"]
+    assert all(row.sample_rate_hz == 32000 for row in rows)
+    assert all(row.channels == 2 for row in rows)
+    assert all("full_audio" in Path(row.target_full_audio_path).parts for row in rows)
+    for row, call in zip(rows, calls, strict=True):
+        assert Path(str(call["source_video_path"])) == Path(row.target_video_path)
     no_subject = rows[1]
     assert no_subject.subject_reference_count == 0
     assert no_subject.target_audio_binding_path is None
@@ -816,11 +831,11 @@ def test_canonical_diarization_inventory_retains_all_visual_clips(
                 {
                     "streams": [
                         {
-                            "sample_rate": "16000",
-                            "channels": 1,
+                            "sample_rate": "32000",
+                            "channels": 2,
                             "duration": "0.100000",
-                            "duration_ts": 1600,
-                            "time_base": "1/16000",
+                            "duration_ts": 3200,
+                            "time_base": "1/32000",
                         }
                     ],
                     "format": {"duration": "0.100000"},
@@ -847,12 +862,20 @@ def test_canonical_diarization_inventory_retains_all_visual_clips(
     assert result.source_pairs_path is None
     assert result.source_pairs_sha256 is None
     assert result.source_target_count == result.selected_target_count == 3
-    assert [item.source_frame_count for item in result.targets] == [1600] * 3
+    assert [item.source_frame_count for item in result.targets] == [3200] * 3
+    canonical_by_clip = {str(item["clip_uid"]): item for item in canonical}
+    assert all(
+        item.source_audio_path
+        == canonical_by_clip[item.target_clip_uid]["target_full_audio_path"]
+        for item in result.targets
+    )
+    assert all(item.source_sample_rate_hz == 32000 for item in result.targets)
+    assert all(item.source_channels == 2 for item in result.targets)
     assert result.targets[0].target_audio_binding_path == str(binding_path)
     assert result.targets[1].target_audio_binding_path is None
     assert result.targets[2].target_audio_binding_path is None
-    assert all(item.source_sample_rate_hz == 16000 for item in result.targets)
-    assert all(item.source_channels == 1 for item in result.targets)
+    assert all(item.source_sample_rate_hz == 32000 for item in result.targets)
+    assert all(item.source_channels == 2 for item in result.targets)
     assert all(item.visual_references for item in result.targets)
     assert len(commands) == 3
     assert all(command[0] == "/fixture/ffprobe" for command in commands)
@@ -915,6 +938,9 @@ def test_canonical_audio_backfill_uses_official_audio_stage_root(
             return SimpleNamespace(
                 path=destination,
                 stream=SimpleNamespace(duration_seconds=2.5),
+                sample_rate_hz=kwargs["sample_rate_hz"],
+                channels=kwargs["channels"],
+                output_format=kwargs["output_format"],
             )
 
     monkeypatch.setattr(
@@ -953,6 +979,7 @@ def test_canonical_audio_backfill_uses_official_audio_stage_root(
     assert not (production_root / "canonical_clips.jsonl").exists()
     assert not (production_root / "canonical_clips_summary.json").exists()
     assert not (production_root / "full_audio").exists()
+    assert not (paths.audio / "h3_full_audio").exists()
 
 
 def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(
@@ -996,6 +1023,9 @@ def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(
             return SimpleNamespace(
                 path=destination,
                 stream=SimpleNamespace(duration_seconds=2.5),
+                sample_rate_hz=kwargs["sample_rate_hz"],
+                channels=kwargs["channels"],
+                output_format=kwargs["output_format"],
             )
 
     output = tmp_path / "audio-stage"
@@ -1615,7 +1645,9 @@ def test_multi_subject_matching_maximizes_complete_face_assignment(
             subject_index=index,
             identity=clip.identity,
             visual_reference_path=f"/{clip_uid}/{entity_id}.png",
-            primary_voice_reference_path=f"/{clip_uid}/{entity_id}.flac",
+            primary_voice_reference_path=str(
+                tmp_path / "primary_voice" / clip_uid / f"{entity_id}.flac"
+            ),
             face_embedding=vector(angle),
             voice_embedding=[1.0, 0.0],
         )
@@ -1786,7 +1818,7 @@ def test_cli_wires_all_eight_stages_for_both_visual_layouts_without_models(
         (root / "summary.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "r2v.h3.qwen3_asr_summary.2",
+                    "schema_version": "r2v.h3.qwen3_asr_summary.3",
                     "segment_count": 2,
                     "transcribed_count": 2,
                     "empty_count": 0,
@@ -1956,7 +1988,7 @@ def test_jea_qwen_stage_launches_one_isolated_subprocess_and_reads_summary(
         (asr / "summary.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "r2v.h3.qwen3_asr_summary.2",
+                    "schema_version": "r2v.h3.qwen3_asr_summary.3",
                     "segment_count": 3,
                     "transcribed_count": 2,
                     "empty_count": 1,
@@ -2177,6 +2209,56 @@ def test_qwen3_backend_loads_model_once_for_multiple_segments() -> None:
     assert len(model.calls) == 2
 
 
+def test_qwen3_runtime_preprocessing_crops_by_time_to_16k_mono(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "canonical.flac"
+    source.write_bytes(b"32k stereo fixture")
+    samples = np.asarray([0.25, -0.5, 0.75], dtype="<f4")
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        assert kwargs == {"check": False, "capture_output": True}
+        return SimpleNamespace(returncode=0, stdout=samples.tobytes(), stderr=b"")
+
+    monkeypatch.setattr("r2v_data_v2.h3.qwen3_asr.subprocess.run", run)
+
+    waveform, sample_rate = load_qwen3_asr_model_input(
+        source,
+        0.125,
+        0.375,
+        ffmpeg="fixture-ffmpeg",
+    )
+
+    assert sample_rate == 16000
+    np.testing.assert_array_equal(waveform, samples)
+    assert calls == [
+        [
+            "fixture-ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(source),
+            "-ss",
+            "0.125000000",
+            "-to",
+            "0.375000000",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+            "pipe:1",
+        ]
+    ]
+
+
 def test_qwen3_empty_and_failed_schemas_publish_no_confidence() -> None:
     common = {
         "clip_uid": "clip",
@@ -2191,9 +2273,9 @@ def test_qwen3_empty_and_failed_schemas_publish_no_confidence() -> None:
         "source_audio_path": "/audio.flac",
         "source_start_sample": 0,
         "source_end_sample": 100,
-        "source_sample_rate_hz": 16000,
+        "source_sample_rate_hz": 32000,
         "start_time": 0.0,
-        "end_time": 0.00625,
+        "end_time": 0.003125,
         "configuration": Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
     }
     empty = Qwen3ASRSegment(status="empty", **common)
@@ -2234,7 +2316,7 @@ def _write_readable_diarization_artifacts(
                     clip_uid,
                     f"/unused/{clip_uid}.flac",
                 ),
-                "source_sample_rate_hz": 16000,
+                "source_sample_rate_hz": 32000,
                 "target_video_path": video_by_clip[clip_uid],
                 "target_audio_binding_path": None,
                 "target_audio_binding_sha256": None,
@@ -2315,12 +2397,12 @@ def _single_qwen_diarization_fixture(
             "target_clip_uid": "clip-readable",
             "segment_id": "segment_0001",
             "speaker_cluster_id": "speaker_1",
-            "start_time": 0.000125,
-            "end_time": 0.0003125,
+            "start_time": 0.0000625,
+            "end_time": 0.00015625,
             "source_start_sample": 2,
             "source_end_sample": 5,
             "source_audio_path": str(source_audio),
-            "source_sample_rate_hz": 16000,
+            "source_sample_rate_hz": 32000,
         }
     ]
     bound_segments = [
@@ -2328,8 +2410,8 @@ def _single_qwen_diarization_fixture(
             "target_clip_uid": "clip-readable",
             "segment_id": "segment_0001",
             "speaker_cluster_id": "speaker_1",
-            "start_time": 0.000125,
-            "end_time": 0.0003125,
+            "start_time": 0.0000625,
+            "end_time": 0.00015625,
             "source_start_sample": 2,
             "source_end_sample": 5,
             "entity_id": "entity_1",
@@ -2358,9 +2440,13 @@ def test_qwen3_consumes_readable_diarization_without_visual_inventory(
     )
     loader_paths: list[Path] = []
 
-    def audio_loader(path: Path) -> tuple[np.ndarray, int]:
+    def audio_loader(
+        path: Path, start_time: float, end_time: float
+    ) -> tuple[np.ndarray, int]:
         loader_paths.append(path)
-        return np.arange(10, dtype=np.float32), 16000
+        assert start_time == 0.0000625
+        assert end_time == 0.00015625
+        return np.asarray([2, 3, 4], dtype=np.float32), 16000
 
     output = tmp_path / "asr"
     summary = run_qwen3_asr(
@@ -2368,7 +2454,7 @@ def test_qwen3_consumes_readable_diarization_without_visual_inventory(
         source_visual_production_root=inventory.visual_production_root,
         output_root=output,
         backend=backend,
-        audio_loader=audio_loader,
+        segment_audio_loader=audio_loader,
     )
 
     assert summary.segment_count == 1
@@ -2414,11 +2500,11 @@ def test_qwen3_tracks_no_speech_canonical_targets_without_fake_rows(
             "segment_id": "segment_0001",
             "speaker_cluster_id": "speaker_1",
             "start_time": 0.0,
-            "end_time": 0.0001875,
+            "end_time": 0.00009375,
             "source_start_sample": 0,
             "source_end_sample": 3,
             "source_audio_path": str(source_audio),
-            "source_sample_rate_hz": 16000,
+            "source_sample_rate_hz": 32000,
         }
     ]
     bound = [
@@ -2446,7 +2532,10 @@ def test_qwen3_tracks_no_speech_canonical_targets_without_fake_rows(
         source_visual_production_root=inventory.visual_production_root,
         output_root=tmp_path / "asr",
         backend=backend,
-        audio_loader=lambda _path: (np.arange(3, dtype=np.float32), 16000),
+        segment_audio_loader=lambda _path, _start, _end: (
+            np.arange(3, dtype=np.float32),
+            16000,
+        ),
     )
 
     rows = (tmp_path / "asr/segments.jsonl").read_text(encoding="utf-8").splitlines()
@@ -2462,7 +2551,7 @@ def test_qwen3_readable_raw_bound_mismatch_fails_closed(tmp_path: Path) -> None:
     inventory, diarization, _source_audio = _single_qwen_diarization_fixture(tmp_path)
     readable_path = diarization / "readable_segments.jsonl"
     readable = json.loads(readable_path.read_text(encoding="utf-8"))
-    readable["source_end_sample"] = 6
+    readable["speaker_cluster_id"] = "speaker-other"
     readable_path.write_text(json.dumps(readable) + "\n", encoding="utf-8")
     backend = Qwen3ASRBackend(
         Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
@@ -2475,7 +2564,10 @@ def test_qwen3_readable_raw_bound_mismatch_fails_closed(tmp_path: Path) -> None:
             source_visual_production_root=inventory.visual_production_root,
             output_root=tmp_path / "asr",
             backend=backend,
-            audio_loader=lambda _path: (np.ones(10, dtype=np.float32), 16000),
+            segment_audio_loader=lambda _path, _start, _end: (
+                np.ones(10, dtype=np.float32),
+                16000,
+            ),
         )
 
 
@@ -2512,9 +2604,9 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
                 "target_video_path": inventory.clips[0].sample.target_video,
                 "source_audio_path": str(source_audio),
                 "source_audio_sha256": "c" * 64,
-                "source_sample_rate_hz": 16000,
-                "source_channels": 1,
-                "source_frame_count": 16000,
+                "source_sample_rate_hz": 32000,
+                "source_channels": 2,
+                "source_frame_count": 32000,
                 "target_audio_binding_path": str(tmp_path / "audio_binding.json"),
                 "visual_references": [],
             }
@@ -2528,8 +2620,8 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
     bound_segments = []
     for index, (start, end) in enumerate(((0.0, 0.5), (0.5, 1.0)), start=1):
         segment_id = f"segment_{index:04d}"
-        start_sample = round(start * 16000)
-        end_sample = round(end * 16000)
+        start_sample = round(start * 32000)
+        end_sample = round(end * 32000)
         raw_segments.append(
             {
                 "target_clip_uid": "clip-fail",
@@ -2546,7 +2638,7 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
                 "source_end_sample": end_sample,
                 "source_audio_path": str(source_audio),
                 "source_audio_sha256": "c" * 64,
-                "source_sample_rate_hz": 16000,
+                "source_sample_rate_hz": 32000,
                 "backend": "fake-diarizen",
                 "model_identifier": "fake/diarizen",
                 "model_fingerprint": "d" * 64,
@@ -2589,7 +2681,9 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
     )
     loader_calls = 0
 
-    def failed_loader(_path: Path) -> tuple[np.ndarray, int]:
+    def failed_loader(
+        _path: Path, _start_time: float, _end_time: float
+    ) -> tuple[np.ndarray, int]:
         nonlocal loader_calls
         loader_calls += 1
         raise OSError("audio infrastructure unavailable")
@@ -2604,7 +2698,7 @@ def test_qwen3_all_segment_infrastructure_failure_publishes_no_stage(
             source_visual_production_root=inventory.visual_production_root,
             output_root=output,
             backend=backend,
-            audio_loader=failed_loader,
+            segment_audio_loader=failed_loader,
         )
 
     assert loader_calls == 2

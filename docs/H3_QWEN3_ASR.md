@@ -109,9 +109,17 @@ audio/canonical_clips_summary.json
 primary_voice/<clip_display_path>/<entity_id>.flac
 ```
 
-Fresh Audio production materializes full audio for all `canonical_clips` while
-running subject binding only for `.clips`. The canonical manifest publishes one
-`r2v.h3.canonical_audio_clip.1` row per Visual canonical clip in Visual order.
+Fresh Audio production materializes one lossless canonical artifact for every
+`canonical_clip` while running subject binding only for `.clips`.
+`audio/full_audio/` is always 32 kHz stereo FLAC decoded directly from the
+original processed target video audio stream. No persistent 16 kHz analysis
+copy or second H3-audio tree is published.
+
+The canonical manifest publishes one `r2v.h3.canonical_audio_clip.2` row per
+Visual canonical clip in Visual order. `target_full_audio_path` and
+`target_full_audio_sha256` mean the single 32 kHz stereo canonical artifact.
+The row records its sample rate, channel count, duration, and original-video
+source policy.
 No-subject rows have null binding path/hash instead of a fabricated empty
 sidecar. Its summary requires the Visual and Audio canonical counts to match.
 
@@ -120,19 +128,33 @@ Canonical Audio rows, DiariZen rows, Qwen rows, and final samples carry `clip_ui
 `episode_name`, `clip_name`, and `shard_id`. Pair review pages sort readable
 paths first.
 
-The active resolved-path output contracts are `r2v.h3.final_sample.4` and
-`r2v.h3.final_summary.5`; the summary declares
-`final_sample_schema_version=r2v.h3.final_sample.4`. Final H3 samples publish
+The active resolved-path output contracts are `r2v.h3.final_sample.5` and
+`r2v.h3.final_summary.6`; the summary declares
+`final_sample_schema_version=r2v.h3.final_sample.5`. Final H3 samples publish
 media paths with explicit ownership semantics:
 
 - `target_video` is the directly readable processed target-video path.
-- `target_full_audio_path` is the directly readable canonical full-audio path.
+- `target_full_audio_path` is the directly readable 32 kHz stereo H3-native
+  target audio used by AudioVAE/training.
 - `visual_references[].image_path` is the original Visual-relative provenance
   path and intentionally retains its source representation.
 - `visual_references[].image_artifact_path` is the directly readable absolute
   reference-image path copied from the normalized Visual inventory.
-- `subject_voices[].voice_reference_path` is the directly readable
-  voice-reference path.
+- `subject_voices[].voice_reference_path` is the directly readable 32 kHz
+  stereo H3 conditioning reference.
+
+Primary-voice quality selection keeps its existing diagnostics, then the
+persisted reference is cropped directly from canonical 32 kHz stereo audio
+using authoritative start/end times and `round(time_seconds * 32000)`.
+Cross-pair variants use the donor occurrence's canonical crop under the same
+policy. ECAPA converts that reference to a 16 kHz mono runtime waveform only
+inside its worker.
+
+DiariZen and Qwen3-ASR use the explicit
+`h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1` preprocessing policy.
+Their model inputs are temporary 16 kHz mono waveforms, while persisted segment
+`source_start_sample` and `source_end_sample` values remain in the canonical
+32 kHz source domain.
 
 Visual reference assets are not copied into H3. A training reader must read
 `image_artifact_path` directly and must not reconstruct Visual export/run-root
@@ -354,7 +376,7 @@ coverage when that root is supplied and projects the record into the
 backend-neutral `full_clip_audio_semantics` field; raw caption text is not
 published. The exact Visual/Audio clip-level join key is `clip_uid`.
 
-Qwen3-ASR inventory and summary contract `.2` report
+Qwen3-ASR inventory and summary contract `.3` report
 `source_target_clip_count`, `clips_with_diarization_segments`, and
 `clips_without_diarization_segments`. No-speech canonical clips receive no fake
 ASR row and still produce canonical Final H3 samples with an empty

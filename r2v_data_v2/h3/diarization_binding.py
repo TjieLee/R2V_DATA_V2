@@ -49,7 +49,9 @@ DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.3"
 DIARIZATION_HUMAN_QA_VERSION = "r2v.h3.diarization_human_qa.1"
 DIARIZATION_MAPPING_POLICY_VERSION = "h3_diarizen_sparse_anchor_policy_v1"
 DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v1"
-DIARIZATION_PREPROCESSING_VERSION = "official_torchaudio_first_channel_passthrough_v1"
+DIARIZATION_PREPROCESSING_VERSION = (
+    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+)
 DIARIZATION_BOUNDARY_POLICY_VERSION = "canonical_source_intersection_v1"
 DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT = (
     "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
@@ -296,9 +298,13 @@ class DiarizationBackendProvenance(SchemaModel):
     request_contract_version: Literal["h3_diarizen_clip_diarization_v1"] = (
         DIARIZATION_REQUEST_VERSION
     )
-    input_preprocessing: Literal["official_torchaudio_first_channel_passthrough_v1"] = (
-        DIARIZATION_PREPROCESSING_VERSION
-    )
+    input_preprocessing: Literal[
+        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    ] = DIARIZATION_PREPROCESSING_VERSION
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
+    model_input_sample_rate_hz: Literal[16000] = 16000
+    model_input_channels: Literal[1] = 1
 
     @model_validator(mode="after")
     def validate_provenance(self) -> DiarizationBackendProvenance:
@@ -376,9 +382,9 @@ class RawDiarizationSegment(SchemaModel):
     model_identifier: str
     model_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     backend_configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    input_preprocessing: Literal["official_torchaudio_first_channel_passthrough_v1"] = (
-        DIARIZATION_PREPROCESSING_VERSION
-    )
+    input_preprocessing: Literal[
+        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    ] = DIARIZATION_PREPROCESSING_VERSION
     boundary_reconciliation: DiarizationBoundaryReconciliation
 
     @model_validator(mode="after")
@@ -873,6 +879,23 @@ class PersistentDiariZenBackend:
             )
         if response.get("model_identifier") != self.provenance.model_identifier:
             raise DiarizationBackendFailure("DiariZen model identifier mismatch")
+        metadata = response.get("backend_metadata")
+        if not isinstance(metadata, dict) or any(
+            metadata.get(key) != expected
+            for key, expected in (
+                ("input_preprocessing", self.provenance.input_preprocessing),
+                ("source_sample_rate_hz", self.provenance.source_sample_rate_hz),
+                ("source_channels", self.provenance.source_channels),
+                (
+                    "model_input_sample_rate_hz",
+                    self.provenance.model_input_sample_rate_hz,
+                ),
+                ("model_input_channels", self.provenance.model_input_channels),
+            )
+        ):
+            raise DiarizationBackendFailure(
+                "DiariZen runtime preprocessing provenance mismatch"
+            )
         segments = response.get("segments")
         if not isinstance(segments, list):
             raise DiarizationBackendFailure("DiariZen worker segments are invalid")
@@ -1826,6 +1849,35 @@ def _write_segment_wav(
     expected_sample_rate: int,
     expected_channels: int,
 ) -> None:
+    if source_path.suffix.lower() == ".flac":
+        try:
+            import soundfile as sf
+        except ImportError as exc:
+            raise RuntimeError(
+                "soundfile is required to render canonical FLAC review audio"
+            ) from exc
+        info = sf.info(str(source_path))
+        if (
+            info.samplerate != expected_sample_rate
+            or info.channels != expected_channels
+            or end_sample > info.frames
+        ):
+            raise ValueError("canonical review audio metadata changed")
+        frames, sample_rate = sf.read(
+            str(source_path),
+            start=start_sample,
+            stop=end_sample,
+            dtype="int16",
+            always_2d=True,
+        )
+        if sample_rate != expected_sample_rate or frames.shape != (
+            end_sample - start_sample,
+            expected_channels,
+        ):
+            raise ValueError("canonical review audio ended unexpectedly")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(destination), frames, expected_sample_rate, subtype="PCM_16")
+        return
     with wave.open(str(source_path), "rb") as source:
         if (
             source.getsampwidth() != 2

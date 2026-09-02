@@ -15,6 +15,40 @@ import numpy as np
 
 from r2v_data_v2.h3.audio_backends import fingerprint_local_model_path
 
+_ANALYSIS_RESAMPLE_POLICY = (
+    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+)
+
+
+def _prepare_model_input(
+    waveform: Any,
+    sample_rate: int,
+    *,
+    torch: Any,
+    torchaudio: Any,
+) -> tuple[Any, str]:
+    if waveform.ndim != 2 or waveform.shape[1] <= 0:
+        raise ValueError("speaker input waveform must be channel-first audio")
+    if not torch.isfinite(waveform).all().item():
+        raise ValueError("speaker input waveform must be finite and non-empty")
+    if sample_rate == 32000 and waveform.shape[0] == 2:
+        mono = waveform.mean(dim=0, keepdim=True)
+        return (
+            torchaudio.functional.resample(
+                mono,
+                orig_freq=32000,
+                new_freq=16000,
+                lowpass_filter_width=64,
+                rolloff=0.9475937167399596,
+                resampling_method="sinc_interp_kaiser",
+                beta=14.769656459379492,
+            ),
+            _ANALYSIS_RESAMPLE_POLICY,
+        )
+    if sample_rate == 16000 and waveform.shape[0] == 1:
+        return waveform, "native_16k_mono_passthrough_v1"
+    raise ValueError("speaker input must be canonical 32 kHz stereo or 16 kHz mono")
+
 
 def validate_speaker_model_path(model_path: Path) -> Path:
     source = model_path.expanduser().resolve(strict=True)
@@ -78,10 +112,14 @@ class SpeechBrainWorker:
     def process(self, request: dict[str, Any]) -> dict[str, Any]:
         audio_path = Path(str(request["audio_path"])).expanduser().resolve(strict=True)
         waveform, sample_rate = self.torchaudio.load(str(audio_path))
-        if waveform.ndim != 2 or waveform.shape[0] != 1 or sample_rate != 16000:
-            raise ValueError("speaker input must be 16 kHz mono audio")
-        if waveform.shape[1] <= 0 or not self.torch.isfinite(waveform).all().item():
-            raise ValueError("speaker input waveform must be finite and non-empty")
+        source_channels = int(waveform.shape[0]) if waveform.ndim == 2 else 0
+        source_sample_count = int(waveform.shape[1]) if waveform.ndim == 2 else 0
+        waveform, preprocessing = _prepare_model_input(
+            waveform,
+            int(sample_rate),
+            torch=self.torch,
+            torchaudio=self.torchaudio,
+        )
         with self.torch.inference_mode():
             encoded = self.classifier.encode_batch(waveform)
         values = encoded.detach().to("cpu").float().numpy().reshape(-1)
@@ -98,8 +136,13 @@ class SpeechBrainWorker:
                 "backend_name": "speechbrain_ecapa_voxceleb",
                 "backend_version": self.backend_version,
                 "source_sample_rate_hz": int(sample_rate),
-                "source_sample_count": int(waveform.shape[1]),
-                "source_duration_seconds": float(waveform.shape[1] / sample_rate),
+                "source_channels": source_channels,
+                "source_sample_count": source_sample_count,
+                "source_duration_seconds": float(source_sample_count / sample_rate),
+                "model_input_sample_rate_hz": 16000,
+                "model_input_channels": 1,
+                "model_input_sample_count": int(waveform.shape[1]),
+                "resampling_policy_version": preprocessing,
                 "embedding_dimension": int(values.size),
             },
         }

@@ -4,6 +4,7 @@ import html
 import json
 import os
 import shutil
+import subprocess
 import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -17,9 +18,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from r2v_data_v2.h3.schemas import SchemaModel
 
 QWEN3_ASR_MODEL_IDENTIFIER = "Qwen/Qwen3-ASR-1.7B"
-QWEN3_ASR_SEGMENT_VERSION = "r2v.h3.qwen3_asr_segment.1"
-QWEN3_ASR_INVENTORY_VERSION = "r2v.h3.qwen3_asr_inventory.2"
-QWEN3_ASR_SUMMARY_VERSION = "r2v.h3.qwen3_asr_summary.2"
+QWEN3_ASR_SEGMENT_VERSION = "r2v.h3.qwen3_asr_segment.2"
+QWEN3_ASR_INVENTORY_VERSION = "r2v.h3.qwen3_asr_inventory.3"
+QWEN3_ASR_SUMMARY_VERSION = "r2v.h3.qwen3_asr_summary.3"
+QWEN3_ASR_INPUT_SAMPLE_RATE_HZ = 16000
+QWEN3_ASR_INPUT_CHANNELS = 1
+QWEN3_ASR_PREPROCESSING_POLICY = (
+    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+)
 
 
 class Qwen3ASRConfiguration(SchemaModel):
@@ -55,7 +61,7 @@ class Qwen3ASRConfiguration(SchemaModel):
 
 
 class Qwen3ASRSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.qwen3_asr_segment.1"] = QWEN3_ASR_SEGMENT_VERSION
+    schema_version: Literal["r2v.h3.qwen3_asr_segment.2"] = QWEN3_ASR_SEGMENT_VERSION
     clip_uid: str
     clip_display_path: str
     media_collection_relpath: str
@@ -70,7 +76,12 @@ class Qwen3ASRSegment(SchemaModel):
     source_audio_path: str
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
+    model_input_sample_rate_hz: Literal[16000] = QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
+    model_input_channels: Literal[1] = QWEN3_ASR_INPUT_CHANNELS
+    input_preprocessing: Literal[
+        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    ] = QWEN3_ASR_PREPROCESSING_POLICY
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
     status: Literal["transcribed", "empty", "failed"]
@@ -85,6 +96,11 @@ class Qwen3ASRSegment(SchemaModel):
     def validate_result(self) -> Qwen3ASRSegment:
         if self.source_end_sample <= self.source_start_sample:
             raise ValueError("Qwen3 ASR segment sample range must be positive")
+        if (
+            self.source_start_sample != round(self.start_time * 32000)
+            or self.source_end_sample != round(self.end_time * 32000)
+        ):
+            raise ValueError("Qwen3 source samples must use canonical 32 kHz time")
         if self.status == "transcribed":
             if (
                 self.text is None
@@ -114,6 +130,7 @@ class Qwen3ASRInventory(SchemaModel):
     schema_version: Literal[
         "r2v.h3.qwen3_asr_inventory.1",
         "r2v.h3.qwen3_asr_inventory.2",
+        "r2v.h3.qwen3_asr_inventory.3",
     ] = (
         QWEN3_ASR_INVENTORY_VERSION
     )
@@ -127,6 +144,13 @@ class Qwen3ASRInventory(SchemaModel):
     model_identifier: Literal["Qwen/Qwen3-ASR-1.7B"] = QWEN3_ASR_MODEL_IDENTIFIER
     package: Literal["qwen-asr==0.0.6"] = "qwen-asr==0.0.6"
     configuration: Qwen3ASRConfiguration
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
+    model_input_sample_rate_hz: Literal[16000] = QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
+    model_input_channels: Literal[1] = QWEN3_ASR_INPUT_CHANNELS
+    input_preprocessing: Literal[
+        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    ] = QWEN3_ASR_PREPROCESSING_POLICY
 
     @model_validator(mode="after")
     def validate_target_coverage(self) -> Qwen3ASRInventory:
@@ -145,6 +169,7 @@ class Qwen3ASRSummary(SchemaModel):
     schema_version: Literal[
         "r2v.h3.qwen3_asr_summary.1",
         "r2v.h3.qwen3_asr_summary.2",
+        "r2v.h3.qwen3_asr_summary.3",
     ] = QWEN3_ASR_SUMMARY_VERSION
     segment_count: int = Field(ge=0)
     transcribed_count: int = Field(ge=0)
@@ -162,6 +187,13 @@ class Qwen3ASRSummary(SchemaModel):
     translation_performed: Literal[False] = False
     correction_performed: Literal[False] = False
     timestamp_alignment_performed: Literal[False] = False
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
+    model_input_sample_rate_hz: Literal[16000] = QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
+    model_input_channels: Literal[1] = QWEN3_ASR_INPUT_CHANNELS
+    input_preprocessing: Literal[
+        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    ] = QWEN3_ASR_PREPROCESSING_POLICY
 
     @model_validator(mode="after")
     def validate_counts(self) -> Qwen3ASRSummary:
@@ -192,7 +224,7 @@ class _ReadableDiarizationTarget(SchemaModel):
     clip_name: str
     shard_id: str
     source_audio_path: str
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
     target_video_path: str
     target_audio_binding_path: str | None = None
     target_audio_binding_sha256: str | None = Field(
@@ -219,7 +251,7 @@ class _ReadableDiarizationSegment(SchemaModel):
     source_audio_path: str
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
     raw_schema_version: Literal["r2v.h3.diarization_segment.2"] = (
@@ -240,6 +272,11 @@ class _ReadableDiarizationSegment(SchemaModel):
             raise ValueError("readable DiariZen sample range must be positive")
         if self.end_time <= self.start_time:
             raise ValueError("readable DiariZen time range must be positive")
+        if (
+            self.source_start_sample != round(self.start_time * 32000)
+            or self.source_end_sample != round(self.end_time * 32000)
+        ):
+            raise ValueError("readable DiariZen samples must use canonical 32 kHz time")
         expected_occurrence = (
             f"{self.clip_uid}/{self.entity_id}"
             if self.entity_id is not None
@@ -291,7 +328,7 @@ class _RawSegmentProvenance(_ProvenanceModel):
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
     source_audio_path: str
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
 
 
 class _BoundSegmentProvenance(_ProvenanceModel):
@@ -375,7 +412,7 @@ class Qwen3ASRBackend:
         )
 
 
-AudioLoader = Callable[[Path], tuple[np.ndarray, int]]
+SegmentAudioLoader = Callable[[Path, float, float], tuple[np.ndarray, int]]
 
 
 def load_official_diarizen_waveform(path: Path) -> tuple[np.ndarray, int]:
@@ -393,6 +430,50 @@ def load_official_diarizen_waveform(path: Path) -> tuple[np.ndarray, int]:
     if waveform.ndim != 2 or waveform.shape[0] < 1 or waveform.shape[1] < 1:
         raise ValueError("DiariZen source audio has no samples or channels")
     return np.ascontiguousarray(waveform[:, 0]), int(sample_rate)
+
+
+def load_qwen3_asr_model_input(
+    path: Path,
+    start_time: float,
+    end_time: float,
+    *,
+    ffmpeg: str = "ffmpeg",
+) -> tuple[np.ndarray, int]:
+    if start_time < 0 or end_time <= start_time:
+        raise ValueError("Qwen3 ASR source interval is invalid")
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-ss",
+            f"{start_time:.9f}",
+            "-to",
+            f"{end_time:.9f}",
+            "-vn",
+            "-ac",
+            str(QWEN3_ASR_INPUT_CHANNELS),
+            "-ar",
+            str(QWEN3_ASR_INPUT_SAMPLE_RATE_HZ),
+            "-c:a",
+            "pcm_f32le",
+            "-f",
+            "f32le",
+            "pipe:1",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise ValueError("Qwen3 ASR runtime audio preprocessing failed")
+    if not completed.stdout or len(completed.stdout) % np.dtype(np.float32).itemsize:
+        raise ValueError("Qwen3 ASR runtime waveform is invalid")
+    waveform = np.frombuffer(completed.stdout, dtype="<f4").copy()
+    if not np.isfinite(waveform).all():
+        raise ValueError("Qwen3 ASR runtime waveform is non-finite")
+    return waveform, QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
 
 
 def _read_rows(path: Path) -> list[dict[str, object]]:
@@ -571,7 +652,8 @@ def run_qwen3_asr(
     source_visual_production_root: str,
     output_root: Path,
     backend: Qwen3ASRBackend,
-    audio_loader: AudioLoader = load_official_diarizen_waveform,
+    segment_audio_loader: SegmentAudioLoader | None = None,
+    ffmpeg: str = "ffmpeg",
     overwrite: bool = False,
 ) -> Qwen3ASRSummary:
     inputs = _load_inputs(diarization_root)
@@ -583,23 +665,29 @@ def run_qwen3_asr(
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     rows: list[Qwen3ASRSegment] = []
-    loaded_audio: dict[str, tuple[np.ndarray, int]] = {}
+    active_loader = segment_audio_loader or (
+        lambda path, start, end: load_qwen3_asr_model_input(
+            path,
+            start,
+            end,
+            ffmpeg=ffmpeg,
+        )
+    )
     try:
         temporary.mkdir()
         for readable in inputs.readable_segments:
             try:
-                if readable.clip_uid not in loaded_audio:
-                    loaded_audio[readable.clip_uid] = audio_loader(
-                        Path(readable.source_audio_path)
-                    )
-                waveform, sample_rate = loaded_audio[readable.clip_uid]
-                if sample_rate != readable.source_sample_rate_hz:
-                    raise ValueError("Qwen3 source sample rate differs from DiariZen")
-                if readable.source_end_sample > waveform.shape[0]:
-                    raise ValueError("Qwen3 segment exceeds DiariZen source waveform")
-                crop = waveform[
-                    readable.source_start_sample : readable.source_end_sample
-                ]
+                crop, sample_rate = active_loader(
+                    Path(readable.source_audio_path),
+                    readable.start_time,
+                    readable.end_time,
+                )
+                if (
+                    crop.ndim != 1
+                    or crop.size == 0
+                    or sample_rate != QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
+                ):
+                    raise ValueError("Qwen3 runtime input must be 16 kHz mono")
                 text, language = backend.transcribe(
                     waveform=crop,
                     sample_rate_hz=sample_rate,
@@ -635,6 +723,9 @@ def run_qwen3_asr(
                     source_start_sample=readable.source_start_sample,
                     source_end_sample=readable.source_end_sample,
                     source_sample_rate_hz=readable.source_sample_rate_hz,
+                    model_input_sample_rate_hz=QWEN3_ASR_INPUT_SAMPLE_RATE_HZ,
+                    model_input_channels=QWEN3_ASR_INPUT_CHANNELS,
+                    input_preprocessing=QWEN3_ASR_PREPROCESSING_POLICY,
                     start_time=readable.start_time,
                     end_time=readable.end_time,
                     status=status,

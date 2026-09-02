@@ -26,6 +26,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -44,6 +45,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         source_visual_production_root=str(visual_root),
         output_root=audio_root / "asr",
         backend=Qwen3ASRBackend(configuration),
+        ffmpeg=arguments.ffmpeg,
         overwrite=arguments.overwrite,
     )
     result = {

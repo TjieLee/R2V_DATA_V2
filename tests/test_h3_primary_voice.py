@@ -11,7 +11,10 @@ from types import SimpleNamespace
 import pytest
 
 from r2v_data_v2.h3.audio_backends import FFmpegAudioMediaBackend
-from r2v_data_v2.h3.jea_audio_production import run_jea_primary_voice_stage
+from r2v_data_v2.h3.jea_audio_production import (
+    CanonicalAudioClip,
+    run_jea_primary_voice_stage,
+)
 from r2v_data_v2.h3.pilot_schemas import (
     AssociationConfidenceDiagnostics,
     LRASDScoreDiagnostics,
@@ -120,15 +123,18 @@ class _SampleSliceBackend:
 
     def extract_voice_reference(self, **request: object) -> Path:
         self.requests.append(request)
-        source = Path(str(request["source_audio_path"]))
-        start = int(request["source_start_sample"])
-        end = int(request["source_end_sample"])
         destination = Path(str(request["destination"]))
-        with wave.open(str(source), "rb") as input_audio:
-            input_audio.setpos(start)
-            frames = input_audio.readframes(end - start)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(frames)
+        if request.get("source_audio_path") is not None:
+            source = Path(str(request["source_audio_path"]))
+            start = int(request["source_start_sample"])
+            end = int(request["source_end_sample"])
+            with wave.open(str(source), "rb") as input_audio:
+                input_audio.setpos(start)
+                frames = input_audio.readframes(end - start)
+            destination.write_bytes(frames)
+        else:
+            destination.write_bytes(Path(str(request["full_audio_path"])).read_bytes())
         return destination
 
 
@@ -206,6 +212,31 @@ def _write_pilot(
     )
     (clip_dir / "voice_reference_quality.json").write_text(
         report.model_dump_json(),
+        encoding="utf-8",
+    )
+
+
+def _write_jea_canonical(
+    pilot: Path,
+    identity: ReadableClipIdentity,
+) -> None:
+    video = pilot / "runtime/clip-a/source.mp4"
+    canonical_audio = pilot / "full_audio/clip-a.flac"
+    canonical_audio.parent.mkdir(parents=True, exist_ok=True)
+    canonical_audio.write_bytes(b"native-32k-stereo-fixture")
+    record = CanonicalAudioClip(
+        **identity.model_dump(mode="python"),
+        target_video_path=str(video),
+        target_video_sha256=hashlib.sha256(video.read_bytes()).hexdigest(),
+        target_full_audio_path=str(canonical_audio),
+        target_full_audio_sha256=hashlib.sha256(
+            canonical_audio.read_bytes()
+        ).hexdigest(),
+        target_duration_seconds=4.0,
+        subject_reference_count=1,
+    )
+    (pilot / "canonical_clips.jsonl").write_text(
+        record.model_dump_json() + "\n",
         encoding="utf-8",
     )
 
@@ -357,6 +388,8 @@ def test_jea_primary_voice_publishes_unicode_readable_asset_path(
         clip_name="片段 01",
         shard_id="shard-1",
     )
+    _write_jea_canonical(pilot, identity)
+    backend = _SampleSliceBackend()
 
     summary = run_jea_primary_voice_stage(
         visual_inventory=SimpleNamespace(
@@ -364,7 +397,7 @@ def test_jea_primary_voice_publishes_unicode_readable_asset_path(
         ),
         audio_root=pilot,
         output_root=output,
-        audio_backend=_SampleSliceBackend(),
+        audio_backend=backend,
     )
 
     expected = Path("01/不惑之旅/不惑之旅 第一集/片段 01/e1.flac")
@@ -377,6 +410,19 @@ def test_jea_primary_voice_publishes_unicode_readable_asset_path(
     reference = selection["primary_voice_reference"]
     assert reference["asset"]["path"] == expected.as_posix()
     assert summary.selected_reference_rows[0]["asset_path"] == expected.as_posix()
+    assert len(backend.requests) == 1
+    assert "source_start_sample" not in backend.requests[0]
+    assert backend.requests[0]["sample_rate_hz"] == 32000
+    assert backend.requests[0]["channels"] == 2
+    assert Path(str(backend.requests[0]["full_audio_path"])) == Path(
+        json.loads(
+            (pilot / "canonical_clips.jsonl").read_text(encoding="utf-8")
+        )["target_full_audio_path"]
+    )
+    assert reference["source_start_sample"] == 0
+    assert reference["source_end_sample"] == 32000
+    assert reference["quality_metadata"]["source_sample_rate_hz"] == 32000
+    assert reference["quality_metadata"]["source_channels"] == 2
 
 
 def test_failed_jea_primary_voice_export_leaves_no_completed_directory(
@@ -394,6 +440,7 @@ def test_failed_jea_primary_voice_export_leaves_no_completed_directory(
         clip_name="片段 01",
         shard_id="shard-1",
     )
+    _write_jea_canonical(pilot, identity)
 
     with pytest.raises(RuntimeError, match="simulated primary voice export failure"):
         run_jea_primary_voice_stage(
@@ -448,3 +495,54 @@ def test_ffmpeg_backend_slices_exact_pcm_samples_before_flac_encoding(
     assert captured["command"][-3:] == ["-c:a", "flac", "-y"]
     assert destination.read_bytes() == b"lossless-flac"
     assert not list(tmp_path.glob("*.pcm-slice-*.wav"))
+
+
+def test_ffmpeg_backend_h3_voice_uses_time_and_native_stereo_audio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "h3-full-audio.flac"
+    source.write_bytes(b"32-khz-stereo-source")
+    destination = tmp_path / "h3-voice.flac"
+    backend = FFmpegAudioMediaBackend(ffmpeg="fake-ffmpeg")
+    captured: list[str] = []
+
+    def fake_publish(command: list[str], output: Path) -> None:
+        captured.extend(command)
+        output.write_bytes(b"32-khz-stereo-voice")
+
+    monkeypatch.setattr(backend, "_publish_command", fake_publish)
+
+    backend.extract_voice_reference(
+        clip_uid="clip-a",
+        entity_id="e1",
+        full_audio_path=source,
+        start_time=0.25,
+        end_time=1.75,
+        destination=destination,
+        sample_rate_hz=32000,
+        channels=2,
+        output_format="flac",
+    )
+
+    assert captured[captured.index("-i") + 1] == str(source)
+    assert captured[captured.index("-ss") + 1] == "0.250000000"
+    assert captured[captured.index("-to") + 1] == "1.750000000"
+    assert captured[captured.index("-ar") + 1] == "32000"
+    assert captured[captured.index("-ac") + 1] == "2"
+
+    with pytest.raises(ValueError, match="restricted to mono analysis audio"):
+        backend.extract_voice_reference(
+            clip_uid="clip-a",
+            entity_id="e1",
+            full_audio_path=source,
+            start_time=0.25,
+            end_time=1.75,
+            destination=destination,
+            sample_rate_hz=32000,
+            channels=2,
+            output_format="flac",
+            source_audio_path=source,
+            source_start_sample=4000,
+            source_end_sample=28000,
+        )

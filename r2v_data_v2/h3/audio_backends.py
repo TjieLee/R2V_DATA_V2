@@ -117,6 +117,7 @@ class AudioMediaBackend(Protocol):
         destination: Path,
         sample_rate_hz: int,
         output_format: str,
+        channels: int = 1,
         source_audio_path: Path | None = None,
         source_start_sample: int | None = None,
         source_end_sample: int | None = None,
@@ -253,6 +254,7 @@ class PrecomputedAudioMediaBackend:
         destination: Path,
         sample_rate_hz: int,
         output_format: str,
+        channels: int = 1,
         source_audio_path: Path | None = None,
         source_start_sample: int | None = None,
         source_end_sample: int | None = None,
@@ -262,6 +264,7 @@ class PrecomputedAudioMediaBackend:
             start_time,
             end_time,
             sample_rate_hz,
+            channels,
             output_format,
             source_audio_path,
             source_start_sample,
@@ -421,6 +424,7 @@ class FFmpegAudioMediaBackend:
         destination: Path,
         sample_rate_hz: int,
         output_format: str,
+        channels: int = 1,
         source_audio_path: Path | None = None,
         source_start_sample: int | None = None,
         source_end_sample: int | None = None,
@@ -433,6 +437,10 @@ class FFmpegAudioMediaBackend:
             source_end_sample,
         )
         if any(value is not None for value in exact_values):
+            if channels != 1:
+                raise ValueError(
+                    "exact sample-index voice extraction is restricted to mono analysis audio"
+                )
             if not all(value is not None for value in exact_values):
                 raise ValueError("exact voice-reference extraction requires all sample inputs")
             assert source_audio_path is not None
@@ -484,7 +492,7 @@ class FFmpegAudioMediaBackend:
                 "-ar",
                 str(sample_rate_hz),
                 "-ac",
-                "1",
+                str(channels),
                 "-c:a",
                 codec,
                 "-y",

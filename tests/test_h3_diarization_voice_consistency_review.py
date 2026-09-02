@@ -74,11 +74,19 @@ def _sample(
         visible_region="whole",
         synthetic=False,
     )
+    canonical_audio = root / "full-audio.flac"
+    canonical_audio.write_bytes(b"canonical-audio")
     voice = FinalSubjectVoice(
         subject_index=1,
         entity_id="e1",
         target_occurrence_id="clip-a/e1",
         voice_reference_path=str(primary_voice),
+        voice_reference_sha256=_sha256(primary_voice),
+        source_start=0.0,
+        source_end=1.0,
+        source_start_sample=0,
+        source_end_sample=32000,
+        sample_mapping_policy="round_time_seconds_times_32000_v1",
         voice_source=("target" if pair_type == "in_pair" else "cross_donor"),
         donor_occurrence_id=(None if pair_type == "in_pair" else "donor/e1"),
         donor_clip_uid=(None if pair_type == "in_pair" else "donor"),
@@ -96,7 +104,8 @@ def _sample(
         clip_name="clip-a",
         shard_id="shard-a",
         target_video=str(target_video),
-        target_full_audio_path=str(root / "source.wav"),
+        target_full_audio_path=str(canonical_audio),
+        target_full_audio_sha256=_sha256(canonical_audio),
         r2v_instruction="Use Image 1.",
         visual_references=[reference],
         subject_voices=[voice],

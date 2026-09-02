@@ -184,8 +184,8 @@ def _job_fixture(tmp_path: Path) -> MimoClipJob:
         start_time=0.0,
         end_time=1.0,
         source_start_sample=0,
-        source_end_sample=16000,
-        source_sample_rate_hz=16000,
+        source_end_sample=32000,
+        source_sample_rate_hz=32000,
         source_speaker_cluster_id="speaker_0",
         current_entity_id="e1",
         entity_occurrence_id="clip-1/e1",
@@ -1763,7 +1763,12 @@ def _sample(tmp_path: Path) -> FinalH3SampleV2:
     audio = tmp_path / "full.flac"
     voice = tmp_path / "voice.flac"
     image = tmp_path / "reference.png"
-    for path, value in ((video, b"v"), (audio, b"a"), (voice, b"x"), (image, b"i")):
+    for path, value in (
+        (video, b"v"),
+        (audio, b"a"),
+        (voice, b"x"),
+        (image, b"i"),
+    ):
         path.write_bytes(value)
     return FinalH3SampleV2(
         sample_id="clip-1/in_pair",
@@ -1778,6 +1783,7 @@ def _sample(tmp_path: Path) -> FinalH3SampleV2:
         shard_id="shard",
         target_video=str(video),
         target_full_audio_path=str(audio),
+        target_full_audio_sha256=_file_sha256(audio),
         r2v_instruction="Use Image 1.",
         visual_references=[
             FinalVisualReference(
@@ -1799,6 +1805,12 @@ def _sample(tmp_path: Path) -> FinalH3SampleV2:
                 entity_id="e1",
                 target_occurrence_id="clip-1/e1",
                 voice_reference_path=str(voice),
+                voice_reference_sha256=_file_sha256(voice),
+                source_start=0.0,
+                source_end=1.0,
+                source_start_sample=0,
+                source_end_sample=32000,
+                sample_mapping_policy="round_time_seconds_times_32000_v1",
                 voice_source="target",
             )
         ],
@@ -1809,8 +1821,8 @@ def _sample(tmp_path: Path) -> FinalH3SampleV2:
                 entity_id="e1",
                 entity_occurrence_id="clip-1/e1",
                 source_start_sample=0,
-                source_end_sample=16000,
-                source_sample_rate_hz=16000,
+                source_end_sample=32000,
+                source_sample_rate_hz=32000,
                 start_time=0.0,
                 end_time=1.0,
                 text="Exact, text!",
@@ -1998,9 +2010,9 @@ def test_mimo_inventory_builds_one_job_per_canonical_target(
                 target_video_path=str(video),
                 source_audio_path=str(audio),
                 source_audio_sha256=_file_sha256(audio),
-                source_sample_rate_hz=16000,
-                source_channels=1,
-                source_frame_count=16000,
+                source_sample_rate_hz=32000,
+                source_channels=2,
+                source_frame_count=32000,
                 visual_references=[],
             )
         )

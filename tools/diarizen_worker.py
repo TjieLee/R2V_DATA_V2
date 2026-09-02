@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 
 def _fingerprint_local_path(path: Path) -> str:
@@ -50,7 +52,44 @@ def _emit(value: dict[str, object]) -> None:
     sys.stdout.flush()
 
 
-def _load_pipeline(arguments: argparse.Namespace) -> tuple[object, object]:
+_ANALYSIS_RESAMPLE_POLICY = (
+    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+)
+
+
+def _prepare_analysis_audio(
+    *,
+    source: Path,
+    destination: Path,
+    torch: Any,
+    torchaudio: Any,
+) -> None:
+    waveform, sample_rate = torchaudio.load(str(source))
+    if waveform.ndim != 2 or waveform.shape[0] != 2 or sample_rate != 32000:
+        raise ValueError("DiariZen canonical source must be 32 kHz stereo")
+    if waveform.shape[1] <= 0 or not torch.isfinite(waveform).all().item():
+        raise ValueError("DiariZen canonical source must be finite and non-empty")
+    mono = waveform.mean(dim=0, keepdim=True)
+    analysis = torchaudio.functional.resample(
+        mono,
+        orig_freq=32000,
+        new_freq=16000,
+        lowpass_filter_width=64,
+        rolloff=0.9475937167399596,
+        resampling_method="sinc_interp_kaiser",
+        beta=14.769656459379492,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    torchaudio.save(
+        str(destination),
+        analysis,
+        16000,
+        encoding="PCM_S",
+        bits_per_sample=16,
+    )
+
+
+def _load_pipeline(arguments: argparse.Namespace) -> tuple[object, object, object, object]:
     code_root = arguments.code_root.expanduser().resolve(strict=True)
     model_cache = arguments.model_cache.expanduser().resolve(strict=True)
     if not code_root.is_dir() or not model_cache.is_dir():
@@ -84,13 +123,15 @@ def _load_pipeline(arguments: argparse.Namespace) -> tuple[object, object]:
             cache_dir=str(model_cache),
         )
         pipeline.to(device)
-    return pipeline, device
+    import torchaudio
+
+    return pipeline, device, torch, torchaudio
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
-        pipeline, device = _load_pipeline(arguments)
+        pipeline, device, torch, torchaudio = _load_pipeline(arguments)
     except Exception as exc:  # noqa: BLE001 - startup must fail closed with diagnostics
         print(f"DiariZen startup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         _emit(
@@ -135,8 +176,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not clip_uid or not audio_path.is_file():
                 raise ValueError("DiariZen request media is invalid")
-            with contextlib.redirect_stdout(sys.stderr):
-                result = pipeline(str(audio_path), sess_name=clip_uid)
+            with tempfile.TemporaryDirectory(prefix="h3-diarizen-analysis-") as work:
+                analysis_path = Path(work) / "analysis_16k_mono.wav"
+                _prepare_analysis_audio(
+                    source=audio_path,
+                    destination=analysis_path,
+                    torch=torch,
+                    torchaudio=torchaudio,
+                )
+                with contextlib.redirect_stdout(sys.stderr):
+                    result = pipeline(str(analysis_path), sess_name=clip_uid)
             segments = [
                 {
                     "start_time": float(turn.start),
@@ -162,8 +211,12 @@ def main(argv: list[str] | None = None) -> int:
                         "backend": "diarizen_official_pipeline",
                         "device": str(device),
                         "input_preprocessing": (
-                            "official_torchaudio_first_channel_passthrough_v1"
+                            _ANALYSIS_RESAMPLE_POLICY
                         ),
+                        "source_sample_rate_hz": 32000,
+                        "source_channels": 2,
+                        "model_input_sample_rate_hz": 16000,
+                        "model_input_channels": 1,
                     },
                 }
             )

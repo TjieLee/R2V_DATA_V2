@@ -98,13 +98,14 @@ def _write_pcm16_wave(
     *,
     sample_rate_hz: int = 16000,
     sample_count: int = 16000,
+    channels: int = 1,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as output:
-        output.setnchannels(1)
+        output.setnchannels(channels)
         output.setsampwidth(2)
         output.setframerate(sample_rate_hz)
-        output.writeframes(b"\x00\x00" * sample_count)
+        output.writeframes(b"\x00\x00" * sample_count * channels)
 
 
 def _production_fixture(
@@ -126,17 +127,27 @@ def _production_fixture(
         media = root / "source" / clip_uid
         media.mkdir(parents=True)
         video = media / "target.mp4"
-        readable_audio = media / "audio_source" / "clip.wav"
-        canonical_audio = (
-            media / "full_audio" / "clip.flac"
+        canonical_audio = media / "full_audio" / "clip.flac"
+        readable_audio = (
+            media / "audio_source" / "clip.flac"
             if distinct_audio_artifacts
-            else readable_audio
+            else canonical_audio
         )
         binding = media / "audio_binding.json"
         video.write_bytes(f"video-{clip_uid}".encode())
-        _write_pcm16_wave(readable_audio)
+        _write_pcm16_wave(
+            readable_audio,
+            sample_rate_hz=32000,
+            sample_count=32000,
+            channels=2,
+        )
         if canonical_audio != readable_audio:
-            _write_pcm16_wave(canonical_audio)
+            _write_pcm16_wave(
+                canonical_audio,
+                sample_rate_hz=32000,
+                sample_count=32000,
+                channels=2,
+            )
         binding.write_text("{}\n", encoding="utf-8")
         pairs.append(
             JEAInPair(
@@ -162,8 +173,8 @@ def _production_fixture(
             entity_id = None
             if clip_index == 0 and speaker_cluster_id == "speaker-0":
                 entity_id = "e1" if segment_index == 0 else None
-            start_sample = segment_index * 1600
-            end_sample = start_sample + 800
+            start_sample = segment_index * 3200
+            end_sample = start_sample + 1600
             values = {
                 "clip_uid": clip_uid,
                 "clip_display_path": display,
@@ -181,9 +192,9 @@ def _production_fixture(
                 "source_audio_path": str(readable_audio),
                 "source_start_sample": start_sample,
                 "source_end_sample": end_sample,
-                "source_sample_rate_hz": 16000,
-                "start_time": start_sample / 16000,
-                "end_time": end_sample / 16000,
+                "source_sample_rate_hz": 32000,
+                "start_time": start_sample / 32000,
+                "end_time": end_sample / 32000,
             }
             readable.append(JEAReadableDiarizationSegment(**values))
             asr_rows.append(
@@ -508,7 +519,7 @@ def test_target_duration_participates_in_inventory_fingerprint(
     assert changed.inventory_fingerprint != inventory.inventory_fingerprint
 
 
-def test_inventory_allows_distinct_readable_and_canonical_audio_artifacts(
+def test_inventory_rejects_distinct_readable_and_canonical_audio_artifacts(
     tmp_path: Path,
 ) -> None:
     root = _production_fixture(
@@ -518,53 +529,41 @@ def test_inventory_allows_distinct_readable_and_canonical_audio_artifacts(
         distinct_audio_artifacts=True,
     )
 
-    inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
+    with pytest.raises(
+        ValueError,
+        match="must be canonical target full audio",
+    ):
+        build_jea_target_audio_caption_inventory(audio_production_root=root)
 
-    job = inventory.jobs[0]
-    assert Path(job.target_full_audio_path).parts[-2:] == ("full_audio", "clip.flac")
+
+def test_inventory_uses_one_canonical_full_audio_artifact(tmp_path: Path) -> None:
+    root = _production_fixture(
+        tmp_path,
+        clip_count=1,
+        segment_count=1,
+    )
+
+    inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
     readable = json.loads(
         (root / "diarization/readable_segments.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()[0]
     )
-    assert Path(readable["source_audio_path"]).parts[-2:] == (
-        "audio_source",
-        "clip.wav",
-    )
-    assert readable["source_audio_path"] != job.target_full_audio_path
+
+    assert readable["source_audio_path"] == inventory.jobs[0].target_full_audio_path
 
 
-def test_inventory_rejects_incompatible_full_audio_timelines(tmp_path: Path) -> None:
+def test_inventory_rejects_noncanonical_readable_audio_even_with_small_delta(
+    tmp_path: Path,
+) -> None:
     root = _production_fixture(
         tmp_path,
         clip_count=1,
         segment_count=1,
         distinct_audio_artifacts=True,
     )
-    pair = json.loads(
-        (root / "pairs/in_pairs.jsonl").read_text(encoding="utf-8").splitlines()[0]
-    )
-    _write_pcm16_wave(Path(pair["target_full_audio_path"]), sample_count=32000)
-
-    with pytest.raises(ValueError, match="timelines differ"):
+    with pytest.raises(ValueError, match="must be canonical target full audio"):
         build_jea_target_audio_caption_inventory(audio_production_root=root)
-
-
-def test_inventory_accepts_lr_asd_audio_quantization_delta(tmp_path: Path) -> None:
-    root = _production_fixture(
-        tmp_path,
-        clip_count=1,
-        segment_count=1,
-        distinct_audio_artifacts=True,
-    )
-    pair = json.loads(
-        (root / "pairs/in_pairs.jsonl").read_text(encoding="utf-8").splitlines()[0]
-    )
-    _write_pcm16_wave(Path(pair["target_full_audio_path"]), sample_count=16833)
-
-    inventory = build_jea_target_audio_caption_inventory(audio_production_root=root)
-
-    assert inventory.target_clip_count == 1
 
 
 def test_inventory_rejects_missing_readable_source_audio(tmp_path: Path) -> None:
@@ -633,8 +632,8 @@ def test_inventory_rejects_segment_outside_readable_source_audio(
     ):
         path = root / relative_path
         rows = [json.loads(line) for line in path.read_text().splitlines()]
-        rows[0]["source_end_sample"] = 16001
-        rows[0]["end_time"] = 16001 / 16000
+        rows[0]["source_end_sample"] = 32001
+        rows[0]["end_time"] = 32001 / 32000
         path.write_text(
             "".join(json.dumps(row) + "\n" for row in rows),
             encoding="utf-8",
@@ -650,7 +649,7 @@ def test_qwen_asr_and_readable_diarization_mismatch_fails_closed(
     root = _production_fixture(tmp_path)
     path = root / "asr/segments.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    rows[0]["source_end_sample"] += 1
+    rows[0]["speaker_cluster_id"] = "speaker-mismatch"
     path.write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
@@ -758,14 +757,13 @@ def test_backends_share_schema_but_use_distinct_media_without_sensitive_evidence
         assert Path(job.target_full_audio_path).resolve().as_uri() not in encoded
 
 
-def test_qwen_omni_uses_pair_canonical_audio_not_readable_source(
+def test_qwen_omni_uses_shared_canonical_audio_source(
     tmp_path: Path,
 ) -> None:
     root = _production_fixture(
         tmp_path,
         clip_count=1,
         segment_count=1,
-        distinct_audio_artifacts=True,
     )
     job = build_jea_target_audio_caption_inventory(audio_production_root=root).jobs[0]
     readable = json.loads(
@@ -784,7 +782,7 @@ def test_qwen_omni_uses_pair_canonical_audio_not_readable_source(
     encoded = json.dumps(completions.requests[0], ensure_ascii=False)
     assert Path(job.target_video_path).resolve().as_uri() not in encoded
     assert Path(job.target_full_audio_path).resolve().as_uri() in encoded
-    assert Path(readable["source_audio_path"]).resolve().as_uri() not in encoded
+    assert readable["source_audio_path"] == job.target_full_audio_path
     assert "SECRET TRANSCRIPT" not in encoded
     assert '"entity_id":' not in encoded
 

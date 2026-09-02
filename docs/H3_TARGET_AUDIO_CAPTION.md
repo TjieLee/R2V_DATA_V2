@@ -10,18 +10,18 @@ $AUDIO_PRODUCTION_ROOT/diarization/readable_segments.jsonl
 $AUDIO_PRODUCTION_ROOT/asr/segments.jsonl
 ```
 
-`pairs/in_pairs.jsonl` owns target video/full-audio identity. Readable DiariZen
+`pairs/in_pairs.jsonl` owns target video and the single canonical 32 kHz stereo
+audio identity. Readable DiariZen
 rows own exact speech intervals, `speaker_cluster_id`, and nullable entity
 binding. Qwen3-ASR rows are reconciled exactly against those DiariZen identities,
 sample ranges, time ranges, and bindings, but transcript text is never placed in
 the caption inventory or model request. Whisper ASR-V2 and TextUsabilityPolicy are
 not inputs to this path.
 
-The readable LR-ASD audio and canonical final full audio may use different paths
-and encodings. Inventory validation retains a strict whole-clip timeline sanity
-gate with a 0.10-second tolerance for LR-ASD 25fps, ffmpeg, and container duration
-quantization; readable segment sample ranges and both audio timeline bounds remain
-fail-closed.
+Readable DiariZen rows and the pair must resolve to that same canonical audio
+file. DiariZen's 16 kHz mono waveform is runtime-only and is not another
+published source artifact. Inventory validation retains strict sample-range and
+whole-clip timeline checks.
 
 Both backends use primary prompt `h3_target_audio_semantics_v2` and the same
 strict reusable semantic response:
@@ -68,9 +68,9 @@ exists.
 Code requires every supplied cluster exactly once and in order, then reattaches
 the frozen nullable `entity_id`. The model receives neither transcript nor entity
 identity. Dots3 receives the native target video with embedded audio. By default,
-the Qwen3-Omni Instruct backend receives only canonical full audio and requests
+the Qwen3-Omni Instruct backend receives only canonical H3-native audio and requests
 text output. The explicit `--include-video` experiment sends target video plus
-canonical full audio. Qwen3-Omni-Captioner is not used because it does not accept
+canonical H3-native audio. Qwen3-Omni-Captioner is not used because it does not accept
 the task's text prompt. Both backends fail closed after at most one primary
 structured-output repair.
 

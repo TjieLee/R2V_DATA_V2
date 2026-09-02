@@ -29,18 +29,19 @@ readable DiariZen rows as an optional subset overlay.
 ## Current architecture
 
 ```text
-canonical full audio -> Captioner -> Qwen3-VL Global
+H3-native canonical audio -> Captioner -> Qwen3-VL Global
                          |    \       -> optional recaption rescue
                          |     \      -> direct-audio music rescue (8091)
                          +----------> Qwen3-Omni-Instruct Local hints (8091)
-canonical full audio ----------------> Qwen3-Omni-Instruct Local truth (8091)
+H3-native canonical audio ----------> Qwen3-Omni-Instruct Local truth (8091)
                                               |
                                               +-> assemble
 ```
 
 ### Captioner
 
-`Qwen3-Omni-30B-A3B-Captioner` receives canonical full audio only. There is no
+`Qwen3-Omni-30B-A3B-Captioner` receives the canonical 32 kHz stereo H3-native
+audio only. There is no
 text prompt and no video. Its native whole-audio caption is preserved verbatim
 as durable primary evidence.
 
@@ -149,7 +150,7 @@ The canonical H3-facing field remains `non_diegetic_music`.
 
 ### Local semantics
 
-`Qwen3-Omni-30B-A3B-Instruct` receives canonical full audio plus the existing
+`Qwen3-Omni-30B-A3B-Instruct` receives canonical H3-native audio plus the existing
 canonical Captioner raw caption. The caption is untrusted acoustic search hints,
 not truth: positive mentions only prompt active listening, hallucinated mentions
 must not be copied, and negative statements cannot veto sound audible in the
@@ -211,7 +212,7 @@ and Local all complete.
 
 ## Model-free canonical Audio backfill
 
-Existing production roots can add missing no-subject full audio and publish the
+Existing production roots can add missing no-subject canonical audio and publish the
 same canonical manifest used by fresh Audio runs without rerunning LR-ASD,
 Silero, DiariZen, ASR, or any model:
 
@@ -222,8 +223,8 @@ Silero, DiariZen, ASR, or any model:
   --audio-production-root "$AUDIO_PRODUCTION_ROOT"
 ```
 
-Existing valid FLAC files are reused. Only missing canonical full audio is
-materialized from the processed canonical target video. The tool updates only
+Existing valid 32 kHz stereo FLAC files are reused. Missing canonical audio is
+materialized directly from the processed canonical target video. The tool updates only
 `audio/canonical_clips.jsonl` and `audio/canonical_clips_summary.json`; subject
 bindings and all downstream stage directories remain untouched.
 The CLI argument remains the whole `$AUDIO_PRODUCTION_ROOT`; `audio/` is selected

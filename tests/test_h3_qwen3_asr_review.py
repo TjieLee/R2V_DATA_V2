@@ -78,7 +78,7 @@ def _segment(
     index: int,
     status: str = "transcribed",
 ) -> Qwen3ASRSegment:
-    start_sample = index * 1600
+    start_sample = index * 3200
     common = {
         "clip_uid": clip_uid,
         "clip_display_path": display,
@@ -93,8 +93,8 @@ def _segment(
         "entity_occurrence_id": f"{clip_uid}/e1" if index % 2 == 0 else None,
         "source_audio_path": f"/audio/{clip_uid}.wav",
         "source_start_sample": start_sample,
-        "source_end_sample": start_sample + 1600,
-        "source_sample_rate_hz": 16000,
+        "source_end_sample": start_sample + 3200,
+        "source_sample_rate_hz": 32000,
         "start_time": index / 10,
         "end_time": index / 10 + 0.1,
         "status": status,

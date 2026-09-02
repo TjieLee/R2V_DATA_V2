@@ -57,10 +57,18 @@ from r2v_data_v2.h3.visual_production_source import (
     VisualProductionInventory,
 )
 
-JEA_PAIR_SCHEMA_VERSION = "r2v.h3.jea_pairs.1"
-CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.1"
-CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.1"
+JEA_PAIR_SCHEMA_VERSION = "r2v.h3.jea_pairs.2"
+CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.2"
+CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.2"
 CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS = 0.10
+CANONICAL_AUDIO_SAMPLE_RATE_HZ = 32000
+CANONICAL_AUDIO_CHANNELS = 2
+ANALYSIS_AUDIO_SAMPLE_RATE_HZ = 16000
+ANALYSIS_AUDIO_CHANNELS = 1
+AUDIO_ANALYSIS_RESAMPLE_POLICY = (
+    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+)
+VOICE_SAMPLE_MAPPING_POLICY = "round_time_seconds_times_32000_v1"
 
 
 @dataclass(frozen=True)
@@ -76,7 +84,7 @@ class JEAProductionPaths:
 
 
 class CanonicalAudioClip(SchemaModel):
-    schema_version: Literal["r2v.h3.canonical_audio_clip.1"] = (
+    schema_version: Literal["r2v.h3.canonical_audio_clip.2"] = (
         CANONICAL_AUDIO_CLIP_VERSION
     )
     clip_uid: str
@@ -90,6 +98,11 @@ class CanonicalAudioClip(SchemaModel):
     target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_full_audio_path: str
     target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sample_rate_hz: Literal[32000] = CANONICAL_AUDIO_SAMPLE_RATE_HZ
+    channels: Literal[2] = CANONICAL_AUDIO_CHANNELS
+    audio_source: Literal["original_target_video_audio_stream"] = (
+        "original_target_video_audio_stream"
+    )
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
     subject_reference_count: int = Field(ge=0)
     target_audio_binding_path: str | None = None
@@ -110,15 +123,17 @@ class CanonicalAudioClip(SchemaModel):
 
 
 class CanonicalAudioClipSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.canonical_audio_clip_summary.1"] = (
+    schema_version: Literal["r2v.h3.canonical_audio_clip_summary.2"] = (
         CANONICAL_AUDIO_CLIP_SUMMARY_VERSION
     )
     canonical_audio_clip_schema_version: Literal[
-        "r2v.h3.canonical_audio_clip.1"
+        "r2v.h3.canonical_audio_clip.2"
     ] = CANONICAL_AUDIO_CLIP_VERSION
     visual_canonical_clip_count: int = Field(gt=0)
     canonical_audio_clip_count: int = Field(gt=0)
     subject_binding_clip_count: int = Field(ge=0)
+    sample_rate_hz: Literal[32000] = CANONICAL_AUDIO_SAMPLE_RATE_HZ
+    channels: Literal[2] = CANONICAL_AUDIO_CHANNELS
 
     @model_validator(mode="after")
     def validate_counts(self) -> CanonicalAudioClipSummary:
@@ -127,6 +142,17 @@ class CanonicalAudioClipSummary(SchemaModel):
         if self.subject_binding_clip_count > self.canonical_audio_clip_count:
             raise ValueError("canonical subject binding count exceeds clip count")
         return self
+
+
+class _CanonicalAudioClipV1(SchemaModel):
+    schema_version: Literal["r2v.h3.canonical_audio_clip.1"]
+    clip_uid: str
+    target_full_audio_path: str
+    target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+
+CanonicalAudioClipExisting = CanonicalAudioClip | _CanonicalAudioClipV1
 
 
 def jea_production_paths(audio_production_root: Path) -> JEAProductionPaths:
@@ -240,17 +266,25 @@ def _publish_canonical_audio_manifest(
     duration_resolver: Callable[[VisualProductionClip], float] | None = None,
 ) -> CanonicalAudioClipSummary:
     destination = audio_root.expanduser().resolve(strict=True)
-    existing_by_clip: dict[str, CanonicalAudioClip] = {}
+    existing_by_clip: dict[str, CanonicalAudioClipExisting] = {}
     existing_path = destination / "canonical_clips.jsonl"
     if existing_path.is_file():
-        existing_by_clip = {
-            record.clip_uid: record
-            for record in (
-                CanonicalAudioClip.model_validate_json(line)
-                for line in existing_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            )
-        }
+        for line in existing_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            version = payload.get("schema_version")
+            if version == CANONICAL_AUDIO_CLIP_VERSION:
+                record: CanonicalAudioClipExisting = CanonicalAudioClip.model_validate(
+                    payload
+                )
+            elif version == "r2v.h3.canonical_audio_clip.1":
+                record = _CanonicalAudioClipV1.model_validate(payload)
+            else:
+                raise ValueError("canonical Audio manifest schema version is unsupported")
+            if record.clip_uid in existing_by_clip:
+                raise ValueError("canonical Audio manifest contains duplicate clip IDs")
+            existing_by_clip[record.clip_uid] = record
     records: list[CanonicalAudioClip] = []
     for item in visual_inventory.canonical_clips:
         clip_uid = item.identity.clip_uid
@@ -277,9 +311,7 @@ def _publish_canonical_audio_manifest(
         elif duration_resolver is not None:
             duration = float(duration_resolver(item))
         else:
-            raise ValueError(
-                "cannot establish existing canonical full-audio duration"
-            )
+            raise ValueError("cannot establish existing canonical-audio duration")
         identity = item.identity
         records.append(
             CanonicalAudioClip(
@@ -330,22 +362,47 @@ def materialize_canonical_audio_clips(
 ) -> CanonicalAudioClipSummary:
     destination = audio_root.expanduser().resolve(strict=False)
     destination.mkdir(parents=True, exist_ok=True)
+    existing_current: dict[str, CanonicalAudioClip] = {}
+    manifest_path = destination / "canonical_clips.jsonl"
+    if manifest_path.is_file():
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if payload.get("schema_version") == CANONICAL_AUDIO_CLIP_VERSION:
+                record = CanonicalAudioClip.model_validate(payload)
+                existing_current[record.clip_uid] = record
     materialized: dict[str, MaterializedMedia] = {}
     for item in visual_inventory.canonical_clips:
+        source_video = Path(item.sample.target_video).resolve(strict=True)
         expected = full_audio_path(destination, item.identity)
-        if expected.is_file():
-            continue
-        result = audio_backend.materialize_full_audio(
-            clip_uid=item.identity.clip_uid,
-            source_video_path=Path(item.sample.target_video).resolve(strict=True),
-            destination=expected,
-            sample_rate_hz=16000,
-            channels=1,
-            output_format="flac",
+        existing = existing_current.get(item.identity.clip_uid)
+        reusable = (
+            existing is not None
+            and expected.is_file()
+            and existing.target_full_audio_path == str(expected.resolve(strict=True))
+            and existing.target_full_audio_sha256 == _sha256_file(expected)
+            and existing.sample_rate_hz == CANONICAL_AUDIO_SAMPLE_RATE_HZ
+            and existing.channels == CANONICAL_AUDIO_CHANNELS
         )
-        if result.path.resolve(strict=True) != expected.resolve(strict=True):
-            raise ValueError("JEA full-audio backend published an unexpected path")
-        materialized[item.identity.clip_uid] = result
+        if not reusable:
+            result = audio_backend.materialize_full_audio(
+                clip_uid=item.identity.clip_uid,
+                source_video_path=source_video,
+                destination=expected,
+                sample_rate_hz=CANONICAL_AUDIO_SAMPLE_RATE_HZ,
+                channels=CANONICAL_AUDIO_CHANNELS,
+                output_format="flac",
+            )
+            if (
+                result.sample_rate_hz != CANONICAL_AUDIO_SAMPLE_RATE_HZ
+                or result.channels != CANONICAL_AUDIO_CHANNELS
+                or result.output_format != "flac"
+            ):
+                raise ValueError("JEA canonical-audio backend violated media contract")
+            if result.path.resolve(strict=True) != expected.resolve(strict=True):
+                raise ValueError("JEA canonical-audio backend published an unexpected path")
+            materialized[item.identity.clip_uid] = result
     return _publish_canonical_audio_manifest(
         visual_inventory=visual_inventory,
         audio_root=destination,
@@ -423,6 +480,24 @@ def run_jea_primary_voice_stage(
             raise ValueError("primary voice clip is absent from Visual Production")
         return primary_voice_path(Path(), identity, entity_id=entity_id)
 
+    canonical_path = audio_root.expanduser().resolve(strict=True) / "canonical_clips.jsonl"
+    canonical = {
+        item.clip_uid: item
+        for item in (
+            CanonicalAudioClip.model_validate_json(line)
+            for line in canonical_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    }
+    def canonical_source(clip_uid: str) -> Path:
+        record = canonical.get(clip_uid)
+        if record is None:
+            raise ValueError("primary voice clip is absent from canonical Audio")
+        path = Path(record.target_full_audio_path).resolve(strict=True)
+        if _sha256_file(path) != record.target_full_audio_sha256:
+            raise ValueError("canonical target full-audio hash changed")
+        return path
+
     return export_primary_voice_references(
         pilot_root=audio_root,
         output_root=output_root,
@@ -430,6 +505,10 @@ def run_jea_primary_voice_stage(
         policy=VoiceReferenceQualityPolicy(),
         overwrite=overwrite,
         output_path_for_entity=output_path,
+        source_audio_for_clip=canonical_source,
+        output_sample_rate_hz=CANONICAL_AUDIO_SAMPLE_RATE_HZ,
+        output_channels=CANONICAL_AUDIO_CHANNELS,
+        sample_mapping_policy=VOICE_SAMPLE_MAPPING_POLICY,
     )
 
 
@@ -443,6 +522,7 @@ class JEAOccurrenceEmbedding(SchemaModel):
     primary_voice_reference_path: str
     face_embedding: list[float]
     voice_embedding: list[float]
+    speaker_embedding_preprocessing: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_occurrence(self) -> JEAOccurrenceEmbedding:
@@ -564,6 +644,9 @@ def run_jea_embedding_stage(
                         primary_voice_reference_path=str(voice_path),
                         face_embedding=face.normalized_vector.tolist(),
                         voice_embedding=voice_vector.tolist(),
+                        speaker_embedding_preprocessing=(
+                            speaker.backend_metadata or {}
+                        ),
                     )
                 )
         rows.sort(
@@ -607,7 +690,7 @@ class JEAInPairSubject(SchemaModel):
 
 
 class JEAInPair(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_pairs.1"] = JEA_PAIR_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.jea_pairs.2"] = JEA_PAIR_SCHEMA_VERSION
     pair_id: str
     target_clip_uid: str
     target_clip_display_path: str
@@ -651,7 +734,7 @@ class JEACrossPairMapping(SchemaModel):
 
 
 class JEACrossPair(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_pairs.1"] = JEA_PAIR_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.jea_pairs.2"] = JEA_PAIR_SCHEMA_VERSION
     pair_id: str
     target_clip_uid: str
     target_clip_display_path: str
@@ -701,7 +784,7 @@ class JEAPairEvidence(SchemaModel):
 
 
 class JEAPairSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_pairs.1"] = JEA_PAIR_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.jea_pairs.2"] = JEA_PAIR_SCHEMA_VERSION
     in_pair_count: int = Field(ge=0)
     cross_pair_count: int = Field(ge=0)
     selected_mapping_count: int = Field(ge=0)
@@ -770,8 +853,11 @@ def _probe_canonical_audio(
             frame_count = round(duration * sample_rate)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("canonical diarization audio metadata is invalid") from exc
-    if sample_rate != 16000 or channels != 1:
-        raise ValueError("canonical diarization audio must be 16 kHz mono")
+    if (
+        sample_rate != CANONICAL_AUDIO_SAMPLE_RATE_HZ
+        or channels != CANONICAL_AUDIO_CHANNELS
+    ):
+        raise ValueError("canonical diarization source must be 32 kHz stereo")
     if frame_count <= 0 or duration <= 0:
         raise ValueError("canonical diarization audio timeline is empty")
     actual_duration = frame_count / sample_rate

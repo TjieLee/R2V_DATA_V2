@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         binding_audit_root=paths.root / "binding_audit_v1",
         qwen3_asr_root=paths.asr,
         output_root=paths.h3,
+        primary_voice_root=paths.primary_voice,
         audio_semantics_root=arguments.audio_semantics_root,
         overwrite=arguments.overwrite,
     )
