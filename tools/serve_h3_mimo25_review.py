@@ -29,8 +29,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
-    mimo_root = paths.root / "mimo25_av_reconcile_v1"
-    shadow_root = paths.root / "mimo25_h3_shadow_v1"
+    mimo_root = paths.root / "mimo25_av_reconcile_v2"
+    shadow_root = paths.root / "mimo25_h3_shadow_v2"
     cases, media = build_review_cases(
         mimo_root=mimo_root,
         shadow_root=shadow_root,

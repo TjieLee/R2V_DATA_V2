@@ -41,8 +41,8 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.1"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.1"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.2"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.2"
 _MIMO_SEGMENT_PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
 
 
@@ -81,7 +81,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.1"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.2"] = (
         MIMO25_SHADOW_RECORD_VERSION
     )
     sample_id: str
@@ -90,7 +90,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v1"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v2"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -113,7 +113,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.1"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.2"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -169,6 +169,8 @@ def _corrected_segments(
             or original.end_time != source.end_time
             or original.source_start_sample != source.source_start_sample
             or original.source_end_sample != source.source_end_sample
+            or original.source_sample_rate_hz != source.source_sample_rate_hz
+            or original.speaker_cluster_id != source.source_speaker_cluster_id
         ):
             raise ValueError("source H3 speech differs from authoritative Qwen3-ASR")
         resolved = decision.resolution == "resolved" and decision.primary_speaker_group is not None
@@ -361,7 +363,10 @@ def _materialize_sample(
         )
     warnings.extend(validation_warnings)
     if record.annotation.warnings:
-        warnings.extend(record.annotation.warnings)
+        warnings.extend(
+            f"{item.segment_id}:{item.code}"
+            for item in record.annotation.warnings
+        )
     return corrected, render_h3_prompt(structured), sorted(set(warnings))
 
 

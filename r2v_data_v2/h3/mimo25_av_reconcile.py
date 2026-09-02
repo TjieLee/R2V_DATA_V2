@@ -37,11 +37,11 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
-MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.1"
-MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.1"
-MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.1"
-MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.1"
-MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.1"
+MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.2"
+MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.2"
+MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.2"
+MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.2"
+MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.2"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
 MIMO25_INVENTORY_SCOPE = "current_diarization_asr_target_inventory"
 
@@ -160,6 +160,7 @@ class MimoSegmentEvidence(SchemaModel):
 
 class MimoClipJob(SchemaModel):
     clip_uid: str
+    r2v_instruction: str = Field(min_length=1)
     target_video_path: str
     target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_full_audio_path: str
@@ -173,6 +174,8 @@ class MimoClipJob(SchemaModel):
 
     @model_validator(mode="after")
     def validate_job(self) -> MimoClipJob:
+        if not self.r2v_instruction.strip():
+            raise ValueError("MiMo R2V instruction must not be blank")
         indexes = [item.image_index for item in self.reference_images]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("MiMo reference images must preserve canonical order")
@@ -202,7 +205,7 @@ class MimoCaseManifest(SchemaModel):
 
 
 class MimoInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_inventory.1"] = MIMO25_INVENTORY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_inventory.2"] = MIMO25_INVENTORY_VERSION
     inventory_scope: Literal["current_diarization_asr_target_inventory"] = (
         MIMO25_INVENTORY_SCOPE
     )
@@ -232,18 +235,19 @@ class MimoInventory(SchemaModel):
 
 
 class MimoFailure(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_failure.1"] = MIMO25_FAILURE_VERSION
+    schema_version: Literal["r2v.h3.mimo25_failure.2"] = MIMO25_FAILURE_VERSION
     clip_uid: str
     code: str
     reason: str
     attempt_count: int = Field(ge=0)
+    http_attempt_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
     repair_count: int = Field(ge=0)
-    issues: list[dict[str, str]]
+    issues: list[dict[str, str | None]]
 
 
 class MimoRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_record.1"] = MIMO25_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_record.2"] = MIMO25_RECORD_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -256,6 +260,7 @@ class MimoRecord(SchemaModel):
         "target_video_plus_canonical_full_audio_fallback",
     ] | None = None
     model_call_count: int = Field(ge=0)
+    http_attempt_count: int = Field(ge=0)
     raw_response_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
     repair_count: int = Field(ge=0)
@@ -275,7 +280,7 @@ class MimoRecord(SchemaModel):
 
 
 class MimoRawResponse(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_raw_response.1"] = MIMO25_RAW_VERSION
+    schema_version: Literal["r2v.h3.mimo25_raw_response.2"] = MIMO25_RAW_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     raw_responses: list[str]
@@ -283,7 +288,7 @@ class MimoRawResponse(SchemaModel):
 
 
 class MimoSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_summary.1"] = MIMO25_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_summary.2"] = MIMO25_SUMMARY_VERSION
     inventory_scope: Literal["current_diarization_asr_target_inventory"] = (
         MIMO25_INVENTORY_SCOPE
     )
@@ -298,10 +303,12 @@ class MimoSummary(SchemaModel):
     failed_count: int = Field(ge=0)
     unsupported_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
+    http_attempt_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
     repair_count: int = Field(ge=0)
     input_modality_counts: dict[str, int]
     usage_totals: dict[str, int]
+    responses_with_nonzero_reasoning_tokens: int = Field(ge=0)
     correction_counts: dict[str, int]
     audio_event_count: int = Field(ge=0)
     music_status_counts: dict[str, int]
@@ -361,6 +368,48 @@ def _index(rows: Sequence[SchemaModel], *fields: str) -> dict[tuple[object, ...]
             raise ValueError(f"duplicate source row: {key}")
         result[key] = row
     return result
+
+
+def _validate_h3_variant_observations(
+    clip_uid: str,
+    samples: Sequence[FinalH3SampleV2],
+) -> FinalH3SampleV2:
+    if not samples:
+        raise ValueError(f"MiMo H3 sample inventory is empty: {clip_uid}")
+    representative = samples[0]
+    if any(
+        item.target_video != representative.target_video
+        or item.target_full_audio_path != representative.target_full_audio_path
+        or item.visual_references != representative.visual_references
+        or item.r2v_instruction != representative.r2v_instruction
+        for item in samples[1:]
+    ):
+        raise ValueError(f"MiMo H3 variants disagree on target observations: {clip_uid}")
+    return representative
+
+
+def _validate_clip_segment_inventory(
+    clip_uid: str,
+    *,
+    raw: Sequence[RawDiarizationSegment],
+    bound: Sequence[BoundDiarizationSegment],
+    asr: Sequence[Qwen3ASRSegment],
+    audits: Sequence[SpeakerBindingSegmentAudit],
+) -> None:
+    inventories = {
+        "raw": {item.segment_id for item in raw if item.target_clip_uid == clip_uid},
+        "bound": {
+            item.segment_id for item in bound if item.target_clip_uid == clip_uid
+        },
+        "audit": {item.segment_id for item in audits if item.clip_uid == clip_uid},
+        "asr": {item.segment_id for item in asr if item.clip_uid == clip_uid},
+    }
+    expected = inventories["raw"]
+    if any(value != expected for value in inventories.values()):
+        raise ValueError(
+            f"MiMo segment inventories differ for {clip_uid}: "
+            + _compact_json({key: sorted(value) for key, value in inventories.items()})
+        )
 
 
 def build_mimo25_inventory(
@@ -447,14 +496,7 @@ def build_mimo25_inventory(
         clip_samples = sorted(samples_by_clip.get(clip_uid, []), key=lambda item: item.sample_id)
         if canonical_clip is None or visual_clip is None or not clip_samples:
             raise ValueError(f"MiMo clip lacks canonical Visual/Audio/H3 input: {clip_uid}")
-        representative = clip_samples[0]
-        if any(
-            item.target_video != representative.target_video
-            or item.target_full_audio_path != representative.target_full_audio_path
-            or item.visual_references != representative.visual_references
-            for item in clip_samples[1:]
-        ):
-            raise ValueError(f"MiMo H3 variants disagree on target observations: {clip_uid}")
+        representative = _validate_h3_variant_observations(clip_uid, clip_samples)
         if (
             Path(representative.target_video).resolve(strict=True)
             != Path(canonical_clip.target_video_path).resolve(strict=True)
@@ -494,6 +536,13 @@ def build_mimo25_inventory(
         reference_subjects = build_reference_contract(
             representative, variant
         ).subjects
+        _validate_clip_segment_inventory(
+            clip_uid,
+            raw=raw,
+            bound=bound,
+            asr=asr,
+            audits=audits,
+        )
         clip_asr = sorted(
             (item for item in asr if item.clip_uid == clip_uid),
             key=lambda item: (item.start_time, item.end_time, item.segment_id),
@@ -509,7 +558,10 @@ def build_mimo25_inventory(
             ) or not isinstance(audit_row, SpeakerBindingSegmentAudit):
                 raise TypeError(f"MiMo segment source coverage differs: {key}")
             exact = (
-                raw_row.speaker_cluster_id == bound_row.speaker_cluster_id == asr_row.speaker_cluster_id,
+                raw_row.speaker_cluster_id
+                == bound_row.speaker_cluster_id
+                == asr_row.speaker_cluster_id
+                == audit_row.speaker_cluster_id,
                 raw_row.start_time == bound_row.start_time == asr_row.start_time == audit_row.start_time,
                 raw_row.end_time == bound_row.end_time == asr_row.end_time == audit_row.end_time,
                 raw_row.source_start_sample == bound_row.source_start_sample == asr_row.source_start_sample,
@@ -557,6 +609,7 @@ def build_mimo25_inventory(
             )
         values = {
             "clip_uid": clip_uid,
+            "r2v_instruction": representative.r2v_instruction,
             "target_video_path": str(target_video),
             "target_video_sha256": canonical_clip.target_video_sha256,
             "target_full_audio_path": str(target_audio),
@@ -636,6 +689,7 @@ def run_mimo25_av_reconcile(
     corrections: Counter[str] = Counter()
     music_counts: Counter[str] = Counter()
     audio_event_count = 0
+    nonzero_reasoning_count = 0
     try:
         _write_json(temporary / "inventory.json", inventory.model_dump(mode="json"))
         for job in inventory.jobs:
@@ -644,7 +698,7 @@ def run_mimo25_av_reconcile(
             entities = {
                 item.entity_id
                 for item in job.reference_images
-                if item.entity_id is not None
+                if item.kind == "subject" and item.entity_id is not None
             }
             labels = {item.picture_label for item in job.reference_images}
             labels |= {item.subject_label for item in job.reference_subjects}
@@ -667,6 +721,7 @@ def run_mimo25_av_reconcile(
                     "failure": None,
                     "input_modality": result.input_modality,
                     "model_call_count": result.model_call_count,
+                    "http_attempt_count": result.http_attempt_count,
                     "raw_response_count": len(result.raw_responses),
                     "http_retry_count": result.http_retry_count,
                     "repair_count": result.repair_count,
@@ -676,10 +731,7 @@ def run_mimo25_av_reconcile(
                 corrections.update(_correction_counts(job, result.annotation))
                 audio_event_count += len(result.annotation.audio_semantics.temporal_non_speech_events)
                 music_counts[result.annotation.audio_semantics.non_diegetic_music_status] += 1
-                for diagnostic in result.diagnostics:
-                    for field, value in diagnostic.usage.model_dump(mode="python").items():
-                        if value is not None:
-                            usage_totals[field] += value
+                case_diagnostics = result.diagnostics
                 raw = MimoRawResponse(
                     clip_uid=job.clip_uid,
                     request_fingerprint=job.request_fingerprint,
@@ -692,6 +744,7 @@ def run_mimo25_av_reconcile(
                     code=exc.code,
                     reason=exc.reason,
                     attempt_count=exc.model_call_count,
+                    http_attempt_count=exc.http_attempt_count,
                     http_retry_count=exc.http_retry_count,
                     repair_count=exc.repair_count,
                     issues=[item.to_dict() for item in exc.issues],
@@ -708,17 +761,25 @@ def run_mimo25_av_reconcile(
                     "failure": failure.model_dump(mode="json"),
                     "input_modality": None,
                     "model_call_count": exc.model_call_count,
+                    "http_attempt_count": exc.http_attempt_count,
                     "raw_response_count": len(exc.raw_responses),
                     "http_retry_count": exc.http_retry_count,
                     "repair_count": exc.repair_count,
                 }
                 records.append(_record(values))
+                case_diagnostics = exc.diagnostics
                 raw = MimoRawResponse(
                     clip_uid=job.clip_uid,
                     request_fingerprint=job.request_fingerprint,
                     raw_responses=list(exc.raw_responses),
                     diagnostics=[item.model_dump(mode="json") for item in exc.diagnostics],
                 )
+            for diagnostic in case_diagnostics:
+                for field, value in diagnostic.usage.model_dump(mode="python").items():
+                    if value is not None:
+                        usage_totals[field] += value
+                if (diagnostic.usage.reasoning_tokens or 0) > 0:
+                    nonzero_reasoning_count += 1
             _write_json(raw_root / f"{job.clip_uid}.json", raw.model_dump(mode="json"))
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "failures.jsonl", failures)
@@ -738,10 +799,12 @@ def run_mimo25_av_reconcile(
             failed_count=sum(item.status == "failed" for item in records),
             unsupported_count=sum(item.status == "unsupported" for item in records),
             model_call_count=sum(item.model_call_count for item in records),
+            http_attempt_count=sum(item.http_attempt_count for item in records),
             http_retry_count=sum(item.http_retry_count for item in records),
             repair_count=sum(item.repair_count for item in records),
             input_modality_counts=dict(sorted(modality_counts.items())),
             usage_totals=dict(sorted(usage_totals.items())),
+            responses_with_nonzero_reasoning_tokens=nonzero_reasoning_count,
             correction_counts=dict(sorted(corrections.items())),
             audio_event_count=audio_event_count,
             music_status_counts=dict(sorted(music_counts.items())),
