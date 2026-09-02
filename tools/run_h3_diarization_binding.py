@@ -18,9 +18,11 @@ from r2v_data_v2.h3.diarization_binding import (
     DEFAULT_DIARIZEN_DEVICE,
     DEFAULT_DIARIZEN_MODEL_IDENTIFIER,
     DEFAULT_DIARIZEN_TIMEOUT_SECONDS,
-    DIARIZATION_PREPROCESSING_VERSION,
+    DIARIZATION_CANONICAL_PREPROCESSING_VERSION,
+    DIARIZATION_LEGACY_PREPROCESSING_VERSION,
     DIARIZATION_REQUEST_VERSION,
     DiarizationBackendProvenance,
+    DiarizationInputProfile,
     PersistentDiariZenBackend,
     build_diarization_inventory,
     diarization_output_root,
@@ -51,6 +53,7 @@ def _configuration_fingerprint(
     model_identifier: str,
     model_fingerprint: str,
     requested_device: str,
+    input_profile: DiarizationInputProfile,
 ) -> str:
     import hashlib
 
@@ -61,7 +64,12 @@ def _configuration_fingerprint(
             "model_fingerprint": model_fingerprint,
             "requested_device": requested_device,
             "request_contract_version": DIARIZATION_REQUEST_VERSION,
-            "input_preprocessing": DIARIZATION_PREPROCESSING_VERSION,
+            "input_profile": input_profile,
+            "input_preprocessing": (
+                DIARIZATION_CANONICAL_PREPROCESSING_VERSION
+                if input_profile == "canonical_32k_stereo"
+                else DIARIZATION_LEGACY_PREPROCESSING_VERSION
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -72,6 +80,7 @@ def _configuration_fingerprint(
 def _runtime_backend(
     *,
     output_root: Path,
+    input_profile: DiarizationInputProfile = "legacy_16k_mono",
 ) -> tuple[PersistentDiariZenBackend, Path]:
     python_value = _required_environment("DIARIZEN_PYTHON")
     python_path = Path(python_value).expanduser()
@@ -117,6 +126,7 @@ def _runtime_backend(
     if timeout_seconds <= 0:
         raise ValueError("DIARIZEN_TIMEOUT_SECONDS must be positive")
     model_fingerprint = fingerprint_local_model_path(model_cache)
+    canonical = input_profile == "canonical_32k_stereo"
     provenance = DiarizationBackendProvenance(
         backend="diarizen_official_pipeline",
         model_identifier=model_identifier,
@@ -125,7 +135,16 @@ def _runtime_backend(
             model_identifier=model_identifier,
             model_fingerprint=model_fingerprint,
             requested_device=requested_device,
+            input_profile=input_profile,
         ),
+        input_profile=input_profile,
+        input_preprocessing=(
+            DIARIZATION_CANONICAL_PREPROCESSING_VERSION
+            if canonical
+            else DIARIZATION_LEGACY_PREPROCESSING_VERSION
+        ),
+        source_sample_rate_hz=32000 if canonical else 16000,
+        source_channels=2 if canonical else 1,
     )
     hidden_diagnostics = output_root.parent / (
         f".{output_root.name}.worker-{uuid.uuid4().hex}"
@@ -149,6 +168,8 @@ def _runtime_backend(
             model_fingerprint,
             "--device",
             "cuda:0",
+            "--input-profile",
+            input_profile,
         ],
         provenance=provenance,
         timeout_seconds=timeout_seconds,

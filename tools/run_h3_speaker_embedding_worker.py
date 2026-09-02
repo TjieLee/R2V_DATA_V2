@@ -16,8 +16,9 @@ import numpy as np
 from r2v_data_v2.h3.audio_backends import fingerprint_local_model_path
 
 _ANALYSIS_RESAMPLE_POLICY = (
-    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    "h3_speaker_ecapa_torchaudio_kaiser_32k_stereo_to_16k_mono_v1"
 )
+_NATIVE_INPUT_POLICY = "h3_speaker_ecapa_native_16k_mono_passthrough_v1"
 
 
 def _prepare_model_input(
@@ -46,7 +47,7 @@ def _prepare_model_input(
             _ANALYSIS_RESAMPLE_POLICY,
         )
     if sample_rate == 16000 and waveform.shape[0] == 1:
-        return waveform, "native_16k_mono_passthrough_v1"
+        return waveform, _NATIVE_INPUT_POLICY
     raise ValueError("speaker input must be canonical 32 kHz stereo or 16 kHz mono")
 
 

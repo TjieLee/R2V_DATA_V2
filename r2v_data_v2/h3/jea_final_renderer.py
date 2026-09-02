@@ -734,6 +734,17 @@ def render_jea_final_samples(
     qwen_by_key = {(item.clip_uid, item.segment_id): item for item in qwen_rows}
     if len(qwen_by_key) != len(qwen_rows) or set(qwen_by_key) != set(bound_by_key):
         raise ValueError("Qwen3 ASR rows do not exactly cover DiariZen segments")
+    failed_asr = sorted(
+        f"{item.clip_uid}/{item.segment_id}"
+        for item in qwen_rows
+        if item.status == "failed"
+    )
+    if failed_asr:
+        preview = failed_asr[:10]
+        raise ValueError(
+            "final H3 cannot consume failed Qwen3-ASR segments: "
+            f"count={len(failed_asr)}, first={preview}"
+        )
     for row in qwen_rows:
         source = bound_by_key.get((row.clip_uid, row.segment_id))
         if source is None or (

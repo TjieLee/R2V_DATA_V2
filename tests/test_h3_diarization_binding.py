@@ -26,6 +26,7 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationBoundaryReconciliation,
     DiarizationHumanQAExport,
     DiarizationHumanQALabel,
+    DiarizationInventory,
     DiarizationTargetClip,
     PersistentDiariZenBackend,
     RawDiarizationSegment,
@@ -226,6 +227,10 @@ def _provenance() -> DiarizationBackendProvenance:
         model_identifier="fixture/diarizen-v2",
         model_fingerprint="a" * 64,
         configuration_fingerprint="b" * 64,
+        input_profile="legacy_16k_mono",
+        input_preprocessing="h3_diarizen_native_16k_mono_passthrough_v1",
+        source_sample_rate_hz=16000,
+        source_channels=1,
     )
 
 
@@ -385,10 +390,12 @@ def _raw(
         source_audio_path=active.source_audio_path,
         source_audio_sha256=active.source_audio_sha256,
         source_sample_rate_hz=active.source_sample_rate_hz,
+        source_channels=active.source_channels,
         backend="fake_diarizen",
         model_identifier="fixture/diarizen-v2",
         model_fingerprint="a" * 64,
         backend_configuration_fingerprint="b" * 64,
+        input_preprocessing="h3_diarizen_native_16k_mono_passthrough_v1",
         boundary_reconciliation=DiarizationBoundaryReconciliation(
             adjusted=False,
             end_clamped=False,
@@ -423,7 +430,7 @@ def test_inventory_reuses_exact_asr_pilot_order_and_production_is_complete(
     assert production.mapping_policy_validated is True
     assert production.numeric_mapping_thresholds_used is False
     assert production.mapping_policy_version == "h3_diarizen_sparse_anchor_policy_v1"
-    assert production.schema_version == "r2v.h3.diarization_inventory.2"
+    assert production.schema_version == "r2v.h3.diarization_inventory.4"
     assert production.calibration_inventory_fingerprint == (
         "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
     )
@@ -480,13 +487,13 @@ def test_dry_run_imports_no_diarizen_and_real_production_is_enabled(
     first_cluster = json.loads(
         (output / "cluster_bindings.jsonl").read_text(encoding="utf-8").splitlines()[0]
     )
-    assert first_cluster["schema_version"] == "r2v.h3.diarization_cluster_binding.2"
+    assert first_cluster["schema_version"] == "r2v.h3.diarization_cluster_binding.3"
     assert first_cluster["mapping_policy_version"] == (
         "h3_diarizen_sparse_anchor_policy_v1"
     )
     summary = completed["summary"]
     assert isinstance(summary, dict)
-    assert summary["schema_version"] == "r2v.h3.diarization_summary.3"
+    assert summary["schema_version"] == "r2v.h3.diarization_summary.4"
     assert summary["mode"] == "production"
     assert summary["target_clip_count"] == 75
     assert summary["backend_call_count"] == 75
@@ -529,7 +536,7 @@ def test_pilot_calls_backend_once_per_target_and_never_for_cross_pairs(
 
     assert [item[0] for item in backend.calls] == expected
     assert summary.backend_call_count == 20
-    assert summary.schema_version == "r2v.h3.diarization_summary.3"
+    assert summary.schema_version == "r2v.h3.diarization_summary.4"
     assert summary.boundary_adjusted_segment_count == 0
     assert summary.boundary_adjusted_clip_count == 0
     assert summary.total_end_overrun_seconds == 0
@@ -625,7 +632,7 @@ def test_terminal_segments_intersect_canonical_source_and_preserve_provenance() 
     assert exact.source_end_sample == target.source_frame_count
     assert exact.boundary_reconciliation.adjusted is False
 
-    assert crossing_a.schema_version == "r2v.h3.diarization_segment.2"
+    assert crossing_a.schema_version == "r2v.h3.diarization_segment.3"
     assert crossing_a.backend_reported_start_time == 7.92
     assert crossing_a.backend_reported_end_time == 30.0
     assert crossing_a.backend_reported_start_sample == 792
@@ -1154,7 +1161,7 @@ for line in sys.stdin:
     if request['operation'] == 'shutdown':
         print(json.dumps({'request_id':request['request_id'],'status':'shutdown'}), flush=True)
         break
-    print(json.dumps({'request_id':request['request_id'],'status':'ready','model_identifier':model,'backend_metadata':{'input_preprocessing':'h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1','source_sample_rate_hz':32000,'source_channels':2,'model_input_sample_rate_hz':16000,'model_input_channels':1},'segments':[{'start_time':0.0,'end_time':1.0,'speaker_label':'a'}]}), flush=True)
+    print(json.dumps({'request_id':request['request_id'],'status':'ready','model_identifier':model,'backend_metadata':{'input_profile':'legacy_16k_mono','input_preprocessing':'h3_diarizen_native_16k_mono_passthrough_v1','source_sample_rate_hz':16000,'source_channels':1,'model_input_sample_rate_hz':16000,'model_input_channels':1},'segments':[{'start_time':0.0,'end_time':1.0,'speaker_label':'a'}]}), flush=True)
 """,
         encoding="utf-8",
     )
@@ -1251,6 +1258,69 @@ def test_diarizen_runtime_preprocessing_downmixes_and_resamples_ephemerally(
             {"encoding": "PCM_S", "bits_per_sample": 16},
         ),
     )
+
+
+def test_diarizen_legacy_runtime_profile_is_native_16k_mono_passthrough(
+    tmp_path: Path,
+) -> None:
+    class _Truth:
+        @staticmethod
+        def item() -> bool:
+            return True
+
+    class _Finite:
+        @staticmethod
+        def all() -> _Truth:
+            return _Truth()
+
+    class _Waveform:
+        ndim = 2
+        shape = (1, 16000)
+
+    calls: list[tuple[str, object]] = []
+
+    class _Functional:
+        @staticmethod
+        def resample(*args: object, **kwargs: object) -> None:
+            calls.append(("resample", (args, kwargs)))
+
+    class _Audio:
+        functional = _Functional()
+
+        @staticmethod
+        def load(path: str) -> tuple[_Waveform, int]:
+            calls.append(("load", path))
+            return _Waveform(), 16000
+
+        @staticmethod
+        def save(*args: object, **kwargs: object) -> None:
+            calls.append(("save", (args, kwargs)))
+
+    source = tmp_path / "legacy.wav"
+    destination = tmp_path / "unused.wav"
+    result = _prepare_analysis_audio(
+        source=source,
+        destination=destination,
+        torch=SimpleNamespace(isfinite=lambda _value: _Finite()),
+        torchaudio=_Audio(),
+        input_profile="legacy_16k_mono",
+    )
+
+    assert result == source
+    assert calls == [("load", str(source))]
+    assert not destination.exists()
+
+
+def test_current_diarization_inventory_rejects_old_sample_domain_schema(
+    tmp_path: Path,
+) -> None:
+    root, _selected = _audio_run(tmp_path)
+    current = build_diarization_inventory(audio_run_root=root, mode="pilot20")
+    legacy = current.model_dump(mode="json")
+    legacy["schema_version"] = "r2v.h3.diarization_inventory.3"
+
+    with pytest.raises(ValueError, match="diarization_inventory.4"):
+        DiarizationInventory.model_validate(legacy)
 
 
 def test_backend_failure_is_isolated_and_empty_output_is_not_failure(

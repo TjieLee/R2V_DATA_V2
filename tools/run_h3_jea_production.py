@@ -276,7 +276,11 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             ),
         ).model_dump(mode="json")
     if "primary-voice" in stages:
-        _require_stage_artifact("primary-voice", "audio", paths.audio / "summary.json")
+        _require_stage_artifact(
+            "primary-voice",
+            "canonical audio",
+            paths.audio / "canonical_clips.jsonl",
+        )
         stage_results["primary-voice"] = run_jea_primary_voice_stage(
             visual_inventory=visual,
             audio_root=paths.audio.resolve(strict=True),
@@ -326,7 +330,10 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             audio_root=paths.audio.resolve(strict=True),
             ffprobe=arguments.ffprobe,
         )
-        backend, diagnostics_root = _runtime_backend(output_root=paths.diarization)
+        backend, diagnostics_root = _runtime_backend(
+            output_root=paths.diarization,
+            input_profile="canonical_32k_stereo",
+        )
         try:
             with backend:
                 summary = run_diarization_binding_pilot(
@@ -354,7 +361,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         )
         stage_results["binding-audit"] = run_speaker_binding_audit(
             audio_production_root=paths.root,
-            ffmpeg=arguments.ffmpeg,
             overwrite=arguments.overwrite,
         ).model_dump(mode="json")
     if "qwen3-asr" in stages:
@@ -380,11 +386,6 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ):
             _require_stage_artifact("h3", prerequisite, path)
         semantics_root = arguments.audio_semantics_root
-        default_semantics_root = paths.root / "audio_semantics_specialized_v1"
-        if semantics_root is None and (
-            default_semantics_root / "assembled/records.jsonl"
-        ).is_file():
-            semantics_root = default_semantics_root
         stage_results["h3"] = render_jea_final_samples(
             visual_inventory=visual,
             audio_root=paths.audio,

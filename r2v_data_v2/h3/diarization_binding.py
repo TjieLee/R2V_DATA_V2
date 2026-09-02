@@ -40,18 +40,22 @@ from r2v_data_v2.h3.schemas import (
     SchemaModel,
 )
 
-DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.3"
-DIARIZATION_SEGMENT_VERSION = "r2v.h3.diarization_segment.2"
-DIARIZATION_CLUSTER_BINDING_VERSION = "r2v.h3.diarization_cluster_binding.2"
-DIARIZATION_BOUND_SEGMENT_VERSION = "r2v.h3.diarization_bound_segment.1"
-DIARIZATION_CLIP_RESULT_VERSION = "r2v.h3.diarization_clip_result.1"
-DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.3"
+DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.4"
+DIARIZATION_SEGMENT_VERSION = "r2v.h3.diarization_segment.3"
+DIARIZATION_CLUSTER_BINDING_VERSION = "r2v.h3.diarization_cluster_binding.3"
+DIARIZATION_BOUND_SEGMENT_VERSION = "r2v.h3.diarization_bound_segment.2"
+DIARIZATION_CLIP_RESULT_VERSION = "r2v.h3.diarization_clip_result.2"
+DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.4"
 DIARIZATION_HUMAN_QA_VERSION = "r2v.h3.diarization_human_qa.1"
 DIARIZATION_MAPPING_POLICY_VERSION = "h3_diarizen_sparse_anchor_policy_v1"
-DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v1"
-DIARIZATION_PREPROCESSING_VERSION = (
-    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v2"
+DIARIZATION_CANONICAL_PREPROCESSING_VERSION = (
+    "h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1"
 )
+DIARIZATION_LEGACY_PREPROCESSING_VERSION = (
+    "h3_diarizen_native_16k_mono_passthrough_v1"
+)
+DIARIZATION_PREPROCESSING_VERSION = DIARIZATION_CANONICAL_PREPROCESSING_VERSION
 DIARIZATION_BOUNDARY_POLICY_VERSION = "canonical_source_intersection_v1"
 DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT = (
     "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
@@ -66,6 +70,8 @@ EXPECTED_PRODUCTION_TARGET_COUNT = 75
 DIARIZATION_HUMAN_QA_LABELS = ("CORRECT", "WRONG", "UNCERTAIN")
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+DiarizationInputProfile = Literal["canonical_32k_stereo", "legacy_16k_mono"]
 
 
 def _compact_json(value: object) -> str:
@@ -168,10 +174,9 @@ class DiarizationTargetClip(SchemaModel):
 
 
 class DiarizationInventory(SchemaModel):
-    schema_version: Literal[
-        "r2v.h3.diarization_inventory.2",
-        "r2v.h3.diarization_inventory.3",
-    ] = DIARIZATION_INVENTORY_VERSION
+    schema_version: Literal["r2v.h3.diarization_inventory.4"] = (
+        DIARIZATION_INVENTORY_VERSION
+    )
     mode: Literal["pilot20", "production"]
     source_inventory_kind: Literal[
         "pair_inventory", "canonical_audio_manifest"
@@ -295,14 +300,16 @@ class DiarizationBackendProvenance(SchemaModel):
     model_identifier: str
     model_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    request_contract_version: Literal["h3_diarizen_clip_diarization_v1"] = (
+    request_contract_version: Literal["h3_diarizen_clip_diarization_v2"] = (
         DIARIZATION_REQUEST_VERSION
     )
+    input_profile: DiarizationInputProfile
     input_preprocessing: Literal[
-        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
-    ] = DIARIZATION_PREPROCESSING_VERSION
-    source_sample_rate_hz: Literal[32000] = 32000
-    source_channels: Literal[2] = 2
+        "h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1",
+        "h3_diarizen_native_16k_mono_passthrough_v1",
+    ]
+    source_sample_rate_hz: Literal[16000, 32000]
+    source_channels: Literal[1, 2]
     model_input_sample_rate_hz: Literal[16000] = 16000
     model_input_channels: Literal[1] = 1
 
@@ -310,6 +317,24 @@ class DiarizationBackendProvenance(SchemaModel):
     def validate_provenance(self) -> DiarizationBackendProvenance:
         if not self.backend.strip() or not self.model_identifier.strip():
             raise ValueError("diarization backend provenance must not be empty")
+        expected = {
+            "canonical_32k_stereo": (
+                32000,
+                2,
+                DIARIZATION_CANONICAL_PREPROCESSING_VERSION,
+            ),
+            "legacy_16k_mono": (
+                16000,
+                1,
+                DIARIZATION_LEGACY_PREPROCESSING_VERSION,
+            ),
+        }[self.input_profile]
+        if (
+            self.source_sample_rate_hz,
+            self.source_channels,
+            self.input_preprocessing,
+        ) != expected:
+            raise ValueError("diarization input profile provenance is inconsistent")
         return self
 
 
@@ -360,7 +385,7 @@ class DiarizationBoundaryReconciliation(SchemaModel):
 
 
 class RawDiarizationSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_segment.2"] = (
+    schema_version: Literal["r2v.h3.diarization_segment.3"] = (
         DIARIZATION_SEGMENT_VERSION
     )
     target_clip_uid: str
@@ -378,13 +403,15 @@ class RawDiarizationSegment(SchemaModel):
     source_audio_path: str
     source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_sample_rate_hz: int = Field(gt=0)
+    source_channels: int = Field(gt=0)
     backend: str
     model_identifier: str
     model_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     backend_configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_preprocessing: Literal[
-        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
-    ] = DIARIZATION_PREPROCESSING_VERSION
+        "h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1",
+        "h3_diarizen_native_16k_mono_passthrough_v1",
+    ]
     boundary_reconciliation: DiarizationBoundaryReconciliation
 
     @model_validator(mode="after")
@@ -443,11 +470,13 @@ class DiarizationEntitySupport(SchemaModel):
 
 
 class DiarizationClusterBinding(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_cluster_binding.2"] = (
+    schema_version: Literal["r2v.h3.diarization_cluster_binding.3"] = (
         DIARIZATION_CLUSTER_BINDING_VERSION
     )
     target_clip_uid: str
     speaker_cluster_id: str
+    source_sample_rate_hz: int = Field(gt=0)
+    source_channels: int = Field(gt=0)
     status: Literal["candidate_mapped", "unbound", "ambiguous", "conflict"]
     entity_id: str | None = None
     cluster_segment_count: int = Field(gt=0)
@@ -494,7 +523,7 @@ class DiarizationClusterBinding(SchemaModel):
 
 
 class BoundDiarizationSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_bound_segment.1"] = (
+    schema_version: Literal["r2v.h3.diarization_bound_segment.2"] = (
         DIARIZATION_BOUND_SEGMENT_VERSION
     )
     target_clip_uid: str
@@ -504,6 +533,8 @@ class BoundDiarizationSegment(SchemaModel):
     end_time: float = Field(gt=0)
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
+    source_sample_rate_hz: int = Field(gt=0)
+    source_channels: int = Field(gt=0)
     cluster_binding_status: Literal[
         "candidate_mapped", "unbound", "ambiguous", "conflict"
     ]
@@ -517,6 +548,14 @@ class BoundDiarizationSegment(SchemaModel):
 
     @model_validator(mode="after")
     def validate_binding(self) -> BoundDiarizationSegment:
+        if self.source_end_sample <= self.source_start_sample:
+            raise ValueError("bound diarization sample range must be positive")
+        if self.source_start_sample != round(
+            self.start_time * self.source_sample_rate_hz
+        ) or self.source_end_sample != round(
+            self.end_time * self.source_sample_rate_hz
+        ):
+            raise ValueError("bound diarization samples must match source time domain")
         mapped = self.cluster_binding_status == "candidate_mapped"
         if mapped != (self.entity_id is not None):
             raise ValueError("bound diarization entity must match cluster status")
@@ -540,10 +579,12 @@ class BoundDiarizationSegment(SchemaModel):
 
 
 class DiarizationClipResult(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_clip_result.1"] = (
+    schema_version: Literal["r2v.h3.diarization_clip_result.2"] = (
         DIARIZATION_CLIP_RESULT_VERSION
     )
     target_clip_uid: str
+    source_sample_rate_hz: int = Field(gt=0)
+    source_channels: int = Field(gt=0)
     status: Literal["ready", "empty", "failed"]
     backend_called: bool
     raw_segment_count: int = Field(ge=0)
@@ -571,7 +612,7 @@ class DiarizationClipResult(SchemaModel):
 
 
 class DiarizationSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_summary.3"] = (
+    schema_version: Literal["r2v.h3.diarization_summary.4"] = (
         DIARIZATION_SUMMARY_VERSION
     )
     mode: Literal["pilot20", "production"]
@@ -871,6 +912,7 @@ class PersistentDiariZenBackend:
                 "clip_uid": clip_uid,
                 "audio_path": str(audio_path),
                 "model_identifier": self.provenance.model_identifier,
+                "input_profile": self.provenance.input_profile,
             }
         )
         if response.get("status") != "ready":
@@ -883,6 +925,7 @@ class PersistentDiariZenBackend:
         if not isinstance(metadata, dict) or any(
             metadata.get(key) != expected
             for key, expected in (
+                ("input_profile", self.provenance.input_profile),
                 ("input_preprocessing", self.provenance.input_preprocessing),
                 ("source_sample_rate_hz", self.provenance.source_sample_rate_hz),
                 ("source_channels", self.provenance.source_channels),
@@ -1039,7 +1082,7 @@ def build_complete_diarization_inventory(
         targets=ordered,
     )
     return DiarizationInventory(
-        schema_version="r2v.h3.diarization_inventory.2",
+        schema_version=DIARIZATION_INVENTORY_VERSION,
         mode="production",
         source_pairs_path=str(pairs_path),
         source_pairs_sha256=pairs_sha256,
@@ -1166,7 +1209,7 @@ def build_diarization_inventory(
         targets=targets,
     )
     return DiarizationInventory(
-        schema_version="r2v.h3.diarization_inventory.2",
+        schema_version=DIARIZATION_INVENTORY_VERSION,
         mode=mode,
         source_pairs_path=str(pairs_path),
         source_pairs_sha256=pairs_sha256,
@@ -1283,12 +1326,14 @@ def _normalize_segments(
                 source_audio_path=target.source_audio_path,
                 source_audio_sha256=target.source_audio_sha256,
                 source_sample_rate_hz=target.source_sample_rate_hz,
+                source_channels=target.source_channels,
                 backend=provenance.backend,
                 model_identifier=provenance.model_identifier,
                 model_fingerprint=provenance.model_fingerprint,
                 backend_configuration_fingerprint=(
                     provenance.configuration_fingerprint
                 ),
+                input_preprocessing=provenance.input_preprocessing,
                 boundary_reconciliation=DiarizationBoundaryReconciliation(
                     adjusted=end_clamped,
                     end_clamped=end_clamped,
@@ -1450,6 +1495,8 @@ def bind_diarization_segments(
             DiarizationClusterBinding(
                 target_clip_uid=target.target_clip_uid,
                 speaker_cluster_id=cluster_id,
+                source_sample_rate_hz=target.source_sample_rate_hz,
+                source_channels=target.source_channels,
                 status=status,
                 entity_id=entity_id,
                 cluster_segment_count=len(segments),
@@ -1539,6 +1586,8 @@ def bind_diarization_segments(
                 end_time=segment.end_time,
                 source_start_sample=segment.source_start_sample,
                 source_end_sample=segment.source_end_sample,
+                source_sample_rate_hz=segment.source_sample_rate_hz,
+                source_channels=segment.source_channels,
                 cluster_binding_status=binding.status,
                 entity_id=entity_id,
                 entity_occurrence_id=(
@@ -1621,6 +1670,8 @@ def _clip_result(
     anchors, legacy_turn_durations = _legacy_metrics(target, sidecar)
     return DiarizationClipResult(
         target_clip_uid=target.target_clip_uid,
+        source_sample_rate_hz=target.source_sample_rate_hz,
+        source_channels=target.source_channels,
         status=status,
         backend_called=True,
         raw_segment_count=len(raw_segments),
@@ -1648,6 +1699,8 @@ def _failed_clip_result(
 ) -> DiarizationClipResult:
     return DiarizationClipResult(
         target_clip_uid=target.target_clip_uid,
+        source_sample_rate_hz=target.source_sample_rate_hz,
+        source_channels=target.source_channels,
         status="failed",
         backend_called=backend_called,
         raw_segment_count=0,
@@ -2150,6 +2203,15 @@ def run_diarization_binding_pilot(
     backend: DiarizationBackend,
     overwrite: bool = False,
 ) -> DiarizationSummary:
+    expected_source = (
+        backend.provenance.source_sample_rate_hz,
+        backend.provenance.source_channels,
+    )
+    if any(
+        (target.source_sample_rate_hz, target.source_channels) != expected_source
+        for target in inventory.targets
+    ):
+        raise ValueError("DiariZen backend input profile differs from inventory")
     destination = output_root.expanduser().resolve(strict=False)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)

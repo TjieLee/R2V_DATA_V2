@@ -126,9 +126,11 @@ JEA Audio uses one persisted canonical representation:
 `audio/full_audio/` is 32 kHz stereo lossless FLAC decoded directly from each
 original target video stream. Final target audio and target/cross voice
 conditioning use this source. DiariZen, Qwen3-ASR, and ECAPA receive only
-deterministic runtime 16 kHz mono views under the versioned preprocessing
-policy; persisted segment and voice sample coordinates remain in the canonical
-32 kHz domain.
+deterministic runtime 16 kHz mono views under model-specific versioned policies:
+`h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1`,
+`h3_qwen3_asr_ffmpeg_32k_stereo_to_16k_mono_v1`, and
+`h3_speaker_ecapa_torchaudio_kaiser_32k_stereo_to_16k_mono_v1`. Persisted
+segment and voice sample coordinates remain in the canonical 32 kHz domain.
 
 The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and

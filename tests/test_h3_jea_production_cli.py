@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import tools.run_h3_jea_production as jea_cli
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.qwen3_asr import (
     QWEN3_ASR_MODEL_IDENTIFIER,
     Qwen3ASRConfiguration,
 )
 from tools.run_h3_jea_production import _audio_parallelism, _parse_stages, _parser
+
+
+class _Result:
+    def model_dump(self, *, mode: str) -> dict[str, int]:
+        assert mode == "json"
+        return {"segment_count": 1}
 
 
 def test_direct_audio_production_root_has_all_seven_stages(tmp_path: Path) -> None:
@@ -55,6 +63,60 @@ def test_production_stage_parser_is_direct_and_ordered() -> None:
     )
     with pytest.raises(ValueError):
         _parse_stages("whisper")
+
+
+def test_binding_audit_stage_calls_real_signature_without_ffmpeg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production_root = tmp_path / "production"
+    paths = jea_production_paths(production_root)
+    paths.diarization.mkdir(parents=True)
+    (paths.diarization / "inventory.json").write_text("{}", encoding="utf-8")
+    visual = SimpleNamespace(
+        visual_production_root=str(tmp_path / "visual"),
+        visual_runs_root=str(tmp_path / "runs"),
+        visual_input_schema="r2v.v3.production_sample.1",
+        visual_input_mode="compacted_production",
+        canonical_sample_count=1,
+        eligible_subject_occurrence_count=1,
+        media_collection_count=1,
+        media_collection_clip_counts={"show/work": 1},
+        shard_count=1,
+    )
+    calls: list[tuple[Path, bool]] = []
+
+    monkeypatch.setattr(
+        jea_cli,
+        "load_visual_production_inventory",
+        lambda **_kwargs: visual,
+    )
+    monkeypatch.setattr(jea_cli, "FFmpegAudioMediaBackend", lambda **_kwargs: object())
+
+    def audit(*, audio_production_root: Path, overwrite: bool) -> _Result:
+        calls.append((audio_production_root, overwrite))
+        return _Result()
+
+    monkeypatch.setattr(jea_cli, "run_speaker_binding_audit", audit)
+
+    result = jea_cli.main(
+        [
+            "--visual-production-root",
+            visual.visual_production_root,
+            "--visual-runs-root",
+            visual.visual_runs_root,
+            "--audio-production-root",
+            str(production_root),
+            "--stages",
+            "binding-audit",
+            "--overwrite",
+            "--workers",
+            "1",
+        ]
+    )
+
+    assert calls == [(paths.root, True)]
+    assert result["stage_results"] == {"binding-audit": {"segment_count": 1}}
 
 
 def test_qwen3_environment_defaults_select_only_qwen3(

@@ -776,7 +776,9 @@ def test_speaker_worker_preprocesses_32k_stereo_for_ecapa() -> None:
     )
 
     assert prepared == "mono-16k"
-    assert policy == "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    assert policy == (
+        "h3_speaker_ecapa_torchaudio_kaiser_32k_stereo_to_16k_mono_v1"
+    )
     assert calls[0][0] == "mono-32k"
     assert calls[0][1]["orig_freq"] == 32000
     assert calls[0][1]["new_freq"] == 16000

@@ -31,7 +31,9 @@ from r2v_data_v2.h3.jea_audio_production import (
 from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRBackend,
     Qwen3ASRConfiguration,
+    Qwen3ASRInventory,
     Qwen3ASRSegment,
+    Qwen3ASRSummary,
     load_official_diarizen_waveform,
     load_qwen3_asr_model_input,
     run_qwen3_asr,
@@ -699,6 +701,16 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
     calls: list[dict[str, object]] = []
 
     class _AudioBackend:
+        def probe_audio_file(self, path: Path) -> SimpleNamespace:
+            assert path.is_file()
+            return SimpleNamespace(
+                sample_rate_hz=32000,
+                channels=2,
+                frame_count=80000,
+                duration_seconds=2.5,
+                format_name="flac",
+            )
+
         def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
             clip_uid = str(kwargs["clip_uid"])
             destination = Path(kwargs["destination"])
@@ -738,6 +750,8 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
     assert [row.clip_uid for row in rows] == ["subject", "object-only"]
     assert all(row.sample_rate_hz == 32000 for row in rows)
     assert all(row.channels == 2 for row in rows)
+    assert all(row.frame_count == 80000 for row in rows)
+    assert all(row.target_duration_seconds == row.frame_count / 32000 for row in rows)
     assert all("full_audio" in Path(row.target_full_audio_path).parts for row in rows)
     for row, call in zip(rows, calls, strict=True):
         assert Path(str(call["source_video_path"])) == Path(row.target_video_path)
@@ -812,6 +826,7 @@ def test_canonical_diarization_inventory_retains_all_visual_clips(
                 target_video_sha256=_file_sha256(video),
                 target_full_audio_path=str(audio),
                 target_full_audio_sha256=_file_sha256(audio),
+                frame_count=3200,
                 target_duration_seconds=0.1,
                 subject_reference_count=len(clip.subject_references),
                 target_audio_binding_path=(str(binding_path) if has_binding else None),
@@ -927,9 +942,39 @@ def test_canonical_audio_backfill_uses_official_audio_stage_root(
         ),
     )
     binding_path.write_text(binding.model_dump_json(indent=2), encoding="utf-8")
+    expected_audio.parent.mkdir(parents=True, exist_ok=True)
+    expected_audio.write_bytes(b"legacy 16 kHz mono audio")
+    video = Path(item.sample.target_video).resolve(strict=True)
+    _jsonl(
+        paths.audio / "canonical_clips.jsonl",
+        [
+            {
+                "schema_version": "r2v.h3.canonical_audio_clip.1",
+                **item.identity.model_dump(mode="json"),
+                "target_video_path": str(video),
+                "target_video_sha256": _file_sha256(video),
+                "target_full_audio_path": str(expected_audio),
+                "target_full_audio_sha256": _file_sha256(expected_audio),
+                "target_duration_seconds": 2.5,
+                "subject_reference_count": len(item.subject_references),
+                "target_audio_binding_path": str(binding_path),
+                "target_audio_binding_sha256": _file_sha256(binding_path),
+            }
+        ],
+    )
     calls: list[Path] = []
 
     class _AudioBackend:
+        def probe_audio_file(self, path: Path) -> SimpleNamespace:
+            assert path.is_file()
+            return SimpleNamespace(
+                sample_rate_hz=32000,
+                channels=2,
+                frame_count=80000,
+                duration_seconds=2.5,
+                format_name="flac",
+            )
+
         def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
             destination = Path(kwargs["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -975,11 +1020,49 @@ def test_canonical_audio_backfill_uses_official_audio_stage_root(
     record = CanonicalAudioClip.model_validate_json(
         (paths.audio / "canonical_clips.jsonl").read_text(encoding="utf-8")
     )
+    assert record.schema_version == "r2v.h3.canonical_audio_clip.3"
+    assert record.frame_count == 80000
     assert record.target_audio_binding_path == str(binding_path.resolve(strict=True))
     assert not (production_root / "canonical_clips.jsonl").exists()
     assert not (production_root / "canonical_clips_summary.json").exists()
     assert not (production_root / "full_audio").exists()
     assert not (paths.audio / "h3_full_audio").exists()
+
+
+def test_current_canonical_manifest_rejects_pre_frame_count_schema(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": "clip-a",
+                "shard_id": "shard-a",
+                "clip_relative_path": "show/work/clip-a.mp4",
+                "source_relative_path": "show/work/source-a.mkv",
+            }
+        ],
+    )
+    clip = inventory.canonical_clips[0]
+    video = Path(clip.sample.target_video).resolve(strict=True)
+    audio = tmp_path / "audio/full_audio/clip-a.flac"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"flac")
+    current = CanonicalAudioClip(
+        **clip.identity.model_dump(mode="python"),
+        target_video_path=str(video),
+        target_video_sha256=_file_sha256(video),
+        target_full_audio_path=str(audio),
+        target_full_audio_sha256=_file_sha256(audio),
+        frame_count=3200,
+        target_duration_seconds=0.1,
+        subject_reference_count=len(clip.subject_references),
+    ).model_dump(mode="json")
+    current.pop("frame_count")
+    current["schema_version"] = "r2v.h3.canonical_audio_clip.2"
+
+    with pytest.raises(ValueError, match="canonical_audio_clip.3"):
+        CanonicalAudioClip.model_validate(current)
 
 
 def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(
@@ -1016,6 +1099,16 @@ def test_audio_stage_binds_subject_subset_but_materializes_canonical_universe(
     monkeypatch.setattr(jea_audio, "run_h3_audio_binding_pilot", fake_pilot)
 
     class _AudioBackend:
+        def probe_audio_file(self, path: Path) -> SimpleNamespace:
+            assert path.is_file()
+            return SimpleNamespace(
+                sample_rate_hz=32000,
+                channels=2,
+                frame_count=80000,
+                duration_seconds=2.5,
+                format_name="flac",
+            )
+
         def materialize_full_audio(self, **kwargs: object) -> SimpleNamespace:
             destination = Path(kwargs["destination"])
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1706,6 +1799,7 @@ def test_cli_wires_all_eight_stages_for_both_visual_layouts_without_models(
         (run_root / "run.json").write_text("{}")
     output = tmp_path / "audio-production"
     binding_audit = output / "binding_audit_v1"
+    (output / "audio_semantics_specialized_v1").mkdir(parents=True)
     calls: list[str] = []
 
     monkeypatch.setattr(jea_cli, "load_visual_production_inventory", lambda **_: inventory)
@@ -1765,11 +1859,11 @@ def test_cli_wires_all_eight_stages_for_both_visual_layouts_without_models(
     monkeypatch.setattr(jea_cli, "build_jea_pairs", pair_stage)
     monkeypatch.setattr(jea_cli, "_embedding_backends", lambda *_: (_Backend(), _Backend()))
     monkeypatch.setattr(jea_cli, "build_jea_diarization_inventory", lambda **_: object())
-    monkeypatch.setattr(
-        jea_cli,
-        "_runtime_backend",
-        lambda **_: (_Backend(), tmp_path / "missing-diagnostics"),
-    )
+    def runtime_backend(**kwargs: object) -> tuple[_Backend, Path]:
+        assert kwargs["input_profile"] == "canonical_32k_stereo"
+        return _Backend(), tmp_path / "missing-diagnostics"
+
+    monkeypatch.setattr(jea_cli, "_runtime_backend", runtime_backend)
 
     def diarization_stage(**kwargs: object) -> _StageResult:
         calls.append("diarization")
@@ -1818,7 +1912,7 @@ def test_cli_wires_all_eight_stages_for_both_visual_layouts_without_models(
         (root / "summary.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "r2v.h3.qwen3_asr_summary.3",
+                    "schema_version": "r2v.h3.qwen3_asr_summary.4",
                     "segment_count": 2,
                     "transcribed_count": 2,
                     "empty_count": 0,
@@ -1837,6 +1931,7 @@ def test_cli_wires_all_eight_stages_for_both_visual_layouts_without_models(
     def h3_stage(**kwargs: object) -> _StageResult:
         calls.append("h3")
         assert kwargs["binding_audit_root"] == binding_audit
+        assert kwargs["audio_semantics_root"] is None
         Path(kwargs["output_root"]).mkdir(parents=True)
         return _StageResult(sample_count=2)
 
@@ -1988,7 +2083,7 @@ def test_jea_qwen_stage_launches_one_isolated_subprocess_and_reads_summary(
         (asr / "summary.json").write_text(
             json.dumps(
                 {
-                    "schema_version": "r2v.h3.qwen3_asr_summary.3",
+                    "schema_version": "r2v.h3.qwen3_asr_summary.4",
                     "segment_count": 3,
                     "transcribed_count": 2,
                     "empty_count": 1,
@@ -2289,6 +2384,62 @@ def test_qwen3_empty_and_failed_schemas_publish_no_confidence() -> None:
         assert payload["text"] is None
 
 
+def test_current_qwen3_contract_rejects_old_16k_schema_versions() -> None:
+    segment = Qwen3ASRSegment(
+        clip_uid="clip",
+        clip_display_path="show/work/clip",
+        media_collection_relpath="show/work",
+        media_collection_name="work",
+        episode_name="episode",
+        clip_name="clip",
+        shard_id="shard",
+        segment_id="segment_0001",
+        speaker_cluster_id="speaker_1",
+        source_audio_path="/audio.flac",
+        source_start_sample=0,
+        source_end_sample=3200,
+        start_time=0.0,
+        end_time=0.1,
+        status="empty",
+        configuration=Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+    )
+    segment_payload = segment.model_dump(mode="json")
+    segment_payload["schema_version"] = "r2v.h3.qwen3_asr_segment.2"
+    with pytest.raises(ValueError, match="qwen3_asr_segment.3"):
+        Qwen3ASRSegment.model_validate(segment_payload)
+
+    inventory = Qwen3ASRInventory(
+        source_diarization_root="/diarization",
+        source_visual_production_root="/visual",
+        segment_count=1,
+        clip_count=1,
+        source_target_clip_count=1,
+        clips_with_diarization_segments=1,
+        clips_without_diarization_segments=0,
+        configuration=Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+    )
+    inventory_payload = inventory.model_dump(mode="json")
+    inventory_payload["schema_version"] = "r2v.h3.qwen3_asr_inventory.3"
+    with pytest.raises(ValueError, match="qwen3_asr_inventory.4"):
+        Qwen3ASRInventory.model_validate(inventory_payload)
+
+    summary = Qwen3ASRSummary(
+        segment_count=1,
+        transcribed_count=0,
+        empty_count=1,
+        failed_count=0,
+        clip_count=1,
+        source_target_clip_count=1,
+        clips_with_diarization_segments=1,
+        clips_without_diarization_segments=0,
+        language_counts={},
+    )
+    summary_payload = summary.model_dump(mode="json")
+    summary_payload["schema_version"] = "r2v.h3.qwen3_asr_summary.3"
+    with pytest.raises(ValueError, match="qwen3_asr_summary.4"):
+        Qwen3ASRSummary.model_validate(summary_payload)
+
+
 def _write_readable_diarization_artifacts(
     *,
     diarization_root: Path,
@@ -2311,12 +2462,13 @@ def _write_readable_diarization_artifacts(
         [
             {
                 **identity.model_dump(mode="json"),
-                "schema_version": "r2v.h3.jea_diarization_target.1",
+                "schema_version": "r2v.h3.jea_diarization_target.2",
                 "source_audio_path": source_audio_by_clip.get(
                     clip_uid,
                     f"/unused/{clip_uid}.flac",
                 ),
                 "source_sample_rate_hz": 32000,
+                "source_channels": 2,
                 "target_video_path": video_by_clip[clip_uid],
                 "target_audio_binding_path": None,
                 "target_audio_binding_sha256": None,
@@ -2335,7 +2487,7 @@ def _write_readable_diarization_artifacts(
         readable.append(
             {
                 **identity_by_clip[clip_uid].model_dump(mode="json"),
-                "schema_version": "r2v.h3.jea_diarization_segment.1",
+                "schema_version": "r2v.h3.jea_diarization_segment.2",
                 "segment_id": raw["segment_id"],
                 "speaker_cluster_id": raw["speaker_cluster_id"],
                 "entity_id": bound.get("entity_id"),
@@ -2344,10 +2496,11 @@ def _write_readable_diarization_artifacts(
                 "source_start_sample": raw["source_start_sample"],
                 "source_end_sample": raw["source_end_sample"],
                 "source_sample_rate_hz": raw["source_sample_rate_hz"],
+                "source_channels": 2,
                 "start_time": raw["start_time"],
                 "end_time": raw["end_time"],
-                "raw_schema_version": "r2v.h3.diarization_segment.2",
-                "bound_schema_version": "r2v.h3.diarization_bound_segment.1",
+                "raw_schema_version": "r2v.h3.diarization_segment.3",
+                "bound_schema_version": "r2v.h3.diarization_bound_segment.2",
                 "mapping_policy_version": "h3_diarizen_sparse_anchor_policy_v1",
                 "segmentation_changed": False,
                 "numeric_mapping_thresholds_changed": False,
@@ -2357,7 +2510,9 @@ def _write_readable_diarization_artifacts(
     (diarization_root / "readable_summary.json").write_text(
         json.dumps(
             {
-                "schema_version": "r2v.h3.jea_diarization_summary.1",
+                "schema_version": "r2v.h3.jea_diarization_summary.2",
+                "source_sample_rate_hz": 32000,
+                "source_channels": 2,
                 "target_count": len(identity_by_clip),
                 "segment_count": len(readable),
                 "media_collection_count": len(

@@ -39,7 +39,6 @@ from r2v_data_v2.h3.asr_transcription import (
 )
 from r2v_data_v2.h3.diarization_binding import (
     DIARIZATION_MAPPING_POLICY_VERSION,
-    DIARIZATION_SEGMENT_VERSION,
     BoundDiarizationSegment,
     DiarizationBoundaryReconciliation,
     DiarizationClusterBinding,
@@ -171,7 +170,7 @@ class ASRV2SegmentJob(SchemaModel):
     source_diarization_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_diarization_segment_schema_version: Literal[
         "r2v.h3.diarization_segment.2"
-    ] = DIARIZATION_SEGMENT_VERSION
+    ] = "r2v.h3.diarization_segment.2"
     source_diarization_mapping_policy_version: Literal[
         "h3_diarizen_sparse_anchor_policy_v1"
     ] = DIARIZATION_MAPPING_POLICY_VERSION

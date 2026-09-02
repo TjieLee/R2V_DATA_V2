@@ -2000,6 +2000,7 @@ def test_mimo_inventory_builds_one_job_per_canonical_target(
                 target_video_sha256=_file_sha256(video),
                 target_full_audio_path=str(audio),
                 target_full_audio_sha256=_file_sha256(audio),
+                frame_count=32000,
                 target_duration_seconds=1.0,
                 subject_reference_count=1,
             )

@@ -17,8 +17,8 @@ from r2v_data_v2.h3.visual_production_source import VisualProductionInventory
 
 
 class JEAReadableDiarizationTarget(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_diarization_target.1"] = (
-        "r2v.h3.jea_diarization_target.1"
+    schema_version: Literal["r2v.h3.jea_diarization_target.2"] = (
+        "r2v.h3.jea_diarization_target.2"
     )
     clip_uid: str
     clip_display_path: str
@@ -28,7 +28,8 @@ class JEAReadableDiarizationTarget(SchemaModel):
     clip_name: str
     shard_id: str
     source_audio_path: str
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     target_video_path: str
     target_audio_binding_path: str | None = None
     target_audio_binding_sha256: str | None = Field(
@@ -46,8 +47,8 @@ class JEAReadableDiarizationTarget(SchemaModel):
 
 
 class JEAReadableDiarizationSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_diarization_segment.1"] = (
-        "r2v.h3.jea_diarization_segment.1"
+    schema_version: Literal["r2v.h3.jea_diarization_segment.2"] = (
+        "r2v.h3.jea_diarization_segment.2"
     )
     clip_uid: str
     clip_display_path: str
@@ -63,14 +64,15 @@ class JEAReadableDiarizationSegment(SchemaModel):
     source_audio_path: str
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
-    raw_schema_version: Literal["r2v.h3.diarization_segment.2"] = (
-        "r2v.h3.diarization_segment.2"
+    raw_schema_version: Literal["r2v.h3.diarization_segment.3"] = (
+        "r2v.h3.diarization_segment.3"
     )
-    bound_schema_version: Literal["r2v.h3.diarization_bound_segment.1"] = (
-        "r2v.h3.diarization_bound_segment.1"
+    bound_schema_version: Literal["r2v.h3.diarization_bound_segment.2"] = (
+        "r2v.h3.diarization_bound_segment.2"
     )
     mapping_policy_version: Literal["h3_diarizen_sparse_anchor_policy_v1"] = (
         "h3_diarizen_sparse_anchor_policy_v1"
@@ -80,9 +82,11 @@ class JEAReadableDiarizationSegment(SchemaModel):
 
 
 class JEAReadableDiarizationSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_diarization_summary.1"] = (
-        "r2v.h3.jea_diarization_summary.1"
+    schema_version: Literal["r2v.h3.jea_diarization_summary.2"] = (
+        "r2v.h3.jea_diarization_summary.2"
     )
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     target_count: int = Field(ge=0)
     segment_count: int = Field(ge=0)
     media_collection_count: int = Field(ge=0)
@@ -149,6 +153,7 @@ def publish_readable_diarization_metadata(
                 **identity.model_dump(mode="python"),
                 source_audio_path=target.source_audio_path,
                 source_sample_rate_hz=target.source_sample_rate_hz,
+                source_channels=target.source_channels,
                 target_video_path=target.target_video_path,
                 target_audio_binding_path=target.target_audio_binding_path,
                 target_audio_binding_sha256=target.target_audio_binding_sha256,
@@ -161,6 +166,8 @@ def publish_readable_diarization_metadata(
         if (
             mapped.source_start_sample != source.source_start_sample
             or mapped.source_end_sample != source.source_end_sample
+            or mapped.source_sample_rate_hz != source.source_sample_rate_hz
+            or mapped.source_channels != source.source_channels
             or mapped.speaker_cluster_id != source.speaker_cluster_id
         ):
             raise ValueError("bound DiariZen segment changed its raw sample extent")
@@ -175,6 +182,7 @@ def publish_readable_diarization_metadata(
                 source_start_sample=source.source_start_sample,
                 source_end_sample=source.source_end_sample,
                 source_sample_rate_hz=source.source_sample_rate_hz,
+                source_channels=source.source_channels,
                 start_time=source.start_time,
                 end_time=source.end_time,
             )

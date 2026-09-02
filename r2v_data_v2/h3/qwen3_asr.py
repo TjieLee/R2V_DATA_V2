@@ -18,13 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from r2v_data_v2.h3.schemas import SchemaModel
 
 QWEN3_ASR_MODEL_IDENTIFIER = "Qwen/Qwen3-ASR-1.7B"
-QWEN3_ASR_SEGMENT_VERSION = "r2v.h3.qwen3_asr_segment.2"
-QWEN3_ASR_INVENTORY_VERSION = "r2v.h3.qwen3_asr_inventory.3"
-QWEN3_ASR_SUMMARY_VERSION = "r2v.h3.qwen3_asr_summary.3"
+QWEN3_ASR_SEGMENT_VERSION = "r2v.h3.qwen3_asr_segment.3"
+QWEN3_ASR_INVENTORY_VERSION = "r2v.h3.qwen3_asr_inventory.4"
+QWEN3_ASR_SUMMARY_VERSION = "r2v.h3.qwen3_asr_summary.4"
 QWEN3_ASR_INPUT_SAMPLE_RATE_HZ = 16000
 QWEN3_ASR_INPUT_CHANNELS = 1
 QWEN3_ASR_PREPROCESSING_POLICY = (
-    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+    "h3_qwen3_asr_ffmpeg_32k_stereo_to_16k_mono_v1"
 )
 
 
@@ -61,7 +61,7 @@ class Qwen3ASRConfiguration(SchemaModel):
 
 
 class Qwen3ASRSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.qwen3_asr_segment.2"] = QWEN3_ASR_SEGMENT_VERSION
+    schema_version: Literal["r2v.h3.qwen3_asr_segment.3"] = QWEN3_ASR_SEGMENT_VERSION
     clip_uid: str
     clip_display_path: str
     media_collection_relpath: str
@@ -77,10 +77,11 @@ class Qwen3ASRSegment(SchemaModel):
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
     source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     model_input_sample_rate_hz: Literal[16000] = QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
     model_input_channels: Literal[1] = QWEN3_ASR_INPUT_CHANNELS
     input_preprocessing: Literal[
-        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+        "h3_qwen3_asr_ffmpeg_32k_stereo_to_16k_mono_v1"
     ] = QWEN3_ASR_PREPROCESSING_POLICY
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
@@ -127,11 +128,7 @@ class Qwen3ASRSegment(SchemaModel):
 
 
 class Qwen3ASRInventory(SchemaModel):
-    schema_version: Literal[
-        "r2v.h3.qwen3_asr_inventory.1",
-        "r2v.h3.qwen3_asr_inventory.2",
-        "r2v.h3.qwen3_asr_inventory.3",
-    ] = (
+    schema_version: Literal["r2v.h3.qwen3_asr_inventory.4"] = (
         QWEN3_ASR_INVENTORY_VERSION
     )
     source_diarization_root: str
@@ -149,7 +146,7 @@ class Qwen3ASRInventory(SchemaModel):
     model_input_sample_rate_hz: Literal[16000] = QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
     model_input_channels: Literal[1] = QWEN3_ASR_INPUT_CHANNELS
     input_preprocessing: Literal[
-        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+        "h3_qwen3_asr_ffmpeg_32k_stereo_to_16k_mono_v1"
     ] = QWEN3_ASR_PREPROCESSING_POLICY
 
     @model_validator(mode="after")
@@ -166,11 +163,9 @@ class Qwen3ASRInventory(SchemaModel):
 
 
 class Qwen3ASRSummary(SchemaModel):
-    schema_version: Literal[
-        "r2v.h3.qwen3_asr_summary.1",
-        "r2v.h3.qwen3_asr_summary.2",
-        "r2v.h3.qwen3_asr_summary.3",
-    ] = QWEN3_ASR_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.qwen3_asr_summary.4"] = (
+        QWEN3_ASR_SUMMARY_VERSION
+    )
     segment_count: int = Field(ge=0)
     transcribed_count: int = Field(ge=0)
     empty_count: int = Field(ge=0)
@@ -192,7 +187,7 @@ class Qwen3ASRSummary(SchemaModel):
     model_input_sample_rate_hz: Literal[16000] = QWEN3_ASR_INPUT_SAMPLE_RATE_HZ
     model_input_channels: Literal[1] = QWEN3_ASR_INPUT_CHANNELS
     input_preprocessing: Literal[
-        "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+        "h3_qwen3_asr_ffmpeg_32k_stereo_to_16k_mono_v1"
     ] = QWEN3_ASR_PREPROCESSING_POLICY
 
     @model_validator(mode="after")
@@ -213,8 +208,8 @@ class Qwen3ASRSummary(SchemaModel):
 
 
 class _ReadableDiarizationTarget(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_diarization_target.1"] = (
-        "r2v.h3.jea_diarization_target.1"
+    schema_version: Literal["r2v.h3.jea_diarization_target.2"] = (
+        "r2v.h3.jea_diarization_target.2"
     )
     clip_uid: str
     clip_display_path: str
@@ -225,6 +220,7 @@ class _ReadableDiarizationTarget(SchemaModel):
     shard_id: str
     source_audio_path: str
     source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     target_video_path: str
     target_audio_binding_path: str | None = None
     target_audio_binding_sha256: str | None = Field(
@@ -234,8 +230,8 @@ class _ReadableDiarizationTarget(SchemaModel):
 
 
 class _ReadableDiarizationSegment(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_diarization_segment.1"] = (
-        "r2v.h3.jea_diarization_segment.1"
+    schema_version: Literal["r2v.h3.jea_diarization_segment.2"] = (
+        "r2v.h3.jea_diarization_segment.2"
     )
     clip_uid: str
     clip_display_path: str
@@ -252,13 +248,14 @@ class _ReadableDiarizationSegment(SchemaModel):
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
     source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     start_time: float = Field(ge=0)
     end_time: float = Field(gt=0)
-    raw_schema_version: Literal["r2v.h3.diarization_segment.2"] = (
-        "r2v.h3.diarization_segment.2"
+    raw_schema_version: Literal["r2v.h3.diarization_segment.3"] = (
+        "r2v.h3.diarization_segment.3"
     )
-    bound_schema_version: Literal["r2v.h3.diarization_bound_segment.1"] = (
-        "r2v.h3.diarization_bound_segment.1"
+    bound_schema_version: Literal["r2v.h3.diarization_bound_segment.2"] = (
+        "r2v.h3.diarization_bound_segment.2"
     )
     mapping_policy_version: Literal["h3_diarizen_sparse_anchor_policy_v1"] = (
         "h3_diarizen_sparse_anchor_policy_v1"
@@ -302,9 +299,11 @@ class _ReadableDiarizationSegment(SchemaModel):
 
 
 class _ReadableDiarizationSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.jea_diarization_summary.1"] = (
-        "r2v.h3.jea_diarization_summary.1"
+    schema_version: Literal["r2v.h3.jea_diarization_summary.2"] = (
+        "r2v.h3.jea_diarization_summary.2"
     )
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     target_count: int = Field(ge=0)
     segment_count: int = Field(ge=0)
     media_collection_count: int = Field(ge=0)
@@ -317,8 +316,8 @@ class _ProvenanceModel(BaseModel):
 
 
 class _RawSegmentProvenance(_ProvenanceModel):
-    schema_version: Literal["r2v.h3.diarization_segment.2"] = (
-        "r2v.h3.diarization_segment.2"
+    schema_version: Literal["r2v.h3.diarization_segment.3"] = (
+        "r2v.h3.diarization_segment.3"
     )
     target_clip_uid: str
     segment_id: str
@@ -329,11 +328,12 @@ class _RawSegmentProvenance(_ProvenanceModel):
     source_end_sample: int = Field(gt=0)
     source_audio_path: str
     source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
 
 
 class _BoundSegmentProvenance(_ProvenanceModel):
-    schema_version: Literal["r2v.h3.diarization_bound_segment.1"] = (
-        "r2v.h3.diarization_bound_segment.1"
+    schema_version: Literal["r2v.h3.diarization_bound_segment.2"] = (
+        "r2v.h3.diarization_bound_segment.2"
     )
     target_clip_uid: str
     segment_id: str
@@ -342,6 +342,8 @@ class _BoundSegmentProvenance(_ProvenanceModel):
     end_time: float = Field(gt=0)
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
     entity_id: str | None = None
     entity_occurrence_id: str | None = None
 
@@ -632,6 +634,10 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
             or readable_item.entity_occurrence_id != bound_item.entity_occurrence_id
             or readable_item.source_audio_path != raw_item.source_audio_path
             or readable_item.source_sample_rate_hz != raw_item.source_sample_rate_hz
+            or readable_item.source_channels != raw_item.source_channels
+            or readable_item.source_sample_rate_hz
+            != bound_item.source_sample_rate_hz
+            or readable_item.source_channels != bound_item.source_channels
             or readable_item.start_time != raw_item.start_time
             or readable_item.end_time != raw_item.end_time
             or readable_item.start_time != bound_item.start_time
@@ -723,6 +729,7 @@ def run_qwen3_asr(
                     source_start_sample=readable.source_start_sample,
                     source_end_sample=readable.source_end_sample,
                     source_sample_rate_hz=readable.source_sample_rate_hz,
+                    source_channels=readable.source_channels,
                     model_input_sample_rate_hz=QWEN3_ASR_INPUT_SAMPLE_RATE_HZ,
                     model_input_channels=QWEN3_ASR_INPUT_CHANNELS,
                     input_preprocessing=QWEN3_ASR_PREPROCESSING_POLICY,

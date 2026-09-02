@@ -1065,6 +1065,7 @@ def test_specialized_inventory_uses_all_canonical_clips_without_pair_or_asr(
                 target_video_sha256=_sha256(video),
                 target_full_audio_path=str(audio),
                 target_full_audio_sha256=_sha256(audio),
+                frame_count=64000,
                 target_duration_seconds=2.0,
                 subject_reference_count=0,
             )

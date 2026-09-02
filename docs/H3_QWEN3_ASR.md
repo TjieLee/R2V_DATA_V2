@@ -150,11 +150,13 @@ Cross-pair variants use the donor occurrence's canonical crop under the same
 policy. ECAPA converts that reference to a 16 kHz mono runtime waveform only
 inside its worker.
 
-DiariZen and Qwen3-ASR use the explicit
-`h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1` preprocessing policy.
-Their model inputs are temporary 16 kHz mono waveforms, while persisted segment
-`source_start_sample` and `source_end_sample` values remain in the canonical
-32 kHz source domain.
+DiariZen and Qwen3-ASR both receive temporary 16 kHz mono model inputs, while
+persisted segment `source_start_sample` and `source_end_sample` values remain in
+the canonical 32 kHz source domain. Their implementations are intentionally
+identified separately: DiariZen uses
+`h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1`, while Qwen3-ASR uses
+`h3_qwen3_asr_ffmpeg_32k_stereo_to_16k_mono_v1`. These provenance values do not
+claim bit-identical preprocessing across model runtimes.
 
 Visual reference assets are not copied into H3. A training reader must read
 `image_artifact_path` directly and must not reconstruct Visual export/run-root
@@ -329,9 +331,7 @@ export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --stages h3 \
-  --audio-semantics-root \
-    "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1"
+  --stages h3
 ```
 
 The active order is `audio -> primary-voice -> embedding -> pair ->
@@ -340,7 +340,10 @@ the existing model-free sidecar rather than a new production inference stage;
 the final renderer requires its canonical segment evidence. Every stage reads
 only its canonical upstream artifacts. Existing stage directories are not
 silently reused; inspect them and pass `--overwrite` only for an intentional
-replacement.
+replacement. Audio semantics is never auto-discovered. Omit
+`--audio-semantics-root` to publish explicit missing semantics coverage, or
+pass only a freshly generated root whose canonical-audio hashes match the
+current 32 kHz manifest; an old 16 kHz-derived semantics root fails closed.
 
 For a minimal ASR-only rerun:
 

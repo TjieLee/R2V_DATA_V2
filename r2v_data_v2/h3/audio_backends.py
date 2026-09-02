@@ -10,6 +10,7 @@ import uuid
 import wave
 from contextlib import suppress
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import IO, Protocol, Self
 
@@ -26,6 +27,15 @@ class MaterializedMedia:
     sample_rate_hz: int
     channels: int
     output_format: str
+
+
+@dataclass(frozen=True)
+class AudioFileProbe:
+    sample_rate_hz: int
+    channels: int
+    frame_count: int
+    duration_seconds: float
+    format_name: str
 
 
 @dataclass(frozen=True)
@@ -95,6 +105,8 @@ class TranscriptBackend(Protocol):
 
 
 class AudioMediaBackend(Protocol):
+    def probe_audio_file(self, path: Path) -> AudioFileProbe: ...
+
     def materialize_full_audio(
         self,
         *,
@@ -328,6 +340,53 @@ class FFmpegAudioMediaBackend:
             time_base=str(stream["time_base"]),
         )
 
+    def probe_audio_file(self, path: Path) -> AudioFileProbe:
+        completed = subprocess.run(
+            [
+                self.ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate,channels,duration_ts,time_base:format=format_name",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        try:
+            payload = json.loads(completed.stdout)
+            streams = payload["streams"]
+            if len(streams) != 1:
+                raise ValueError("audio file must expose exactly one selected stream")
+            stream = streams[0]
+            sample_rate = int(stream["sample_rate"])
+            channels = int(stream["channels"])
+            frames = (
+                Fraction(int(stream["duration_ts"]))
+                * Fraction(str(stream["time_base"]))
+                * sample_rate
+            )
+            if frames.denominator != 1:
+                raise ValueError("audio file duration is not sample-aligned")
+            frame_count = int(frames)
+            format_name = str(payload["format"]["format_name"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("audio file probe metadata is invalid") from exc
+        if sample_rate <= 0 or channels <= 0 or frame_count <= 0:
+            raise ValueError("audio file probe returned an empty stream")
+        return AudioFileProbe(
+            sample_rate_hz=sample_rate,
+            channels=channels,
+            frame_count=frame_count,
+            duration_seconds=frame_count / sample_rate,
+            format_name=format_name,
+        )
+
     @staticmethod
     def _publish_command(command: list[str], destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -437,46 +496,84 @@ class FFmpegAudioMediaBackend:
             source_end_sample,
         )
         if any(value is not None for value in exact_values):
-            if channels != 1:
-                raise ValueError(
-                    "exact sample-index voice extraction is restricted to mono analysis audio"
-                )
             if not all(value is not None for value in exact_values):
                 raise ValueError("exact voice-reference extraction requires all sample inputs")
             assert source_audio_path is not None
             assert source_start_sample is not None
             assert source_end_sample is not None
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            slice_path = destination.with_name(
-                f".{destination.stem}.pcm-slice-{uuid.uuid4().hex}.wav"
+            if channels == 1:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                slice_path = destination.with_name(
+                    f".{destination.stem}.pcm-slice-{uuid.uuid4().hex}.wav"
+                )
+                try:
+                    self._write_pcm16_mono_slice(
+                        source=source_audio_path,
+                        destination=slice_path,
+                        sample_rate_hz=sample_rate_hz,
+                        start_sample=source_start_sample,
+                        end_sample=source_end_sample,
+                    )
+                    self._publish_command(
+                        [
+                            self.ffmpeg,
+                            "-v",
+                            "error",
+                            "-i",
+                            str(slice_path),
+                            "-ar",
+                            str(sample_rate_hz),
+                            "-ac",
+                            "1",
+                            "-c:a",
+                            codec,
+                            "-y",
+                        ],
+                        destination,
+                    )
+                finally:
+                    slice_path.unlink(missing_ok=True)
+                return destination
+            if channels != 2 or sample_rate_hz != 32000 or output_format != "flac":
+                raise ValueError("canonical exact voice extraction requires 32 kHz stereo FLAC")
+            source_probe = self.probe_audio_file(source_audio_path)
+            if (
+                source_probe.sample_rate_hz != sample_rate_hz
+                or source_probe.channels != channels
+                or source_end_sample > source_probe.frame_count
+            ):
+                raise ValueError("canonical voice-reference extent differs from source audio")
+            self._publish_command(
+                [
+                    self.ffmpeg,
+                    "-v",
+                    "error",
+                    "-i",
+                    str(source_audio_path),
+                    "-af",
+                    (
+                        f"atrim=start_sample={source_start_sample}:"
+                        f"end_sample={source_end_sample},asetpts=PTS-STARTPTS"
+                    ),
+                    "-ar",
+                    str(sample_rate_hz),
+                    "-ac",
+                    str(channels),
+                    "-c:a",
+                    codec,
+                    "-y",
+                ],
+                destination,
             )
-            try:
-                self._write_pcm16_mono_slice(
-                    source=source_audio_path,
-                    destination=slice_path,
-                    sample_rate_hz=sample_rate_hz,
-                    start_sample=source_start_sample,
-                    end_sample=source_end_sample,
-                )
-                self._publish_command(
-                    [
-                        self.ffmpeg,
-                        "-v",
-                        "error",
-                        "-i",
-                        str(slice_path),
-                        "-ar",
-                        str(sample_rate_hz),
-                        "-ac",
-                        "1",
-                        "-c:a",
-                        codec,
-                        "-y",
-                    ],
-                    destination,
-                )
-            finally:
-                slice_path.unlink(missing_ok=True)
+            output_probe = self.probe_audio_file(destination)
+            if (
+                output_probe.sample_rate_hz != sample_rate_hz
+                or output_probe.channels != channels
+                or output_probe.frame_count
+                != source_end_sample - source_start_sample
+                or "flac" not in output_probe.format_name.lower()
+            ):
+                raise ValueError("canonical voice-reference output extent is invalid")
             return destination
         self._publish_command(
             [

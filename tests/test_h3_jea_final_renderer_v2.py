@@ -416,6 +416,7 @@ def _write_canonical_sources(
                 target_video_sha256=_sha256(video),
                 target_full_audio_path=str(audio),
                 target_full_audio_sha256=_sha256(audio),
+                frame_count=3200,
                 target_duration_seconds=0.1,
                 subject_reference_count=len(clip.subject_references),
             )
@@ -433,8 +434,10 @@ def _write_canonical_sources(
             )
         )
         results.append(
-            DiarizationClipResult(
-                target_clip_uid=clip_uid,
+                DiarizationClipResult(
+                    target_clip_uid=clip_uid,
+                    source_sample_rate_hz=32000,
+                    source_channels=2,
                 status="ready" if clip_uid in clips_with_segments else "empty",
                 backend_called=True,
                 raw_segment_count=1 if clip_uid in clips_with_segments else 0,
@@ -736,7 +739,11 @@ def _voice(
     )
 
 
-def _render(tmp_path: Path) -> list[dict[str, object]]:
+def _render(
+    tmp_path: Path,
+    *,
+    statuses: dict[str, str] | None = None,
+) -> list[dict[str, object]]:
     inventory = _visual_inventory(tmp_path)
     build_jea_pairs(
         visual_inventory=inventory,
@@ -747,6 +754,7 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
     bound = []
     qwen = []
     for clip in inventory.clips:
+        status = (statuses or {}).get(clip.identity.clip_uid, "transcribed")
         bound.append(
             BoundDiarizationSegment(
                 target_clip_uid=clip.identity.clip_uid,
@@ -756,6 +764,8 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
                 end_time=0.1,
                 source_start_sample=0,
                 source_end_sample=3200,
+                source_sample_rate_hz=32000,
+                source_channels=2,
                 cluster_binding_status="candidate_mapped",
                 entity_id="entity_1",
                 entity_occurrence_id=f"{clip.identity.clip_uid}/entity_1",
@@ -775,11 +785,19 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
                 source_start_sample=0,
                 source_end_sample=3200,
                 source_sample_rate_hz=32000,
+                source_channels=2,
                 start_time=0.0,
                 end_time=0.1,
-                status="transcribed",
-                text=f"raw {clip.identity.clip_uid}",
-                language="en",
+                status=status,
+                text=(
+                    f"raw {clip.identity.clip_uid}"
+                    if status == "transcribed"
+                    else None
+                ),
+                language="en" if status == "transcribed" else None,
+                failure_reason=(
+                    "fixture ASR failure" if status == "failed" else None
+                ),
                 configuration=Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
             )
         )
@@ -810,6 +828,32 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
         .read_text(encoding="utf-8")
         .splitlines()
     ]
+
+
+def test_final_renderer_allows_empty_qwen_row_without_speech(tmp_path: Path) -> None:
+    rows = _render(tmp_path, statuses={"clip-a": "empty"})
+
+    clip_rows = [item for item in rows if item["clip_uid"] == "clip-a"]
+    assert clip_rows
+    assert all(item["speech_segments"] == [] for item in clip_rows)
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [
+        {"clip-a": "failed", "clip-b": "failed"},
+        {"clip-a": "transcribed", "clip-b": "failed"},
+    ],
+)
+def test_final_renderer_rejects_failed_qwen_rows(
+    tmp_path: Path,
+    statuses: dict[str, str],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="final H3 cannot consume failed Qwen3-ASR segments",
+    ):
+        _render(tmp_path, statuses=statuses)
 
 
 def test_final_visual_reference_preserves_canonical_visible_region_values(
@@ -1208,6 +1252,32 @@ def test_final_renderer_projects_canonical_audio_semantics_for_every_variant(
         semantics_root / "assembled/records.jsonl"
     )
 
+    stale_root = tmp_path / "stale-audio-semantics"
+    stale_canonical = canonical[0].model_copy(
+        update={"target_full_audio_sha256": "f" * 64}
+    )
+    _jsonl(
+        stale_root / "assembled/records.jsonl",
+        [
+            _specialized_semantics_record(
+                stale_canonical if item.clip_uid == stale_canonical.clip_uid else item,
+                media_root=tmp_path,
+            )
+            for item in canonical
+        ],
+    )
+    with pytest.raises(ValueError, match="Audio semantics target provenance differs"):
+        render_jea_final_samples(
+            visual_inventory=inventory,
+            audio_root=tmp_path / "audio",
+            pairs_root=tmp_path / "pairs",
+            diarization_root=tmp_path / "diarization",
+            binding_audit_root=tmp_path / "binding_audit_v1",
+            qwen3_asr_root=tmp_path / "asr",
+            output_root=tmp_path / "h3-with-stale-semantics",
+            audio_semantics_root=stale_root,
+        )
+
 
 def test_final_renderer_publishes_all_canonical_clips_with_optional_voice_variants(
     tmp_path: Path,
@@ -1247,6 +1317,8 @@ def test_final_renderer_publishes_all_canonical_clips_with_optional_voice_varian
                 end_time=0.1,
                 source_start_sample=0,
                 source_end_sample=3200,
+                source_sample_rate_hz=32000,
+                source_channels=2,
                 cluster_binding_status="candidate_mapped",
                 entity_id="entity_1",
                 entity_occurrence_id=f"{clip_uid}/entity_1",
@@ -1374,6 +1446,8 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
                 end_time=index * 0.1,
                 source_start_sample=start_sample,
                 source_end_sample=end_sample,
+                source_sample_rate_hz=32000,
+                source_channels=2,
                 cluster_binding_status="candidate_mapped",
                 entity_id=entity_id,
                 entity_occurrence_id=f"clip-a/{entity_id}",
@@ -1393,6 +1467,7 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
                 source_start_sample=start_sample,
                 source_end_sample=end_sample,
                 source_sample_rate_hz=32000,
+                source_channels=2,
                 start_time=(index - 1) * 0.1,
                 end_time=index * 0.1,
                 status="transcribed",
@@ -1486,6 +1561,8 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
                 end_time=index * 0.1,
                 source_start_sample=start_sample,
                 source_end_sample=end_sample,
+                source_sample_rate_hz=32000,
+                source_channels=2,
                 cluster_binding_status=status,
                 entity_id=entity_id,
                 entity_occurrence_id=occurrence_id,

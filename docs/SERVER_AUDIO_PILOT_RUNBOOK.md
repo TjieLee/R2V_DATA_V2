@@ -1632,9 +1632,41 @@ remain only the speech actually found. Specialized Audio semantics is an
 independent canonical-wide target projection and Qwen3-ASR is not its admission
 dependency. Final clip-level Visual/Audio rendering joins exactly on `clip_uid`.
 
-To regenerate only the canonical-wide stages on an existing Audio production
-root, first inspect the model-free plan, then intentionally replace the four
-dependent stages:
+Existing production roots created before the 32 kHz migration contain 16 kHz
+analysis audio, voice references and old sample-domain DiariZen/Qwen3-ASR
+artifacts. Migrate them in this exact order. The commands do not rerun LR-ASD.
+
+Step 1 is a model-free backfill. It decodes 32 kHz stereo FLAC directly from
+the original target videos, probes the persisted FLAC frame extent, and writes
+the current canonical manifest. It never upsamples the old 16 kHz audio:
+
+```bash
+"$R2V_PYTHON" tools/backfill_h3_canonical_audio.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --ffmpeg "$FFMPEG" \
+  --ffprobe "$FFPROBE"
+```
+
+Step 2 regenerates the 32 kHz stereo primary-voice bytes, then their speaker
+embeddings and pair artifacts. It reuses the existing frozen LR-ASD binding
+evidence and does not rerun the Audio stage:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages primary-voice,embedding,pair \
+  --ffmpeg "$FFMPEG" \
+  --ffprobe "$FFPROBE" \
+  --overwrite
+```
+
+Step 3 regenerates every persisted sample-domain stage. Deliberately omit
+`--audio-semantics-root`: the existing `audio_semantics_specialized_v1` was
+bound to old canonical-audio hashes and must not be auto-discovered or rebound.
 
 ```bash
 "$R2V_PYTHON" tools/run_h3_jea_production.py \
@@ -1642,23 +1674,14 @@ dependent stages:
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --stages diarization,binding-audit,qwen3-asr,h3 \
-  --audio-semantics-root \
-    "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1" \
-  --ffprobe "$FFPROBE" \
-  --dry-run
-
-"$R2V_PYTHON" tools/run_h3_jea_production.py \
-  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
-  --visual-runs-root "$VISUAL_RUNS_ROOT" \
-  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --stages diarization,binding-audit,qwen3-asr,h3 \
-  --audio-semantics-root \
-    "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1" \
+  --ffmpeg "$FFMPEG" \
   --ffprobe "$FFPROBE" \
   --overwrite
 ```
 
-This command does not rerun LR-ASD, primary voice, embeddings, pairs, or the
-specialized Audio-semantics models. Issue #11 remains open until the resulting
-canonical base count equals the Visual canonical count and full-clip semantics
-coverage is verified from real server artifacts.
+The temporary Final H3 summary must report missing full-clip semantics coverage;
+that is the expected fail-visible state. After a new MiMo/specialized semantics
+run is generated against the new canonical hashes, pass that fresh root
+explicitly to a separate `--stages h3 --audio-semantics-root ... --overwrite`
+render. A stale semantics directory is ignored when no root is supplied and
+fails provenance validation when supplied explicitly.

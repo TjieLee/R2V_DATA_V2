@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import r2v_data_v2.h3.diarization_voice_consistency_audit as voice_audit
 from r2v_data_v2.h3.audio_backends import EmbeddingResult
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
@@ -28,7 +31,7 @@ from r2v_data_v2.h3.jea_final_renderer import (
     FinalVisualReference,
 )
 
-_SAMPLE_RATE = 16000
+_SAMPLE_RATE = 32000
 _MODEL_HASH = "f" * 64
 
 
@@ -36,15 +39,56 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_wav(path: Path, seconds: float = 3.0) -> None:
-    samples = np.arange(round(seconds * _SAMPLE_RATE), dtype=np.int32)
+def _write_wav(path: Path, *, frames: int, rate: int = 16000) -> None:
+    samples = np.arange(frames, dtype=np.int32)
     pcm = ((samples % 200) - 100).astype("<i2")
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
-        output.setframerate(_SAMPLE_RATE)
+        output.setframerate(rate)
         output.writeframes(pcm.tobytes())
+
+
+def _write_flac_fixture(path: Path) -> None:
+    path.write_bytes(b"fLaC" + b"canonical-32k-stereo-fixture")
+
+
+@pytest.fixture(autouse=True)
+def _fake_media_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        if "-show_entries" in command:
+            assert Path(command[-1]).read_bytes().startswith(b"fLaC")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "streams": [
+                            {
+                                "sample_rate": "32000",
+                                "channels": 2,
+                                "duration_ts": 96000,
+                                "time_base": "1/32000",
+                            }
+                        ],
+                        "format": {"format_name": "flac"},
+                    }
+                ),
+                stderr="",
+            )
+        filter_value = command[command.index("-af") + 1]
+        match = re.fullmatch(
+            r"atrim=start_sample=(\d+):end_sample=(\d+),asetpts=PTS-STARTPTS",
+            filter_value,
+        )
+        assert match is not None
+        start, end = (int(value) for value in match.groups())
+        assert command[command.index("-ar") + 1] == "16000"
+        assert command[command.index("-ac") + 1] == "1"
+        _write_wav(Path(command[-1]), frames=(end - start) // 2)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(voice_audit.subprocess, "run", fake_run)
 
 
 def _raw(
@@ -72,10 +116,14 @@ def _raw(
         source_audio_path=str(source_audio),
         source_audio_sha256=_sha256(source_audio),
         source_sample_rate_hz=_SAMPLE_RATE,
+        source_channels=2,
         backend="fixture_diarizen",
         model_identifier="fixture/diarizen",
         model_fingerprint="a" * 64,
         backend_configuration_fingerprint="b" * 64,
+        input_preprocessing=(
+            "h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1"
+        ),
         boundary_reconciliation=DiarizationBoundaryReconciliation(
             adjusted=False,
             end_clamped=False,
@@ -100,6 +148,8 @@ def _bound(
         end_time=raw.end_time,
         source_start_sample=raw.source_start_sample,
         source_end_sample=raw.source_end_sample,
+        source_sample_rate_hz=raw.source_sample_rate_hz,
+        source_channels=raw.source_channels,
         cluster_binding_status="candidate_mapped",
         entity_id=entity_id,
         entity_occurrence_id=f"{raw.target_clip_uid}/{entity_id}",
@@ -223,9 +273,9 @@ class _FakeSpeakerBackend:
 
 def _fixture(tmp_path: Path) -> tuple[Path, list[Path]]:
     production = tmp_path / "production"
-    source_audio = tmp_path / "source.wav"
+    source_audio = tmp_path / "source.flac"
     voice = tmp_path / "voice.flac"
-    _write_wav(source_audio)
+    _write_flac_fixture(source_audio)
     voice.write_bytes(b"voice-reference")
     raw = [
         _raw(

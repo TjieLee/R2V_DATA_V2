@@ -505,15 +505,6 @@ def export_primary_voice_references(
                     ):
                         raise ValueError("primary voice output path must be safe and relative")
                     voice_path = temporary / relative_voice_path
-                    exact_source = (
-                        {
-                            "source_audio_path": source_audio,
-                            "source_start_sample": start_sample,
-                            "source_end_sample": end_sample,
-                        }
-                        if source_audio_for_clip is None
-                        else {}
-                    )
                     audio_backend.extract_voice_reference(
                         clip_uid=clip_uid,
                         entity_id=entity_id,
@@ -524,7 +515,9 @@ def export_primary_voice_references(
                         sample_rate_hz=output_sample_rate_hz,
                         channels=output_channels,
                         output_format="flac",
-                        **exact_source,
+                        source_audio_path=source_audio,
+                        source_start_sample=start_sample,
+                        source_end_sample=end_sample,
                     )
                     artifact = build_voice_reference_artifact(
                         assessment=chosen,

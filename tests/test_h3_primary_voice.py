@@ -129,10 +129,13 @@ class _SampleSliceBackend:
             source = Path(str(request["source_audio_path"]))
             start = int(request["source_start_sample"])
             end = int(request["source_end_sample"])
-            with wave.open(str(source), "rb") as input_audio:
-                input_audio.setpos(start)
-                frames = input_audio.readframes(end - start)
-            destination.write_bytes(frames)
+            if request.get("channels") == 2:
+                destination.write_bytes(f"stereo:{start}:{end}".encode())
+            else:
+                with wave.open(str(source), "rb") as input_audio:
+                    input_audio.setpos(start)
+                    frames = input_audio.readframes(end - start)
+                destination.write_bytes(frames)
         else:
             destination.write_bytes(Path(str(request["full_audio_path"])).read_bytes())
         return destination
@@ -232,6 +235,7 @@ def _write_jea_canonical(
         target_full_audio_sha256=hashlib.sha256(
             canonical_audio.read_bytes()
         ).hexdigest(),
+        frame_count=128000,
         target_duration_seconds=4.0,
         subject_reference_count=1,
     )
@@ -411,7 +415,8 @@ def test_jea_primary_voice_publishes_unicode_readable_asset_path(
     assert reference["asset"]["path"] == expected.as_posix()
     assert summary.selected_reference_rows[0]["asset_path"] == expected.as_posix()
     assert len(backend.requests) == 1
-    assert "source_start_sample" not in backend.requests[0]
+    assert backend.requests[0]["source_start_sample"] == 0
+    assert backend.requests[0]["source_end_sample"] == 32000
     assert backend.requests[0]["sample_rate_hz"] == 32000
     assert backend.requests[0]["channels"] == 2
     assert Path(str(backend.requests[0]["full_audio_path"])) == Path(
@@ -497,14 +502,14 @@ def test_ffmpeg_backend_slices_exact_pcm_samples_before_flac_encoding(
     assert not list(tmp_path.glob("*.pcm-slice-*.wav"))
 
 
-def test_ffmpeg_backend_h3_voice_uses_time_and_native_stereo_audio(
+def test_ffmpeg_backend_h3_voice_uses_exact_samples_and_native_stereo_audio(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "h3-full-audio.flac"
     source.write_bytes(b"32-khz-stereo-source")
     destination = tmp_path / "h3-voice.flac"
-    backend = FFmpegAudioMediaBackend(ffmpeg="fake-ffmpeg")
+    backend = FFmpegAudioMediaBackend(ffmpeg="fake-ffmpeg", ffprobe="fake-ffprobe")
     captured: list[str] = []
 
     def fake_publish(command: list[str], output: Path) -> None:
@@ -512,6 +517,17 @@ def test_ffmpeg_backend_h3_voice_uses_time_and_native_stereo_audio(
         output.write_bytes(b"32-khz-stereo-voice")
 
     monkeypatch.setattr(backend, "_publish_command", fake_publish)
+    monkeypatch.setattr(
+        backend,
+        "probe_audio_file",
+        lambda path: SimpleNamespace(
+            sample_rate_hz=32000,
+            channels=2,
+            frame_count=64000 if path == source else 48000,
+            duration_seconds=2.0 if path == source else 1.5,
+            format_name="flac",
+        ),
+    )
 
     backend.extract_voice_reference(
         clip_uid="clip-a",
@@ -523,26 +539,17 @@ def test_ffmpeg_backend_h3_voice_uses_time_and_native_stereo_audio(
         sample_rate_hz=32000,
         channels=2,
         output_format="flac",
+        source_audio_path=source,
+        source_start_sample=8000,
+        source_end_sample=56000,
     )
 
     assert captured[captured.index("-i") + 1] == str(source)
-    assert captured[captured.index("-ss") + 1] == "0.250000000"
-    assert captured[captured.index("-to") + 1] == "1.750000000"
+    assert "-ss" not in captured
+    assert "-to" not in captured
+    assert captured[captured.index("-af") + 1] == (
+        "atrim=start_sample=8000:end_sample=56000,asetpts=PTS-STARTPTS"
+    )
     assert captured[captured.index("-ar") + 1] == "32000"
     assert captured[captured.index("-ac") + 1] == "2"
-
-    with pytest.raises(ValueError, match="restricted to mono analysis audio"):
-        backend.extract_voice_reference(
-            clip_uid="clip-a",
-            entity_id="e1",
-            full_audio_path=source,
-            start_time=0.25,
-            end_time=1.75,
-            destination=destination,
-            sample_rate_hz=32000,
-            channels=2,
-            output_format="flac",
-            source_audio_path=source,
-            source_start_sample=4000,
-            source_end_sample=28000,
-        )
+    assert destination.read_bytes() == b"32-khz-stereo-voice"

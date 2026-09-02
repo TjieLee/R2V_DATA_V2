@@ -89,7 +89,7 @@ positive overrun was 0.0205 seconds and maximum was 0.0525 seconds / 840
 samples. No additional numeric mapping threshold is justified by this accepted
 calibration.
 
-Summary schema v3 distinguishes:
+Summary schema v4 distinguishes:
 
 - `mapped_direct_anchor_speaker_seconds`: mapped-cluster duration directly
   supported by usable LR-ASD/Visual identity evidence;
@@ -104,26 +104,30 @@ unioned speaker time, not a naive sum over overlapping segments.
 
 ## Versioned Artifacts
 
-- `r2v.h3.diarization_inventory.3` for active canonical-wide JEA production
-- `r2v.h3.diarization_inventory.2` for the retained legacy pair/pilot path
-- `r2v.h3.diarization_segment.2`
-- `r2v.h3.diarization_cluster_binding.2`
-- `r2v.h3.diarization_bound_segment.1`
-- `r2v.h3.diarization_clip_result.1`
-- `r2v.h3.diarization_summary.3`
+- `r2v.h3.diarization_inventory.4`
+- `r2v.h3.diarization_segment.3`
+- `r2v.h3.diarization_cluster_binding.3`
+- `r2v.h3.diarization_bound_segment.2`
+- `r2v.h3.diarization_clip_result.2`
+- `r2v.h3.diarization_summary.4`
 - `r2v.h3.diarization_human_qa.1`
 
 `speaker_cluster_id` is always clip-local. The stage performs no cross-clip or
 transitive speaker clustering. Raw segments use integer half-open source sample
 ranges and retain overlapping speakers.
 
-Active JEA production roots the `.3` inventory in the exact canonical Visual
+Active JEA production roots the `.4` inventory in the exact canonical Visual
 inventory and `audio/canonical_clips.jsonl`, not in pairs. Every canonical clip
 is a target, and its actual 32 kHz stereo canonical FLAC extent is established
 by ffprobe. The DiariZen worker derives a temporary 16 kHz mono analysis view
-under `h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1`; it does not
-publish a second canonical audio artifact. Persisted source sample coordinates
-remain in the 32 kHz canonical domain. An Audio binding sidecar is optional
+under
+`h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1`; it does not publish
+a second canonical audio artifact. Persisted source sample coordinates remain
+in the 32 kHz canonical domain. The retained pair-rooted tool explicitly uses
+`h3_diarizen_native_16k_mono_passthrough_v1` for its legacy 16 kHz mono inputs;
+it does not resample them. The profile, source sample rate, and channel count
+are persisted so one schema version never silently reinterprets sample-domain
+integers. An Audio binding sidecar is optional
 evidence: a missing or non-ready sidecar supplies no frozen anchors, so
 resulting clusters remain unbound rather than dropping the clip. Empty DiariZen
 output is a valid empty clip result; backend failure remains distinct and

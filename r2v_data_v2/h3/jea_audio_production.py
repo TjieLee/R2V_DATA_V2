@@ -58,16 +58,13 @@ from r2v_data_v2.h3.visual_production_source import (
 )
 
 JEA_PAIR_SCHEMA_VERSION = "r2v.h3.jea_pairs.2"
-CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.2"
-CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.2"
+CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.3"
+CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.3"
 CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS = 0.10
 CANONICAL_AUDIO_SAMPLE_RATE_HZ = 32000
 CANONICAL_AUDIO_CHANNELS = 2
 ANALYSIS_AUDIO_SAMPLE_RATE_HZ = 16000
 ANALYSIS_AUDIO_CHANNELS = 1
-AUDIO_ANALYSIS_RESAMPLE_POLICY = (
-    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
-)
 VOICE_SAMPLE_MAPPING_POLICY = "round_time_seconds_times_32000_v1"
 
 
@@ -84,7 +81,7 @@ class JEAProductionPaths:
 
 
 class CanonicalAudioClip(SchemaModel):
-    schema_version: Literal["r2v.h3.canonical_audio_clip.2"] = (
+    schema_version: Literal["r2v.h3.canonical_audio_clip.3"] = (
         CANONICAL_AUDIO_CLIP_VERSION
     )
     clip_uid: str
@@ -103,6 +100,7 @@ class CanonicalAudioClip(SchemaModel):
     audio_source: Literal["original_target_video_audio_stream"] = (
         "original_target_video_audio_stream"
     )
+    frame_count: int = Field(gt=0)
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
     subject_reference_count: int = Field(ge=0)
     target_audio_binding_path: str | None = None
@@ -113,6 +111,11 @@ class CanonicalAudioClip(SchemaModel):
 
     @model_validator(mode="after")
     def validate_binding(self) -> CanonicalAudioClip:
+        expected_duration = self.frame_count / self.sample_rate_hz
+        if abs(self.target_duration_seconds - expected_duration) > 1e-12:
+            raise ValueError(
+                "canonical audio duration must equal its persisted sample extent"
+            )
         if (self.target_audio_binding_path is None) != (
             self.target_audio_binding_sha256 is None
         ):
@@ -123,11 +126,11 @@ class CanonicalAudioClip(SchemaModel):
 
 
 class CanonicalAudioClipSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.canonical_audio_clip_summary.2"] = (
+    schema_version: Literal["r2v.h3.canonical_audio_clip_summary.3"] = (
         CANONICAL_AUDIO_CLIP_SUMMARY_VERSION
     )
     canonical_audio_clip_schema_version: Literal[
-        "r2v.h3.canonical_audio_clip.2"
+        "r2v.h3.canonical_audio_clip.3"
     ] = CANONICAL_AUDIO_CLIP_VERSION
     visual_canonical_clip_count: int = Field(gt=0)
     canonical_audio_clip_count: int = Field(gt=0)
@@ -147,12 +150,53 @@ class CanonicalAudioClipSummary(SchemaModel):
 class _CanonicalAudioClipV1(SchemaModel):
     schema_version: Literal["r2v.h3.canonical_audio_clip.1"]
     clip_uid: str
+    clip_display_path: str
+    media_collection_relpath: str
+    media_collection_name: str
+    episode_name: str
+    clip_name: str
+    shard_id: str
+    target_video_path: str
+    target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_full_audio_path: str
     target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    subject_reference_count: int = Field(ge=0)
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
-CanonicalAudioClipExisting = CanonicalAudioClip | _CanonicalAudioClipV1
+class _CanonicalAudioClipV2(SchemaModel):
+    schema_version: Literal["r2v.h3.canonical_audio_clip.2"]
+    clip_uid: str
+    clip_display_path: str
+    media_collection_relpath: str
+    media_collection_name: str
+    episode_name: str
+    clip_name: str
+    shard_id: str
+    target_video_path: str
+    target_video_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_full_audio_path: str
+    target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sample_rate_hz: Literal[32000]
+    channels: Literal[2]
+    audio_source: Literal["original_target_video_audio_stream"]
+    target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    subject_reference_count: int = Field(ge=0)
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
+CanonicalAudioClipExisting = (
+    CanonicalAudioClip | _CanonicalAudioClipV2 | _CanonicalAudioClipV1
+)
 
 
 def jea_production_paths(audio_production_root: Path) -> JEAProductionPaths:
@@ -262,6 +306,7 @@ def _publish_canonical_audio_manifest(
     *,
     visual_inventory: VisualProductionInventory,
     audio_root: Path,
+    audio_backend: AudioMediaBackend,
     materialized_by_clip: dict[str, MaterializedMedia],
     duration_resolver: Callable[[VisualProductionClip], float] | None = None,
 ) -> CanonicalAudioClipSummary:
@@ -278,6 +323,8 @@ def _publish_canonical_audio_manifest(
                 record: CanonicalAudioClipExisting = CanonicalAudioClip.model_validate(
                     payload
                 )
+            elif version == "r2v.h3.canonical_audio_clip.2":
+                record = _CanonicalAudioClipV2.model_validate(payload)
             elif version == "r2v.h3.canonical_audio_clip.1":
                 record = _CanonicalAudioClipV1.model_validate(payload)
             else:
@@ -292,26 +339,46 @@ def _publish_canonical_audio_manifest(
         audio_path = full_audio_path(destination, item.identity).resolve(strict=True)
         if not audio_path.is_file():
             raise FileNotFoundError(f"canonical full audio is missing: {audio_path}")
+        probe = audio_backend.probe_audio_file(audio_path)
+        if (
+            probe.sample_rate_hz != CANONICAL_AUDIO_SAMPLE_RATE_HZ
+            or probe.channels != CANONICAL_AUDIO_CHANNELS
+            or "flac" not in probe.format_name.lower()
+        ):
+            raise ValueError("persisted canonical audio must be 32 kHz stereo FLAC")
         binding_path, binding_hash, binding_duration = _canonical_binding(
             destination,
             item,
         )
         media = materialized_by_clip.get(clip_uid)
         existing = existing_by_clip.get(clip_uid)
-        if media is not None:
-            duration = media.stream.duration_seconds
-        elif (
-            existing is not None
-            and existing.target_full_audio_path == str(audio_path)
-            and existing.target_full_audio_sha256 == _sha256_file(audio_path)
+        source_duration = (
+            media.stream.duration_seconds
+            if media is not None
+            else (
+                binding_duration
+                if binding_duration is not None
+                else (
+                    float(duration_resolver(item))
+                    if duration_resolver is not None
+                    and not isinstance(existing, CanonicalAudioClip)
+                    else None
+                )
+            )
+        )
+        if source_duration is not None and (
+            abs(source_duration - probe.duration_seconds)
+            > CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS
         ):
-            duration = existing.target_duration_seconds
-        elif binding_duration is not None:
-            duration = binding_duration
-        elif duration_resolver is not None:
-            duration = float(duration_resolver(item))
-        else:
-            raise ValueError("cannot establish existing canonical-audio duration")
+            raise ValueError("source and canonical full-audio timelines differ")
+        audio_hash = _sha256_file(audio_path)
+        if media is None and isinstance(existing, CanonicalAudioClip) and (
+            existing.target_full_audio_path != str(audio_path)
+            or existing.target_full_audio_sha256 != audio_hash
+            or existing.frame_count != probe.frame_count
+            or abs(existing.target_duration_seconds - probe.duration_seconds) > 1e-12
+        ):
+            raise ValueError("reused canonical audio differs from its current manifest")
         identity = item.identity
         records.append(
             CanonicalAudioClip(
@@ -325,8 +392,9 @@ def _publish_canonical_audio_manifest(
                 target_video_path=str(video_path),
                 target_video_sha256=_sha256_file(video_path),
                 target_full_audio_path=str(audio_path),
-                target_full_audio_sha256=_sha256_file(audio_path),
-                target_duration_seconds=duration,
+                target_full_audio_sha256=audio_hash,
+                frame_count=probe.frame_count,
+                target_duration_seconds=probe.duration_seconds,
                 subject_reference_count=len(item.subject_references),
                 target_audio_binding_path=binding_path,
                 target_audio_binding_sha256=binding_hash,
@@ -406,6 +474,7 @@ def materialize_canonical_audio_clips(
     return _publish_canonical_audio_manifest(
         visual_inventory=visual_inventory,
         audio_root=destination,
+        audio_backend=audio_backend,
         materialized_by_clip=materialized,
         duration_resolver=duration_resolver,
     )
@@ -914,8 +983,8 @@ def build_jea_diarization_inventory(
             raise ValueError("canonical full-audio hash differs from manifest")
         timeline = _probe_canonical_audio(source_audio, ffprobe=ffprobe)
         if (
-            abs(timeline.duration_seconds - record.target_duration_seconds)
-            > CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS
+            timeline.frame_count != record.frame_count
+            or abs(timeline.duration_seconds - record.target_duration_seconds) > 1e-12
         ):
             raise ValueError("canonical full-audio timeline differs from manifest")
         sidecar_path: Path | None = None

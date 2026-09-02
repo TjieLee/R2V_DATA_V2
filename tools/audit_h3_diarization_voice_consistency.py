@@ -40,6 +40,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cuda-visible-devices")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -121,6 +123,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 speaker_backend=backend,
                 output_root=output_root,
                 overwrite=arguments.overwrite,
+                ffmpeg=arguments.ffmpeg,
+                ffprobe=arguments.ffprobe,
             )
     finally:
         if diagnostics.exists():

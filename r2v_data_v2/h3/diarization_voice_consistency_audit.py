@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import shutil
+import subprocess
 import uuid
 import wave
 from collections import Counter
@@ -15,11 +16,10 @@ from typing import Literal
 import numpy as np
 from pydantic import Field, model_validator
 
-from r2v_data_v2.h3.asr_transcription import (
-    ASRTranscriptionFailure,
-    prepare_exact_asr_waveform,
+from r2v_data_v2.h3.audio_backends import (
+    FFmpegAudioMediaBackend,
+    SpeakerEmbeddingBackend,
 )
-from r2v_data_v2.h3.audio_backends import SpeakerEmbeddingBackend
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     RawDiarizationSegment,
@@ -28,13 +28,16 @@ from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
 from r2v_data_v2.h3.schemas import SchemaModel
 
-VOICE_CONSISTENCY_AUDIT_VERSION = "r2v.h3.diarization_voice_consistency.1"
+VOICE_CONSISTENCY_AUDIT_VERSION = "r2v.h3.diarization_voice_consistency.2"
 VOICE_CONSISTENCY_SKIP_VERSION = "r2v.h3.diarization_voice_consistency_skip.1"
 VOICE_CONSISTENCY_SUMMARY_VERSION = (
-    "r2v.h3.diarization_voice_consistency_summary.1"
+    "r2v.h3.diarization_voice_consistency_summary.2"
 )
 DEFAULT_OUTPUT_DIRECTORY = "diarization_voice_consistency_audit_v1"
 SPEAKER_MODEL_IDENTIFIER = "speechbrain/spkrec-ecapa-voxceleb"
+VOICE_CONSISTENCY_INPUT_PREPROCESSING = (
+    "h3_voice_consistency_ffmpeg_atrim_32k_stereo_to_16k_mono_v1"
+)
 
 IdentityScope = Literal["direct_anchor_present", "cluster_propagated_only"]
 DurationBucket = Literal["<0.75s", "0.75-1.0s", "1.0-2.0s", ">=2.0s"]
@@ -47,7 +50,7 @@ ReviewSelection = Literal[
 
 
 class VoiceConsistencyAuditRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_voice_consistency.1"] = (
+    schema_version: Literal["r2v.h3.diarization_voice_consistency.2"] = (
         VOICE_CONSISTENCY_AUDIT_VERSION
     )
     clip_uid: str
@@ -65,7 +68,13 @@ class VoiceConsistencyAuditRecord(SchemaModel):
     source_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_start_sample: int = Field(ge=0)
     source_end_sample: int = Field(gt=0)
-    source_sample_rate_hz: int = Field(gt=0)
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
+    model_input_sample_rate_hz: Literal[16000] = 16000
+    model_input_channels: Literal[1] = 1
+    input_preprocessing: Literal[
+        "h3_voice_consistency_ffmpeg_atrim_32k_stereo_to_16k_mono_v1"
+    ] = VOICE_CONSISTENCY_INPUT_PREPROCESSING
     segment_audio_path: str
     segment_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     primary_voice_reference_path: str
@@ -156,7 +165,7 @@ class VoiceConsistencyReviewCandidate(VoiceConsistencyAuditRecord):
 
 class VoiceConsistencyAuditSummary(SchemaModel):
     schema_version: Literal[
-        "r2v.h3.diarization_voice_consistency_summary.1"
+        "r2v.h3.diarization_voice_consistency_summary.2"
     ] = VOICE_CONSISTENCY_SUMMARY_VERSION
     source_audio_production_root: str
     source_artifact_sha256: dict[str, str]
@@ -177,6 +186,13 @@ class VoiceConsistencyAuditSummary(SchemaModel):
     primary_voice_embedding_call_count: int = Field(ge=0)
     segment_embedding_call_count: int = Field(ge=0)
     model_call_count: int = Field(ge=0)
+    source_sample_rate_hz: Literal[32000] = 32000
+    source_channels: Literal[2] = 2
+    model_input_sample_rate_hz: Literal[16000] = 16000
+    model_input_channels: Literal[1] = 1
+    input_preprocessing: Literal[
+        "h3_voice_consistency_ffmpeg_atrim_32k_stereo_to_16k_mono_v1"
+    ] = VOICE_CONSISTENCY_INPUT_PREPROCESSING
     similarity_distributions: dict[IdentityScope, SimilarityDistribution]
     duration_bucket_distributions: dict[
         IdentityScope,
@@ -203,16 +219,6 @@ class VoiceConsistencyAuditSummary(SchemaModel):
         ):
             raise ValueError("voice-consistency model-call counts do not reconcile")
         return self
-
-
-@dataclass(frozen=True)
-class _ExactSegmentAudioJob:
-    source_audio_path: str
-    source_audio_sha256: str
-    source_sample_rate_hz: int
-    source_channels: int
-    source_start_sample: int
-    source_end_sample: int
 
 
 @dataclass(frozen=True)
@@ -339,37 +345,54 @@ def similarity_distribution(values: Sequence[float]) -> SimilarityDistribution:
     )
 
 
-def _source_channels(raw: RawDiarizationSegment) -> int:
-    path = Path(raw.source_audio_path).expanduser().resolve(strict=True)
+def _prepare_voice_consistency_segment(
+    raw: RawDiarizationSegment,
+    destination: Path,
+    *,
+    ffmpeg: str,
+) -> None:
+    if raw.source_sample_rate_hz != 32000 or raw.source_channels != 2:
+        raise ValueError("voice-consistency source must be canonical 32 kHz stereo")
+    source = Path(raw.source_audio_path).expanduser().resolve(strict=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-i",
+            str(source),
+            "-af",
+            (
+                f"atrim=start_sample={raw.source_start_sample}:"
+                f"end_sample={raw.source_end_sample},asetpts=PTS-STARTPTS"
+            ),
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_s16le",
+            "-y",
+            str(destination),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise ValueError("voice-consistency ffmpeg segment preparation failed")
     try:
-        with wave.open(str(path), "rb") as source:
+        with wave.open(str(destination), "rb") as prepared:
             if (
-                source.getsampwidth() != 2
-                or source.getcomptype() != "NONE"
-                or source.getframerate() != raw.source_sample_rate_hz
+                prepared.getframerate() != 16000
+                or prepared.getnchannels() != 1
+                or prepared.getsampwidth() != 2
+                or prepared.getcomptype() != "NONE"
+                or prepared.getnframes() <= 0
             ):
-                raise ValueError(
-                    "voice-consistency source must be matching PCM16 WAV"
-                )
-            if raw.source_end_sample > source.getnframes():
-                raise ValueError("voice-consistency segment exceeds source audio")
-            return source.getnchannels()
+                raise ValueError("voice-consistency model input is not 16 kHz mono PCM")
     except (OSError, EOFError, wave.Error) as exc:
-        raise ValueError("voice-consistency source audio is unreadable") from exc
-
-
-def _write_pcm16_wav(path: Path, waveform: np.ndarray) -> None:
-    samples = np.clip(
-        np.rint(np.asarray(waveform, dtype=np.float64) * 32768.0),
-        -32768,
-        32767,
-    ).astype("<i2")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), "wb") as destination:
-        destination.setnchannels(1)
-        destination.setsampwidth(2)
-        destination.setframerate(16000)
-        destination.writeframes(samples.tobytes())
+        raise ValueError("voice-consistency model input is unreadable") from exc
 
 
 def _load_target_voices(
@@ -519,6 +542,8 @@ def run_diarization_voice_consistency_audit(
     speaker_backend: SpeakerEmbeddingBackend,
     output_root: Path | None = None,
     overwrite: bool = False,
+    ffmpeg: str = "ffmpeg",
+    ffprobe: str = "ffprobe",
 ) -> VoiceConsistencyAuditSummary:
     paths = jea_production_paths(audio_production_root)
     production_root = paths.root.resolve(strict=True)
@@ -547,6 +572,8 @@ def run_diarization_voice_consistency_audit(
     raw_by_key = _validate_segment_inputs(raw_segments, bound_segments)
     target_voices, primary_voice_hashes = _load_target_voices(samples)
     source_audio_hashes: dict[str, str] = {}
+    source_audio_frame_counts: dict[str, int] = {}
+    media_backend = FFmpegAudioMediaBackend(ffmpeg=ffmpeg, ffprobe=ffprobe)
     for raw in raw_segments:
         source_path = Path(raw.source_audio_path).expanduser().resolve(strict=True)
         source_sha = _sha256_file(source_path)
@@ -555,6 +582,22 @@ def run_diarization_voice_consistency_audit(
         previous = source_audio_hashes.setdefault(str(source_path), source_sha)
         if previous != source_sha:
             raise ValueError("raw diarization source audio changed during inventory")
+        if raw.source_sample_rate_hz != 32000 or raw.source_channels != 2:
+            raise ValueError("voice-consistency source must be canonical 32 kHz stereo")
+        source_key = str(source_path)
+        if source_key not in source_audio_frame_counts:
+            probe = media_backend.probe_audio_file(source_path)
+            if (
+                probe.sample_rate_hz != 32000
+                or probe.channels != 2
+                or "flac" not in probe.format_name.lower()
+            ):
+                raise ValueError(
+                    "voice-consistency source must be persisted 32 kHz stereo FLAC"
+                )
+            source_audio_frame_counts[source_key] = probe.frame_count
+        if raw.source_end_sample > source_audio_frame_counts[source_key]:
+            raise ValueError("voice-consistency segment exceeds source audio")
 
     destination = (
         output_root.expanduser().resolve(strict=False)
@@ -634,20 +677,12 @@ def run_diarization_voice_consistency_audit(
             )
             segment_path = temporary / segment_relative
             try:
-                channels = _source_channels(raw)
-                prepared = prepare_exact_asr_waveform(
-                    _ExactSegmentAudioJob(
-                        source_audio_path=raw.source_audio_path,
-                        source_audio_sha256=raw.source_audio_sha256,
-                        source_sample_rate_hz=raw.source_sample_rate_hz,
-                        source_channels=channels,
-                        source_start_sample=raw.source_start_sample,
-                        source_end_sample=raw.source_end_sample,
-                    ),
-                    unit_label="segment",
+                _prepare_voice_consistency_segment(
+                    raw,
+                    segment_path,
+                    ffmpeg=ffmpeg,
                 )
-                _write_pcm16_wav(segment_path, prepared.waveform)
-            except (ASRTranscriptionFailure, OSError, ValueError) as exc:
+            except (OSError, ValueError) as exc:
                 skipped.append(
                     VoiceConsistencySkippedRecord(
                         clip_uid=bound.target_clip_uid,
@@ -707,6 +742,7 @@ def run_diarization_voice_consistency_audit(
                     source_start_sample=raw.source_start_sample,
                     source_end_sample=raw.source_end_sample,
                     source_sample_rate_hz=raw.source_sample_rate_hz,
+                    source_channels=raw.source_channels,
                     segment_audio_path=str(segment_relative.as_posix()),
                     segment_audio_sha256=_sha256_file(segment_path),
                     primary_voice_reference_path=str(target_voice.path),

@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 def _fingerprint_local_path(path: Path) -> str:
@@ -41,6 +41,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-identifier", required=True)
     parser.add_argument("--model-fingerprint", required=True)
     parser.add_argument("--device", required=True)
+    parser.add_argument(
+        "--input-profile",
+        choices=("canonical_32k_stereo", "legacy_16k_mono"),
+        required=True,
+    )
     return parser
 
 
@@ -52,9 +57,12 @@ def _emit(value: dict[str, object]) -> None:
     sys.stdout.flush()
 
 
-_ANALYSIS_RESAMPLE_POLICY = (
-    "h3_audio_analysis_resample_32k_stereo_to_16k_mono_v1"
+_CANONICAL_RESAMPLE_POLICY = (
+    "h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1"
 )
+_LEGACY_PASSTHROUGH_POLICY = "h3_diarizen_native_16k_mono_passthrough_v1"
+
+InputProfile = Literal["canonical_32k_stereo", "legacy_16k_mono"]
 
 
 def _prepare_analysis_audio(
@@ -63,12 +71,19 @@ def _prepare_analysis_audio(
     destination: Path,
     torch: Any,
     torchaudio: Any,
-) -> None:
+    input_profile: InputProfile = "canonical_32k_stereo",
+) -> Path:
     waveform, sample_rate = torchaudio.load(str(source))
-    if waveform.ndim != 2 or waveform.shape[0] != 2 or sample_rate != 32000:
+    if waveform.ndim != 2 or waveform.shape[1] <= 0:
+        raise ValueError("DiariZen source must be channel-first non-empty audio")
+    if not torch.isfinite(waveform).all().item():
+        raise ValueError("DiariZen source must contain only finite samples")
+    if input_profile == "legacy_16k_mono":
+        if waveform.shape[0] != 1 or sample_rate != 16000:
+            raise ValueError("legacy DiariZen source must be 16 kHz mono")
+        return source
+    if waveform.shape[0] != 2 or sample_rate != 32000:
         raise ValueError("DiariZen canonical source must be 32 kHz stereo")
-    if waveform.shape[1] <= 0 or not torch.isfinite(waveform).all().item():
-        raise ValueError("DiariZen canonical source must be finite and non-empty")
     mono = waveform.mean(dim=0, keepdim=True)
     analysis = torchaudio.functional.resample(
         mono,
@@ -87,6 +102,7 @@ def _prepare_analysis_audio(
         encoding="PCM_S",
         bits_per_sample=16,
     )
+    return destination
 
 
 def _load_pipeline(arguments: argparse.Namespace) -> tuple[object, object, object, object]:
@@ -168,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("unsupported DiariZen worker operation")
             if request.get("model_identifier") != arguments.model_identifier:
                 raise ValueError("DiariZen request model identifier mismatch")
+            if request.get("input_profile") != arguments.input_profile:
+                raise ValueError("DiariZen request input profile mismatch")
             clip_uid = str(request.get("clip_uid") or "")
             audio_path = (
                 Path(str(request.get("audio_path") or ""))
@@ -178,14 +196,15 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("DiariZen request media is invalid")
             with tempfile.TemporaryDirectory(prefix="h3-diarizen-analysis-") as work:
                 analysis_path = Path(work) / "analysis_16k_mono.wav"
-                _prepare_analysis_audio(
+                model_audio_path = _prepare_analysis_audio(
                     source=audio_path,
                     destination=analysis_path,
                     torch=torch,
                     torchaudio=torchaudio,
+                    input_profile=arguments.input_profile,
                 )
                 with contextlib.redirect_stdout(sys.stderr):
-                    result = pipeline(str(analysis_path), sess_name=clip_uid)
+                    result = pipeline(str(model_audio_path), sess_name=clip_uid)
             segments = [
                 {
                     "start_time": float(turn.start),
@@ -210,11 +229,22 @@ def main(argv: list[str] | None = None) -> int:
                     "backend_metadata": {
                         "backend": "diarizen_official_pipeline",
                         "device": str(device),
+                        "input_profile": arguments.input_profile,
                         "input_preprocessing": (
-                            _ANALYSIS_RESAMPLE_POLICY
+                            _CANONICAL_RESAMPLE_POLICY
+                            if arguments.input_profile == "canonical_32k_stereo"
+                            else _LEGACY_PASSTHROUGH_POLICY
                         ),
-                        "source_sample_rate_hz": 32000,
-                        "source_channels": 2,
+                        "source_sample_rate_hz": (
+                            32000
+                            if arguments.input_profile == "canonical_32k_stereo"
+                            else 16000
+                        ),
+                        "source_channels": (
+                            2
+                            if arguments.input_profile == "canonical_32k_stereo"
+                            else 1
+                        ),
                         "model_input_sample_rate_hz": 16000,
                         "model_input_channels": 1,
                     },
