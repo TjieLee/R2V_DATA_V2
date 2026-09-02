@@ -18,8 +18,8 @@ from r2v_data_v2.h3.schemas import SchemaModel
 
 QWEN3_ASR_MODEL_IDENTIFIER = "Qwen/Qwen3-ASR-1.7B"
 QWEN3_ASR_SEGMENT_VERSION = "r2v.h3.qwen3_asr_segment.1"
-QWEN3_ASR_INVENTORY_VERSION = "r2v.h3.qwen3_asr_inventory.1"
-QWEN3_ASR_SUMMARY_VERSION = "r2v.h3.qwen3_asr_summary.1"
+QWEN3_ASR_INVENTORY_VERSION = "r2v.h3.qwen3_asr_inventory.2"
+QWEN3_ASR_SUMMARY_VERSION = "r2v.h3.qwen3_asr_summary.2"
 
 
 class Qwen3ASRConfiguration(SchemaModel):
@@ -111,25 +111,49 @@ class Qwen3ASRSegment(SchemaModel):
 
 
 class Qwen3ASRInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.qwen3_asr_inventory.1"] = (
+    schema_version: Literal[
+        "r2v.h3.qwen3_asr_inventory.1",
+        "r2v.h3.qwen3_asr_inventory.2",
+    ] = (
         QWEN3_ASR_INVENTORY_VERSION
     )
     source_diarization_root: str
     source_visual_production_root: str
     segment_count: int = Field(ge=0)
     clip_count: int = Field(ge=0)
+    source_target_clip_count: int = Field(default=0, ge=0)
+    clips_with_diarization_segments: int = Field(default=0, ge=0)
+    clips_without_diarization_segments: int = Field(default=0, ge=0)
     model_identifier: Literal["Qwen/Qwen3-ASR-1.7B"] = QWEN3_ASR_MODEL_IDENTIFIER
     package: Literal["qwen-asr==0.0.6"] = "qwen-asr==0.0.6"
     configuration: Qwen3ASRConfiguration
 
+    @model_validator(mode="after")
+    def validate_target_coverage(self) -> Qwen3ASRInventory:
+        if self.schema_version == QWEN3_ASR_INVENTORY_VERSION:
+            if self.source_target_clip_count != (
+                self.clips_with_diarization_segments
+                + self.clips_without_diarization_segments
+            ):
+                raise ValueError("Qwen3 ASR inventory target coverage must reconcile")
+            if self.clip_count != self.clips_with_diarization_segments:
+                raise ValueError("Qwen3 ASR inventory clip count differs from coverage")
+        return self
+
 
 class Qwen3ASRSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.qwen3_asr_summary.1"] = QWEN3_ASR_SUMMARY_VERSION
+    schema_version: Literal[
+        "r2v.h3.qwen3_asr_summary.1",
+        "r2v.h3.qwen3_asr_summary.2",
+    ] = QWEN3_ASR_SUMMARY_VERSION
     segment_count: int = Field(ge=0)
     transcribed_count: int = Field(ge=0)
     empty_count: int = Field(ge=0)
     failed_count: int = Field(ge=0)
     clip_count: int = Field(ge=0)
+    source_target_clip_count: int = Field(default=0, ge=0)
+    clips_with_diarization_segments: int = Field(default=0, ge=0)
+    clips_without_diarization_segments: int = Field(default=0, ge=0)
     model_identifier: Literal["Qwen/Qwen3-ASR-1.7B"] = QWEN3_ASR_MODEL_IDENTIFIER
     package: Literal["qwen-asr==0.0.6"] = "qwen-asr==0.0.6"
     language_counts: dict[str, int]
@@ -145,7 +169,36 @@ class Qwen3ASRSummary(SchemaModel):
             self.transcribed_count + self.empty_count + self.failed_count
         ):
             raise ValueError("Qwen3 ASR summary counts must reconcile")
+        if self.schema_version == QWEN3_ASR_SUMMARY_VERSION:
+            if self.source_target_clip_count != (
+                self.clips_with_diarization_segments
+                + self.clips_without_diarization_segments
+            ):
+                raise ValueError("Qwen3 ASR target coverage counts must reconcile")
+            if self.clip_count != self.clips_with_diarization_segments:
+                raise ValueError("Qwen3 ASR segment clip count differs from coverage")
         return self
+
+
+class _ReadableDiarizationTarget(SchemaModel):
+    schema_version: Literal["r2v.h3.jea_diarization_target.1"] = (
+        "r2v.h3.jea_diarization_target.1"
+    )
+    clip_uid: str
+    clip_display_path: str
+    media_collection_relpath: str
+    media_collection_name: str
+    episode_name: str
+    clip_name: str
+    shard_id: str
+    source_audio_path: str
+    source_sample_rate_hz: int = Field(gt=0)
+    target_video_path: str
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class _ReadableDiarizationSegment(SchemaModel):
@@ -406,6 +459,7 @@ def _review_html(rows: Sequence[Qwen3ASRSegment]) -> str:
 @dataclass(frozen=True)
 class _Inputs:
     readable_segments: list[_ReadableDiarizationSegment]
+    target_clip_ids: list[str]
 
 
 def _index_by_key(
@@ -440,6 +494,15 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
         _ReadableDiarizationSegment.model_validate(row)
         for row in _read_rows(root / "readable_segments.jsonl")
     ]
+    targets_path = root / "readable_targets.jsonl"
+    targets = (
+        [
+            _ReadableDiarizationTarget.model_validate(row)
+            for row in _read_rows(targets_path)
+        ]
+        if targets_path.is_file()
+        else []
+    )
     raw = [
         _RawSegmentProvenance.model_validate(row)
         for row in _read_rows(root / "raw_segments.jsonl")
@@ -450,6 +513,17 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
     ]
     if readable_summary.segment_count != len(readable):
         raise ValueError("readable DiariZen segment count differs from summary")
+    target_ids = [item.clip_uid for item in targets]
+    if targets:
+        if (
+            readable_summary.target_count != len(targets)
+            or len(target_ids) != len(set(target_ids))
+        ):
+            raise ValueError("readable DiariZen target inventory is inconsistent")
+    else:
+        target_ids = list(dict.fromkeys(item.clip_uid for item in readable))
+    if not {item.clip_uid for item in readable}.issubset(target_ids):
+        raise ValueError("readable DiariZen segment references a non-target clip")
     readable_by_key = _index_by_key(readable, source_name="readable")
     raw_by_key = _index_by_key(raw, source_name="raw")
     bound_by_key = _index_by_key(bound, source_name="bound")
@@ -488,7 +562,7 @@ def _load_inputs(diarization_root: Path) -> _Inputs:
                 f"readable DiariZen source audio is missing: "
                 f"{readable_item.source_audio_path}"
             )
-    return _Inputs(readable)
+    return _Inputs(readable, target_ids)
 
 
 def run_qwen3_asr(
@@ -585,13 +659,19 @@ def run_qwen3_asr(
             for item in rows
             if item.status == "transcribed" and item.language
         )
+        clips_with_segments = len({item.clip_uid for item in inputs.readable_segments})
+        source_target_count = len(inputs.target_clip_ids)
+        clips_without_segments = source_target_count - clips_with_segments
         inventory = Qwen3ASRInventory(
             source_diarization_root=str(
                 Path(diarization_root).expanduser().resolve(strict=True)
             ),
             source_visual_production_root=source_visual_production_root,
             segment_count=len(rows),
-            clip_count=len({item.clip_uid for item in rows}),
+            clip_count=clips_with_segments,
+            source_target_clip_count=source_target_count,
+            clips_with_diarization_segments=clips_with_segments,
+            clips_without_diarization_segments=clips_without_segments,
             configuration=backend.configuration,
         )
         summary = Qwen3ASRSummary(
@@ -599,7 +679,10 @@ def run_qwen3_asr(
             transcribed_count=status_counts["transcribed"],
             empty_count=status_counts["empty"],
             failed_count=status_counts["failed"],
-            clip_count=len({item.clip_uid for item in rows}),
+            clip_count=clips_with_segments,
+            source_target_clip_count=source_target_count,
+            clips_with_diarization_segments=clips_with_segments,
+            clips_without_diarization_segments=clips_without_segments,
             language_counts=dict(sorted(language_counts.items())),
         )
         _write_json(temporary / "inventory.json", inventory)

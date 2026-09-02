@@ -16,7 +16,10 @@ from openai import OpenAI
 from pydantic import Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
-from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
+from r2v_data_v2.h3.jea_final_renderer import (
+    FinalFullClipAudioSemantics,
+    FinalH3SampleV2,
+)
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.semantic_augmentation import MediaURLResolver
 from r2v_data_v2.h3.specialized_audio_semantics import (
@@ -592,10 +595,11 @@ class Qwen38RecaptionSummary(SchemaModel):
     target_video_reference_count: Literal[0] = 0
     checkpoint_written: Literal[False] = False
     production_h3_modified: Literal[False] = False
-    inventory_scope: Literal["current_h3_samples_inventory_only"] = (
-        "current_h3_samples_inventory_only"
-    )
-    canonical_wide_coverage: Literal[False] = False
+    inventory_scope: Literal[
+        "current_h3_samples_inventory_only",
+        "canonical_h3_samples_inventory",
+    ] = "current_h3_samples_inventory_only"
+    canonical_wide_coverage: bool = False
 
     @model_validator(mode="after")
     def validate_counts(self) -> Qwen38RecaptionSummary:
@@ -796,7 +800,14 @@ def build_audio_facts(
     *,
     semantics_records_sha256: str | None,
 ) -> RecaptionAudioFacts:
-    if semantics is not None:
+    final_semantics = sample.full_clip_audio_semantics
+    if final_semantics is not None:
+        active_semantics: (
+            FinalFullClipAudioSemantics | SpecializedAudioSemanticsRecord | None
+        ) = final_semantics
+    else:
+        active_semantics = semantics
+    if semantics is not None and final_semantics is None:
         target_video = Path(sample.target_video).expanduser().resolve(strict=True)
         target_audio = Path(sample.target_full_audio_path).expanduser().resolve(
             strict=True
@@ -813,8 +824,8 @@ def build_audio_facts(
             raise ValueError("Audio semantics media provenance differs from H3 sample")
     delivery_by_cluster = {
         item.speaker_cluster_id: item.delivery_style
-        for item in semantics.speaker_delivery
-    } if semantics is not None else {}
+        for item in active_semantics.speaker_delivery
+    } if active_semantics is not None else {}
     speaker_ids = _speaker_ids(sample)
     subject_by_entity = _subject_by_entity(contract)
     speech = []
@@ -845,8 +856,8 @@ def build_audio_facts(
             )
         )
     non_speech = []
-    if semantics is not None:
-        for index, event in enumerate(semantics.temporal_audio_events, start=1):
+    if active_semantics is not None:
+        for index, event in enumerate(active_semantics.temporal_audio_events, start=1):
             non_speech.append(
                 RecaptionNonSpeechFact(
                     fact_id=f"non_speech_{index}",
@@ -858,20 +869,27 @@ def build_audio_facts(
                 )
             )
     provenance = {"speech": "current_h3_final_sample.speech_segments"}
-    if semantics_records_sha256 is not None:
+    if final_semantics is not None:
+        provenance["full_clip_audio_semantics"] = (
+            final_semantics.source_record_fingerprint
+        )
+    elif semantics_records_sha256 is not None:
         provenance["audio_semantics_records_sha256"] = semantics_records_sha256
-    grounding_complete = semantics is not None and (
-        semantics.global_semantics_status == "ready"
+    grounding_complete = (
+        final_semantics.status == "complete"
+        if final_semantics is not None
+        else semantics is not None
+        and semantics.global_semantics_status == "ready"
         and semantics.local_semantics_status == "ready"
     )
     return RecaptionAudioFacts(
         speech=speech,
         non_speech_events=non_speech,
         overall_soundscape_hint=(
-            None if semantics is None else semantics.overall_soundscape
+            None if active_semantics is None else active_semantics.overall_soundscape
         ),
         non_diegetic_music_hint=(
-            None if semantics is None else semantics.non_diegetic_music
+            None if active_semantics is None else active_semantics.non_diegetic_music
         ),
         audio_grounding_complete=grounding_complete,
         provenance=provenance,
@@ -1968,13 +1986,21 @@ def build_qwen38_full_manifest(
     sample_ids = [sample.sample_id for sample in samples]
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError("current H3 samples inventory contains duplicate sample IDs")
+    canonical_counts = Counter(
+        sample.clip_uid for sample in samples if sample.pair_type == "canonical"
+    )
+    all_clip_ids = {sample.clip_uid for sample in samples}
+    if set(canonical_counts) != all_clip_ids or any(
+        count != 1 for count in canonical_counts.values()
+    ):
+        raise ValueError("full recaption manifest requires one canonical base per clip")
     cases: list[Qwen38RecaptionManifestCase] = []
     for sample in samples:
-        variant: ConditioningVariant = (
-            "target_voice_reference"
-            if sample.pair_type == "in_pair"
-            else "cross_voice_reference"
-        )
+        variant: ConditioningVariant = {
+            "canonical": "visual_only",
+            "in_pair": "target_voice_reference",
+            "cross_pair": "cross_voice_reference",
+        }[sample.pair_type]
         try:
             build_reference_contract(sample, variant)
         except (OSError, ValueError) as exc:
@@ -1985,7 +2011,7 @@ def build_qwen38_full_manifest(
             Qwen38RecaptionManifestCase(
                 sample_id=sample.sample_id,
                 conditioning_variant=variant,
-                note="current H3 samples inventory only; not canonical-wide coverage",
+                note="canonical-wide final H3 sample inventory",
             )
         )
     output = output_path.expanduser().resolve(strict=False)
@@ -2215,6 +2241,15 @@ def run_qwen38_h3_recaption_pilot(
         failure_counts = Counter(
             item.failure.code for item in records if item.failure is not None
         )
+        canonical_counts = Counter(
+            sample.clip_uid
+            for sample in samples
+            if sample.pair_type == "canonical"
+        )
+        canonical_wide_coverage = (
+            set(canonical_counts) == {sample.clip_uid for sample in samples}
+            and all(count == 1 for count in canonical_counts.values())
+        )
         summary = Qwen38RecaptionSummary(
             source_h3_samples_path=str(samples_path.resolve(strict=True)),
             source_h3_samples_sha256=_sha256_file(samples_path),
@@ -2232,6 +2267,12 @@ def run_qwen38_h3_recaption_pilot(
                 sorted(Counter(item.conditioning_variant for item in records).items())
             ),
             failure_counts=dict(sorted(failure_counts.items())),
+            inventory_scope=(
+                "canonical_h3_samples_inventory"
+                if canonical_wide_coverage
+                else "current_h3_samples_inventory_only"
+            ),
+            canonical_wide_coverage=canonical_wide_coverage,
         )
         _write_jsonl(temporary / "manifest.jsonl", cases)
         _write_jsonl(temporary / "records.jsonl", records)

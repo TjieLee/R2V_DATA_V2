@@ -1603,12 +1603,14 @@ until the exact backend directory has been reviewed.
 ## Canonical clip-level Audio universe
 
 Visual Production `samples.jsonl` is the sole clip-level admission source. All
-validated rows must appear in `audio/canonical_clips.jsonl` and receive canonical
-full audio, even when they have no subject reference, primary voice, pair,
-DiariZen speaker, or Qwen3-ASR segment. Those subject/speech stages are optional
-enrichment only. Subject Audio binding continues to process only the
-subject-reference subset and no empty subject, speaker, voice, or transcript is
-fabricated for other clips.
+validated rows must appear in `audio/canonical_clips.jsonl`, receive canonical
+full audio, and enter the canonical-wide DiariZen inventory, even when they
+have no subject reference, primary voice, pair, ready LR-ASD Audio sidecar, or
+eventual speech segment. A missing/non-ready sidecar provides no direct identity
+anchors and leaves clusters unbound; it never removes the clip. Empty DiariZen
+output remains a valid target with no fake Qwen3-ASR row. Subject Audio binding
+continues to process only the subject-reference subset, while pair artifacts
+only create optional voice-conditioned Final H3 variants.
 
 For an existing production root, publish/backfill the canonical Audio manifest
 without any AI model call:
@@ -1625,6 +1627,38 @@ Audio stage through the shared layout and writes only below
 `$AUDIO_PRODUCTION_ROOT/audio/`, never directly at the production root.
 
 The specialized Audio semantics inventory is built from that manifest. Readable
-DiariZen speaker evidence is an optional subset overlay and Qwen3-ASR is not an
-inventory dependency. Future clip-level Visual/Audio rendering joins exactly on
-`clip_uid`.
+DiariZen now covers the same exact canonical clip set; its readable segment rows
+remain only the speech actually found. Specialized Audio semantics is an
+independent canonical-wide target projection and Qwen3-ASR is not its admission
+dependency. Final clip-level Visual/Audio rendering joins exactly on `clip_uid`.
+
+To regenerate only the canonical-wide stages on an existing Audio production
+root, first inspect the model-free plan, then intentionally replace the four
+dependent stages:
+
+```bash
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages diarization,binding-audit,qwen3-asr,h3 \
+  --audio-semantics-root \
+    "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1" \
+  --ffprobe "$FFPROBE" \
+  --dry-run
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages diarization,binding-audit,qwen3-asr,h3 \
+  --audio-semantics-root \
+    "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1" \
+  --ffprobe "$FFPROBE" \
+  --overwrite
+```
+
+This command does not rerun LR-ASD, primary voice, embeddings, pairs, or the
+specialized Audio-semantics models. Issue #11 remains open until the resulting
+canonical base count equals the Visual canonical count and full-clip semantics
+coverage is verified from real server artifacts.

@@ -49,6 +49,7 @@ def test_production_stage_parser_is_direct_and_ordered() -> None:
         "embedding",
         "pair",
         "diarization",
+        "binding-audit",
         "qwen3-asr",
         "h3",
     )

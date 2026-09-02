@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationError, model_validator
 
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoInventory,
@@ -173,9 +173,14 @@ def build_review_cases(
     ]
     shadow_summary_path = shadow / "summary.json"
     if shadow_summary_path.is_file():
-        shadow_summary = MimoH3ShadowSummary.model_validate_json(
-            shadow_summary_path.read_text(encoding="utf-8")
-        )
+        try:
+            shadow_summary = MimoH3ShadowSummary.model_validate_json(
+                shadow_summary_path.read_text(encoding="utf-8")
+            )
+        except ValidationError as exc:
+            raise ValueError(
+                "MiMo review shadow provenance differs from current AV annotation"
+            ) from exc
         if (
             shadow_summary.source_mimo_inventory_fingerprint
             != inventory.inventory_fingerprint

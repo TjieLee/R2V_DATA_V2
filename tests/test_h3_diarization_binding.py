@@ -31,6 +31,7 @@ from r2v_data_v2.h3.diarization_binding import (
     _mapped_identity_duration_metrics,
     _normalize_segments,
     bind_diarization_segments,
+    build_complete_diarization_inventory,
     build_diarization_inventory,
     diarization_output_root,
     run_diarization_binding_pilot,
@@ -274,6 +275,87 @@ def _target(*, clip_uid: str = "clip-a", rate: int = 100) -> DiarizationTargetCl
         target_audio_binding_path=f"/{clip_uid}.json",
         visual_references=[],
     )
+
+
+def test_canonical_targets_without_sidecars_still_diarize_and_bind_unbound(
+    tmp_path: Path,
+) -> None:
+    targets = []
+    for clip_uid in ("clip-speech", "clip-empty"):
+        audio = tmp_path / f"{clip_uid}.flac"
+        audio.write_bytes(f"audio:{clip_uid}".encode())
+        targets.append(
+            DiarizationTargetClip(
+                target_clip_uid=clip_uid,
+                target_video_path=f"/{clip_uid}.mp4",
+                source_audio_path=str(audio),
+                source_audio_sha256=_sha256(audio),
+                source_sample_rate_hz=16000,
+                source_channels=1,
+                source_frame_count=16000,
+                target_audio_binding_path=None,
+                visual_references=[],
+            )
+        )
+    pairs = tmp_path / "legacy-pairs.jsonl"
+    pairs.write_text("{}\n", encoding="utf-8")
+    inventory = build_complete_diarization_inventory(
+        source_pairs_path=pairs,
+        targets=sorted(targets, key=lambda item: item.target_clip_uid),
+    )
+    backend = _FakeBackend(
+        {
+            "clip-speech": [
+                DiarizationBackendSegment(
+                    start_time=0.0,
+                    end_time=0.5,
+                    speaker_label="speaker-a",
+                )
+            ],
+            "clip-empty": [],
+        }
+    )
+    output = tmp_path / "diarization"
+
+    summary = run_diarization_binding_pilot(
+        inventory=inventory,
+        output_root=output,
+        backend=backend,
+    )
+
+    results = {
+        row["target_clip_uid"]: row
+        for row in (
+            json.loads(line)
+            for line in (output / "clip_results.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+    }
+    clusters = [
+        json.loads(line)
+        for line in (output / "cluster_bindings.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    bound = [
+        json.loads(line)
+        for line in (output / "bound_segments.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [item[0] for item in backend.calls] == ["clip-empty", "clip-speech"]
+    assert results["clip-empty"]["status"] == "empty"
+    assert results["clip-speech"]["status"] == "ready"
+    assert results["clip-speech"]["legacy_bound_interval_count"] == 0
+    assert clusters[0]["status"] == "unbound"
+    assert clusters[0]["entity_id"] is None
+    assert bound[0]["identity_scope"] == "unresolved"
+    assert bound[0]["entity_id"] is None
+    assert summary.target_clip_count == 2
+    assert summary.ready_clip_count == 1
+    assert summary.empty_clip_count == 1
+    assert summary.failed_clip_count == 0
 
 
 def _raw(

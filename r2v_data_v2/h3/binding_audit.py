@@ -17,6 +17,7 @@ from r2v_data_v2.h3.audio_binding import AudioBindingProductionConfig
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
     DiarizationClusterBinding,
+    DiarizationInventory,
     RawDiarizationSegment,
 )
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
@@ -248,6 +249,8 @@ class SpeakerBindingAuditSummary(SchemaModel):
     audio_binding_input_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     lr_asd_native_input_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     clip_count: int = Field(ge=0)
+    clips_without_ready_audio_binding: int = Field(default=0, ge=0)
+    clips_without_lr_asd_native: int = Field(default=0, ge=0)
     cluster_count: int = Field(ge=0)
     segment_count: int = Field(ge=0)
     candidate_mapped_count: int = Field(ge=0)
@@ -437,11 +440,11 @@ def _overlap_seconds(
 
 def _exclusive_frames(
     native: LRASDNativeArtifact,
-    sidecar: AudioBindingSidecar,
+    sidecar: AudioBindingSidecar | None,
 ) -> list[_ExclusiveFrame]:
     association_by_track = {
         item.face_track_id: item for item in sidecar.evidence.associations
-    }
+    } if sidecar is not None and sidecar.evidence is not None else {}
     active_by_frame: dict[int, list[str]] = defaultdict(list)
     for track in native.tracks:
         for sample in track.samples:
@@ -474,11 +477,11 @@ def _exclusive_frames(
 
 def _multi_active_frames(
     native: LRASDNativeArtifact,
-    sidecar: AudioBindingSidecar,
+    sidecar: AudioBindingSidecar | None,
 ) -> list[_MultiActiveFrame]:
     association_by_track = {
         item.face_track_id: item for item in sidecar.evidence.associations
-    }
+    } if sidecar is not None and sidecar.evidence is not None else {}
     active_by_frame: dict[int, list[str]] = defaultdict(list)
     for track in native.tracks:
         for sample in track.samples:
@@ -724,9 +727,9 @@ class _AnchorAuditEvidence:
 def _binding_anchor_evidence(
     *,
     raw_segments: Sequence[RawDiarizationSegment],
-    sidecar: AudioBindingSidecar,
+    sidecar: AudioBindingSidecar | None,
 ) -> _AnchorAuditEvidence:
-    if not raw_segments:
+    if not raw_segments or sidecar is None:
         return _AnchorAuditEvidence({}, {}, {})
     sample_rate = raw_segments[0].source_sample_rate_hz
     minimum = AudioBindingProductionConfig().minimum_binding_confidence
@@ -796,18 +799,23 @@ def _load_sidecars(
     audio_root: Path,
 ) -> dict[str, tuple[AudioBindingSidecar, Path]]:
     output: dict[str, tuple[AudioBindingSidecar, Path]] = {}
+    seen_clip_ids: set[str] = set()
     for path in sorted((audio_root / "clips").glob("**/audio_binding.json")):
         sidecar = AudioBindingSidecar.model_validate_json(path.read_text(encoding="utf-8"))
-        if sidecar.clip_uid in output:
+        if sidecar.clip_uid in seen_clip_ids:
             raise ValueError("binding audit found duplicate Audio sidecar clip UID")
-        if sidecar.status != "ready" or sidecar.evidence is None:
-            continue
+        seen_clip_ids.add(sidecar.clip_uid)
         output[sidecar.clip_uid] = (sidecar, path)
     return output
 
 
-def _load_native(audio_root: Path, clip_uid: str) -> tuple[LRASDNativeArtifact, Path]:
+def _load_optional_native(
+    audio_root: Path,
+    clip_uid: str,
+) -> tuple[LRASDNativeArtifact, Path] | None:
     path = audio_root / "runtime" / clip_uid / "lr_asd" / "lr_asd_native.json"
+    if not path.is_file():
+        return None
     native = LRASDNativeArtifact.model_validate_json(path.read_text(encoding="utf-8"))
     if native.clip_uid != clip_uid:
         raise ValueError("binding audit LR-ASD clip identity is inconsistent")
@@ -852,6 +860,7 @@ def _validate_inputs(
 def _build_records(
     *,
     audio_root: Path,
+    target_clip_ids: Sequence[str],
     raw_segments: Sequence[RawDiarizationSegment],
     cluster_bindings: Sequence[DiarizationClusterBinding],
     bound_segments: Sequence[BoundDiarizationSegment],
@@ -860,8 +869,22 @@ def _build_records(
     list[SpeakerBindingSegmentAudit],
     dict[str, str],
     dict[str, str],
+    int,
+    int,
 ]:
     sidecars = _load_sidecars(audio_root)
+    target_ids = list(target_clip_ids)
+    if len(target_ids) != len(set(target_ids)):
+        raise ValueError("binding audit target clip inventory contains duplicates")
+    target_id_set = set(target_ids)
+    raw_clip_ids = {item.target_clip_uid for item in raw_segments}
+    if not raw_clip_ids.issubset(target_id_set):
+        raise ValueError("binding audit segments contain a non-target clip")
+    native_by_clip = {
+        clip_uid: loaded
+        for clip_uid in target_ids
+        if (loaded := _load_optional_native(audio_root, clip_uid)) is not None
+    }
     raw_by_clip: dict[str, list[RawDiarizationSegment]] = defaultdict(list)
     raw_by_cluster: dict[tuple[str, str], list[RawDiarizationSegment]] = defaultdict(list)
     bound_by_key = {
@@ -879,16 +902,29 @@ def _build_records(
     segment_records: list[SpeakerBindingSegmentAudit] = []
     sidecar_hashes: dict[str, str] = {}
     native_hashes: dict[str, str] = {}
+    ready_sidecar_clip_ids: set[str] = set()
     for clip_uid in sorted(raw_by_clip):
         loaded_sidecar = sidecars.get(clip_uid)
-        if loaded_sidecar is None:
-            raise ValueError(f"binding audit is missing ready Audio sidecar for {clip_uid}")
-        sidecar, sidecar_path = loaded_sidecar
-        native, native_path = _load_native(audio_root, clip_uid)
-        sidecar_hashes[clip_uid] = _sha256(sidecar_path)
-        native_hashes[clip_uid] = _sha256(native_path)
-        frames = _exclusive_frames(native, sidecar)
-        multi_active_frames = _multi_active_frames(native, sidecar)
+        sidecar = (
+            loaded_sidecar[0]
+            if loaded_sidecar is not None
+            and loaded_sidecar[0].status == "ready"
+            and loaded_sidecar[0].evidence is not None
+            else None
+        )
+        if loaded_sidecar is not None:
+            sidecar_hashes[clip_uid] = _sha256(loaded_sidecar[1])
+        if sidecar is not None:
+            ready_sidecar_clip_ids.add(clip_uid)
+        loaded_native = native_by_clip.get(clip_uid)
+        if loaded_native is None:
+            frames: list[_ExclusiveFrame] = []
+            multi_active_frames: list[_MultiActiveFrame] = []
+        else:
+            native, native_path = loaded_native
+            native_hashes[clip_uid] = _sha256(native_path)
+            frames = _exclusive_frames(native, sidecar)
+            multi_active_frames = _multi_active_frames(native, sidecar)
         anchor_evidence = _binding_anchor_evidence(
             raw_segments=raw_by_clip[clip_uid],
             sidecar=sidecar,
@@ -1123,7 +1159,19 @@ def _build_records(
             item.segment_id,
         )
     )
-    return cluster_records, segment_records, sidecar_hashes, native_hashes
+    for clip_uid, (_, path) in sidecars.items():
+        if clip_uid in target_id_set:
+            sidecar_hashes.setdefault(clip_uid, _sha256(path))
+    for clip_uid, (_, path) in native_by_clip.items():
+        native_hashes.setdefault(clip_uid, _sha256(path))
+    return (
+        cluster_records,
+        segment_records,
+        sidecar_hashes,
+        native_hashes,
+        len(target_id_set - ready_sidecar_clip_ids),
+        len(target_id_set - set(native_by_clip)),
+    )
 
 
 def _review_manifest(
@@ -1163,6 +1211,9 @@ def _summary(
     source_paths: dict[str, Path],
     audio_binding_hashes: dict[str, str],
     lr_asd_native_hashes: dict[str, str],
+    target_clip_count: int,
+    clips_without_ready_audio_binding: int,
+    clips_without_lr_asd_native: int,
     clusters: Sequence[SpeakerBindingClusterAudit],
     segments: Sequence[SpeakerBindingSegmentAudit],
     review: Sequence[SpeakerBindingReviewCase],
@@ -1183,7 +1234,9 @@ def _summary(
         lr_asd_native_input_set_sha256=_artifact_set_fingerprint(
             lr_asd_native_hashes
         ),
-        clip_count=len({item.clip_uid for item in clusters}),
+        clip_count=target_clip_count,
+        clips_without_ready_audio_binding=clips_without_ready_audio_binding,
+        clips_without_lr_asd_native=clips_without_lr_asd_native,
         cluster_count=len(clusters),
         segment_count=len(segments),
         candidate_mapped_count=status_counts["candidate_mapped"],
@@ -1280,8 +1333,28 @@ def run_speaker_binding_audit(
         source_paths["bound_segments"], BoundDiarizationSegment
     )
     _validate_inputs(raw_segments, cluster_bindings, bound_segments)
-    clusters, segments, audio_binding_hashes, lr_asd_native_hashes = _build_records(
+    inventory_path = diarization_root / "inventory.json"
+    if inventory_path.is_file():
+        source_paths["inventory"] = inventory_path
+        inventory = DiarizationInventory.model_validate_json(
+            inventory_path.read_text(encoding="utf-8")
+        )
+        target_clip_ids = [item.target_clip_uid for item in inventory.targets]
+    else:
+        target_clip_ids = sorted(
+            {item.target_clip_uid for item in raw_segments}
+            | {item.target_clip_uid for item in cluster_bindings}
+        )
+    (
+        clusters,
+        segments,
+        audio_binding_hashes,
+        lr_asd_native_hashes,
+        clips_without_ready_audio_binding,
+        clips_without_lr_asd_native,
+    ) = _build_records(
         audio_root=audio_root,
+        target_clip_ids=target_clip_ids,
         raw_segments=raw_segments,
         cluster_bindings=cluster_bindings,
         bound_segments=bound_segments,
@@ -1293,6 +1366,9 @@ def run_speaker_binding_audit(
         source_paths=source_paths,
         audio_binding_hashes=audio_binding_hashes,
         lr_asd_native_hashes=lr_asd_native_hashes,
+        target_clip_count=len(target_clip_ids),
+        clips_without_ready_audio_binding=clips_without_ready_audio_binding,
+        clips_without_lr_asd_native=clips_without_lr_asd_native,
         clusters=clusters,
         segments=segments,
         review=review,

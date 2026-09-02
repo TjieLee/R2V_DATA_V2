@@ -40,7 +40,7 @@ from r2v_data_v2.h3.schemas import (
     SchemaModel,
 )
 
-DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.2"
+DIARIZATION_INVENTORY_VERSION = "r2v.h3.diarization_inventory.3"
 DIARIZATION_SEGMENT_VERSION = "r2v.h3.diarization_segment.2"
 DIARIZATION_CLUSTER_BINDING_VERSION = "r2v.h3.diarization_cluster_binding.2"
 DIARIZATION_BOUND_SEGMENT_VERSION = "r2v.h3.diarization_bound_segment.1"
@@ -136,20 +136,29 @@ class DiarizationTargetClip(SchemaModel):
     source_sample_rate_hz: int = Field(gt=0)
     source_channels: int = Field(gt=0)
     source_frame_count: int = Field(gt=0)
-    target_audio_binding_path: str
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     visual_references: list[DiarizationVisualReference]
 
     @model_validator(mode="after")
     def validate_target(self) -> DiarizationTargetClip:
         if _SAFE_ID.fullmatch(self.target_clip_uid) is None:
             raise ValueError("diarization target clip UID is not path-safe")
-        for value in (
-            self.target_video_path,
-            self.source_audio_path,
-            self.target_audio_binding_path,
-        ):
+        for value in (self.target_video_path, self.source_audio_path):
             if not value.strip():
                 raise ValueError("diarization target provenance path is empty")
+        if (
+            self.target_audio_binding_path is not None
+            and not self.target_audio_binding_path.strip()
+        ):
+            raise ValueError("diarization Audio binding path must be non-empty or null")
+        if self.target_audio_binding_path is None and (
+            self.target_audio_binding_sha256 is not None
+        ):
+            raise ValueError("diarization Audio binding hash requires a path")
         entity_ids = [item.entity_id for item in self.visual_references]
         if len(entity_ids) != len(set(entity_ids)):
             raise ValueError("diarization visual reference entities must be unique")
@@ -157,12 +166,30 @@ class DiarizationTargetClip(SchemaModel):
 
 
 class DiarizationInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.diarization_inventory.2"] = (
-        DIARIZATION_INVENTORY_VERSION
-    )
+    schema_version: Literal[
+        "r2v.h3.diarization_inventory.2",
+        "r2v.h3.diarization_inventory.3",
+    ] = DIARIZATION_INVENTORY_VERSION
     mode: Literal["pilot20", "production"]
-    source_pairs_path: str
-    source_pairs_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_inventory_kind: Literal[
+        "pair_inventory", "canonical_audio_manifest"
+    ] = "pair_inventory"
+    source_pairs_path: str | None = None
+    source_pairs_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    source_visual_production_root: str | None = None
+    source_visual_inventory_path: str | None = None
+    source_visual_inventory_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    source_canonical_audio_manifest_path: str | None = None
+    source_canonical_audio_manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     source_asr_inventory_path: str | None = None
     source_asr_inventory_fingerprint: str | None = Field(
         default=None,
@@ -185,6 +212,7 @@ class DiarizationInventory(SchemaModel):
     selection_mode: Literal[
         "same_ordered_asr_pilot20_targets_v1",
         "complete_in_pair_target_inventory_v1",
+        "canonical_visual_target_inventory_v1",
     ]
     bounded_selection_applied: bool
     parent_quota_applied: Literal[False] = False
@@ -202,9 +230,30 @@ class DiarizationInventory(SchemaModel):
             raise ValueError("diarization selected target count is inconsistent")
         if self.source_target_count < self.selected_target_count:
             raise ValueError("diarization selection cannot exceed source targets")
+        canonical_fields = (
+            self.source_visual_production_root,
+            self.source_visual_inventory_path,
+            self.source_visual_inventory_sha256,
+            self.source_canonical_audio_manifest_path,
+            self.source_canonical_audio_manifest_sha256,
+        )
+        if self.source_inventory_kind == "pair_inventory":
+            if self.source_pairs_path is None or self.source_pairs_sha256 is None:
+                raise ValueError("pair-rooted diarization inventory requires pair provenance")
+            if any(value is not None for value in canonical_fields):
+                raise ValueError("pair-rooted diarization cannot claim canonical provenance")
+        elif (
+            self.source_pairs_path is not None
+            or self.source_pairs_sha256 is not None
+            or any(value is None for value in canonical_fields)
+        ):
+            raise ValueError(
+                "canonical diarization inventory requires only Visual/Audio provenance"
+            )
         if self.mode == "pilot20":
             if (
-                self.selection_mode != "same_ordered_asr_pilot20_targets_v1"
+                self.source_inventory_kind != "pair_inventory"
+                or self.selection_mode != "same_ordered_asr_pilot20_targets_v1"
                 or self.selected_target_count != PILOT_TARGET_COUNT
                 or self.source_target_count != EXPECTED_PRODUCTION_TARGET_COUNT
                 or not self.bounded_selection_applied
@@ -213,7 +262,11 @@ class DiarizationInventory(SchemaModel):
             ):
                 raise ValueError("diarization pilot must reuse the frozen ASR pilot20")
         elif (
-            self.selection_mode != "complete_in_pair_target_inventory_v1"
+            self.selection_mode
+            not in {
+                "complete_in_pair_target_inventory_v1",
+                "canonical_visual_target_inventory_v1",
+            }
             or self.selected_target_count != self.source_target_count
             or self.bounded_selection_applied
             or self.source_asr_inventory_path is not None
@@ -222,6 +275,16 @@ class DiarizationInventory(SchemaModel):
             raise ValueError(
                 "production diarization inventory must independently be complete"
             )
+        elif (
+            self.source_inventory_kind == "canonical_audio_manifest"
+        ) != (self.selection_mode == "canonical_visual_target_inventory_v1"):
+            raise ValueError("production diarization source kind and selection differ")
+        if self.source_inventory_kind == "canonical_audio_manifest" and any(
+            (target.target_audio_binding_path is None)
+            != (target.target_audio_binding_sha256 is None)
+            for target in self.targets
+        ):
+            raise ValueError("canonical diarization binding path/hash must be paired")
         return self
 
 
@@ -892,15 +955,31 @@ def _source_frame_count(path: Path, *, sample_rate: int, channels: int) -> int:
 
 def _inventory_fingerprint(
     *,
-    source_pairs_sha256: str,
+    source_pairs_sha256: str | None,
     source_asr_inventory_fingerprint: str | None,
     mode: str,
     targets: Sequence[DiarizationTargetClip],
+    source_inventory_kind: str = "pair_inventory",
+    source_visual_inventory_sha256: str | None = None,
+    source_canonical_audio_manifest_sha256: str | None = None,
 ) -> str:
+    source: dict[str, str | None] = {}
+    if source_inventory_kind == "canonical_audio_manifest":
+        source.update(
+            {
+                "source_inventory_kind": source_inventory_kind,
+                "source_visual_inventory_sha256": source_visual_inventory_sha256,
+                "source_canonical_audio_manifest_sha256": (
+                    source_canonical_audio_manifest_sha256
+                ),
+            }
+        )
+    else:
+        source["source_pairs_sha256"] = source_pairs_sha256
     return _sha256_text(
         _compact_json(
             {
-                "source_pairs_sha256": source_pairs_sha256,
+                **source,
                 "source_asr_inventory_fingerprint": (source_asr_inventory_fingerprint),
                 "mapping_policy_version": DIARIZATION_MAPPING_POLICY_VERSION,
                 "mapping_policy_validated": True,
@@ -937,6 +1016,7 @@ def build_complete_diarization_inventory(
         targets=ordered,
     )
     return DiarizationInventory(
+        schema_version="r2v.h3.diarization_inventory.2",
         mode="production",
         source_pairs_path=str(pairs_path),
         source_pairs_sha256=pairs_sha256,
@@ -1046,6 +1126,7 @@ def build_diarization_inventory(
                 source_channels=audio.channels,
                 source_frame_count=frame_count,
                 target_audio_binding_path=str(sidecar_path),
+                target_audio_binding_sha256=_sha256_file(sidecar_path),
                 visual_references=[
                     DiarizationVisualReference(
                         entity_id=subject.target_entity_id,
@@ -1062,6 +1143,7 @@ def build_diarization_inventory(
         targets=targets,
     )
     return DiarizationInventory(
+        schema_version="r2v.h3.diarization_inventory.2",
         mode=mode,
         source_pairs_path=str(pairs_path),
         source_pairs_sha256=pairs_sha256,
@@ -1462,22 +1544,31 @@ def bind_diarization_segments(
     )
 
 
-def _load_sidecar(target: DiarizationTargetClip) -> AudioBindingSidecar:
+def _load_optional_sidecar(
+    target: DiarizationTargetClip,
+) -> AudioBindingSidecar | None:
+    if target.target_audio_binding_path is None:
+        return None
     path = Path(target.target_audio_binding_path).expanduser().resolve(strict=True)
-    sidecar = AudioBindingSidecar.model_validate_json(path.read_text(encoding="utf-8"))
     if (
-        sidecar.clip_uid != target.target_clip_uid
-        or sidecar.status != "ready"
-        or sidecar.evidence is None
+        target.target_audio_binding_sha256 is not None
+        and _sha256_file(path) != target.target_audio_binding_sha256
     ):
+        raise ValueError("diarization source Audio sidecar hash changed")
+    sidecar = AudioBindingSidecar.model_validate_json(path.read_text(encoding="utf-8"))
+    if sidecar.clip_uid != target.target_clip_uid:
         raise ValueError("diarization source Audio sidecar is inconsistent")
+    if sidecar.status != "ready" or sidecar.evidence is None:
+        return None
     return sidecar
 
 
 def _legacy_metrics(
     target: DiarizationTargetClip,
-    sidecar: AudioBindingSidecar,
+    sidecar: AudioBindingSidecar | None,
 ) -> tuple[list[_Anchor], list[float]]:
+    if sidecar is None:
+        return [], []
     anchors = _usable_anchors(sidecar.bindings, target=target)
     turns = coalesce_audio_bindings(
         sidecar.bindings,
@@ -1500,7 +1591,7 @@ def _clip_result(
     *,
     target: DiarizationTargetClip,
     raw_segments: Sequence[RawDiarizationSegment],
-    sidecar: AudioBindingSidecar,
+    sidecar: AudioBindingSidecar | None,
     mapping: _MappingResult,
     status: Literal["ready", "empty"],
 ) -> DiarizationClipResult:
@@ -2027,8 +2118,9 @@ def run_diarization_binding_pilot(
                     or _sha256_file(audio_path) != target.source_audio_sha256
                 ):
                     raise ValueError("source_audio_hash_mismatch")
-                sidecar = _load_sidecar(target)
-                anchors_by_clip[target.target_clip_uid] = list(sidecar.bindings)
+                sidecar = _load_optional_sidecar(target)
+                frozen_bindings = [] if sidecar is None else list(sidecar.bindings)
+                anchors_by_clip[target.target_clip_uid] = frozen_bindings
                 backend_called = True
                 backend_segments = backend.diarize(
                     clip_uid=target.target_clip_uid,
@@ -2042,7 +2134,7 @@ def run_diarization_binding_pilot(
                 mapping = bind_diarization_segments(
                     target=target,
                     raw_segments=clip_raw,
-                    frozen_bindings=sidecar.bindings,
+                    frozen_bindings=frozen_bindings,
                 )
                 raw_segments.extend(clip_raw)
                 cluster_bindings.extend(mapping.bindings)

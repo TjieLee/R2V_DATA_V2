@@ -4,11 +4,12 @@ import hashlib
 import html
 import json
 import shutil
+import subprocess
 import uuid
-import wave
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -34,7 +35,9 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationInventory,
     DiarizationTargetClip,
     DiarizationVisualReference,
-    build_complete_diarization_inventory,
+)
+from r2v_data_v2.h3.diarization_binding import (
+    _inventory_fingerprint as _diarization_inventory_fingerprint,
 )
 from r2v_data_v2.h3.embedding_pilot import _normalize, materialize_face_embedding
 from r2v_data_v2.h3.lr_asd import LRASDBackend, SpeechActivityBackend
@@ -57,6 +60,7 @@ from r2v_data_v2.h3.visual_production_source import (
 JEA_PAIR_SCHEMA_VERSION = "r2v.h3.jea_pairs.1"
 CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.1"
 CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.1"
+CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS = 0.10
 
 
 @dataclass(frozen=True)
@@ -711,83 +715,182 @@ class JEAPairSummary(SchemaModel):
     maximum_cross_pairs_per_target: Literal[1] = 1
 
 
-def _pcm16_frame_count(path: Path, *, sample_rate: int, channels: int) -> int:
+@dataclass(frozen=True)
+class _CanonicalAudioTimeline:
+    sample_rate_hz: int
+    channels: int
+    frame_count: int
+    duration_seconds: float
+
+
+def _probe_canonical_audio(
+    path: Path,
+    *,
+    ffprobe: str,
+) -> _CanonicalAudioTimeline:
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=sample_rate,channels,duration,duration_ts,time_base:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ValueError("cannot inspect canonical diarization audio")
     try:
-        with wave.open(str(path), "rb") as source:
-            if (
-                source.getsampwidth() != 2
-                or source.getcomptype() != "NONE"
-                or source.getframerate() != sample_rate
-                or source.getnchannels() != channels
-            ):
-                raise ValueError("JEA diarization source must be matching PCM16 WAV")
-            return source.getnframes()
-    except (OSError, EOFError, wave.Error) as exc:
-        raise ValueError("JEA diarization source audio is unreadable") from exc
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams", [])
+        if len(streams) != 1:
+            raise ValueError("canonical audio must expose exactly one selected stream")
+        stream = streams[0]
+        sample_rate = int(stream["sample_rate"])
+        channels = int(stream["channels"])
+        duration_value = stream.get("duration") or payload.get("format", {}).get(
+            "duration"
+        )
+        duration = float(duration_value)
+        duration_ts = stream.get("duration_ts")
+        time_base = stream.get("time_base")
+        if duration_ts not in {None, "N/A"} and time_base not in {None, "N/A"}:
+            frames = Fraction(int(duration_ts)) * Fraction(str(time_base)) * sample_rate
+            if frames.denominator != 1:
+                raise ValueError("canonical audio timestamp extent is not sample-aligned")
+            frame_count = int(frames)
+        else:
+            frame_count = round(duration * sample_rate)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("canonical diarization audio metadata is invalid") from exc
+    if sample_rate != 16000 or channels != 1:
+        raise ValueError("canonical diarization audio must be 16 kHz mono")
+    if frame_count <= 0 or duration <= 0:
+        raise ValueError("canonical diarization audio timeline is empty")
+    actual_duration = frame_count / sample_rate
+    if abs(actual_duration - duration) > (1 / sample_rate + 1e-9):
+        raise ValueError("canonical audio duration and sample extent differ")
+    return _CanonicalAudioTimeline(
+        sample_rate_hz=sample_rate,
+        channels=channels,
+        frame_count=frame_count,
+        duration_seconds=actual_duration,
+    )
 
 
 def build_jea_diarization_inventory(
     *,
-    pairs_root: Path,
+    visual_inventory: VisualProductionInventory,
+    audio_root: Path,
+    ffprobe: str = "ffprobe",
 ) -> DiarizationInventory:
-    root = pairs_root.expanduser().resolve(strict=True)
-    pairs_path = (root / "in_pairs.jsonl").resolve(strict=True)
-    pairs = [
-        JEAInPair.model_validate_json(line)
-        for line in pairs_path.read_text(encoding="utf-8").splitlines()
+    canonical_root = audio_root.expanduser().resolve(strict=True)
+    manifest_path = (canonical_root / "canonical_clips.jsonl").resolve(strict=True)
+    visual_root = Path(visual_inventory.visual_production_root).expanduser().resolve(
+        strict=True
+    )
+    visual_inventory_path = (visual_root / "samples.jsonl").resolve(strict=True)
+    canonical = [
+        CanonicalAudioClip.model_validate_json(line)
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    canonical_by_clip = {item.clip_uid: item for item in canonical}
+    visual_ids = [item.identity.clip_uid for item in visual_inventory.canonical_clips]
+    if len(canonical_by_clip) != len(canonical):
+        raise ValueError("canonical Audio manifest contains duplicate clip IDs")
+    if len(visual_ids) != len(set(visual_ids)):
+        raise ValueError("canonical Visual inventory contains duplicate clip IDs")
+    if set(canonical_by_clip) != set(visual_ids):
+        raise ValueError("canonical Visual and Audio clip inventories differ")
     targets: list[DiarizationTargetClip] = []
-    for pair in sorted(pairs, key=lambda item: item.target_clip_uid):
-        video_path = Path(pair.target_video_path).expanduser().resolve(strict=True)
-        full_audio = Path(pair.target_full_audio_path).expanduser().resolve(strict=True)
-        sidecar_path = (
-            Path(pair.target_audio_binding_path).expanduser().resolve(strict=True)
-        )
-        if not full_audio.is_file():
-            raise ValueError("JEA in-pair canonical full audio is unavailable")
-        sidecar = AudioBindingSidecar.model_validate_json(
-            sidecar_path.read_text(encoding="utf-8")
-        )
+    for visual in visual_inventory.canonical_clips:
+        clip_uid = visual.identity.clip_uid
+        record = canonical_by_clip[clip_uid]
+        video_path = Path(visual.sample.target_video).expanduser().resolve(strict=True)
+        manifest_video = Path(record.target_video_path).expanduser().resolve(strict=True)
         if (
-            sidecar.clip_uid != pair.target_clip_uid
-            or sidecar.status != "ready"
-            or sidecar.evidence is None
+            manifest_video != video_path
+            or _sha256_file(video_path) != record.target_video_sha256
         ):
-            raise ValueError("JEA diarization requires a matching ready Audio sidecar")
-        audio = sidecar.evidence.audio
+            raise ValueError("canonical Visual and Audio target video provenance differs")
+        source_audio = Path(record.target_full_audio_path).expanduser().resolve(
+            strict=True
+        )
+        if _sha256_file(source_audio) != record.target_full_audio_sha256:
+            raise ValueError("canonical full-audio hash differs from manifest")
+        timeline = _probe_canonical_audio(source_audio, ffprobe=ffprobe)
         if (
-            audio.full_audio_path is None
-            or audio.sample_rate_hz is None
-            or audio.channels is None
+            abs(timeline.duration_seconds - record.target_duration_seconds)
+            > CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS
         ):
-            raise ValueError("JEA Audio sidecar provenance is incomplete")
-        source_audio = Path(audio.full_audio_path).expanduser().resolve(strict=True)
+            raise ValueError("canonical full-audio timeline differs from manifest")
+        sidecar_path: Path | None = None
+        if record.target_audio_binding_path is not None:
+            sidecar_path = Path(record.target_audio_binding_path).expanduser().resolve(
+                strict=True
+            )
+            if _sha256_file(sidecar_path) != record.target_audio_binding_sha256:
+                raise ValueError("canonical Audio binding hash differs from manifest")
+            sidecar = AudioBindingSidecar.model_validate_json(
+                sidecar_path.read_text(encoding="utf-8")
+            )
+            if sidecar.clip_uid != clip_uid:
+                raise ValueError("canonical Audio binding clip identity differs")
         targets.append(
             DiarizationTargetClip(
-                target_clip_uid=pair.target_clip_uid,
+                target_clip_uid=clip_uid,
                 target_video_path=str(video_path),
                 source_audio_path=str(source_audio),
                 source_audio_sha256=_sha256_file(source_audio),
-                source_sample_rate_hz=audio.sample_rate_hz,
-                source_channels=audio.channels,
-                source_frame_count=_pcm16_frame_count(
-                    source_audio,
-                    sample_rate=audio.sample_rate_hz,
-                    channels=audio.channels,
+                source_sample_rate_hz=timeline.sample_rate_hz,
+                source_channels=timeline.channels,
+                source_frame_count=timeline.frame_count,
+                target_audio_binding_path=(
+                    None if sidecar_path is None else str(sidecar_path)
                 ),
-                target_audio_binding_path=str(sidecar_path),
+                target_audio_binding_sha256=record.target_audio_binding_sha256,
                 visual_references=[
                     DiarizationVisualReference(
-                        entity_id=subject.target_entity_id,
-                        image_path=subject.target_visual_reference_path,
+                        entity_id=reference.entity_id,
+                        image_path=reference.artifact_path,
                     )
-                    for subject in pair.subjects
+                    for reference in visual.subject_references
+                    if reference.entity_id is not None
                 ],
             )
         )
-    return build_complete_diarization_inventory(
-        source_pairs_path=pairs_path,
+    manifest_sha256 = _sha256_file(manifest_path)
+    visual_sha256 = _sha256_file(visual_inventory_path)
+    fingerprint = _diarization_inventory_fingerprint(
+        source_pairs_sha256=None,
+        source_asr_inventory_fingerprint=None,
+        mode="production",
+        targets=targets,
+        source_inventory_kind="canonical_audio_manifest",
+        source_visual_inventory_sha256=visual_sha256,
+        source_canonical_audio_manifest_sha256=manifest_sha256,
+    )
+    return DiarizationInventory(
+        mode="production",
+        source_inventory_kind="canonical_audio_manifest",
+        source_visual_production_root=str(visual_root),
+        source_visual_inventory_path=str(visual_inventory_path),
+        source_visual_inventory_sha256=visual_sha256,
+        source_canonical_audio_manifest_path=str(manifest_path),
+        source_canonical_audio_manifest_sha256=manifest_sha256,
+        inventory_fingerprint=fingerprint,
+        source_target_count=len(targets),
+        selected_target_count=len(targets),
+        selection_mode="canonical_visual_target_inventory_v1",
+        bounded_selection_applied=False,
         targets=targets,
     )
 

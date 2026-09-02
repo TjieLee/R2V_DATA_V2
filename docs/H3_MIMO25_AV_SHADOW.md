@@ -17,9 +17,18 @@ production stages. It writes only `mimo25_av_reconcile_v3/` and
 
 MiMo never splits or deletes a DiariZen segment. Multiple vocal events can mark
 a segment as requiring acoustic refinement, but the authoritative segment and
-Qwen3-ASR text remain present. The first inventory scope is explicitly
-`current_diarization_asr_target_inventory`; `canonical_wide_coverage=false`, so
-this work does not resolve the separate canonical-wide inventory gap.
+Qwen3-ASR text remain present. The default inventory scope is
+`canonical_visual_target_inventory` with `canonical_wide_coverage=true` and
+exact Visual, canonical Audio, DiariZen, Final H3, and segment-evidence coverage.
+An explicit case manifest switches the scope to `explicit_case_subset` and sets
+canonical-wide coverage false.
+
+Each clip must have exactly one `pair_type="canonical"` Final H3 sample. That
+sample is the target-observation representative and uses the `visual_only`
+conditioning contract. Optional `in_pair` and `cross_pair` variants must carry
+identical target video, full audio, Visual references, instruction, and
+full-clip Audio semantics; all variant sample IDs remain in provenance, but
+they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 

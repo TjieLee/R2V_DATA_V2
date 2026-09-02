@@ -14,6 +14,7 @@ from pydantic import Field, model_validator
 from r2v_data_v2.h3.binding_audit import SpeakerBindingSegmentAudit
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
+    DiarizationInventory,
     RawDiarizationSegment,
 )
 from r2v_data_v2.h3.jea_audio_production import (
@@ -43,7 +44,7 @@ MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.3"
 MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.3"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.3"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
-MIMO25_INVENTORY_SCOPE = "current_diarization_asr_target_inventory"
+MIMO25_INVENTORY_SCOPE = "canonical_visual_target_inventory"
 
 
 def _compact_json(value: object) -> str:
@@ -206,12 +207,18 @@ class MimoCaseManifest(SchemaModel):
 
 class MimoInventory(SchemaModel):
     schema_version: Literal["r2v.h3.mimo25_inventory.3"] = MIMO25_INVENTORY_VERSION
-    inventory_scope: Literal["current_diarization_asr_target_inventory"] = (
-        MIMO25_INVENTORY_SCOPE
-    )
-    canonical_wide_coverage: Literal[False] = False
+    inventory_scope: Literal[
+        "current_diarization_asr_target_inventory",
+        "canonical_visual_target_inventory",
+        "explicit_case_subset",
+    ] = MIMO25_INVENTORY_SCOPE
+    canonical_wide_coverage: bool = True
     source_visual_inventory_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_canonical_audio_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_diarization_inventory_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     source_diarization_raw_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_diarization_bound_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_qwen3_asr_segments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -229,6 +236,8 @@ class MimoInventory(SchemaModel):
         if len(clip_ids) != len(set(clip_ids)):
             raise ValueError("MiMo inventory clip IDs must be unique")
         values = self.model_dump(mode="json", exclude={"inventory_fingerprint"})
+        if values["source_diarization_inventory_sha256"] is None:
+            values.pop("source_diarization_inventory_sha256")
         if self.inventory_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("MiMo inventory fingerprint is invalid")
         return self
@@ -289,10 +298,12 @@ class MimoRawResponse(SchemaModel):
 
 class MimoSummary(SchemaModel):
     schema_version: Literal["r2v.h3.mimo25_summary.3"] = MIMO25_SUMMARY_VERSION
-    inventory_scope: Literal["current_diarization_asr_target_inventory"] = (
-        MIMO25_INVENTORY_SCOPE
-    )
-    canonical_wide_coverage: Literal[False] = False
+    inventory_scope: Literal[
+        "current_diarization_asr_target_inventory",
+        "canonical_visual_target_inventory",
+        "explicit_case_subset",
+    ] = MIMO25_INVENTORY_SCOPE
+    canonical_wide_coverage: bool = True
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_artifact_hashes: dict[str, str]
     model: Literal["mimo-v2.5"] = MIMO25_MODEL
@@ -377,13 +388,18 @@ def _validate_h3_variant_observations(
 ) -> FinalH3SampleV2:
     if not samples:
         raise ValueError(f"MiMo H3 sample inventory is empty: {clip_uid}")
-    representative = samples[0]
+    canonical = [item for item in samples if item.pair_type == "canonical"]
+    if len(canonical) != 1:
+        raise ValueError(f"MiMo requires one canonical H3 base sample: {clip_uid}")
+    representative = canonical[0]
     if any(
         item.target_video != representative.target_video
         or item.target_full_audio_path != representative.target_full_audio_path
         or item.visual_references != representative.visual_references
         or item.r2v_instruction != representative.r2v_instruction
-        for item in samples[1:]
+        or item.full_clip_audio_semantics != representative.full_clip_audio_semantics
+        for item in samples
+        if item is not representative
     ):
         raise ValueError(f"MiMo H3 variants disagree on target observations: {clip_uid}")
     return representative
@@ -432,6 +448,7 @@ def build_mimo25_inventory(
     source_paths = {
         "visual_inventory": visual_production_root.resolve(strict=True) / "samples.jsonl",
         "canonical_audio_manifest": paths.audio / "canonical_clips.jsonl",
+        "diarization_inventory": paths.diarization / "inventory.json",
         "diarization_raw_segments": paths.diarization / "raw_segments.jsonl",
         "diarization_bound_segments": paths.diarization / "bound_segments.jsonl",
         "qwen3_asr_segments": paths.asr / "segments.jsonl",
@@ -445,6 +462,22 @@ def build_mimo25_inventory(
         CanonicalAudioClip.model_validate(row)
         for row in _read_jsonl(source_paths["canonical_audio_manifest"])
     ]
+    diarization_inventory = DiarizationInventory.model_validate_json(
+        source_paths["diarization_inventory"].read_text(encoding="utf-8")
+    )
+    if (
+        diarization_inventory.source_inventory_kind != "canonical_audio_manifest"
+        or diarization_inventory.selection_mode
+        != "canonical_visual_target_inventory_v1"
+        or diarization_inventory.source_canonical_audio_manifest_path is None
+        or Path(
+            diarization_inventory.source_canonical_audio_manifest_path
+        ).resolve(strict=True)
+        != source_paths["canonical_audio_manifest"].resolve(strict=True)
+        or diarization_inventory.source_canonical_audio_manifest_sha256
+        != sha256_file(source_paths["canonical_audio_manifest"])
+    ):
+        raise ValueError("MiMo DiariZen inventory is not canonical-rooted")
     raw = [
         RawDiarizationSegment.model_validate(row)
         for row in _read_jsonl(source_paths["diarization_raw_segments"])
@@ -466,7 +499,17 @@ def build_mimo25_inventory(
         for row in _read_jsonl(source_paths["h3_samples"])
     ]
     canonical_by_clip = {item.clip_uid: item for item in canonical}
-    if len(canonical_by_clip) != len(canonical):
+    visual_clip_ids = [item.identity.clip_uid for item in visual.canonical_clips]
+    diarization_clip_ids = [
+        item.target_clip_uid for item in diarization_inventory.targets
+    ]
+    if (
+        len(canonical_by_clip) != len(canonical)
+        or len(visual_clip_ids) != len(set(visual_clip_ids))
+        or len(diarization_clip_ids) != len(set(diarization_clip_ids))
+        or set(canonical_by_clip) != set(visual_clip_ids)
+        or set(canonical_by_clip) != set(diarization_clip_ids)
+    ):
         raise ValueError("canonical Audio manifest contains duplicate clips")
     raw_by_key = _index(raw, "target_clip_uid", "segment_id")
     bound_by_key = _index(bound, "target_clip_uid", "segment_id")
@@ -475,7 +518,16 @@ def build_mimo25_inventory(
     samples_by_clip: dict[str, list[FinalH3SampleV2]] = defaultdict(list)
     for sample in samples:
         samples_by_clip[sample.clip_uid].append(sample)
-    available_clip_ids = sorted(samples_by_clip)
+    canonical_h3_ids = [
+        sample.clip_uid for sample in samples if sample.pair_type == "canonical"
+    ]
+    if (
+        len(canonical_h3_ids) != len(set(canonical_h3_ids))
+        or set(canonical_h3_ids) != set(visual_clip_ids)
+        or set(samples_by_clip) != set(visual_clip_ids)
+    ):
+        raise ValueError("MiMo H3 inventory is not canonical-wide")
+    available_clip_ids = visual_clip_ids
     if case_manifest_path is not None or case_manifest is not None:
         if case_manifest is not None:
             manifest = case_manifest
@@ -529,11 +581,7 @@ def build_mimo25_inventory(
                     image_sha256=sha256_file(artifact),
                 )
             )
-        variant = (
-            "target_voice_reference"
-            if representative.pair_type == "in_pair"
-            else "cross_voice_reference"
-        )
+        variant = "visual_only"
         reference_subjects = build_reference_contract(
             representative, variant
         ).subjects
@@ -627,10 +675,19 @@ def build_mimo25_inventory(
     source_hashes = {name: sha256_file(path) for name, path in source_paths.items()}
     values = {
         "schema_version": MIMO25_INVENTORY_VERSION,
-        "inventory_scope": MIMO25_INVENTORY_SCOPE,
-        "canonical_wide_coverage": False,
+        "inventory_scope": (
+            "explicit_case_subset"
+            if case_manifest_path is not None or case_manifest is not None
+            else MIMO25_INVENTORY_SCOPE
+        ),
+        "canonical_wide_coverage": (
+            case_manifest_path is None and case_manifest is None
+        ),
         "source_visual_inventory_sha256": source_hashes["visual_inventory"],
         "source_canonical_audio_manifest_sha256": source_hashes["canonical_audio_manifest"],
+        "source_diarization_inventory_sha256": source_hashes[
+            "diarization_inventory"
+        ],
         "source_diarization_raw_segments_sha256": source_hashes["diarization_raw_segments"],
         "source_diarization_bound_segments_sha256": source_hashes["diarization_bound_segments"],
         "source_qwen3_asr_segments_sha256": source_hashes["qwen3_asr_segments"],
@@ -787,6 +844,8 @@ def run_mimo25_av_reconcile(
         _write_jsonl(temporary / "records.jsonl", records)
         _write_jsonl(temporary / "failures.jsonl", failures)
         summary = MimoSummary(
+            inventory_scope=inventory.inventory_scope,
+            canonical_wide_coverage=inventory.canonical_wide_coverage,
             inventory_fingerprint=inventory.inventory_fingerprint,
             source_artifact_hashes={
                 "visual_inventory": inventory.source_visual_inventory_sha256,
@@ -796,6 +855,15 @@ def run_mimo25_av_reconcile(
                 "qwen3_asr_segments": inventory.source_qwen3_asr_segments_sha256,
                 "binding_audit_segments": inventory.source_binding_audit_segments_sha256,
                 "h3_samples": inventory.source_h3_samples_sha256,
+                **(
+                    {}
+                    if inventory.source_diarization_inventory_sha256 is None
+                    else {
+                        "diarization_inventory": (
+                            inventory.source_diarization_inventory_sha256
+                        )
+                    }
+                ),
             },
             clip_count=len(records),
             ready_count=sum(item.status == "ready" for item in records),

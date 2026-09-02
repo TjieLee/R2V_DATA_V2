@@ -1080,8 +1080,18 @@ def test_full_manifest_preserves_all_pair_samples_and_maps_conditioning(
             "pair_type": "cross_pair",
         }
     )
+    canonical_sample = in_sample.model_copy(
+        update={
+            "sample_id": "clip-1/canonical",
+            "pair_id": "canonical/clip-1",
+            "pair_type": "canonical",
+            "subject_voices": [],
+        }
+    )
     production = tmp_path / "production"
-    samples_path = _write_samples(production, [in_sample, cross_sample])
+    samples_path = _write_samples(
+        production, [canonical_sample, in_sample, cross_sample]
+    )
     before = samples_path.read_bytes()
     manifest_path = tmp_path / "all.jsonl"
     cases = build_qwen38_full_manifest(
@@ -1090,14 +1100,16 @@ def test_full_manifest_preserves_all_pair_samples_and_maps_conditioning(
         conditioning_policy="sample_pair_type",
     )
     assert [item.sample_id for item in cases] == [
+        canonical_sample.sample_id,
         in_sample.sample_id,
         cross_sample.sample_id,
     ]
     assert [item.conditioning_variant for item in cases] == [
+        "visual_only",
         "target_voice_reference",
         "cross_voice_reference",
     ]
-    assert all("not canonical-wide coverage" in (item.note or "") for item in cases)
+    assert all("canonical-wide" in (item.note or "") for item in cases)
     assert samples_path.read_bytes() == before
 
 
@@ -1105,7 +1117,14 @@ def test_full_manifest_fails_closed_without_required_voice_contract(
     tmp_path: Path,
 ) -> None:
     sample = _sample(tmp_path).model_copy(update={"subject_voices": []})
-    samples_path = _write_samples(tmp_path / "production", [sample])
+    canonical = sample.model_copy(
+        update={
+            "sample_id": "clip-1/canonical",
+            "pair_id": "canonical/clip-1",
+            "pair_type": "canonical",
+        }
+    )
+    samples_path = _write_samples(tmp_path / "production", [canonical, sample])
     with pytest.raises(ValueError, match="cannot satisfy target_voice_reference"):
         build_qwen38_full_manifest(
             h3_samples_path=samples_path,

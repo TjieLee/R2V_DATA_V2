@@ -15,6 +15,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from r2v_data_v2.h3.audio_backends import FFmpegAudioMediaBackend
 from r2v_data_v2.h3.audio_production import atomic_replace_stage
+from r2v_data_v2.h3.binding_audit import run_speaker_binding_audit
 from r2v_data_v2.h3.diarization_binding import run_diarization_binding_pilot
 from r2v_data_v2.h3.jea_audio_production import (
     JEAOccurrenceEmbedding,
@@ -49,6 +50,7 @@ _STAGES = (
     "embedding",
     "pair",
     "diarization",
+    "binding-audit",
     "qwen3-asr",
     "h3",
 )
@@ -61,6 +63,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--audio-semantics-root", type=Path)
     parser.add_argument("--stages", default=",".join(_STAGES))
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -313,10 +316,12 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ).model_dump(mode="json")
     if "diarization" in stages:
         _require_stage_artifact(
-            "diarization", "pair", paths.pairs / "in_pairs.jsonl"
+            "diarization", "canonical audio", paths.audio / "canonical_clips.jsonl"
         )
         inventory = build_jea_diarization_inventory(
-            pairs_root=paths.pairs.resolve(strict=True)
+            visual_inventory=visual,
+            audio_root=paths.audio.resolve(strict=True),
+            ffprobe=arguments.ffprobe,
         )
         backend, diagnostics_root = _runtime_backend(output_root=paths.diarization)
         try:
@@ -338,6 +343,16 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             "summary": summary.model_dump(mode="json"),
             "readable": readable.model_dump(mode="json"),
         }
+    if "binding-audit" in stages:
+        _require_stage_artifact(
+            "binding-audit",
+            "diarization",
+            paths.diarization / "inventory.json",
+        )
+        stage_results["binding-audit"] = run_speaker_binding_audit(
+            audio_production_root=paths.root,
+            overwrite=arguments.overwrite,
+        ).model_dump(mode="json")
     if "qwen3-asr" in stages:
         _require_stage_artifact(
             "qwen3-asr",
@@ -352,19 +367,28 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
         ).model_dump(mode="json")
     if "h3" in stages:
         for prerequisite, path in (
-            ("pair", paths.pairs / "in_pairs.jsonl"),
+            ("canonical audio", paths.audio / "canonical_clips.jsonl"),
+            ("diarization", paths.diarization / "inventory.json"),
             ("diarization", paths.diarization / "bound_segments.jsonl"),
             ("binding-audit", paths.root / "binding_audit_v1" / "segments.jsonl"),
             ("qwen3-asr", paths.asr / "segments.jsonl"),
         ):
             _require_stage_artifact("h3", prerequisite, path)
+        semantics_root = arguments.audio_semantics_root
+        default_semantics_root = paths.root / "audio_semantics_specialized_v1"
+        if semantics_root is None and (
+            default_semantics_root / "assembled/records.jsonl"
+        ).is_file():
+            semantics_root = default_semantics_root
         stage_results["h3"] = render_jea_final_samples(
             visual_inventory=visual,
-            pairs_root=paths.pairs,
+            audio_root=paths.audio,
+            pairs_root=paths.pairs if paths.pairs.exists() else None,
             diarization_root=paths.diarization,
             binding_audit_root=paths.root / "binding_audit_v1",
             qwen3_asr_root=paths.asr,
             output_root=paths.h3,
+            audio_semantics_root=semantics_root,
             overwrite=arguments.overwrite,
         ).model_dump(mode="json")
     result = {**plan, "stage_results": stage_results}

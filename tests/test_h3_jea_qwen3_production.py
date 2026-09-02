@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import subprocess
@@ -15,10 +16,12 @@ import r2v_data_v2.h3.jea_audio_production as jea_audio
 import tools.backfill_h3_canonical_audio as canonical_audio_backfill
 import tools.run_h3_jea_production as jea_cli
 import tools.run_h3_qwen3_asr as qwen_cli
+from r2v_data_v2.h3.diarization_binding import DiarizationInventory
 from r2v_data_v2.h3.jea_audio_production import (
     CanonicalAudioClip,
     JEAOccurrenceEmbedding,
     audio_binding_path,
+    build_jea_diarization_inventory,
     build_jea_pairs,
     full_audio_path,
     jea_production_paths,
@@ -55,6 +58,10 @@ class _StageResult:
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
         return dict(self.values)
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -735,6 +742,125 @@ def test_canonical_audio_manifest_covers_subject_and_no_subject_clips(
     )
     assert calls == []
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_canonical_diarization_inventory_retains_all_visual_clips(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": clip_uid,
+                "shard_id": f"shard-{clip_uid}",
+                "clip_relative_path": f"show/work/{clip_uid}.mp4",
+                "source_relative_path": f"show/work/{clip_uid}.mkv",
+            }
+            for clip_uid in ("clip-a", "clip-b", "clip-c")
+        ],
+    )
+    audio_root = tmp_path / "audio-production/audio"
+    binding_clip = inventory.canonical_clips[0]
+    binding_path = audio_binding_path(audio_root, binding_clip.identity)
+    binding_path.parent.mkdir(parents=True)
+    binding = AudioBindingSidecar(
+        clip_uid=binding_clip.identity.clip_uid,
+        source_run_root=inventory.visual_runs_root,
+        source_video_path=binding_clip.sample.target_video,
+        status="ineligible",
+        reason="fixture has no ready entity binding",
+        evidence=AudioBindingEvidence(
+            clip_uid=binding_clip.identity.clip_uid,
+            audio=AudioTrackMetadata(
+                status="ready",
+                source_video_path=binding_clip.sample.target_video,
+                full_audio_path=str(audio_root / "binding-source.wav"),
+                duration_seconds=0.1,
+                sample_rate_hz=16000,
+                channels=1,
+            ),
+        ),
+    )
+    binding_path.write_text(binding.model_dump_json(), encoding="utf-8")
+    canonical = []
+    for clip in inventory.canonical_clips:
+        audio = full_audio_path(audio_root, clip.identity)
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(f"flac:{clip.identity.clip_uid}".encode())
+        has_binding = clip.identity.clip_uid == binding_clip.identity.clip_uid
+        video = Path(clip.sample.target_video).resolve(strict=True)
+        canonical.append(
+            CanonicalAudioClip(
+                **clip.identity.model_dump(mode="python"),
+                target_video_path=str(video),
+                target_video_sha256=_file_sha256(video),
+                target_full_audio_path=str(audio),
+                target_full_audio_sha256=_file_sha256(audio),
+                target_duration_seconds=0.1,
+                subject_reference_count=len(clip.subject_references),
+                target_audio_binding_path=(str(binding_path) if has_binding else None),
+                target_audio_binding_sha256=(
+                    _file_sha256(binding_path) if has_binding else None
+                ),
+            ).model_dump(mode="json")
+        )
+    _jsonl(audio_root / "canonical_clips.jsonl", canonical)
+    commands: list[list[str]] = []
+
+    def fake_ffprobe(command: list[str], **_: object) -> SimpleNamespace:
+        commands.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "streams": [
+                        {
+                            "sample_rate": "16000",
+                            "channels": 1,
+                            "duration": "0.100000",
+                            "duration_ts": 1600,
+                            "time_base": "1/16000",
+                        }
+                    ],
+                    "format": {"duration": "0.100000"},
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(jea_audio.subprocess, "run", fake_ffprobe)
+
+    result = build_jea_diarization_inventory(
+        visual_inventory=inventory,
+        audio_root=audio_root,
+        ffprobe="/fixture/ffprobe",
+    )
+
+    assert [item.target_clip_uid for item in result.targets] == [
+        "clip-a",
+        "clip-b",
+        "clip-c",
+    ]
+    assert result.source_inventory_kind == "canonical_audio_manifest"
+    assert result.selection_mode == "canonical_visual_target_inventory_v1"
+    assert result.source_pairs_path is None
+    assert result.source_pairs_sha256 is None
+    assert result.source_target_count == result.selected_target_count == 3
+    assert [item.source_frame_count for item in result.targets] == [1600] * 3
+    assert result.targets[0].target_audio_binding_path == str(binding_path)
+    assert result.targets[1].target_audio_binding_path is None
+    assert result.targets[2].target_audio_binding_path is None
+    assert all(item.source_sample_rate_hz == 16000 for item in result.targets)
+    assert all(item.source_channels == 1 for item in result.targets)
+    assert all(item.visual_references for item in result.targets)
+    assert len(commands) == 3
+    assert all(command[0] == "/fixture/ffprobe" for command in commands)
+
+    invalid = result.model_dump(mode="json")
+    invalid["targets"][0]["target_audio_binding_sha256"] = None
+    with pytest.raises(ValueError, match="binding path/hash must be paired"):
+        DiarizationInventory.model_validate(invalid)
 
 
 def test_canonical_audio_backfill_uses_official_audio_stage_root(
@@ -1518,7 +1644,7 @@ def test_multi_subject_matching_maximizes_complete_face_assignment(
 
 
 @pytest.mark.parametrize("input_layout", ["compacted", "single_run"])
-def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
+def test_cli_wires_all_eight_stages_for_both_visual_layouts_without_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     input_layout: str,
@@ -1548,8 +1674,6 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         (run_root / "run.json").write_text("{}")
     output = tmp_path / "audio-production"
     binding_audit = output / "binding_audit_v1"
-    binding_audit.mkdir(parents=True)
-    (binding_audit / "segments.jsonl").write_text("{}\n", encoding="utf-8")
     calls: list[str] = []
 
     monkeypatch.setattr(jea_cli, "load_visual_production_inventory", lambda **_: inventory)
@@ -1566,6 +1690,7 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         root = Path(kwargs["output_root"])
         root.mkdir(parents=True)
         (root / "summary.json").write_text("{}")
+        (root / "canonical_clips.jsonl").write_text("{}\n")
         return _StageResult(clip_count=2)
 
     def primary_stage(**kwargs: object) -> _StageResult:
@@ -1629,6 +1754,19 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         "publish_readable_diarization_metadata",
         lambda **_: _StageResult(segment_count=2),
     )
+
+    def binding_audit_stage(**kwargs: object) -> _StageResult:
+        calls.append("binding-audit")
+        assert kwargs["audio_production_root"] == output
+        binding_audit.mkdir(parents=True)
+        (binding_audit / "segments.jsonl").write_text("{}\n", encoding="utf-8")
+        return _StageResult(segment_count=2)
+
+    monkeypatch.setattr(
+        jea_cli,
+        "run_speaker_binding_audit",
+        binding_audit_stage,
+    )
     qwen_environment = tmp_path / "qwen"
     qwen_python = qwen_environment / "bin/python"
     qwen_python.parent.mkdir(parents=True)
@@ -1648,11 +1786,15 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         (root / "summary.json").write_text(
             json.dumps(
                 {
+                    "schema_version": "r2v.h3.qwen3_asr_summary.2",
                     "segment_count": 2,
                     "transcribed_count": 2,
                     "empty_count": 0,
                     "failed_count": 0,
                     "clip_count": 2,
+                    "source_target_clip_count": 2,
+                    "clips_with_diarization_segments": 2,
+                    "clips_without_diarization_segments": 0,
                     "language_counts": {},
                 }
             ),
@@ -1688,6 +1830,7 @@ def test_cli_wires_all_seven_stages_for_both_visual_layouts_without_models(
         "embedding",
         "pair",
         "diarization",
+        "binding-audit",
         "qwen3-asr",
         "h3",
     ]
@@ -1813,11 +1956,15 @@ def test_jea_qwen_stage_launches_one_isolated_subprocess_and_reads_summary(
         (asr / "summary.json").write_text(
             json.dumps(
                 {
+                    "schema_version": "r2v.h3.qwen3_asr_summary.2",
                     "segment_count": 3,
                     "transcribed_count": 2,
                     "empty_count": 1,
                     "failed_count": 0,
                     "clip_count": 1,
+                    "source_target_clip_count": 1,
+                    "clips_with_diarization_segments": 1,
+                    "clips_without_diarization_segments": 0,
                     "language_counts": {"zh": 2},
                 }
             ),
@@ -2070,6 +2217,31 @@ def _write_readable_diarization_artifacts(
     identity_by_clip = {
         item.identity.clip_uid: item.identity for item in inventory.clips
     }
+    source_audio_by_clip = {
+        str(item["target_clip_uid"]): str(item["source_audio_path"])
+        for item in raw_segments
+    }
+    video_by_clip = {
+        item.identity.clip_uid: item.sample.target_video for item in inventory.clips
+    }
+    _jsonl(
+        diarization_root / "readable_targets.jsonl",
+        [
+            {
+                **identity.model_dump(mode="json"),
+                "schema_version": "r2v.h3.jea_diarization_target.1",
+                "source_audio_path": source_audio_by_clip.get(
+                    clip_uid,
+                    f"/unused/{clip_uid}.flac",
+                ),
+                "source_sample_rate_hz": 16000,
+                "target_video_path": video_by_clip[clip_uid],
+                "target_audio_binding_path": None,
+                "target_audio_binding_sha256": None,
+            }
+            for clip_uid, identity in identity_by_clip.items()
+        ],
+    )
     bound_by_key = {
         (str(item["target_clip_uid"]), str(item["segment_id"])): item
         for item in bound_segments
@@ -2200,6 +2372,9 @@ def test_qwen3_consumes_readable_diarization_without_visual_inventory(
     )
 
     assert summary.segment_count == 1
+    assert summary.source_target_clip_count == 1
+    assert summary.clips_with_diarization_segments == 1
+    assert summary.clips_without_diarization_segments == 0
     assert loader_paths == [source_audio]
     waveform, sample_rate = model.calls[0]["audio"]
     np.testing.assert_array_equal(waveform, np.asarray([2, 3, 4], dtype=np.float32))
@@ -2212,6 +2387,75 @@ def test_qwen3_consumes_readable_diarization_without_visual_inventory(
     assert row["speaker_cluster_id"] == "speaker_1"
     assert row["entity_id"] == "entity_1"
     assert row["entity_occurrence_id"] == "clip-readable/entity_1"
+
+
+def test_qwen3_tracks_no_speech_canonical_targets_without_fake_rows(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        tmp_path,
+        [
+            {
+                "clip_uid": clip_uid,
+                "shard_id": f"shard-{clip_uid}",
+                "clip_relative_path": f"show/collection/{clip_uid}.mp4",
+                "source_relative_path": f"show/collection/{clip_uid}.mkv",
+            }
+            for clip_uid in ("clip-speech", "clip-empty")
+        ],
+    )
+    diarization = tmp_path / "diarization"
+    diarization.mkdir()
+    source_audio = tmp_path / "source.flac"
+    source_audio.write_bytes(b"source audio")
+    raw = [
+        {
+            "target_clip_uid": "clip-speech",
+            "segment_id": "segment_0001",
+            "speaker_cluster_id": "speaker_1",
+            "start_time": 0.0,
+            "end_time": 0.0001875,
+            "source_start_sample": 0,
+            "source_end_sample": 3,
+            "source_audio_path": str(source_audio),
+            "source_sample_rate_hz": 16000,
+        }
+    ]
+    bound = [
+        {
+            **raw[0],
+            "entity_id": None,
+            "entity_occurrence_id": None,
+        }
+    ]
+    _jsonl(diarization / "raw_segments.jsonl", raw)
+    _jsonl(diarization / "bound_segments.jsonl", bound)
+    _write_readable_diarization_artifacts(
+        diarization_root=diarization,
+        inventory=inventory,
+        raw_segments=raw,
+        bound_segments=bound,
+    )
+    backend = Qwen3ASRBackend(
+        Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+        model_factory=lambda *_args, **_kwargs: _FakeQwenModel(),
+    )
+
+    summary = run_qwen3_asr(
+        diarization_root=diarization,
+        source_visual_production_root=inventory.visual_production_root,
+        output_root=tmp_path / "asr",
+        backend=backend,
+        audio_loader=lambda _path: (np.arange(3, dtype=np.float32), 16000),
+    )
+
+    rows = (tmp_path / "asr/segments.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    assert json.loads(rows[0])["clip_uid"] == "clip-speech"
+    assert summary.source_target_clip_count == 2
+    assert summary.clips_with_diarization_segments == 1
+    assert summary.clips_without_diarization_segments == 1
+    assert summary.clip_count == 1
 
 
 def test_qwen3_readable_raw_bound_mismatch_fails_closed(tmp_path: Path) -> None:

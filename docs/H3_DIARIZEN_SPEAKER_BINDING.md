@@ -104,7 +104,8 @@ unioned speaker time, not a naive sum over overlapping segments.
 
 ## Versioned Artifacts
 
-- `r2v.h3.diarization_inventory.2`
+- `r2v.h3.diarization_inventory.3` for active canonical-wide JEA production
+- `r2v.h3.diarization_inventory.2` for the retained legacy pair/pilot path
 - `r2v.h3.diarization_segment.2`
 - `r2v.h3.diarization_cluster_binding.2`
 - `r2v.h3.diarization_bound_segment.1`
@@ -115,6 +116,15 @@ unioned speaker time, not a naive sum over overlapping segments.
 `speaker_cluster_id` is always clip-local. The stage performs no cross-clip or
 transitive speaker clustering. Raw segments use integer half-open source sample
 ranges and retain overlapping speakers.
+
+Active JEA production roots the `.3` inventory in the exact canonical Visual
+inventory and `audio/canonical_clips.jsonl`, not in pairs. Every canonical clip
+is a target, and its actual 16 kHz mono canonical FLAC extent is established by
+ffprobe. An Audio binding sidecar is optional evidence: a missing or non-ready
+sidecar supplies no frozen anchors, so resulting clusters remain unbound rather
+than dropping the clip. Empty DiariZen output is a valid empty clip result;
+backend failure remains distinct and fail-closed. The pair-rooted commands below
+describe the retained historical pilot/legacy production entry point only.
 
 The pilot inventory reuses the exact ordered 20 targets in
 `$AUDIO_RUN_ROOT/asr_pilot20/inventory.json`. It validates that the source is
@@ -186,9 +196,10 @@ per selected target clip. Worker diagnostics go to stderr, never protocol
 stdout. A requested CUDA device never falls back to CPU.
 
 The official pipeline reads the supplied audio path with `torchaudio`, selects
-the first channel, and preserves its time coordinate. R2V passes the immutable
-canonical Audio V1 PCM16 WAV directly, verifies its hash before inference, and
-records `official_torchaudio_first_channel_passthrough_v1`. It performs no
+the first channel, and preserves its time coordinate. The historical pilot
+passes its immutable Audio V1 PCM16 WAV. Active JEA canonical-wide production
+passes the immutable canonical 16 kHz mono FLAC from
+`audio/canonical_clips.jsonl`; both paths verify the source hash and perform no
 denoising, enhancement, interpolation, or timestamp shift.
 
 ## Server Staging Reference

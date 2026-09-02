@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from r2v_data_v2.h3.diarization_binding import (
     BoundDiarizationSegment,
@@ -30,7 +30,19 @@ class JEAReadableDiarizationTarget(SchemaModel):
     source_audio_path: str
     source_sample_rate_hz: int = Field(gt=0)
     target_video_path: str
-    target_audio_binding_path: str
+    target_audio_binding_path: str | None = None
+    target_audio_binding_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> JEAReadableDiarizationTarget:
+        if self.target_audio_binding_path is None and (
+            self.target_audio_binding_sha256 is not None
+        ):
+            raise ValueError("readable Audio binding hash requires a path")
+        return self
 
 
 class JEAReadableDiarizationSegment(SchemaModel):
@@ -122,8 +134,13 @@ def publish_readable_diarization_metadata(
     }:
         raise ValueError("DiariZen raw and bound segment inventories differ")
     identity_by_clip = {
-        item.identity.clip_uid: item.identity for item in visual_inventory.clips
+        item.identity.clip_uid: item.identity
+        for item in visual_inventory.canonical_clips
     }
+    if set(identity_by_clip) != {
+        target.target_clip_uid for target in inventory.targets
+    }:
+        raise ValueError("readable DiariZen targets differ from canonical Visual clips")
     targets: list[JEAReadableDiarizationTarget] = []
     for target in inventory.targets:
         identity = identity_by_clip[target.target_clip_uid]
@@ -134,6 +151,7 @@ def publish_readable_diarization_metadata(
                 source_sample_rate_hz=target.source_sample_rate_hz,
                 target_video_path=target.target_video_path,
                 target_audio_binding_path=target.target_audio_binding_path,
+                target_audio_binding_sha256=target.target_audio_binding_sha256,
             )
         )
     segments: list[JEAReadableDiarizationSegment] = []

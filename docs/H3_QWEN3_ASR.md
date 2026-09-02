@@ -115,14 +115,14 @@ running subject binding only for `.clips`. The canonical manifest publishes one
 No-subject rows have null binding path/hash instead of a fabricated empty
 sidecar. Its summary requires the Visual and Audio canonical counts to match.
 
-Pair rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
+Canonical Audio rows, DiariZen rows, Qwen rows, and final samples carry `clip_uid`,
 `clip_display_path`, `media_collection_relpath`, `media_collection_name`,
 `episode_name`, `clip_name`, and `shard_id`. Pair review pages sort readable
 paths first.
 
-The active resolved-path output contracts are `r2v.h3.final_sample.3` and
-`r2v.h3.final_summary.4`; the summary declares
-`final_sample_schema_version=r2v.h3.final_sample.3`. Final H3 samples publish
+The active resolved-path output contracts are `r2v.h3.final_sample.4` and
+`r2v.h3.final_summary.5`; the summary declares
+`final_sample_schema_version=r2v.h3.final_sample.4`. Final H3 samples publish
 media paths with explicit ownership semantics:
 
 - `target_video` is the directly readable processed target-video path.
@@ -248,7 +248,11 @@ failures are isolated; inspect `$AUDIO_PRODUCTION_ROOT/.embedding_worker_diagnos
 before running `pair` when `face_embedding_available_count` unexpectedly equals
 zero.
 
-Run each stage explicitly from the normal repository environment. For the
+Run each stage explicitly from the normal repository environment. DiariZen is
+rooted in `audio/canonical_clips.jsonl` plus the canonical Visual inventory;
+primary voice and pair availability do not select its targets. Audio bindings
+are optional identity evidence, so a missing or non-ready sidecar produces
+unbound DiariZen segments rather than dropping the clip. For the
 `qwen3-asr` stage, the JEA orchestrator launches exactly one child process with
 `$QWEN3_ASR_ENV/bin/python`; that child loads Qwen once and processes all
 readable DiariZen segments. Do not launch the all-stage orchestrator with the
@@ -291,20 +295,25 @@ export R2V_PYTHON=/mnt/workspace/litengjie/data/R2V_DATA_V2/.venv/bin/python
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --stages qwen3-asr
-
-"$R2V_PYTHON" tools/audit_h3_speaker_bindings.py \
-  --audio-production-root "$AUDIO_PRODUCTION_ROOT"
+  --stages binding-audit
 
 "$R2V_PYTHON" tools/run_h3_jea_production.py \
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
-  --stages h3
+  --stages qwen3-asr
+
+"$R2V_PYTHON" tools/run_h3_jea_production.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --stages h3 \
+  --audio-semantics-root \
+    "$AUDIO_PRODUCTION_ROOT/audio_semantics_specialized_v1"
 ```
 
 The active order is `audio -> primary-voice -> embedding -> pair ->
-diarization -> qwen3-asr -> binding_audit_v1 -> h3`. The binding audit remains
+diarization -> binding-audit -> qwen3-asr -> h3`. The binding audit remains
 the existing model-free sidecar rather than a new production inference stage;
 the final renderer requires its canonical segment evidence. Every stage reads
 only its canonical upstream artifacts. Existing stage directories are not
@@ -339,9 +348,17 @@ official JEA layout and publishes only under its `audio/` child, including
 `audio/canonical_clips.jsonl` and `audio/full_audio/`.
 
 Specialized clip-level audio semantics reads `audio/canonical_clips.jsonl` and
-does not use Qwen3-ASR as an admission dependency. DiariZen speaker clusters are
-an optional subset overlay. The future exact Visual/Audio clip-level join key is
-`clip_uid`, with one specialized assembled record per Visual canonical clip.
+does not use Qwen3-ASR as an admission dependency. It publishes one assembled
+record per Visual canonical clip. The final renderer validates exact semantics
+coverage when that root is supplied and projects the record into the
+backend-neutral `full_clip_audio_semantics` field; raw caption text is not
+published. The exact Visual/Audio clip-level join key is `clip_uid`.
+
+Qwen3-ASR inventory and summary contract `.2` report
+`source_target_clip_count`, `clips_with_diarization_segments`, and
+`clips_without_diarization_segments`. No-speech canonical clips receive no fake
+ASR row and still produce canonical Final H3 samples with an empty
+`speech_segments` list.
 
 ## Model-free Qwen3 ASR human review
 

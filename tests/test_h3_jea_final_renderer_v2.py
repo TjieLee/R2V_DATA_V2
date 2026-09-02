@@ -10,10 +10,17 @@ from r2v_data_v2.h3.binding_audit import (
     SpeakerBindingAuditSummary,
     SpeakerBindingSegmentAudit,
 )
-from r2v_data_v2.h3.diarization_binding import BoundDiarizationSegment
+from r2v_data_v2.h3.diarization_binding import (
+    BoundDiarizationSegment,
+    DiarizationClipResult,
+    DiarizationInventory,
+    DiarizationTargetClip,
+)
 from r2v_data_v2.h3.jea_audio_production import (
+    CanonicalAudioClip,
     JEAOccurrenceEmbedding,
     build_jea_pairs,
+    full_audio_path,
 )
 from r2v_data_v2.h3.jea_final_renderer import (
     FinalH3SampleV2,
@@ -24,6 +31,17 @@ from r2v_data_v2.h3.jea_final_renderer import (
 from r2v_data_v2.h3.qwen3_asr import (
     Qwen3ASRConfiguration,
     Qwen3ASRSegment,
+)
+from r2v_data_v2.h3.specialized_audio_semantics import (
+    SpecializedAudioSemanticsRecord,
+    SpecializedBackendProvenance,
+)
+from r2v_data_v2.h3.specialized_audio_semantics import (
+    _compact_json as _specialized_compact_json,
+)
+from r2v_data_v2.h3.target_audio_caption_contract import (
+    TargetSpeakerDelivery,
+    TemporalAudioEvent,
 )
 from r2v_data_v2.h3.visual_production_source import (
     NormalizedVisualReference,
@@ -191,6 +209,23 @@ def _visual_inventory(tmp_path: Path) -> VisualProductionInventory:
     )
 
 
+def _canonical_wide_visual_inventory(tmp_path: Path) -> VisualProductionInventory:
+    base = _visual_inventory(tmp_path)
+    clip_c = _visual_clip(tmp_path, "clip-c", "episode_c_0003")
+    clips = [*base.canonical_clips, clip_c]
+    return base.model_copy(
+        update={
+            "canonical_sample_count": len(clips),
+            "eligible_clip_count": len(clips),
+            "eligible_subject_occurrence_count": len(clips),
+            "media_collection_clip_counts": {"节目/集合": len(clips)},
+            "shard_count": len(clips),
+            "canonical_clips": clips,
+            "clips": clips,
+        }
+    )
+
+
 def _occurrences(inventory: VisualProductionInventory) -> list[JEAOccurrenceEmbedding]:
     return [
         JEAOccurrenceEmbedding(
@@ -231,6 +266,8 @@ def _sha256(path: Path) -> str:
 def _write_binding_audit(
     tmp_path: Path,
     bound: list[BoundDiarizationSegment],
+    *,
+    clip_count: int | None = None,
 ) -> Path:
     root = tmp_path / "binding_audit_v1"
     root.mkdir()
@@ -300,11 +337,16 @@ def _write_binding_audit(
         source_audio_production_root=str(tmp_path),
         source_diarization_root=str(tmp_path / "diarization"),
         source_artifact_sha256={
-            "bound_segments": _sha256(tmp_path / "diarization/bound_segments.jsonl")
+            "bound_segments": _sha256(tmp_path / "diarization/bound_segments.jsonl"),
+            "inventory": _sha256(tmp_path / "diarization/inventory.json"),
         },
         audio_binding_input_set_sha256="a" * 64,
         lr_asd_native_input_set_sha256="b" * 64,
-        clip_count=len({item.target_clip_uid for item in bound}),
+        clip_count=(
+            len({item.target_clip_uid for item in bound})
+            if clip_count is None
+            else clip_count
+        ),
         cluster_count=len(cluster_statuses),
         segment_count=len(segments),
         candidate_mapped_count=status_counts["candidate_mapped"],
@@ -343,6 +385,220 @@ def _write_binding_audit(
         encoding="utf-8",
     )
     return root
+
+
+def _write_canonical_sources(
+    tmp_path: Path,
+    inventory: VisualProductionInventory,
+    *,
+    clips_with_segments: set[str],
+) -> None:
+    canonical = []
+    targets = []
+    results = []
+    for clip in inventory.canonical_clips:
+        clip_uid = clip.identity.clip_uid
+        audio = full_audio_path(tmp_path / "audio", clip.identity)
+        audio.parent.mkdir(parents=True, exist_ok=True)
+        audio.write_bytes(f"canonical-audio:{clip_uid}".encode())
+        video = Path(clip.sample.target_video).resolve(strict=True)
+        canonical.append(
+            CanonicalAudioClip(
+                **clip.identity.model_dump(mode="python"),
+                target_video_path=str(video),
+                target_video_sha256=_sha256(video),
+                target_full_audio_path=str(audio),
+                target_full_audio_sha256=_sha256(audio),
+                target_duration_seconds=0.1,
+                subject_reference_count=len(clip.subject_references),
+            )
+        )
+        targets.append(
+            DiarizationTargetClip(
+                target_clip_uid=clip_uid,
+                target_video_path=str(video),
+                source_audio_path=str(audio),
+                source_audio_sha256=_sha256(audio),
+                source_sample_rate_hz=16000,
+                source_channels=1,
+                source_frame_count=1600,
+                visual_references=[],
+            )
+        )
+        results.append(
+            DiarizationClipResult(
+                target_clip_uid=clip_uid,
+                status="ready" if clip_uid in clips_with_segments else "empty",
+                backend_called=True,
+                raw_segment_count=1 if clip_uid in clips_with_segments else 0,
+                speaker_cluster_count=1 if clip_uid in clips_with_segments else 0,
+                legacy_bound_interval_count=0,
+                legacy_coalesced_bound_turn_count=0,
+                legacy_lr_asd_bound_samples=0,
+                usable_direct_anchor_samples=0,
+                contested_anchor_samples=0,
+                unmatched_anchor_samples=0,
+                diarization_segment_durations=([0.1] if clip_uid in clips_with_segments else []),
+                legacy_bound_turn_durations=[],
+            )
+        )
+    _jsonl(tmp_path / "audio/canonical_clips.jsonl", canonical)
+    diarization = DiarizationInventory(
+        mode="production",
+        source_inventory_kind="canonical_audio_manifest",
+        source_visual_production_root=inventory.visual_production_root,
+        source_visual_inventory_path=str(tmp_path / "samples.jsonl"),
+        source_visual_inventory_sha256="a" * 64,
+        source_canonical_audio_manifest_path=str(
+            tmp_path / "audio/canonical_clips.jsonl"
+        ),
+        source_canonical_audio_manifest_sha256=_sha256(
+            tmp_path / "audio/canonical_clips.jsonl"
+        ),
+        inventory_fingerprint="b" * 64,
+        source_target_count=len(targets),
+        selected_target_count=len(targets),
+        selection_mode="canonical_visual_target_inventory_v1",
+        bounded_selection_applied=False,
+        targets=targets,
+    )
+    (tmp_path / "diarization").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "diarization/inventory.json").write_text(
+        diarization.model_dump_json(indent=2), encoding="utf-8"
+    )
+    _jsonl(tmp_path / "diarization/clip_results.jsonl", results)
+
+
+def _specialized_provenance(
+    *,
+    role: str,
+    media_root: Path,
+) -> SpecializedBackendProvenance:
+    input_modality = {
+        "captioner": "canonical_full_audio_only",
+        "global_semantics": "captioner_text_only",
+        "local_semantics": "canonical_full_audio_only",
+    }[role]
+    media_mode = "none" if role == "global_semantics" else "file"
+    values = {
+        "backend": "vllm",
+        "role": role,
+        "served_model_name": f"fixture/{role}",
+        "checkpoint_id": f"fixture/{role}",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "input_modality": input_modality,
+        "media_mode": media_mode,
+        "media_root": None if media_mode == "none" else str(media_root),
+        "media_base_url": None,
+        "output_modalities": ["text"],
+        "prompt_version": f"fixture_{role}_v1",
+        "fallback_prompt_version": None,
+        "fallback_policy_version": "fixture_fallback_v1",
+        "temperature": 0.6 if role == "captioner" else 0.0,
+        "top_p": 0.95 if role == "captioner" else None,
+        "top_k": 20 if role == "captioner" else None,
+        "max_tokens": 256,
+        "repair_retries": 1,
+        "runtime_dependency_fingerprints": None,
+    }
+    provisional = SpecializedBackendProvenance.model_construct(
+        **values,
+        configuration_fingerprint="",
+    )
+    fingerprint_values = provisional.model_dump(
+        mode="json",
+        exclude={"configuration_fingerprint"},
+    )
+    fingerprint_values.pop("runtime_dependency_fingerprints")
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return SpecializedBackendProvenance(
+        **values,
+        configuration_fingerprint=fingerprint,
+    )
+
+
+def _specialized_semantics_record(
+    canonical: CanonicalAudioClip,
+    *,
+    media_root: Path,
+) -> SpecializedAudioSemanticsRecord:
+    captioner = _specialized_provenance(role="captioner", media_root=media_root)
+    global_semantics = _specialized_provenance(
+        role="global_semantics",
+        media_root=media_root,
+    )
+    local_semantics = _specialized_provenance(
+        role="local_semantics",
+        media_root=media_root,
+    )
+    values = {
+        "target_clip_uid": canonical.clip_uid,
+        "clip_display_path": canonical.clip_display_path,
+        "status": "complete",
+        "raw_audio_caption": "raw caption must not enter Final H3",
+        "overall_audio_description": f"Audio for {canonical.clip_uid}.",
+        "overall_soundscape": "quiet interior ambience",
+        "non_diegetic_music": None,
+        "temporal_audio_events": [
+            TemporalAudioEvent(
+                start_time=0.02,
+                end_time=0.08,
+                description="a brief object sound",
+            )
+        ],
+        "speaker_delivery": [
+            TargetSpeakerDelivery(
+                speaker_cluster_id="speaker_1",
+                delivery_style="calm",
+                entity_id="entity_1",
+            )
+        ],
+        "target_video_path": canonical.target_video_path,
+        "target_video_sha256": canonical.target_video_sha256,
+        "target_full_audio_path": canonical.target_full_audio_path,
+        "target_full_audio_sha256": canonical.target_full_audio_sha256,
+        "target_duration_seconds": canonical.target_duration_seconds,
+        "target_audio_binding_path": canonical.target_audio_binding_path,
+        "target_audio_binding_sha256": canonical.target_audio_binding_sha256,
+        "captioner_status": "ready",
+        "global_semantics_status": "ready",
+        "local_semantics_status": "ready",
+        "captioner_provenance": captioner,
+        "global_semantics_provenance": global_semantics,
+        "local_semantics_provenance": local_semantics,
+        "captioner_failure": None,
+        "global_semantics_failure": None,
+        "local_semantics_failure": None,
+        "captioner_request_fingerprint": "1" * 64,
+        "global_semantics_request_fingerprint": "2" * 64,
+        "local_semantics_request_fingerprint": "3" * 64,
+        "captioner_record_fingerprint": "4" * 64,
+        "global_semantics_record_fingerprint": "5" * 64,
+        "local_semantics_record_fingerprint": "6" * 64,
+    }
+    provisional = SpecializedAudioSemanticsRecord.model_construct(
+        **values,
+        assemble_fingerprint="",
+    )
+    fingerprint = hashlib.sha256(
+        _specialized_compact_json(
+            provisional.model_dump(
+                mode="json",
+                exclude={"assemble_fingerprint"},
+            )
+        ).encode()
+    ).hexdigest()
+    return SpecializedAudioSemanticsRecord(
+        **values,
+        assemble_fingerprint=fingerprint,
+    )
 
 
 def _final_sample(
@@ -458,9 +714,19 @@ def _render(tmp_path: Path) -> list[dict[str, object]]:
         )
     _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
     _jsonl(tmp_path / "asr/segments.jsonl", qwen)
-    audit_root = _write_binding_audit(tmp_path, bound)
+    _write_canonical_sources(
+        tmp_path,
+        inventory,
+        clips_with_segments={item.target_clip_uid for item in bound},
+    )
+    audit_root = _write_binding_audit(
+        tmp_path,
+        bound,
+        clip_count=len(inventory.canonical_clips),
+    )
     render_jea_final_samples(
         visual_inventory=inventory,
+        audio_root=tmp_path / "audio",
         pairs_root=tmp_path / "pairs",
         diarization_root=tmp_path / "diarization",
         binding_audit_root=audit_root,
@@ -716,7 +982,7 @@ def test_resolved_path_contract_requires_new_final_sample_schema(
     sample = _final_sample(tmp_path, [_voice(1)])
     payload = sample.model_dump(mode="json")
 
-    assert sample.schema_version == "r2v.h3.final_sample.3"
+    assert sample.schema_version == "r2v.h3.final_sample.4"
     without_artifact = json.loads(json.dumps(payload))
     without_artifact["visual_references"][0].pop("image_artifact_path")
     with pytest.raises(ValueError, match="image_artifact_path"):
@@ -724,14 +990,14 @@ def test_resolved_path_contract_requires_new_final_sample_schema(
 
     old_version = json.loads(json.dumps(payload))
     old_version["schema_version"] = "r2v.h3.final_sample.2"
-    with pytest.raises(ValueError, match="r2v.h3.final_sample.3"):
+    with pytest.raises(ValueError, match="r2v.h3.final_sample.4"):
         FinalH3SampleV2.model_validate(old_version)
 
 
 def test_final_sample_allows_partial_subject_voice_coverage(tmp_path: Path) -> None:
     sample = _final_sample(tmp_path, [_voice(1)])
 
-    assert sample.schema_version == "r2v.h3.final_sample.3"
+    assert sample.schema_version == "r2v.h3.final_sample.4"
     assert [item.entity_id for item in sample.visual_references] == [
         "entity_1",
         "entity_2",
@@ -773,10 +1039,10 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     tmp_path: Path,
 ) -> None:
     rows = _render(tmp_path)
-    assert {row["schema_version"] for row in rows} == {"r2v.h3.final_sample.3"}
+    assert {row["schema_version"] for row in rows} == {"r2v.h3.final_sample.4"}
     summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
-    assert summary["schema_version"] == "r2v.h3.final_summary.4"
-    assert summary["final_sample_schema_version"] == "r2v.h3.final_sample.3"
+    assert summary["schema_version"] == "r2v.h3.final_summary.5"
+    assert summary["final_sample_schema_version"] == "r2v.h3.final_sample.4"
     first = next(row for row in rows if row["sample_id"] == "clip-a/in_pair")
     assert first["r2v_instruction"] == "canonical clip-a: Image 1 and Image 2"
     assert [item["kind"] for item in first["visual_references"]] == [
@@ -794,6 +1060,184 @@ def test_final_renderer_uses_exact_canonical_instruction_and_ordered_references(
     assert second["visual_references"][0]["scope"] == "full"
     assert second["visual_references"][0]["visible_region"] == "whole"
     assert len(first["subject_voices"]) == 1
+
+
+def test_final_renderer_projects_canonical_audio_semantics_for_every_variant(
+    tmp_path: Path,
+) -> None:
+    _render(tmp_path)
+    inventory = _visual_inventory(tmp_path)
+    canonical = [
+        CanonicalAudioClip.model_validate_json(line)
+        for line in (tmp_path / "audio/canonical_clips.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    semantics_root = tmp_path / "audio_semantics_specialized_v1"
+    _jsonl(
+        semantics_root / "assembled/records.jsonl",
+        [
+            _specialized_semantics_record(item, media_root=tmp_path)
+            for item in canonical
+        ],
+    )
+
+    summary = render_jea_final_samples(
+        visual_inventory=inventory,
+        audio_root=tmp_path / "audio",
+        pairs_root=tmp_path / "pairs",
+        diarization_root=tmp_path / "diarization",
+        binding_audit_root=tmp_path / "binding_audit_v1",
+        qwen3_asr_root=tmp_path / "asr",
+        output_root=tmp_path / "h3-with-semantics",
+        audio_semantics_root=semantics_root,
+    )
+
+    samples = [
+        json.loads(line)
+        for line in (tmp_path / "h3-with-semantics/samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    for clip_uid in {item["clip_uid"] for item in samples}:
+        clip_semantics = {
+            json.dumps(item["full_clip_audio_semantics"], sort_keys=True)
+            for item in samples
+            if item["clip_uid"] == clip_uid
+        }
+        assert len(clip_semantics) == 1
+    assert all(item["full_clip_audio_semantics"] is not None for item in samples)
+    assert all(
+        "raw_audio_caption" not in item["full_clip_audio_semantics"]
+        for item in samples
+    )
+    assert summary.audio_semantics_available_clip_count == len(canonical)
+    assert summary.audio_semantics_complete_clip_count == len(canonical)
+    assert summary.audio_semantics_missing_clip_count == 0
+    assert summary.source_audio_semantics_records_sha256 == _sha256(
+        semantics_root / "assembled/records.jsonl"
+    )
+
+
+def test_final_renderer_publishes_all_canonical_clips_with_optional_voice_variants(
+    tmp_path: Path,
+) -> None:
+    inventory = _canonical_wide_visual_inventory(tmp_path)
+    build_jea_pairs(
+        visual_inventory=inventory,
+        occurrences=_occurrences(inventory)[:2],
+        audio_root=tmp_path / "audio",
+        output_root=tmp_path / "pairs",
+    )
+    for name in ("in_pairs.jsonl", "cross_pairs.jsonl"):
+        path = tmp_path / "pairs" / name
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        selected = [row for row in rows if row["target_clip_uid"] == "clip-a"]
+        path.write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in selected
+            ),
+            encoding="utf-8",
+        )
+    bound = []
+    qwen = []
+    for clip in inventory.canonical_clips[:2]:
+        clip_uid = clip.identity.clip_uid
+        bound.append(
+            BoundDiarizationSegment(
+                target_clip_uid=clip_uid,
+                segment_id="segment_0001",
+                speaker_cluster_id="speaker_1",
+                start_time=0.0,
+                end_time=0.1,
+                source_start_sample=0,
+                source_end_sample=1600,
+                cluster_binding_status="candidate_mapped",
+                entity_id="entity_1",
+                entity_occurrence_id=f"{clip_uid}/entity_1",
+                direct_anchor_samples=100,
+                direct_anchor_seconds=0.00625,
+                identity_scope="direct_anchor_present",
+            )
+        )
+        qwen.append(
+            Qwen3ASRSegment(
+                **clip.identity.model_dump(mode="python"),
+                segment_id="segment_0001",
+                speaker_cluster_id="speaker_1",
+                entity_id="entity_1",
+                entity_occurrence_id=f"{clip_uid}/entity_1",
+                source_audio_path=str(tmp_path / f"{clip_uid}.flac"),
+                source_start_sample=0,
+                source_end_sample=1600,
+                source_sample_rate_hz=16000,
+                start_time=0.0,
+                end_time=0.1,
+                status="transcribed",
+                text=f"speech from {clip_uid}",
+                language="en",
+                configuration=Qwen3ASRConfiguration(local_model_path="/local/qwen3"),
+            )
+        )
+    _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
+    _jsonl(tmp_path / "asr/segments.jsonl", qwen)
+    _write_canonical_sources(
+        tmp_path,
+        inventory,
+        clips_with_segments={"clip-a", "clip-b"},
+    )
+    audit_root = _write_binding_audit(
+        tmp_path,
+        bound,
+        clip_count=len(inventory.canonical_clips),
+    )
+
+    summary = render_jea_final_samples(
+        visual_inventory=inventory,
+        audio_root=tmp_path / "audio",
+        pairs_root=tmp_path / "pairs",
+        diarization_root=tmp_path / "diarization",
+        binding_audit_root=audit_root,
+        qwen3_asr_root=tmp_path / "asr",
+        output_root=tmp_path / "h3",
+    )
+
+    samples = [
+        FinalH3SampleV2.model_validate_json(line)
+        for line in (tmp_path / "h3/samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    canonical = [item for item in samples if item.pair_type == "canonical"]
+    assert [item.clip_uid for item in canonical] == ["clip-a", "clip-b", "clip-c"]
+    assert all(not item.subject_voices for item in canonical)
+    assert [item.pair_type for item in samples if item.clip_uid == "clip-a"] == [
+        "canonical",
+        "in_pair",
+        "cross_pair",
+    ]
+    assert [item.pair_type for item in samples if item.clip_uid == "clip-b"] == [
+        "canonical"
+    ]
+    clip_c = next(item for item in canonical if item.clip_uid == "clip-c")
+    assert clip_c.speech_segments == []
+    assert summary.canonical_clip_count == len(inventory.canonical_clips)
+    assert summary.canonical_base_sample_count == len(inventory.canonical_clips)
+    assert summary.in_pair_sample_count == 1
+    assert summary.cross_pair_sample_count == 1
+    assert summary.final_sample_count == len(inventory.canonical_clips) + 2
+    assert summary.canonical_clips_without_target_voice_variant_count == 2
+    assert summary.canonical_clips_with_empty_speech_count == 1
+    assert summary.audio_semantics_available_clip_count == 0
+    assert summary.audio_semantics_missing_clip_count == len(
+        inventory.canonical_clips
+    )
+    assert (tmp_path / "h3/samples/节目/集合/episode_c_0003/canonical.json").is_file()
 
 
 def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path) -> None:
@@ -869,10 +1313,20 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
         )
     _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
     _jsonl(tmp_path / "asr/segments.jsonl", qwen)
-    audit_root = _write_binding_audit(tmp_path, bound)
+    _write_canonical_sources(
+        tmp_path,
+        inventory,
+        clips_with_segments={item.target_clip_uid for item in bound},
+    )
+    audit_root = _write_binding_audit(
+        tmp_path,
+        bound,
+        clip_count=inventory.canonical_sample_count,
+    )
 
     render_jea_final_samples(
         visual_inventory=inventory,
+        audio_root=tmp_path / "audio",
         pairs_root=tmp_path / "pairs",
         diarization_root=tmp_path / "diarization",
         binding_audit_root=audit_root,
@@ -880,9 +1334,13 @@ def test_final_renderer_preserves_unvoiced_subject_and_its_speech(tmp_path: Path
         output_root=tmp_path / "h3",
     )
 
-    row = json.loads(
-        (tmp_path / "h3/samples.jsonl").read_text(encoding="utf-8").splitlines()[0]
-    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "h3/samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    row = next(item for item in rows if item["pair_type"] == "in_pair")
     assert [item["entity_id"] for item in row["visual_references"][:2]] == [
         "entity_1",
         "entity_2",
@@ -967,10 +1425,20 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
         )
     _jsonl(tmp_path / "diarization/bound_segments.jsonl", bound)
     _jsonl(tmp_path / "asr/segments.jsonl", qwen)
-    audit_root = _write_binding_audit(tmp_path, bound)
+    _write_canonical_sources(
+        tmp_path,
+        inventory,
+        clips_with_segments={item.target_clip_uid for item in bound},
+    )
+    audit_root = _write_binding_audit(
+        tmp_path,
+        bound,
+        clip_count=inventory.canonical_sample_count,
+    )
 
     render_jea_final_samples(
         visual_inventory=inventory,
+        audio_root=tmp_path / "audio",
         pairs_root=tmp_path / "pairs",
         diarization_root=tmp_path / "diarization",
         binding_audit_root=audit_root,
@@ -1008,7 +1476,7 @@ def test_final_renderer_only_publishes_directly_anchored_segment_identity(
     assert "subject_id" not in propagated
     assert "rendered_dialogue" not in propagated
     summary = json.loads((tmp_path / "h3/summary.json").read_text(encoding="utf-8"))
-    assert summary["schema_version"] == "r2v.h3.final_summary.4"
+    assert summary["schema_version"] == "r2v.h3.final_summary.5"
     assert summary["entity_bindings_removed_by_direct_anchor_gate"] == 1
     assert summary["speaker_binding_audit_policy_version"] == (
         "h3_speaker_binding_structural_audit_v1"

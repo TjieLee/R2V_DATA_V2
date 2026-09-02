@@ -22,10 +22,11 @@ The pilot writes only:
   review.html
 ```
 
-It never modifies `h3/samples.jsonl` and is not yet authoritative production
-H3 output. The current source remains the available final H3 sample inventory.
-GitHub issue #11, which tracks widening that inventory to canonical full-clip
-coverage, remains deliberately deferred.
+It never modifies `h3/samples.jsonl` and is not authoritative production H3
+output. The active final inventory contains exactly one canonical base sample
+per canonical Visual clip plus optional target-voice and cross-voice variants.
+GitHub issue #11 remains open until that canonical-wide code path and full-clip
+Audio semantics coverage are verified by a real server rerun.
 
 ## Official Contract
 
@@ -406,10 +407,11 @@ human_review/
 Annotations bind `sample_id` to the exact current `request_fingerprint`. A prior
 fingerprint remains historical evidence but does not count as current review.
 Reviewed output roots refuse ordinary inference overwrite; use a new output root
-for a new prompt/backend result. The dashboard and reports explicitly cover only
-the current pair-rooted `h3/samples.jsonl` inventory, not Issue #11 canonical-wide
-coverage. `audio_fact_audit`, raw responses, review annotations, and debug
-provenance never enter rendered H3 training text.
+for a new prompt/backend result. A full manifest requires exactly one
+`pair_type="canonical"` sample per canonical clip and maps it to `visual_only`;
+`in_pair` maps to `target_voice_reference`, and `cross_pair` maps to
+`cross_voice_reference`. `audio_fact_audit`, raw responses, review annotations,
+and debug provenance never enter rendered H3 training text.
 
 ### Fresh Unseen V6 Canary
 

@@ -1,11 +1,11 @@
 # JEA Qwen3 Audio production integration
 
-The active readable JEA Audio production path now runs all seven explicit stages
+The active readable JEA Audio production path now runs all eight explicit stages
 from canonical Visual `samples.jsonl`. It accepts both compacted
 `r2v.v3.production_sample.1` inputs and ordinary completed single-run
 `r2v.v3.sample.1` exports without changing downstream Audio semantics: Audio
-binding, frozen primary voice,
-InsightFace/ECAPA embeddings, frozen PairPolicy, DiariZen, isolated local
+binding, frozen primary voice, InsightFace/ECAPA embeddings, frozen PairPolicy,
+DiariZen, the model-free speaker-binding audit, isolated local
 Qwen/Qwen3-ASR-1.7B, and final H3 rendering. Cross donors remain restricted to
 the full media collection path. See `docs/H3_QWEN3_ASR.md`. Legacy Whisper
 pilots are retained but are not selected by this production path; Dots3 remains
@@ -110,6 +110,17 @@ turn crop independently to Whisper-large-v3 with `task=transcribe`. Code owns
 all identity, entity, and timestamp fields. Cross-pairs never create extra jobs,
 and video, donor media, primary voice, embeddings, and PairPolicy evidence never
 reach the ASR backend. See `docs/H3_WHISPER_ASR.md`.
+
+The active JEA speech/final path is now canonical-wide: canonical Visual plus
+`audio/canonical_clips.jsonl` admits every target to DiariZen, the binding audit,
+Qwen3-ASR segment coverage, and one base Final H3 sample. Missing/non-ready
+LR-ASD binding evidence produces unbound clusters rather than target loss, and
+no-speech clips produce no fake ASR row. PairPolicy outputs only add optional
+target-voice and cross-voice variants. Final contracts are
+`r2v.h3.final_sample.4` and `r2v.h3.final_summary.5`; the latter reports exact
+canonical/variant/speech and full-clip Audio-semantics coverage. Issue #11 is
+structurally fixed in code but remains open pending the real canonical-wide
+server rerun and artifact-count/semantics validation.
 
 The frozen LR-ASD-derived bound turns are a temporary ASR V1 segmentation baseline,
 not a Whisper backend dependency. Turn records carry generic segmentation and

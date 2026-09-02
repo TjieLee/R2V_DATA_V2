@@ -22,6 +22,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-production-root", type=Path, required=True)
     parser.add_argument("--visual-runs-root", type=Path, required=True)
     parser.add_argument("--audio-production-root", type=Path, required=True)
+    parser.add_argument("--audio-semantics-root", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -35,11 +36,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
     paths = jea_production_paths(arguments.audio_production_root)
     summary = render_jea_final_samples(
         visual_inventory=visual,
-        pairs_root=paths.pairs,
+        audio_root=paths.audio,
+        pairs_root=paths.pairs if paths.pairs.exists() else None,
         diarization_root=paths.diarization,
         binding_audit_root=paths.root / "binding_audit_v1",
         qwen3_asr_root=paths.asr,
         output_root=paths.h3,
+        audio_semantics_root=arguments.audio_semantics_root,
         overwrite=arguments.overwrite,
     )
     result = {

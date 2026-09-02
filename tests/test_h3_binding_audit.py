@@ -13,7 +13,9 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationBoundaryReconciliation,
     DiarizationClusterBinding,
     DiarizationEntitySupport,
+    DiarizationTargetClip,
     RawDiarizationSegment,
+    build_complete_diarization_inventory,
 )
 from r2v_data_v2.h3.jea_audio_production import jea_production_paths
 from r2v_data_v2.h3.pilot_schemas import (
@@ -551,6 +553,75 @@ def test_model_free_binding_audit_emits_structural_evidence_without_mutation(
 
     for path, before in source_bytes.items():
         assert Path(path).read_bytes() == before
+
+
+def test_binding_audit_emits_neutral_rows_without_sidecar_or_native(
+    tmp_path: Path,
+) -> None:
+    root, _ = _fixture(tmp_path / "audio-run")
+    sidecar = root / "audio/clips/clip-a/audio_binding.json"
+    native = root / "audio/runtime/clip-a/lr_asd/lr_asd_native.json"
+    sidecar.unlink()
+    native.unlink()
+    raw = [
+        RawDiarizationSegment.model_validate(row)
+        for row in _rows(root / "diarization/raw_segments.jsonl")
+    ]
+    raw_by_cluster: dict[str, list[RawDiarizationSegment]] = {}
+    for item in raw:
+        raw_by_cluster.setdefault(item.speaker_cluster_id, []).append(item)
+    clusters = [
+        _cluster(
+            cluster_id,
+            segments=segments,
+            status="unbound",
+            entity_id=None,
+            supports=[],
+        )
+        for cluster_id, segments in sorted(raw_by_cluster.items())
+    ]
+    bound = [
+        _bound(item, status="unbound", entity_id=None, direct=0)
+        for item in raw
+    ]
+    _write_jsonl(root / "diarization/cluster_bindings.jsonl", clusters)
+    _write_jsonl(root / "diarization/bound_segments.jsonl", bound)
+    pairs = root / "pairs.jsonl"
+    pairs.write_text("{}\n", encoding="utf-8")
+    inventory = build_complete_diarization_inventory(
+        source_pairs_path=pairs,
+        targets=[
+            DiarizationTargetClip(
+                target_clip_uid="clip-a",
+                target_video_path="/fixture/video.mp4",
+                source_audio_path="/fixture/audio.wav",
+                source_audio_sha256=_HASH,
+                source_sample_rate_hz=_SAMPLE_RATE,
+                source_channels=1,
+                source_frame_count=7 * _SAMPLE_RATE,
+                target_audio_binding_path=None,
+                visual_references=[],
+            )
+        ],
+    )
+    (root / "diarization/inventory.json").write_text(
+        inventory.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+    summary = run_speaker_binding_audit(audio_production_root=root)
+
+    segments = _rows(root / "binding_audit_v1/segments.jsonl")
+    assert len(segments) == 9
+    assert all(not row["exclusive_active_faces"] for row in segments)
+    assert all(not row["multi_active_face_track_ids"] for row in segments)
+    assert all(not row["direct_support_seconds_by_entity"] for row in segments)
+    assert summary.clip_count == 1
+    assert summary.clips_without_ready_audio_binding == 1
+    assert summary.clips_without_lr_asd_native == 1
+    assert summary.segment_count == 9
+    assert summary.model_call_count == 0
+    assert summary.bindings_modified_count == 0
 
 
 def test_binding_audit_review_order_is_deterministic_and_non_gating(

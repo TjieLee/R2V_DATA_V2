@@ -8,6 +8,32 @@
 > in `docs/H3_QWEN3_ASR.md`; in particular, current Visual references publish a
 > directly readable `image_artifact_path` and do not copy Visual assets into H3.
 
+## Active JEA Canonical Renderer
+
+The active JEA renderer is rooted in the complete canonical Visual inventory,
+not in `pairs/in_pairs.jsonl`. It requires exact canonical Visual/Audio and
+DiariZen target coverage, a model-free `binding_audit_v1`, and Qwen3-ASR rows
+for every actual DiariZen segment. A DiariZen `empty` result is a valid
+no-speech target; a DiariZen `failed` result blocks final publication.
+
+The current contracts are `r2v.h3.final_sample.4` and
+`r2v.h3.final_summary.5`. Every canonical clip produces exactly one
+`pair_type="canonical"` base sample with no voice reference. Valid in-pairs and
+cross-pairs add optional target-voice and donor-voice variants without deciding
+whether the canonical target survives. Pair artifacts are therefore an
+optional strict subset of the canonical target inventory.
+
+`full_clip_audio_semantics` is a backend-neutral projection of a validated
+specialized assembled record. It carries final descriptions, temporal
+non-speech events, and speaker delivery, but never the upstream raw caption.
+If no semantics root is supplied, canonical samples still publish with a null
+semantics field and explicit missing-coverage counts in `summary.json`.
+
+Active output is fixed at `$AUDIO_PRODUCTION_ROOT/h3/`; per-clip files include
+`canonical.json` and, when available, `in_pair.json` and
+`cross_pair_1.json`. Source media and Visual references remain directly
+readable provenance paths and are not copied.
+
 The deterministic final renderer is implemented as a data-assembly stage. It
 does not run Whisper, DiariZen, an MLLM, or any other model. Its inputs remain
 read-only and its fixed output is:

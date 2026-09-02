@@ -89,7 +89,7 @@ class MimoH3ShadowRecord(SchemaModel):
     )
     sample_id: str
     clip_uid: str
-    pair_type: Literal["in_pair", "cross_pair"]
+    pair_type: Literal["canonical", "in_pair", "cross_pair"]
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -140,11 +140,11 @@ class MimoH3ShadowSummary(SchemaModel):
 
 
 def _variant(sample: FinalH3SampleV2) -> ConditioningVariant:
-    return (
-        "target_voice_reference"
-        if sample.pair_type == "in_pair"
-        else "cross_voice_reference"
-    )
+    return {
+        "canonical": "visual_only",
+        "in_pair": "target_voice_reference",
+        "cross_pair": "cross_voice_reference",
+    }[sample.pair_type]
 
 
 def _corrected_segments(
@@ -323,9 +323,9 @@ def _materialize_sample(
         for item in semantics.temporal_non_speech_events
     }
     prefix = (
-        "[reference generation + audio reference]"
-        if variant in {"target_voice_reference", "cross_voice_reference"}
-        else "[reference generation + audio reuse]"
+        "[reference generation]"
+        if variant == "visual_only"
+        else "[reference generation + audio reference]"
     )
     music = (
         semantics.non_diegetic_music

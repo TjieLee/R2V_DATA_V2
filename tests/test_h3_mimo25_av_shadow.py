@@ -10,7 +10,16 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import r2v_data_v2.h3.mimo25_av_reconcile as mimo25_reconcile
 import r2v_data_v2.h3.mimo25_h3_materializer as mimo25_materializer
+from r2v_data_v2.h3.diarization_binding import (
+    DiarizationInventory,
+    DiarizationTargetClip,
+)
+from r2v_data_v2.h3.jea_audio_production import (
+    CanonicalAudioClip,
+    jea_production_paths,
+)
 from r2v_data_v2.h3.jea_final_renderer import (
     FinalH3SampleV2,
     FinalQwen3SpeechSegment,
@@ -21,6 +30,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MIMO25_FAILURE_VERSION,
     MIMO25_INVENTORY_VERSION,
     MIMO25_RECORD_VERSION,
+    MimoCaseManifest,
     MimoClipJob,
     MimoFailure,
     MimoRawResponse,
@@ -31,6 +41,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     _job,
     _validate_clip_segment_inventory,
     _validate_h3_variant_observations,
+    build_mimo25_inventory,
     run_mimo25_av_reconcile,
 )
 from r2v_data_v2.h3.mimo25_backend import (
@@ -1030,8 +1041,18 @@ def test_r2v_instruction_is_fingerprinted_and_variant_disagreement_fails(
 
     sample = _sample(tmp_path)
     changed = sample.model_copy(update={"r2v_instruction": "Different instruction."})
+    canonical_payload = sample.model_dump(mode="python")
+    canonical_payload.update(
+        {
+            "sample_id": "clip-1/canonical",
+            "pair_id": "canonical/clip-1",
+            "pair_type": "canonical",
+            "subject_voices": [],
+        }
+    )
+    canonical = FinalH3SampleV2.model_validate(canonical_payload)
     with pytest.raises(ValueError, match="variants disagree"):
-        _validate_h3_variant_observations("clip-1", [sample, changed])
+        _validate_h3_variant_observations("clip-1", [canonical, changed])
 
 
 def test_only_subject_reference_entities_are_speaker_bindable(tmp_path: Path) -> None:
@@ -1866,6 +1887,191 @@ def _file_sha256(path: Path) -> str:
     return __import__("hashlib").sha256(path.read_bytes()).hexdigest()
 
 
+def test_mimo_inventory_builds_one_job_per_canonical_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    production_root = tmp_path / "production"
+    paths = jea_production_paths(production_root)
+    visual_root = tmp_path / "visual"
+    visual_runs_root = tmp_path / "visual-runs"
+    visual_root.mkdir()
+    visual_runs_root.mkdir()
+    (visual_root / "samples.jsonl").write_text("{}\n", encoding="utf-8")
+
+    sample_roots = [tmp_path / "clip-1", tmp_path / "clip-2"]
+    for root in sample_roots:
+        root.mkdir()
+    seed_samples = [_sample(root) for root in sample_roots]
+
+    def variant(
+        seed: FinalH3SampleV2,
+        *,
+        clip_uid: str,
+        pair_type: str,
+        suffix: str,
+    ) -> FinalH3SampleV2:
+        payload = seed.model_dump(mode="json")
+        payload.update(
+            {
+                "sample_id": f"{clip_uid}/{suffix}",
+                "pair_id": f"{pair_type}/{clip_uid}",
+                "pair_type": pair_type,
+                "clip_uid": clip_uid,
+                "clip_display_path": f"01/show/episode/{clip_uid}",
+                "clip_name": clip_uid,
+                "speech_segments": [],
+                "subject_voices": (
+                    []
+                    if pair_type == "canonical"
+                    else payload["subject_voices"]
+                ),
+            }
+        )
+        if pair_type == "cross_pair":
+            payload["subject_voices"][0].update(
+                {
+                    "voice_source": "cross_donor",
+                    "donor_occurrence_id": "donor/e1",
+                    "donor_clip_uid": "donor",
+                    "donor_clip_display_path": "01/show/episode/donor",
+                }
+            )
+        return FinalH3SampleV2.model_validate(payload)
+
+    canonical_1 = variant(
+        seed_samples[0],
+        clip_uid="clip-1",
+        pair_type="canonical",
+        suffix="z-canonical",
+    )
+    in_pair_1 = variant(
+        seed_samples[0],
+        clip_uid="clip-1",
+        pair_type="in_pair",
+        suffix="a-in-pair",
+    )
+    cross_pair_1 = variant(
+        seed_samples[0],
+        clip_uid="clip-1",
+        pair_type="cross_pair",
+        suffix="b-cross-pair",
+    )
+    canonical_2 = variant(
+        seed_samples[1],
+        clip_uid="clip-2",
+        pair_type="canonical",
+        suffix="canonical",
+    )
+    h3_samples = [in_pair_1, cross_pair_1, canonical_1, canonical_2]
+
+    canonical_audio = []
+    targets = []
+    visual_clips = []
+    for sample in (canonical_1, canonical_2):
+        video = Path(sample.target_video).resolve(strict=True)
+        audio = Path(sample.target_full_audio_path).resolve(strict=True)
+        identity = SimpleNamespace(clip_uid=sample.clip_uid)
+        visual_clips.append(
+            SimpleNamespace(identity=identity, sample=SimpleNamespace(target_video=str(video)))
+        )
+        canonical_audio.append(
+            CanonicalAudioClip(
+                clip_uid=sample.clip_uid,
+                clip_display_path=sample.clip_display_path,
+                media_collection_relpath=sample.media_collection_relpath,
+                media_collection_name=sample.media_collection_name,
+                episode_name=sample.episode_name,
+                clip_name=sample.clip_name,
+                shard_id=sample.shard_id,
+                target_video_path=str(video),
+                target_video_sha256=_file_sha256(video),
+                target_full_audio_path=str(audio),
+                target_full_audio_sha256=_file_sha256(audio),
+                target_duration_seconds=1.0,
+                subject_reference_count=1,
+            )
+        )
+        targets.append(
+            DiarizationTargetClip(
+                target_clip_uid=sample.clip_uid,
+                target_video_path=str(video),
+                source_audio_path=str(audio),
+                source_audio_sha256=_file_sha256(audio),
+                source_sample_rate_hz=16000,
+                source_channels=1,
+                source_frame_count=16000,
+                visual_references=[],
+            )
+        )
+
+    _write_models_jsonl(paths.audio / "canonical_clips.jsonl", canonical_audio)
+    canonical_manifest_sha256 = _file_sha256(paths.audio / "canonical_clips.jsonl")
+    paths.diarization.mkdir(parents=True)
+    diarization_inventory = DiarizationInventory(
+        mode="production",
+        source_inventory_kind="canonical_audio_manifest",
+        source_visual_production_root=str(visual_root),
+        source_visual_inventory_path=str(visual_root / "samples.jsonl"),
+        source_visual_inventory_sha256=_file_sha256(visual_root / "samples.jsonl"),
+        source_canonical_audio_manifest_path=str(
+            paths.audio / "canonical_clips.jsonl"
+        ),
+        source_canonical_audio_manifest_sha256=canonical_manifest_sha256,
+        inventory_fingerprint="a" * 64,
+        source_target_count=2,
+        selected_target_count=2,
+        selection_mode="canonical_visual_target_inventory_v1",
+        bounded_selection_applied=False,
+        targets=targets,
+    )
+    (paths.diarization / "inventory.json").write_text(
+        diarization_inventory.model_dump_json(indent=2) + "\n",
+        encoding="utf-8",
+    )
+    for path in (
+        paths.diarization / "raw_segments.jsonl",
+        paths.diarization / "bound_segments.jsonl",
+        paths.asr / "segments.jsonl",
+        production_root / "binding_audit_v1/segments.jsonl",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    _write_models_jsonl(paths.h3 / "samples.jsonl", h3_samples)
+
+    visual_inventory = SimpleNamespace(canonical_clips=visual_clips)
+    monkeypatch.setattr(
+        mimo25_reconcile,
+        "load_visual_production_inventory",
+        lambda **_kwargs: visual_inventory,
+    )
+    inventory = build_mimo25_inventory(
+        visual_production_root=visual_root,
+        visual_runs_root=visual_runs_root,
+        audio_production_root=production_root,
+    )
+
+    assert inventory.inventory_scope == "canonical_visual_target_inventory"
+    assert inventory.canonical_wide_coverage is True
+    assert [job.clip_uid for job in inventory.jobs] == ["clip-1", "clip-2"]
+    assert inventory.jobs[0].source_h3_sample_ids == [
+        "clip-1/a-in-pair",
+        "clip-1/b-cross-pair",
+        "clip-1/z-canonical",
+    ]
+    assert inventory.jobs[1].source_h3_sample_ids == ["clip-2/canonical"]
+
+    subset = build_mimo25_inventory(
+        visual_production_root=visual_root,
+        visual_runs_root=visual_runs_root,
+        audio_production_root=production_root,
+        case_manifest=MimoCaseManifest(clip_uids=["clip-2"]),
+    )
+    assert subset.inventory_scope == "explicit_case_subset"
+    assert subset.canonical_wide_coverage is False
+    assert [job.clip_uid for job in subset.jobs] == ["clip-2"]
+
+
 def _materializer_fixture(
     tmp_path: Path,
     *,
@@ -1876,8 +2082,19 @@ def _materializer_fixture(
     media_root.mkdir()
     sample = _sample(media_root)
     raw_job = _job_fixture(media_root)
-    samples = [sample]
-    for index in range(2, source_sample_count + 1):
+    canonical_payload = sample.model_dump(mode="python")
+    canonical_payload.update(
+        {
+            "sample_id": "clip-1/canonical",
+            "pair_id": "canonical/clip-1",
+            "pair_type": "canonical",
+            "subject_voices": [],
+        }
+    )
+    samples = [FinalH3SampleV2.model_validate(canonical_payload)]
+    if source_sample_count >= 2:
+        samples.append(sample)
+    for index in range(3, source_sample_count + 1):
         payload = sample.model_dump(mode="python")
         payload["sample_id"] = f"clip-1/variant-{index}"
         payload["pair_id"] = f"in_pair/clip-1-variant-{index}"
@@ -2137,8 +2354,8 @@ def test_materializer_rejects_record_inventory_or_request_drift(
 @pytest.mark.parametrize(
     ("source_sample_count", "declared_sample_ids"),
     [
-        (2, ["clip-1/in_pair"]),
-        (1, ["clip-1/in_pair", "clip-1/removed-variant"]),
+        (2, ["clip-1/canonical"]),
+        (1, ["clip-1/canonical", "clip-1/removed-variant"]),
     ],
 )
 def test_materializer_rejects_source_h3_sample_id_addition_or_removal(

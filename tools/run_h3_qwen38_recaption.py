@@ -101,8 +101,8 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
                 arguments.prepare_all_manifest.expanduser().resolve()
             ),
             "case_count": len(cases),
-            "inventory_scope": "current_h3_samples_inventory_only",
-            "canonical_wide_coverage": False,
+            "inventory_scope": "canonical_h3_samples_inventory",
+            "canonical_wide_coverage": True,
             "model_loaded": False,
             "model_calls": 0,
         }
