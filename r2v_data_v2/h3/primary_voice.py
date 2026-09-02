@@ -22,6 +22,7 @@ from r2v_data_v2.h3.pilot_schemas import (
 from r2v_data_v2.h3.schemas import AudioBindingSidecar, SchemaModel
 
 VOICE_REFERENCE_QUALITY_POLICY_VERSION = "voice_reference_quality_v1"
+CANONICAL_VOICE_BOUNDARY_POLICY_VERSION = "canonical_voice_source_intersection_v1"
 
 VoiceQualityReasonCode = Literal[
     "voice_duration_too_short",
@@ -117,6 +118,29 @@ class VoiceReferenceQualityAssessment(SchemaModel):
         if (self.status == "accepted") != (not self.reason_codes):
             raise ValueError("voice assessment status must match its hard-gate reasons")
         return self
+
+
+@dataclass(frozen=True)
+class _CanonicalVoiceBoundaryReconciliation:
+    requested_start_sample: int
+    requested_end_sample: int
+    effective_start_sample: int
+    effective_end_sample: int
+    end_clamped: bool
+    end_overrun_samples: int
+    end_overrun_seconds: float
+
+    def provenance(self) -> dict[str, object]:
+        return {
+            "policy_version": CANONICAL_VOICE_BOUNDARY_POLICY_VERSION,
+            "requested_start_sample": self.requested_start_sample,
+            "requested_end_sample": self.requested_end_sample,
+            "effective_start_sample": self.effective_start_sample,
+            "effective_end_sample": self.effective_end_sample,
+            "end_clamped": self.end_clamped,
+            "end_overrun_samples": self.end_overrun_samples,
+            "end_overrun_seconds": self.end_overrun_seconds,
+        }
 
 
 class PrimaryVoiceReferenceSelection(SchemaModel):
@@ -251,6 +275,38 @@ def select_primary_voice_assessments(
     return selected
 
 
+def _reconcile_canonical_voice_boundary(
+    assessment: VoiceReferenceQualityAssessment,
+    *,
+    frame_count: int,
+    sample_rate_hz: int,
+    minimum_duration_seconds: float,
+    timeline_tolerance_seconds: float,
+) -> _CanonicalVoiceBoundaryReconciliation | None:
+    turn = assessment.metrics
+    requested_start = round(turn.start_time * sample_rate_hz)
+    requested_end = round(turn.end_time * sample_rate_hz)
+    if requested_start >= frame_count:
+        return None
+    overrun_samples = max(0, requested_end - frame_count)
+    overrun_seconds = overrun_samples / sample_rate_hz
+    if overrun_seconds > timeline_tolerance_seconds:
+        return None
+    effective_end = min(requested_end, frame_count)
+    effective_duration = (effective_end - requested_start) / sample_rate_hz
+    if effective_duration < minimum_duration_seconds:
+        return None
+    return _CanonicalVoiceBoundaryReconciliation(
+        requested_start_sample=requested_start,
+        requested_end_sample=requested_end,
+        effective_start_sample=requested_start,
+        effective_end_sample=effective_end,
+        end_clamped=effective_end != requested_end,
+        end_overrun_samples=overrun_samples,
+        end_overrun_seconds=overrun_seconds,
+    )
+
+
 def voice_turn_sample_range(
     turn: VoiceReferenceTurnDiagnostics,
     *,
@@ -318,6 +374,9 @@ def build_voice_reference_artifact(
     sample_mapping_policy: str = "native_16k_turn_sample_extent_v1",
     source_start_sample: int | None = None,
     source_end_sample: int | None = None,
+    source_start: float | None = None,
+    source_end: float | None = None,
+    canonical_boundary_reconciliation: dict[str, object] | None = None,
 ) -> VoiceReferenceArtifact:
     turn = assessment.metrics
     if source_start_sample is None and source_end_sample is None:
@@ -329,29 +388,38 @@ def build_voice_reference_artifact(
         start_sample, end_sample = source_start_sample, source_end_sample
     else:
         raise ValueError("voice reference source sample extent must be complete")
+    if (source_start is None) != (source_end is None):
+        raise ValueError("voice reference source time extent must be complete")
+    actual_start = turn.start_time if source_start is None else source_start
+    actual_end = turn.end_time if source_end is None else source_end
+    quality_metadata: dict[str, object] = {
+        "assessment": assessment.model_dump(mode="json"),
+        "policy_version": assessment.policy_version,
+        "policy_fingerprint": assessment.policy_fingerprint,
+        "thresholds_calibrated": True,
+        "quality_score_definition": "binary_all_hard_gates_pass_v1",
+        "selection_policy": (
+            "snr_lr_asd_p10_lr_asd_mean_duration_association_time_v1"
+        ),
+        "source_sample_rate_hz": source_sample_rate_hz,
+        "source_channels": source_channels,
+        "sample_mapping_policy": sample_mapping_policy,
+    }
+    if canonical_boundary_reconciliation is not None:
+        quality_metadata["canonical_boundary_reconciliation"] = dict(
+            canonical_boundary_reconciliation
+        )
     return VoiceReferenceArtifact(
         voice_reference_id="voice_ref_1",
         entity_occurrence_id=assessment.entity_occurrence_id,
         source_turn_id=turn.turn_id,
-        source_start=turn.start_time,
-        source_end=turn.end_time,
+        source_start=actual_start,
+        source_end=actual_end,
         source_start_sample=start_sample,
         source_end_sample=end_sample,
         asset=_file_asset(asset_path, output_root),
         quality_score=1.0,
-        quality_metadata={
-            "assessment": assessment.model_dump(mode="json"),
-            "policy_version": assessment.policy_version,
-            "policy_fingerprint": assessment.policy_fingerprint,
-            "thresholds_calibrated": True,
-            "quality_score_definition": "binary_all_hard_gates_pass_v1",
-            "selection_policy": (
-                "snr_lr_asd_p10_lr_asd_mean_duration_association_time_v1"
-            ),
-            "source_sample_rate_hz": source_sample_rate_hz,
-            "source_channels": source_channels,
-            "sample_mapping_policy": sample_mapping_policy,
-        },
+        quality_metadata=quality_metadata,
     )
 
 
@@ -399,6 +467,7 @@ def export_primary_voice_references(
     output_sample_rate_hz: int = 16000,
     output_channels: int = 1,
     sample_mapping_policy: str = "native_16k_turn_sample_extent_v1",
+    canonical_timeline_tolerance_seconds: float | None = None,
 ) -> PrimaryVoiceReferenceExportSummary:
     source = pilot_root.expanduser().resolve(strict=True)
     destination = output_root.expanduser().resolve(strict=False)
@@ -409,6 +478,16 @@ def export_primary_voice_references(
     ):
         raise ValueError("primary voice export must be outside the source pilot root")
     active = policy or VoiceReferenceQualityPolicy()
+    if source_audio_for_clip is not None and (
+        output_sample_rate_hz != 32000
+        or output_channels != 2
+        or canonical_timeline_tolerance_seconds is None
+        or not math.isfinite(canonical_timeline_tolerance_seconds)
+        or canonical_timeline_tolerance_seconds < 0
+    ):
+        raise ValueError(
+            "canonical primary voice requires 32 kHz stereo and a finite timeline tolerance"
+        )
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid.uuid4().hex}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     assessments: list[VoiceReferenceQualityAssessment] = []
@@ -442,10 +521,6 @@ def export_primary_voice_references(
                 for item in sidecar.h3_ir.subjects
                 if item.reference_type == "subject"
             ]
-            selected = select_primary_voice_assessments(
-                clip_assessments,
-                entity_order=subject_ids,
-            )
             source_audio = (
                 source_audio_for_clip(clip_uid).expanduser().resolve(strict=True)
                 if source_audio_for_clip is not None
@@ -453,6 +528,44 @@ def export_primary_voice_references(
                     pilot_root=source,
                     source_audio_path=report.source_audio_path,
                 )
+            )
+            canonical_boundaries: dict[
+                tuple[str, str], _CanonicalVoiceBoundaryReconciliation
+            ] = {}
+            selectable_assessments = clip_assessments
+            if source_audio_for_clip is not None:
+                probe = audio_backend.probe_audio_file(source_audio)
+                if (
+                    probe.sample_rate_hz != 32000
+                    or probe.channels != 2
+                    or "flac" not in probe.format_name.lower()
+                ):
+                    raise ValueError(
+                        "canonical primary voice source must be 32 kHz stereo FLAC"
+                    )
+                assert canonical_timeline_tolerance_seconds is not None
+                selectable_assessments = []
+                for assessment in clip_assessments:
+                    if assessment.status != "accepted":
+                        continue
+                    reconciliation = _reconcile_canonical_voice_boundary(
+                        assessment,
+                        frame_count=probe.frame_count,
+                        sample_rate_hz=probe.sample_rate_hz,
+                        minimum_duration_seconds=active.minimum_duration_seconds,
+                        timeline_tolerance_seconds=(
+                            canonical_timeline_tolerance_seconds
+                        ),
+                    )
+                    if reconciliation is None:
+                        continue
+                    selectable_assessments.append(assessment)
+                    canonical_boundaries[
+                        (assessment.metrics.entity_id, assessment.turn_id)
+                    ] = reconciliation
+            selected = select_primary_voice_assessments(
+                selectable_assessments,
+                entity_order=subject_ids,
             )
             for entity_id in subject_ids:
                 occurrence_id = f"{clip_uid}/{entity_id}"
@@ -468,29 +581,40 @@ def export_primary_voice_references(
                 artifact = None
                 reasons: list[str] = []
                 if chosen is None:
-                    reasons.append(
-                        "no_voice_reference_candidate_turn"
-                        if not entity_assessments
-                        else "no_voice_reference_passed_quality_gate"
-                    )
-                    reasons.extend(
-                        code
-                        for code in _REASON_CODE_ORDER
-                        if any(code in item.reason_codes for item in entity_assessments)
-                    )
+                    if source_audio_for_clip is not None and accepted:
+                        reasons.append("no_voice_reference_within_canonical_audio")
+                    else:
+                        reasons.append(
+                            "no_voice_reference_candidate_turn"
+                            if not entity_assessments
+                            else "no_voice_reference_passed_quality_gate"
+                        )
+                        reasons.extend(
+                            code
+                            for code in _REASON_CODE_ORDER
+                            if any(
+                                code in item.reason_codes
+                                for item in entity_assessments
+                            )
+                        )
                 else:
                     if source_audio_for_clip is None:
                         start_sample, end_sample = voice_turn_sample_range(
                             chosen.metrics,
                             sample_rate_hz=output_sample_rate_hz,
                         )
+                        source_start = chosen.metrics.start_time
+                        source_end = chosen.metrics.end_time
+                        boundary_provenance = None
                     else:
-                        start_sample = round(
-                            chosen.metrics.start_time * output_sample_rate_hz
-                        )
-                        end_sample = round(
-                            chosen.metrics.end_time * output_sample_rate_hz
-                        )
+                        boundary = canonical_boundaries[
+                            (chosen.metrics.entity_id, chosen.turn_id)
+                        ]
+                        start_sample = boundary.effective_start_sample
+                        end_sample = boundary.effective_end_sample
+                        source_start = start_sample / output_sample_rate_hz
+                        source_end = end_sample / output_sample_rate_hz
+                        boundary_provenance = boundary.provenance()
                     relative_voice_path = (
                         output_path_for_entity(clip_uid, entity_id)
                         if output_path_for_entity is not None
@@ -509,8 +633,8 @@ def export_primary_voice_references(
                         clip_uid=clip_uid,
                         entity_id=entity_id,
                         full_audio_path=source_audio,
-                        start_time=chosen.metrics.start_time,
-                        end_time=chosen.metrics.end_time,
+                        start_time=source_start,
+                        end_time=source_end,
                         destination=voice_path,
                         sample_rate_hz=output_sample_rate_hz,
                         channels=output_channels,
@@ -528,6 +652,9 @@ def export_primary_voice_references(
                         sample_mapping_policy=sample_mapping_policy,
                         source_start_sample=start_sample,
                         source_end_sample=end_sample,
+                        source_start=source_start,
+                        source_end=source_end,
+                        canonical_boundary_reconciliation=boundary_provenance,
                     )
                     selected_rows.append(
                         {
@@ -535,8 +662,8 @@ def export_primary_voice_references(
                             "entity_id": entity_id,
                             "entity_occurrence_id": occurrence_id,
                             "source_turn_id": chosen.turn_id,
-                            "source_start": chosen.metrics.start_time,
-                            "source_end": chosen.metrics.end_time,
+                            "source_start": source_start,
+                            "source_end": source_end,
                             "source_start_sample": start_sample,
                             "source_end_sample": end_sample,
                             "estimated_snr_db": chosen.metrics.estimated_snr_db,

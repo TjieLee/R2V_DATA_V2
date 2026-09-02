@@ -118,8 +118,26 @@ def _write_wav(path: Path, samples: list[int]) -> None:
 
 
 class _SampleSliceBackend:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        frame_count: int = 128000,
+        sample_rate_hz: int = 32000,
+        channels: int = 2,
+        format_name: str = "flac",
+    ) -> None:
         self.requests: list[dict[str, object]] = []
+        self.probe = SimpleNamespace(
+            frame_count=frame_count,
+            sample_rate_hz=sample_rate_hz,
+            channels=channels,
+            duration_seconds=frame_count / sample_rate_hz,
+            format_name=format_name,
+        )
+
+    def probe_audio_file(self, path: Path) -> SimpleNamespace:
+        assert path.is_file()
+        return self.probe
 
     def extract_voice_reference(self, **request: object) -> Path:
         self.requests.append(request)
@@ -141,7 +159,7 @@ class _SampleSliceBackend:
         return destination
 
 
-class _FailingSampleSliceBackend:
+class _FailingSampleSliceBackend(_SampleSliceBackend):
     def extract_voice_reference(self, **request: object) -> Path:
         destination = Path(str(request["destination"]))
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -222,6 +240,8 @@ def _write_pilot(
 def _write_jea_canonical(
     pilot: Path,
     identity: ReadableClipIdentity,
+    *,
+    frame_count: int = 128000,
 ) -> None:
     video = pilot / "runtime/clip-a/source.mp4"
     canonical_audio = pilot / "full_audio/clip-a.flac"
@@ -235,8 +255,8 @@ def _write_jea_canonical(
         target_full_audio_sha256=hashlib.sha256(
             canonical_audio.read_bytes()
         ).hexdigest(),
-        frame_count=128000,
-        target_duration_seconds=4.0,
+        frame_count=frame_count,
+        target_duration_seconds=frame_count / 32000,
         subject_reference_count=1,
     )
     (pilot / "canonical_clips.jsonl").write_text(
@@ -428,6 +448,266 @@ def test_jea_primary_voice_publishes_unicode_readable_asset_path(
     assert reference["source_end_sample"] == 32000
     assert reference["quality_metadata"]["source_sample_rate_hz"] == 32000
     assert reference["quality_metadata"]["source_channels"] == 2
+    reconciliation = reference["quality_metadata"][
+        "canonical_boundary_reconciliation"
+    ]
+    assert reconciliation == {
+        "policy_version": "canonical_voice_source_intersection_v1",
+        "requested_start_sample": 0,
+        "requested_end_sample": 32000,
+        "effective_start_sample": 0,
+        "effective_end_sample": 32000,
+        "end_clamped": False,
+        "end_overrun_samples": 0,
+        "end_overrun_seconds": 0.0,
+    }
+
+
+def test_jea_primary_voice_clamps_small_canonical_eof_overrun(
+    tmp_path: Path,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    turn = _turn(start_time=2.0, duration=1.5)
+    _write_pilot(pilot, [turn])
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/show/episode/clip-a",
+        media_collection_relpath="01/show",
+        media_collection_name="show",
+        episode_name="episode",
+        clip_name="clip-a",
+        shard_id="shard-1",
+    )
+    frame_count = 111854
+    _write_jea_canonical(pilot, identity, frame_count=frame_count)
+    backend = _SampleSliceBackend(frame_count=frame_count)
+
+    run_jea_primary_voice_stage(
+        visual_inventory=SimpleNamespace(
+            clips=[SimpleNamespace(identity=identity)]
+        ),
+        audio_root=pilot,
+        output_root=output,
+        audio_backend=backend,
+    )
+
+    selection = json.loads(
+        (output / "primary_voice_references.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    reference = selection["primary_voice_reference"]
+    assert reference["source_start_sample"] == 64000
+    assert reference["source_end_sample"] == frame_count
+    assert reference["source_start"] == 2.0
+    assert reference["source_end"] == frame_count / 32000
+    assert reference["quality_metadata"]["assessment"]["metrics"]["end_time"] == 3.5
+    assert reference["quality_metadata"]["canonical_boundary_reconciliation"] == {
+        "policy_version": "canonical_voice_source_intersection_v1",
+        "requested_start_sample": 64000,
+        "requested_end_sample": 112000,
+        "effective_start_sample": 64000,
+        "effective_end_sample": frame_count,
+        "end_clamped": True,
+        "end_overrun_samples": 146,
+        "end_overrun_seconds": 146 / 32000,
+    }
+    assert backend.requests[0]["source_start_sample"] == 64000
+    assert backend.requests[0]["source_end_sample"] == frame_count
+    assert backend.requests[0]["end_time"] == frame_count / 32000
+    assert (output / reference["asset"]["path"]).read_bytes() == (
+        f"stereo:64000:{frame_count}".encode()
+    )
+
+
+@pytest.mark.parametrize(
+    ("turn", "frame_count"),
+    [
+        (_turn(start_time=2.0, duration=1.5), 108000),
+        (_turn(start_time=4.4, duration=1.0), 172147),
+        (_turn(start_time=4.0, duration=1.0), 128000),
+    ],
+    ids=["overrun_exceeds_tolerance", "effective_duration_too_short", "starts_at_eof"],
+)
+def test_jea_primary_voice_rejects_canonical_ineligible_candidates(
+    tmp_path: Path,
+    turn: VoiceReferenceTurnDiagnostics,
+    frame_count: int,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    _write_pilot(pilot, [turn])
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/show/episode/clip-a",
+        media_collection_relpath="01/show",
+        media_collection_name="show",
+        episode_name="episode",
+        clip_name="clip-a",
+        shard_id="shard-1",
+    )
+    _write_jea_canonical(pilot, identity, frame_count=frame_count)
+    backend = _SampleSliceBackend(frame_count=frame_count)
+
+    summary = run_jea_primary_voice_stage(
+        visual_inventory=SimpleNamespace(
+            clips=[SimpleNamespace(identity=identity)]
+        ),
+        audio_root=pilot,
+        output_root=output,
+        audio_backend=backend,
+    )
+
+    selections = [
+        json.loads(line)
+        for line in (output / "primary_voice_references.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert selections[0]["primary_voice_reference"] is None
+    assert selections[0]["reason_codes"] == [
+        "no_voice_reference_within_canonical_audio"
+    ]
+    assert selections[0]["accepted_turn_ids"] == [turn.turn_id]
+    assert summary.accepted_turn_count == 1
+    assert summary.occurrences_with_primary_voice_reference == 0
+    assert backend.requests == []
+
+
+def test_jea_primary_voice_reselects_next_ranked_canonical_candidate(
+    tmp_path: Path,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    turns = [
+        _turn(turn_id="turn_1", start_time=2.0, duration=1.5, snr_db=20.0),
+        _turn(turn_id="turn_2", start_time=4.4, duration=1.0, snr_db=30.0),
+    ]
+    _write_pilot(pilot, turns)
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/show/episode/clip-a",
+        media_collection_relpath="01/show",
+        media_collection_name="show",
+        episode_name="episode",
+        clip_name="clip-a",
+        shard_id="shard-1",
+    )
+    frame_count = 172147
+    _write_jea_canonical(pilot, identity, frame_count=frame_count)
+    backend = _SampleSliceBackend(frame_count=frame_count)
+
+    summary = run_jea_primary_voice_stage(
+        visual_inventory=SimpleNamespace(
+            clips=[SimpleNamespace(identity=identity)]
+        ),
+        audio_root=pilot,
+        output_root=output,
+        audio_backend=backend,
+    )
+
+    assert summary.selected_reference_rows[0]["source_turn_id"] == "turn_1"
+    assert backend.requests[0]["source_start_sample"] == 64000
+    assert backend.requests[0]["source_end_sample"] == 112000
+    selection = json.loads(
+        (output / "primary_voice_references.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert selection["accepted_turn_ids"] == ["turn_1", "turn_2"]
+    assert selection["primary_voice_reference"]["source_turn_id"] == "turn_1"
+
+
+def test_jea_primary_voice_canonical_ineligibility_is_per_entity(
+    tmp_path: Path,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    turns = [
+        _turn(entity_id="e2", turn_id="turn_1", start_time=2.0, duration=1.5),
+        _turn(entity_id="e1", turn_id="turn_2", start_time=4.4, duration=1.0),
+    ]
+    _write_pilot(pilot, turns)
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/show/episode/clip-a",
+        media_collection_relpath="01/show",
+        media_collection_name="show",
+        episode_name="episode",
+        clip_name="clip-a",
+        shard_id="shard-1",
+    )
+    frame_count = 172147
+    _write_jea_canonical(pilot, identity, frame_count=frame_count)
+    backend = _SampleSliceBackend(frame_count=frame_count)
+
+    summary = run_jea_primary_voice_stage(
+        visual_inventory=SimpleNamespace(
+            clips=[SimpleNamespace(identity=identity)]
+        ),
+        audio_root=pilot,
+        output_root=output,
+        audio_backend=backend,
+    )
+
+    selections = {
+        row["entity_id"]: row
+        for row in (
+            json.loads(line)
+            for line in (output / "primary_voice_references.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+    }
+    assert selections["e1"]["primary_voice_reference"] is None
+    assert selections["e1"]["reason_codes"] == [
+        "no_voice_reference_within_canonical_audio"
+    ]
+    assert selections["e2"]["primary_voice_reference"]["source_turn_id"] == "turn_1"
+    assert summary.occurrences_with_primary_voice_reference == 1
+    assert summary.occurrences_without_primary_voice_reference == 1
+    assert len(backend.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("sample_rate_hz", "channels"),
+    [(16000, 2), (32000, 1)],
+)
+def test_jea_primary_voice_rejects_invalid_canonical_audio_format(
+    tmp_path: Path,
+    sample_rate_hz: int,
+    channels: int,
+) -> None:
+    pilot = tmp_path / "voice-quality"
+    _write_pilot(pilot, [_turn()])
+    output = tmp_path / "primary_voice"
+    identity = ReadableClipIdentity(
+        clip_uid="clip-a",
+        clip_display_path="01/show/episode/clip-a",
+        media_collection_relpath="01/show",
+        media_collection_name="show",
+        episode_name="episode",
+        clip_name="clip-a",
+        shard_id="shard-1",
+    )
+    _write_jea_canonical(pilot, identity)
+    backend = _SampleSliceBackend(
+        sample_rate_hz=sample_rate_hz,
+        channels=channels,
+    )
+
+    with pytest.raises(ValueError, match="32 kHz stereo FLAC"):
+        run_jea_primary_voice_stage(
+            visual_inventory=SimpleNamespace(
+                clips=[SimpleNamespace(identity=identity)]
+            ),
+            audio_root=pilot,
+            output_root=output,
+            audio_backend=backend,
+        )
+
+    assert not output.exists()
 
 
 def test_failed_jea_primary_voice_export_leaves_no_completed_directory(

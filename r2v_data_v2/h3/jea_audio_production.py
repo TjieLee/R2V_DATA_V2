@@ -578,6 +578,9 @@ def run_jea_primary_voice_stage(
         output_sample_rate_hz=CANONICAL_AUDIO_SAMPLE_RATE_HZ,
         output_channels=CANONICAL_AUDIO_CHANNELS,
         sample_mapping_policy=VOICE_SAMPLE_MAPPING_POLICY,
+        canonical_timeline_tolerance_seconds=(
+            CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS
+        ),
     )
 
 
