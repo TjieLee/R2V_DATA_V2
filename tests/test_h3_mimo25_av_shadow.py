@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+import r2v_data_v2.h3.mimo25_h3_materializer as mimo25_materializer
 from r2v_data_v2.h3.jea_final_renderer import (
     FinalH3SampleV2,
     FinalQwen3SpeechSegment,
@@ -48,7 +49,10 @@ from r2v_data_v2.h3.mimo25_backend import (
     OpenAIMimo25Backend,
     validate_annotation,
 )
-from r2v_data_v2.h3.mimo25_h3_materializer import _materialize_sample
+from r2v_data_v2.h3.mimo25_h3_materializer import (
+    _materialize_sample,
+    materialize_mimo25_h3_shadow,
+)
 from r2v_data_v2.h3.mimo25_human_review import (
     MimoHumanReviewAnnotation,
     MimoReviewCase,
@@ -209,6 +213,7 @@ def _validate(
     annotation: MimoAVAnnotationDraft,
     *,
     segment_ids: list[str] | None = None,
+    segment_intervals: dict[str, tuple[float, float]] | None = None,
     transcribed_segment_ids: list[str] | None = None,
     allowed_entity_ids: set[str] | None = None,
     allowed_reference_labels: set[str] | None = None,
@@ -219,6 +224,11 @@ def _validate(
     return validate_annotation(
         annotation,
         segment_ids=segment_ids or ["segment_1"],
+        segment_intervals=(
+            {"segment_1": (0.0, 1.0)}
+            if segment_intervals is None
+            else segment_intervals
+        ),
         transcribed_segment_ids=(
             ["segment_1"]
             if transcribed_segment_ids is None
@@ -260,6 +270,14 @@ class _Completions:
             | tuple[str, int | None, str]
             | tuple[str, int | None, str, int | None]
             | tuple[str, int | None, str, int | None, int | None]
+            | tuple[
+                str,
+                int | None,
+                str,
+                int | None,
+                int | None,
+                int | None,
+            ]
         ],
     ) -> None:
         self.responses = responses
@@ -272,11 +290,13 @@ class _Completions:
         finish_reason = response[2] if len(response) >= 3 else "stop"
         reasoning_tokens = response[3] if len(response) >= 4 else 0
         video_tokens = response[4] if len(response) >= 5 else 10
+        image_tokens = response[5] if len(response) >= 6 else 6
         details = {
             key: value
             for key, value in {
                 "audio_tokens": audio_tokens,
                 "video_tokens": video_tokens,
+                "image_tokens": image_tokens,
             }.items()
             if value is not None
         } or None
@@ -319,6 +339,7 @@ def _backend(
         | tuple[str, int | None, str]
         | tuple[str, int | None, str, int | None]
         | tuple[str, int | None, str, int | None, int | None]
+        | tuple[str, int | None, str, int | None, int | None, int | None]
     ],
 ) -> tuple[OpenAIMimo25Backend, _Completions]:
     completions = _Completions(responses)
@@ -459,7 +480,7 @@ def test_unknown_av_token_usage_warns_without_loop(tmp_path: Path) -> None:
     job = _job_fixture(tmp_path)
     backend, completions = _backend(
         tmp_path,
-        [(_annotation().model_dump_json(), None, "stop", 0, None)],
+        [(_annotation().model_dump_json(), None, "stop", 0, None, None)],
     )
     result = backend.reconcile(
         job,
@@ -471,9 +492,63 @@ def test_unknown_av_token_usage_warns_without_loop(tmp_path: Path) -> None:
     assert len(completions.requests) == 1
     assert {
         "prompt_tokens_details_unavailable",
+        "image_tokens_unavailable",
         "video_tokens_unavailable",
         "audio_tokens_unavailable",
     } <= set(result.diagnostics[0].warnings)
+
+
+def test_zero_reference_image_tokens_fail_closed(tmp_path: Path) -> None:
+    backend, completions = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), 5, "stop", 0, 10, 0)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_reference_images_not_observed"
+    assert len(completions.requests) == 1
+
+
+def test_unknown_reference_image_tokens_warn_without_retry(tmp_path: Path) -> None:
+    backend, completions = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), 5, "stop", 0, 10, None)],
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+    assert len(completions.requests) == 1
+    assert "image_tokens_unavailable" in result.diagnostics[0].warnings
+
+
+def test_audio_fallback_zero_reference_image_tokens_fail_closed(
+    tmp_path: Path,
+) -> None:
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path,
+        [(raw, 0, "stop", 0, 10, 6), (raw, 4, "stop", 0, 10, 0)],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_reference_images_not_observed"
+    assert len(completions.requests) == 2
 
 
 def test_explicit_zero_video_tokens_fail_closed(tmp_path: Path) -> None:
@@ -862,6 +937,28 @@ def test_full_av_recheck_zero_video_tokens_fails_closed(tmp_path: Path) -> None:
             allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
         )
     assert exc_info.value.code == "mimo_target_video_not_observed"
+    assert exc_info.value.recheck_count == 1
+
+
+def test_full_av_recheck_zero_reference_image_tokens_fails_closed(
+    tmp_path: Path,
+) -> None:
+    backend, _ = _backend(
+        tmp_path,
+        [
+            ("not json", 5, "stop", 0, 10, 6),
+            (_annotation().model_dump_json(), 5, "stop", 0, 10, 0),
+        ],
+    )
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert exc_info.value.code == "mimo_reference_images_not_observed"
     assert exc_info.value.recheck_count == 1
 
 
@@ -1273,6 +1370,27 @@ def test_audio_event_ids_are_contiguous_and_chronological() -> None:
         MimoAVAnnotationDraft.model_validate(payload)
 
 
+def test_simultaneous_double_digit_audio_event_ids_are_chronological() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["temporal_non_speech_events"] = [
+        {
+            "event_id": f"ae{index}",
+            "approximate_start_time": 0.1,
+            "approximate_end_time": 0.2,
+            "category": "physical",
+            "pattern": "single",
+            "description": f"Audible event {index} occurs.",
+            "source_grounding": "audible_only",
+        }
+        for index in range(1, 11)
+    ]
+    payload["h3_draft"]["shots"][0]["description_template"] = " ".join(
+        [*(f"[[audio_event:ae{index}]]" for index in range(1, 11)), "[[segment:segment_1]]"]
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert len(annotation.audio_semantics.temporal_non_speech_events) == 10
+
+
 @pytest.mark.parametrize(
     ("template", "issue_code"),
     [
@@ -1393,6 +1511,43 @@ def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
     assert "subject_retention_contract_mismatch" in {item.code for item in issues}
 
 
+@pytest.mark.parametrize(
+    "extra_definition",
+    [
+        "An extra arbitrary definition.",
+        "<Picture 1> defines the person.",
+    ],
+)
+def test_subject_definitions_reject_noncanonical_extra_rows(
+    extra_definition: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"].append(extra_definition)
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+    assert "subject_definition_contract_mismatch" in {item.code for item in issues}
+
+
+@pytest.mark.parametrize(
+    "retention_rows",
+    [
+        ["<Picture 1>: fully_preserved - visible."],
+        ["fully_preserved - visible."],
+        ["<Subject 1>: fully_preserved weak_reference - conflicting markers."],
+        ["<Subject 1> and <Subject 2>: fully_preserved - invalid owner."],
+    ],
+)
+def test_visual_retention_requires_exact_canonical_subject_rows(
+    retention_rows: list[str],
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["visual_retention_analysis"] = retention_rows
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>", "<Subject 2>"},
+    )
+    assert "subject_retention_contract_mismatch" in {item.code for item in issues}
+
+
 def test_significant_authoritative_transcript_cannot_leak_into_draft() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["summary"] = "请把这扇门轻轻关上"
@@ -1407,6 +1562,122 @@ def test_significant_authoritative_transcript_cannot_leak_into_draft() -> None:
             _annotation(),
             authoritative_transcripts=["嗯"],
         )
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["event", "delivery", "soundscape", "music", "summary"],
+)
+def test_significant_authoritative_transcript_cannot_leak_into_audio_semantics(
+    field: str,
+) -> None:
+    transcript = "请把这扇门轻轻关上"
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_semantics"]
+    if field == "event":
+        semantics["temporal_non_speech_events"][0]["description"] = transcript
+    elif field == "delivery":
+        semantics["speaker_delivery"][0]["delivery_style"] = transcript
+    elif field == "soundscape":
+        semantics["overall_soundscape"] = transcript
+    elif field == "music":
+        semantics["non_diegetic_music_status"] = "present"
+        semantics["non_diegetic_music"] = transcript
+    else:
+        semantics["audiovisual_summary"] = transcript
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        authoritative_transcripts=[transcript],
+    )
+    assert "audio_semantics_contains_authoritative_transcript" in {
+        item.code for item in issues
+    }
+
+
+@pytest.mark.parametrize("transcript", ["嗯", "OK"])
+def test_short_authoritative_text_does_not_trigger_audio_semantics_leakage(
+    transcript: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["audiovisual_summary"] = transcript
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        authoritative_transcripts=[transcript],
+    )
+    assert "audio_semantics_contains_authoritative_transcript" not in {
+        item.code for item in issues
+    }
+
+
+def _two_shot_annotation(
+    *,
+    speech_shot: int = 1,
+    event_shot: int = 1,
+    event_interval: tuple[float, float] = (1.0, 1.5),
+) -> MimoAVAnnotationDraft:
+    payload = _annotation().model_dump(mode="json")
+    event = payload["audio_semantics"]["temporal_non_speech_events"][0]
+    event["approximate_start_time"], event["approximate_end_time"] = event_interval
+    shot_text = {1: ["<Subject 1> remains visible."], 2: ["The scene continues."]}
+    shot_text[speech_shot].append("[[segment:segment_1]]")
+    shot_text[event_shot].append("[[audio_event:ae1]]")
+    payload["h3_draft"]["shots"] = [
+        {
+            "shot_index": 1,
+            "start_time": None,
+            "description_template": " ".join(shot_text[1]),
+        },
+        {
+            "shot_index": 2,
+            "start_time": 5.0,
+            "description_template": " ".join(shot_text[2]),
+        },
+    ]
+    return MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_speech_placeholder_must_overlap_its_shot() -> None:
+    issues = _validate(
+        _two_shot_annotation(speech_shot=2),
+        segment_intervals={"segment_1": (1.0, 2.0)},
+        target_duration_seconds=10.0,
+    )
+    assert "speech_placeholder_wrong_shot" in {item.code for item in issues}
+
+
+@pytest.mark.parametrize("speech_shot", [1, 2])
+def test_speech_placeholder_crossing_cut_may_use_either_overlapping_shot(
+    speech_shot: int,
+) -> None:
+    issues = _validate(
+        _two_shot_annotation(speech_shot=speech_shot),
+        segment_intervals={"segment_1": (4.8, 5.2)},
+        target_duration_seconds=10.0,
+    )
+    assert "speech_placeholder_wrong_shot" not in {item.code for item in issues}
+
+
+def test_audio_event_placeholder_must_overlap_its_shot() -> None:
+    issues = _validate(
+        _two_shot_annotation(event_shot=2),
+        segment_intervals={"segment_1": (1.0, 2.0)},
+        target_duration_seconds=10.0,
+    )
+    assert "audio_event_placeholder_wrong_shot" in {item.code for item in issues}
+
+
+@pytest.mark.parametrize("event_shot", [1, 2])
+def test_audio_event_crossing_cut_may_use_either_overlapping_shot(
+    event_shot: int,
+) -> None:
+    issues = _validate(
+        _two_shot_annotation(event_shot=event_shot, event_interval=(4.9, 5.1)),
+        segment_intervals={"segment_1": (1.0, 2.0)},
+        target_duration_seconds=10.0,
+    )
+    assert "audio_event_placeholder_wrong_shot" not in {
+        item.code for item in issues
     }
 
 
@@ -1525,15 +1796,21 @@ def _sample(tmp_path: Path) -> FinalH3SampleV2:
     )
 
 
-def _record_fixture(tmp_path: Path, annotation: MimoAVAnnotationDraft) -> MimoRecord:
-    job = _job_fixture(tmp_path)
+def _record_fixture(
+    tmp_path: Path,
+    annotation: MimoAVAnnotationDraft,
+    *,
+    job: MimoClipJob | None = None,
+    inventory_fingerprint: str = "a" * 64,
+) -> MimoRecord:
+    active_job = job or _job_fixture(tmp_path)
     resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
     provenance = MimoBackendConfig(media_resolver=resolver, api_key="secret").provenance()
     values = {
         "schema_version": MIMO25_RECORD_VERSION,
-        "clip_uid": job.clip_uid,
-        "request_fingerprint": job.request_fingerprint,
-        "inventory_fingerprint": "a" * 64,
+        "clip_uid": active_job.clip_uid,
+        "request_fingerprint": active_job.request_fingerprint,
+        "inventory_fingerprint": inventory_fingerprint,
         "status": "ready",
         "backend_provenance": provenance.model_dump(mode="json"),
         "annotation": annotation.model_dump(mode="json"),
@@ -1549,6 +1826,117 @@ def _record_fixture(tmp_path: Path, annotation: MimoAVAnnotationDraft) -> MimoRe
         json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return MimoRecord(**values, record_fingerprint=fingerprint)
+
+
+def _replace_record(record: MimoRecord, **changes: object) -> MimoRecord:
+    values = record.model_dump(mode="json", exclude={"record_fingerprint"})
+    values.update(changes)
+    fingerprint = __import__("hashlib").sha256(
+        json.dumps(
+            values,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return MimoRecord(**values, record_fingerprint=fingerprint)
+
+
+def _write_models_jsonl(path: Path, values: list[object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(
+            json.dumps(
+                value.model_dump(mode="json"),  # type: ignore[attr-defined]
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+            for value in values
+        ),
+        encoding="utf-8",
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    return __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+
+
+def _materializer_fixture(
+    tmp_path: Path,
+    *,
+    source_sample_count: int = 1,
+    declared_sample_ids: list[str] | None = None,
+) -> SimpleNamespace:
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    sample = _sample(media_root)
+    raw_job = _job_fixture(media_root)
+    samples = [sample]
+    for index in range(2, source_sample_count + 1):
+        payload = sample.model_dump(mode="python")
+        payload["sample_id"] = f"clip-1/variant-{index}"
+        payload["pair_id"] = f"in_pair/clip-1-variant-{index}"
+        samples.append(FinalH3SampleV2.model_validate(payload))
+    source_h3 = tmp_path / "source-h3"
+    samples_path = source_h3 / "samples.jsonl"
+    _write_models_jsonl(samples_path, samples)
+    job_values = raw_job.model_dump(mode="json", exclude={"request_fingerprint"})
+    job_values.update(
+        {
+            "target_video_sha256": _file_sha256(Path(raw_job.target_video_path)),
+            "target_full_audio_sha256": _file_sha256(
+                Path(raw_job.target_full_audio_path)
+            ),
+            "source_h3_sample_ids": (
+                [item.sample_id for item in samples]
+                if declared_sample_ids is None
+                else declared_sample_ids
+            ),
+        }
+    )
+    job_values["reference_images"][0]["image_sha256"] = _file_sha256(
+        Path(raw_job.reference_images[0].image_artifact_path)
+    )
+    job = _job(job_values)
+    inventory_values = {
+        "schema_version": MIMO25_INVENTORY_VERSION,
+        "inventory_scope": "current_diarization_asr_target_inventory",
+        "canonical_wide_coverage": False,
+        "source_visual_inventory_sha256": "1" * 64,
+        "source_canonical_audio_manifest_sha256": "2" * 64,
+        "source_diarization_raw_segments_sha256": "3" * 64,
+        "source_diarization_bound_segments_sha256": "4" * 64,
+        "source_qwen3_asr_segments_sha256": "5" * 64,
+        "source_binding_audit_segments_sha256": "6" * 64,
+        "source_h3_samples_sha256": _file_sha256(samples_path),
+        "clip_count": 1,
+        "jobs": [job.model_dump(mode="json")],
+    }
+    inventory = _inventory(inventory_values)
+    record = _record_fixture(
+        media_root,
+        _annotation(),
+        job=job,
+        inventory_fingerprint=inventory.inventory_fingerprint,
+    )
+    mimo_root = tmp_path / "mimo"
+    mimo_root.mkdir()
+    (mimo_root / "inventory.json").write_text(
+        inventory.model_dump_json(), encoding="utf-8"
+    )
+    _write_models_jsonl(mimo_root / "records.jsonl", [record])
+    return SimpleNamespace(
+        mimo_root=mimo_root,
+        source_h3=source_h3,
+        samples_path=samples_path,
+        output_root=tmp_path / "materialized",
+        job=job,
+        inventory=inventory,
+        record=record,
+        samples=samples,
+    )
 
 
 def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
@@ -1625,6 +2013,137 @@ def test_materializer_preserves_structured_asr_warning_location(tmp_path: Path) 
     assert "segment_1:possible_asr_conflict" in warnings
 
 
+def test_materializer_provenance_preflight_accepts_unchanged_inputs(
+    tmp_path: Path,
+) -> None:
+    fixture = _materializer_fixture(tmp_path)
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+    )
+    assert summary.ready_count == 1
+    assert summary.failed_count == 0
+
+
+def test_materializer_rejects_stale_source_h3_samples_sha(tmp_path: Path) -> None:
+    fixture = _materializer_fixture(tmp_path)
+    fixture.samples_path.write_bytes(fixture.samples_path.read_bytes() + b"\n")
+    with pytest.raises(
+        ValueError,
+        match="MiMo source H3 inventory changed after AV annotation",
+    ):
+        materialize_mimo25_h3_shadow(
+            mimo_root=fixture.mimo_root,
+            source_h3_root=fixture.source_h3,
+            output_root=fixture.output_root,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("inventory_fingerprint", "record inventory fingerprint mismatch"),
+        ("request_fingerprint", "record request fingerprint mismatch"),
+    ],
+)
+def test_materializer_rejects_record_inventory_or_request_drift(
+    tmp_path: Path,
+    field: str,
+    message: str,
+) -> None:
+    fixture = _materializer_fixture(tmp_path)
+    changed = _replace_record(fixture.record, **{field: "f" * 64})
+    _write_models_jsonl(fixture.mimo_root / "records.jsonl", [changed])
+    with pytest.raises(ValueError, match=message):
+        materialize_mimo25_h3_shadow(
+            mimo_root=fixture.mimo_root,
+            source_h3_root=fixture.source_h3,
+            output_root=fixture.output_root,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_sample_count", "declared_sample_ids"),
+    [
+        (2, ["clip-1/in_pair"]),
+        (1, ["clip-1/in_pair", "clip-1/removed-variant"]),
+    ],
+)
+def test_materializer_rejects_source_h3_sample_id_addition_or_removal(
+    tmp_path: Path,
+    source_sample_count: int,
+    declared_sample_ids: list[str],
+) -> None:
+    fixture = _materializer_fixture(
+        tmp_path,
+        source_sample_count=source_sample_count,
+        declared_sample_ids=declared_sample_ids,
+    )
+    with pytest.raises(ValueError, match="source H3 sample IDs changed"):
+        materialize_mimo25_h3_shadow(
+            mimo_root=fixture.mimo_root,
+            source_h3_root=fixture.source_h3,
+            output_root=fixture.output_root,
+        )
+
+
+@pytest.mark.parametrize(
+    ("path_kind", "message"),
+    [
+        ("video", "target video changed"),
+        ("audio", "target full audio changed"),
+        ("image", "frozen reference image changed"),
+    ],
+)
+def test_materializer_rejects_media_byte_drift(
+    tmp_path: Path,
+    path_kind: str,
+    message: str,
+) -> None:
+    fixture = _materializer_fixture(tmp_path)
+    paths = {
+        "video": Path(fixture.job.target_video_path),
+        "audio": Path(fixture.job.target_full_audio_path),
+        "image": Path(fixture.job.reference_images[0].image_artifact_path),
+    }
+    paths[path_kind].write_bytes(b"changed")
+    with pytest.raises(ValueError, match=message):
+        materialize_mimo25_h3_shadow(
+            mimo_root=fixture.mimo_root,
+            source_h3_root=fixture.source_h3,
+            output_root=fixture.output_root,
+        )
+
+
+def test_materializer_hashes_clip_media_once_across_variants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _materializer_fixture(tmp_path, source_sample_count=2)
+    original = mimo25_materializer._sha256_file
+    calls: dict[Path, int] = {}
+
+    def counted(path: Path) -> str:
+        resolved = path.resolve()
+        calls[resolved] = calls.get(resolved, 0) + 1
+        return original(path)
+
+    monkeypatch.setattr(mimo25_materializer, "_sha256_file", counted)
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+    )
+    assert summary.ready_count == 2
+    for path in (
+        Path(fixture.job.target_video_path),
+        Path(fixture.job.target_full_audio_path),
+        Path(fixture.job.reference_images[0].image_artifact_path),
+    ):
+        assert calls[path.resolve()] == 1
+
+
 class _FakeBackend:
     def __init__(self, tmp_path: Path) -> None:
         resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
@@ -1650,6 +2169,7 @@ class _FakeBackend:
                         prompt_tokens=10,
                         completion_tokens=5,
                         total_tokens=15,
+                        image_tokens=2,
                         video_tokens=4,
                         audio_tokens=3,
                         cached_tokens=1,
@@ -1730,6 +2250,7 @@ def test_shadow_runner_is_atomic_and_does_not_modify_inputs(tmp_path: Path) -> N
     )
     assert backend.calls == ["clip-1"]
     assert summary.ready_count == 1
+    assert summary.usage_totals["image_tokens"] == 2
     assert summary.production_binding_modified is False
     assert summary.production_diarization_modified is False
     assert summary.production_asr_modified is False

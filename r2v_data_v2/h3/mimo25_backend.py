@@ -281,11 +281,8 @@ class MimoAudioSemantics(SchemaModel):
         event_ids = [event.event_id for event in events]
         if event_ids != [f"ae{index}" for index in range(1, len(events) + 1)]:
             raise ValueError("MiMo Audio event IDs must be contiguous")
-        event_order = [
-            (event.approximate_start_time, event.approximate_end_time, event.event_id)
-            for event in events
-        ]
-        if event_order != sorted(event_order):
+        event_start_times = [event.approximate_start_time for event in events]
+        if event_start_times != sorted(event_start_times):
             raise ValueError("MiMo Audio events must be chronological")
         groups = [item.speaker_group for item in self.speaker_delivery]
         if len(groups) != len(set(groups)):
@@ -409,6 +406,7 @@ class MimoUsage(SchemaModel):
     prompt_tokens: int | None = Field(default=None, ge=0)
     completion_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
+    image_tokens: int | None = Field(default=None, ge=0)
     video_tokens: int | None = Field(default=None, ge=0)
     audio_tokens: int | None = Field(default=None, ge=0)
     cached_tokens: int | None = Field(default=None, ge=0)
@@ -677,6 +675,7 @@ def _completion_diagnostic(
             prompt_tokens=_token(usage, "prompt_tokens"),
             completion_tokens=_token(usage, "completion_tokens"),
             total_tokens=_token(usage, "total_tokens"),
+            image_tokens=_token(prompt_details, "image_tokens"),
             video_tokens=_token(prompt_details, "video_tokens"),
             audio_tokens=_token(prompt_details, "audio_tokens"),
             cached_tokens=cached_tokens,
@@ -711,6 +710,13 @@ def _validate_av_observation_usage(
     *,
     require_explicit_audio: bool,
 ) -> None:
+    if diagnostic.usage.image_tokens == 0:
+        raise MimoBackendFailure(
+            code="mimo_reference_images_not_observed",
+            reason="MiMo reported zero frozen-reference image tokens",
+        )
+    if diagnostic.usage.image_tokens is None:
+        diagnostic.warnings.append("image_tokens_unavailable")
     if diagnostic.usage.video_tokens == 0:
         raise MimoBackendFailure(
             code="mimo_target_video_not_observed",
@@ -752,6 +758,7 @@ def validate_annotation(
     annotation: MimoAVAnnotationDraft,
     *,
     segment_ids: list[str],
+    segment_intervals: dict[str, tuple[float, float]],
     transcribed_segment_ids: list[str],
     authoritative_transcripts: list[str],
     allowed_entity_ids: set[str],
@@ -996,6 +1003,58 @@ def validate_annotation(
                         f"shot {shot.shot_index} prefixes a complete speech clause",
                     )
                 )
+    shot_intervals = [
+        (
+            0.0 if index == 0 else float(shot.start_time),
+            (
+                target_duration_seconds
+                if index + 1 == len(draft.shots)
+                else float(draft.shots[index + 1].start_time)
+            ),
+        )
+        for index, shot in enumerate(draft.shots)
+        if (index == 0 or shot.start_time is not None)
+        and (
+            index + 1 == len(draft.shots)
+            or draft.shots[index + 1].start_time is not None
+        )
+    ]
+    if len(shot_intervals) == len(draft.shots):
+        event_by_id = {
+            event.event_id: (
+                event.approximate_start_time,
+                event.approximate_end_time,
+            )
+            for event in annotation.audio_semantics.temporal_non_speech_events
+        }
+        for index, shot in enumerate(draft.shots):
+            shot_start, shot_end = shot_intervals[index]
+            for match in _PLACEHOLDER.finditer(shot.description_template):
+                interval = segment_intervals.get(match.group(1))
+                if interval is not None and not (
+                    interval[0] < shot_end and interval[1] > shot_start
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "speech_placeholder_wrong_shot",
+                            "h3_draft.shots",
+                            f"{match.group(1)} does not overlap shot {shot.shot_index}",
+                        )
+                    )
+            for match in _AUDIO_EVENT_PLACEHOLDER.finditer(
+                shot.description_template
+            ):
+                interval = event_by_id.get(match.group(1))
+                if interval is not None and not (
+                    interval[0] < shot_end and interval[1] > shot_start
+                ):
+                    issues.append(
+                        ValidationIssue(
+                            "audio_event_placeholder_wrong_shot",
+                            "h3_draft.shots",
+                            f"{match.group(1)} does not overlap shot {shot.shot_index}",
+                        )
+                    )
     draft_text = "\n".join((*shot_templates, non_shot_text))
     if _PIPELINE_OWNED.search(draft_text):
         issues.append(
@@ -1068,6 +1127,14 @@ def validate_annotation(
                 str(unknown_retention_subjects),
             )
         )
+    if len(draft.visual_retention_analysis) != len(reference_subjects):
+        issues.append(
+            ValidationIssue(
+                "subject_retention_contract_mismatch",
+                "h3_draft.visual_retention_analysis",
+                "retention rows must exactly cover supplied Subjects",
+            )
+        )
     for subject_label in sorted(supplied_subject_labels):
         rows = [
             line
@@ -1079,7 +1146,20 @@ def validate_annotation(
             for line in rows
             for marker in _ALLOWED_RETENTION_MARKER_OCCURRENCE.findall(line)
         ]
-        if len(rows) != 1 or len(markers) != 1:
+        subject_labels = (
+            [
+                match.group(0)
+                for match in _PICTURE_OR_SUBJECT.finditer(rows[0])
+                if match.group(1) == "Subject"
+            ]
+            if len(rows) == 1
+            else []
+        )
+        if (
+            len(rows) != 1
+            or len(markers) != 1
+            or subject_labels != [subject_label]
+        ):
             issues.append(
                 ValidationIssue(
                     "subject_retention_contract_mismatch",
@@ -1087,6 +1167,14 @@ def validate_annotation(
                     f"{subject_label} requires exactly one allowed retention line",
                 )
             )
+    if len(draft.subject_definitions) != len(reference_subjects):
+        issues.append(
+            ValidationIssue(
+                "subject_definition_contract_mismatch",
+                "h3_draft.subject_definitions",
+                "definition rows must exactly cover supplied Subjects",
+            )
+        )
     for subject in reference_subjects:
         subject_label = str(subject.subject_label)
         expected_pictures = set(subject.source_picture_labels)
@@ -1104,7 +1192,20 @@ def validate_annotation(
             if len(definitions) == 1
             else set()
         )
-        if len(definitions) != 1 or actual_pictures != expected_pictures:
+        definition_subjects = (
+            [
+                match.group(0)
+                for match in _PICTURE_OR_SUBJECT.finditer(definitions[0])
+                if match.group(1) == "Subject"
+            ]
+            if len(definitions) == 1
+            else []
+        )
+        if (
+            len(definitions) != 1
+            or definition_subjects != [subject_label]
+            or actual_pictures != expected_pictures
+        ):
             issues.append(
                 ValidationIssue(
                     "subject_definition_contract_mismatch",
@@ -1140,6 +1241,42 @@ def validate_annotation(
                     "draft_contains_authoritative_transcript",
                     "h3_draft",
                     "model-authored draft copies exact authoritative ASR text",
+                )
+            )
+            break
+    audio_semantics = annotation.audio_semantics
+    model_owned_audio_fields = [
+        *(event.description for event in audio_semantics.temporal_non_speech_events),
+        *(item.delivery_style for item in audio_semantics.speaker_delivery),
+        *(
+            [audio_semantics.overall_soundscape]
+            if audio_semantics.overall_soundscape is not None
+            else []
+        ),
+        *(
+            [audio_semantics.non_diegetic_music]
+            if audio_semantics.non_diegetic_music is not None
+            else []
+        ),
+        audio_semantics.audiovisual_summary,
+    ]
+    normalized_audio_fields = [
+        _normalized_text(value) for value in model_owned_audio_fields
+    ]
+    for transcript in authoritative_transcripts:
+        normalized_transcript = _normalized_text(transcript)
+        if (
+            _significant_transcript(transcript)
+            and normalized_transcript
+            and any(
+                normalized_transcript in field for field in normalized_audio_fields
+            )
+        ):
+            issues.append(
+                ValidationIssue(
+                    "audio_semantics_contains_authoritative_transcript",
+                    "audio_semantics",
+                    "model-authored Audio semantics copies exact authoritative ASR text",
                 )
             )
             break
@@ -1496,6 +1633,10 @@ class OpenAIMimo25Backend:
                 validation_issues = validate_annotation(
                     annotation,
                     segment_ids=segment_ids,
+                    segment_intervals={
+                        item.segment_id: (item.start_time, item.end_time)
+                        for item in job.segments
+                    },
                     transcribed_segment_ids=transcribed_segment_ids,
                     authoritative_transcripts=[
                         item.asr_text

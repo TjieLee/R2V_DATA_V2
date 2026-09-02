@@ -387,6 +387,59 @@ def _record(values: dict[str, object]) -> MimoH3ShadowRecord:
     )
 
 
+def _validate_job_media_integrity(job: MimoClipJob) -> None:
+    media = (
+        (
+            Path(job.target_video_path),
+            job.target_video_sha256,
+            "MiMo target video changed after AV annotation",
+        ),
+        (
+            Path(job.target_full_audio_path),
+            job.target_full_audio_sha256,
+            "MiMo target full audio changed after AV annotation",
+        ),
+        *(
+            (
+                Path(reference.image_artifact_path),
+                reference.image_sha256,
+                "MiMo frozen reference image changed after AV annotation",
+            )
+            for reference in job.reference_images
+        ),
+    )
+    for path, expected_sha256, message in media:
+        if not path.is_file() or _sha256_file(path) != expected_sha256:
+            raise ValueError(message)
+
+
+def _validate_materializer_provenance(
+    *,
+    inventory: MimoInventory,
+    records: Sequence[MimoRecord],
+    source_samples: Sequence[FinalH3SampleV2],
+) -> None:
+    job_by_clip = {item.clip_uid: item for item in inventory.jobs}
+    sample_ids_by_clip: dict[str, list[str]] = {
+        clip_uid: [] for clip_uid in job_by_clip
+    }
+    for sample in source_samples:
+        if sample.clip_uid in sample_ids_by_clip:
+            sample_ids_by_clip[sample.clip_uid].append(sample.sample_id)
+    for record in records:
+        job = job_by_clip.get(record.clip_uid)
+        if record.inventory_fingerprint != inventory.inventory_fingerprint:
+            raise ValueError("MiMo record inventory fingerprint mismatch")
+        if job is None or record.request_fingerprint != job.request_fingerprint:
+            raise ValueError("MiMo record request fingerprint mismatch")
+    for job in inventory.jobs:
+        if sorted(sample_ids_by_clip[job.clip_uid]) != sorted(
+            job.source_h3_sample_ids
+        ):
+            raise ValueError("MiMo source H3 sample IDs changed after AV annotation")
+        _validate_job_media_integrity(job)
+
+
 def materialize_mimo25_h3_shadow(
     *,
     mimo_root: Path,
@@ -396,16 +449,19 @@ def materialize_mimo25_h3_shadow(
 ) -> MimoH3ShadowSummary:
     source_mimo = mimo_root.expanduser().resolve(strict=True)
     source_h3 = source_h3_root.expanduser().resolve(strict=True)
+    source_h3_samples_path = source_h3 / "samples.jsonl"
     inventory = MimoInventory.model_validate_json(
         (source_mimo / "inventory.json").read_text(encoding="utf-8")
     )
+    if _sha256_file(source_h3_samples_path) != inventory.source_h3_samples_sha256:
+        raise ValueError("MiMo source H3 inventory changed after AV annotation")
     mimo_records = [
         MimoRecord.model_validate(row)
         for row in _read_jsonl(source_mimo / "records.jsonl")
     ]
     all_source_samples = [
         FinalH3SampleV2.model_validate(row)
-        for row in _read_jsonl(source_h3 / "samples.jsonl")
+        for row in _read_jsonl(source_h3_samples_path)
     ]
     job_by_clip = {item.clip_uid: item for item in inventory.jobs}
     source_samples = [
@@ -416,6 +472,11 @@ def materialize_mimo25_h3_shadow(
         raise ValueError("MiMo records contain duplicate target clips")
     if set(record_by_clip) != set(job_by_clip):
         raise ValueError("MiMo records do not exactly cover the selected inventory")
+    _validate_materializer_provenance(
+        inventory=inventory,
+        records=mimo_records,
+        source_samples=all_source_samples,
+    )
     destination = output_root.expanduser().resolve(strict=False)
     if destination.exists() and not overwrite:
         raise FileExistsError(destination)
@@ -478,7 +539,7 @@ def materialize_mimo25_h3_shadow(
         summary = MimoH3ShadowSummary(
             source_mimo_inventory_fingerprint=inventory.inventory_fingerprint,
             source_mimo_records_sha256=_sha256_file(source_mimo / "records.jsonl"),
-            source_h3_samples_sha256=_sha256_file(source_h3 / "samples.jsonl"),
+            source_h3_samples_sha256=_sha256_file(source_h3_samples_path),
             sample_count=len(records),
             ready_count=sum(item.status == "ready" for item in records),
             failed_count=sum(item.status == "failed" for item in records),
