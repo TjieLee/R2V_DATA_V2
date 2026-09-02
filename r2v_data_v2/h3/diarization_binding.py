@@ -34,6 +34,9 @@ from r2v_data_v2.h3.audio_binding import (
     coalesce_audio_bindings,
 )
 from r2v_data_v2.h3.audio_production import H3ProductionInPair
+from r2v_data_v2.h3.audio_schemas import (
+    CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS,
+)
 from r2v_data_v2.h3.schemas import (
     AudioBindingSidecar,
     AudioEntityBinding,
@@ -48,7 +51,7 @@ DIARIZATION_CLIP_RESULT_VERSION = "r2v.h3.diarization_clip_result.2"
 DIARIZATION_SUMMARY_VERSION = "r2v.h3.diarization_summary.4"
 DIARIZATION_HUMAN_QA_VERSION = "r2v.h3.diarization_human_qa.1"
 DIARIZATION_MAPPING_POLICY_VERSION = "h3_diarizen_sparse_anchor_policy_v1"
-DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v2"
+DIARIZATION_REQUEST_VERSION = "h3_diarizen_clip_diarization_v3"
 DIARIZATION_CANONICAL_PREPROCESSING_VERSION = (
     "h3_diarizen_torchaudio_kaiser_32k_stereo_to_16k_mono_v1"
 )
@@ -57,6 +60,9 @@ DIARIZATION_LEGACY_PREPROCESSING_VERSION = (
 )
 DIARIZATION_PREPROCESSING_VERSION = DIARIZATION_CANONICAL_PREPROCESSING_VERSION
 DIARIZATION_BOUNDARY_POLICY_VERSION = "canonical_source_intersection_v1"
+DIARIZATION_CANONICAL_ANCHOR_BOUNDARY_POLICY_VERSION = (
+    "canonical_audio_anchor_source_intersection_v1"
+)
 DIARIZATION_CALIBRATION_INVENTORY_FINGERPRINT = (
     "776761abc1ffa1822766eb29c1ecf61f9e32beda35f2246cb3ef6dc3f096e7b7"
 )
@@ -300,7 +306,7 @@ class DiarizationBackendProvenance(SchemaModel):
     model_identifier: str
     model_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     configuration_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    request_contract_version: Literal["h3_diarizen_clip_diarization_v2"] = (
+    request_contract_version: Literal["h3_diarizen_clip_diarization_v3"] = (
         DIARIZATION_REQUEST_VERSION
     )
     input_profile: DiarizationInputProfile
@@ -1352,6 +1358,7 @@ def _usable_anchors(
     bindings: Sequence[AudioEntityBinding],
     *,
     target: DiarizationTargetClip,
+    input_profile: DiarizationInputProfile,
 ) -> list[_Anchor]:
     minimum = AudioBindingProductionConfig().minimum_binding_confidence
     output: list[_Anchor] = []
@@ -1366,8 +1373,17 @@ def _usable_anchors(
             continue
         start = round(binding.start_time * target.source_sample_rate_hz)
         end = round(binding.end_time * target.source_sample_rate_hz)
-        if start < 0 or end <= start or end > target.source_frame_count:
+        if start < 0 or end <= start or start >= target.source_frame_count:
             raise ValueError("frozen Audio binding exceeds canonical source audio")
+        if end > target.source_frame_count:
+            if input_profile == "legacy_16k_mono":
+                raise ValueError("frozen Audio binding exceeds canonical source audio")
+            overrun_seconds = (
+                end - target.source_frame_count
+            ) / target.source_sample_rate_hz
+            if overrun_seconds > CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS:
+                raise ValueError("frozen Audio binding exceeds canonical source audio")
+            end = target.source_frame_count
         output.append(
             _Anchor(
                 index=index,
@@ -1395,13 +1411,18 @@ def bind_diarization_segments(
     target: DiarizationTargetClip,
     raw_segments: Sequence[RawDiarizationSegment],
     frozen_bindings: Sequence[AudioEntityBinding],
+    input_profile: DiarizationInputProfile = "legacy_16k_mono",
 ) -> _MappingResult:
     clusters: dict[str, list[RawDiarizationSegment]] = defaultdict(list)
     for segment in raw_segments:
         if segment.target_clip_uid != target.target_clip_uid:
             raise ValueError("raw diarization segment belongs to another clip")
         clusters[segment.speaker_cluster_id].append(segment)
-    anchors = _usable_anchors(frozen_bindings, target=target)
+    anchors = _usable_anchors(
+        frozen_bindings,
+        target=target,
+        input_profile=input_profile,
+    )
     support: dict[tuple[str, str], _SupportAccumulator] = {}
     usable_spans: dict[str, list[_SampleSpan]] = defaultdict(list)
     contested_spans: dict[str, list[_SampleSpan]] = defaultdict(list)
@@ -1638,10 +1659,16 @@ def _load_optional_sidecar(
 def _legacy_metrics(
     target: DiarizationTargetClip,
     sidecar: AudioBindingSidecar | None,
+    *,
+    input_profile: DiarizationInputProfile,
 ) -> tuple[list[_Anchor], list[float]]:
     if sidecar is None:
         return [], []
-    anchors = _usable_anchors(sidecar.bindings, target=target)
+    anchors = _usable_anchors(
+        sidecar.bindings,
+        target=target,
+        input_profile=input_profile,
+    )
     turns = coalesce_audio_bindings(
         sidecar.bindings,
         clip_uid=target.target_clip_uid,
@@ -1666,8 +1693,13 @@ def _clip_result(
     sidecar: AudioBindingSidecar | None,
     mapping: _MappingResult,
     status: Literal["ready", "empty"],
+    input_profile: DiarizationInputProfile,
 ) -> DiarizationClipResult:
-    anchors, legacy_turn_durations = _legacy_metrics(target, sidecar)
+    anchors, legacy_turn_durations = _legacy_metrics(
+        target,
+        sidecar,
+        input_profile=input_profile,
+    )
     return DiarizationClipResult(
         target_clip_uid=target.target_clip_uid,
         source_sample_rate_hz=target.source_sample_rate_hz,
@@ -2249,6 +2281,7 @@ def run_diarization_binding_pilot(
                     target=target,
                     raw_segments=clip_raw,
                     frozen_bindings=frozen_bindings,
+                    input_profile=backend.provenance.input_profile,
                 )
                 raw_segments.extend(clip_raw)
                 cluster_bindings.extend(mapping.bindings)
@@ -2260,6 +2293,7 @@ def run_diarization_binding_pilot(
                         sidecar=sidecar,
                         mapping=mapping,
                         status="ready" if clip_raw else "empty",
+                        input_profile=backend.provenance.input_profile,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - isolate one diarization clip

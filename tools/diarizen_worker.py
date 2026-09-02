@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -105,6 +106,48 @@ def _prepare_analysis_audio(
     return destination
 
 
+@contextlib.contextmanager
+def _all_inactive_reconstruct_guard(
+    pipeline: object,
+    *,
+    numpy: Any,
+) -> Any:
+    instance_attributes = vars(pipeline)
+    had_instance_override = "reconstruct" in instance_attributes
+    previous_instance_override = instance_attributes.get("reconstruct")
+    original = pipeline.reconstruct
+    state = {"applied": False}
+
+    def guarded(*args: object, **kwargs: object) -> object:
+        bound = inspect.signature(original).bind(*args, **kwargs)
+        hard_clusters = bound.arguments.get("hard_clusters")
+        segmentations = bound.arguments.get("segmentations")
+        if hard_clusters is not None and segmentations is not None:
+            clusters = numpy.asarray(hard_clusters)
+            segmentation_data = numpy.asarray(segmentations.data)
+            inactive = numpy.sum(segmentation_data, axis=1) == 0
+            if (
+                clusters.size > 0
+                and inactive.shape == clusters.shape
+                and bool(numpy.all(clusters == -2))
+                and bool(numpy.all(inactive))
+            ):
+                working_clusters = numpy.array(hard_clusters, copy=True)
+                working_clusters[...] = 0
+                bound.arguments["hard_clusters"] = working_clusters
+                state["applied"] = True
+        return original(*bound.args, **bound.kwargs)
+
+    pipeline.reconstruct = guarded
+    try:
+        yield state
+    finally:
+        if had_instance_override:
+            pipeline.reconstruct = previous_instance_override
+        else:
+            del pipeline.reconstruct
+
+
 def _load_pipeline(arguments: argparse.Namespace) -> tuple[object, object, object, object]:
     code_root = arguments.code_root.expanduser().resolve(strict=True)
     model_cache = arguments.model_cache.expanduser().resolve(strict=True)
@@ -148,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
         pipeline, device, torch, torchaudio = _load_pipeline(arguments)
+        import numpy as np
     except Exception as exc:  # noqa: BLE001 - startup must fail closed with diagnostics
         print(f"DiariZen startup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         _emit(
@@ -203,7 +247,11 @@ def main(argv: list[str] | None = None) -> int:
                     torchaudio=torchaudio,
                     input_profile=arguments.input_profile,
                 )
-                with contextlib.redirect_stdout(sys.stderr):
+                with contextlib.ExitStack() as stack:
+                    guard_state = stack.enter_context(
+                        _all_inactive_reconstruct_guard(pipeline, numpy=np)
+                    )
+                    stack.enter_context(contextlib.redirect_stdout(sys.stderr))
                     result = pipeline(str(model_audio_path), sess_name=clip_uid)
             segments = [
                 {
@@ -247,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         "model_input_sample_rate_hz": 16000,
                         "model_input_channels": 1,
+                        "all_inactive_reconstruction_guard_applied": guard_state[
+                            "applied"
+                        ],
                     },
                 }
             )

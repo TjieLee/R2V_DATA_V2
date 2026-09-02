@@ -19,7 +19,9 @@ from r2v_data_v2.h3.audio_production import (
     H3ProductionInPairSubject,
 )
 from r2v_data_v2.h3.diarization_binding import (
+    DIARIZATION_CANONICAL_ANCHOR_BOUNDARY_POLICY_VERSION,
     DIARIZATION_HUMAN_QA_LABELS,
+    DIARIZATION_REQUEST_VERSION,
     DiarizationBackendFailure,
     DiarizationBackendProvenance,
     DiarizationBackendSegment,
@@ -30,8 +32,10 @@ from r2v_data_v2.h3.diarization_binding import (
     DiarizationTargetClip,
     PersistentDiariZenBackend,
     RawDiarizationSegment,
+    _legacy_metrics,
     _mapped_identity_duration_metrics,
     _normalize_segments,
+    _usable_anchors,
     bind_diarization_segments,
     build_complete_diarization_inventory,
     build_diarization_inventory,
@@ -49,7 +53,10 @@ from r2v_data_v2.h3.schemas import (
     PictureAsset,
     SemanticSubject,
 )
-from tools.diarizen_worker import _prepare_analysis_audio
+from tools.diarizen_worker import (
+    _all_inactive_reconstruct_guard,
+    _prepare_analysis_audio,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -270,15 +277,21 @@ class _FakeBackend:
         )
 
 
-def _target(*, clip_uid: str = "clip-a", rate: int = 100) -> DiarizationTargetClip:
+def _target(
+    *,
+    clip_uid: str = "clip-a",
+    rate: int = 100,
+    channels: int = 1,
+    frame_count: int = 1000,
+) -> DiarizationTargetClip:
     return DiarizationTargetClip(
         target_clip_uid=clip_uid,
         target_video_path=f"/{clip_uid}.mp4",
         source_audio_path=f"/{clip_uid}.wav",
         source_audio_sha256="c" * 64,
         source_sample_rate_hz=rate,
-        source_channels=1,
-        source_frame_count=1000,
+        source_channels=channels,
+        source_frame_count=frame_count,
         target_audio_binding_path=f"/{clip_uid}.json",
         visual_references=[],
     )
@@ -715,6 +728,91 @@ def test_sparse_raw_anchor_maps_cluster_and_propagates_to_zero_overlap_segment()
         "cluster_propagated_only",
     ]
     assert mapping.bound_segments[1].entity_id == "e1"
+
+
+def test_canonical_anchor_small_eof_overrun_is_clamped_for_direct_support() -> None:
+    target = _target(rate=32000, channels=2, frame_count=32000)
+    binding = _binding(0.9, 1.05)
+    anchors = _usable_anchors(
+        [binding],
+        target=target,
+        input_profile="canonical_32k_stereo",
+    )
+
+    assert [(item.start, item.end) for item in anchors] == [(28800, 32000)]
+    mapping = bind_diarization_segments(
+        target=target,
+        raw_segments=[_raw("speaker_0", 0.8, 1.0, index=1, target=target)],
+        frozen_bindings=[binding],
+        input_profile="canonical_32k_stereo",
+    )
+
+    assert mapping.bindings[0].status == "candidate_mapped"
+    assert mapping.bindings[0].usable_anchor_sample_count == 3200
+    assert mapping.bindings[0].entity_supports[0].direct_support_samples == 3200
+    assert mapping.bound_segments[0].direct_anchor_samples == 3200
+
+
+def test_canonical_anchor_large_eof_overrun_fails_closed() -> None:
+    target = _target(rate=32000, channels=2, frame_count=32000)
+
+    with pytest.raises(
+        ValueError,
+        match="frozen Audio binding exceeds canonical source audio",
+    ):
+        _usable_anchors(
+            [_binding(0.8, 1.10003125)],
+            target=target,
+            input_profile="canonical_32k_stereo",
+        )
+
+
+def test_canonical_anchor_starting_at_eof_fails_closed() -> None:
+    target = _target(rate=32000, channels=2, frame_count=32000)
+
+    with pytest.raises(
+        ValueError,
+        match="frozen Audio binding exceeds canonical source audio",
+    ):
+        _usable_anchors(
+            [_binding(1.0, 1.02)],
+            target=target,
+            input_profile="canonical_32k_stereo",
+        )
+
+
+def test_legacy_anchor_small_eof_overrun_remains_strict() -> None:
+    target = _target(rate=16000, channels=1, frame_count=16000)
+
+    with pytest.raises(
+        ValueError,
+        match="frozen Audio binding exceeds canonical source audio",
+    ):
+        _usable_anchors(
+            [_binding(0.9, 1.01)],
+            target=target,
+            input_profile="legacy_16k_mono",
+        )
+
+
+def test_legacy_metrics_and_mapping_share_effective_canonical_anchors() -> None:
+    target = _target(rate=32000, channels=2, frame_count=32000)
+    binding = _binding(0.9, 1.05)
+    anchors, durations = _legacy_metrics(
+        target,
+        SimpleNamespace(bindings=[binding]),
+        input_profile="canonical_32k_stereo",
+    )
+    mapping = bind_diarization_segments(
+        target=target,
+        raw_segments=[_raw("speaker_0", 0.8, 1.0, index=1, target=target)],
+        frozen_bindings=[binding],
+        input_profile="canonical_32k_stereo",
+    )
+
+    assert [(item.start, item.end) for item in anchors] == [(28800, 32000)]
+    assert durations == pytest.approx([0.15])
+    assert mapping.usable_samples == anchors[0].end - anchors[0].start
 
 
 def test_identity_propagation_metrics_include_unanchored_part_of_mixed_segment() -> (
@@ -1309,6 +1407,111 @@ def test_diarizen_legacy_runtime_profile_is_native_16k_mono_passthrough(
     assert result == source
     assert calls == [("load", str(source))]
     assert not destination.exists()
+
+
+class _Segmentations:
+    def __init__(self, data: np.ndarray) -> None:
+        self.data = data
+
+
+class _ReconstructPipeline:
+    def __init__(self, *, unrelated_failure: bool = False) -> None:
+        self.calls: list[np.ndarray] = []
+        self.unrelated_failure = unrelated_failure
+
+    def reconstruct(
+        self,
+        segmentations: _Segmentations,
+        hard_clusters: np.ndarray,
+    ) -> np.ndarray:
+        del segmentations
+        self.calls.append(hard_clusters.copy())
+        if self.unrelated_failure:
+            raise ValueError("unrelated reconstruction failure")
+        return np.zeros((1, int(np.max(hard_clusters)) + 1))
+
+
+def test_diarizen_all_inactive_reconstruct_guard_returns_empty_activity() -> None:
+    pipeline = _ReconstructPipeline()
+    segmentations = _Segmentations(np.zeros((1, 4, 2), dtype=np.int64))
+    hard_clusters = np.full((1, 2), -2, dtype=np.int64)
+
+    with _all_inactive_reconstruct_guard(pipeline, numpy=np) as state:
+        reconstructed = pipeline.reconstruct(segmentations, hard_clusters)
+
+    assert state == {"applied": True}
+    assert pipeline.calls[0].tolist() == [[0, 0]]
+    assert reconstructed.shape == (1, 1)
+    assert "reconstruct" not in vars(pipeline)
+    with pytest.raises(ValueError, match="negative dimensions"):
+        pipeline.reconstruct(segmentations, hard_clusters)
+
+
+def test_diarizen_reconstruct_guard_leaves_other_states_unchanged() -> None:
+    pipeline = _ReconstructPipeline()
+    segmentations = _Segmentations(
+        np.array([[[1, 0], [0, 0]]], dtype=np.int64)
+    )
+    hard_clusters = np.array([[0, -2]], dtype=np.int64)
+
+    with _all_inactive_reconstruct_guard(pipeline, numpy=np) as state:
+        pipeline.reconstruct(segmentations, hard_clusters)
+
+    assert state == {"applied": False}
+    assert [item.tolist() for item in pipeline.calls] == [hard_clusters.tolist()]
+
+
+def test_diarizen_reconstruct_guard_requires_zero_inactive_segmentations() -> None:
+    pipeline = _ReconstructPipeline()
+    segmentations = _Segmentations(np.ones((1, 2, 1), dtype=np.int64))
+    hard_clusters = np.full((1, 1), -2, dtype=np.int64)
+
+    with _all_inactive_reconstruct_guard(
+        pipeline, numpy=np
+    ) as state, pytest.raises(ValueError, match="negative dimensions"):
+        pipeline.reconstruct(segmentations, hard_clusters)
+
+    assert state == {"applied": False}
+    assert [item.tolist() for item in pipeline.calls] == [hard_clusters.tolist()]
+
+
+def test_diarizen_reconstruct_guard_propagates_unrelated_value_error() -> None:
+    pipeline = _ReconstructPipeline(unrelated_failure=True)
+    segmentations = _Segmentations(np.zeros((1, 2, 1), dtype=np.int64))
+    hard_clusters = np.full((1, 1), -2, dtype=np.int64)
+
+    with _all_inactive_reconstruct_guard(
+        pipeline, numpy=np
+    ) as state, pytest.raises(ValueError, match="unrelated reconstruction failure"):
+        pipeline.reconstruct(segmentations, hard_clusters)
+
+    assert state == {"applied": True}
+
+
+def test_diarization_request_v3_changes_configuration_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = {
+        "model_identifier": "fixture/diarizen",
+        "model_fingerprint": "a" * 64,
+        "requested_device": "cuda:0",
+        "input_profile": "canonical_32k_stereo",
+    }
+    current = diarization_cli._configuration_fingerprint(**arguments)
+    monkeypatch.setattr(
+        diarization_cli,
+        "DIARIZATION_REQUEST_VERSION",
+        "h3_diarizen_clip_diarization_v2",
+    )
+    previous = diarization_cli._configuration_fingerprint(**arguments)
+
+    assert DIARIZATION_REQUEST_VERSION == "h3_diarizen_clip_diarization_v3"
+    assert _provenance().request_contract_version == DIARIZATION_REQUEST_VERSION
+    assert current != previous
+    assert (
+        DIARIZATION_CANONICAL_ANCHOR_BOUNDARY_POLICY_VERSION
+        == "canonical_audio_anchor_source_intersection_v1"
+    )
 
 
 def test_current_diarization_inventory_rejects_old_sample_domain_schema(

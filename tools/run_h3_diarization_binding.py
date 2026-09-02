@@ -18,6 +18,7 @@ from r2v_data_v2.h3.diarization_binding import (
     DEFAULT_DIARIZEN_DEVICE,
     DEFAULT_DIARIZEN_MODEL_IDENTIFIER,
     DEFAULT_DIARIZEN_TIMEOUT_SECONDS,
+    DIARIZATION_CANONICAL_ANCHOR_BOUNDARY_POLICY_VERSION,
     DIARIZATION_CANONICAL_PREPROCESSING_VERSION,
     DIARIZATION_LEGACY_PREPROCESSING_VERSION,
     DIARIZATION_REQUEST_VERSION,
@@ -69,6 +70,11 @@ def _configuration_fingerprint(
                 DIARIZATION_CANONICAL_PREPROCESSING_VERSION
                 if input_profile == "canonical_32k_stereo"
                 else DIARIZATION_LEGACY_PREPROCESSING_VERSION
+            ),
+            "anchor_boundary_policy_version": (
+                DIARIZATION_CANONICAL_ANCHOR_BOUNDARY_POLICY_VERSION
+                if input_profile == "canonical_32k_stereo"
+                else "strict_frozen_audio_anchor_extent_v1"
             ),
         },
         sort_keys=True,

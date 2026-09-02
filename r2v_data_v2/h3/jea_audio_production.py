@@ -30,7 +30,10 @@ from r2v_data_v2.h3.audio_pairing import (
     evaluate_pair_policy_v1,
     select_complete_donor_matching,
 )
-from r2v_data_v2.h3.audio_schemas import PairEvidence
+from r2v_data_v2.h3.audio_schemas import (
+    CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS,
+    PairEvidence,
+)
 from r2v_data_v2.h3.diarization_binding import (
     DiarizationInventory,
     DiarizationTargetClip,
@@ -60,7 +63,6 @@ from r2v_data_v2.h3.visual_production_source import (
 JEA_PAIR_SCHEMA_VERSION = "r2v.h3.jea_pairs.2"
 CANONICAL_AUDIO_CLIP_VERSION = "r2v.h3.canonical_audio_clip.3"
 CANONICAL_AUDIO_CLIP_SUMMARY_VERSION = "r2v.h3.canonical_audio_clip_summary.3"
-CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS = 0.10
 CANONICAL_AUDIO_SAMPLE_RATE_HZ = 32000
 CANONICAL_AUDIO_CHANNELS = 2
 ANALYSIS_AUDIO_SAMPLE_RATE_HZ = 16000

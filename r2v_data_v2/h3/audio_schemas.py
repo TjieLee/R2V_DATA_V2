@@ -11,6 +11,7 @@ from r2v_data_v2.h3.schemas import BindingStatus, SchemaModel
 AUDIO_CLIP_BINDING_SCHEMA_VERSION = "r2v.audio.clip_binding.1"
 AUDIO_PAIR_SAMPLE_SCHEMA_VERSION = "r2v.audio.pair_sample.1"
 H3_SAMPLE_SCHEMA_VERSION = "r2v.h3.sample.1"
+CANONICAL_AUDIO_TIMELINE_TOLERANCE_SECONDS = 0.10
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ENTITY_ID = re.compile(r"e[1-9]\d*")
