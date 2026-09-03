@@ -20,6 +20,20 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
 - the deterministic materializer owns `Sx`, Subject and Audio references, exact
   dialogue, and final H3 formatting.
 
+Every DiariZen segment receives one `segment_decisions` row, including empty or
+otherwise non-transcribed segments. The separate internal H3 draft inventory is
+stricter: only Qwen3-ASR segments with `asr_status="transcribed"` receive
+`[[segment:...]]` placeholders. Those placeholders and `[[audio_event:...]]`
+are pipeline-internal and are always removed by deterministic materialization;
+they are not MiniMax H3 syntax.
+
+Each draft Subject definition is constrained by a machine-readable, per-request
+mapping from its exact frozen `<Subject N>` label to all and only its owning
+`<Picture N>` labels. MiMo must cite those labels explicitly, but the definition
+remains natural official Ref2VA prose rather than a project-specific fixed
+English template. The full-AV recheck receives the same mapping and exact
+transcribed-segment inventory.
+
 MiMo never splits or deletes a DiariZen segment. Multiple vocal events can mark
 a segment as requiring acoustic refinement, but the authoritative segment and
 Qwen3-ASR text remain present. The default inventory scope is
@@ -50,7 +64,7 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v5`
+- `h3_mimo25_unified_av_reconcile_v6`
 - `h3_mimo25_av_authority_contract_v5`
 - `r2v.h3.mimo25_av_annotation.5`
 - `r2v.h3.mimo25_backend.5`
@@ -121,6 +135,13 @@ once as `[[audio_event:aeN]]` in a shot. The deterministic MiMo materializer
 replaces those placeholders with the validated event descriptions before the
 existing exact speech-placeholder materialization, so final H3 text cannot
 silently omit accepted Audio events.
+
+The materialized output remains official MiniMax H3 Ref2VA: the six sections
+are emitted in `subject_definitions`, `summary`, `retention_analysis`,
+`detailed_description`, `overall_soundscape`, `non_diegetic_music` order;
+reference labels keep one meaning across sections; and dialogue uses stable
+`(Sx)` source IDs with `<d>[Language] ...</d>`. The mandatory draft contract
+does not redefine official reference-label or retention-marker semantics.
 
 MiMo records retain explicit `present`, `absent`, or `unknown` status for the
 overall soundscape and non-diegetic music. The H3 training prompt renders a

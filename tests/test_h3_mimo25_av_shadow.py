@@ -235,6 +235,53 @@ def _job_fixture(tmp_path: Path) -> MimoClipJob:
     return _job(values)
 
 
+def _multi_picture_job_fixture(tmp_path: Path) -> MimoClipJob:
+    job = _job_fixture(tmp_path)
+    second_image = tmp_path / "reference-2.png"
+    second_image.write_bytes(b"image-2")
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    values["reference_images"].append(
+        MimoReferenceImage(
+            image_index=2,
+            picture_label="<Picture 2>",
+            kind="subject",
+            entity_id="e1",
+            image_artifact_path=str(second_image.resolve()),
+            image_sha256="4" * 64,
+        ).model_dump(mode="json")
+    )
+    values["reference_subjects"][0]["source_picture_labels"] = [
+        "<Picture 1>",
+        "<Picture 2>",
+    ]
+    return _job(values)
+
+
+def _job_with_non_transcribed_segment(tmp_path: Path) -> MimoClipJob:
+    job = _job_fixture(tmp_path)
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    values["target_duration_seconds"] = 2.0
+    values["segments"].append(
+        MimoSegmentEvidence(
+            segment_id="segment_2",
+            start_time=1.0,
+            end_time=2.0,
+            source_start_sample=32000,
+            source_end_sample=64000,
+            source_sample_rate_hz=32000,
+            source_speaker_cluster_id="speaker_1",
+            identity_scope="unresolved",
+            direct_anchor_seconds=0.0,
+            cluster_binding_status="unbound",
+            overlapping_visible_entities=[],
+            direct_support_seconds_by_entity={},
+            competing_visible_speaker_evidence=[],
+            asr_status="empty",
+        ).model_dump(mode="json")
+    )
+    return _job(values)
+
+
 def _validate(
     annotation: MimoAVAnnotationDraft,
     *,
@@ -472,7 +519,7 @@ def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> 
 
 
 def test_mimo_v5_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v5"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v6"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v5"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.5"
     for phrase in (
@@ -487,6 +534,45 @@ def test_mimo_v5_prompt_restores_dense_visual_and_audio_authority_contract() -> 
     ):
         assert phrase in SYSTEM_PROMPT
     assert "SUPPLIED <Picture N> AND <Subject N> LABELS" in SYSTEM_PROMPT
+
+
+def test_primary_prompt_includes_exact_subject_picture_contract(
+    tmp_path: Path,
+) -> None:
+    job = _multi_picture_job_fixture(tmp_path)
+    backend, _ = _backend(tmp_path, [])
+
+    prompt = backend._prompt(job)
+    contract = backend.build_mandatory_h3_draft_contract(job)
+
+    assert contract["subject_definition_requirements"] == [
+        {
+            "subject_label": "<Subject 1>",
+            "required_source_picture_labels": ["<Picture 1>", "<Picture 2>"],
+        }
+    ]
+    assert json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) in prompt
+    assert "ALL AND ONLY its required_source_picture_labels exactly once each" in prompt
+    assert "natural official H3 Ref2VA English prose" in prompt
+    assert "There is no required fixed English connector" in prompt
+
+
+def test_primary_prompt_separates_decision_and_speech_placeholder_inventories(
+    tmp_path: Path,
+) -> None:
+    job = _job_with_non_transcribed_segment(tmp_path)
+    backend, _ = _backend(tmp_path, [])
+
+    prompt = backend._prompt(job)
+    contract = backend.build_mandatory_h3_draft_contract(job)
+
+    assert contract["allowed_segment_ids"] == ["segment_1", "segment_2"]
+    assert contract["transcribed_segment_ids"] == ["segment_1"]
+    assert "including non-transcribed segments" in prompt
+    assert "Never emit a speech placeholder for an allowed segment" in prompt
+    assert "listed in transcribed_segment_ids" in prompt
 
 
 def test_mimo_prompt_separates_voice_identity_from_visible_speech() -> None:
@@ -1113,6 +1199,38 @@ def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) 
     recheck = content[-1]["text"]
     assert job.r2v_instruction in recheck
     assert job.target_video_path not in recheck
+
+
+def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
+    job = _multi_picture_job_fixture(tmp_path)
+    backend, _ = _backend(tmp_path, [])
+    issues = [
+        ValidationIssue(
+            "subject_definition_contract_mismatch",
+            "h3_draft.subject_definitions",
+            "definition differs",
+        ),
+        ValidationIssue(
+            "speech_placeholder_inventory_mismatch",
+            "h3_draft.shots",
+            "placeholder inventory differs",
+        ),
+    ]
+
+    prompt = backend._full_av_recheck_prompt(
+        job,
+        invalid_response="{}",
+        issues=issues,
+    )
+    contract = backend.build_mandatory_h3_draft_contract(job)
+
+    assert json.dumps(
+        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ) in prompt
+    assert "regenerate each affected definition" in prompt
+    assert "exact Subject-to-Pictures mapping" in prompt
+    assert "rebuild all shot speech placeholders" in prompt
+    assert "exactly equals transcribed_segment_ids" in prompt
 
 
 def test_sglang_full_av_recheck_preserves_primary_transport_contract(
@@ -2027,6 +2145,94 @@ def test_subject_definition_rejects_wrong_supplied_picture() -> None:
     assert "subject_definition_contract_mismatch" in {item.code for item in issues}
 
 
+def test_subject_definition_rejects_extra_supplied_picture() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"] = [
+        "<Subject 1> is the person in <Picture 1> and <Picture 2>."
+    ]
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        allowed_reference_labels={"<Picture 1>", "<Picture 2>", "<Subject 1>"},
+    )
+    assert "subject_definition_contract_mismatch" in {item.code for item in issues}
+
+
+def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None:
+    subjects = [
+        RecaptionSubjectContract(
+            subject_index=1,
+            subject_label="<Subject 1>",
+            kind="entity",
+            entity_id="e1",
+            source_picture_labels=["<Picture 1>", "<Picture 2>"],
+        )
+    ]
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"] = [
+        (
+            "<Subject 1> is the same person shown in <Picture 1> and <Picture 2>, "
+            "with the visible appearance combined across both references."
+        )
+    ]
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        allowed_reference_labels={"<Picture 1>", "<Picture 2>", "<Subject 1>"},
+        reference_subjects=subjects,
+    )
+    assert "subject_definition_contract_mismatch" not in {
+        item.code for item in issues
+    }
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "[[segment:segment_1]]",
+        "[[segment:segment_1]] [[segment:segment_1]] [[segment:segment_2]]",
+        "[[segment:segment_2]] [[segment:segment_1]]",
+    ],
+)
+def test_speech_placeholder_inventory_rejects_missing_duplicate_or_reordered(
+    template: str,
+) -> None:
+    payload = _two_segment_annotation(
+        second_group="g1", second_entity=None
+    ).model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["description_template"] = template
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        segment_ids=["segment_1", "segment_2"],
+        transcribed_segment_ids=["segment_1", "segment_2"],
+    )
+    assert "speech_placeholder_inventory_mismatch" in {
+        item.code for item in issues
+    }
+
+
+def test_non_transcribed_segment_cannot_receive_speech_placeholder() -> None:
+    annotation = _two_segment_annotation(second_group="g1", second_entity=None)
+    issues = _validate(
+        annotation,
+        segment_ids=["segment_1", "segment_2"],
+        transcribed_segment_ids=["segment_1"],
+    )
+    assert "speech_placeholder_inventory_mismatch" in {
+        item.code for item in issues
+    }
+
+
+def test_exact_transcribed_speech_placeholder_inventory_is_accepted() -> None:
+    annotation = _two_segment_annotation(second_group="g1", second_entity=None)
+    issues = _validate(
+        annotation,
+        segment_ids=["segment_1", "segment_2"],
+        transcribed_segment_ids=["segment_1", "segment_2"],
+    )
+    assert "speech_placeholder_inventory_mismatch" not in {
+        item.code for item in issues
+    }
+
+
 def test_warning_requires_known_segment_and_never_contains_replacement_text() -> None:
     warning = MimoAnnotationWarning(
         code="possible_asr_conflict", segment_id="segment_1"
@@ -2565,6 +2771,30 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert "[[audio_event:" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert not warnings or all("words" in item for item in warnings)
+
+
+def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, _annotation()),
+    )
+    sections = [
+        "subject_definitions",
+        "summary",
+        "retention_analysis",
+        "detailed_description",
+        "overall_soundscape",
+        "non_diegetic_music",
+    ]
+
+    assert [rendered.index(f"{section}:\n") for section in sections] == sorted(
+        rendered.index(f"{section}:\n") for section in sections
+    )
+    assert "[[segment:" not in rendered
+    assert "[[audio_event:" not in rendered
+    assert "<Subject 1> (S1)" in rendered
+    assert "<d>[English] Exact, text!</d>" in rendered
 
 
 @pytest.mark.parametrize(

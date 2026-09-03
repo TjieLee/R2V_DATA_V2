@@ -26,7 +26,7 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v5"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v6"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v5"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.5"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.5"
@@ -414,7 +414,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v5"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v6"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v5"] = (
@@ -665,9 +665,11 @@ Use observed evidence, never plausible filler. Do not infer psychology or unsupp
 
 SUPPLIED <Picture N> AND <Subject N> LABELS are immutable pipeline-provided labels. Reuse them exactly where required; never renumber or invent them. Use supplied Picture and Subject labels in subject definitions and visual retention analysis. Do not emit <Video N>, <Audio N>, unknown Picture/Subject labels, your own reference numbering, (Sx), <d>, donor provenance, or final H3 formatting. The target video is observation only and is never <Video N>. Pictures are content references, not first frames, last frames, or keyframes.
 
+Subject definitions must remain natural official MiniMax H3 Ref2VA prose. The per-request mandatory H3 draft contract supplies the exact pipeline-owned Subject-to-Picture provenance. Write exactly one definition for each supplied Subject, begin it with that exact Subject label, and naturally cite every and only its required Picture labels exactly once. Do not impose or invent a fixed English phrase for that relationship.
+
 The only allowed visual retention markers are fully_preserved, partially_preserved, and weak_reference. attribute_transfer is forbidden by the current conditioning contract. Do not invent another marker.
 
-Each supplied transcribed segment must appear exactly once as [[segment:<segment_id>]] in shot description_template fields, in authoritative chronological order and at its observed temporal position. A placeholder represents the complete speech clause. Never prefix it with says, speaks, asks, replies, shouts, whispers, "the woman says", "the man replies", a character name, a pronoun, or a role. Do not place a placeholder in subject_definitions, summary, or visual_retention_analysis. Do not copy dialogue.
+Every supplied DiariZen segment in allowed_segment_ids must receive exactly one segment_decisions row in supplied order, whether transcribed or not. H3 draft speech placeholders follow the separate transcribed_segment_ids inventory: each listed transcribed segment must appear exactly once as [[segment:<segment_id>]] in shot description_template fields, in authoritative chronological order and at its observed temporal position, and no other segment may receive a speech placeholder. A placeholder represents the complete speech clause. It is internal draft syntax, not MiniMax H3 syntax, and must be left for deterministic materialization. Never prefix it with says, speaks, asks, replies, shouts, whispers, "the woman says", "the man replies", a character name, a pronoun, or a role. Do not place a placeholder in subject_definitions, summary, or visual_retention_analysis. Do not copy dialogue.
 
 Insert every emitted Audio event exactly once as [[audio_event:<event_id>]] at its approximate observed position in the appropriate shot. Audio-event placeholders must follow event chronological order, may overlap speech placeholders, and are allowed only in shot description_template fields. Each placeholder represents the complete grounded Audio-event clause. Do not restate or paraphrase that event elsewhere in the shot.
 
@@ -1531,6 +1533,54 @@ class OpenAIMimo25Backend:
             ],
         }
 
+    @staticmethod
+    def build_mandatory_h3_draft_contract(
+        job: MimoBackendJob,
+    ) -> dict[str, object]:
+        return {
+            "subject_definition_requirements": [
+                {
+                    "subject_label": subject.subject_label,
+                    "required_source_picture_labels": list(
+                        subject.source_picture_labels
+                    ),
+                }
+                for subject in job.reference_subjects
+            ],
+            "allowed_segment_ids": [item.segment_id for item in job.segments],
+            "transcribed_segment_ids": [
+                item.segment_id
+                for item in job.segments
+                if item.asr_status == "transcribed"
+            ],
+        }
+
+    @classmethod
+    def _mandatory_h3_draft_contract_text(cls, job: MimoBackendJob) -> str:
+        return (
+            "MACHINE-READABLE MANDATORY H3 DRAFT CONTRACT:\n"
+            + _compact_json(cls.build_mandatory_h3_draft_contract(job))
+            + "\nMANDATORY H3 DRAFT SYNTAX RULES:\n"
+            "1. segment_decisions must cover every allowed_segment_ids item exactly "
+            "once and in supplied order, including non-transcribed segments.\n"
+            "2. Flattened [[segment:ID]] placeholders across h3_draft.shots must "
+            "equal transcribed_segment_ids exactly, once each and in that chronological "
+            "order. Never emit a speech placeholder for an allowed segment that is not "
+            "listed in transcribed_segment_ids.\n"
+            "3. subject_definitions must contain exactly one row per "
+            "subject_definition_requirements item. Each row must begin with its exact "
+            "subject_label, contain ALL AND ONLY its required_source_picture_labels "
+            "exactly once each, and contain no other Subject label.\n"
+            "4. Subject definitions must be natural official H3 Ref2VA English prose. "
+            "There is no required fixed English connector. Illustrative metasyntax only: "
+            "'{subject_label} is ... in {required_picture_label_1} and "
+            "{required_picture_label_2} ...'. Replace every brace token with the supplied "
+            "labels and do not emit brace tokens.\n"
+            "5. [[segment:ID]] and [[audio_event:ID]] are internal draft placeholders. "
+            "Do not convert them into final (Sx), <d>, or other MiniMax H3 syntax; the "
+            "deterministic materializer owns final rendering."
+        )
+
     def _prompt(self, job: MimoBackendJob) -> str:
         return (
             "Return exactly one JSON object matching this schema, with no markdown or extra fields.\n"
@@ -1540,6 +1590,8 @@ class OpenAIMimo25Backend:
             + "\nThis is task intent and a non-authoritative visual hint. It may tell you how "
             "the supplied references are intended to participate in generation, but it must "
             "never override what is actually observed in the target video."
+            + "\n"
+            + self._mandatory_h3_draft_contract_text(job)
             + "\nCOMPACT AUTHORITATIVE INPUT:\n"
             + _compact_json(self.build_compact_task_contract(job))
         )
@@ -1621,6 +1673,26 @@ class OpenAIMimo25Backend:
         invalid_response: str,
         issues: list[ValidationIssue],
     ) -> str:
+        issue_codes = {item.code for item in issues}
+        issue_actions: list[str] = []
+        if "subject_definition_contract_mismatch" in issue_codes:
+            issue_actions.append(
+                "For subject_definition_contract_mismatch, regenerate each affected "
+                "definition from the supplied exact Subject-to-Pictures mapping. Do not "
+                "guess, omit, add, duplicate, or reassign Picture ownership."
+            )
+        if "speech_placeholder_inventory_mismatch" in issue_codes:
+            issue_actions.append(
+                "For speech_placeholder_inventory_mismatch, rebuild all shot speech "
+                "placeholders so their flattened sequence exactly equals "
+                "transcribed_segment_ids. Do not locally patch the previous string and "
+                "do not emit placeholders for other allowed segments."
+            )
+        actions = (
+            "\nISSUE-SPECIFIC CONTRACT ACTIONS:\n" + "\n".join(issue_actions)
+            if issue_actions
+            else ""
+        )
         return (
             "Reinspect the SAME audiovisual evidence. Do not merely edit fields to "
             "satisfy validation. Resolve speaker/entity/audio-semantic contradictions "
@@ -1628,7 +1700,10 @@ class OpenAIMimo25Backend:
             "timing and Qwen3-ASR text. Do not change segment boundaries, sample "
             "boundaries, ASR text, ASR language, or the reference inventory. Return "
             "exactly one compact JSON object with no markdown or extra fields."
-            "\nCOMPACT AUTHORITATIVE TASK CONTRACT: "
+            "\n"
+            + self._mandatory_h3_draft_contract_text(job)
+            + actions
+            + "\nCOMPACT AUTHORITATIVE TASK CONTRACT: "
             + _compact_json(self.build_compact_task_contract(job))
             + "\nSCHEMA: "
             + _compact_json(MimoAVAnnotationDraft.model_json_schema())
