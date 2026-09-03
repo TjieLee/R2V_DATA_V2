@@ -380,7 +380,11 @@ def _materialize_sample(
         shots=[
             Qwen38DraftShot(
                 shot_index=item.shot_index,
-                start_time=item.start_time,
+                start_time=(
+                    None
+                    if item.shot_index == 1 and item.start_time == 0
+                    else item.start_time
+                ),
                 description_template=_render_timeline_parts(
                     item,
                     audio_event_by_id=audio_event_by_id,

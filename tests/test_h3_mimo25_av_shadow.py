@@ -491,6 +491,26 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
 
 
+def test_first_shot_zero_does_not_trigger_full_av_recheck(tmp_path: Path) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["start_time"] = 0
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    backend, completions = _backend(tmp_path, [(annotation.model_dump_json(), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.annotation.h3_draft.shots[0].start_time == 0
+    assert result.model_call_count == 1
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+
+
 def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
     tmp_path: Path,
 ) -> None:
@@ -2333,10 +2353,63 @@ def test_subject_definition_and_shot_bounds_fail_closed() -> None:
     }
 
 
-def test_first_shot_start_time_zero_is_rejected() -> None:
+@pytest.mark.parametrize("start_time", [None, 0])
+def test_first_shot_implicit_or_explicit_zero_is_accepted(
+    start_time: float | None,
+) -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["h3_draft"]["shots"][0]["start_time"] = 0
-    with pytest.raises(ValidationError, match="Shot 1 cannot have a start time"):
+    payload["h3_draft"]["shots"][0]["start_time"] = start_time
+    draft = MimoAVAnnotationDraft.model_validate(payload)
+    assert draft.h3_draft.shots[0].start_time == start_time
+
+
+def test_first_shot_nonzero_start_time_is_rejected() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["start_time"] = 0.1
+    with pytest.raises(ValidationError, match="start implicitly or at zero"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+@pytest.mark.parametrize("start_time", [None, 0])
+def test_later_shot_missing_or_zero_start_time_is_rejected(
+    start_time: float | None,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"].append(
+        {
+            "shot_index": 2,
+            "start_time": start_time,
+            "timeline_parts": [_prose("A hard cut reveals another angle.")],
+        }
+    )
+    with pytest.raises(ValidationError, match="later MiMo H3"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_later_positive_hard_cuts_remain_strictly_ordered() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"].extend(
+        [
+            {
+                "shot_index": 2,
+                "start_time": 0.25,
+                "timeline_parts": [_prose("A hard cut reveals another angle.")],
+            },
+            {
+                "shot_index": 3,
+                "start_time": 0.75,
+                "timeline_parts": [_prose("A final hard cut returns to the subject.")],
+            },
+        ]
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert [shot.start_time for shot in annotation.h3_draft.shots] == [
+        None,
+        0.25,
+        0.75,
+    ]
+    payload["h3_draft"]["shots"][2]["start_time"] = 0.2
+    with pytest.raises(ValidationError, match="strictly increase"):
         MimoAVAnnotationDraft.model_validate(payload)
 
 
@@ -2988,6 +3061,42 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert "[[audio_event:" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert not warnings or all("words" in item for item in warnings)
+
+
+def test_materializer_canonicalizes_first_shot_zero_to_none(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["start_time"] = 0
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert annotation.h3_draft.shots[0].start_time == 0
+    _, expected_rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, _annotation()),
+    )
+
+    original = mimo25_materializer.materialize_h3_draft
+    observed: dict[str, float | None] = {}
+
+    def capture_start_time(draft: object, *args: object, **kwargs: object) -> object:
+        observed["start_time"] = draft.shots[0].start_time  # type: ignore[attr-defined]
+        return original(draft, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        mimo25_materializer,
+        "materialize_h3_draft",
+        capture_start_time,
+    )
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    assert observed["start_time"] is None
+    assert rendered == expected_rendered
 
 
 def test_materializer_audio_facts_use_segment_level_delivery(tmp_path: Path) -> None:

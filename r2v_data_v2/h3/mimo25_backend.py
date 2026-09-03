@@ -403,12 +403,14 @@ class MimoH3Draft(SchemaModel):
         indexes = [shot.shot_index for shot in self.shots]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("MiMo H3 shots must use contiguous indexes")
-        if self.shots[0].start_time is not None:
-            raise ValueError("MiMo H3 Shot 1 cannot have a start time")
+        if self.shots[0].start_time not in {None, 0}:
+            raise ValueError("MiMo H3 Shot 1 must start implicitly or at zero")
         later = [shot.start_time for shot in self.shots[1:]]
         if any(value is None for value in later):
             raise ValueError("later MiMo H3 shots require hard-cut times")
         numeric = [value for value in later if value is not None]
+        if any(value <= 0 for value in numeric):
+            raise ValueError("later MiMo H3 hard-cut times must be positive")
         if numeric != sorted(numeric) or len(numeric) != len(set(numeric)):
             raise ValueError("MiMo H3 hard-cut times must strictly increase")
         return self
