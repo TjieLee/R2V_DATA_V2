@@ -18,6 +18,7 @@ from openai import OpenAI
 from pydantic import Field, StrictStr, model_validator
 
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import (
     ValidationIssue,
     parse_structured_json_issues,
@@ -80,14 +81,6 @@ BindingStatus = Literal[
     "visible_entity",
     "offscreen",
     "no_reliable_entity",
-    "uncertain",
-]
-SpeechPresentation = Literal[
-    "onscreen_spoken",
-    "offscreen_spoken",
-    "voice_over",
-    "message_voice_over",
-    "device_playback",
     "uncertain",
 ]
 EvidenceCode = Literal[

@@ -43,6 +43,9 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     validate_h3_response,
 )
 from r2v_data_v2.h3.schemas import SchemaModel
+from r2v_data_v2.h3.speech_presentation import (
+    render_speech_presentation_clause,
+)
 
 MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.4"
 MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.4"
@@ -298,23 +301,11 @@ def _render_mimo_speech_clause(
     decisions: dict[str, MimoSegmentDecision],
 ) -> str:
     presentation = decisions[speech.segment_id].speech_presentation
-    if presentation == "onscreen_spoken":
-        return base_clause
-    prefix = {
-        "offscreen_spoken": f"({speech.speaker_id}), speaking offscreen",
-        "voice_over": (
-            f"({speech.speaker_id}), as a voice-over rather than visible speech"
-        ),
-        "message_voice_over": (
-            f"({speech.speaker_id}), as a message voice-over rather than visible speech"
-        ),
-        "device_playback": (
-            f"({speech.speaker_id}), heard through an in-scene device rather than "
-            "visible speech"
-        ),
-        "uncertain": f"({speech.speaker_id}), with speech presentation uncertain",
-    }[presentation]
-    return f"{prefix}: {speech.locked_dialogue_block}"
+    return render_speech_presentation_clause(
+        speech=speech,
+        base_clause=base_clause,
+        presentation=presentation,
+    )
 
 
 def _materialize_sample(

@@ -4,6 +4,12 @@ This experimental path is additive and read-only with respect to the current JEA
 production stages. It writes only `mimo25_av_reconcile_v4/` and
 `mimo25_h3_shadow_v4/` under the Audio production root.
 
+While the MiMo checkpoint is unavailable, the independent
+`H3_QWEN_SPEECH_PRESENTATION_AB.md` shadow can exercise the same deterministic
+speech-presentation wording with Qwen3.5 and Qwen3.8. That visual-only A/B is a
+temporary contract check, not a replacement for MiMo's full audiovisual speaker
+reconciliation.
+
 ## Authority contract
 
 - DiariZen owns exact speech segment times and sample boundaries.
