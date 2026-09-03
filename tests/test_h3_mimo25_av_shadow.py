@@ -190,6 +190,15 @@ def _audio_event(event_id: str) -> dict[str, str]:
     return {"type": "audio_event", "event_id": event_id}
 
 
+def _segment_decision_branch_schemas() -> dict[str, dict[str, object]]:
+    schema = MimoAVAnnotationDraft.model_json_schema()
+    item_schema = schema["properties"]["segment_decisions"]["items"]
+    return {
+        resolution: schema["$defs"][reference.rsplit("/", 1)[-1]]
+        for resolution, reference in item_schema["discriminator"]["mapping"].items()
+    }
+
+
 def _job_fixture(tmp_path: Path) -> MimoClipJob:
     video = tmp_path / "target.mp4"
     audio = tmp_path / "full.flac"
@@ -507,17 +516,16 @@ def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
     assert response_format["json_schema"]["schema"] == (
         MimoAVAnnotationDraft.model_json_schema()
     )
-    decision_schema = response_format["json_schema"]["schema"]["$defs"][
-        "MimoSegmentDecision"
-    ]
-    assert "entity_id" in decision_schema["required"]
-    assert "delivery_style" in decision_schema["required"]
-    assert "direct_anchor_present" not in decision_schema["properties"][
-        "evidence_codes"
-    ]["items"]["enum"]
-    assert "visible_lip_motion" in decision_schema["properties"]["evidence_codes"][
-        "items"
-    ]["enum"]
+    decision_schemas = _segment_decision_branch_schemas()
+    for decision_schema in decision_schemas.values():
+        assert "entity_id" in decision_schema["required"]
+        assert "delivery_style" in decision_schema["required"]
+        assert "direct_anchor_present" not in decision_schema["properties"][
+            "evidence_codes"
+        ]["items"]["enum"]
+        assert "visible_lip_motion" in decision_schema["properties"][
+            "evidence_codes"
+        ]["items"]["enum"]
     assert request["reasoning_effort"] == "none"
     assert request["extra_body"] == {
         "use_audio_in_video": True,
@@ -551,10 +559,10 @@ def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> 
     assert xiaomi.configuration_fingerprint != sglang.configuration_fingerprint
 
 
-def test_mimo_v8_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v8"
+def test_mimo_v9_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v9"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v5"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.7"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.8"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -653,10 +661,10 @@ def test_segment_decision_requires_speech_presentation() -> None:
 
 
 def test_segment_decision_entity_id_is_required_but_nullable() -> None:
-    decision_schema = MimoAVAnnotationDraft.model_json_schema()["$defs"][
-        "MimoSegmentDecision"
-    ]
-    assert "entity_id" in decision_schema["required"]
+    assert all(
+        "entity_id" in schema["required"]
+        for schema in _segment_decision_branch_schemas().values()
+    )
 
     payload = _annotation().model_dump(mode="json")
     del payload["segment_decisions"][0]["entity_id"]
@@ -673,10 +681,10 @@ def test_segment_decision_entity_id_is_required_but_nullable() -> None:
 
 
 def test_segment_decision_delivery_is_required_but_nullable() -> None:
-    decision_schema = MimoAVAnnotationDraft.model_json_schema()["$defs"][
-        "MimoSegmentDecision"
-    ]
-    assert "delivery_style" in decision_schema["required"]
+    assert all(
+        "delivery_style" in schema["required"]
+        for schema in _segment_decision_branch_schemas().values()
+    )
 
     payload = _annotation().model_dump(mode="json")
     del payload["segment_decisions"][0]["delivery_style"]
@@ -687,6 +695,57 @@ def test_segment_decision_delivery_is_required_but_nullable() -> None:
     payload["segment_decisions"][0]["delivery_style"] = " "
     with pytest.raises(ValidationError, match="delivery must be non-empty"):
         MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_resolution_discriminator_structures_primary_speaker_group() -> None:
+    schema = MimoAVAnnotationDraft.model_json_schema()
+    item_schema = schema["properties"]["segment_decisions"]["items"]
+    assert item_schema["discriminator"]["propertyName"] == "resolution"
+    assert set(item_schema["discriminator"]["mapping"]) == {
+        "resolved",
+        "needs_acoustic_refinement",
+        "uncertain",
+    }
+
+    branches = _segment_decision_branch_schemas()
+    resolved = branches["resolved"]
+    refinement = branches["needs_acoustic_refinement"]
+    assert "primary_speaker_group" in resolved["required"]
+    assert resolved["properties"]["primary_speaker_group"] == {
+        "pattern": r"^g[1-9]\d*$",
+        "title": "Primary Speaker Group",
+        "type": "string",
+    }
+    assert "primary_speaker_group" in refinement["required"]
+    assert {item["type"] for item in refinement["properties"]["primary_speaker_group"]["anyOf"]} == {
+        "string",
+        "null",
+    }
+
+    resolved_payload = _annotation().model_dump(mode="json")
+    del resolved_payload["segment_decisions"][0]["primary_speaker_group"]
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(resolved_payload)
+
+    resolved_payload = _annotation().model_dump(mode="json")
+    resolved_payload["segment_decisions"][0]["primary_speaker_group"] = None
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(resolved_payload)
+    assert _annotation().segment_decisions[0].primary_speaker_group == "g1"
+
+    refinement_payload = _annotation(
+        resolution="needs_acoustic_refinement"
+    ).model_dump(mode="json")
+    refinement_payload["segment_decisions"][0]["primary_speaker_group"] = None
+    assert (
+        MimoAVAnnotationDraft.model_validate(refinement_payload)
+        .segment_decisions[0]
+        .primary_speaker_group
+        is None
+    )
+    del refinement_payload["segment_decisions"][0]["primary_speaker_group"]
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(refinement_payload)
 
 
 def test_visible_entity_requires_confirmed_onscreen_speaker_evidence() -> None:
@@ -2272,6 +2331,13 @@ def test_subject_definition_and_shot_bounds_fail_closed() -> None:
         "subject_definition_contract_mismatch",
         "shot_start_outside_target",
     }
+
+
+def test_first_shot_start_time_zero_is_rejected() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["start_time"] = 0
+    with pytest.raises(ValidationError, match="Shot 1 cannot have a start time"):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 def test_subject_definition_rejects_wrong_supplied_picture() -> None:

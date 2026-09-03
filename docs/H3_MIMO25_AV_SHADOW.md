@@ -79,10 +79,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v8`
+- `h3_mimo25_unified_av_reconcile_v9`
 - `h3_mimo25_av_authority_contract_v5`
-- `r2v.h3.mimo25_av_annotation.7`
-- `r2v.h3.mimo25_backend.6`
+- `r2v.h3.mimo25_av_annotation.8`
+- `r2v.h3.mimo25_backend.7`
 - `h3_mimo25_materializer_v6`
 - `r2v.h3.mimo25_inventory.3`
 - `r2v.h3.mimo25_record.5`
@@ -101,6 +101,11 @@ and uses strict `json_schema` constrained decoding with the complete current
 `json_object` contract. The base URL never selects transport implicitly;
 transport and actual response-format mode are recorded in backend provenance
 and its configuration fingerprint.
+The `.8` annotation uses a `resolution`-discriminated segment-decision schema:
+`resolved` requires a non-null `gN` `primary_speaker_group`, while acoustic
+refinement and uncertain decisions still require the field explicitly and may
+publish `null`. This invariant is enforced by SGLang constrained decoding and
+again by backend semantic validation.
 Payloads and API keys are never persisted. Explicitly reported zero video
 tokens fail closed. If primary embedded-audio tokens are exactly zero, one
 request retries with canonical full audio; explicitly reported zero audio

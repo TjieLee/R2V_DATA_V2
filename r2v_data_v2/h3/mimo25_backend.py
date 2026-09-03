@@ -26,10 +26,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v8"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v9"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v5"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.7"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.6"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.8"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.7"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v6"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -169,11 +169,11 @@ class MimoSecondaryVocalActivity(SchemaModel):
         return self
 
 
-class MimoSegmentDecision(SchemaModel):
+class _MimoSegmentDecisionBase(SchemaModel):
     segment_id: str = Field(min_length=1)
     vocal_composition: VocalComposition
     resolution: Resolution
-    primary_speaker_group: str | None = Field(default=None, pattern=r"^g[1-9]\d*$")
+    primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
     binding_status: BindingStatus
     speech_presentation: SpeechPresentation
     entity_id: str | None
@@ -183,7 +183,7 @@ class MimoSegmentDecision(SchemaModel):
     evidence_codes: list[EvidenceCode] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_decision(self) -> MimoSegmentDecision:
+    def validate_decision(self) -> _MimoSegmentDecisionBase:
         if self.delivery_style is not None and not self.delivery_style.strip():
             raise ValueError("MiMo segment delivery must be non-empty or null")
         if self.resolution == "resolved" and self.primary_speaker_group is None:
@@ -240,6 +240,29 @@ class MimoSegmentDecision(SchemaModel):
         if len(self.evidence_codes) != len(set(self.evidence_codes)):
             raise ValueError("segment evidence codes must be unique")
         return self
+
+
+class MimoResolvedSegmentDecision(_MimoSegmentDecisionBase):
+    resolution: Literal["resolved"]
+    primary_speaker_group: str = Field(pattern=r"^g[1-9]\d*$")
+
+
+class MimoAcousticRefinementSegmentDecision(_MimoSegmentDecisionBase):
+    resolution: Literal["needs_acoustic_refinement"]
+    primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
+
+
+class MimoUncertainSegmentDecision(_MimoSegmentDecisionBase):
+    resolution: Literal["uncertain"]
+    primary_speaker_group: str | None = Field(pattern=r"^g[1-9]\d*$")
+
+
+MimoSegmentDecision = Annotated[
+    MimoResolvedSegmentDecision
+    | MimoAcousticRefinementSegmentDecision
+    | MimoUncertainSegmentDecision,
+    Field(discriminator="resolution"),
+]
 
 
 class MimoAudioEvent(SchemaModel):
@@ -403,7 +426,7 @@ class MimoAnnotationWarning(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.7"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.8"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     audio_semantics: MimoAudioSemantics
     h3_draft: MimoH3Draft
@@ -415,7 +438,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.6"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.7"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -432,13 +455,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v8"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v9"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v5"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.7"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.8"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal["h3_mimo25_materializer_v6"] = (
