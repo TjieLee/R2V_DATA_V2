@@ -26,10 +26,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v9"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v10"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v5"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.8"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.7"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.8"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v6"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -193,17 +193,9 @@ class _MimoSegmentDecisionBase(SchemaModel):
                 raise ValueError("visible_entity requires supplied entity_id")
             if self.speech_presentation != "onscreen_spoken":
                 raise ValueError("visible_entity requires onscreen_spoken presentation")
-            if not _has_onscreen_speaker_evidence(self.evidence_codes):
-                raise ValueError(
-                    "visible_entity requires reliable onscreen speaker evidence"
-                )
         elif self.entity_id is not None:
             raise ValueError("only visible_entity may publish entity_id")
         if self.speech_presentation == "onscreen_spoken":
-            if not _has_onscreen_speaker_evidence(self.evidence_codes):
-                raise ValueError(
-                    "onscreen_spoken requires reliable onscreen speaker evidence"
-                )
             if self.binding_status == "offscreen":
                 raise ValueError("onscreen_spoken cannot use offscreen binding status")
         elif self.binding_status == "visible_entity" or self.entity_id is not None:
@@ -440,7 +432,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.7"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.8"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -457,7 +449,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v9"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v10"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v5"] = (
@@ -1764,6 +1756,25 @@ class OpenAIMimo25Backend:
                 "group assignments consistently. A group represents identity, not a "
                 "turn. Do not blindly merge groups unless the audiovisual evidence "
                 "supports the same speaker."
+            )
+        if issue_codes & {
+            "visible_entity_requires_confirmed_onscreen_speech",
+            "onscreen_speech_requires_reliable_visible_speaker_evidence",
+        }:
+            issue_actions.append(
+                "For unreliable onscreen-speaker evidence, reinspect every affected "
+                "segment in the actual audiovisual media. Keep onscreen_spoken and "
+                "visible_entity only if (A) synchronized mouth, lip, or jaw motion is "
+                "actually visible, then include visible_lip_motion; or (B) the visible "
+                "speaker's mouth is genuinely occluded or the speaker is back-facing, "
+                "then include speaker_visible_mouth_occluded together with "
+                "av_temporal_alignment and/or voice_continuity. If neither A nor B is "
+                "supported, do not claim visible_entity: set entity_id=null and choose "
+                "the actually supported no_reliable_entity, uncertain, or offscreen "
+                "binding and corresponding speech_presentation. Never invent lip "
+                "motion or mouth occlusion, and never preserve visible_entity merely "
+                "to satisfy validation. source_cluster_support and the current binding "
+                "are evidence only, not final authority."
             )
         actions = (
             "\nISSUE-SPECIFIC CONTRACT ACTIONS:\n" + "\n".join(issue_actions)

@@ -79,10 +79,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v9`
+- `h3_mimo25_unified_av_reconcile_v10`
 - `h3_mimo25_av_authority_contract_v5`
 - `r2v.h3.mimo25_av_annotation.8`
-- `r2v.h3.mimo25_backend.7`
+- `r2v.h3.mimo25_backend.8`
 - `h3_mimo25_materializer_v6`
 - `r2v.h3.mimo25_inventory.3`
 - `r2v.h3.mimo25_record.5`

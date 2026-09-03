@@ -579,8 +579,8 @@ def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> 
     assert xiaomi.configuration_fingerprint != sglang.configuration_fingerprint
 
 
-def test_mimo_v9_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v9"
+def test_mimo_v10_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v10"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v5"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.8"
     for phrase in (
@@ -768,17 +768,51 @@ def test_resolution_discriminator_structures_primary_speaker_group() -> None:
         MimoAVAnnotationDraft.model_validate(refinement_payload)
 
 
-def test_visible_entity_requires_confirmed_onscreen_speaker_evidence() -> None:
+def test_visible_entity_structural_relationships_remain_model_validated() -> None:
     payload = _annotation().model_dump(mode="json")
     decision = payload["segment_decisions"][0]
     decision["speech_presentation"] = "message_voice_over"
     with pytest.raises(ValidationError, match="onscreen_spoken"):
         MimoAVAnnotationDraft.model_validate(payload)
 
-    decision["speech_presentation"] = "onscreen_spoken"
-    decision["evidence_codes"] = ["av_temporal_alignment"]
-    with pytest.raises(ValidationError, match="onscreen speaker evidence"):
-        MimoAVAnnotationDraft.model_validate(payload)
+
+def test_unconfirmed_onscreen_evidence_parses_before_semantic_validation() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"] = [
+        "av_temporal_alignment",
+        "voice_continuity",
+        "source_cluster_support",
+    ]
+
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert annotation.segment_decisions[0].entity_id == "e1"
+
+
+def test_unconfirmed_onscreen_evidence_has_segment_level_semantic_issues() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"] = [
+        "av_temporal_alignment",
+        "voice_continuity",
+        "source_cluster_support",
+    ]
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    expected = {
+        "visible_entity_requires_confirmed_onscreen_speech",
+        "onscreen_speech_requires_reliable_visible_speaker_evidence",
+    }
+    assert {item.code for item in issues} == expected
+    assert {item.field for item in issues} == {"segment_1"}
+
+
+def test_visible_lip_motion_remains_valid_onscreen_evidence() -> None:
+    annotation = _annotation()
+    assert annotation.segment_decisions[0].evidence_codes == [
+        "visible_lip_motion",
+        "av_temporal_alignment",
+    ]
+    assert not _validate(annotation)
 
 
 @pytest.mark.parametrize(
@@ -804,8 +838,13 @@ def test_mouth_occlusion_without_continuity_is_not_onscreen_evidence() -> None:
     payload["segment_decisions"][0]["evidence_codes"] = [
         "speaker_visible_mouth_occluded"
     ]
-    with pytest.raises(ValidationError, match="onscreen speaker evidence"):
-        MimoAVAnnotationDraft.model_validate(payload)
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert {
+        item.code for item in _validate(annotation)
+    } == {
+        "visible_entity_requires_confirmed_onscreen_speech",
+        "onscreen_speech_requires_reliable_visible_speaker_evidence",
+    }
 
 
 def test_onscreen_speech_without_known_entity_is_valid() -> None:
@@ -1418,6 +1457,109 @@ def test_full_av_recheck_explains_speaker_identity_contradiction(
     assert "reconsider clip-local speaker identity" in prompt
     assert "A group represents identity, not a turn" in prompt
     assert "Do not blindly merge groups" in prompt
+
+
+def test_full_av_recheck_targets_unreliable_onscreen_speaker_evidence(
+    tmp_path: Path,
+) -> None:
+    backend, _ = _backend(tmp_path, [])
+    prompt = backend._full_av_recheck_prompt(
+        _job_fixture(tmp_path),
+        invalid_response="{}",
+        issues=[
+            ValidationIssue(
+                "visible_entity_requires_confirmed_onscreen_speech",
+                "segment_1",
+                "insufficient onscreen evidence",
+            ),
+            ValidationIssue(
+                "onscreen_speech_requires_reliable_visible_speaker_evidence",
+                "segment_1",
+                "insufficient onscreen evidence",
+            ),
+        ],
+    )
+
+    for phrase in (
+        "reinspect every affected segment in the actual audiovisual media",
+        "synchronized mouth, lip, or jaw motion",
+        "include visible_lip_motion",
+        "speaker_visible_mouth_occluded",
+        "av_temporal_alignment and/or voice_continuity",
+        "set entity_id=null",
+        "no_reliable_entity, uncertain, or offscreen",
+        "Never invent lip motion or mouth occlusion",
+        "never preserve visible_entity merely to satisfy validation",
+        "source_cluster_support and the current binding are evidence only",
+    ):
+        assert phrase in prompt
+
+
+def test_unreliable_onscreen_evidence_can_be_corrected_by_one_recheck(
+    tmp_path: Path,
+) -> None:
+    invalid_payload = _annotation().model_dump(mode="json")
+    invalid_payload["segment_decisions"][0]["evidence_codes"] = [
+        "av_temporal_alignment",
+        "voice_continuity",
+        "source_cluster_support",
+    ]
+    backend, completions = _backend(
+        tmp_path,
+        [
+            (json.dumps(invalid_payload), 5),
+            (_annotation().model_dump_json(), 5),
+        ],
+    )
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.recheck_count == 1
+    assert result.model_call_count == 2
+    assert len(completions.requests) == 2
+    assert result.annotation.segment_decisions[0].evidence_codes == [
+        "visible_lip_motion",
+        "av_temporal_alignment",
+    ]
+
+
+def test_repeated_unreliable_onscreen_evidence_fails_after_one_recheck(
+    tmp_path: Path,
+) -> None:
+    invalid_payload = _annotation().model_dump(mode="json")
+    invalid_payload["segment_decisions"][0]["evidence_codes"] = [
+        "av_temporal_alignment",
+        "voice_continuity",
+        "source_cluster_support",
+    ]
+    raw = json.dumps(invalid_payload)
+    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+
+    failure = exc_info.value
+    assert failure.code == "mimo_structured_output_failed"
+    assert failure.recheck_count == 1
+    assert failure.model_call_count == 2
+    assert len(completions.requests) == 2
+    assert {item.code for item in failure.issues} == {
+        "visible_entity_requires_confirmed_onscreen_speech",
+        "onscreen_speech_requires_reliable_visible_speaker_evidence",
+    }
+    assert {item.field for item in failure.issues} == {"segment_1"}
 
 
 def test_sglang_full_av_recheck_preserves_primary_transport_contract(
