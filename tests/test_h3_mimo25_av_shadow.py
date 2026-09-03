@@ -105,6 +105,7 @@ def _annotation(
                         else "offscreen_spoken"
                     ),
                     "entity_id": entity_id,
+                    "delivery_style": "calm and clear",
                     "secondary_vocal_activity": {
                         "present": composition != "single_speaker",
                         "speaker_relation": (
@@ -143,9 +144,6 @@ def _annotation(
                         "source_grounding": "audiovisually_grounded",
                     }
                 ],
-                "speaker_delivery": [
-                    {"speaker_group": group, "delivery_style": "calm and clear"}
-                ],
                 "overall_soundscape_status": "present",
                 "overall_soundscape": "Quiet speech with a short clink.",
                 "non_diegetic_music_status": "absent",
@@ -164,16 +162,32 @@ def _annotation(
                     {
                         "shot_index": 1,
                         "start_time": None,
-                        "description_template": (
-                            "<Subject 1> faces the camera. [[audio_event:ae1]] "
-                            "[[segment:segment_1]]"
-                        ),
+                        "timeline_parts": [
+                            {
+                                "type": "prose",
+                                "text": "<Subject 1> faces the camera.",
+                            },
+                            {"type": "audio_event", "event_id": "ae1"},
+                            {"type": "speech", "segment_id": "segment_1"},
+                        ],
                     }
                 ],
             },
             "warnings": [],
         }
     )
+
+
+def _prose(text: str) -> dict[str, str]:
+    return {"type": "prose", "text": text}
+
+
+def _speech(segment_id: str) -> dict[str, str]:
+    return {"type": "speech", "segment_id": segment_id}
+
+
+def _audio_event(event_id: str) -> dict[str, str]:
+    return {"type": "audio_event", "event_id": event_id}
 
 
 def _job_fixture(tmp_path: Path) -> MimoClipJob:
@@ -486,6 +500,24 @@ def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
 
     assert result.model_call_count == 1
     request = completions.requests[0]
+    response_format = request["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "MimoAVAnnotationDraft"
+    assert response_format["json_schema"]["strict"] is True
+    assert response_format["json_schema"]["schema"] == (
+        MimoAVAnnotationDraft.model_json_schema()
+    )
+    decision_schema = response_format["json_schema"]["schema"]["$defs"][
+        "MimoSegmentDecision"
+    ]
+    assert "entity_id" in decision_schema["required"]
+    assert "delivery_style" in decision_schema["required"]
+    assert "direct_anchor_present" not in decision_schema["properties"][
+        "evidence_codes"
+    ]["items"]["enum"]
+    assert "visible_lip_motion" in decision_schema["properties"]["evidence_codes"][
+        "items"
+    ]["enum"]
     assert request["reasoning_effort"] == "none"
     assert request["extra_body"] == {
         "use_audio_in_video": True,
@@ -499,6 +531,7 @@ def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
     assert not any(item["type"] in {"audio_url", "input_audio"} for item in content)  # type: ignore[union-attr]
     assert backend.provenance.transport == "sglang"
     assert backend.provenance.backend == "sglang_openai_compatible"
+    assert backend.provenance.response_format == "json_schema"
 
 
 def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> None:
@@ -518,10 +551,10 @@ def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> 
     assert xiaomi.configuration_fingerprint != sglang.configuration_fingerprint
 
 
-def test_mimo_v5_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v7"
+def test_mimo_v8_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v8"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v5"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.6"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.7"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -559,7 +592,7 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
     assert "There is no required fixed English connector" in prompt
 
 
-def test_primary_prompt_separates_decision_and_speech_placeholder_inventories(
+def test_primary_prompt_separates_decision_and_typed_speech_inventories(
     tmp_path: Path,
 ) -> None:
     job = _job_with_non_transcribed_segment(tmp_path)
@@ -570,13 +603,14 @@ def test_primary_prompt_separates_decision_and_speech_placeholder_inventories(
 
     assert contract["allowed_segment_ids"] == ["segment_1", "segment_2"]
     assert contract["transcribed_segment_ids"] == ["segment_1"]
-    assert contract["required_speech_placeholder_sequence"] == [
-        "[[segment:segment_1]]"
-    ]
-    assert contract["forbidden_speech_placeholder_ids"] == ["segment_2"]
+    assert contract["required_speech_segment_sequence"] == ["segment_1"]
+    assert contract["forbidden_speech_segment_ids"] == ["segment_2"]
     assert "including non-transcribed segments" in prompt
-    assert "required_speech_placeholder_sequence byte-for-byte" in prompt
-    assert "forbidden_speech_placeholder_ids" in prompt
+    assert "required_speech_segment_sequence exactly" in prompt
+    assert "forbidden_speech_segment_ids" in prompt
+    assert "timeline_parts" in prompt
+    assert "[[segment:" not in prompt
+    assert "[[audio_event:" not in prompt
 
 
 def test_prompt_defines_primary_speaker_group_as_identity() -> None:
@@ -636,6 +670,23 @@ def test_segment_decision_entity_id_is_required_but_nullable() -> None:
     invalid["segment_decisions"][0]["entity_id"] = "e1"
     with pytest.raises(ValidationError, match="only visible_entity"):
         MimoAVAnnotationDraft.model_validate(invalid)
+
+
+def test_segment_decision_delivery_is_required_but_nullable() -> None:
+    decision_schema = MimoAVAnnotationDraft.model_json_schema()["$defs"][
+        "MimoSegmentDecision"
+    ]
+    assert "delivery_style" in decision_schema["required"]
+
+    payload = _annotation().model_dump(mode="json")
+    del payload["segment_decisions"][0]["delivery_style"]
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["delivery_style"] = " "
+    with pytest.raises(ValidationError, match="delivery must be non-empty"):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 def test_visible_entity_requires_confirmed_onscreen_speaker_evidence() -> None:
@@ -1263,9 +1314,9 @@ def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
     ) in prompt
     assert "regenerate each affected definition" in prompt
     assert "exact Subject-to-Pictures mapping" in prompt
-    assert "rebuild all shot speech placeholders" in prompt
-    assert "required_speech_placeholder_sequence" in prompt
-    assert "byte-for-byte" in prompt
+    assert "rebuild all typed speech timeline parts" in prompt
+    assert "required_speech_segment_sequence" in prompt
+    assert "exactly equals" in prompt
 
 
 def test_full_av_recheck_explains_speaker_identity_contradiction(
@@ -1688,14 +1739,11 @@ def _two_segment_annotation(
         ["visible_lip_motion"] if second_entity is not None else ["offscreen_audio"]
     )
     second["entity_id"] = second_entity
+    second["delivery_style"] = "brief and clear"
     payload["segment_decisions"].append(second)
-    payload["h3_draft"]["shots"][0]["description_template"] += (
-        " Then [[segment:segment_2]]"
+    payload["h3_draft"]["shots"][0]["timeline_parts"].extend(
+        [_prose("Then the action continues."), _speech("segment_2")]
     )
-    if second_group != "g1":
-        payload["audio_semantics"]["speaker_delivery"].append(
-            {"speaker_group": second_group, "delivery_style": "brief and clear"}
-        )
     return MimoAVAnnotationDraft.model_validate(payload)
 
 
@@ -1761,9 +1809,6 @@ def test_speech_placeholders_are_allowed_only_in_shots(
     issue_code: str,
 ) -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["h3_draft"]["shots"][0]["description_template"] = (
-        "<Subject 1> remains visible."
-    )
     payload["h3_draft"][field] = value
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
     assert issue_code in {item.code for item in issues}
@@ -1778,10 +1823,7 @@ def test_speech_placeholders_are_allowed_only_in_shots(
             "<Picture 1> is the target keyframe.",
             "unassigned_picture_keyframe_role",
         ),
-        (
-            "The person says [[segment:segment_1]]",
-            "draft_prefixes_complete_speech_placeholder",
-        ),
+        ("The person says", "draft_prefixes_complete_speech_placeholder"),
     ],
 )
 def test_h3_draft_rejects_pipeline_owned_or_ambiguous_syntax(
@@ -1789,12 +1831,47 @@ def test_h3_draft_rejects_pipeline_owned_or_ambiguous_syntax(
     issue_code: str,
 ) -> None:
     payload = _annotation().model_dump(mode="json")
-    if "[[segment:" in draft_text:
-        payload["h3_draft"]["shots"][0]["description_template"] = draft_text
+    if issue_code == "draft_prefixes_complete_speech_placeholder":
+        payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+            _prose(draft_text),
+            _speech("segment_1"),
+            _audio_event("ae1"),
+        ]
     else:
         payload["h3_draft"]["summary"] = draft_text
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
     assert issue_code in {item.code for item in issues}
+
+
+def test_timeline_parts_use_a_discriminated_union() -> None:
+    shot_schema = MimoAVAnnotationDraft.model_json_schema()["$defs"]["MimoH3Shot"]
+    item_schema = shot_schema["properties"]["timeline_parts"]["items"]
+    assert item_schema["discriminator"]["propertyName"] == "type"
+    assert set(item_schema["discriminator"]["mapping"]) == {
+        "prose",
+        "speech",
+        "audio_event",
+    }
+
+
+@pytest.mark.parametrize(
+    "forbidden_text",
+    [
+        "[[segment:segment_1]]",
+        "[[audio_event:ae1]]",
+        "(S1) speaks.",
+        "<d>[English] text</d>",
+        "[Shot 1] A person stands.",
+        "<Video 1> supplies motion.",
+        "<Audio 1> supplies sound.",
+        "<Unknown 1> supplies an invented reference.",
+    ],
+)
+def test_timeline_prose_rejects_pipeline_owned_syntax(forbidden_text: str) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["timeline_parts"][0]["text"] = forbidden_text
+    with pytest.raises(ValidationError, match="pipeline-owned syntax"):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 @pytest.mark.parametrize(
@@ -1839,10 +1916,12 @@ def _two_audio_event_annotation() -> MimoAVAnnotationDraft:
             "source_grounding": "audible_only",
         }
     )
-    payload["h3_draft"]["shots"][0]["description_template"] = (
-        "<Subject 1> remains visible. [[audio_event:ae1]] "
-        "[[segment:segment_1]] [[audio_event:ae2]]"
-    )
+    payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+        _prose("<Subject 1> remains visible."),
+        _audio_event("ae1"),
+        _speech("segment_1"),
+        _audio_event("ae2"),
+    ]
     return MimoAVAnnotationDraft.model_validate(payload)
 
 
@@ -1871,50 +1950,55 @@ def test_simultaneous_double_digit_audio_event_ids_are_chronological() -> None:
         }
         for index in range(1, 11)
     ]
-    payload["h3_draft"]["shots"][0]["description_template"] = " ".join(
-        [*(f"[[audio_event:ae{index}]]" for index in range(1, 11)), "[[segment:segment_1]]"]
-    )
+    payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+        *(_audio_event(f"ae{index}") for index in range(1, 11)),
+        _speech("segment_1"),
+    ]
     annotation = MimoAVAnnotationDraft.model_validate(payload)
     assert len(annotation.audio_semantics.temporal_non_speech_events) == 10
 
 
 @pytest.mark.parametrize(
-    ("template", "issue_code"),
+    ("timeline_parts", "issue_code"),
     [
         (
-            "[[audio_event:ae1]] [[segment:segment_1]]",
+            [_audio_event("ae1"), _speech("segment_1")],
             "missing_audio_event_placeholder",
         ),
         (
-            "[[audio_event:ae1]] [[audio_event:ae1]] "
-            + "[[segment:segment_1]] [[audio_event:ae2]]",
+            [
+                _audio_event("ae1"),
+                _audio_event("ae1"),
+                _speech("segment_1"),
+                _audio_event("ae2"),
+            ],
             "duplicate_audio_event_placeholder",
         ),
         (
-            "[[audio_event:ae1]] [[segment:segment_1]] [[audio_event:ae3]]",
+            [_audio_event("ae1"), _speech("segment_1"), _audio_event("ae3")],
             "unknown_audio_event_placeholder",
         ),
         (
-            "[[audio_event:ae2]] [[segment:segment_1]] [[audio_event:ae1]]",
+            [_audio_event("ae2"), _speech("segment_1"), _audio_event("ae1")],
             "audio_event_placeholder_order_mismatch",
         ),
     ],
 )
 def test_audio_event_placeholder_coverage_is_exact(
-    template: str,
+    timeline_parts: list[dict[str, str]],
     issue_code: str,
 ) -> None:
     payload = _two_audio_event_annotation().model_dump(mode="json")
-    payload["h3_draft"]["shots"][0]["description_template"] = template
+    payload["h3_draft"]["shots"][0]["timeline_parts"] = timeline_parts
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
     assert issue_code in {item.code for item in issues}
 
 
-def test_audio_event_placeholder_is_allowed_only_in_shots() -> None:
+def test_free_form_timeline_syntax_is_rejected_outside_shots() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["summary"] += " [[audio_event:ae1]]"
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
-    assert "audio_event_placeholder_outside_shot" in {item.code for item in issues}
+    assert "speech_placeholder_outside_shot" in {item.code for item in issues}
 
 
 def test_audiovisual_summary_is_required_and_nonempty() -> None:
@@ -1927,21 +2011,18 @@ def test_audiovisual_summary_is_required_and_nonempty() -> None:
         MimoAVAnnotationDraft.model_validate(payload)
 
 
-def test_resolved_transcribed_speaker_delivery_requires_full_group_coverage() -> None:
-    annotation = _two_segment_annotation(second_group="g2", second_entity="e2")
-    payload = annotation.model_dump(mode="json")
-    payload["audio_semantics"]["speaker_delivery"] = payload["audio_semantics"][
-        "speaker_delivery"
-    ][:1]
+def test_segment_delivery_matches_authoritative_transcription_status() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["delivery_style"] = None
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+    assert "missing_transcribed_segment_delivery" in {item.code for item in issues}
+
+    payload["segment_decisions"][0]["delivery_style"] = "calm and clear"
     issues = _validate(
         MimoAVAnnotationDraft.model_validate(payload),
-        segment_ids=["segment_1", "segment_2"],
-        transcribed_segment_ids=["segment_1", "segment_2"],
-        allowed_entity_ids={"e1", "e2"},
+        transcribed_segment_ids=[],
     )
-    assert "missing_resolved_transcribed_speaker_delivery" in {
-        item.code for item in issues
-    }
+    assert "non_transcribed_segment_delivery" in {item.code for item in issues}
 
 
 def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
@@ -2065,7 +2146,7 @@ def test_significant_authoritative_transcript_cannot_leak_into_audio_semantics(
     if field == "event":
         semantics["temporal_non_speech_events"][0]["description"] = transcript
     elif field == "delivery":
-        semantics["speaker_delivery"][0]["delivery_style"] = transcript
+        payload["segment_decisions"][0]["delivery_style"] = transcript
     elif field == "soundscape":
         semantics["overall_soundscape"] = transcript
     elif field == "music":
@@ -2106,19 +2187,22 @@ def _two_shot_annotation(
     payload = _annotation().model_dump(mode="json")
     event = payload["audio_semantics"]["temporal_non_speech_events"][0]
     event["approximate_start_time"], event["approximate_end_time"] = event_interval
-    shot_text = {1: ["<Subject 1> remains visible."], 2: ["The scene continues."]}
-    shot_text[speech_shot].append("[[segment:segment_1]]")
-    shot_text[event_shot].append("[[audio_event:ae1]]")
+    shot_parts = {
+        1: [_prose("<Subject 1> remains visible.")],
+        2: [_prose("The scene continues.")],
+    }
+    shot_parts[speech_shot].append(_speech("segment_1"))
+    shot_parts[event_shot].append(_audio_event("ae1"))
     payload["h3_draft"]["shots"] = [
         {
             "shot_index": 1,
             "start_time": None,
-            "description_template": " ".join(shot_text[1]),
+            "timeline_parts": shot_parts[1],
         },
         {
             "shot_index": 2,
             "start_time": 5.0,
-            "description_template": " ".join(shot_text[2]),
+            "timeline_parts": shot_parts[2],
         },
     ]
     return MimoAVAnnotationDraft.model_validate(payload)
@@ -2177,7 +2261,7 @@ def test_subject_definition_and_shot_bounds_fail_closed() -> None:
         {
             "shot_index": 2,
             "start_time": 1.0,
-            "description_template": "A hard cut occurs.",
+            "timeline_parts": [_prose("A hard cut occurs.")],
         }
     )
     issues = _validate(
@@ -2242,20 +2326,24 @@ def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None
 
 
 @pytest.mark.parametrize(
-    "template",
+    "speech_segment_ids",
     [
-        "[[segment:segment_1]]",
-        "[[segment:segment_1]] [[segment:segment_1]] [[segment:segment_2]]",
-        "[[segment:segment_2]] [[segment:segment_1]]",
+        ["segment_1"],
+        ["segment_1", "segment_1", "segment_2"],
+        ["segment_2", "segment_1"],
     ],
 )
 def test_speech_placeholder_inventory_rejects_missing_duplicate_or_reordered(
-    template: str,
+    speech_segment_ids: list[str],
 ) -> None:
     payload = _two_segment_annotation(
         second_group="g1", second_entity=None
     ).model_dump(mode="json")
-    payload["h3_draft"]["shots"][0]["description_template"] = template
+    payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+        _prose("<Subject 1> remains visible."),
+        _audio_event("ae1"),
+        *(_speech(segment_id) for segment_id in speech_segment_ids),
+    ]
     issues = _validate(
         MimoAVAnnotationDraft.model_validate(payload),
         segment_ids=["segment_1", "segment_2"],
@@ -2790,10 +2878,13 @@ def _presentation_annotation(presentation: str) -> MimoAVAnnotationDraft:
     if presentation == "message_voice_over":
         decision["evidence_codes"].append("message_text_alignment")
         payload["h3_draft"]["summary"] = "A person silently handles a phone."
-        payload["h3_draft"]["shots"][0]["description_template"] = (
-            "<Subject 1> looks at the phone and types without visible speech. "
-            "[[audio_event:ae1]] [[segment:segment_1]]"
-        )
+        payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+            _prose(
+                "<Subject 1> looks at the phone and types without visible speech."
+            ),
+            _audio_event("ae1"),
+            _speech("segment_1"),
+        ]
     return MimoAVAnnotationDraft.model_validate(payload)
 
 
@@ -2825,9 +2916,28 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert corrected[0].end_time == 1.0
     assert "<d>[English] Exact, text!</d>" in rendered
     assert "A short repeated clink is audible." in rendered
+    assert rendered.index("A short repeated clink is audible.") < rendered.index(
+        "<d>[English] Exact, text!</d>"
+    )
     assert "[[audio_event:" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert not warnings or all("words" in item for item in warnings)
+
+
+def test_materializer_audio_facts_use_segment_level_delivery(tmp_path: Path) -> None:
+    sample = _sample(tmp_path)
+    record = _record_fixture(tmp_path, _annotation())
+    facts = mimo25_materializer._audio_facts(
+        sample=sample,
+        corrected=sample.speech_segments,
+        record=record,
+        contract=mimo25_materializer.build_reference_contract(
+            sample,
+            mimo25_materializer._variant(sample),
+        ),
+    )
+
+    assert facts.speech[0].delivery == "calm and clear"
 
 
 def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
@@ -2850,6 +2960,7 @@ def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
     )
     assert "[[segment:" not in rendered
     assert "[[audio_event:" not in rendered
+    assert "[[" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert "<d>[English] Exact, text!</d>" in rendered
 
@@ -3000,9 +3111,7 @@ def test_message_voice_over_draft_keeps_phone_action_without_visible_speech(
     tmp_path: Path,
 ) -> None:
     annotation = _presentation_annotation("message_voice_over")
-    assert "looks at the phone and types" in (
-        annotation.h3_draft.shots[0].description_template
-    )
+    assert "looks at the phone and types" in annotation.h3_draft.shots[0].timeline_parts[0].text
     corrected, rendered, _ = _materialize_sample(
         _sample(tmp_path),
         _job_fixture(tmp_path),

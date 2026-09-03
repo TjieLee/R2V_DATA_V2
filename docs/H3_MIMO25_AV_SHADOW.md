@@ -21,18 +21,20 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   dialogue, and final H3 formatting.
 
 Every DiariZen segment receives one `segment_decisions` row, including empty or
-otherwise non-transcribed segments. The separate internal H3 draft inventory is
-stricter: only Qwen3-ASR segments with `asr_status="transcribed"` receive
-`[[segment:...]]` placeholders. Those placeholders and `[[audio_event:...]]`
-are pipeline-internal and are always removed by deterministic materialization;
-they are not MiniMax H3 syntax.
+otherwise non-transcribed segments. Only Qwen3-ASR segments with
+`asr_status="transcribed"` receive typed `speech` entries in the internal shot
+timeline. MiMo chooses prose and temporal ordering, while the pipeline owns the
+exact speech and Audio-event inventories, dialogue text, and final H3 syntax.
+Free-form MiMo prose cannot contain internal placeholders or final `(Sx)`,
+`<d>`, or shot-header syntax.
 
-The per-request contract precomputes the complete literal speech-placeholder
-sequence from the authoritative transcribed-segment inventory and separately
-lists every forbidden non-transcribed segment ID. MiMo chooses the observed
-shot and temporal position, but it does not derive speech-placeholder
-eligibility. Every segment decision explicitly publishes `entity_id`: an exact
-supplied ID for `visible_entity`, otherwise JSON `null`.
+The per-request contract supplies the exact ordered transcribed-segment
+inventory and separately lists every forbidden non-transcribed segment ID.
+MiMo chooses the observed shot and temporal position, but it does not derive
+speech eligibility. Every segment decision explicitly publishes `entity_id`:
+an exact supplied ID for `visible_entity`, otherwise JSON `null`. Each
+transcribed decision also carries its own audible `delivery_style`; every
+non-transcribed decision uses `null`.
 
 Each draft Subject definition is constrained by a machine-readable, per-request
 mapping from its exact frozen `<Subject N>` label to all and only its owning
@@ -77,11 +79,11 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v7`
+- `h3_mimo25_unified_av_reconcile_v8`
 - `h3_mimo25_av_authority_contract_v5`
-- `r2v.h3.mimo25_av_annotation.6`
-- `r2v.h3.mimo25_backend.5`
-- `h3_mimo25_materializer_v5`
+- `r2v.h3.mimo25_av_annotation.7`
+- `r2v.h3.mimo25_backend.6`
+- `h3_mimo25_materializer_v6`
 - `r2v.h3.mimo25_inventory.3`
 - `r2v.h3.mimo25_record.5`
 - `r2v.h3.mimo25_summary.5`
@@ -93,9 +95,12 @@ Prompt, policy, annotation schema, and materializer versions are:
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
 JSON-object output, temperature 0.2, and 16384 completion tokens. Base64 is the
-pilot default. `--transport sglang` is the explicit local-provider alternative;
-the base URL never selects transport implicitly. Transport is recorded in
-backend provenance and its configuration fingerprint.
+pilot default. `--transport sglang` is the explicit local-provider alternative
+and uses strict `json_schema` constrained decoding with the complete current
+`MimoAVAnnotationDraft` schema. Xiaomi remains on its separately validated
+`json_object` contract. The base URL never selects transport implicitly;
+transport and actual response-format mode are recorded in backend provenance
+and its configuration fingerprint.
 Payloads and API keys are never persisted. Explicitly reported zero video
 tokens fail closed. If primary embedded-audio tokens are exactly zero, one
 request retries with canonical full audio; explicitly reported zero audio
@@ -142,19 +147,22 @@ or own that external source patch.
 After the authoritative primary or canonical-audio-fallback response is
 selected, parse or semantic validation failure may trigger at most one full AV
 recheck with the same references, target video, and selected audio modality.
-There is no text-only semantic repair. The v5 annotation assigns chronological
-`ae1`, `ae2`, ... IDs to non-speech Audio events and requires each event exactly
-once as `[[audio_event:aeN]]` in a shot. The deterministic MiMo materializer
-replaces those placeholders with the validated event descriptions before the
-existing exact speech-placeholder materialization, so final H3 text cannot
-silently omit accepted Audio events.
+There is no text-only semantic repair. The `.7` annotation assigns chronological
+`ae1`, `ae2`, ... IDs to non-speech Audio events and requires exact ordered
+coverage by typed `audio_event` timeline parts. Typed `speech` parts likewise
+must exactly cover authoritative transcribed segments. The deterministic MiMo
+materializer renders those typed references into the existing internal Qwen3.8
+draft interface, then uses the unchanged validated final renderer. It does not
+repair missing, extra, duplicated, reordered, or misplaced model parts.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,
 `detailed_description`, `overall_soundscape`, `non_diegetic_music` order;
 reference labels keep one meaning across sections; and dialogue uses stable
 `(Sx)` source IDs with `<d>[Language] ...</d>`. The mandatory draft contract
-does not redefine official reference-label or retention-marker semantics.
+does not redefine official reference-label or retention-marker semantics. The
+typed timeline is internal annotation structure only and never appears in the
+final Ref2VA text.
 
 MiMo records retain explicit `present`, `absent`, or `unknown` status for the
 overall soundscape and non-diegetic music. The H3 training prompt renders a

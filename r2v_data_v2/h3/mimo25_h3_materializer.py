@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import shutil
 import uuid
 from collections import Counter
@@ -23,6 +22,10 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
 )
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
+    MimoH3AudioEventPart,
+    MimoH3ProsePart,
+    MimoH3Shot,
+    MimoH3SpeechPart,
     MimoSegmentDecision,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
@@ -47,10 +50,6 @@ from r2v_data_v2.h3.speech_presentation import (
 
 MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.5"
 MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.5"
-_MIMO_SEGMENT_PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
-_MIMO_AUDIO_EVENT_PLACEHOLDER = re.compile(
-    r"\[\[audio_event:([^\[\]\r\n]+)\]\]"
-)
 
 
 def _compact_json(value: object) -> str:
@@ -97,7 +96,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v5"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v6"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -240,9 +239,9 @@ def _audio_facts(
         if item.kind == "entity" and item.entity_id is not None
     }
     speaker_ids = _speaker_ids(corrected)
-    delivery_by_group = {
-        item.speaker_group: item.delivery_style
-        for item in record.annotation.audio_semantics.speaker_delivery
+    delivery_by_segment = {
+        item.segment_id: item.delivery_style
+        for item in record.annotation.segment_decisions
     }
     speech = []
     for segment in corrected:
@@ -261,7 +260,7 @@ def _audio_facts(
                 end_time=segment.end_time,
                 text=segment.text,
                 language=language,
-                delivery=delivery_by_group.get(segment.speaker_cluster_id),
+                delivery=delivery_by_segment[segment.segment_id],
                 locked_dialogue_block=f"<d>[{language}] {segment.text}</d>",
             )
         )
@@ -304,6 +303,24 @@ def _render_mimo_speech_clause(
         base_clause=base_clause,
         presentation=presentation,
     )
+
+
+def _render_timeline_parts(
+    shot: MimoH3Shot,
+    *,
+    audio_event_by_id: dict[str, str],
+) -> str:
+    rendered: list[str] = []
+    for part in shot.timeline_parts:
+        if isinstance(part, MimoH3ProsePart):
+            rendered.append(part.text.strip())
+        elif isinstance(part, MimoH3SpeechPart):
+            rendered.append(f"[[{part.segment_id}]]")
+        elif isinstance(part, MimoH3AudioEventPart):
+            rendered.append(audio_event_by_id[part.event_id])
+        else:  # pragma: no cover - discriminated schema makes this unreachable
+            raise TypeError(f"unsupported MiMo timeline part: {type(part).__name__}")
+    return " ".join(rendered)
 
 
 def _materialize_sample(
@@ -364,12 +381,9 @@ def _materialize_sample(
             Qwen38DraftShot(
                 shot_index=item.shot_index,
                 start_time=item.start_time,
-                description_template=_MIMO_SEGMENT_PLACEHOLDER.sub(
-                    lambda match: f"[[{match.group(1)}]]",
-                    _MIMO_AUDIO_EVENT_PLACEHOLDER.sub(
-                        lambda match: audio_event_by_id[match.group(1)],
-                        item.description_template,
-                    ),
+                description_template=_render_timeline_parts(
+                    item,
+                    audio_event_by_id=audio_event_by_id,
                 ),
             )
             for item in record.annotation.h3_draft.shots
