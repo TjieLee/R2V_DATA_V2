@@ -35,6 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     selection.add_argument("--case-manifest", type=Path)
     selection.add_argument("--known-case-pilot", action="store_true")
     parser.add_argument("--model", default=MIMO25_MODEL)
+    parser.add_argument("--transport", choices=("xiaomi", "sglang"), default="xiaomi")
     parser.add_argument("--base-url", default=MIMO25_DEFAULT_BASE_URL)
     parser.add_argument("--fps", type=float, default=4.0)
     parser.add_argument("--media-resolution", default="default")
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             "dry_run": True,
             "model_called": False,
             "output_root": str(output_root),
+            "transport": arguments.transport,
             "clip_count": inventory.clip_count,
             "clip_uids": [item.clip_uid for item in inventory.jobs],
             "inventory_fingerprint": inventory.inventory_fingerprint,
@@ -83,6 +85,7 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             MimoBackendConfig(
                 media_resolver=resolver,
                 api_key=api_key,
+                transport=arguments.transport,
                 base_url=arguments.base_url,
                 model=arguments.model,
                 video_fps=arguments.fps,

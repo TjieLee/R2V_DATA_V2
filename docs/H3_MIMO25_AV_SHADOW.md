@@ -4,11 +4,9 @@ This experimental path is additive and read-only with respect to the current JEA
 production stages. It writes only `mimo25_av_reconcile_v5/` and
 `mimo25_h3_shadow_v5/` under the Audio production root.
 
-While the MiMo checkpoint is unavailable, the independent
-`H3_QWEN_SPEECH_PRESENTATION_AB.md` shadow can exercise the same deterministic
-speech-presentation wording with Qwen3.5 and Qwen3.8. That visual-only A/B is a
-temporary contract check, not a replacement for MiMo's full audiovisual speaker
-reconciliation.
+The independent `H3_QWEN_SPEECH_PRESENTATION_AB.md` shadow is frozen as a
+visual-only contract check. It is not a replacement for MiMo's full audiovisual
+speaker reconciliation; MiMo is the final AV authority for this shadow path.
 
 ## Authority contract
 
@@ -65,9 +63,12 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `r2v.h3.mimo25_h3_shadow.5`
 - `r2v.h3.mimo25_h3_shadow_summary.5`
 
-The OpenAI-compatible client defaults to model `mimo-v2.5`, video FPS 4,
-`media_resolution=default`, disabled thinking, JSON-object output,
-temperature 0.2, and 16384 completion tokens. Base64 is the pilot default.
+The OpenAI-compatible client defaults to the `xiaomi` transport, model
+`mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
+JSON-object output, temperature 0.2, and 16384 completion tokens. Base64 is the
+pilot default. `--transport sglang` is the explicit local-provider alternative;
+the base URL never selects transport implicitly. Transport is recorded in
+backend provenance and its configuration fingerprint.
 Payloads and API keys are never persisted. Explicitly reported zero video
 tokens fail closed. If primary embedded-audio tokens are exactly zero, one
 request retries with canonical full audio; explicitly reported zero audio
@@ -86,16 +87,30 @@ The exact request contract keeps `fps` and `media_resolution` beside the
 }
 ```
 
-The one canonical-audio fallback uses
-`{"type":"input_audio","input_audio":{"data":"..."}}`; it never uses
-`audio_url`. Every primary, fallback, and full-AV-recheck request sends
-`extra_body={"thinking":{"type":"disabled"}}`. MiMo reasoning is
-intentionally disabled because this dataset path needs deterministic structured
-annotation rather than agentic chain-of-thought, while avoiding unnecessary
-tokens and latency. Nonzero reported reasoning tokens are retained as runtime
-diagnostics. Only `stop` is an explicitly successful finish reason; unavailable
-finish reason is retained as a warning, while token limits and every other
-explicit non-stop reason fail closed without a semantic recheck.
+On `xiaomi`, the one canonical-audio fallback uses
+`{"type":"input_audio","input_audio":{"data":"..."}}`, and every request
+sends `extra_body={"thinking":{"type":"disabled"}}`. On `sglang`, every
+primary, fallback, and full-AV-recheck request sends HTTP-top-level
+`use_audio_in_video=true`, `reasoning_effort="none"`, and
+`chat_template_kwargs={"thinking":false,"enable_thinking":false}`. The primary
+request remains one complete target MP4 with embedded audio and no separate
+Audio item. Only an explicit primary `audio_tokens==0` adds canonical full audio
+as `{"type":"audio_url","audio_url":{"url":"..."}}`, while retaining the
+target video. MiMo reasoning is intentionally disabled because this dataset
+path needs deterministic structured annotation rather than agentic
+chain-of-thought, while avoiding unnecessary tokens and latency. Nonzero
+reported reasoning tokens are retained as runtime diagnostics. Only `stop` is
+an explicitly successful finish reason; unavailable finish reason is retained
+as a warning, while token limits and every other explicit non-stop reason fail
+closed without a semantic recheck.
+
+The local SGLang transport was validated at `http://127.0.0.1:8092/v1` with
+`mimo-v2.5` on 8 H200 GPUs using TP8, DP2, and DP-attention. The observed smoke
+reported `video_tokens=28800`, `audio_tokens=53`, `reasoning_tokens=0`, and
+`reasoning_content=None`, with the full AV request completing in about 17.1
+seconds. That SGLang checkout carries an external runtime patch for upstream
+`sglang#37060` (MiMo audio encoder deadlock under TP8+DP2); R2V does not modify
+or own that external source patch.
 
 After the authoritative primary or canonical-audio-fallback response is
 selected, parse or semantic validation failure may trigger at most one full AV
@@ -138,6 +153,7 @@ export MIMO_API_KEY='...'
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
   --known-case-pilot \
+  --transport xiaomi \
   --model mimo-v2.5 \
   --fps 4 \
   --media-resolution default \
@@ -148,12 +164,32 @@ export MIMO_API_KEY='...'
   --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
   --visual-runs-root "$VISUAL_RUNS_ROOT" \
   --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --transport xiaomi \
   --model mimo-v2.5 \
   --fps 4 \
   --media-resolution default \
   --media-root /mnt/workspace \
   --media-mode base64 \
   --overwrite
+```
+
+Run the same MiMo contract against the validated local SGLang endpoint:
+
+```bash
+export MIMO_API_KEY=EMPTY
+
+"$R2V_PYTHON" tools/run_h3_mimo25_av_reconcile.py \
+  --visual-production-root "$VISUAL_PRODUCTION_ROOT" \
+  --visual-runs-root "$VISUAL_RUNS_ROOT" \
+  --audio-production-root "$AUDIO_PRODUCTION_ROOT" \
+  --known-case-pilot \
+  --transport sglang \
+  --base-url http://127.0.0.1:8092/v1 \
+  --model mimo-v2.5 \
+  --fps 4 \
+  --media-resolution default \
+  --media-root /mnt/workspace \
+  --media-mode base64
 ```
 
 Materialize and review without another model call:

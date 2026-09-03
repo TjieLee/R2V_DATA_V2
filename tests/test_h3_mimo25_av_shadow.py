@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
-from typing import get_args
+from typing import Literal, get_args
 
 import pytest
 from pydantic import ValidationError
@@ -367,12 +367,18 @@ def _backend(
         | tuple[str, int | None, str, int | None, int | None]
         | tuple[str, int | None, str, int | None, int | None, int | None]
     ],
+    *,
+    transport: Literal["xiaomi", "sglang"] = "xiaomi",
 ) -> tuple[OpenAIMimo25Backend, _Completions]:
     completions = _Completions(responses)
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
     backend = OpenAIMimo25Backend(
-        MimoBackendConfig(media_resolver=resolver, api_key="secret"),
+        MimoBackendConfig(
+            media_resolver=resolver,
+            api_key="secret",
+            transport=transport,
+        ),
         client=client,
         sleep=lambda _: None,
         jitter=lambda: 0.0,
@@ -397,6 +403,7 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert request["response_format"] == {"type": "json_object"}
     assert request["stream"] is False
     assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in request
     content = request["messages"][1]["content"]  # type: ignore[index]
     video = next(item for item in content if item["type"] == "video_url")  # type: ignore[union-attr]
     assert video["video_url"] == {"url": video["video_url"]["url"]}
@@ -409,7 +416,59 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert "secret" not in json.dumps(request)
     assert MIMO25_PROMPT_VERSION in backend.provenance.model_dump_json()
     assert MIMO25_POLICY_VERSION in backend.provenance.model_dump_json()
+    assert backend.provenance.transport == "xiaomi"
+    assert backend.provenance.backend == "xiaomi_openai_compatible"
     assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
+
+
+def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
+    tmp_path: Path,
+) -> None:
+    backend, completions = _backend(
+        tmp_path,
+        [(_annotation().model_dump_json(), 53)],
+        transport="sglang",
+    )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 1
+    request = completions.requests[0]
+    assert request["reasoning_effort"] == "none"
+    assert request["extra_body"] == {
+        "use_audio_in_video": True,
+        "chat_template_kwargs": {
+            "thinking": False,
+            "enable_thinking": False,
+        },
+    }
+    content = request["messages"][1]["content"]  # type: ignore[index]
+    assert any(item["type"] == "video_url" for item in content)  # type: ignore[union-attr]
+    assert not any(item["type"] in {"audio_url", "input_audio"} for item in content)  # type: ignore[union-attr]
+    assert backend.provenance.transport == "sglang"
+    assert backend.provenance.backend == "sglang_openai_compatible"
+
+
+def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> None:
+    resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
+    xiaomi = MimoBackendConfig(
+        media_resolver=resolver,
+        api_key="secret",
+    ).provenance()
+    sglang = MimoBackendConfig(
+        media_resolver=resolver,
+        api_key="secret",
+        transport="sglang",
+    ).provenance()
+
+    assert xiaomi.transport == "xiaomi"
+    assert sglang.transport == "sglang"
+    assert xiaomi.configuration_fingerprint != sglang.configuration_fingerprint
 
 
 def test_mimo_v5_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
@@ -607,6 +666,35 @@ def test_audio_token_zero_uses_one_canonical_audio_fallback(tmp_path: Path) -> N
     assert completions.requests[1]["extra_body"] == {
         "thinking": {"type": "disabled"}
     }
+
+
+def test_sglang_audio_token_zero_uses_audio_url_fallback(tmp_path: Path) -> None:
+    raw = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path,
+        [(raw, 0), (raw, 4)],
+        transport="sglang",
+    )
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 2
+    assert result.input_modality == "target_video_plus_canonical_full_audio_fallback"
+    fallback = completions.requests[1]
+    content = fallback["messages"][1]["content"]  # type: ignore[index]
+    assert any(item["type"] == "video_url" for item in content)  # type: ignore[union-attr]
+    audio_items = [item for item in content if item["type"] == "audio_url"]  # type: ignore[union-attr]
+    assert len(audio_items) == 1
+    assert audio_items[0]["audio_url"]["url"].startswith("data:audio/")
+    assert not any(item["type"] == "input_audio" for item in content)  # type: ignore[union-attr]
+    assert fallback["reasoning_effort"] == "none"
+    assert fallback["extra_body"]["use_audio_in_video"] is True
 
 
 def test_http_audio_fallback_uses_input_audio_data(tmp_path: Path) -> None:
@@ -1025,6 +1113,35 @@ def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) 
     recheck = content[-1]["text"]
     assert job.r2v_instruction in recheck
     assert job.target_video_path not in recheck
+
+
+def test_sglang_full_av_recheck_preserves_primary_transport_contract(
+    tmp_path: Path,
+) -> None:
+    backend, completions = _backend(
+        tmp_path,
+        [("not json", 5), (_annotation().model_dump_json(), 5)],
+        transport="sglang",
+    )
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 2
+    assert result.recheck_count == 1
+    for request in completions.requests:
+        assert request["reasoning_effort"] == "none"
+        assert request["extra_body"]["use_audio_in_video"] is True
+        content = request["messages"][1]["content"]  # type: ignore[index]
+        assert any(item["type"] == "video_url" for item in content)
+        assert not any(
+            item["type"] in {"audio_url", "input_audio"} for item in content
+        )
 
 
 def test_both_malformed_responses_fail_with_nullable_issue_field(

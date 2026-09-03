@@ -32,6 +32,7 @@ MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.5"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.5"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v5"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
+MimoTransport = Literal["xiaomi", "sglang"]
 
 _GROUP = re.compile(r"g([1-9]\d*)")
 _PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
@@ -397,7 +398,10 @@ class MimoThinkingContract(SchemaModel):
 
 class MimoBackendProvenance(SchemaModel):
     schema_version: Literal["r2v.h3.mimo25_backend.5"] = MIMO25_BACKEND_VERSION
-    backend: Literal["xiaomi_openai_compatible"] = "xiaomi_openai_compatible"
+    backend: Literal[
+        "xiaomi_openai_compatible", "sglang_openai_compatible"
+    ]
+    transport: MimoTransport
     model: Literal["mimo-v2.5"] = MIMO25_MODEL
     base_url: str
     video_fps: Literal[4.0] = 4.0
@@ -430,6 +434,9 @@ class MimoBackendProvenance(SchemaModel):
     def validate_provenance(self) -> MimoBackendProvenance:
         if not self.base_url.strip() or not self.media_root.strip():
             raise ValueError("MiMo endpoint and media root are required")
+        expected_backend = f"{self.transport}_openai_compatible"
+        if self.backend != expected_backend:
+            raise ValueError("MiMo backend provenance differs from transport")
         if (self.media_mode == "http") != (self.media_base_url is not None):
             raise ValueError("MiMo HTTP media mode requires one public base URL")
         values = self.model_dump(mode="json", exclude={"configuration_fingerprint"})
@@ -567,6 +574,7 @@ class MimoMediaResolver:
 class MimoBackendConfig:
     media_resolver: MimoMediaResolver
     api_key: str
+    transport: MimoTransport = "xiaomi"
     base_url: str = MIMO25_DEFAULT_BASE_URL
     model: str = MIMO25_MODEL
     video_fps: float = 4.0
@@ -579,6 +587,7 @@ class MimoBackendConfig:
     def __post_init__(self) -> None:
         if (
             not self.api_key.strip()
+            or self.transport not in {"xiaomi", "sglang"}
             or not self.base_url.strip()
             or self.model != MIMO25_MODEL
             or self.video_fps != 4.0
@@ -589,12 +598,13 @@ class MimoBackendConfig:
             or self.timeout_seconds <= 0
             or not 1 <= self.http_max_attempts <= 5
         ):
-            raise ValueError("MiMo backend configuration violates the v3 contract")
+            raise ValueError("MiMo backend configuration violates the v5 contract")
 
     def provenance(self) -> MimoBackendProvenance:
         values = {
             "schema_version": MIMO25_BACKEND_VERSION,
-            "backend": "xiaomi_openai_compatible",
+            "backend": f"{self.transport}_openai_compatible",
+            "transport": self.transport,
             "model": self.model,
             "base_url": self.base_url,
             "video_fps": self.video_fps,
@@ -1454,16 +1464,23 @@ class OpenAIMimo25Backend:
             }
         )
         if include_audio_fallback:
-            content.append(
-                {
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": self.config.media_resolver.resolve(
-                            Path(job.target_full_audio_path)
-                        )
-                    },
-                }
+            audio_url = self.config.media_resolver.resolve(
+                Path(job.target_full_audio_path)
             )
+            if self.config.transport == "sglang":
+                content.append(
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": audio_url},
+                    }
+                )
+            else:
+                content.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": audio_url},
+                    }
+                )
         return content
 
     @staticmethod
@@ -1560,8 +1577,20 @@ class OpenAIMimo25Backend:
             "temperature": self.config.temperature,
             "max_completion_tokens": self.config.max_completion_tokens,
             "stream": False,
-            "extra_body": {"thinking": {"type": "disabled"}},
         }
+        if self.config.transport == "sglang":
+            payload.update(
+                reasoning_effort="none",
+                extra_body={
+                    "use_audio_in_video": True,
+                    "chat_template_kwargs": {
+                        "thinking": False,
+                        "enable_thinking": False,
+                    },
+                },
+            )
+        else:
+            payload["extra_body"] = {"thinking": {"type": "disabled"}}
         completion, attempts, retries = self._call(payload)
         try:
             choices = _value(completion, "choices")
@@ -1789,6 +1818,7 @@ __all__ = [
     "MimoH3Shot",
     "MimoMediaResolver",
     "MimoSegmentDecision",
+    "MimoTransport",
     "OpenAIMimo25Backend",
     "SpeechPresentation",
     "sha256_file",
