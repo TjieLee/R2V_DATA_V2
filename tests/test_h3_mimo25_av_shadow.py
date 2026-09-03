@@ -146,6 +146,7 @@ def _annotation(
                 "speaker_delivery": [
                     {"speaker_group": group, "delivery_style": "calm and clear"}
                 ],
+                "overall_soundscape_status": "present",
                 "overall_soundscape": "Quiet speech with a short clink.",
                 "non_diegetic_music_status": "absent",
                 "non_diegetic_music": None,
@@ -411,10 +412,10 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
 
 
-def test_mimo_v4_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v4"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v4"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.4"
+def test_mimo_v5_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v5"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v5"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.5"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -431,7 +432,10 @@ def test_mimo_v4_prompt_restores_dense_visual_and_audio_authority_contract() -> 
 
 def test_mimo_prompt_separates_voice_identity_from_visible_speech() -> None:
     for phrase in (
-        "A voice matching a visible character is NOT evidence",
+        "speaker_visible_mouth_occluded",
+        "LR-ASD activity and direct-anchor support are not required",
+        "an unbound current proposal",
+        "Every supplied DiariZen segment must receive exactly one decision",
         "silently reads a phone",
         "message_voice_over",
         "Never delete an authoritative segment",
@@ -455,7 +459,7 @@ def test_segment_decision_requires_speech_presentation() -> None:
         MimoAVAnnotationDraft.model_validate(payload)
 
 
-def test_visible_entity_requires_confirmed_onscreen_lip_motion() -> None:
+def test_visible_entity_requires_confirmed_onscreen_speaker_evidence() -> None:
     payload = _annotation().model_dump(mode="json")
     decision = payload["segment_decisions"][0]
     decision["speech_presentation"] = "message_voice_over"
@@ -464,7 +468,34 @@ def test_visible_entity_requires_confirmed_onscreen_lip_motion() -> None:
 
     decision["speech_presentation"] = "onscreen_spoken"
     decision["evidence_codes"] = ["av_temporal_alignment"]
-    with pytest.raises(ValidationError, match="visible_lip_motion"):
+    with pytest.raises(ValidationError, match="onscreen speaker evidence"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "evidence_codes",
+    [
+        ["speaker_visible_mouth_occluded", "av_temporal_alignment"],
+        ["speaker_visible_mouth_occluded", "voice_continuity"],
+    ],
+)
+def test_visible_entity_allows_mouth_occluded_continuity_evidence(
+    evidence_codes: list[str],
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"] = evidence_codes
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert annotation.segment_decisions[0].entity_id == "e1"
+    assert not _validate(annotation)
+    assert "lr_asd_support" not in evidence_codes
+
+
+def test_mouth_occlusion_without_continuity_is_not_onscreen_evidence() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"] = [
+        "speaker_visible_mouth_occluded"
+    ]
+    with pytest.raises(ValidationError, match="onscreen speaker evidence"):
         MimoAVAnnotationDraft.model_validate(payload)
 
 
@@ -482,6 +513,47 @@ def test_onscreen_speech_without_known_entity_is_valid() -> None:
     decision["binding_status"] = "offscreen"
     with pytest.raises(ValidationError, match="cannot use offscreen"):
         MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_unbound_zero_anchor_segment_can_be_recovered_by_mimo(
+    tmp_path: Path,
+) -> None:
+    job = _job_fixture(tmp_path)
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    source = values["segments"][0]
+    source.update(
+        current_entity_id=None,
+        entity_occurrence_id=None,
+        identity_scope="unresolved",
+        direct_anchor_seconds=0.0,
+        cluster_binding_status="unbound",
+        direct_support_seconds_by_entity={},
+    )
+    unbound_job = _job(values)
+    response = _annotation().model_dump(mode="json")
+    response["segment_decisions"][0]["evidence_codes"] = [
+        "speaker_visible_mouth_occluded",
+        "voice_continuity",
+    ]
+    backend, completions = _backend(
+        tmp_path,
+        [(json.dumps(response), 8)],
+    )
+
+    result = backend.reconcile(
+        unbound_job,
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.annotation.segment_decisions[0].entity_id == "e1"
+    assert result.model_call_count == 1
+    prompt = completions.requests[0]["messages"][1]["content"][-1]["text"]
+    assert '"cluster_binding_status":"unbound"' in prompt
+    assert '"direct_anchor_seconds":0.0' in prompt
+    assert '"allowed_segment_ids":["segment_1"]' in prompt
 
 
 def test_non_onscreen_presentations_cannot_claim_visible_entity() -> None:
@@ -2376,6 +2448,66 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert "[[audio_event:" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert not warnings or all("words" in item for item in warnings)
+
+
+@pytest.mark.parametrize(
+    ("status", "description", "expected"),
+    [
+        ("present", "A low room hum and a light clink are audible.", "A low room hum and a light clink are audible."),
+        ("absent", None, "N/A"),
+        ("unknown", None, "N/A"),
+    ],
+)
+def test_materializer_renders_soundscape_status_without_ungrounded_prose(
+    tmp_path: Path,
+    status: str,
+    description: str | None,
+    expected: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_semantics"]
+    semantics["overall_soundscape_status"] = status
+    semantics["overall_soundscape"] = description
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    assert f"overall_soundscape:\n{expected}" in rendered
+    assert "No additional soundscape is established" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("status", "description", "expected"),
+    [
+        ("present", "Faint non-diegetic strings continue underneath.", "Faint non-diegetic strings continue underneath."),
+        ("absent", None, "N/A"),
+        ("unknown", None, "N/A"),
+    ],
+)
+def test_materializer_renders_music_status_without_ungrounded_prose(
+    tmp_path: Path,
+    status: str,
+    description: str | None,
+    expected: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_semantics"]
+    semantics["non_diegetic_music_status"] = status
+    semantics["non_diegetic_music"] = description
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    assert f"non_diegetic_music:\n{expected}" in rendered
+    assert "Non-diegetic music is not established" not in rendered
 
 
 @pytest.mark.parametrize(

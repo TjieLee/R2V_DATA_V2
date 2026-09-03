@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v4"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v4"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.4"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.4"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v4"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v5"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v5"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.5"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.5"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v5"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 
 _GROUP = re.compile(r"g([1-9]\d*)")
@@ -85,6 +85,7 @@ BindingStatus = Literal[
 ]
 EvidenceCode = Literal[
     "visible_lip_motion",
+    "speaker_visible_mouth_occluded",
     "av_temporal_alignment",
     "voice_continuity",
     "speaker_turn_change",
@@ -99,6 +100,14 @@ EvidenceCode = Literal[
     "voice_over_context",
     "device_playback_context",
 ]
+
+
+def _has_onscreen_speaker_evidence(evidence_codes: list[EvidenceCode]) -> bool:
+    evidence = set(evidence_codes)
+    return "visible_lip_motion" in evidence or (
+        "speaker_visible_mouth_occluded" in evidence
+        and bool(evidence & {"av_temporal_alignment", "voice_continuity"})
+    )
 
 
 def _compact_json(value: object) -> str:
@@ -182,13 +191,17 @@ class MimoSegmentDecision(SchemaModel):
                 raise ValueError("visible_entity requires supplied entity_id")
             if self.speech_presentation != "onscreen_spoken":
                 raise ValueError("visible_entity requires onscreen_spoken presentation")
-            if "visible_lip_motion" not in self.evidence_codes:
-                raise ValueError("visible_entity requires visible_lip_motion evidence")
+            if not _has_onscreen_speaker_evidence(self.evidence_codes):
+                raise ValueError(
+                    "visible_entity requires reliable onscreen speaker evidence"
+                )
         elif self.entity_id is not None:
             raise ValueError("only visible_entity may publish entity_id")
         if self.speech_presentation == "onscreen_spoken":
-            if "visible_lip_motion" not in self.evidence_codes:
-                raise ValueError("onscreen_spoken requires visible_lip_motion evidence")
+            if not _has_onscreen_speaker_evidence(self.evidence_codes):
+                raise ValueError(
+                    "onscreen_spoken requires reliable onscreen speaker evidence"
+                )
             if self.binding_status == "offscreen":
                 raise ValueError("onscreen_spoken cannot use offscreen binding status")
         elif self.binding_status == "visible_entity" or self.entity_id is not None:
@@ -279,6 +292,7 @@ class MimoSpeakerDelivery(SchemaModel):
 class MimoAudioSemantics(SchemaModel):
     temporal_non_speech_events: list[MimoAudioEvent]
     speaker_delivery: list[MimoSpeakerDelivery]
+    overall_soundscape_status: Literal["present", "absent", "unknown"]
     overall_soundscape: StrictStr | None = None
     non_diegetic_music_status: Literal["present", "absent", "unknown"]
     non_diegetic_music: StrictStr | None = None
@@ -286,6 +300,11 @@ class MimoAudioSemantics(SchemaModel):
 
     @model_validator(mode="after")
     def validate_semantics(self) -> MimoAudioSemantics:
+        if self.overall_soundscape_status == "present":
+            if self.overall_soundscape is None or not self.overall_soundscape.strip():
+                raise ValueError("present soundscape requires a concise description")
+        elif self.overall_soundscape is not None:
+            raise ValueError("absent or unknown soundscape cannot publish a description")
         if self.non_diegetic_music_status == "present":
             if self.non_diegetic_music is None or not self.non_diegetic_music.strip():
                 raise ValueError("present music requires a concise description")
@@ -365,7 +384,7 @@ class MimoAnnotationWarning(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.4"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.5"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     audio_semantics: MimoAudioSemantics
     h3_draft: MimoH3Draft
@@ -377,7 +396,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.4"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.5"] = MIMO25_BACKEND_VERSION
     backend: Literal["xiaomi_openai_compatible"] = "xiaomi_openai_compatible"
     model: Literal["mimo-v2.5"] = MIMO25_MODEL
     base_url: str
@@ -391,16 +410,16 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v4"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v5"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v4"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v5"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.4"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.5"] = (
         MIMO25_SCHEMA_VERSION
     )
-    materializer_version: Literal["h3_mimo25_materializer_v4"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v5"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     http_max_attempts: int = Field(ge=1, le=5)
@@ -604,7 +623,7 @@ class MimoBackendConfig:
 SYSTEM_PROMPT = """You are the unified audiovisual reconciliation model for an H3 shadow pipeline.
 
 AUTHORITATIVE PIPELINE FACTS
-1. Supplied DiariZen segment boundaries and sample ranges are authoritative acoustic boundaries for this pass. Never change, split, merge, delete, or invent them and never invent precise subsegment timing.
+1. Supplied DiariZen segment boundaries and sample ranges are authoritative acoustic boundaries for this pass. Every supplied DiariZen segment must receive exactly one decision, including segments with no LR-ASD binding or zero direct-anchor support. Never change, split, merge, delete, filter, or invent them and never invent precise subsegment timing.
 2. Supplied Qwen3-ASR text and language are authoritative transcript facts. Never transcribe, correct, rewrite, paraphrase, translate, repunctuate, complete, split, merge, or move their text. Your output schema contains no transcript field.
 3. Frozen Visual references define the only valid entities and reference ownership. Never invent an entity, Picture, Subject, or attribute owner.
 4. LR-ASD evidence, DiariZen source clusters, and current entity bindings are fallible proposals. Verify and correct only their speaker/entity structure using synchronized audiovisual evidence.
@@ -616,7 +635,7 @@ AUTHORITATIVE PIPELINE FACTS
 PASS 1 - SEGMENT / SPEAKER / ENTITY RECONCILIATION
 Return exactly one decision for every supplied segment ID, no more and no fewer. Preserve every segment. Temporary groups are clip-local g1, g2, ... ordered contiguously by chronological first appearance. Do not emit S1/S2. A source cluster may split and different source clusters may merge when AV evidence supports it.
 
-Speaker identity, visible-entity binding, and speech audiovisual presentation are three different questions. A visible person being present is NOT evidence that they are speaking. A voice matching a visible character is NOT evidence that the character's mouth produces the current speech. visible_entity may be emitted only when synchronized visual evidence shows speech-like mouth, lip, or jaw motion during that segment; then speech_presentation must be onscreen_spoken, entity_id must name one supplied entity, and evidence_codes must include visible_lip_motion. LR-ASD activity, source-cluster support, voice continuity, body or head motion, and visibility alone are insufficient. onscreen_spoken with no reliable supplied identity is legal with entity_id=null and still requires visible_lip_motion.
+Speaker identity, visible-entity binding, and speech audiovisual presentation are three different questions. A visible person being present is NOT by itself evidence that they are speaking. onscreen_spoken and visible_entity are allowed when either synchronized mouth, lip, or jaw motion is visible, recorded as visible_lip_motion, OR when the visible speaker's mouth is occluded or the speaker is back-facing and synchronized audiovisual or voice-continuity evidence still reliably identifies that visible speaker. Record the latter case with speaker_visible_mouth_occluded plus av_temporal_alignment or voice_continuity. A face or visible body alone is insufficient. LR-ASD activity and direct-anchor support are not required: a segment with LR-ASD=0, an unbound current proposal, or direct_anchor_seconds=0 may still be corrected to visible_entity when the target audiovisual evidence supports one supplied entity. onscreen_spoken with no reliable supplied identity remains legal with entity_id=null when the same onscreen-speaker evidence is present.
 
 If a visible person silently reads a phone, looks at a message, types, reacts, or listens while a voice is heard, do not classify the voice as onscreen_spoken merely because it sounds like that character. If speech audibly reads or represents displayed or typed messaging while the visible person does not speak, use message_voice_over with entity_id=null. Use voice_over for narration, inner voice, editorial voice-over, or other speech not produced by a visible speaking mouth. Use offscreen_spoken for speech from outside the frame. Use device_playback for speech audibly emitted by an in-scene phone, television, radio, video, or recording. When the audiovisual evidence is insufficient, use uncertain and remove visible-entity binding. Never delete an authoritative segment because its presentation is non-onscreen: Qwen3-ASR transcript/language and DiariZen exact timing remain authoritative.
 
@@ -625,7 +644,7 @@ Conceptual examples: a visible person silently reads or types on a phone while a
 Do NOT interpret more than one audible vocal event as evidence that an upstream segment is invalid. A valid segment may include discourse particles or interjections from its primary speaker; sighing, breathing, laughter, coughing, hesitation, or other non-lexical vocalization from the same speaker; a brief non-speech vocalization from another person; overlapping secondary speech; or sequential speech by two speakers. Short particles such as 嗯, 啊, 唉, 哦, 诶, uh, um, hm, oh, and ah do not by themselves prove a speaker change. same_speaker_nonlexical preserves the group. secondary_non_speech_vocalization preserves primary dialogue ownership. overlapping_secondary_speech and sequential_multi_speaker_speech preserve the source segment but require needs_acoustic_refinement; never invent an internal change timestamp.
 
 PASS 2 - AV AUDIO SEMANTICS
-Describe only meaningfully audible non-speech events, delivery, soundscape, and music. Synchronized video may ground an audible door close, cup placement, or other source; visible action alone cannot establish sound. Use generic impact/clink when the source is uncertain. Coalesce repeated acoustically similar micro-events from one action into one event with pattern=repeated. Split only genuinely distinct sources, meanings, or times. Assign every temporal_non_speech_event a stable contiguous event_id ae1, ae2, ... in chronological order. Each event description must be one concise standalone English audible clause with no timestamp text, transcript, reference label, speaker syntax, dialogue markup, or placeholder. Do not guess HVAC, room acoustics, ventilation, machinery, or material source from scene plausibility. Music requires audible musical structure; visual context may distinguish diegetic from non-diegetic music. Speaker delivery describes only audible pace, energy, loudness, articulation, hesitation, questioning, shouting, whispering, rhythm, and pauses, never transcript, gender, age, nationality, role, or identity. For every resolved primary speaker group owning an authoritative transcribed segment, speaker_delivery must include that group exactly once; never emit an unknown group.
+Describe only meaningfully audible non-speech events, delivery, soundscape, and music. Synchronized video may ground an audible door close, cup placement, or other source; visible action alone cannot establish sound. Use generic impact/clink when the source is uncertain. Coalesce repeated acoustically similar micro-events from one action into one event with pattern=repeated. Split only genuinely distinct sources, meanings, or times. Assign every temporal_non_speech_event a stable contiguous event_id ae1, ae2, ... in chronological order. Each event description must be one concise standalone English audible clause with no timestamp text, transcript, reference label, speaker syntax, dialogue markup, or placeholder. Do not guess HVAC, room acoustics, ventilation, machinery, or material source from scene plausibility. Set overall_soundscape_status to present only with a concise audible description, absent when no meaningful additional soundscape is audible, or unknown when the evidence is uncertain; absent and unknown require overall_soundscape=null. Music requires audible musical structure; visual context may distinguish diegetic from non-diegetic music. Set non_diegetic_music_status to present only with a concise audible description, absent when confidently absent, or unknown when uncertain; absent and unknown require non_diegetic_music=null. Speaker delivery describes only audible pace, energy, loudness, articulation, hesitation, questioning, shouting, whispering, rhythm, and pauses, never transcript, gender, age, nationality, role, or identity. For every resolved primary speaker group owning an authoritative transcribed segment, speaker_delivery must include that group exactly once; never emit an unknown group.
 
 audiovisual_summary is a concise summary of directly observed audiovisual context. It must not quote or paraphrase dialogue and must not infer plot, relationship, intention, causality, or psychology.
 
@@ -645,7 +664,7 @@ Insert every emitted Audio event exactly once as [[audio_event:<event_id>]] at i
 Every supplied <Subject N> must have exactly one visual_retention_analysis line beginning with that exact Subject label and containing exactly one allowed retention marker. Do not use Picture labels as retention owners and do not emit unknown or duplicate Subject retention lines.
 
 PASS 4 - CONSISTENCY CHECK BEFORE JSON
-Check: every source segment exactly once; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; visible_entity only with onscreen_spoken plus visible_lip_motion; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; every transcribed placeholder exactly once in chronological order and only in shots; every Audio-event placeholder exactly once in event order and only in shots; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; no pipeline-owned syntax; JSON only with no markdown or extra fields."""
+Check: every source segment exactly once even when LR-ASD is unbound or direct-anchor support is zero; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; visible_entity only with onscreen_spoken plus visible_lip_motion OR speaker_visible_mouth_occluded with av_temporal_alignment or voice_continuity; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; every transcribed placeholder exactly once in chronological order and only in shots; every Audio-event placeholder exactly once in event order and only in shots; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; no pipeline-owned syntax; JSON only with no markdown or extra fields."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -804,23 +823,23 @@ def validate_annotation(
         if decision.binding_status == "visible_entity" and (
             decision.speech_presentation != "onscreen_spoken"
             or decision.entity_id is None
-            or "visible_lip_motion" not in decision.evidence_codes
+            or not _has_onscreen_speaker_evidence(decision.evidence_codes)
         ):
             issues.append(
                 ValidationIssue(
                     "visible_entity_requires_confirmed_onscreen_speech",
                     decision.segment_id,
-                    "visible_entity requires onscreen_spoken, entity_id, and visible_lip_motion",
+                    "visible_entity requires onscreen_spoken, entity_id, and reliable onscreen speaker evidence",
                 )
             )
-        if decision.speech_presentation == "onscreen_spoken" and (
-            "visible_lip_motion" not in decision.evidence_codes
+        if decision.speech_presentation == "onscreen_spoken" and not (
+            _has_onscreen_speaker_evidence(decision.evidence_codes)
         ):
             issues.append(
                 ValidationIssue(
-                    "onscreen_speech_requires_visible_lip_motion",
+                    "onscreen_speech_requires_reliable_visible_speaker_evidence",
                     decision.segment_id,
-                    "onscreen_spoken requires visible_lip_motion",
+                    "onscreen_spoken requires visible lip motion or mouth-occluded visible-speaker continuity",
                 )
             )
         if (

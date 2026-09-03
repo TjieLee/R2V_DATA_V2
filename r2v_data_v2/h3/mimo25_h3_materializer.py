@@ -26,8 +26,6 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoSegmentDecision,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
-    UNGROUNDED_NON_DIEGETIC_MUSIC,
-    UNGROUNDED_OVERALL_SOUNDSCAPE,
     AudioFactAuditItem,
     ConditioningVariant,
     Qwen38DraftShot,
@@ -47,8 +45,8 @@ from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.4"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.4"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.5"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.5"
 _MIMO_SEGMENT_PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
 _MIMO_AUDIO_EVENT_PLACEHOLDER = re.compile(
     r"\[\[audio_event:([^\[\]\r\n]+)\]\]"
@@ -90,7 +88,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.4"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.5"] = (
         MIMO25_SHADOW_RECORD_VERSION
     )
     sample_id: str
@@ -99,7 +97,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v4"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v5"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -122,7 +120,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.4"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.5"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -285,7 +283,7 @@ def _audio_facts(
         non_speech_events=events,
         overall_soundscape_hint=semantics.overall_soundscape,
         non_diegetic_music_hint=semantics.non_diegetic_music,
-        audio_grounding_complete=semantics.non_diegetic_music_status != "unknown",
+        audio_grounding_complete=True,
         provenance={
             "speech": "qwen3_asr_segments_exact",
             "speaker_structure": "mimo25_shadow_annotation",
@@ -352,8 +350,11 @@ def _materialize_sample(
         semantics.non_diegetic_music
         if semantics.non_diegetic_music_status == "present"
         else "N/A"
-        if semantics.non_diegetic_music_status == "absent"
-        else UNGROUNDED_NON_DIEGETIC_MUSIC
+    )
+    soundscape = (
+        semantics.overall_soundscape
+        if semantics.overall_soundscape_status == "present"
+        else "N/A"
     )
     draft = Qwen38H3DraftResponse(
         subject_definitions=record.annotation.h3_draft.subject_definitions,
@@ -373,10 +374,7 @@ def _materialize_sample(
             )
             for item in record.annotation.h3_draft.shots
         ],
-        overall_soundscape=(
-            semantics.overall_soundscape
-            or UNGROUNDED_OVERALL_SOUNDSCAPE
-        ),
+        overall_soundscape=soundscape,
         non_diegetic_music=music,
         audio_fact_audit=[
             AudioFactAuditItem(fact_id=item.fact_id, action="preserved")

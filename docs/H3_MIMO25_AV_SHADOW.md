@@ -1,8 +1,8 @@
 # H3 MiMo-V2.5 AV Shadow
 
 This experimental path is additive and read-only with respect to the current JEA
-production stages. It writes only `mimo25_av_reconcile_v4/` and
-`mimo25_h3_shadow_v4/` under the Audio production root.
+production stages. It writes only `mimo25_av_reconcile_v5/` and
+`mimo25_h3_shadow_v5/` under the Audio production root.
 
 While the MiMo checkpoint is unavailable, the independent
 `H3_QWEN_SPEECH_PRESENTATION_AB.md` shadow can exercise the same deterministic
@@ -31,9 +31,14 @@ An explicit case manifest switches the scope to `explicit_case_subset` and sets
 canonical-wide coverage false.
 
 Speaker identity, visible-entity binding, and speech presentation are separate
-facts. A voice matching a visible character does not establish visible speech.
-Only `onscreen_spoken` with MiMo-observed `visible_lip_motion` may materialize as
-`<Subject N> (Sx) says, ...`. `offscreen_spoken`, `voice_over`,
+facts. A visible person alone does not establish visible speech. An
+`onscreen_spoken` segment may materialize as `<Subject N> (Sx) says, ...` when
+MiMo observes either `visible_lip_motion`, or a visible speaker whose mouth is
+occluded/back-facing together with AV alignment or voice-continuity evidence.
+LR-ASD support and direct anchors are proposals, not prerequisites: MiMo may
+restore a supplied entity for an unbound or zero-anchor segment. Every DiariZen
+segment enters MiMo regardless of its current LR-ASD/binding evidence.
+`offscreen_spoken`, `voice_over`,
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
 presentation similarly removes visible-entity binding rather than guessing.
@@ -47,18 +52,18 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v4`
-- `h3_mimo25_av_authority_contract_v4`
-- `r2v.h3.mimo25_av_annotation.4`
-- `r2v.h3.mimo25_backend.4`
-- `h3_mimo25_materializer_v4`
+- `h3_mimo25_unified_av_reconcile_v5`
+- `h3_mimo25_av_authority_contract_v5`
+- `r2v.h3.mimo25_av_annotation.5`
+- `r2v.h3.mimo25_backend.5`
+- `h3_mimo25_materializer_v5`
 - `r2v.h3.mimo25_inventory.3`
-- `r2v.h3.mimo25_record.4`
-- `r2v.h3.mimo25_summary.4`
-- `r2v.h3.mimo25_failure.4`
-- `r2v.h3.mimo25_raw_response.4`
-- `r2v.h3.mimo25_h3_shadow.4`
-- `r2v.h3.mimo25_h3_shadow_summary.4`
+- `r2v.h3.mimo25_record.5`
+- `r2v.h3.mimo25_summary.5`
+- `r2v.h3.mimo25_failure.5`
+- `r2v.h3.mimo25_raw_response.5`
+- `r2v.h3.mimo25_h3_shadow.5`
+- `r2v.h3.mimo25_h3_shadow_summary.5`
 
 The OpenAI-compatible client defaults to model `mimo-v2.5`, video FPS 4,
 `media_resolution=default`, disabled thinking, JSON-object output,
@@ -95,12 +100,18 @@ explicit non-stop reason fail closed without a semantic recheck.
 After the authoritative primary or canonical-audio-fallback response is
 selected, parse or semantic validation failure may trigger at most one full AV
 recheck with the same references, target video, and selected audio modality.
-There is no text-only semantic repair. The v4 annotation assigns chronological
+There is no text-only semantic repair. The v5 annotation assigns chronological
 `ae1`, `ae2`, ... IDs to non-speech Audio events and requires each event exactly
 once as `[[audio_event:aeN]]` in a shot. The deterministic MiMo materializer
 replaces those placeholders with the validated event descriptions before the
 existing exact speech-placeholder materialization, so final H3 text cannot
 silently omit accepted Audio events.
+
+MiMo records retain explicit `present`, `absent`, or `unknown` status for the
+overall soundscape and non-diegetic music. The H3 training prompt renders a
+description only for `present`; both `absent` and `unknown` render as `N/A`.
+Thus uncertainty remains available in the annotation without emitting prose
+such as "not established" into training prompts.
 
 ## Server commands
 
@@ -160,4 +171,4 @@ Materialize and review without another model call:
 ```
 
 Open `http://127.0.0.1:8768`. Review annotations are fingerprint-bound and are
-stored under `mimo25_h3_shadow_v4/human_review/`.
+stored under `mimo25_h3_shadow_v5/human_review/`.

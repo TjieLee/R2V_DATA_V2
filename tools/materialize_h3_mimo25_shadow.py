@@ -24,9 +24,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> dict[str, object]:
     arguments = _parser().parse_args(argv)
     paths = jea_production_paths(arguments.audio_production_root)
-    output = paths.root / "mimo25_h3_shadow_v4"
+    output = paths.root / "mimo25_h3_shadow_v5"
     summary = materialize_mimo25_h3_shadow(
-        mimo_root=paths.root / "mimo25_av_reconcile_v4",
+        mimo_root=paths.root / "mimo25_av_reconcile_v5",
         source_h3_root=paths.h3,
         output_root=output,
         overwrite=arguments.overwrite,
