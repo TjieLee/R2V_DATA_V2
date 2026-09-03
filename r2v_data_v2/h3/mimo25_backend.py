@@ -26,9 +26,9 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v6"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v7"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v5"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.5"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.6"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.5"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v5"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
@@ -178,7 +178,7 @@ class MimoSegmentDecision(SchemaModel):
     primary_speaker_group: str | None = Field(default=None, pattern=r"^g[1-9]\d*$")
     binding_status: BindingStatus
     speech_presentation: SpeechPresentation
-    entity_id: str | None = None
+    entity_id: str | None
     secondary_vocal_activity: MimoSecondaryVocalActivity
     confidence: Literal["high", "medium", "low"]
     evidence_codes: list[EvidenceCode] = Field(min_length=1)
@@ -385,7 +385,7 @@ class MimoAnnotationWarning(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.5"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.6"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     audio_semantics: MimoAudioSemantics
     h3_draft: MimoH3Draft
@@ -414,13 +414,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v6"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v7"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v5"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.5"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.6"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal["h3_mimo25_materializer_v5"] = (
@@ -645,6 +645,10 @@ AUTHORITATIVE PIPELINE FACTS
 PASS 1 - SEGMENT / SPEAKER / ENTITY RECONCILIATION
 Return exactly one decision for every supplied segment ID, no more and no fewer. Preserve every segment. Temporary groups are clip-local g1, g2, ... ordered contiguously by chronological first appearance. Do not emit S1/S2. A source cluster may split and different source clusters may merge when AV evidence supports it.
 
+A primary_speaker_group represents one clip-local speaker identity, not one speech turn. A new segment, pause, language change, ASR change, sentence change, or turn boundary must not by itself create a new group. If multiple resolved visible_entity decisions identify the same entity_id, reuse the same primary_speaker_group. One resolved primary_speaker_group must never map to multiple visible entity_ids. Reconsider identity from audiovisual evidence when assignments conflict; do not blindly merge groups.
+
+Every segment decision must explicitly include the entity_id key. For binding_status=visible_entity, entity_id must be one exact supplied bindable entity ID. For every other binding_status, entity_id must be null.
+
 Speaker identity, visible-entity binding, and speech audiovisual presentation are three different questions. A visible person being present is NOT by itself evidence that they are speaking. onscreen_spoken and visible_entity are allowed when either synchronized mouth, lip, or jaw motion is visible, recorded as visible_lip_motion, OR when the visible speaker's mouth is occluded or the speaker is back-facing and synchronized audiovisual or voice-continuity evidence still reliably identifies that visible speaker. Record the latter case with speaker_visible_mouth_occluded plus av_temporal_alignment or voice_continuity. A face or visible body alone is insufficient. LR-ASD activity and direct-anchor support are not required: a segment with LR-ASD=0, an unbound current proposal, or direct_anchor_seconds=0 may still be corrected to visible_entity when the target audiovisual evidence supports one supplied entity. onscreen_spoken with no reliable supplied identity remains legal with entity_id=null when the same onscreen-speaker evidence is present.
 
 If a visible person silently reads a phone, looks at a message, types, reacts, or listens while a voice is heard, do not classify the voice as onscreen_spoken merely because it sounds like that character. If speech audibly reads or represents displayed or typed messaging while the visible person does not speak, use message_voice_over with entity_id=null. Use voice_over for narration, inner voice, editorial voice-over, or other speech not produced by a visible speaking mouth. Use offscreen_spoken for speech from outside the frame. Use device_playback for speech audibly emitted by an in-scene phone, television, radio, video, or recording. When the audiovisual evidence is insufficient, use uncertain and remove visible-entity binding. Never delete an authoritative segment because its presentation is non-onscreen: Qwen3-ASR transcript/language and DiariZen exact timing remain authoritative.
@@ -676,7 +680,7 @@ Insert every emitted Audio event exactly once as [[audio_event:<event_id>]] at i
 Every supplied <Subject N> must have exactly one visual_retention_analysis line beginning with that exact Subject label and containing exactly one allowed retention marker. Do not use Picture labels as retention owners and do not emit unknown or duplicate Subject retention lines.
 
 PASS 4 - CONSISTENCY CHECK BEFORE JSON
-Check: every source segment exactly once even when LR-ASD is unbound or direct-anchor support is zero; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; visible_entity only with onscreen_spoken plus visible_lip_motion OR speaker_visible_mouth_occluded with av_temporal_alignment or voice_continuity; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; every transcribed placeholder exactly once in chronological order and only in shots; every Audio-event placeholder exactly once in event order and only in shots; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; no pipeline-owned syntax; JSON only with no markdown or extra fields."""
+Check: every source segment exactly once even when LR-ASD is unbound or direct-anchor support is zero; every decision explicitly contains entity_id; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; primary_speaker_group denotes identity rather than turn; the same resolved visible entity reuses one group and one resolved group never maps to multiple visible entities; visible_entity only with onscreen_spoken plus visible_lip_motion OR speaker_visible_mouth_occluded with av_temporal_alignment or voice_continuity; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; the flattened speech placeholder sequence byte-for-byte matches required_speech_placeholder_sequence and excludes every forbidden_speech_placeholder_id; every Audio-event placeholder exactly once in event order and only in shots; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; no pipeline-owned syntax; JSON only with no markdown or extra fields."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -1537,6 +1541,11 @@ class OpenAIMimo25Backend:
     def build_mandatory_h3_draft_contract(
         job: MimoBackendJob,
     ) -> dict[str, object]:
+        transcribed_segment_ids = [
+            item.segment_id
+            for item in job.segments
+            if item.asr_status == "transcribed"
+        ]
         return {
             "subject_definition_requirements": [
                 {
@@ -1548,10 +1557,15 @@ class OpenAIMimo25Backend:
                 for subject in job.reference_subjects
             ],
             "allowed_segment_ids": [item.segment_id for item in job.segments],
-            "transcribed_segment_ids": [
+            "transcribed_segment_ids": transcribed_segment_ids,
+            "required_speech_placeholder_sequence": [
+                f"[[segment:{segment_id}]]"
+                for segment_id in transcribed_segment_ids
+            ],
+            "forbidden_speech_placeholder_ids": [
                 item.segment_id
                 for item in job.segments
-                if item.asr_status == "transcribed"
+                if item.segment_id not in transcribed_segment_ids
             ],
         }
 
@@ -1562,21 +1576,31 @@ class OpenAIMimo25Backend:
             + _compact_json(cls.build_mandatory_h3_draft_contract(job))
             + "\nMANDATORY H3 DRAFT SYNTAX RULES:\n"
             "1. segment_decisions must cover every allowed_segment_ids item exactly "
-            "once and in supplied order, including non-transcribed segments.\n"
-            "2. Flattened [[segment:ID]] placeholders across h3_draft.shots must "
-            "equal transcribed_segment_ids exactly, once each and in that chronological "
-            "order. Never emit a speech placeholder for an allowed segment that is not "
-            "listed in transcribed_segment_ids.\n"
-            "3. subject_definitions must contain exactly one row per "
+            "once and in supplied order, including non-transcribed segments. Every row "
+            "must explicitly include entity_id; visible_entity uses one supplied ID and "
+            "all other binding statuses use null.\n"
+            "2. Flatten the literal speech placeholder tokens across h3_draft.shots, "
+            "then verify that the resulting list equals "
+            "required_speech_placeholder_sequence byte-for-byte. Use each required token "
+            "exactly once and in listed order. Never emit a placeholder whose ID appears "
+            "in forbidden_speech_placeholder_ids. The model chooses only the correct "
+            "observed shot and position for each precomputed token; it does not decide "
+            "which segments qualify.\n"
+            "3. primary_speaker_group is clip-local speaker identity, not turn identity. "
+            "Do not create a new group for a pause, segment, language, ASR, sentence, or "
+            "turn boundary. Reuse one group for resolved visible_entity decisions with "
+            "the same entity_id, and never map one resolved group to multiple visible "
+            "entity_ids.\n"
+            "4. subject_definitions must contain exactly one row per "
             "subject_definition_requirements item. Each row must begin with its exact "
             "subject_label, contain ALL AND ONLY its required_source_picture_labels "
             "exactly once each, and contain no other Subject label.\n"
-            "4. Subject definitions must be natural official H3 Ref2VA English prose. "
+            "5. Subject definitions must be natural official H3 Ref2VA English prose. "
             "There is no required fixed English connector. Illustrative metasyntax only: "
             "'{subject_label} is ... in {required_picture_label_1} and "
             "{required_picture_label_2} ...'. Replace every brace token with the supplied "
             "labels and do not emit brace tokens.\n"
-            "5. [[segment:ID]] and [[audio_event:ID]] are internal draft placeholders. "
+            "6. [[segment:ID]] and [[audio_event:ID]] are internal draft placeholders. "
             "Do not convert them into final (Sx), <d>, or other MiniMax H3 syntax; the "
             "deterministic materializer owns final rendering."
         )
@@ -1684,9 +1708,21 @@ class OpenAIMimo25Backend:
         if "speech_placeholder_inventory_mismatch" in issue_codes:
             issue_actions.append(
                 "For speech_placeholder_inventory_mismatch, rebuild all shot speech "
-                "placeholders so their flattened sequence exactly equals "
-                "transcribed_segment_ids. Do not locally patch the previous string and "
-                "do not emit placeholders for other allowed segments."
+                "placeholders from required_speech_placeholder_sequence so their "
+                "flattened literal-token sequence equals that supplied list "
+                "byte-for-byte. Do not derive eligibility again, locally patch the "
+                "previous string, or emit any forbidden_speech_placeholder_id."
+            )
+        if issue_codes & {
+            "visible_entity_speaker_group_contradiction",
+            "speaker_group_entity_contradiction",
+        }:
+            issue_actions.append(
+                "For a visible entity/speaker-group contradiction, reconsider clip-local "
+                "speaker identity from the same audiovisual evidence and regenerate "
+                "group assignments consistently. A group represents identity, not a "
+                "turn. Do not blindly merge groups unless the audiovisual evidence "
+                "supports the same speaker."
             )
         actions = (
             "\nISSUE-SPECIFIC CONTRACT ACTIONS:\n" + "\n".join(issue_actions)

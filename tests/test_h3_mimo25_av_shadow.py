@@ -519,9 +519,9 @@ def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> 
 
 
 def test_mimo_v5_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v6"
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v7"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v5"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.5"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.6"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -570,9 +570,23 @@ def test_primary_prompt_separates_decision_and_speech_placeholder_inventories(
 
     assert contract["allowed_segment_ids"] == ["segment_1", "segment_2"]
     assert contract["transcribed_segment_ids"] == ["segment_1"]
+    assert contract["required_speech_placeholder_sequence"] == [
+        "[[segment:segment_1]]"
+    ]
+    assert contract["forbidden_speech_placeholder_ids"] == ["segment_2"]
     assert "including non-transcribed segments" in prompt
-    assert "Never emit a speech placeholder for an allowed segment" in prompt
-    assert "listed in transcribed_segment_ids" in prompt
+    assert "required_speech_placeholder_sequence byte-for-byte" in prompt
+    assert "forbidden_speech_placeholder_ids" in prompt
+
+
+def test_prompt_defines_primary_speaker_group_as_identity() -> None:
+    for phrase in (
+        "represents one clip-local speaker identity, not one speech turn",
+        "must not by itself create a new group",
+        "reuse the same primary_speaker_group",
+        "do not blindly merge groups",
+    ):
+        assert phrase in SYSTEM_PROMPT
 
 
 def test_mimo_prompt_separates_voice_identity_from_visible_speech() -> None:
@@ -602,6 +616,26 @@ def test_segment_decision_requires_speech_presentation() -> None:
     del payload["segment_decisions"][0]["speech_presentation"]
     with pytest.raises(ValidationError):
         MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_segment_decision_entity_id_is_required_but_nullable() -> None:
+    decision_schema = MimoAVAnnotationDraft.model_json_schema()["$defs"][
+        "MimoSegmentDecision"
+    ]
+    assert "entity_id" in decision_schema["required"]
+
+    payload = _annotation().model_dump(mode="json")
+    del payload["segment_decisions"][0]["entity_id"]
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+    assert _annotation(entity_id="e1").segment_decisions[0].entity_id == "e1"
+    assert _annotation(entity_id=None).segment_decisions[0].entity_id is None
+
+    invalid = _annotation(entity_id=None).model_dump(mode="json")
+    invalid["segment_decisions"][0]["entity_id"] = "e1"
+    with pytest.raises(ValidationError, match="only visible_entity"):
+        MimoAVAnnotationDraft.model_validate(invalid)
 
 
 def test_visible_entity_requires_confirmed_onscreen_speaker_evidence() -> None:
@@ -1230,7 +1264,30 @@ def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
     assert "regenerate each affected definition" in prompt
     assert "exact Subject-to-Pictures mapping" in prompt
     assert "rebuild all shot speech placeholders" in prompt
-    assert "exactly equals transcribed_segment_ids" in prompt
+    assert "required_speech_placeholder_sequence" in prompt
+    assert "byte-for-byte" in prompt
+
+
+def test_full_av_recheck_explains_speaker_identity_contradiction(
+    tmp_path: Path,
+) -> None:
+    job = _job_fixture(tmp_path)
+    backend, _ = _backend(tmp_path, [])
+    prompt = backend._full_av_recheck_prompt(
+        job,
+        invalid_response="{}",
+        issues=[
+            ValidationIssue(
+                "visible_entity_speaker_group_contradiction",
+                "segment_decisions",
+                "e1 maps to multiple groups",
+            )
+        ],
+    )
+
+    assert "reconsider clip-local speaker identity" in prompt
+    assert "A group represents identity, not a turn" in prompt
+    assert "Do not blindly merge groups" in prompt
 
 
 def test_sglang_full_av_recheck_preserves_primary_transport_contract(

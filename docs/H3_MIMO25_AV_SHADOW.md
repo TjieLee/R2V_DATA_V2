@@ -27,6 +27,13 @@ stricter: only Qwen3-ASR segments with `asr_status="transcribed"` receive
 are pipeline-internal and are always removed by deterministic materialization;
 they are not MiniMax H3 syntax.
 
+The per-request contract precomputes the complete literal speech-placeholder
+sequence from the authoritative transcribed-segment inventory and separately
+lists every forbidden non-transcribed segment ID. MiMo chooses the observed
+shot and temporal position, but it does not derive speech-placeholder
+eligibility. Every segment decision explicitly publishes `entity_id`: an exact
+supplied ID for `visible_entity`, otherwise JSON `null`.
+
 Each draft Subject definition is constrained by a machine-readable, per-request
 mapping from its exact frozen `<Subject N>` label to all and only its owning
 `<Picture N>` labels. MiMo must cite those labels explicitly, but the definition
@@ -54,6 +61,12 @@ segment enters MiMo regardless of its current LR-ASD/binding evidence.
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
 presentation similarly removes visible-entity binding rather than guessing.
+The clip-local `primary_speaker_group` represents speaker identity rather than
+a speech turn. Segment boundaries, pauses, language changes, or ASR changes do
+not create a new group by themselves. Resolved segments bound to the same
+visible entity reuse one group, while one resolved group cannot map to multiple
+visible entities; full-AV recheck must revisit the AV evidence rather than
+blindly merging a conflicting assignment.
 
 Each clip must have exactly one `pair_type="canonical"` Final H3 sample. That
 sample is the target-observation representative and uses the `visual_only`
@@ -64,9 +77,9 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v6`
+- `h3_mimo25_unified_av_reconcile_v7`
 - `h3_mimo25_av_authority_contract_v5`
-- `r2v.h3.mimo25_av_annotation.5`
+- `r2v.h3.mimo25_av_annotation.6`
 - `r2v.h3.mimo25_backend.5`
 - `h3_mimo25_materializer_v5`
 - `r2v.h3.mimo25_inventory.3`
