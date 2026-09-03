@@ -21,7 +21,10 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoInventory,
     MimoRecord,
 )
-from r2v_data_v2.h3.mimo25_backend import MIMO25_MATERIALIZER_VERSION
+from r2v_data_v2.h3.mimo25_backend import (
+    MIMO25_MATERIALIZER_VERSION,
+    MimoSegmentDecision,
+)
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     UNGROUNDED_NON_DIEGETIC_MUSIC,
     UNGROUNDED_OVERALL_SOUNDSCAPE,
@@ -41,8 +44,8 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 )
 from r2v_data_v2.h3.schemas import SchemaModel
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.3"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.3"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.4"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.4"
 _MIMO_SEGMENT_PLACEHOLDER = re.compile(r"\[\[segment:([^\[\]\r\n]+)\]\]")
 _MIMO_AUDIO_EVENT_PLACEHOLDER = re.compile(
     r"\[\[audio_event:([^\[\]\r\n]+)\]\]"
@@ -84,7 +87,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.3"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.4"] = (
         MIMO25_SHADOW_RECORD_VERSION
     )
     sample_id: str
@@ -93,7 +96,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v3"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v4"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -116,7 +119,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.3"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.4"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -184,7 +187,9 @@ def _corrected_segments(
         )
         entity_id = (
             decision.entity_id
-            if resolved and decision.binding_status == "visible_entity"
+            if resolved
+            and decision.binding_status == "visible_entity"
+            and decision.speech_presentation == "onscreen_spoken"
             else None
         )
         if not resolved:
@@ -287,6 +292,31 @@ def _audio_facts(
     )
 
 
+def _render_mimo_speech_clause(
+    speech: RecaptionSpeechFact,
+    base_clause: str,
+    decisions: dict[str, MimoSegmentDecision],
+) -> str:
+    presentation = decisions[speech.segment_id].speech_presentation
+    if presentation == "onscreen_spoken":
+        return base_clause
+    prefix = {
+        "offscreen_spoken": f"({speech.speaker_id}), speaking offscreen",
+        "voice_over": (
+            f"({speech.speaker_id}), as a voice-over rather than visible speech"
+        ),
+        "message_voice_over": (
+            f"({speech.speaker_id}), as a message voice-over rather than visible speech"
+        ),
+        "device_playback": (
+            f"({speech.speaker_id}), heard through an in-scene device rather than "
+            "visible speech"
+        ),
+        "uncertain": f"({speech.speaker_id}), with speech presentation uncertain",
+    }[presentation]
+    return f"{prefix}: {speech.locked_dialogue_block}"
+
+
 def _materialize_sample(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
@@ -362,7 +392,16 @@ def _materialize_sample(
             for item in facts.non_speech_events
         ],
     )
-    structured = materialize_h3_draft(draft, request)
+    decisions = {
+        item.segment_id: item for item in record.annotation.segment_decisions
+    }
+    structured = materialize_h3_draft(
+        draft,
+        request,
+        speech_clause_transform=lambda speech, clause: _render_mimo_speech_clause(
+            speech, clause, decisions
+        ),
+    )
     if "[[audio_event:" in structured.detailed_description:
         raise ValueError("MiMo Audio-event placeholder survived materialization")
     issues, validation_warnings = validate_h3_response(structured, request)

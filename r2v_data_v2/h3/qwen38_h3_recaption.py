@@ -7,7 +7,7 @@ import re
 import shutil
 import uuid
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -1346,6 +1346,8 @@ def _format_shot_timestamp(seconds: float) -> str:
 def materialize_h3_draft(
     draft: Qwen38H3DraftResponse,
     request: Qwen38RecaptionRequest,
+    *,
+    speech_clause_transform: Callable[[RecaptionSpeechFact, str], str] | None = None,
 ) -> Qwen38H3StructuredResponse:
     issues = validate_h3_draft(draft, request)
     if issues:
@@ -1356,12 +1358,18 @@ def materialize_h3_draft(
     speech_by_id = {
         speech.fact_id: speech for speech in request.audio_facts.speech
     }
+
+    def render_speech(match: re.Match[str]) -> str:
+        speech = speech_by_id[match.group(1)]
+        clause = _render_locked_speech(speech, request.reference_contract)
+        if speech_clause_transform is not None:
+            clause = speech_clause_transform(speech, clause)
+        return clause
+
     rendered_shots = []
     for shot in draft.shots:
         description = _SPEECH_PLACEHOLDER.sub(
-            lambda match: _render_locked_speech(
-                speech_by_id[match.group(1)], request.reference_contract
-            ),
+            render_speech,
             shot.description_template.strip(),
         )
         if shot.shot_index == 1:

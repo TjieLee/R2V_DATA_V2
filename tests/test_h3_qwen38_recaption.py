@@ -440,6 +440,20 @@ def test_speaker_ids_follow_first_cluster_appearance_and_binding(tmp_path: Path)
     assert _codes(response, request) == set()
 
 
+def test_default_materializer_is_unchanged_without_speech_transform(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    draft = _draft(request)
+    default = materialize_h3_draft(draft, request)
+    identity_transform = materialize_h3_draft(
+        draft,
+        request,
+        speech_clause_transform=lambda _speech, clause: clause,
+    )
+    assert default.model_dump(mode="json") == identity_transform.model_dump(mode="json")
+
+
 @pytest.mark.parametrize(
     ("variant", "voice_source"),
     [

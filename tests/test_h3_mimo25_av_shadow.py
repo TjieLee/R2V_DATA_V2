@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -59,6 +60,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoMediaResolver,
     MimoUsage,
     OpenAIMimo25Backend,
+    SpeechPresentation,
     validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
@@ -97,6 +99,11 @@ def _annotation(
                     "binding_status": (
                         "visible_entity" if entity_id is not None else "offscreen"
                     ),
+                    "speech_presentation": (
+                        "onscreen_spoken"
+                        if entity_id is not None
+                        else "offscreen_spoken"
+                    ),
                     "entity_id": entity_id,
                     "secondary_vocal_activity": {
                         "present": composition != "single_speaker",
@@ -117,7 +124,11 @@ def _annotation(
                         ),
                     },
                     "confidence": "high",
-                    "evidence_codes": ["av_temporal_alignment"],
+                    "evidence_codes": (
+                        ["visible_lip_motion", "av_temporal_alignment"]
+                        if entity_id is not None
+                        else ["offscreen_audio"]
+                    ),
                 }
             ],
             "audio_semantics": {
@@ -400,10 +411,10 @@ def test_mimo_request_contract_and_embedded_audio(tmp_path: Path) -> None:
     assert job.r2v_instruction in content[-1]["text"]  # type: ignore[index]
 
 
-def test_mimo_v3_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v3"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v3"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.3"
+def test_mimo_v4_prompt_restores_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v4"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v4"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.4"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -416,6 +427,88 @@ def test_mimo_v3_prompt_restores_dense_visual_and_audio_authority_contract() -> 
     ):
         assert phrase in SYSTEM_PROMPT
     assert "SUPPLIED <Picture N> AND <Subject N> LABELS" in SYSTEM_PROMPT
+
+
+def test_mimo_prompt_separates_voice_identity_from_visible_speech() -> None:
+    for phrase in (
+        "A voice matching a visible character is NOT evidence",
+        "silently reads a phone",
+        "message_voice_over",
+        "Never delete an authoritative segment",
+        "speech_presentation is not onscreen_spoken",
+    ):
+        assert phrase in SYSTEM_PROMPT
+
+
+def test_segment_decision_requires_speech_presentation() -> None:
+    assert get_args(SpeechPresentation) == (
+        "onscreen_spoken",
+        "offscreen_spoken",
+        "voice_over",
+        "message_voice_over",
+        "device_playback",
+        "uncertain",
+    )
+    payload = _annotation().model_dump(mode="json")
+    del payload["segment_decisions"][0]["speech_presentation"]
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_visible_entity_requires_confirmed_onscreen_lip_motion() -> None:
+    payload = _annotation().model_dump(mode="json")
+    decision = payload["segment_decisions"][0]
+    decision["speech_presentation"] = "message_voice_over"
+    with pytest.raises(ValidationError, match="onscreen_spoken"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+    decision["speech_presentation"] = "onscreen_spoken"
+    decision["evidence_codes"] = ["av_temporal_alignment"]
+    with pytest.raises(ValidationError, match="visible_lip_motion"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_onscreen_speech_without_known_entity_is_valid() -> None:
+    payload = _annotation(entity_id=None).model_dump(mode="json")
+    decision = payload["segment_decisions"][0]
+    decision.update(
+        binding_status="no_reliable_entity",
+        speech_presentation="onscreen_spoken",
+        evidence_codes=["visible_lip_motion"],
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert annotation.segment_decisions[0].entity_id is None
+
+    decision["binding_status"] = "offscreen"
+    with pytest.raises(ValidationError, match="cannot use offscreen"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_non_onscreen_presentations_cannot_claim_visible_entity() -> None:
+    for presentation in (
+        "offscreen_spoken",
+        "voice_over",
+        "message_voice_over",
+        "device_playback",
+        "uncertain",
+    ):
+        payload = _annotation().model_dump(mode="json")
+        payload["segment_decisions"][0]["speech_presentation"] = presentation
+        with pytest.raises(ValidationError):
+            MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_message_voice_over_preserves_resolved_speech_without_entity() -> None:
+    payload = _annotation(entity_id=None).model_dump(mode="json")
+    decision = payload["segment_decisions"][0]
+    decision.update(
+        binding_status="offscreen",
+        speech_presentation="message_voice_over",
+        evidence_codes=["no_visible_lip_motion", "message_text_alignment"],
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert annotation.segment_decisions[0].resolution == "resolved"
+    assert not _validate(annotation)
 
 
 def test_audio_token_zero_uses_one_canonical_audio_fallback(tmp_path: Path) -> None:
@@ -1223,6 +1316,12 @@ def _two_segment_annotation(
     second["primary_speaker_group"] = second_group
     second["binding_status"] = (
         "visible_entity" if second_entity is not None else "offscreen"
+    )
+    second["speech_presentation"] = (
+        "onscreen_spoken" if second_entity is not None else "offscreen_spoken"
+    )
+    second["evidence_codes"] = (
+        ["visible_lip_motion"] if second_entity is not None else ["offscreen_audio"]
     )
     second["entity_id"] = second_entity
     payload["segment_decisions"].append(second)
@@ -2224,6 +2323,28 @@ def _shadow_records(fixture: SimpleNamespace) -> list[object]:
     ]
 
 
+def _presentation_annotation(presentation: str) -> MimoAVAnnotationDraft:
+    onscreen = presentation == "onscreen_spoken"
+    payload = _annotation(entity_id="e1" if onscreen else None).model_dump(mode="json")
+    decision = payload["segment_decisions"][0]
+    decision["binding_status"] = "visible_entity" if onscreen else "offscreen"
+    decision["speech_presentation"] = presentation
+    decision["entity_id"] = "e1" if onscreen else None
+    decision["evidence_codes"] = (
+        ["visible_lip_motion", "av_temporal_alignment"]
+        if onscreen
+        else ["no_visible_lip_motion"]
+    )
+    if presentation == "message_voice_over":
+        decision["evidence_codes"].append("message_text_alignment")
+        payload["h3_draft"]["summary"] = "A person silently handles a phone."
+        payload["h3_draft"]["shots"][0]["description_template"] = (
+            "<Subject 1> looks at the phone and types without visible speech. "
+            "[[audio_event:ae1]] [[segment:segment_1]]"
+        )
+    return MimoAVAnnotationDraft.model_validate(payload)
+
+
 def _write_shadow_records(
     fixture: SimpleNamespace,
     records: list[object],
@@ -2257,6 +2378,105 @@ def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     assert not warnings or all("words" in item for item in warnings)
 
 
+@pytest.mark.parametrize(
+    ("presentation", "expected_phrase"),
+    [
+        ("offscreen_spoken", "speaking offscreen"),
+        ("voice_over", "as a voice-over rather than visible speech"),
+        ("message_voice_over", "as a message voice-over rather than visible speech"),
+        (
+            "device_playback",
+            "heard through an in-scene device rather than visible speech",
+        ),
+        ("uncertain", "with speech presentation uncertain"),
+    ],
+)
+def test_materializer_renders_non_onscreen_speech_without_visible_subject(
+    tmp_path: Path,
+    presentation: str,
+    expected_phrase: str,
+) -> None:
+    sample = _sample(tmp_path)
+    job = _job_fixture(tmp_path)
+    annotation = _presentation_annotation(presentation)
+    corrected, rendered, _ = _materialize_sample(
+        sample, job, _record_fixture(tmp_path, annotation)
+    )
+    segment = corrected[0]
+    assert segment.entity_id is None
+    assert segment.entity_occurrence_id is None
+    assert expected_phrase in rendered
+    assert "<Subject 1> (S1)" not in rendered
+    assert " says," not in rendered
+    assert "<d>[English] Exact, text!</d>" in rendered
+    assert (
+        segment.start_time,
+        segment.end_time,
+        segment.source_start_sample,
+        segment.source_end_sample,
+        segment.source_sample_rate_hz,
+        segment.language,
+    ) == (0.0, 1.0, 0, 32000, 32000, "English")
+
+
+def test_materializer_preserves_existing_onscreen_speech_clause(tmp_path: Path) -> None:
+    sample = _sample(tmp_path)
+    payload = sample.model_dump(mode="python")
+    payload.update(
+        sample_id="clip-1/canonical",
+        pair_id="canonical/clip-1",
+        pair_type="canonical",
+        subject_voices=[],
+    )
+    canonical = FinalH3SampleV2.model_validate(payload)
+    _, rendered, _ = _materialize_sample(
+        canonical,
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, _presentation_annotation("onscreen_spoken")),
+    )
+    assert (
+        "<Subject 1> (S1) says, <d>[English] Exact, text!</d>"
+    ) in rendered
+
+
+def test_materializer_keeps_onscreen_speech_with_unknown_entity_unbound(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation(entity_id=None).model_dump(mode="json")
+    decision = payload["segment_decisions"][0]
+    decision.update(
+        binding_status="no_reliable_entity",
+        speech_presentation="onscreen_spoken",
+        evidence_codes=["visible_lip_motion"],
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    corrected, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+    assert corrected[0].entity_id is None
+    assert "(S1) says, <d>[English] Exact, text!</d>" in rendered
+    assert "<Subject 1> (S1)" not in rendered
+
+
+def test_message_voice_over_draft_keeps_phone_action_without_visible_speech(
+    tmp_path: Path,
+) -> None:
+    annotation = _presentation_annotation("message_voice_over")
+    assert "looks at the phone and types" in (
+        annotation.h3_draft.shots[0].description_template
+    )
+    corrected, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+    assert corrected[0].entity_id is None
+    assert "message voice-over" in rendered
+    assert "<Subject 1> (S1) says" not in rendered
+
+
 def test_materializer_inserts_every_audio_event_description_exactly_once(
     tmp_path: Path,
 ) -> None:
@@ -2283,7 +2503,7 @@ def test_materializer_retains_refinement_segment_without_entity(tmp_path: Path) 
     corrected, rendered, warnings = _materialize_sample(sample, job, record)
     assert len(corrected) == 1
     assert corrected[0].entity_id is None
-    assert "(S1) says, <d>[English] Exact, text!</d>" in rendered
+    assert "(S1), speaking offscreen: <d>[English] Exact, text!</d>" in rendered
     assert "<Subject 1> (S1)" not in rendered
     assert "segment_1:acoustic_refinement_unresolved" in warnings
 
