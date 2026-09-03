@@ -26,10 +26,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v10"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v5"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v11"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v6"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.8"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.8"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.9"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v6"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -42,6 +42,17 @@ _PIPELINE_OWNED = re.compile(
 _SPEECH_LEAD_IN = re.compile(
     r"\b(?:says?|speaks?|asks?|replies?|shouts?|whispers?)\s*,?\s*$",
     flags=re.IGNORECASE,
+)
+_ONSCREEN_SPEAKER_CONFLICT_CODES = frozenset(
+    {
+        "lr_asd_conflict",
+        "source_cluster_conflict",
+        "insufficient_evidence",
+        "offscreen_audio",
+        "message_text_alignment",
+        "voice_over_context",
+        "device_playback_context",
+    }
 )
 _KEYFRAME_ROLE = re.compile(
     r"<Picture\s+[1-9]\d*>[^.\n]{0,100}\b(first frame|last frame|keyframe)\b"
@@ -101,12 +112,23 @@ EvidenceCode = Literal[
 ]
 
 
-def _has_onscreen_speaker_evidence(evidence_codes: list[EvidenceCode]) -> bool:
+def _has_onscreen_speaker_evidence(
+    evidence_codes: list[EvidenceCode],
+    *,
+    competing_visible_speaker_evidence: list[str] | None = None,
+) -> bool:
     evidence = set(evidence_codes)
-    return "visible_lip_motion" in evidence or (
+    direct = "visible_lip_motion" in evidence
+    occluded = (
         "speaker_visible_mouth_occluded" in evidence
         and bool(evidence & {"av_temporal_alignment", "voice_continuity"})
     )
+    strong_indirect = (
+        {"av_temporal_alignment", "voice_continuity"} <= evidence
+        and not competing_visible_speaker_evidence
+        and not (evidence & _ONSCREEN_SPEAKER_CONFLICT_CODES)
+    )
+    return direct or occluded or strong_indirect
 
 
 def _compact_json(value: object) -> str:
@@ -432,7 +454,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.8"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.9"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -449,10 +471,10 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v10"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v11"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v5"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v6"] = (
         MIMO25_POLICY_VERSION
     )
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.8"] = (
@@ -638,7 +660,7 @@ class MimoBackendConfig:
             or self.timeout_seconds <= 0
             or not 1 <= self.http_max_attempts <= 5
         ):
-            raise ValueError("MiMo backend configuration violates the v5 contract")
+            raise ValueError("MiMo backend configuration violates the v6 contract")
 
     def provenance(self) -> MimoBackendProvenance:
         values = {
@@ -691,7 +713,7 @@ A primary_speaker_group represents one clip-local speaker identity, not one spee
 
 Every segment decision must explicitly include the entity_id key. For binding_status=visible_entity, entity_id must be one exact supplied bindable entity ID. For every other binding_status, entity_id must be null.
 
-Speaker identity, visible-entity binding, and speech audiovisual presentation are three different questions. A visible person being present is NOT by itself evidence that they are speaking. onscreen_spoken and visible_entity are allowed when either synchronized mouth, lip, or jaw motion is visible, recorded as visible_lip_motion, OR when the visible speaker's mouth is occluded or the speaker is back-facing and synchronized audiovisual or voice-continuity evidence still reliably identifies that visible speaker. Record the latter case with speaker_visible_mouth_occluded plus av_temporal_alignment or voice_continuity. A face or visible body alone is insufficient. LR-ASD activity and direct-anchor support are not required: a segment with LR-ASD=0, an unbound current proposal, or direct_anchor_seconds=0 may still be corrected to visible_entity when the target audiovisual evidence supports one supplied entity. onscreen_spoken with no reliable supplied identity remains legal with entity_id=null when the same onscreen-speaker evidence is present.
+Speaker identity, visible-entity binding, and speech audiovisual presentation are three different questions. A visible person being present is NOT by itself evidence that they are speaking. onscreen_spoken and visible_entity are allowed when synchronized mouth, lip, or jaw motion is visible, recorded as visible_lip_motion; when the visible speaker's mouth is occluded or the speaker is back-facing and speaker_visible_mouth_occluded is paired with av_temporal_alignment or voice_continuity; OR when av_temporal_alignment and voice_continuity together strongly identify one visible speaker and there is no meaningful competing visible-speaker or explicit conflict evidence. The strong indirect path does not require inventing lip motion or mouth occlusion. A face or visible body alone is insufficient. source_cluster_support, LR-ASD activity, direct-anchor support, and the current binding are not independently sufficient, though LR-ASD activity and direct-anchor support are not required: a segment with LR-ASD=0, an unbound current proposal, or direct_anchor_seconds=0 may still be corrected to visible_entity when the target audiovisual evidence supports one supplied entity. onscreen_spoken with no reliable supplied identity remains legal with entity_id=null when the same onscreen-speaker evidence is present.
 
 If a visible person silently reads a phone, looks at a message, types, reacts, or listens while a voice is heard, do not classify the voice as onscreen_spoken merely because it sounds like that character. If speech audibly reads or represents displayed or typed messaging while the visible person does not speak, use message_voice_over with entity_id=null. Use voice_over for narration, inner voice, editorial voice-over, or other speech not produced by a visible speaking mouth. Use offscreen_spoken for speech from outside the frame. Use device_playback for speech audibly emitted by an in-scene phone, television, radio, video, or recording. When the audiovisual evidence is insufficient, use uncertain and remove visible-entity binding. Never delete an authoritative segment because its presentation is non-onscreen: Qwen3-ASR transcript/language and DiariZen exact timing remain authoritative.
 
@@ -722,7 +744,7 @@ Insert every emitted Audio event exactly once as an audio_event timeline part at
 Every supplied <Subject N> must have exactly one visual_retention_analysis line beginning with that exact Subject label and containing exactly one allowed retention marker. Do not use Picture labels as retention owners and do not emit unknown or duplicate Subject retention lines.
 
 PASS 4 - CONSISTENCY CHECK BEFORE JSON
-Check: every source segment exactly once even when LR-ASD is unbound or direct-anchor support is zero; every decision explicitly contains entity_id and the required segment-level delivery_style; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; primary_speaker_group denotes identity rather than turn; the same resolved visible entity reuses one group and one resolved group never maps to multiple visible entities; visible_entity only with onscreen_spoken plus visible_lip_motion OR speaker_visible_mouth_occluded with av_temporal_alignment or voice_continuity; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; typed speech and Audio-event inventories are exact and chronological; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; prose contains no pipeline-owned syntax; JSON only with no markdown or extra fields."""
+Check: every source segment exactly once even when LR-ASD is unbound or direct-anchor support is zero; every decision explicitly contains entity_id and the required segment-level delivery_style; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; primary_speaker_group denotes identity rather than turn; the same resolved visible entity reuses one group and one resolved group never maps to multiple visible entities; visible_entity only with onscreen_spoken plus visible_lip_motion, speaker_visible_mouth_occluded with av_temporal_alignment or voice_continuity, OR av_temporal_alignment plus voice_continuity with no meaningful competing visible-speaker or explicit conflict evidence; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; typed speech and Audio-event inventories are exact and chronological; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; prose contains no pipeline-owned syntax; JSON only with no markdown or extra fields."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -859,6 +881,7 @@ def validate_annotation(
     *,
     segment_ids: list[str],
     segment_intervals: dict[str, tuple[float, float]],
+    competing_visible_speaker_evidence_by_segment: dict[str, list[str]] | None = None,
     transcribed_segment_ids: list[str],
     authoritative_transcripts: list[str],
     allowed_entity_ids: set[str],
@@ -867,6 +890,7 @@ def validate_annotation(
     target_duration_seconds: float,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
+    competing_by_segment = competing_visible_speaker_evidence_by_segment or {}
     decisions = annotation.segment_decisions
     actual_ids = [item.segment_id for item in decisions]
     if actual_ids != segment_ids:
@@ -881,7 +905,12 @@ def validate_annotation(
         if decision.binding_status == "visible_entity" and (
             decision.speech_presentation != "onscreen_spoken"
             or decision.entity_id is None
-            or not _has_onscreen_speaker_evidence(decision.evidence_codes)
+            or not _has_onscreen_speaker_evidence(
+                decision.evidence_codes,
+                competing_visible_speaker_evidence=competing_by_segment.get(
+                    decision.segment_id
+                ),
+            )
         ):
             issues.append(
                 ValidationIssue(
@@ -891,13 +920,18 @@ def validate_annotation(
                 )
             )
         if decision.speech_presentation == "onscreen_spoken" and not (
-            _has_onscreen_speaker_evidence(decision.evidence_codes)
+            _has_onscreen_speaker_evidence(
+                decision.evidence_codes,
+                competing_visible_speaker_evidence=competing_by_segment.get(
+                    decision.segment_id
+                ),
+            )
         ):
             issues.append(
                 ValidationIssue(
                     "onscreen_speech_requires_reliable_visible_speaker_evidence",
                     decision.segment_id,
-                    "onscreen_spoken requires visible lip motion or mouth-occluded visible-speaker continuity",
+                    "onscreen_spoken requires visible articulation, mouth-occluded continuity, or uncontested audiovisual-and-voice continuity",
                 )
             )
         if (
@@ -1768,13 +1802,19 @@ class OpenAIMimo25Backend:
                 "actually visible, then include visible_lip_motion; or (B) the visible "
                 "speaker's mouth is genuinely occluded or the speaker is back-facing, "
                 "then include speaker_visible_mouth_occluded together with "
-                "av_temporal_alignment and/or voice_continuity. If neither A nor B is "
-                "supported, do not claim visible_entity: set entity_id=null and choose "
-                "the actually supported no_reliable_entity, uncertain, or offscreen "
-                "binding and corresponding speech_presentation. Never invent lip "
-                "motion or mouth occlusion, and never preserve visible_entity merely "
-                "to satisfy validation. source_cluster_support and the current binding "
-                "are evidence only, not final authority."
+                "av_temporal_alignment and/or voice_continuity; or (C) lip visibility "
+                "is unreliable but av_temporal_alignment and voice_continuity together "
+                "identify one visible speaker with no meaningful competing "
+                "visible-speaker or explicit conflict evidence. Path C does not require "
+                "visible_lip_motion or speaker_visible_mouth_occluded. If none of A, B, "
+                "or C is supported, do not claim visible_entity: set entity_id=null and "
+                "choose the actually supported no_reliable_entity, uncertain, or "
+                "offscreen binding and corresponding speech_presentation. Never invent "
+                "lip motion or mouth occlusion, never preserve visible_entity merely "
+                "to satisfy validation, and never use voice continuity to force a "
+                "visible binding when competing speaker evidence exists. "
+                "source_cluster_support and the current binding are evidence only, not "
+                "final authority."
             )
         actions = (
             "\nISSUE-SPECIFIC CONTRACT ACTIONS:\n" + "\n".join(issue_actions)
@@ -1912,6 +1952,10 @@ class OpenAIMimo25Backend:
                     segment_ids=segment_ids,
                     segment_intervals={
                         item.segment_id: (item.start_time, item.end_time)
+                        for item in job.segments
+                    },
+                    competing_visible_speaker_evidence_by_segment={
+                        item.segment_id: item.competing_visible_speaker_evidence
                         for item in job.segments
                     },
                     transcribed_segment_ids=transcribed_segment_ids,

@@ -55,8 +55,11 @@ Speaker identity, visible-entity binding, and speech presentation are separate
 facts. A visible person alone does not establish visible speech. An
 `onscreen_spoken` segment may materialize as `<Subject N> (Sx) says, ...` when
 MiMo observes either `visible_lip_motion`, or a visible speaker whose mouth is
-occluded/back-facing together with AV alignment or voice-continuity evidence.
-LR-ASD support and direct anchors are proposals, not prerequisites: MiMo may
+occluded/back-facing together with AV alignment or voice-continuity evidence,
+or AV alignment plus voice continuity with no meaningful competing visible
+speaker or explicit conflict evidence. The indirect path does not require an
+invented mouth-occlusion explanation. LR-ASD support and direct anchors are
+proposals, not prerequisites: MiMo may
 restore a supplied entity for an unbound or zero-anchor segment. Every DiariZen
 segment enters MiMo regardless of its current LR-ASD/binding evidence.
 `offscreen_spoken`, `voice_over`,
@@ -79,10 +82,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v10`
-- `h3_mimo25_av_authority_contract_v5`
+- `h3_mimo25_unified_av_reconcile_v11`
+- `h3_mimo25_av_authority_contract_v6`
 - `r2v.h3.mimo25_av_annotation.8`
-- `r2v.h3.mimo25_backend.8`
+- `r2v.h3.mimo25_backend.9`
 - `h3_mimo25_materializer_v6`
 - `r2v.h3.mimo25_inventory.3`
 - `r2v.h3.mimo25_record.5`
