@@ -106,12 +106,24 @@ LR-ASD support, source-cluster support, current bindings, and direct anchors are
 proposals rather than visible-speaking proof: MiMo may
 restore a supplied entity for an unbound or zero-anchor segment. Every DiariZen
 segment enters MiMo regardless of its current LR-ASD/binding evidence.
-If the one full-AV recheck still claims visible speech using continuity alone,
-the adapter deterministically removes that visible-entity claim: explicit
-`offscreen_audio` becomes `offscreen` / `offscreen_spoken`; otherwise it becomes
-`no_reliable_entity` / `uncertain`. The speaker group and other valid evidence
-are preserved, `insufficient_evidence` is recorded, and the corrected annotation
-must pass the complete validator before publication.
+Before deciding whether a full-AV recheck is necessary, the adapter applies only
+semantics-preserving raw canonicalization and fail-closed typed normalization.
+Exact duplicate Stage B or Stage C evidence codes are removed in first-occurrence
+order, and an exact redundant leading copy of a row's own retention marker is
+stripped. Unknown Stage A entities are removed rather than remapped. Unknown or
+unsupported Stage C bindings are downgraded to null-entity conservative states,
+and identity-bearing voice-profile prose is replaced only with `null`.
+Visible-speaker normalization uses the same Stage-A-aware grounded-evidence
+predicate as validation: explicit `offscreen_audio` becomes `offscreen` /
+`offscreen_spoken`; otherwise an unsupported claim becomes
+`no_reliable_entity` / `uncertain`. Malformed offscreen claims never gain
+fabricated `offscreen_audio`. The speaker group and other valid evidence are
+preserved, `insufficient_evidence` is recorded when capacity permits, and the
+complete validator runs after normalization. A clean primary response therefore
+publishes without recheck; remaining semantic failures receive the existing one
+full-AV recheck, followed by the same normalization and full validation.
+Model-authored Subject visual prose containing Audio-profile content is not
+rewritten by these normalizers and remains a recheck or fail-closed condition.
 `offscreen_spoken`, `voice_over`,
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
@@ -135,7 +147,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_unified_av_reconcile_v20`
 - `h3_mimo25_av_authority_contract_v14`
 - `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.18`
+- `r2v.h3.mimo25_backend.19`
 - `h3_mimo25_materializer_v14`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`

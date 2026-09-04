@@ -68,6 +68,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoUsage,
     OpenAIMimo25Backend,
     SpeechPresentation,
+    _canonicalize_raw_annotation_payload,
     _canonicalize_same_visible_entity_speaker_groups,
     _normalize_speaker_voice_profiles,
     validate_annotation,
@@ -848,6 +849,12 @@ def test_mimo_v20_prompt_preserves_staged_visual_audio_authority_contract() -> N
         assert phrase in SYSTEM_PROMPT
 
 
+def test_backend_v19_records_pre_recheck_normalization_policy(tmp_path: Path) -> None:
+    backend, _ = _backend(tmp_path, [])
+
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.19"
+
+
 def test_primary_prompt_includes_exact_subject_picture_contract(
     tmp_path: Path,
 ) -> None:
@@ -956,6 +963,42 @@ def test_visible_mouth_occluded_subject_remains_onscreen(
     assert annotation.segment_decisions[0].speech_presentation == "onscreen_spoken"
 
 
+def test_grounded_mouth_occluded_subject_is_not_downgraded_before_recheck(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    observation = payload["visual_observation"]["segment_views"][0][
+        "entity_observations"
+    ][0]
+    observation.update(
+        orientation="back",
+        face_visibility="occluded",
+        mouth_visibility="not_assessable",
+        speech_correlated_articulation="not_assessable",
+    )
+    payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = [
+        "speaker_visible_mouth_occluded",
+        "voice_continuity",
+    ]
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    grounding = result.annotation.segment_decisions[0]
+    assert grounding.binding_status == "visible_entity"
+    assert grounding.speech_presentation == "onscreen_spoken"
+    assert grounding.entity_id == "e1"
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.deterministic_correction_counts == {}
+
+
 def test_true_offscreen_speaker_requires_spatial_audio_evidence() -> None:
     annotation = _annotation(entity_id=None)
 
@@ -965,6 +1008,26 @@ def test_true_offscreen_speaker_requires_spatial_audio_evidence() -> None:
     assert grounding.binding_status == "offscreen"
     assert grounding.speech_presentation == "offscreen_spoken"
     assert grounding.evidence_codes == ["offscreen_audio"]
+
+
+def test_true_offscreen_speaker_is_unchanged_by_pre_recheck_normalization(
+    tmp_path: Path,
+) -> None:
+    annotation = _annotation(entity_id=None)
+    backend, completions = _backend(tmp_path, [(annotation.model_dump_json(), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.annotation.segment_decisions[0] == annotation.segment_decisions[0]
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.deterministic_correction_counts == {}
 
 
 def test_visible_listener_does_not_inherit_offscreen_speaker() -> None:
@@ -2058,6 +2121,232 @@ def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) 
     assert job.target_video_path not in recheck
 
 
+def test_safe_raw_canonicalization_finishes_without_full_av_recheck(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    audio = payload["audio_observation"]["segment_decisions"][0]
+    audio["audio_evidence_codes"] = [
+        "voice_continuity",
+        "voice_continuity",
+        "source_cluster_support",
+        "source_cluster_support",
+    ]
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding["evidence_codes"] = [
+        "visible_lip_motion",
+        "av_temporal_alignment",
+        "visible_lip_motion",
+    ]
+    retention = payload["h3_semantics"]["visual_retention_analysis"][0]
+    retention["description"] = "fully preserved: the person remains visible."
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 1
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.annotation.audio_observation.segment_decisions[
+        0
+    ].audio_evidence_codes == ["voice_continuity", "source_cluster_support"]
+    assert result.annotation.segment_decisions[0].evidence_codes == [
+        "visible_lip_motion",
+        "av_temporal_alignment",
+    ]
+    assert (
+        result.annotation.h3_semantics.visual_retention_analysis[0].description
+        == "the person remains visible."
+    )
+    assert result.deterministic_correction_counts == {
+        "audio_evidence_code_deduplication": 2,
+        "av_grounding_evidence_code_deduplication": 1,
+        "retention_marker_prefix_normalization": 1,
+    }
+
+
+def test_raw_retention_normalization_only_strips_own_leading_marker() -> None:
+    payload = _annotation().model_dump(mode="json")
+    retention = payload["h3_semantics"]["visual_retention_analysis"][0]
+    retention["marker"] = "partially_preserved"
+    retention["description"] = (
+        "partially preserved: the person later remains fully preserved in view."
+    )
+
+    canonical, corrections = _canonicalize_raw_annotation_payload(
+        json.dumps(payload)
+    )
+    normalized = json.loads(canonical)
+
+    assert normalized["h3_semantics"]["visual_retention_analysis"][0][
+        "description"
+    ] == "the person later remains fully preserved in view."
+    assert corrections == {"retention_marker_prefix_normalization": 1}
+    with pytest.raises(ValidationError, match="repeats a retention marker"):
+        MimoAVAnnotationDraft.model_validate(normalized)
+
+
+def test_voice_profile_identity_claim_is_dropped_before_recheck(tmp_path: Path) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_observation"]["speaker_voice_profiles"][0][
+        "voice_characteristics"
+    ] = "The doctor has a measured low voice."
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.annotation.speaker_voice_profiles[0].speaker_group == "g1"
+    assert result.annotation.speaker_voice_profiles[0].voice_characteristics is None
+    assert result.deterministic_correction_counts == {
+        "speaker_voice_profile_identity_claim_dropped": 1
+    }
+
+
+def test_unknown_stage_a_visual_entity_is_removed_without_remap(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    view = payload["visual_observation"]["segment_views"][0]
+    view["visible_entity_ids"].append("e9")
+    view["entity_observations"].append(
+        {
+            "entity_id": "e9",
+            "visibility": "partially_visible",
+            "orientation": "uncertain",
+            "face_visibility": "uncertain",
+            "mouth_visibility": "uncertain",
+            "speech_correlated_articulation": "uncertain",
+        }
+    )
+    backend, _ = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    normalized_view = result.annotation.visual_observation.segment_views[0]
+    assert normalized_view.visible_entity_ids == ["e1"]
+    assert [item.entity_id for item in normalized_view.entity_observations] == ["e1"]
+    assert result.annotation.segment_decisions[0].entity_id == "e1"
+    assert result.recheck_count == 0
+    assert result.deterministic_correction_counts == {
+        "unknown_visual_entity_removed": 1
+    }
+
+
+def test_unknown_stage_c_entity_is_downgraded_without_remap(tmp_path: Path) -> None:
+    payload = _annotation().model_dump(mode="json")
+    view = payload["visual_observation"]["segment_views"][0]
+    view["visible_entity_ids"] = ["e9"]
+    view["entity_observations"][0]["entity_id"] = "e9"
+    payload["av_grounding"]["segment_groundings"][0]["entity_id"] = "e9"
+    backend, _ = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    grounding = result.annotation.segment_decisions[0]
+    assert grounding.entity_id is None
+    assert grounding.binding_status == "no_reliable_entity"
+    assert grounding.speech_presentation == "uncertain"
+    assert grounding.confidence == "low"
+    assert "insufficient_evidence" in grounding.evidence_codes
+    assert result.recheck_count == 0
+    assert result.deterministic_correction_counts == {
+        "unknown_grounding_entity_downgrade": 1,
+        "unknown_visual_entity_removed": 1,
+    }
+
+
+def test_subject_audio_profile_contamination_still_requires_recheck(
+    tmp_path: Path,
+) -> None:
+    invalid = _annotation().model_dump(mode="json")
+    invalid["h3_semantics"]["subject_definitions"][0]["description"] = (
+        "a person with a visible jacket and a steady vocal timbre."
+    )
+    valid = _annotation().model_dump_json()
+    backend, completions = _backend(
+        tmp_path,
+        [(json.dumps(invalid), 8), (valid, 8)],
+    )
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 2
+    assert result.recheck_count == 1
+    assert len(completions.requests) == 2
+    assert result.deterministic_correction_counts == {}
+
+
+def test_corrections_accumulate_across_primary_and_recheck(tmp_path: Path) -> None:
+    primary = _annotation().model_dump(mode="json")
+    primary["audio_observation"]["segment_decisions"][0][
+        "audio_evidence_codes"
+    ] = ["voice_continuity", "voice_continuity"]
+    primary["h3_semantics"]["subject_definitions"][0]["description"] = (
+        "a person with a visible jacket and a steady vocal timbre."
+    )
+    recheck = _annotation().model_dump(mode="json")
+    recheck["av_grounding"]["segment_groundings"][0]["evidence_codes"] = [
+        "visible_lip_motion",
+        "visible_lip_motion",
+        "av_temporal_alignment",
+    ]
+    recheck["audio_observation"]["speaker_voice_profiles"][0][
+        "voice_characteristics"
+    ] = "The doctor has a measured low voice."
+    backend, _ = _backend(
+        tmp_path,
+        [(json.dumps(primary), 8), (json.dumps(recheck), 8)],
+    )
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 2
+    assert result.recheck_count == 1
+    assert result.deterministic_correction_counts == {
+        "audio_evidence_code_deduplication": 1,
+        "av_grounding_evidence_code_deduplication": 1,
+        "speaker_voice_profile_identity_claim_dropped": 1,
+    }
+
+
 def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
     job = _multi_picture_job_fixture(tmp_path)
     backend, _ = _backend(tmp_path, [])
@@ -2202,7 +2491,7 @@ def test_full_av_recheck_explains_presentation_evidence_contradiction(
     assert "Speaker-group identity may continue" in prompt
 
 
-def test_unreliable_onscreen_evidence_can_be_corrected_by_one_recheck(
+def test_unreliable_onscreen_evidence_is_downgraded_before_recheck(
     tmp_path: Path,
 ) -> None:
     invalid_payload = _annotation().model_dump(mode="json")
@@ -2212,10 +2501,7 @@ def test_unreliable_onscreen_evidence_can_be_corrected_by_one_recheck(
     ]
     backend, completions = _backend(
         tmp_path,
-        [
-            (json.dumps(invalid_payload), 5),
-            (_annotation().model_dump_json(), 5),
-        ],
+        [(json.dumps(invalid_payload), 5)],
     )
 
     result = backend.reconcile(
@@ -2226,13 +2512,13 @@ def test_unreliable_onscreen_evidence_can_be_corrected_by_one_recheck(
         allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
     )
 
-    assert result.recheck_count == 1
-    assert result.model_call_count == 2
-    assert len(completions.requests) == 2
-    assert result.annotation.segment_decisions[0].evidence_codes == [
-        "visible_lip_motion",
-        "av_temporal_alignment",
-    ]
+    assert result.recheck_count == 0
+    assert result.model_call_count == 1
+    assert len(completions.requests) == 1
+    decision = result.annotation.segment_decisions[0]
+    assert decision.binding_status == "no_reliable_entity"
+    assert decision.speech_presentation == "uncertain"
+    assert decision.entity_id is None
 
 
 def _annotation_for_938_review(*, corrected_offscreen: bool) -> MimoAVAnnotationDraft:
@@ -2347,7 +2633,7 @@ def test_repeated_unreliable_onscreen_evidence_is_conservatively_downgraded(
     invalid_payload = _annotation().model_dump(mode="json")
     invalid_payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = evidence_codes
     raw = json.dumps(invalid_payload)
-    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+    backend, completions = _backend(tmp_path, [(raw, 5)])
 
     result = backend.reconcile(
         _job_fixture(tmp_path),
@@ -2358,9 +2644,9 @@ def test_repeated_unreliable_onscreen_evidence_is_conservatively_downgraded(
     )
 
     decision = result.annotation.segment_decisions[0]
-    assert result.recheck_count == 1
-    assert result.model_call_count == 2
-    assert len(completions.requests) == 2
+    assert result.recheck_count == 0
+    assert result.model_call_count == 1
+    assert len(completions.requests) == 1
     assert decision.binding_status == binding_status
     assert decision.speech_presentation == speech_presentation
     assert decision.entity_id is None
@@ -2375,6 +2661,69 @@ def test_repeated_unreliable_onscreen_evidence_is_conservatively_downgraded(
     }
     assert result.deterministic_correction_counts == {
         "conservative_visible_speaker_downgrade": 1
+    }
+
+
+def test_onscreen_code_without_grounded_stage_a_evidence_is_downgraded(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    observation = payload["visual_observation"]["segment_views"][0][
+        "entity_observations"
+    ][0]
+    observation["speech_correlated_articulation"] = "not_observed"
+    payload["av_grounding"]["segment_groundings"][0]["evidence_codes"] = [
+        "visible_lip_motion",
+        "av_temporal_alignment",
+    ]
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    grounding = result.annotation.segment_decisions[0]
+    assert grounding.binding_status == "no_reliable_entity"
+    assert grounding.speech_presentation == "uncertain"
+    assert grounding.entity_id is None
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.deterministic_correction_counts == {
+        "conservative_visible_speaker_downgrade": 1
+    }
+
+
+def test_malformed_offscreen_without_audio_evidence_does_not_invent_it(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation(entity_id=None).model_dump(mode="json")
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding["evidence_codes"] = ["voice_continuity"]
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    grounding = result.annotation.segment_decisions[0]
+    assert grounding.binding_status == "no_reliable_entity"
+    assert grounding.entity_id is None
+    assert grounding.speech_presentation == "uncertain"
+    assert grounding.confidence == "low"
+    assert "offscreen_audio" not in grounding.evidence_codes
+    assert "insufficient_evidence" in grounding.evidence_codes
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.deterministic_correction_counts == {
+        "conservative_offscreen_presentation_downgrade": 1
     }
 
 
@@ -2416,7 +2765,7 @@ def test_mixed_a073_issues_allow_downgrade_and_profile_normalization(
     assert "visible_entity_speaker_group_contradiction" in issue_codes
     assert "speaker_voice_profile_inventory_mismatch" in issue_codes
     raw = json.dumps(invalid_payload)
-    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+    backend, completions = _backend(tmp_path, [(raw, 5)])
 
     result = backend.reconcile(
         job,
@@ -2426,8 +2775,8 @@ def test_mixed_a073_issues_allow_downgrade_and_profile_normalization(
         allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
     )
 
-    assert len(completions.requests) == 2
-    assert result.recheck_count == 1
+    assert len(completions.requests) == 1
+    assert result.recheck_count == 0
     assert [item.primary_speaker_group for item in result.annotation.segment_decisions] == [
         "g1",
         "g2",
@@ -2490,7 +2839,7 @@ def test_a073_reliable_same_entity_groups_are_safely_canonicalized(
     assert "visible_entity_speaker_group_contradiction" in issue_codes
     assert "speaker_voice_profile_inventory_mismatch" in issue_codes
     raw = invalid_annotation.model_dump_json()
-    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+    backend, completions = _backend(tmp_path, [(raw, 5)])
 
     result = backend.reconcile(
         job,
@@ -2500,7 +2849,8 @@ def test_a073_reliable_same_entity_groups_are_safely_canonicalized(
         allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
     )
 
-    assert len(completions.requests) == 2
+    assert len(completions.requests) == 1
+    assert result.recheck_count == 0
     assert [item.primary_speaker_group for item in result.annotation.segment_decisions] == [
         "g1",
         "g1",
@@ -2760,7 +3110,9 @@ def test_both_malformed_responses_fail_with_nullable_issue_field(
 
 def test_semantic_issue_triggers_full_media_recheck(tmp_path: Path) -> None:
     invalid = _annotation().model_dump(mode="json")
-    invalid["av_grounding"]["segment_groundings"][0]["entity_id"] = "e9"
+    invalid["h3_semantics"]["subject_definitions"][0]["description"] = (
+        "a visible person with a measured vocal cadence."
+    )
     backend, completions = _backend(
         tmp_path,
         [
@@ -2785,7 +3137,9 @@ def test_audio_fallback_recheck_preserves_explicit_audio_modality(
     tmp_path: Path,
 ) -> None:
     invalid = _annotation().model_dump(mode="json")
-    invalid["av_grounding"]["segment_groundings"][0]["entity_id"] = "e9"
+    invalid["h3_semantics"]["subject_definitions"][0]["description"] = (
+        "a visible person with a measured vocal cadence."
+    )
     raw = _annotation().model_dump_json()
     backend, completions = _backend(
         tmp_path,
@@ -2855,7 +3209,9 @@ def test_explicit_audio_recheck_zero_audio_tokens_fails_closed(
     tmp_path: Path,
 ) -> None:
     invalid = _annotation().model_dump(mode="json")
-    invalid["av_grounding"]["segment_groundings"][0]["entity_id"] = "e9"
+    invalid["h3_semantics"]["subject_definitions"][0]["description"] = (
+        "a visible person with a measured vocal cadence."
+    )
     raw = _annotation().model_dump_json()
     backend, _ = _backend(
         tmp_path,

@@ -9,6 +9,7 @@ import random
 import re
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
@@ -21,6 +22,7 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.speech_presentation import SpeechPresentation
 from r2v_data_v2.structured_output import (
     ValidationIssue,
+    normalize_structured_json_envelope,
     parse_structured_json_issues,
 )
 
@@ -29,7 +31,7 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v20"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v14"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.18"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.19"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v14"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -129,16 +131,6 @@ AudioEvidenceCode = Literal[
 ]
 
 
-def _has_onscreen_speaker_evidence(evidence_codes: list[EvidenceCode]) -> bool:
-    evidence = set(evidence_codes)
-    direct = "visible_lip_motion" in evidence
-    occluded = (
-        "speaker_visible_mouth_occluded" in evidence
-        and bool(evidence & {"av_temporal_alignment", "voice_continuity"})
-    )
-    return direct or occluded
-
-
 def _has_grounded_onscreen_evidence(
     decision: MimoAVSegmentGrounding,
     view: MimoVisualSegmentView | None,
@@ -183,6 +175,101 @@ def _sha256_text(value: str) -> str:
 
 def _normalized_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _deduplicate_exact_strings(values: object) -> tuple[object, int]:
+    if not isinstance(values, list):
+        return values, 0
+    seen: set[str] = set()
+    result: list[object] = []
+    removed = 0
+    for value in values:
+        if isinstance(value, str) and value in seen:
+            removed += 1
+            continue
+        if isinstance(value, str):
+            seen.add(value)
+        result.append(value)
+    return result, removed
+
+
+def _strip_redundant_retention_marker_prefix(
+    marker: object,
+    description: object,
+) -> tuple[object, bool]:
+    if not isinstance(marker, str) or not isinstance(description, str):
+        return description, False
+    marker_pattern = r"[\s_-]+".join(re.escape(part) for part in marker.split("_"))
+    match = re.match(
+        rf"^\s*{marker_pattern}\s*(?:-|:|\u2013|\u2014)\s*",
+        description,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return description, False
+    remainder = description[match.end() :].strip()
+    if not remainder:
+        return description, False
+    return remainder, True
+
+
+def _canonicalize_raw_annotation_payload(
+    raw: str,
+) -> tuple[str, dict[str, int]]:
+    try:
+        payload = json.loads(normalize_structured_json_envelope(raw))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return raw, {}
+    if not isinstance(payload, dict):
+        return raw, {}
+
+    corrections: Counter[str] = Counter()
+    audio_observation = payload.get("audio_observation")
+    if isinstance(audio_observation, dict):
+        decisions = audio_observation.get("segment_decisions")
+        if isinstance(decisions, list):
+            for decision in decisions:
+                if not isinstance(decision, dict) or "audio_evidence_codes" not in decision:
+                    continue
+                values, count = _deduplicate_exact_strings(
+                    decision["audio_evidence_codes"]
+                )
+                if count:
+                    decision["audio_evidence_codes"] = values
+                    corrections["audio_evidence_code_deduplication"] += count
+
+    av_grounding = payload.get("av_grounding")
+    if isinstance(av_grounding, dict):
+        groundings = av_grounding.get("segment_groundings")
+        if isinstance(groundings, list):
+            for grounding in groundings:
+                if not isinstance(grounding, dict) or "evidence_codes" not in grounding:
+                    continue
+                values, count = _deduplicate_exact_strings(
+                    grounding["evidence_codes"]
+                )
+                if count:
+                    grounding["evidence_codes"] = values
+                    corrections["av_grounding_evidence_code_deduplication"] += count
+
+    h3_semantics = payload.get("h3_semantics")
+    if isinstance(h3_semantics, dict):
+        retention_rows = h3_semantics.get("visual_retention_analysis")
+        if isinstance(retention_rows, list):
+            for row in retention_rows:
+                if not isinstance(row, dict):
+                    continue
+                description, changed = _strip_redundant_retention_marker_prefix(
+                    row.get("marker"),
+                    row.get("description"),
+                )
+                if changed:
+                    row["description"] = description
+                    corrections["retention_marker_prefix_normalization"] += 1
+
+    if not corrections:
+        return raw, {}
+    return _compact_json(payload), dict(sorted(corrections.items()))
 
 
 def _significant_transcript(value: str) -> bool:
@@ -703,7 +790,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.18"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.19"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1929,28 +2016,122 @@ def _normalize_speaker_voice_profiles(
     return MimoAVAnnotationDraft.model_validate(payload), 1
 
 
-def _conservative_visible_speaker_downgrade(
+def _append_insufficient_evidence(decision: dict[str, Any]) -> None:
+    evidence_codes = list(decision["evidence_codes"])
+    if "insufficient_evidence" not in evidence_codes and len(evidence_codes) < 8:
+        evidence_codes.append("insufficient_evidence")
+    decision["evidence_codes"] = evidence_codes
+
+
+def _remove_unknown_visual_entities(
     annotation: MimoAVAnnotationDraft,
-    issues: list[ValidationIssue],
+    *,
+    allowed_entity_ids: set[str],
 ) -> tuple[MimoAVAnnotationDraft, int]:
-    affected_segments = {
-        issue.field
-        for issue in issues
-        if issue.code in _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES
-        and issue.field is not None
-    }
-    if not affected_segments:
+    payload = annotation.model_dump(mode="python")
+    correction_count = 0
+    for view in payload["visual_observation"]["segment_views"]:
+        visible_entity_ids = list(view["visible_entity_ids"])
+        known_entity_ids = [
+            entity_id
+            for entity_id in visible_entity_ids
+            if entity_id in allowed_entity_ids
+        ]
+        correction_count += len(visible_entity_ids) - len(known_entity_ids)
+        view["visible_entity_ids"] = known_entity_ids
+        view["entity_observations"] = [
+            observation
+            for observation in view["entity_observations"]
+            if observation["entity_id"] in allowed_entity_ids
+        ]
+    if correction_count == 0:
         return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), correction_count
+
+
+def _supported_non_onscreen_presentation(
+    decision: dict[str, Any],
+) -> tuple[BindingStatus, SpeechPresentation] | None:
+    evidence = set(decision["evidence_codes"])
+    presentation = decision["speech_presentation"]
+    if presentation == "offscreen_spoken" and "offscreen_audio" in evidence:
+        return "offscreen", "offscreen_spoken"
+    if presentation == "voice_over" and "voice_over_context" in evidence:
+        return "no_reliable_entity", "voice_over"
+    if (
+        presentation == "message_voice_over"
+        and {"message_text_alignment", "voice_over_context"} <= evidence
+    ):
+        return "no_reliable_entity", "message_voice_over"
+    if presentation == "device_playback" and "device_playback_context" in evidence:
+        return "no_reliable_entity", "device_playback"
+    return None
+
+
+def _downgrade_unknown_grounding_entities(
+    annotation: MimoAVAnnotationDraft,
+    *,
+    allowed_entity_ids: set[str],
+) -> tuple[MimoAVAnnotationDraft, int]:
     payload = annotation.model_dump(mode="python")
     correction_count = 0
     for decision in payload["av_grounding"]["segment_groundings"]:
-        if decision["segment_id"] not in affected_segments or _has_onscreen_speaker_evidence(
-            decision["evidence_codes"]
+        entity_id = decision["entity_id"]
+        if entity_id is None or entity_id in allowed_entity_ids:
+            continue
+        supported = _supported_non_onscreen_presentation(decision)
+        if supported is None:
+            decision["binding_status"] = "no_reliable_entity"
+            decision["speech_presentation"] = "uncertain"
+            _append_insufficient_evidence(decision)
+        else:
+            decision["binding_status"], decision["speech_presentation"] = supported
+        decision["entity_id"] = None
+        decision["confidence"] = "low"
+        correction_count += 1
+    if correction_count == 0:
+        return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), correction_count
+
+
+def _drop_voice_profile_identity_claims(
+    annotation: MimoAVAnnotationDraft,
+) -> tuple[MimoAVAnnotationDraft, int]:
+    payload = annotation.model_dump(mode="python")
+    correction_count = 0
+    for profile in payload["audio_observation"]["speaker_voice_profiles"]:
+        value = profile["voice_characteristics"]
+        if isinstance(value, str) and _VOICE_IDENTITY_PROFILE.search(value):
+            profile["voice_characteristics"] = None
+            correction_count += 1
+    if correction_count == 0:
+        return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), correction_count
+
+
+def _conservative_visible_speaker_downgrade(
+    annotation: MimoAVAnnotationDraft,
+) -> tuple[MimoAVAnnotationDraft, int]:
+    view_by_segment = {
+        view.segment_id: view for view in annotation.visual_observation.segment_views
+    }
+    payload = annotation.model_dump(mode="python")
+    correction_count = 0
+    for grounding, decision in zip(
+        annotation.av_grounding.segment_groundings,
+        payload["av_grounding"]["segment_groundings"],
+        strict=True,
+    ):
+        claims_visible_speech = (
+            grounding.binding_status == "visible_entity"
+            or grounding.speech_presentation == "onscreen_spoken"
+        )
+        if not claims_visible_speech or _has_grounded_onscreen_evidence(
+            grounding,
+            view_by_segment.get(grounding.segment_id),
         ):
             continue
         evidence_codes = list(decision["evidence_codes"])
-        if "insufficient_evidence" not in evidence_codes and len(evidence_codes) >= 8:
-            continue
         if "offscreen_audio" in evidence_codes:
             decision["binding_status"] = "offscreen"
             decision["speech_presentation"] = "offscreen_spoken"
@@ -1959,9 +2140,39 @@ def _conservative_visible_speaker_downgrade(
             decision["speech_presentation"] = "uncertain"
         decision["entity_id"] = None
         decision["confidence"] = "low"
-        if "insufficient_evidence" not in evidence_codes:
-            evidence_codes.append("insufficient_evidence")
         decision["evidence_codes"] = evidence_codes
+        _append_insufficient_evidence(decision)
+        correction_count += 1
+    if correction_count == 0:
+        return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), correction_count
+
+
+def _conservative_offscreen_presentation_downgrade(
+    annotation: MimoAVAnnotationDraft,
+) -> tuple[MimoAVAnnotationDraft, int]:
+    payload = annotation.model_dump(mode="python")
+    correction_count = 0
+    for decision in payload["av_grounding"]["segment_groundings"]:
+        if decision["speech_presentation"] != "offscreen_spoken":
+            continue
+        evidence_codes = list(decision["evidence_codes"])
+        valid = (
+            decision["binding_status"] == "offscreen"
+            and decision["entity_id"] is None
+            and "offscreen_audio" in evidence_codes
+        )
+        if valid:
+            continue
+        decision["entity_id"] = None
+        decision["confidence"] = "low"
+        if "offscreen_audio" in evidence_codes:
+            decision["binding_status"] = "offscreen"
+            decision["speech_presentation"] = "offscreen_spoken"
+        else:
+            decision["binding_status"] = "no_reliable_entity"
+            decision["speech_presentation"] = "uncertain"
+            _append_insufficient_evidence(decision)
         correction_count += 1
     if correction_count == 0:
         return annotation, 0
@@ -1979,6 +2190,9 @@ def _canonicalize_same_visible_entity_speaker_groups(
         return annotation, {}, None
     audio_by_id = {
         item.segment_id: item for item in annotation.audio_observation.segment_decisions
+    }
+    view_by_id = {
+        item.segment_id: item for item in annotation.visual_observation.segment_views
     }
 
     groups_by_entity: dict[str, list[str]] = {}
@@ -2014,7 +2228,10 @@ def _canonicalize_same_visible_entity_speaker_groups(
             groups.append(group)
         reliable_by_entity[entity_id] = reliable_by_entity.get(
             entity_id, True
-        ) and _has_onscreen_speaker_evidence(decision.evidence_codes)
+        ) and _has_grounded_onscreen_evidence(
+            decision,
+            view_by_id.get(decision.segment_id),
+        )
 
     merged_group_by_group: dict[str, str] = {}
     for entity_id, groups in groups_by_entity.items():
@@ -2080,6 +2297,57 @@ def _canonicalize_same_visible_entity_speaker_groups(
         MimoAVAnnotationDraft.model_validate(payload),
         correction_counts,
         source_groups_by_final_group,
+    )
+
+
+def _normalize_annotation_before_recheck(
+    annotation: MimoAVAnnotationDraft,
+    *,
+    segment_ids: list[str],
+    transcribed_segment_ids: set[str],
+    allowed_entity_ids: set[str],
+) -> tuple[MimoAVAnnotationDraft, dict[str, int]]:
+    corrections: Counter[str] = Counter()
+
+    annotation, count = _remove_unknown_visual_entities(
+        annotation,
+        allowed_entity_ids=allowed_entity_ids,
+    )
+    corrections["unknown_visual_entity_removed"] += count
+
+    annotation, count = _downgrade_unknown_grounding_entities(
+        annotation,
+        allowed_entity_ids=allowed_entity_ids,
+    )
+    corrections["unknown_grounding_entity_downgrade"] += count
+
+    annotation, count = _conservative_visible_speaker_downgrade(annotation)
+    corrections["conservative_visible_speaker_downgrade"] += count
+
+    annotation, count = _conservative_offscreen_presentation_downgrade(annotation)
+    corrections["conservative_offscreen_presentation_downgrade"] += count
+
+    annotation, count = _drop_voice_profile_identity_claims(annotation)
+    corrections["speaker_voice_profile_identity_claim_dropped"] += count
+
+    annotation, group_corrections, source_groups = (
+        _canonicalize_same_visible_entity_speaker_groups(
+            annotation,
+            segment_ids=segment_ids,
+            allowed_entity_ids=allowed_entity_ids,
+        )
+    )
+    corrections.update(group_corrections)
+
+    annotation, count = _normalize_speaker_voice_profiles(
+        annotation,
+        transcribed_segment_ids=transcribed_segment_ids,
+        source_groups_by_final_group=source_groups,
+    )
+    corrections["speaker_voice_profile_inventory_normalization"] += count
+
+    return annotation, dict(
+        sorted((key, value) for key, value in corrections.items() if value)
     )
 
 
@@ -2570,11 +2838,26 @@ class OpenAIMimo25Backend:
             raw, _ = perform_request(include_audio=True)
             modality = "target_video_plus_canonical_full_audio_fallback"
 
-        def parse_and_validate(value: str) -> tuple[MimoAVAnnotationDraft | None, list[ValidationIssue]]:
+        deterministic_correction_counts: Counter[str] = Counter()
+
+        def parse_normalize_and_validate(
+            value: str,
+        ) -> tuple[MimoAVAnnotationDraft | None, list[ValidationIssue]]:
+            canonical_value, raw_corrections = _canonicalize_raw_annotation_payload(
+                value
+            )
+            deterministic_correction_counts.update(raw_corrections)
             annotation, validation_issues = parse_structured_json_issues(
-                value, MimoAVAnnotationDraft
+                canonical_value, MimoAVAnnotationDraft
             )
             if annotation is not None:
+                annotation, typed_corrections = _normalize_annotation_before_recheck(
+                    annotation,
+                    segment_ids=segment_ids,
+                    transcribed_segment_ids=set(transcribed_segment_ids),
+                    allowed_entity_ids=allowed_entity_ids,
+                )
+                deterministic_correction_counts.update(typed_corrections)
                 validation_issues = validate_annotation(
                     annotation,
                     segment_ids=segment_ids,
@@ -2595,7 +2878,7 @@ class OpenAIMimo25Backend:
                 )
             return annotation, validation_issues
 
-        annotation, issues = parse_and_validate(raw)
+        annotation, issues = parse_normalize_and_validate(raw)
         if annotation is None or issues:
             recheck_count = 1
             raw, _ = perform_request(
@@ -2606,53 +2889,7 @@ class OpenAIMimo25Backend:
                     issues=issues,
                 ),
             )
-            annotation, issues = parse_and_validate(raw)
-        deterministic_correction_counts: dict[str, int] = {}
-        if annotation is not None and issues:
-            annotation, downgrade_count = _conservative_visible_speaker_downgrade(
-                annotation,
-                issues,
-            )
-            if downgrade_count:
-                deterministic_correction_counts[
-                    "conservative_visible_speaker_downgrade"
-                ] = downgrade_count
-            annotation, group_correction_counts, source_groups = (
-                _canonicalize_same_visible_entity_speaker_groups(
-                    annotation,
-                    segment_ids=segment_ids,
-                    allowed_entity_ids=allowed_entity_ids,
-                )
-            )
-            deterministic_correction_counts.update(group_correction_counts)
-            annotation, profile_correction_count = _normalize_speaker_voice_profiles(
-                annotation,
-                transcribed_segment_ids=set(transcribed_segment_ids),
-                source_groups_by_final_group=source_groups,
-            )
-            if profile_correction_count:
-                deterministic_correction_counts[
-                    "speaker_voice_profile_inventory_normalization"
-                ] = profile_correction_count
-            if deterministic_correction_counts:
-                issues = validate_annotation(
-                    annotation,
-                    segment_ids=segment_ids,
-                    segment_intervals={
-                        item.segment_id: (item.start_time, item.end_time)
-                        for item in job.segments
-                    },
-                    transcribed_segment_ids=transcribed_segment_ids,
-                    authoritative_transcripts=[
-                        item.asr_text
-                        for item in job.segments
-                        if item.asr_status == "transcribed" and item.asr_text is not None
-                    ],
-                    allowed_entity_ids=allowed_entity_ids,
-                    allowed_reference_labels=allowed_reference_labels,
-                    reference_subjects=job.reference_subjects,
-                    target_duration_seconds=job.target_duration_seconds,
-                )
+            annotation, issues = parse_normalize_and_validate(raw)
         if annotation is None or issues:
             raise contextual_failure(
                 MimoBackendFailure(
@@ -2672,7 +2909,9 @@ class OpenAIMimo25Backend:
             ),
             recheck_count=recheck_count,
             input_modality=modality,
-            deterministic_correction_counts=deterministic_correction_counts,
+            deterministic_correction_counts=dict(
+                sorted(deterministic_correction_counts.items())
+            ),
         )
 
 
