@@ -48,6 +48,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     run_mimo25_av_reconcile,
 )
 from r2v_data_v2.h3.mimo25_backend import (
+    _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES,
     MIMO25_MODEL,
     MIMO25_POLICY_VERSION,
     MIMO25_PROMPT_VERSION,
@@ -345,6 +346,24 @@ def _job_with_non_transcribed_segment(tmp_path: Path) -> MimoClipJob:
             asr_status="empty",
         ).model_dump(mode="json")
     )
+    return _job(values)
+
+
+def _three_transcribed_segment_job(tmp_path: Path) -> MimoClipJob:
+    job = _job_fixture(tmp_path)
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    values["target_duration_seconds"] = 3.0
+    first = values["segments"][0]
+    for index in (2, 3):
+        segment = dict(first)
+        segment["segment_id"] = f"segment_{index}"
+        segment["start_time"] = float(index - 1)
+        segment["end_time"] = float(index)
+        segment["source_start_sample"] = (index - 1) * 32000
+        segment["source_end_sample"] = index * 32000
+        segment["source_speaker_cluster_id"] = f"speaker_{index - 1}"
+        segment["asr_text"] = f"Exact text {index}."
+        values["segments"].append(segment)
     return _job(values)
 
 
@@ -1996,6 +2015,95 @@ def test_repeated_unreliable_onscreen_evidence_is_conservatively_downgraded(
     }
 
 
+def test_mixed_a073_issues_allow_downgrade_and_profile_normalization(
+    tmp_path: Path,
+) -> None:
+    job = _three_transcribed_segment_job(tmp_path)
+    invalid_payload = _annotation().model_dump(mode="json")
+    first = invalid_payload["segment_decisions"][0]
+    first["evidence_codes"] = ["voice_continuity"]
+    invalid_payload["segment_decisions"] = []
+    for index in (1, 2, 3):
+        decision = dict(first)
+        decision["segment_id"] = f"segment_{index}"
+        decision["primary_speaker_group"] = f"g{index}"
+        decision["delivery_style"] = f"measured delivery {index}"
+        invalid_payload["segment_decisions"].append(decision)
+    invalid_payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+        _prose("A visible conversation unfolds."),
+        _audio_event("ae1"),
+        _speech("segment_1"),
+        _speech("segment_2"),
+        _speech("segment_3"),
+    ]
+    invalid_annotation = MimoAVAnnotationDraft.model_validate(invalid_payload)
+    issue_codes = {
+        issue.code
+        for issue in _validate(
+            invalid_annotation,
+            segment_ids=["segment_1", "segment_2", "segment_3"],
+            segment_intervals={
+                "segment_1": (0.0, 1.0),
+                "segment_2": (1.0, 2.0),
+                "segment_3": (2.0, 3.0),
+            },
+            transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+            authoritative_transcripts=[
+                "Exact, text!",
+                "Exact text 2.",
+                "Exact text 3.",
+            ],
+            target_duration_seconds=3.0,
+        )
+    }
+    assert _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES <= issue_codes
+    assert "visible_entity_speaker_group_contradiction" in issue_codes
+    assert "speaker_voice_profile_inventory_mismatch" in issue_codes
+    raw = json.dumps(invalid_payload)
+    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+
+    result = backend.reconcile(
+        job,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert len(completions.requests) == 2
+    assert result.recheck_count == 1
+    assert [item.primary_speaker_group for item in result.annotation.segment_decisions] == [
+        "g1",
+        "g2",
+        "g3",
+    ]
+    assert [item.entity_id for item in result.annotation.segment_decisions] == [
+        None,
+        None,
+        None,
+    ]
+    assert [item.binding_status for item in result.annotation.segment_decisions] == [
+        "no_reliable_entity",
+        "no_reliable_entity",
+        "no_reliable_entity",
+    ]
+    assert [item.speech_presentation for item in result.annotation.segment_decisions] == [
+        "uncertain",
+        "uncertain",
+        "uncertain",
+    ]
+    profiles = result.annotation.speaker_voice_profiles
+    assert [item.speaker_group for item in profiles] == ["g1", "g2", "g3"]
+    assert profiles[0].voice_characteristics == (
+        "clear mid-register timbre with measured cadence"
+    )
+    assert [item.voice_characteristics for item in profiles[1:]] == [None, None]
+    assert result.deterministic_correction_counts == {
+        "conservative_visible_speaker_downgrade": 3,
+        "speaker_voice_profile_inventory_normalization": 1,
+    }
+
+
 def test_recheck_visible_lip_motion_positive_stays_visible(tmp_path: Path) -> None:
     invalid = "not json"
     valid = _annotation().model_dump_json()
@@ -2040,6 +2148,10 @@ def test_visible_speaker_downgrade_does_not_hide_other_semantic_failures(
     assert "subject_definition_contract_mismatch" in {
         issue.code for issue in exc_info.value.issues
     }
+    assert not (
+        _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES
+        & {issue.code for issue in exc_info.value.issues}
+    )
 
 
 def test_sglang_full_av_recheck_preserves_primary_transport_contract(

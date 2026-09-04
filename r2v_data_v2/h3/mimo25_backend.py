@@ -1078,16 +1078,10 @@ def validate_annotation(
                     "non-transcribed segment requires delivery_style=null",
                 )
             )
-    required_profile_groups: list[str] = []
-    for decision in decisions:
-        group = decision.primary_speaker_group
-        if (
-            decision.resolution == "resolved"
-            and decision.segment_id in transcribed_segment_set
-            and group is not None
-            and group not in required_profile_groups
-        ):
-            required_profile_groups.append(group)
+    required_profile_groups = _required_voice_profile_groups(
+        decisions,
+        transcribed_segment_ids=transcribed_segment_set,
+    )
     actual_profile_groups = [
         profile.speaker_group for profile in annotation.speaker_voice_profiles
     ]
@@ -1474,15 +1468,72 @@ _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES = {
 }
 
 
+def _required_voice_profile_groups(
+    decisions: list[MimoSegmentDecision],
+    *,
+    transcribed_segment_ids: set[str],
+) -> list[str]:
+    required_groups: list[str] = []
+    for decision in decisions:
+        group = decision.primary_speaker_group
+        if (
+            decision.resolution == "resolved"
+            and decision.segment_id in transcribed_segment_ids
+            and group is not None
+            and group not in required_groups
+        ):
+            required_groups.append(group)
+    return required_groups
+
+
+def _normalize_speaker_voice_profiles(
+    annotation: MimoAVAnnotationDraft,
+    *,
+    transcribed_segment_ids: set[str],
+) -> tuple[MimoAVAnnotationDraft, int]:
+    required_groups = _required_voice_profile_groups(
+        annotation.segment_decisions,
+        transcribed_segment_ids=transcribed_segment_ids,
+    )
+    required_group_set = set(required_groups)
+    profiles_by_group: dict[str, MimoSpeakerVoiceProfile] = {}
+    for profile in annotation.speaker_voice_profiles:
+        if profile.speaker_group not in required_group_set:
+            continue
+        if profile.speaker_group in profiles_by_group:
+            return annotation, 0
+        profiles_by_group[profile.speaker_group] = profile
+    normalized_profiles = [
+        profiles_by_group.get(group)
+        or MimoSpeakerVoiceProfile(
+            speaker_group=group,
+            voice_characteristics=None,
+        )
+        for group in required_groups
+    ]
+    if normalized_profiles == annotation.speaker_voice_profiles:
+        return annotation, 0
+    payload = annotation.model_dump(mode="python")
+    payload["speaker_voice_profiles"] = [
+        profile.model_dump(mode="python") for profile in normalized_profiles
+    ]
+    return MimoAVAnnotationDraft.model_validate(payload), 1
+
+
 def _conservative_visible_speaker_downgrade(
     annotation: MimoAVAnnotationDraft,
     issues: list[ValidationIssue],
-) -> tuple[MimoAVAnnotationDraft, int]:
-    if not issues or any(
-        issue.code not in _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES for issue in issues
-    ):
-        return annotation, 0
-    affected_segments = {issue.field for issue in issues if issue.field is not None}
+    *,
+    transcribed_segment_ids: set[str],
+) -> tuple[MimoAVAnnotationDraft, dict[str, int]]:
+    affected_segments = {
+        issue.field
+        for issue in issues
+        if issue.code in _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES
+        and issue.field is not None
+    }
+    if not affected_segments:
+        return annotation, {}
     payload = annotation.model_dump(mode="python")
     correction_count = 0
     for decision in payload["segment_decisions"]:
@@ -1492,7 +1543,7 @@ def _conservative_visible_speaker_downgrade(
             continue
         evidence_codes = list(decision["evidence_codes"])
         if "insufficient_evidence" not in evidence_codes and len(evidence_codes) >= 8:
-            return annotation, 0
+            continue
         if "offscreen_audio" in evidence_codes:
             decision["binding_status"] = "offscreen"
             decision["speech_presentation"] = "offscreen_spoken"
@@ -1506,8 +1557,20 @@ def _conservative_visible_speaker_downgrade(
         decision["evidence_codes"] = evidence_codes
         correction_count += 1
     if correction_count == 0:
-        return annotation, 0
-    return MimoAVAnnotationDraft.model_validate(payload), correction_count
+        return annotation, {}
+    corrected = MimoAVAnnotationDraft.model_validate(payload)
+    corrected, profile_correction_count = _normalize_speaker_voice_profiles(
+        corrected,
+        transcribed_segment_ids=transcribed_segment_ids,
+    )
+    correction_counts = {
+        "conservative_visible_speaker_downgrade": correction_count,
+    }
+    if profile_correction_count:
+        correction_counts["speaker_voice_profile_inventory_normalization"] = (
+            profile_correction_count
+        )
+    return corrected, correction_counts
 
 
 class OpenAIMimo25Backend:
@@ -2010,11 +2073,12 @@ class OpenAIMimo25Backend:
             annotation, issues = parse_and_validate(raw)
         deterministic_correction_counts: dict[str, int] = {}
         if annotation is not None and issues:
-            annotation, correction_count = _conservative_visible_speaker_downgrade(
+            annotation, correction_counts = _conservative_visible_speaker_downgrade(
                 annotation,
                 issues,
+                transcribed_segment_ids=set(transcribed_segment_ids),
             )
-            if correction_count:
+            if correction_counts:
                 issues = validate_annotation(
                     annotation,
                     segment_ids=segment_ids,
@@ -2034,9 +2098,7 @@ class OpenAIMimo25Backend:
                     target_duration_seconds=job.target_duration_seconds,
                 )
                 if not issues:
-                    deterministic_correction_counts[
-                        "conservative_visible_speaker_downgrade"
-                    ] = correction_count
+                    deterministic_correction_counts.update(correction_counts)
         if annotation is None or issues:
             raise contextual_failure(
                 MimoBackendFailure(
