@@ -31,7 +31,7 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v20"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v14"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.19"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.20"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v14"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -48,10 +48,6 @@ _SPEECH_LEAD_IN = re.compile(
 _KEYFRAME_ROLE = re.compile(
     r"<Picture\s+[1-9]\d*>[^.\n]{0,100}\b(first frame|last frame|keyframe)\b"
     r"|\b(first frame|last frame|keyframe)\b[^.\n]{0,100}<Picture\s+[1-9]\d*>",
-    flags=re.IGNORECASE,
-)
-_ALLOWED_RETENTION_MARKER_OCCURRENCE = re.compile(
-    r"\b(?:fully[\s_-]+preserved|partially[\s_-]+preserved|weak[\s_-]+reference)\b",
     flags=re.IGNORECASE,
 )
 _BARE_SUBJECT_LABEL = re.compile(r"(?<!<)\bSubject\s+[1-9]\d*\b(?!>)")
@@ -88,6 +84,16 @@ _TRUNCATED_FINISH_REASONS = {
 }
 _VISIBLE_PRESENTATION_CONTRADICTIONS = frozenset(
     {"offscreen_audio", "voice_over_context", "device_playback_context"}
+)
+_SOUNDSCAPE_EVENT_CATEGORIES = frozenset(
+    {
+        "physical",
+        "environmental",
+        "mechanical",
+        "electronic",
+        "human_non_speech",
+        "other",
+    }
 )
 
 VocalComposition = Literal[
@@ -243,14 +249,23 @@ def _canonicalize_raw_annotation_payload(
         groundings = av_grounding.get("segment_groundings")
         if isinstance(groundings, list):
             for grounding in groundings:
-                if not isinstance(grounding, dict) or "evidence_codes" not in grounding:
+                if not isinstance(grounding, dict):
                     continue
-                values, count = _deduplicate_exact_strings(
-                    grounding["evidence_codes"]
-                )
-                if count:
-                    grounding["evidence_codes"] = values
-                    corrections["av_grounding_evidence_code_deduplication"] += count
+                if "evidence_codes" in grounding:
+                    values, count = _deduplicate_exact_strings(
+                        grounding["evidence_codes"]
+                    )
+                    if count:
+                        grounding["evidence_codes"] = values
+                        corrections[
+                            "av_grounding_evidence_code_deduplication"
+                        ] += count
+                if (
+                    grounding.get("binding_status") != "visible_entity"
+                    and grounding.get("entity_id") is not None
+                ):
+                    grounding["entity_id"] = None
+                    corrections["non_visible_binding_entity_id_removed"] += 1
 
     h3_semantics = payload.get("h3_semantics")
     if isinstance(h3_semantics, dict):
@@ -682,8 +697,6 @@ class MimoVisualRetentionDraft(SchemaModel):
             for match in _PICTURE_OR_SUBJECT.finditer(self.description)
         ) or _BARE_SUBJECT_LABEL.search(self.description):
             raise ValueError("MiMo retention description repeats a Subject label")
-        if _ALLOWED_RETENTION_MARKER_OCCURRENCE.search(self.description):
-            raise ValueError("MiMo retention description repeats a retention marker")
         return self
 
     def render(self) -> str:
@@ -790,7 +803,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.19"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.20"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1919,6 +1932,18 @@ def validate_annotation(
                 "overall_soundscape must exclude dialogue, singing, and music",
             )
         )
+    for event in audio_semantics.temporal_non_speech_events:
+        if (
+            event.category in _SOUNDSCAPE_EVENT_CATEGORIES
+            and _SOUNDSCAPE_CONTAMINATION.search(event.description)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "soundscape_event_category_contamination",
+                    event.event_id,
+                    "soundscape-category event contains music or dialogue semantics",
+                )
+            )
     normalized_audio_fields = [
         _normalized_text(value) for value in model_owned_audio_fields
     ]
@@ -2107,6 +2132,38 @@ def _drop_voice_profile_identity_claims(
     if correction_count == 0:
         return annotation, 0
     return MimoAVAnnotationDraft.model_validate(payload), correction_count
+
+
+def _rebuild_contaminated_overall_soundscape_from_events(
+    annotation: MimoAVAnnotationDraft,
+) -> tuple[MimoAVAnnotationDraft, int]:
+    semantics = annotation.audio_semantics
+    soundscape = semantics.overall_soundscape
+    if (
+        semantics.overall_soundscape_status != "present"
+        or soundscape is None
+        or _SOUNDSCAPE_CONTAMINATION.search(soundscape) is None
+    ):
+        return annotation, 0
+
+    descriptions: list[str] = []
+    seen: set[str] = set()
+    for event in semantics.temporal_non_speech_events:
+        if event.category not in _SOUNDSCAPE_EVENT_CATEGORIES:
+            continue
+        if _SOUNDSCAPE_CONTAMINATION.search(event.description):
+            return annotation, 0
+        if event.description not in seen:
+            descriptions.append(event.description.strip())
+            seen.add(event.description)
+    if not descriptions:
+        return annotation, 0
+
+    payload = annotation.model_dump(mode="python")
+    payload["audio_observation"]["audio_semantics"]["overall_soundscape"] = " ".join(
+        descriptions
+    )
+    return MimoAVAnnotationDraft.model_validate(payload), 1
 
 
 def _conservative_visible_speaker_downgrade(
@@ -2329,6 +2386,11 @@ def _normalize_annotation_before_recheck(
 
     annotation, count = _drop_voice_profile_identity_claims(annotation)
     corrections["speaker_voice_profile_identity_claim_dropped"] += count
+
+    annotation, count = _rebuild_contaminated_overall_soundscape_from_events(
+        annotation
+    )
+    corrections["overall_soundscape_rebuilt_from_typed_events"] += count
 
     annotation, group_corrections, source_groups = (
         _canonicalize_same_visible_entity_speaker_groups(

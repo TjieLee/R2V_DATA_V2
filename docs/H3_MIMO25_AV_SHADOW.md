@@ -110,9 +110,12 @@ Before deciding whether a full-AV recheck is necessary, the adapter applies only
 semantics-preserving raw canonicalization and fail-closed typed normalization.
 Exact duplicate Stage B or Stage C evidence codes are removed in first-occurrence
 order, and an exact redundant leading copy of a row's own retention marker is
-stripped. Unknown Stage A entities are removed rather than remapped. Unknown or
-unsupported Stage C bindings are downgraded to null-entity conservative states,
-and identity-bearing voice-profile prose is replaced only with `null`.
+stripped. A retention phrase that occurs naturally later in the description is
+valid prose and is not a structural failure. Unknown Stage A entities are removed
+rather than remapped. Unknown or unsupported Stage C bindings are downgraded to
+null-entity conservative states, and an explicitly non-visible Stage C binding
+cannot retain an `entity_id`. Identity-bearing voice-profile prose is replaced
+only with `null`.
 Visible-speaker normalization uses the same Stage-A-aware grounded-evidence
 predicate as validation: explicit `offscreen_audio` becomes `offscreen` /
 `offscreen_spoken`; otherwise an unsupported claim becomes
@@ -147,7 +150,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_unified_av_reconcile_v20`
 - `h3_mimo25_av_authority_contract_v14`
 - `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.19`
+- `r2v.h3.mimo25_backend.20`
 - `h3_mimo25_materializer_v14`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
@@ -292,6 +295,14 @@ are illustrative rather than exhaustive. `single` denotes one transient,
 `repeated` several distinct repetitions, and `continuous` a sustained layer or
 operation; a multi-frame event window does not by itself make a brief sound
 continuous.
+
+Before recheck, a `present` soundscape that accidentally contains dialogue or
+music wording may be rebuilt only from its already published, chronological typed
+events in `physical`, `environmental`, `mechanical`, `electronic`,
+`human_non_speech`, or `other`. Exact duplicate descriptions are removed;
+diegetic and non-diegetic music are excluded. If an eligible event itself contains
+dialogue/music semantics, or no clean eligible event exists, the adapter does not
+fabricate a replacement and retains the normal recheck/fail-closed path.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,

@@ -849,10 +849,10 @@ def test_mimo_v20_prompt_preserves_staged_visual_audio_authority_contract() -> N
         assert phrase in SYSTEM_PROMPT
 
 
-def test_backend_v19_records_pre_recheck_normalization_policy(tmp_path: Path) -> None:
+def test_backend_v20_records_pre_recheck_normalization_policy(tmp_path: Path) -> None:
     backend, _ = _backend(tmp_path, [])
 
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.19"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.20"
 
 
 def test_primary_prompt_includes_exact_subject_picture_contract(
@@ -2188,8 +2188,316 @@ def test_raw_retention_normalization_only_strips_own_leading_marker() -> None:
         "description"
     ] == "the person later remains fully preserved in view."
     assert corrections == {"retention_marker_prefix_normalization": 1}
-    with pytest.raises(ValidationError, match="repeats a retention marker"):
-        MimoAVAnnotationDraft.model_validate(normalized)
+    assert MimoAVAnnotationDraft.model_validate(normalized)
+
+
+def test_natural_retention_restatement_does_not_trigger_recheck(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_semantics"]["visual_retention_analysis"][0]["description"] = (
+        "The jacket changes slightly while the facial appearance remains fully preserved."
+    )
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 1
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.annotation.h3_semantics.visual_retention_analysis[0].description == (
+        "The jacket changes slightly while the facial appearance remains fully preserved."
+    )
+    assert result.deterministic_correction_counts == {}
+
+
+def test_non_visible_binding_entity_id_is_removed_before_pydantic_parse() -> None:
+    payload = _annotation().model_dump(mode="json")
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding.update(
+        binding_status="no_reliable_entity",
+        speech_presentation="uncertain",
+        entity_id="e1",
+    )
+
+    canonical, corrections = _canonicalize_raw_annotation_payload(json.dumps(payload))
+    normalized = json.loads(canonical)
+
+    assert normalized["av_grounding"]["segment_groundings"][0]["entity_id"] is None
+    assert normalized["av_grounding"]["segment_groundings"][0][
+        "primary_speaker_group"
+    ] == "g1"
+    assert corrections == {"non_visible_binding_entity_id_removed": 1}
+    assert MimoAVAnnotationDraft.model_validate(normalized)
+
+
+def test_contaminated_soundscape_rebuilds_from_clean_typed_events(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    first = semantics["temporal_non_speech_events"][0]
+    first.update(
+        category="environmental",
+        pattern="continuous",
+        description="Soft indoor room tone with faint ventilation hum.",
+        source_grounding="audible_only",
+    )
+    semantics["temporal_non_speech_events"].append(
+        {
+            "event_id": "ae2",
+            "approximate_start_time": 0.3,
+            "approximate_end_time": 0.4,
+            "category": "physical",
+            "pattern": "single",
+            "description": "A door closes with a muted latch click.",
+            "source_grounding": "audiovisually_grounded",
+        }
+    )
+    semantics["overall_soundscape"] = (
+        "No music is audible; quiet room tone and a door close dominate."
+    )
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("visual"),
+        _audio_event("ae1"),
+        _audio_event("ae2"),
+        _speech("segment_1"),
+    ]
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.annotation.audio_semantics.overall_soundscape == (
+        "Soft indoor room tone with faint ventilation hum. "
+        "A door closes with a muted latch click."
+    )
+    assert result.model_call_count == 1
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.deterministic_correction_counts == {
+        "overall_soundscape_rebuilt_from_typed_events": 1
+    }
+
+
+def test_non_diegetic_music_is_excluded_from_rebuilt_soundscape(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"][0].update(
+        category="environmental",
+        pattern="continuous",
+        description="A low indoor room tone remains audible.",
+        source_grounding="audible_only",
+    )
+    semantics["temporal_non_speech_events"].append(
+        {
+            "event_id": "ae2",
+            "approximate_start_time": 0.3,
+            "approximate_end_time": 0.9,
+            "category": "non_diegetic_music",
+            "pattern": "continuous",
+            "description": "A restrained piano score plays underneath the scene.",
+            "source_grounding": "audible_only",
+        }
+    )
+    semantics["overall_soundscape"] = "A soft piano score plays over room tone."
+    semantics["non_diegetic_music_status"] = "present"
+    semantics["non_diegetic_music"] = (
+        "A restrained piano score plays underneath the scene."
+    )
+    backend, _ = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert (
+        result.annotation.audio_semantics.overall_soundscape
+        == "A low indoor room tone remains audible."
+    )
+    assert result.annotation.audio_semantics.non_diegetic_music == (
+        "A restrained piano score plays underneath the scene."
+    )
+    assert [
+        event.category
+        for event in result.annotation.audio_semantics.temporal_non_speech_events
+    ] == ["environmental", "non_diegetic_music"]
+    assert result.recheck_count == 0
+
+
+def test_diegetic_music_is_excluded_from_rebuilt_soundscape(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"][0].update(
+        category="diegetic_music",
+        pattern="continuous",
+        description="A radio plays a soft melody inside the room.",
+        source_grounding="audiovisually_grounded",
+    )
+    semantics["temporal_non_speech_events"].append(
+        {
+            "event_id": "ae2",
+            "approximate_start_time": 0.3,
+            "approximate_end_time": 0.9,
+            "category": "environmental",
+            "pattern": "continuous",
+            "description": "A low indoor room tone remains audible.",
+            "source_grounding": "audible_only",
+        }
+    )
+    semantics["overall_soundscape"] = "Music and low room tone fill the space."
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("visual"),
+        _audio_event("ae1"),
+        _audio_event("ae2"),
+        _speech("segment_1"),
+    ]
+    backend, _ = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert (
+        result.annotation.audio_semantics.overall_soundscape
+        == "A low indoor room tone remains audible."
+    )
+    assert [
+        event.category
+        for event in result.annotation.audio_semantics.temporal_non_speech_events
+    ] == ["diegetic_music", "environmental"]
+    assert result.recheck_count == 0
+
+
+def test_mislabeled_soundscape_event_is_not_used_to_mask_contamination(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"][0].update(
+        category="other",
+        pattern="continuous",
+        description="Soft background music plays continuously.",
+        source_grounding="audible_only",
+    )
+    semantics["overall_soundscape"] = "Soft background music plays continuously."
+    raw = json.dumps(payload)
+    backend, completions = _backend(tmp_path, [(raw, 8), (raw, 8)])
+
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+
+    assert exc_info.value.recheck_count == 1
+    assert len(completions.requests) == 2
+    assert {
+        "overall_soundscape_contains_music_or_speech",
+        "soundscape_event_category_contamination",
+    } <= {issue.code for issue in exc_info.value.issues}
+
+
+def test_contaminated_soundscape_without_typed_events_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"] = []
+    semantics["overall_soundscape"] = "No music is audible."
+    payload["h3_projection"]["shots"][0]["timeline_parts"] = [
+        _prose("visual"),
+        _speech("segment_1"),
+    ]
+    raw = json.dumps(payload)
+    backend, completions = _backend(tmp_path, [(raw, 8), (raw, 8)])
+
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _job_fixture(tmp_path),
+            segment_ids=["segment_1"],
+            transcribed_segment_ids=["segment_1"],
+            allowed_entity_ids={"e1"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+
+    assert exc_info.value.recheck_count == 1
+    assert len(completions.requests) == 2
+    assert "overall_soundscape_contains_music_or_speech" in {
+        issue.code for issue in exc_info.value.issues
+    }
+
+
+def test_random10_mechanical_defects_normalize_in_one_model_call(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_semantics"]["visual_retention_analysis"][0]["description"] = (
+        "The face and hairstyle remain fully preserved."
+    )
+    grounding = payload["av_grounding"]["segment_groundings"][0]
+    grounding.update(
+        binding_status="no_reliable_entity",
+        speech_presentation="uncertain",
+        entity_id="e1",
+    )
+    semantics = payload["audio_observation"]["audio_semantics"]
+    semantics["temporal_non_speech_events"][0].update(
+        category="environmental",
+        pattern="continuous",
+        description="A faint indoor room ambience is audible.",
+        source_grounding="audible_only",
+    )
+    semantics["overall_soundscape"] = (
+        "No music is audible; only faint indoor room ambience remains."
+    )
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.model_call_count == 1
+    assert result.recheck_count == 0
+    assert len(completions.requests) == 1
+    assert result.annotation.segment_decisions[0].entity_id is None
+    assert result.annotation.audio_semantics.overall_soundscape == (
+        "A faint indoor room ambience is audible."
+    )
+    assert result.deterministic_correction_counts == {
+        "non_visible_binding_entity_id_removed": 1,
+        "overall_soundscape_rebuilt_from_typed_events": 1,
+    }
 
 
 def test_voice_profile_identity_claim_is_dropped_before_recheck(tmp_path: Path) -> None:
@@ -3698,7 +4006,7 @@ def test_attribute_transfer_and_unknown_retention_marker_reject(marker: str) -> 
         ("weak_reference", "weak reference"),
     ],
 )
-def test_retention_description_cannot_repeat_marker(
+def test_retention_description_may_naturally_restate_marker(
     marker: str,
     repeated: str,
 ) -> None:
@@ -3706,8 +4014,11 @@ def test_retention_description_cannot_repeat_marker(
     payload["h3_semantics"]["visual_retention_analysis"] = [
         _retention("<Subject 1>", marker, f"the result is {repeated}.")
     ]
-    with pytest.raises(ValidationError, match="repeats a retention marker"):
-        MimoAVAnnotationDraft.model_validate(payload)
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert annotation.h3_semantics.visual_retention_analysis[0].description == (
+        f"the result is {repeated}."
+    )
 
 
 def _two_audio_event_annotation() -> MimoAVAnnotationDraft:
