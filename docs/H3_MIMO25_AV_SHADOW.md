@@ -19,6 +19,11 @@ speaker reconciliation; MiMo is the final AV authority for this shadow path.
   writes an H3 visual/temporal draft.
 - the deterministic materializer owns `Sx`, Subject and Audio references, exact
   dialogue, and final H3 formatting.
+- post-MiMo voice recovery may create a real target voice asset only from a
+  validated clean single-speaker, resolved `visible_entity` / `onscreen_spoken`
+  segment for an entity that has no existing target voice. It uses the exact
+  DiariZen 32 kHz sample interval in canonical stereo FLAC; LR-ASD, association,
+  current binding, and direct-anchor support are not recovery gates.
 
 Every DiariZen segment receives one `segment_decisions` row, including empty or
 otherwise non-transcribed segments. Only Qwen3-ASR segments with
@@ -86,14 +91,15 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_av_authority_contract_v7`
 - `r2v.h3.mimo25_av_annotation.8`
 - `r2v.h3.mimo25_backend.10`
-- `h3_mimo25_materializer_v6`
+- `h3_mimo25_materializer_v7`
+- `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
 - `r2v.h3.mimo25_record.5`
 - `r2v.h3.mimo25_summary.5`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.5`
-- `r2v.h3.mimo25_h3_shadow_summary.5`
+- `r2v.h3.mimo25_h3_shadow.6`
+- `r2v.h3.mimo25_h3_shadow_summary.6`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -171,6 +177,36 @@ reference labels keep one meaning across sections; and dialogue uses stable
 does not redefine official reference-label or retention-marker semantics. The
 typed timeline is internal annotation structure only and never appears in the
 final Ref2VA text.
+
+## Post-MiMo target voice recovery
+
+The model-free shadow materializer preserves every existing ASD-derived target
+voice first and considers only missing Subject entities for recovery. A candidate
+must be resolved to one `gN`, be `visible_entity` plus `onscreen_spoken`, use
+`vocal_composition="single_speaker"`, and have no secondary vocal activity. The
+versioned acoustic gate retains the frozen 1.0-second minimum, -40 dBFS minimum
+RMS, 0.0001 maximum clipping ratio, required local noise evidence, and 10 dB
+minimum estimated SNR. Association confidence and LR-ASD score gates are
+intentionally absent. Local noise uses the robust median of 20 ms windows from
+the nearby canonical-audio regions outside all authoritative DiariZen speech
+segments; less than 0.20 seconds of such context rejects fail closed.
+
+At most one exact segment is selected per missing entity. Existing target voices
+keep priority; recovered voices fill canonical Subject order while respecting
+Audio <= 3 and Picture + Audio <= 12. An existing in-pair receives a shadow-only
+effective voice overlay. If a clip has only a canonical sample and recovery
+succeeds, the shadow derives one in-pair while leaving the canonical sample
+voice-free. Cross-pairs are never created or modified by recovery. Assets and
+machine-readable provenance are published under
+`mimo25_h3_shadow_v5/recovered_voice_refs/` and
+`recovered_voice_references.jsonl`; no recovery terms enter final H3 prose.
+
+This remains compatible with the official MiniMax H3 Ref2VA contract: every
+`<Audio N>` denotes an actual audio signal, Audio numbering is independent of
+stable `(Sx)` speaker IDs, no target `<Video N>` is introduced, Subject/Picture
+provenance is unchanged, and the final six-section order remains unchanged.
+The review page exposes each real Audio asset, Subject/entity, `(Sx)`, source
+type, source segment, and browser audio player.
 
 MiMo records retain explicit `present`, `absent`, or `unknown` status for the
 overall soundscape and non-diegetic music. The H3 training prompt renders a

@@ -8,11 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, get_args
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
 import r2v_data_v2.h3.mimo25_av_reconcile as mimo25_reconcile
 import r2v_data_v2.h3.mimo25_h3_materializer as mimo25_materializer
+from r2v_data_v2.h3.audio_backends import AudioFileProbe
 from r2v_data_v2.h3.diarization_binding import (
     DiarizationInventory,
     DiarizationTargetClip,
@@ -76,6 +78,11 @@ from r2v_data_v2.h3.mimo25_human_review import (
     make_review_server,
     render_review_html,
 )
+from r2v_data_v2.h3.mimo25_recovered_voice import (
+    CanonicalAudioAnalysis,
+    MimoRecoveredVoiceQualityPolicy,
+    recover_mimo_target_voices,
+)
 from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionSubjectContract
 from r2v_data_v2.structured_output import ValidationIssue
 
@@ -111,8 +118,7 @@ def _annotation(
                         "speaker_relation": (
                             "none"
                             if composition == "single_speaker"
-                            else
-                            "same_speaker"
+                            else "same_speaker"
                             if composition == "same_speaker_nonlexical"
                             else "different_speaker"
                         ),
@@ -540,12 +546,14 @@ def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
     for decision_schema in decision_schemas.values():
         assert "entity_id" in decision_schema["required"]
         assert "delivery_style" in decision_schema["required"]
-        assert "direct_anchor_present" not in decision_schema["properties"][
-            "evidence_codes"
-        ]["items"]["enum"]
-        assert "visible_lip_motion" in decision_schema["properties"][
-            "evidence_codes"
-        ]["items"]["enum"]
+        assert (
+            "direct_anchor_present"
+            not in decision_schema["properties"]["evidence_codes"]["items"]["enum"]
+        )
+        assert (
+            "visible_lip_motion"
+            in decision_schema["properties"]["evidence_codes"]["items"]["enum"]
+        )
     assert request["reasoning_effort"] == "none"
     assert request["extra_body"] == {
         "use_audio_in_video": True,
@@ -577,6 +585,29 @@ def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> 
     assert xiaomi.transport == "xiaomi"
     assert sglang.transport == "sglang"
     assert xiaomi.configuration_fingerprint != sglang.configuration_fingerprint
+
+
+def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readable(
+    tmp_path: Path,
+) -> None:
+    resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
+    current = MimoBackendConfig(
+        media_resolver=resolver,
+        api_key="secret",
+    ).provenance()
+    values = current.model_dump(mode="json", exclude={"configuration_fingerprint"})
+    values["materializer_version"] = "h3_mimo25_materializer_v6"
+    values["configuration_fingerprint"] = __import__("hashlib").sha256(
+        json.dumps(
+            {key: value for key, value in values.items() if key != "configuration_fingerprint"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    historical = type(current).model_validate(values)
+    assert historical.materializer_version == "h3_mimo25_materializer_v6"
+    assert current.materializer_version == "h3_mimo25_materializer_v7"
 
 
 def test_mimo_v12_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
@@ -614,9 +645,10 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
             "required_source_picture_labels": ["<Picture 1>", "<Picture 2>"],
         }
     ]
-    assert json.dumps(
-        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ) in prompt
+    assert (
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        in prompt
+    )
     assert "ALL AND ONLY its required_source_picture_labels exactly once each" in prompt
     assert "natural official H3 Ref2VA English prose" in prompt
     assert "There is no required fixed English connector" in prompt
@@ -739,7 +771,10 @@ def test_resolution_discriminator_structures_primary_speaker_group() -> None:
         "type": "string",
     }
     assert "primary_speaker_group" in refinement["required"]
-    assert {item["type"] for item in refinement["properties"]["primary_speaker_group"]["anyOf"]} == {
+    assert {
+        item["type"]
+        for item in refinement["properties"]["primary_speaker_group"]["anyOf"]
+    } == {
         "string",
         "null",
     }
@@ -755,9 +790,9 @@ def test_resolution_discriminator_structures_primary_speaker_group() -> None:
         MimoAVAnnotationDraft.model_validate(resolved_payload)
     assert _annotation().segment_decisions[0].primary_speaker_group == "g1"
 
-    refinement_payload = _annotation(
-        resolution="needs_acoustic_refinement"
-    ).model_dump(mode="json")
+    refinement_payload = _annotation(resolution="needs_acoustic_refinement").model_dump(
+        mode="json"
+    )
     refinement_payload["segment_decisions"][0]["primary_speaker_group"] = None
     assert (
         MimoAVAnnotationDraft.model_validate(refinement_payload)
@@ -829,7 +864,9 @@ def test_single_indirect_signal_has_segment_level_semantic_issues(
     assert {item.field for item in issues} == {"segment_1"}
 
 
-@pytest.mark.parametrize("conflict_code", ["lr_asd_conflict", "source_cluster_conflict"])
+@pytest.mark.parametrize(
+    "conflict_code", ["lr_asd_conflict", "source_cluster_conflict"]
+)
 def test_explicit_conflict_does_not_make_indirect_continuity_visible_evidence(
     conflict_code: str,
 ) -> None:
@@ -880,9 +917,7 @@ def test_mouth_occlusion_without_continuity_is_not_onscreen_evidence() -> None:
         "speaker_visible_mouth_occluded"
     ]
     annotation = MimoAVAnnotationDraft.model_validate(payload)
-    assert {
-        item.code for item in _validate(annotation)
-    } == {
+    assert {item.code for item in _validate(annotation)} == {
         "visible_entity_requires_confirmed_onscreen_speech",
         "onscreen_speech_requires_reliable_visible_speaker_evidence",
     }
@@ -993,9 +1028,7 @@ def test_audio_token_zero_uses_one_canonical_audio_fallback(tmp_path: Path) -> N
     assert audio_items[0]["input_audio"]["data"].startswith("data:audio/")
     assert ";base64," in audio_items[0]["input_audio"]["data"]
     assert not any(item["type"] == "audio_url" for item in content)  # type: ignore[union-attr]
-    assert completions.requests[1]["extra_body"] == {
-        "thinking": {"type": "disabled"}
-    }
+    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
 
 
 def test_sglang_audio_token_zero_uses_audio_url_fallback(tmp_path: Path) -> None:
@@ -1256,9 +1289,7 @@ def test_http_retry_failure_preserves_logical_and_http_counts(tmp_path: Path) ->
             media_resolver=MimoMediaResolver(mode="base64", media_root=tmp_path),
             api_key="secret",
         ),
-        client=SimpleNamespace(
-            chat=SimpleNamespace(completions=AlwaysFails())
-        ),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=AlwaysFails())),
         sleep=lambda _: None,
         jitter=lambda: 0.0,
     )
@@ -1437,9 +1468,7 @@ def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) 
     assert any(item["type"] == "video_url" for item in content)
     assert any(item["type"] == "image_url" for item in content)
     assert "Reinspect the SAME audiovisual evidence" in content[-1]["text"]
-    assert completions.requests[1]["extra_body"] == {
-        "thinking": {"type": "disabled"}
-    }
+    assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
     recheck = content[-1]["text"]
     assert job.r2v_instruction in recheck
     assert job.target_video_path not in recheck
@@ -1468,9 +1497,10 @@ def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
     )
     contract = backend.build_mandatory_h3_draft_contract(job)
 
-    assert json.dumps(
-        contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ) in prompt
+    assert (
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        in prompt
+    )
     assert "regenerate each affected definition" in prompt
     assert "exact Subject-to-Pictures mapping" in prompt
     assert "rebuild all typed speech timeline parts" in prompt
@@ -1720,9 +1750,7 @@ def test_sglang_full_av_recheck_preserves_primary_transport_contract(
         assert request["extra_body"]["use_audio_in_video"] is True
         content = request["messages"][1]["content"]  # type: ignore[index]
         assert any(item["type"] == "video_url" for item in content)
-        assert not any(
-            item["type"] in {"audio_url", "input_audio"} for item in content
-        )
+        assert not any(item["type"] in {"audio_url", "input_audio"} for item in content)
 
 
 def test_both_malformed_responses_fail_with_nullable_issue_field(
@@ -1797,7 +1825,10 @@ def test_audio_fallback_recheck_preserves_explicit_audio_modality(
     content = completions.requests[-1]["messages"][1]["content"]  # type: ignore[index]
     assert any(item["type"] == "video_url" for item in content)
     assert any(item["type"] == "input_audio" for item in content)
-    assert all(isinstance(request["messages"][1]["content"], list) for request in completions.requests)  # type: ignore[index]
+    assert all(
+        isinstance(request["messages"][1]["content"], list)
+        for request in completions.requests
+    )  # type: ignore[index]
 
 
 def test_full_av_recheck_zero_video_tokens_fails_closed(tmp_path: Path) -> None:
@@ -1983,7 +2014,10 @@ def test_segment_contract_preserves_multi_vocal_segments() -> None:
     assert len(overlap.segment_decisions) == 1
     with pytest.raises(ValidationError, match="requires acoustic refinement"):
         _annotation(composition="sequential_multi_speaker_speech")
-    assert "Multiple vocal sounds inside one segment never make that segment invalid" in SYSTEM_PROMPT
+    assert (
+        "Multiple vocal sounds inside one segment never make that segment invalid"
+        in SYSTEM_PROMPT
+    )
     assert "transcript" not in MimoAVAnnotationDraft.model_json_schema()["properties"]
 
 
@@ -2144,13 +2178,20 @@ def test_cross_reference_validation_rejects_inventory_drift() -> None:
         transcribed_segment_ids=["segment_1"],
         allowed_entity_ids={"e2"},
     )
-    assert {item.code for item in issues} == {"segment_inventory_mismatch", "unknown_entity"}
+    assert {item.code for item in issues} == {
+        "segment_inventory_mismatch",
+        "unknown_entity",
+    }
 
 
 @pytest.mark.parametrize(
     ("field", "value", "issue_code"),
     [
-        ("summary", "A summary [[segment:segment_1]]", "speech_placeholder_outside_shot"),
+        (
+            "summary",
+            "A summary [[segment:segment_1]]",
+            "speech_placeholder_outside_shot",
+        ),
         (
             "visual_retention_analysis",
             ["<Picture 1>: fully_preserved [[segment:segment_1]]"],
@@ -2602,9 +2643,7 @@ def test_audio_event_crossing_cut_may_use_either_overlapping_shot(
         segment_intervals={"segment_1": (1.0, 2.0)},
         target_duration_seconds=10.0,
     )
-    assert "audio_event_placeholder_wrong_shot" not in {
-        item.code for item in issues
-    }
+    assert "audio_event_placeholder_wrong_shot" not in {item.code for item in issues}
 
 
 def test_subject_definition_and_shot_bounds_fail_closed() -> None:
@@ -2735,9 +2774,7 @@ def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None
         allowed_reference_labels={"<Picture 1>", "<Picture 2>", "<Subject 1>"},
         reference_subjects=subjects,
     )
-    assert "subject_definition_contract_mismatch" not in {
-        item.code for item in issues
-    }
+    assert "subject_definition_contract_mismatch" not in {item.code for item in issues}
 
 
 @pytest.mark.parametrize(
@@ -2751,9 +2788,9 @@ def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None
 def test_speech_placeholder_inventory_rejects_missing_duplicate_or_reordered(
     speech_segment_ids: list[str],
 ) -> None:
-    payload = _two_segment_annotation(
-        second_group="g1", second_entity=None
-    ).model_dump(mode="json")
+    payload = _two_segment_annotation(second_group="g1", second_entity=None).model_dump(
+        mode="json"
+    )
     payload["h3_draft"]["shots"][0]["timeline_parts"] = [
         _prose("<Subject 1> remains visible."),
         _audio_event("ae1"),
@@ -2764,9 +2801,7 @@ def test_speech_placeholder_inventory_rejects_missing_duplicate_or_reordered(
         segment_ids=["segment_1", "segment_2"],
         transcribed_segment_ids=["segment_1", "segment_2"],
     )
-    assert "speech_placeholder_inventory_mismatch" in {
-        item.code for item in issues
-    }
+    assert "speech_placeholder_inventory_mismatch" in {item.code for item in issues}
 
 
 def test_non_transcribed_segment_cannot_receive_speech_placeholder() -> None:
@@ -2776,9 +2811,7 @@ def test_non_transcribed_segment_cannot_receive_speech_placeholder() -> None:
         segment_ids=["segment_1", "segment_2"],
         transcribed_segment_ids=["segment_1"],
     )
-    assert "speech_placeholder_inventory_mismatch" in {
-        item.code for item in issues
-    }
+    assert "speech_placeholder_inventory_mismatch" in {item.code for item in issues}
 
 
 def test_exact_transcribed_speech_placeholder_inventory_is_accepted() -> None:
@@ -2788,9 +2821,7 @@ def test_exact_transcribed_speech_placeholder_inventory_is_accepted() -> None:
         segment_ids=["segment_1", "segment_2"],
         transcribed_segment_ids=["segment_1", "segment_2"],
     )
-    assert "speech_placeholder_inventory_mismatch" not in {
-        item.code for item in issues
-    }
+    assert "speech_placeholder_inventory_mismatch" not in {item.code for item in issues}
 
 
 def test_warning_requires_known_segment_and_never_contains_replacement_text() -> None:
@@ -2801,13 +2832,12 @@ def test_warning_requires_known_segment_and_never_contains_replacement_text() ->
         "code": "possible_asr_conflict",
         "segment_id": "segment_1",
     }
-    assert "replacement_text" not in MimoAnnotationWarning.model_json_schema()[
-        "properties"
-    ]
+    assert (
+        "replacement_text"
+        not in MimoAnnotationWarning.model_json_schema()["properties"]
+    )
     payload = _annotation().model_dump(mode="json")
-    payload["warnings"] = [
-        {"code": "possible_asr_conflict", "segment_id": "unknown"}
-    ]
+    payload["warnings"] = [{"code": "possible_asr_conflict", "segment_id": "unknown"}]
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
     assert "warning_unknown_segment" in {item.code for item in issues}
 
@@ -2895,7 +2925,9 @@ def _record_fixture(
 ) -> MimoRecord:
     active_job = job or _job_fixture(tmp_path)
     resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
-    provenance = MimoBackendConfig(media_resolver=resolver, api_key="secret").provenance()
+    provenance = MimoBackendConfig(
+        media_resolver=resolver, api_key="secret"
+    ).provenance()
     values = {
         "schema_version": MIMO25_RECORD_VERSION,
         "clip_uid": active_job.clip_uid,
@@ -2912,23 +2944,33 @@ def _record_fixture(
         "http_retry_count": 0,
         "recheck_count": 0,
     }
-    fingerprint = __import__("hashlib").sha256(
-        json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    fingerprint = (
+        __import__("hashlib")
+        .sha256(
+            json.dumps(
+                values, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        )
+        .hexdigest()
+    )
     return MimoRecord(**values, record_fingerprint=fingerprint)
 
 
 def _replace_record(record: MimoRecord, **changes: object) -> MimoRecord:
     values = record.model_dump(mode="json", exclude={"record_fingerprint"})
     values.update(changes)
-    fingerprint = __import__("hashlib").sha256(
-        json.dumps(
-            values,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    fingerprint = (
+        __import__("hashlib")
+        .sha256(
+            json.dumps(
+                values,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        .hexdigest()
+    )
     return MimoRecord(**values, record_fingerprint=fingerprint)
 
 
@@ -2988,9 +3030,7 @@ def test_mimo_inventory_builds_one_job_per_canonical_target(
                 "clip_name": clip_uid,
                 "speech_segments": [],
                 "subject_voices": (
-                    []
-                    if pair_type == "canonical"
-                    else payload["subject_voices"]
+                    [] if pair_type == "canonical" else payload["subject_voices"]
                 ),
             }
         )
@@ -3039,7 +3079,9 @@ def test_mimo_inventory_builds_one_job_per_canonical_target(
         audio = Path(sample.target_full_audio_path).resolve(strict=True)
         identity = SimpleNamespace(clip_uid=sample.clip_uid)
         visual_clips.append(
-            SimpleNamespace(identity=identity, sample=SimpleNamespace(target_video=str(video)))
+            SimpleNamespace(
+                identity=identity, sample=SimpleNamespace(target_video=str(video))
+            )
         )
         canonical_audio.append(
             CanonicalAudioClip(
@@ -3081,9 +3123,7 @@ def test_mimo_inventory_builds_one_job_per_canonical_target(
         source_visual_production_root=str(visual_root),
         source_visual_inventory_path=str(visual_root / "samples.jsonl"),
         source_visual_inventory_sha256=_file_sha256(visual_root / "samples.jsonl"),
-        source_canonical_audio_manifest_path=str(
-            paths.audio / "canonical_clips.jsonl"
-        ),
+        source_canonical_audio_manifest_path=str(paths.audio / "canonical_clips.jsonl"),
         source_canonical_audio_manifest_sha256=canonical_manifest_sha256,
         inventory_fingerprint="a" * 64,
         source_target_count=2,
@@ -3204,7 +3244,7 @@ def _materializer_fixture(
     inventory = _inventory(inventory_values)
     record = _record_fixture(
         media_root,
-        _annotation(),
+        _presentation_annotation("offscreen_spoken"),
         job=job,
         inventory_fingerprint=inventory.inventory_fingerprint,
     )
@@ -3224,6 +3264,155 @@ def _materializer_fixture(
         record=record,
         samples=samples,
     )
+
+
+class _RecoveredVoiceAnalyzer:
+    def __init__(self, *, seconds: float = 3.0, speech_amplitude: int = 3000) -> None:
+        frame_count = round(seconds * 32000)
+        samples = np.full(frame_count, 100, dtype=np.int16)
+        samples[: min(32000, frame_count)] = speech_amplitude
+        self.analysis = CanonicalAudioAnalysis(
+            probe=AudioFileProbe(
+                sample_rate_hz=32000,
+                channels=2,
+                frame_count=frame_count,
+                duration_seconds=seconds,
+                format_name="flac",
+            ),
+            mono_pcm16=samples,
+        )
+        self.calls: list[Path] = []
+
+    def load(self, path: Path) -> CanonicalAudioAnalysis:
+        self.calls.append(path)
+        return self.analysis
+
+
+class _RecoveredVoiceMediaBackend:
+    def __init__(self) -> None:
+        self.extractions: list[dict[str, object]] = []
+
+    def probe_audio_file(self, path: Path) -> AudioFileProbe:
+        del path
+        raise AssertionError("recovery uses the injected analyzer probe")
+
+    def materialize_full_audio(self, **_: object) -> object:
+        raise AssertionError("recovery never materializes canonical full audio")
+
+    def extract_voice_reference(self, **kwargs: object) -> Path:
+        self.extractions.append(dict(kwargs))
+        destination = Path(kwargs["destination"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"deterministic-32k-stereo-flac")
+        return destination
+
+
+def _as_asd_miss(job: MimoClipJob) -> MimoClipJob:
+    values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    values["target_duration_seconds"] = 3.0
+    values["segments"][0].update(
+        current_entity_id=None,
+        entity_occurrence_id=None,
+        identity_scope="unresolved",
+        direct_anchor_seconds=0.0,
+        cluster_binding_status="unbound",
+        direct_support_seconds_by_entity={},
+    )
+    return _job(values)
+
+
+def _configure_recovery_materializer_fixture(
+    fixture: SimpleNamespace,
+    *,
+    recover_entity_id: str,
+) -> SimpleNamespace:
+    samples = fixture.samples
+    job_values = fixture.job.model_dump(mode="json", exclude={"request_fingerprint"})
+    if recover_entity_id == "e2":
+        image = Path(fixture.job.target_video_path).parent / "reference-e2.png"
+        image.write_bytes(b"image-e2")
+        reference = FinalVisualReference(
+            image_id="image_2",
+            image_index=2,
+            kind="subject",
+            image_path="selected/reference-e2.png",
+            image_artifact_path=str(image),
+            entity_id="e2",
+            source_frame_index=1,
+            scope="full",
+            visible_region="whole",
+            synthetic=False,
+        )
+        samples = [
+            FinalH3SampleV2.model_validate(
+                {
+                    **item.model_dump(mode="python"),
+                    "visual_references": [
+                        *item.model_dump(mode="python")["visual_references"],
+                        reference.model_dump(mode="python"),
+                    ],
+                }
+            )
+            for item in samples
+        ]
+        job_values["reference_images"].append(
+            MimoReferenceImage(
+                image_index=2,
+                picture_label="<Picture 2>",
+                kind="subject",
+                entity_id="e2",
+                image_artifact_path=str(image),
+                image_sha256=_file_sha256(image),
+            ).model_dump(mode="json")
+        )
+        job_values["reference_subjects"].append(
+            RecaptionSubjectContract(
+                subject_index=2,
+                subject_label="<Subject 2>",
+                kind="entity",
+                entity_id="e2",
+                source_picture_labels=["<Picture 2>"],
+            ).model_dump(mode="json")
+        )
+    job = _as_asd_miss(_job(job_values))
+    _write_models_jsonl(fixture.samples_path, samples)
+    inventory_values = fixture.inventory.model_dump(
+        mode="json", exclude={"inventory_fingerprint"}
+    )
+    inventory_values["source_h3_samples_sha256"] = _file_sha256(fixture.samples_path)
+    inventory_values["jobs"] = [job.model_dump(mode="json")]
+    if inventory_values["source_diarization_inventory_sha256"] is None:
+        inventory_values.pop("source_diarization_inventory_sha256")
+    inventory = _inventory(inventory_values)
+    annotation_payload = _annotation(entity_id=recover_entity_id).model_dump(
+        mode="json"
+    )
+    annotation_payload["segment_decisions"][0]["evidence_codes"] = [
+        "speaker_visible_mouth_occluded",
+        "voice_continuity",
+    ]
+    if recover_entity_id == "e2":
+        annotation_payload["h3_draft"]["subject_definitions"].append(
+            "<Subject 2> is the person shown in <Picture 2>."
+        )
+        annotation_payload["h3_draft"]["visual_retention_analysis"].append(
+            "<Subject 2>: fully_preserved - the person remains visible."
+        )
+    record = _record_fixture(
+        Path(job.target_video_path).parent,
+        MimoAVAnnotationDraft.model_validate(annotation_payload),
+        job=job,
+        inventory_fingerprint=inventory.inventory_fingerprint,
+    )
+    (fixture.mimo_root / "inventory.json").write_text(
+        inventory.model_dump_json(), encoding="utf-8"
+    )
+    _write_models_jsonl(fixture.mimo_root / "records.jsonl", [record])
+    fixture.job = job
+    fixture.inventory = inventory
+    fixture.record = record
+    fixture.samples = samples
+    return fixture
 
 
 def _review_fixture(
@@ -3294,9 +3483,7 @@ def _presentation_annotation(presentation: str) -> MimoAVAnnotationDraft:
         decision["evidence_codes"].append("message_text_alignment")
         payload["h3_draft"]["summary"] = "A person silently handles a phone."
         payload["h3_draft"]["shots"][0]["timeline_parts"] = [
-            _prose(
-                "<Subject 1> looks at the phone and types without visible speech."
-            ),
+            _prose("<Subject 1> looks at the phone and types without visible speech."),
             _audio_event("ae1"),
             _speech("segment_1"),
         ]
@@ -3322,7 +3509,9 @@ def _write_shadow_records(
 def test_materializer_preserves_exact_asr_and_segment(tmp_path: Path) -> None:
     sample = _sample(tmp_path)
     job = _job_fixture(tmp_path)
-    record = _record_fixture(tmp_path, _annotation(composition="same_speaker_nonlexical"))
+    record = _record_fixture(
+        tmp_path, _annotation(composition="same_speaker_nonlexical")
+    )
     corrected, rendered, warnings = _materialize_sample(sample, job, record)
     assert len(corrected) == 1
     assert corrected[0].text == "Exact, text!"
@@ -3419,7 +3608,11 @@ def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("status", "description", "expected"),
     [
-        ("present", "A low room hum and a light clink are audible.", "A low room hum and a light clink are audible."),
+        (
+            "present",
+            "A low room hum and a light clink are audible.",
+            "A low room hum and a light clink are audible.",
+        ),
         ("absent", None, "N/A"),
         ("unknown", None, "N/A"),
     ],
@@ -3449,7 +3642,11 @@ def test_materializer_renders_soundscape_status_without_ungrounded_prose(
 @pytest.mark.parametrize(
     ("status", "description", "expected"),
     [
-        ("present", "Faint non-diegetic strings continue underneath.", "Faint non-diegetic strings continue underneath."),
+        (
+            "present",
+            "Faint non-diegetic strings continue underneath.",
+            "Faint non-diegetic strings continue underneath.",
+        ),
         ("absent", None, "N/A"),
         ("unknown", None, "N/A"),
     ],
@@ -3532,9 +3729,7 @@ def test_materializer_preserves_existing_onscreen_speech_clause(tmp_path: Path) 
         _job_fixture(tmp_path),
         _record_fixture(tmp_path, _presentation_annotation("onscreen_spoken")),
     )
-    assert (
-        "<Subject 1> (S1) says, <d>[English] Exact, text!</d>"
-    ) in rendered
+    assert ("<Subject 1> (S1) says, <d>[English] Exact, text!</d>") in rendered
 
 
 def test_materializer_keeps_onscreen_speech_with_unknown_entity_unbound(
@@ -3562,7 +3757,10 @@ def test_message_voice_over_draft_keeps_phone_action_without_visible_speech(
     tmp_path: Path,
 ) -> None:
     annotation = _presentation_annotation("message_voice_over")
-    assert "looks at the phone and types" in annotation.h3_draft.shots[0].timeline_parts[0].text
+    assert (
+        "looks at the phone and types"
+        in annotation.h3_draft.shots[0].timeline_parts[0].text
+    )
     corrected, rendered, _ = _materialize_sample(
         _sample(tmp_path),
         _job_fixture(tmp_path),
@@ -3619,9 +3817,7 @@ def test_materializer_rejects_source_speaker_cluster_drift(tmp_path: Path) -> No
 
 def test_materializer_preserves_structured_asr_warning_location(tmp_path: Path) -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["warnings"] = [
-        {"code": "possible_asr_conflict", "segment_id": "segment_1"}
-    ]
+    payload["warnings"] = [{"code": "possible_asr_conflict", "segment_id": "segment_1"}]
     _, _, warnings = _materialize_sample(
         _sample(tmp_path),
         _job_fixture(tmp_path),
@@ -3761,6 +3957,347 @@ def test_materializer_hashes_clip_media_once_across_variants(
         assert calls[path.resolve()] == 1
 
 
+def test_mimo_recovery_uses_asd_independent_exact_canonical_samples(
+    tmp_path: Path,
+) -> None:
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    record = _record_fixture(tmp_path, _annotation(), job=job)
+    analyzer = _RecoveredVoiceAnalyzer()
+    media = _RecoveredVoiceMediaBackend()
+
+    recovered, temporary_voices, published_voices = recover_mimo_target_voices(
+        job=job,
+        record=record,
+        subject_index_by_entity={"e1": 1},
+        existing_entity_ids=set(),
+        reference_capacity=3,
+        temporary_root=tmp_path / "temporary",
+        final_root=tmp_path / "final",
+        audio_backend=media,
+        analyzer=analyzer,
+    )
+
+    assert len(recovered) == 1
+    assert recovered[0].status == "selected"
+    assert recovered[0].reason_codes == []
+    assert recovered[0].quality_policy_version == (
+        "h3_mimo25_recovered_voice_quality_v1"
+    )
+    assert recovered[0].source_start_sample == 0
+    assert recovered[0].source_end_sample == 32000
+    assert len(temporary_voices) == len(published_voices) == 1
+    extraction = media.extractions[0]
+    assert extraction["source_start_sample"] == 0
+    assert extraction["source_end_sample"] == 32000
+    assert extraction["sample_rate_hz"] == 32000
+    assert extraction["channels"] == 2
+    assert extraction["source_audio_path"] == Path(job.target_full_audio_path)
+    assert "lr_asd" not in json.dumps(recovered[0].model_dump(mode="json"))
+
+
+def test_mimo_recovery_preserves_existing_entity_voice(tmp_path: Path) -> None:
+    job = _job_fixture(tmp_path)
+    analyzer = _RecoveredVoiceAnalyzer()
+    recovered, temporary, published = recover_mimo_target_voices(
+        job=job,
+        record=_record_fixture(tmp_path, _annotation(), job=job),
+        subject_index_by_entity={"e1": 1},
+        existing_entity_ids={"e1"},
+        reference_capacity=2,
+        temporary_root=tmp_path / "temporary",
+        final_root=tmp_path / "final",
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        analyzer=analyzer,
+    )
+    assert recovered == temporary == published == []
+    assert analyzer.calls == []
+
+
+@pytest.mark.parametrize(
+    ("annotation", "expected_reason"),
+    [
+        (_presentation_annotation("offscreen_spoken"), None),
+        (
+            MimoAVAnnotationDraft.model_validate(
+                {
+                    **_annotation().model_dump(mode="json"),
+                    "segment_decisions": [
+                        {
+                            **_annotation().model_dump(mode="json")[
+                                "segment_decisions"
+                            ][0],
+                            "resolution": "uncertain",
+                        }
+                    ],
+                }
+            ),
+            "unresolved",
+        ),
+        (
+            _annotation(
+                composition="overlapping_secondary_speech",
+                resolution="needs_acoustic_refinement",
+            ),
+            "unresolved",
+        ),
+    ],
+)
+def test_mimo_recovery_rejects_unsafe_speaker_semantics(
+    tmp_path: Path,
+    annotation: MimoAVAnnotationDraft,
+    expected_reason: str | None,
+) -> None:
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    analyzer = _RecoveredVoiceAnalyzer()
+    recovered, _, voices = recover_mimo_target_voices(
+        job=job,
+        record=_record_fixture(tmp_path, annotation, job=job),
+        subject_index_by_entity={"e1": 1},
+        existing_entity_ids=set(),
+        reference_capacity=3,
+        temporary_root=tmp_path / "temporary",
+        final_root=tmp_path / "final",
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        analyzer=analyzer,
+    )
+    assert voices == []
+    if expected_reason is None:
+        assert recovered == []
+        assert analyzer.calls == []
+    else:
+        assert expected_reason in recovered[0].reason_codes
+
+
+def test_938_offscreen_group_never_recovers_e4_voice(tmp_path: Path) -> None:
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    analyzer = _RecoveredVoiceAnalyzer()
+    recovered, _, voices = recover_mimo_target_voices(
+        job=job,
+        record=_record_fixture(
+            tmp_path,
+            _presentation_annotation("offscreen_spoken"),
+            job=job,
+        ),
+        subject_index_by_entity={"e1": 1, "e4": 2},
+        existing_entity_ids=set(),
+        reference_capacity=3,
+        temporary_root=tmp_path / "temporary",
+        final_root=tmp_path / "final",
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        analyzer=analyzer,
+    )
+    assert recovered == []
+    assert voices == []
+    assert analyzer.calls == []
+
+
+def test_mimo_recovery_acoustic_and_reference_limit_rejections(
+    tmp_path: Path,
+) -> None:
+    job = _as_asd_miss(_job_fixture(tmp_path))
+    record = _record_fixture(tmp_path, _annotation(), job=job)
+    quiet, _, quiet_voices = recover_mimo_target_voices(
+        job=job,
+        record=record,
+        subject_index_by_entity={"e1": 1},
+        existing_entity_ids=set(),
+        reference_capacity=3,
+        temporary_root=tmp_path / "quiet-temporary",
+        final_root=tmp_path / "quiet-final",
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        analyzer=_RecoveredVoiceAnalyzer(speech_amplitude=0),
+    )
+    assert "rms_too_low" in quiet[0].reason_codes
+    assert quiet_voices == []
+
+    limited, _, limited_voices = recover_mimo_target_voices(
+        job=job,
+        record=record,
+        subject_index_by_entity={"e1": 1},
+        existing_entity_ids=set(),
+        reference_capacity=0,
+        temporary_root=tmp_path / "limited-temporary",
+        final_root=tmp_path / "limited-final",
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        analyzer=_RecoveredVoiceAnalyzer(),
+    )
+    assert limited[0].reason_codes == ["reference_limit"]
+    assert limited_voices == []
+
+
+def test_canonical_only_asd_miss_derives_real_in_pair_without_mutating_source(
+    tmp_path: Path,
+) -> None:
+    fixture = _configure_recovery_materializer_fixture(
+        _materializer_fixture(tmp_path), recover_entity_id="e1"
+    )
+    before = {
+        path: path.read_bytes()
+        for path in (
+            fixture.samples_path,
+            fixture.mimo_root / "records.jsonl",
+            Path(fixture.job.target_full_audio_path),
+        )
+    }
+    media = _RecoveredVoiceMediaBackend()
+    summary = materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        audio_backend=media,
+        recovered_voice_analyzer=_RecoveredVoiceAnalyzer(),
+    )
+    records = _shadow_records(fixture)
+    canonical = next(item for item in records if item.pair_type == "canonical")
+    derived = next(
+        item for item in records if item.derived_from_pair_type == "canonical"
+    )
+
+    assert canonical.effective_subject_voices == []
+    assert canonical.audio_references == []
+    assert derived.pair_type == "in_pair"
+    assert len(derived.effective_subject_voices) == 1
+    assert derived.audio_references[0].source_type == "mimo_recovered_target_voice"
+    assert derived.audio_references[0].source_segment_id == "segment_1"
+    assert "<Audio 1> is the voice-timbre reference for <Subject 1> (S1)." in (
+        derived.rendered_h3_prompt or ""
+    )
+    assert "using the voice timbre referenced from <Audio 1>" in (
+        derived.rendered_h3_prompt or ""
+    )
+    assert "mimo_recovered" not in (derived.rendered_h3_prompt or "")
+    assert summary.derived_in_pair_count == 1
+    assert summary.recovered_voice_accepted_count == 1
+    assert summary.existing_target_voice_reference_count == 0
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_existing_in_pair_is_enriched_in_subject_order_and_cross_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    fixture = _configure_recovery_materializer_fixture(
+        _materializer_fixture(tmp_path, source_sample_count=2),
+        recover_entity_id="e2",
+    )
+    materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        recovered_voice_analyzer=_RecoveredVoiceAnalyzer(),
+    )
+    records = _shadow_records(fixture)
+    in_pair = next(item for item in records if item.pair_type == "in_pair")
+    canonical = next(item for item in records if item.pair_type == "canonical")
+
+    assert [item.entity_id for item in in_pair.effective_subject_voices] == ["e1", "e2"]
+    assert [item.source_type for item in in_pair.audio_references] == [
+        "existing_target_voice",
+        "mimo_recovered_target_voice",
+    ]
+    assert "<Audio 2> is the voice-timbre reference for <Subject 2> (S1)." in (
+        in_pair.rendered_h3_prompt or ""
+    )
+    assert canonical.effective_subject_voices == []
+    assert not any(item.derived_from_pair_type == "canonical" for item in records)
+
+
+def test_mimo_recovery_candidate_selection_is_deterministic(tmp_path: Path) -> None:
+    job_values = _job_fixture(tmp_path).model_dump(
+        mode="json", exclude={"request_fingerprint"}
+    )
+    job_values["target_duration_seconds"] = 3.0
+    first = job_values["segments"][0]
+    first.update(
+        end_time=0.4,
+        source_end_sample=12800,
+        current_entity_id=None,
+        entity_occurrence_id=None,
+        identity_scope="unresolved",
+        direct_anchor_seconds=0.0,
+        cluster_binding_status="unbound",
+        direct_support_seconds_by_entity={},
+    )
+    second = dict(first)
+    second.update(
+        segment_id="segment_2",
+        start_time=0.5,
+        end_time=0.9,
+        source_start_sample=16000,
+        source_end_sample=28800,
+        source_speaker_cluster_id="speaker_1",
+        asr_text="Second exact text.",
+    )
+    job_values["segments"] = [first, second]
+    job = _job(job_values)
+    annotation_values = _annotation().model_dump(mode="json")
+    second_decision = dict(annotation_values["segment_decisions"][0])
+    second_decision.update(segment_id="segment_2", primary_speaker_group="g2")
+    annotation_values["segment_decisions"] = [
+        annotation_values["segment_decisions"][0],
+        second_decision,
+    ]
+    annotation = MimoAVAnnotationDraft.model_validate(annotation_values)
+    policy = MimoRecoveredVoiceQualityPolicy(minimum_duration_seconds=0.25)
+
+    recovered, _, voices = recover_mimo_target_voices(
+        job=job,
+        record=_record_fixture(tmp_path, annotation, job=job),
+        subject_index_by_entity={"e1": 1},
+        existing_entity_ids=set(),
+        reference_capacity=3,
+        temporary_root=tmp_path / "temporary",
+        final_root=tmp_path / "final",
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        analyzer=_RecoveredVoiceAnalyzer(),
+        policy=policy,
+    )
+    assert [item.source_segment_id for item in recovered] == ["segment_1", "segment_2"]
+    assert recovered[0].status == "selected"
+    assert recovered[1].reason_codes == ["not_selected_better_candidate"]
+    assert voices[0].source_start_sample == 0
+
+
+def test_review_exposes_recovered_audio_asset_and_provenance(tmp_path: Path) -> None:
+    fixture = _configure_recovery_materializer_fixture(
+        _materializer_fixture(tmp_path), recover_entity_id="e1"
+    )
+    materialize_mimo25_h3_shadow(
+        mimo_root=fixture.mimo_root,
+        source_h3_root=fixture.source_h3,
+        output_root=fixture.output_root,
+        audio_backend=_RecoveredVoiceMediaBackend(),
+        recovered_voice_analyzer=_RecoveredVoiceAnalyzer(),
+    )
+    raw_path = fixture.mimo_root / "raw_responses" / f"{fixture.job.clip_uid}.json"
+    raw_path.parent.mkdir()
+    raw_path.write_text(
+        MimoRawResponse(
+            clip_uid=fixture.job.clip_uid,
+            request_fingerprint=fixture.job.request_fingerprint,
+            raw_responses=[],
+            diagnostics=[],
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    cases, media = build_review_cases(
+        mimo_root=fixture.mimo_root,
+        shadow_root=fixture.output_root,
+    )
+    derived = next(
+        item
+        for item in cases[0].payload["shadow_variants"]
+        if item["derived_from_pair_type"] == "canonical"
+    )
+    audio = derived["audio_references"][0]
+    assert audio["source_type"] == "mimo_recovered_target_voice"
+    assert audio["source_segment_id"] == "segment_1"
+    assert audio["media_url"].removeprefix("/media/") in media
+    page = render_review_html(cases, {})
+    assert '<audio controls preload="none"' in page
+    assert "mimo_recovered_target_voice" in page
+
+
 class _FakeBackend:
     def __init__(self, tmp_path: Path) -> None:
         resolver = MimoMediaResolver(mode="base64", media_root=tmp_path)
@@ -3815,9 +4352,7 @@ class _FailingBackend(_FakeBackend):
                     finish_reason="stop",
                     usage=MimoUsage(reasoning_tokens=3),
                     http_attempt_count=1,
-                    warnings=[
-                        "reasoning_tokens_nonzero_under_disabled_thinking"
-                    ],
+                    warnings=["reasoning_tokens_nonzero_under_disabled_thinking"],
                 ),
                 MimoCompletionDiagnostic(
                     input_modality="full_av_recheck_embedded_audio",
@@ -3987,9 +4522,7 @@ def test_review_cases_validate_provenance_and_include_runtime_diagnostics(
             "request_error": None,
         }
     ]
-    assert "raw response must not enter review HTML" not in json.dumps(
-        cases[0].payload
-    )
+    assert "raw response must not enter review HTML" not in json.dumps(cases[0].payload)
 
 
 def test_review_fingerprint_changes_with_mimo_or_shadow_record(
@@ -4027,9 +4560,7 @@ def test_review_fingerprint_changes_with_mimo_or_shadow_record(
         ],
     )
     assert changed_store.current_annotations() == {}
-    shadow_values = variants[0].model_dump(
-        mode="json", exclude={"record_fingerprint"}
-    )
+    shadow_values = variants[0].model_dump(mode="json", exclude={"record_fingerprint"})
     shadow_values["warnings"] = ["rerendered"]
     changed_shadow = mimo25_materializer._record(shadow_values)
     assert _review_case_fingerprint(fixture.record, [changed_shadow]) != original

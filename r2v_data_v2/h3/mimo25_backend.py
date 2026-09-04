@@ -30,7 +30,7 @@ MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v12"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v7"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.8"
 MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.10"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v6"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v7"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -460,7 +460,9 @@ class MimoBackendProvenance(SchemaModel):
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.8"] = (
         MIMO25_SCHEMA_VERSION
     )
-    materializer_version: Literal["h3_mimo25_materializer_v6"] = (
+    materializer_version: Literal[
+        "h3_mimo25_materializer_v6", "h3_mimo25_materializer_v7"
+    ] = (
         MIMO25_MATERIALIZER_VERSION
     )
     http_max_attempts: int = Field(ge=1, le=5)

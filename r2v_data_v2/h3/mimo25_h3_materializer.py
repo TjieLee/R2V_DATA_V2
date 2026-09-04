@@ -11,9 +11,11 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from r2v_data_v2.h3.audio_backends import AudioMediaBackend, FFmpegAudioMediaBackend
 from r2v_data_v2.h3.jea_final_renderer import (
     FinalH3SampleV2,
     FinalQwen3SpeechSegment,
+    FinalSubjectVoice,
 )
 from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoClipJob,
@@ -27,6 +29,13 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoH3Shot,
     MimoH3SpeechPart,
     MimoSegmentDecision,
+)
+from r2v_data_v2.h3.mimo25_recovered_voice import (
+    RECOVERED_VOICE_POLICY_VERSION,
+    FFmpegRecoveredVoiceAudioAnalyzer,
+    MimoRecoveredVoiceReference,
+    RecoveredVoiceAudioAnalyzer,
+    recover_mimo_target_voices,
 )
 from r2v_data_v2.h3.qwen38_h3_recaption import (
     AudioFactAuditItem,
@@ -48,8 +57,23 @@ from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.5"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.5"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.6"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.6"
+
+
+class MimoShadowAudioReference(SchemaModel):
+    audio_index: int = Field(gt=0)
+    subject_index: int = Field(gt=0)
+    entity_id: str
+    speaker_id: str | None = Field(default=None, pattern=r"^S[1-9]\d*$")
+    source_type: Literal[
+        "existing_target_voice",
+        "mimo_recovered_target_voice",
+        "cross_donor",
+    ]
+    voice_reference_path: str
+    voice_reference_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_segment_id: str | None = None
 
 
 def _compact_json(value: object) -> str:
@@ -69,7 +93,11 @@ def _sha256_file(path: Path) -> str:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -87,19 +115,22 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.5"] = (
-        MIMO25_SHADOW_RECORD_VERSION
-    )
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.6"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
+    source_h3_sample_id: str
     clip_uid: str
     pair_type: Literal["canonical", "in_pair", "cross_pair"]
+    derived_from_pair_type: Literal["canonical"] | None = None
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v6"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v7"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
+    effective_subject_voices: list[FinalSubjectVoice]
+    audio_references: list[MimoShadowAudioReference]
+    recovered_voice_references: list[MimoRecoveredVoiceReference]
     rendered_h3_prompt: str | None = None
     warnings: list[str]
     failure_reason: str | None = None
@@ -110,8 +141,56 @@ class MimoH3ShadowRecord(SchemaModel):
         if self.status == "ready":
             if self.rendered_h3_prompt is None or self.failure_reason is not None:
                 raise ValueError("ready MiMo H3 shadow record is incomplete")
-        elif self.rendered_h3_prompt is not None or not self.failure_reason:
+        elif (
+            self.rendered_h3_prompt is not None
+            or not self.failure_reason
+            or self.effective_subject_voices
+            or self.audio_references
+            or self.recovered_voice_references
+        ):
             raise ValueError("failed MiMo H3 shadow record requires only failure")
+        if (self.derived_from_pair_type is None) != (
+            self.sample_id == self.source_h3_sample_id
+        ):
+            raise ValueError("derived MiMo H3 shadow provenance is inconsistent")
+        if self.pair_type != "in_pair" and self.recovered_voice_references:
+            raise ValueError("only target in-pair shadow may publish recovered voices")
+        if self.pair_type == "canonical" and (
+            self.effective_subject_voices or self.audio_references
+        ):
+            raise ValueError("canonical MiMo shadow must remain voice-free")
+        if len(self.audio_references) != len(self.effective_subject_voices):
+            raise ValueError("MiMo shadow Audio provenance count is inconsistent")
+        if [item.audio_index for item in self.audio_references] != list(
+            range(1, len(self.audio_references) + 1)
+        ):
+            raise ValueError("MiMo shadow Audio provenance order is inconsistent")
+        recovered_by_entity = {
+            item.entity_id: item
+            for item in self.recovered_voice_references
+            if item.status == "selected"
+        }
+        for voice, audio in zip(self.effective_subject_voices, self.audio_references):
+            recovered = recovered_by_entity.get(voice.entity_id)
+            expected_source = (
+                "cross_donor"
+                if voice.voice_source == "cross_donor"
+                else (
+                    "mimo_recovered_target_voice"
+                    if recovered is not None
+                    else "existing_target_voice"
+                )
+            )
+            if (
+                audio.subject_index != voice.subject_index
+                or audio.entity_id != voice.entity_id
+                or audio.source_type != expected_source
+                or audio.voice_reference_path != voice.voice_reference_path
+                or audio.voice_reference_sha256 != voice.voice_reference_sha256
+                or audio.source_segment_id
+                != (None if recovered is None else recovered.source_segment_id)
+            ):
+                raise ValueError("MiMo shadow Audio provenance differs from voice asset")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("MiMo H3 shadow record fingerprint is invalid")
@@ -119,7 +198,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.5"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.6"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -130,6 +209,17 @@ class MimoH3ShadowSummary(SchemaModel):
     failed_count: int = Field(ge=0)
     warning_counts: dict[str, int]
     target_clip_annotation_reuse_count: int = Field(ge=0)
+    recovered_voice_quality_policy_version: Literal[
+        "h3_mimo25_recovered_voice_quality_v1"
+    ] = RECOVERED_VOICE_POLICY_VERSION
+    existing_target_voice_reference_count: int = Field(ge=0)
+    recovered_voice_candidate_count: int = Field(ge=0)
+    recovered_voice_accepted_count: int = Field(ge=0)
+    recovered_voice_rejected_count: int = Field(ge=0)
+    recovered_voice_entity_count: int = Field(ge=0)
+    derived_in_pair_count: int = Field(ge=0)
+    enriched_existing_in_pair_count: int = Field(ge=0)
+    recovery_rejection_reason_counts: dict[str, int]
     asr_text_modified: Literal[False] = False
     asr_language_modified: Literal[False] = False
     source_segments_deleted: Literal[False] = False
@@ -139,6 +229,10 @@ class MimoH3ShadowSummary(SchemaModel):
     def validate_counts(self) -> MimoH3ShadowSummary:
         if self.sample_count != self.ready_count + self.failed_count:
             raise ValueError("MiMo H3 shadow summary counts must reconcile")
+        if self.recovered_voice_candidate_count != (
+            self.recovered_voice_accepted_count + self.recovered_voice_rejected_count
+        ):
+            raise ValueError("MiMo recovered voice counts must reconcile")
         return self
 
 
@@ -159,7 +253,9 @@ def _corrected_segments(
     decisions = {item.segment_id: item for item in record.annotation.segment_decisions}
     source_by_id = {item.segment_id: item for item in job.segments}
     sample_by_id = {item.segment_id: item for item in sample.speech_segments}
-    transcribed_ids = [item.segment_id for item in job.segments if item.asr_status == "transcribed"]
+    transcribed_ids = [
+        item.segment_id for item in job.segments if item.asr_status == "transcribed"
+    ]
     if set(sample_by_id) != set(transcribed_ids):
         raise ValueError("source H3 speech inventory differs from authoritative ASR")
     corrected: list[FinalQwen3SpeechSegment] = []
@@ -179,7 +275,10 @@ def _corrected_segments(
             or original.speaker_cluster_id != source.source_speaker_cluster_id
         ):
             raise ValueError("source H3 speech differs from authoritative Qwen3-ASR")
-        resolved = decision.resolution == "resolved" and decision.primary_speaker_group is not None
+        resolved = (
+            decision.resolution == "resolved"
+            and decision.primary_speaker_group is not None
+        )
         group = (
             decision.primary_speaker_group
             if resolved
@@ -253,7 +352,9 @@ def _audio_facts(
                 speaker_cluster_id=segment.speaker_cluster_id,
                 entity_id=segment.entity_id,
                 entity_subject_label=(
-                    None if segment.entity_id is None else entity_subject.get(segment.entity_id)
+                    None
+                    if segment.entity_id is None
+                    else entity_subject.get(segment.entity_id)
                 ),
                 speaker_id=speaker_ids[segment.speaker_cluster_id],
                 start_time=segment.start_time,
@@ -331,7 +432,9 @@ def _materialize_sample(
     assert record.annotation is not None
     corrected, warnings = _corrected_segments(sample, job, record)
     corrected_payload = sample.model_dump(mode="python")
-    corrected_payload["speech_segments"] = [item.model_dump(mode="python") for item in corrected]
+    corrected_payload["speech_segments"] = [
+        item.model_dump(mode="python") for item in corrected
+    ]
     corrected_sample = FinalH3SampleV2.model_validate(corrected_payload)
     variant = _variant(corrected_sample)
     contract = build_reference_contract(corrected_sample, variant)
@@ -355,8 +458,7 @@ def _materialize_sample(
     )
     semantics = record.annotation.audio_semantics
     audio_event_by_id = {
-        item.event_id: item.description
-        for item in semantics.temporal_non_speech_events
+        item.event_id: item.description for item in semantics.temporal_non_speech_events
     }
     prefix = (
         "[reference generation]"
@@ -399,9 +501,7 @@ def _materialize_sample(
             for item in facts.non_speech_events
         ],
     )
-    decisions = {
-        item.segment_id: item for item in record.annotation.segment_decisions
-    }
+    decisions = {item.segment_id: item for item in record.annotation.segment_decisions}
     structured = materialize_h3_draft(
         draft,
         request,
@@ -420,8 +520,7 @@ def _materialize_sample(
     warnings.extend(validation_warnings)
     if record.annotation.warnings:
         warnings.extend(
-            f"{item.segment_id}:{item.code}"
-            for item in record.annotation.warnings
+            f"{item.segment_id}:{item.code}" for item in record.annotation.warnings
         )
     return corrected, render_h3_prompt(structured), sorted(set(warnings))
 
@@ -431,6 +530,80 @@ def _record(values: dict[str, object]) -> MimoH3ShadowRecord:
         **values,
         record_fingerprint=_sha256_text(_compact_json(values)),
     )
+
+
+def _sample_with_voices(
+    sample: FinalH3SampleV2,
+    *,
+    voices: Sequence[FinalSubjectVoice],
+    sample_id: str | None = None,
+    pair_id: str | None = None,
+    pair_type: Literal["canonical", "in_pair", "cross_pair"] | None = None,
+) -> FinalH3SampleV2:
+    values = sample.model_dump(mode="python")
+    values["subject_voices"] = [item.model_dump(mode="python") for item in voices]
+    if sample_id is not None:
+        values["sample_id"] = sample_id
+    if pair_id is not None:
+        values["pair_id"] = pair_id
+    if pair_type is not None:
+        values["pair_type"] = pair_type
+    return FinalH3SampleV2.model_validate(values)
+
+
+def _subject_index_by_entity(job: MimoClipJob) -> dict[str, int]:
+    return {
+        item.entity_id: item.subject_index
+        for item in job.reference_subjects
+        if item.kind == "entity" and item.entity_id is not None
+    }
+
+
+def _audio_references(
+    *,
+    voices: Sequence[FinalSubjectVoice],
+    corrected: Sequence[FinalQwen3SpeechSegment],
+    recovered: Sequence[MimoRecoveredVoiceReference],
+) -> list[MimoShadowAudioReference]:
+    speaker_ids = _speaker_ids(corrected)
+    speaker_by_entity: dict[str, str] = {}
+    for speech in corrected:
+        if speech.entity_id is not None and speech.entity_id not in speaker_by_entity:
+            speaker_by_entity[speech.entity_id] = speaker_ids[speech.speaker_cluster_id]
+    recovered_by_entity = {
+        item.entity_id: item for item in recovered if item.status == "selected"
+    }
+    result: list[MimoShadowAudioReference] = []
+    for index, voice in enumerate(
+        sorted(voices, key=lambda item: (item.subject_index, item.entity_id)),
+        start=1,
+    ):
+        recovered_voice = recovered_by_entity.get(voice.entity_id)
+        result.append(
+            MimoShadowAudioReference(
+                audio_index=index,
+                subject_index=voice.subject_index,
+                entity_id=voice.entity_id,
+                speaker_id=speaker_by_entity.get(voice.entity_id),
+                source_type=(
+                    "cross_donor"
+                    if voice.voice_source == "cross_donor"
+                    else (
+                        "mimo_recovered_target_voice"
+                        if recovered_voice is not None
+                        else "existing_target_voice"
+                    )
+                ),
+                voice_reference_path=voice.voice_reference_path,
+                voice_reference_sha256=voice.voice_reference_sha256,
+                source_segment_id=(
+                    None
+                    if recovered_voice is None
+                    else recovered_voice.source_segment_id
+                ),
+            )
+        )
+    return result
 
 
 def _validate_job_media_integrity(job: MimoClipJob) -> None:
@@ -479,9 +652,7 @@ def _validate_materializer_provenance(
         if job is None or record.request_fingerprint != job.request_fingerprint:
             raise ValueError("MiMo record request fingerprint mismatch")
     for job in inventory.jobs:
-        if sorted(sample_ids_by_clip[job.clip_uid]) != sorted(
-            job.source_h3_sample_ids
-        ):
+        if sorted(sample_ids_by_clip[job.clip_uid]) != sorted(job.source_h3_sample_ids):
             raise ValueError("MiMo source H3 sample IDs changed after AV annotation")
         _validate_job_media_integrity(job)
 
@@ -492,6 +663,8 @@ def materialize_mimo25_h3_shadow(
     source_h3_root: Path,
     output_root: Path,
     overwrite: bool = False,
+    audio_backend: AudioMediaBackend | None = None,
+    recovered_voice_analyzer: RecoveredVoiceAudioAnalyzer | None = None,
 ) -> MimoH3ShadowSummary:
     source_mimo = mimo_root.expanduser().resolve(strict=True)
     source_h3 = source_h3_root.expanduser().resolve(strict=True)
@@ -530,16 +703,72 @@ def materialize_mimo25_h3_shadow(
     temporary.mkdir(parents=True)
     records: list[MimoH3ShadowRecord] = []
     warning_counts: Counter[str] = Counter()
+    recovery_records: list[MimoRecoveredVoiceReference] = []
+    temporary_recovered_by_clip: dict[str, list[FinalSubjectVoice]] = {}
+    published_recovered_by_clip: dict[str, list[FinalSubjectVoice]] = {}
+    active_audio_backend = audio_backend or FFmpegAudioMediaBackend()
+    active_analyzer = recovered_voice_analyzer or FFmpegRecoveredVoiceAudioAnalyzer()
+    existing_target_by_clip: dict[str, list[FinalSubjectVoice]] = {}
+    canonical_by_clip: dict[str, FinalH3SampleV2] = {}
+    in_pair_by_clip: dict[str, FinalH3SampleV2] = {}
+    for sample in source_samples:
+        if sample.pair_type == "canonical":
+            if sample.clip_uid in canonical_by_clip:
+                raise ValueError("MiMo source H3 contains duplicate canonical samples")
+            canonical_by_clip[sample.clip_uid] = sample
+        elif sample.pair_type == "in_pair":
+            if sample.clip_uid in in_pair_by_clip:
+                raise ValueError("MiMo source H3 contains duplicate in-pair samples")
+            in_pair_by_clip[sample.clip_uid] = sample
+            existing_target_by_clip[sample.clip_uid] = [
+                item for item in sample.subject_voices if item.voice_source == "target"
+            ]
     try:
+        for job in inventory.jobs:
+            mimo_record = record_by_clip[job.clip_uid]
+            canonical = canonical_by_clip.get(job.clip_uid)
+            if canonical is None:
+                raise ValueError("MiMo source H3 canonical sample is missing")
+            existing = existing_target_by_clip.get(job.clip_uid, [])
+            existing_ids = {item.entity_id for item in existing}
+            if len(existing_ids) != len(existing):
+                raise ValueError("MiMo source target voices contain duplicate entities")
+            capacity = min(
+                3 - len(existing),
+                12 - len(canonical.visual_references) - len(existing),
+            )
+            if mimo_record.status != "ready":
+                continue
+            clip_records, temporary_voices, published_voices = (
+                recover_mimo_target_voices(
+                    job=job,
+                    record=mimo_record,
+                    subject_index_by_entity=_subject_index_by_entity(job),
+                    existing_entity_ids=existing_ids,
+                    reference_capacity=max(0, capacity),
+                    temporary_root=temporary,
+                    final_root=destination,
+                    audio_backend=active_audio_backend,
+                    analyzer=active_analyzer,
+                )
+            )
+            recovery_records.extend(clip_records)
+            temporary_recovered_by_clip[job.clip_uid] = temporary_voices
+            published_recovered_by_clip[job.clip_uid] = published_voices
+
         for sample in source_samples:
             source_hash = _sha256_text(_compact_json(sample.model_dump(mode="json")))
             job = job_by_clip.get(sample.clip_uid)
             mimo_record = record_by_clip.get(sample.clip_uid)
+            published_recovered = published_recovered_by_clip.get(sample.clip_uid, [])
+            temporary_recovered = temporary_recovered_by_clip.get(sample.clip_uid, [])
             base = {
                 "schema_version": MIMO25_SHADOW_RECORD_VERSION,
                 "sample_id": sample.sample_id,
+                "source_h3_sample_id": sample.sample_id,
                 "clip_uid": sample.clip_uid,
                 "pair_type": sample.pair_type,
+                "derived_from_pair_type": None,
                 "source_mimo_record_fingerprint": (
                     "0" * 64 if mimo_record is None else mimo_record.record_fingerprint
                 ),
@@ -551,14 +780,39 @@ def materialize_mimo25_h3_shadow(
                     **base,
                     "status": "failed",
                     "corrected_speech_segments": [],
+                    "effective_subject_voices": [],
+                    "audio_references": [],
+                    "recovered_voice_references": [],
                     "rendered_h3_prompt": None,
                     "warnings": [],
                     "failure_reason": "ready MiMo target annotation is unavailable",
                 }
             else:
                 try:
+                    render_sample = sample
+                    published_voices = list(sample.subject_voices)
+                    sample_recovery: list[MimoRecoveredVoiceReference] = []
+                    if sample.pair_type == "in_pair" and published_recovered:
+                        temporary_effective = sorted(
+                            [*sample.subject_voices, *temporary_recovered],
+                            key=lambda item: (item.subject_index, item.entity_id),
+                        )
+                        render_sample = _sample_with_voices(
+                            sample,
+                            voices=temporary_effective,
+                        )
+                        published_voices = sorted(
+                            [*sample.subject_voices, *published_recovered],
+                            key=lambda item: (item.subject_index, item.entity_id),
+                        )
+                        sample_recovery = [
+                            item
+                            for item in recovery_records
+                            if item.clip_uid == sample.clip_uid
+                            and item.status == "selected"
+                        ]
                     corrected, rendered, warnings = _materialize_sample(
-                        sample, job, mimo_record
+                        render_sample, job, mimo_record
                     )
                     warning_counts.update(warnings)
                     values = {
@@ -566,6 +820,20 @@ def materialize_mimo25_h3_shadow(
                         "status": "ready",
                         "corrected_speech_segments": [
                             item.model_dump(mode="json") for item in corrected
+                        ],
+                        "effective_subject_voices": [
+                            item.model_dump(mode="json") for item in published_voices
+                        ],
+                        "audio_references": [
+                            item.model_dump(mode="json")
+                            for item in _audio_references(
+                                voices=published_voices,
+                                corrected=corrected,
+                                recovered=sample_recovery,
+                            )
+                        ],
+                        "recovered_voice_references": [
+                            item.model_dump(mode="json") for item in sample_recovery
                         ],
                         "rendered_h3_prompt": rendered,
                         "warnings": warnings,
@@ -576,12 +844,95 @@ def materialize_mimo25_h3_shadow(
                         **base,
                         "status": "failed",
                         "corrected_speech_segments": [],
+                        "effective_subject_voices": [],
+                        "audio_references": [],
+                        "recovered_voice_references": [],
                         "rendered_h3_prompt": None,
                         "warnings": [],
                         "failure_reason": f"{type(exc).__name__}: {exc}",
                     }
             records.append(_record(values))
+
+        for clip_uid, recovered_voices in sorted(published_recovered_by_clip.items()):
+            if not recovered_voices or clip_uid in in_pair_by_clip:
+                continue
+            canonical = canonical_by_clip[clip_uid]
+            job = job_by_clip[clip_uid]
+            mimo_record = record_by_clip[clip_uid]
+            temporary_voices = temporary_recovered_by_clip[clip_uid]
+            render_sample = _sample_with_voices(
+                canonical,
+                voices=temporary_voices,
+                sample_id=f"{canonical.sample_id}/mimo_recovered_in_pair",
+                pair_id=f"in_pair/{clip_uid}/mimo_recovered",
+                pair_type="in_pair",
+            )
+            published_sample = _sample_with_voices(
+                canonical,
+                voices=recovered_voices,
+                sample_id=render_sample.sample_id,
+                pair_id=render_sample.pair_id,
+                pair_type="in_pair",
+            )
+            selected_recovery = [
+                item
+                for item in recovery_records
+                if item.clip_uid == clip_uid and item.status == "selected"
+            ]
+            corrected, rendered, warnings = _materialize_sample(
+                render_sample, job, mimo_record
+            )
+            warning_counts.update(warnings)
+            records.append(
+                _record(
+                    {
+                        "schema_version": MIMO25_SHADOW_RECORD_VERSION,
+                        "sample_id": published_sample.sample_id,
+                        "source_h3_sample_id": canonical.sample_id,
+                        "clip_uid": clip_uid,
+                        "pair_type": "in_pair",
+                        "derived_from_pair_type": "canonical",
+                        "status": "ready",
+                        "source_mimo_record_fingerprint": mimo_record.record_fingerprint,
+                        "source_h3_sample_sha256": _sha256_text(
+                            _compact_json(canonical.model_dump(mode="json"))
+                        ),
+                        "materializer_version": MIMO25_MATERIALIZER_VERSION,
+                        "corrected_speech_segments": [
+                            item.model_dump(mode="json") for item in corrected
+                        ],
+                        "effective_subject_voices": [
+                            item.model_dump(mode="json") for item in recovered_voices
+                        ],
+                        "audio_references": [
+                            item.model_dump(mode="json")
+                            for item in _audio_references(
+                                voices=recovered_voices,
+                                corrected=corrected,
+                                recovered=selected_recovery,
+                            )
+                        ],
+                        "recovered_voice_references": [
+                            item.model_dump(mode="json") for item in selected_recovery
+                        ],
+                        "rendered_h3_prompt": rendered,
+                        "warnings": warnings,
+                        "failure_reason": None,
+                    }
+                )
+            )
+        records.sort(key=lambda item: (item.clip_uid, item.sample_id))
         _write_jsonl(temporary / "records.jsonl", records)
+        _write_jsonl(temporary / "recovered_voice_references.jsonl", recovery_records)
+        selected_recovery = [
+            item for item in recovery_records if item.status == "selected"
+        ]
+        rejection_counts = Counter(
+            code
+            for item in recovery_records
+            if item.status == "rejected"
+            for code in item.reason_codes
+        )
         summary = MimoH3ShadowSummary(
             source_mimo_inventory_fingerprint=inventory.inventory_fingerprint,
             source_mimo_records_sha256=_sha256_file(source_mimo / "records.jsonl"),
@@ -591,8 +942,30 @@ def materialize_mimo25_h3_shadow(
             failed_count=sum(item.status == "failed" for item in records),
             warning_counts=dict(sorted(warning_counts.items())),
             target_clip_annotation_reuse_count=sum(
-                max(0, count - 1) for count in Counter(item.clip_uid for item in source_samples).values()
+                max(0, count - 1)
+                for count in Counter(item.clip_uid for item in records).values()
             ),
+            existing_target_voice_reference_count=sum(
+                len(items) for items in existing_target_by_clip.values()
+            ),
+            recovered_voice_candidate_count=len(recovery_records),
+            recovered_voice_accepted_count=len(selected_recovery),
+            recovered_voice_rejected_count=(
+                len(recovery_records) - len(selected_recovery)
+            ),
+            recovered_voice_entity_count=len(
+                {(item.clip_uid, item.entity_id) for item in selected_recovery}
+            ),
+            derived_in_pair_count=sum(
+                item.derived_from_pair_type == "canonical" for item in records
+            ),
+            enriched_existing_in_pair_count=sum(
+                item.pair_type == "in_pair"
+                and item.derived_from_pair_type is None
+                and bool(item.recovered_voice_references)
+                for item in records
+            ),
+            recovery_rejection_reason_counts=dict(sorted(rejection_counts.items())),
         )
         _write_json(temporary / "summary.json", summary.model_dump(mode="json"))
         destination.parent.mkdir(parents=True, exist_ok=True)

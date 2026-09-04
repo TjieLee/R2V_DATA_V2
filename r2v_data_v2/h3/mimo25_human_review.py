@@ -77,8 +77,20 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -166,7 +178,9 @@ def build_review_cases(
     inventory = MimoInventory.model_validate_json(
         (mimo / "inventory.json").read_text(encoding="utf-8")
     )
-    records = [MimoRecord.model_validate(row) for row in _read_jsonl(mimo / "records.jsonl")]
+    records = [
+        MimoRecord.model_validate(row) for row in _read_jsonl(mimo / "records.jsonl")
+    ]
     shadow_records = [
         MimoH3ShadowRecord.model_validate(row)
         for row in _read_jsonl(shadow / "records.jsonl")
@@ -194,7 +208,9 @@ def build_review_cases(
         shadow_by_clip.setdefault(record.clip_uid, []).append(record)
     legacy_by_sample: dict[str, Qwen38RecaptionRecord] = {}
     if legacy_qwen38_root is not None:
-        legacy_path = legacy_qwen38_root.expanduser().resolve(strict=True) / "records.jsonl"
+        legacy_path = (
+            legacy_qwen38_root.expanduser().resolve(strict=True) / "records.jsonl"
+        )
         legacy_by_sample = {
             item.sample_id: item
             for item in (
@@ -224,7 +240,10 @@ def build_review_cases(
         variants = sorted(
             shadow_by_clip.get(job.clip_uid, []), key=lambda item: item.sample_id
         )
-        actual_sample_ids = [item.sample_id for item in variants]
+        source_variants = [
+            item for item in variants if item.derived_from_pair_type is None
+        ]
+        actual_sample_ids = [item.source_h3_sample_id for item in source_variants]
         if actual_sample_ids != sorted(job.source_h3_sample_ids):
             raise ValueError(
                 "MiMo review shadow provenance differs from current AV annotation"
@@ -232,6 +251,14 @@ def build_review_cases(
         if any(
             item.clip_uid != job.clip_uid
             or item.source_mimo_record_fingerprint != record.record_fingerprint
+            or (
+                item.derived_from_pair_type is not None
+                and (
+                    item.derived_from_pair_type != "canonical"
+                    or item.pair_type != "in_pair"
+                    or item.source_h3_sample_id not in job.source_h3_sample_ids
+                )
+            )
             for item in variants
         ):
             raise ValueError(
@@ -254,7 +281,24 @@ def build_review_cases(
             path = Path(item.image_artifact_path).resolve(strict=True)
             token = _token(path)
             media[token] = path
-            references.append({**item.model_dump(mode="json"), "media_url": f"/media/{token}"})
+            references.append(
+                {**item.model_dump(mode="json"), "media_url": f"/media/{token}"}
+            )
+        shadow_variants = []
+        for item in variants:
+            variant = item.model_dump(mode="json")
+            audio_references = []
+            for audio in item.audio_references:
+                path = Path(audio.voice_reference_path).resolve(strict=True)
+                if _sha256_file(path) != audio.voice_reference_sha256:
+                    raise ValueError("MiMo review Audio reference provenance mismatch")
+                token = _token(path)
+                media[token] = path
+                audio_references.append(
+                    {**audio.model_dump(mode="json"), "media_url": f"/media/{token}"}
+                )
+            variant["audio_references"] = audio_references
+            shadow_variants.append(variant)
         review_fingerprint = _review_case_fingerprint(record, variants)
         payload = {
             "clip_uid": job.clip_uid,
@@ -264,7 +308,7 @@ def build_review_cases(
             "source_segments": [item.model_dump(mode="json") for item in job.segments],
             "mimo_record": record.model_dump(mode="json"),
             "mimo_runtime_diagnostics": raw.diagnostics,
-            "shadow_variants": [item.model_dump(mode="json") for item in variants],
+            "shadow_variants": shadow_variants,
             "legacy_qwen38": {
                 item.sample_id: legacy_by_sample[item.sample_id].rendered_h3_prompt
                 for item in variants
@@ -315,7 +359,9 @@ class MimoReviewStore:
         rows = [by_clip[key] for key in sorted(by_clip)]
         _atomic_text(
             self.annotations_path,
-            "".join(_compact_json(item.model_dump(mode="json")) + "\n" for item in rows),
+            "".join(
+                _compact_json(item.model_dump(mode="json")) + "\n" for item in rows
+            ),
         )
         return self.publish_derived()
 
@@ -338,17 +384,43 @@ class MimoReviewStore:
         )
         _atomic_text(
             self.root / "summary.json",
-            json.dumps(summary.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            json.dumps(
+                summary.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            )
+            + "\n",
         )
         csv_path = self.root / "annotations.csv"
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{csv_path.name}.", dir=csv_path.parent)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{csv_path.name}.", dir=csv_path.parent
+        )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(("clip_uid", "record_fingerprint", "decision", "issue_tags", "notes", "reviewed_at"))
+                writer.writerow(
+                    (
+                        "clip_uid",
+                        "record_fingerprint",
+                        "decision",
+                        "issue_tags",
+                        "notes",
+                        "reviewed_at",
+                    )
+                )
                 for item in sorted(current, key=lambda row: row.clip_uid):
-                    writer.writerow((item.clip_uid, item.record_fingerprint, item.decision, "|".join(item.issue_tags), item.notes, item.reviewed_at))
+                    writer.writerow(
+                        (
+                            item.clip_uid,
+                            item.record_fingerprint,
+                            item.decision,
+                            "|".join(item.issue_tags),
+                            item.notes,
+                            item.reviewed_at,
+                        )
+                    )
             Path(temporary).replace(csv_path)
         except Exception:
             Path(temporary).unlink(missing_ok=True)
@@ -356,19 +428,26 @@ class MimoReviewStore:
         return summary
 
 
-def render_review_html(cases: Sequence[MimoReviewCase], annotations: dict[str, MimoHumanReviewAnnotation]) -> str:
+def render_review_html(
+    cases: Sequence[MimoReviewCase], annotations: dict[str, MimoHumanReviewAnnotation]
+) -> str:
     payload = [
         {**item.payload, "review_case_fingerprint": item.record_fingerprint}
         for item in cases
     ]
-    annotation_payload = {key: value.model_dump(mode="json") for key, value in annotations.items()}
-    tags = "".join(f'<label><input type="checkbox" value="{html.escape(tag)}"> {html.escape(tag)}</label>' for tag in ISSUE_TAGS)
+    annotation_payload = {
+        key: value.model_dump(mode="json") for key, value in annotations.items()
+    }
+    tags = "".join(
+        f'<label><input type="checkbox" value="{html.escape(tag)}"> {html.escape(tag)}</label>'
+        for tag in ISSUE_TAGS
+    )
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>MiMo AV Review</title>
 <style>body{{font:14px system-ui;margin:0;background:#f4f5f7;color:#18202a}}header{{position:sticky;top:0;background:#fff;padding:12px 20px;border-bottom:1px solid #ccd2da;z-index:2}}main{{display:grid;grid-template-columns:minmax(420px,1fr) minmax(520px,1.3fr);gap:16px;padding:16px}}video{{width:100%;max-height:48vh;background:#000}}.panel{{background:#fff;border:1px solid #ccd2da;padding:12px;border-radius:6px;overflow:auto}}.refs{{display:flex;gap:8px;overflow:auto}}.refs img{{height:130px}}table{{border-collapse:collapse;width:100%;font-size:12px}}td,th{{border:1px solid #d8dde4;padding:5px;vertical-align:top}}pre{{white-space:pre-wrap}}button{{padding:10px 18px;margin:4px;font-weight:700}}.pass{{background:#d7f5df}}.issue{{background:#ffe1dc}}.skip{{background:#eee}}#tags label{{display:inline-block;margin:4px 10px 4px 0}}</style></head>
 <body><header><button onclick="move(-1)">Previous</button><button onclick="move(1)">Next</button><b id="progress"></b></header><main><section class="panel"><h2 id="title"></h2><video id="video" controls></video><h3>Frozen references</h3><div id="refs" class="refs"></div><h3>Segments</h3><div id="segments"></div><h3>Audio semantics</h3><pre id="audio"></pre><h3>MiMo runtime diagnostics</h3><pre id="diagnostics"></pre></section><section class="panel"><h3>MiMo H3 shadow</h3><div id="shadow"></div><h3>Legacy Qwen3.8</h3><div id="legacy"></div><hr><button class="pass" onclick="save('PASS')">PASS</button><button class="issue" onclick="save('ISSUE')">ISSUE</button><button class="skip" onclick="save('SKIP')">SKIP</button><div id="tags">{tags}</div><textarea id="notes" rows="4" style="width:100%" placeholder="notes"></textarea></section></main>
-<script>const cases={json.dumps(payload, ensure_ascii=False).replace('</', '<\\/')};const initial={json.dumps(annotation_payload, ensure_ascii=False).replace('</', '<\\/')};let index=0;
+<script>const cases={json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")};const initial={json.dumps(annotation_payload, ensure_ascii=False).replace("</", "<\\/")};let index=0;
 function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
-function draw(){{const c=cases[index],r=c.mimo_record.annotation;document.getElementById('progress').textContent=` ${{index+1}} / ${{cases.length}}`;document.getElementById('title').textContent=c.clip_uid;document.getElementById('video').src=c.target_video_url;document.getElementById('refs').innerHTML=c.references.map(x=>`<figure><img src="${{x.media_url}}"><figcaption>${{esc(x.picture_label)}} ${{esc(x.entity_id||x.kind)}}</figcaption></figure>`).join('');const decisions=Object.fromEntries((r?.segment_decisions||[]).map(x=>[x.segment_id,x]));document.getElementById('segments').innerHTML='<table><tr><th>ID/time</th><th>ASR exact</th><th>source proposal</th><th>MiMo correction</th></tr>'+c.source_segments.map(x=>`<tr><td>${{esc(x.segment_id)}}<br>${{x.start_time}}-${{x.end_time}}</td><td>[${{esc(x.asr_language)}}] ${{esc(x.asr_text)}}</td><td>${{esc(x.source_speaker_cluster_id)}} / ${{esc(x.current_entity_id)}}<br>${{esc(x.identity_scope)}}</td><td><pre>${{esc(JSON.stringify(decisions[x.segment_id]||null,null,2))}}</pre></td></tr>`).join('')+'</table>';document.getElementById('audio').textContent=JSON.stringify(r?.audio_semantics||null,null,2);document.getElementById('diagnostics').textContent=JSON.stringify(c.mimo_runtime_diagnostics||[],null,2);document.getElementById('shadow').innerHTML=c.shadow_variants.map(x=>`<h4>${{esc(x.sample_id)}} (${{esc(x.pair_type)}})</h4><pre>${{esc(x.rendered_h3_prompt||x.failure_reason)}}</pre>`).join('');document.getElementById('legacy').innerHTML=Object.entries(c.legacy_qwen38).map(([k,v])=>`<h4>${{esc(k)}}</h4><pre>${{esc(v)}}</pre>`).join('')||'[not supplied]';const a=initial[c.clip_uid];document.getElementById('notes').value=a?.notes||'';document.querySelectorAll('#tags input').forEach(el=>el.checked=!!a?.issue_tags?.includes(el.value));}}
+function draw(){{const c=cases[index],r=c.mimo_record.annotation;document.getElementById('progress').textContent=` ${{index+1}} / ${{cases.length}}`;document.getElementById('title').textContent=c.clip_uid;document.getElementById('video').src=c.target_video_url;document.getElementById('refs').innerHTML=c.references.map(x=>`<figure><img src="${{x.media_url}}"><figcaption>${{esc(x.picture_label)}} ${{esc(x.entity_id||x.kind)}}</figcaption></figure>`).join('');const decisions=Object.fromEntries((r?.segment_decisions||[]).map(x=>[x.segment_id,x]));document.getElementById('segments').innerHTML='<table><tr><th>ID/time</th><th>ASR exact</th><th>source proposal</th><th>MiMo correction</th></tr>'+c.source_segments.map(x=>`<tr><td>${{esc(x.segment_id)}}<br>${{x.start_time}}-${{x.end_time}}</td><td>[${{esc(x.asr_language)}}] ${{esc(x.asr_text)}}</td><td>${{esc(x.source_speaker_cluster_id)}} / ${{esc(x.current_entity_id)}}<br>${{esc(x.identity_scope)}}</td><td><pre>${{esc(JSON.stringify(decisions[x.segment_id]||null,null,2))}}</pre></td></tr>`).join('')+'</table>';document.getElementById('audio').textContent=JSON.stringify(r?.audio_semantics||null,null,2);document.getElementById('diagnostics').textContent=JSON.stringify(c.mimo_runtime_diagnostics||[],null,2);document.getElementById('shadow').innerHTML=c.shadow_variants.map(x=>`<h4>${{esc(x.sample_id)}} (${{esc(x.pair_type)}})</h4>${{(x.audio_references||[]).map(a=>`<div><b>&lt;Audio ${{a.audio_index}}&gt;</b> Subject ${{a.subject_index}} / ${{esc(a.entity_id)}} / ${{esc(a.speaker_id||'no Sx')}}<br>source: ${{esc(a.source_type)}}${{a.source_segment_id?' / '+esc(a.source_segment_id):''}}<br><audio controls preload="none" src="${{a.media_url}}"></audio></div>`).join('')}}<pre>${{esc(x.rendered_h3_prompt||x.failure_reason)}}</pre>`).join('');document.getElementById('legacy').innerHTML=Object.entries(c.legacy_qwen38).map(([k,v])=>`<h4>${{esc(k)}}</h4><pre>${{esc(v)}}</pre>`).join('')||'[not supplied]';const a=initial[c.clip_uid];document.getElementById('notes').value=a?.notes||'';document.querySelectorAll('#tags input').forEach(el=>el.checked=!!a?.issue_tags?.includes(el.value));}}
 function move(delta){{index=Math.max(0,Math.min(cases.length-1,index+delta));draw();}}
 async function save(decision){{const c=cases[index],tags=[...document.querySelectorAll('#tags input:checked')].map(x=>x.value);if(decision==='ISSUE'&&!tags.length){{alert('Select an issue tag');return;}}const body={{schema_version:'{MIMO25_REVIEW_ANNOTATION_VERSION}',clip_uid:c.clip_uid,record_fingerprint:c.review_case_fingerprint,decision,issue_tags:decision==='ISSUE'?tags:[],notes:document.getElementById('notes').value,reviewed_at:new Date().toISOString()}};const response=await fetch('/api/annotation',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(!response.ok){{alert(await response.text());return;}}initial[c.clip_uid]=body;move(1);}}draw();</script></body></html>"""
 
@@ -409,17 +488,27 @@ def make_review_server(
             if range_header:
                 range_match = re.fullmatch(r"bytes=(\d+)-(\d*)", range_header)
                 if range_match is None:
-                    self._send(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, b"", "text/plain")
+                    self._send(
+                        HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, b"", "text/plain"
+                    )
                     return
                 start = int(range_match.group(1))
-                end = min(size - 1, int(range_match.group(2)) if range_match.group(2) else size - 1)
+                end = min(
+                    size - 1,
+                    int(range_match.group(2)) if range_match.group(2) else size - 1,
+                )
                 if start > end:
-                    self._send(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, b"", "text/plain")
+                    self._send(
+                        HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, b"", "text/plain"
+                    )
                     return
                 status = HTTPStatus.PARTIAL_CONTENT
             length = end - start + 1
             self.send_response(status)
-            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+            self.send_header(
+                "Content-Type",
+                mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            )
             self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Cache-Control", "no-store")
@@ -438,11 +527,21 @@ def make_review_server(
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 64 * 1024:
                     raise ValueError("invalid annotation payload length")
-                annotation = MimoHumanReviewAnnotation.model_validate_json(self.rfile.read(length))
+                annotation = MimoHumanReviewAnnotation.model_validate_json(
+                    self.rfile.read(length)
+                )
                 summary = store.save(annotation)
-                self._send(HTTPStatus.OK, _compact_json(summary.model_dump(mode="json")).encode(), "application/json")
+                self._send(
+                    HTTPStatus.OK,
+                    _compact_json(summary.model_dump(mode="json")).encode(),
+                    "application/json",
+                )
             except (OSError, ValueError) as exc:
-                self._send(HTTPStatus.BAD_REQUEST, str(exc).encode(), "text/plain; charset=utf-8")
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    str(exc).encode(),
+                    "text/plain; charset=utf-8",
+                )
 
         def log_message(self, format: str, *args: object) -> None:
             return
