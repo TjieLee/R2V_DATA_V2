@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v18"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v19"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v13"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.12"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.16"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v11"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.17"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v12"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -523,7 +523,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.16"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.17"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -540,7 +540,7 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v18"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v19"] = (
         MIMO25_PROMPT_VERSION
     )
     policy_version: Literal["h3_mimo25_av_authority_contract_v13"] = (
@@ -556,6 +556,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v9",
         "h3_mimo25_materializer_v10",
         "h3_mimo25_materializer_v11",
+        "h3_mimo25_materializer_v12",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -656,6 +657,7 @@ class MimoBackendJob(Protocol):
     target_video_path: str
     target_full_audio_path: str
     target_duration_seconds: float
+    reference_selection: Any
     reference_subjects: list[Any]
     reference_images: list[Any]
     segments: list[Any]
@@ -805,6 +807,7 @@ H3 DRAFT
 - Use observed evidence, not plausible filler. Do not infer unsupported emotion/psychology, intent, causality, relationships, identity, sound, offscreen events, or object detail. Non-onscreen speech must not create visible speaking/lip motion. Add later shots only for real hard cuts.
 - Subject definitions use typed subject_label plus natural official MiniMax H3 Ref2VA visual description. Set subject_label to the exact supplied Subject. Keep description visual-only and do not repeat any Subject or Picture label there. Frozen Subject-to-Picture provenance is pipeline-owned and will be appended deterministically after generation; never reproduce, reinterpret, omit, add, or reassign that provenance in description. Never put voice, vocal, pitch, timbre, cadence, articulation, accent, dialect, or speaking-rate concepts in a visual Subject description. Pictures are content references, not first frames, last frames, or keyframes.
 - Visual retention uses typed subject_label, marker, and description. Set subject_label to the exact supplied Subject; choose exactly one marker from fully_preserved, partially_preserved, weak_reference; and write visual explanation only in description without repeating a Subject label or marker. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
+- The frozen R2V instruction uses original source <Image N> identities. reference_selection maps each surviving source Image to one task-local contiguous <Picture N>; dropped source Images were intentionally omitted only to comply with the official H3 reference-file limit. Create no Picture or Subject for a dropped source Image, never reinterpret one surviving source Image as another after task-local renumbering, and use the target video as authoritative observation evidence.
 - timeline_parts alone place typed prose, speech, and audio events in target-video playback order. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in chronological order and at the appropriate observed position; their descriptions are not repeated in prose. Internal event IDs and approximate event times never appear as final prose or invented sound timestamps. The deterministic materializer owns final official H3 syntax, and ordinary observed target-video sounds never create <Audio N> or a conditioning asset."""
 
 
@@ -1819,6 +1822,19 @@ class OpenAIMimo25Backend:
             "clip_uid": job.clip_uid,
             "r2v_instruction": job.r2v_instruction,
             "target_duration_seconds": job.target_duration_seconds,
+            "reference_selection": job.reference_selection.model_dump(mode="json"),
+            "reference_image_mapping": [
+                {
+                    key: value
+                    for key, value in item.model_dump(mode="json").items()
+                    if key
+                    not in {
+                        "image_artifact_path",
+                        "image_sha256",
+                    }
+                }
+                for item in job.reference_images
+            ],
             "subject_definition_requirements": [
                 {
                     "subject_label": subject.subject_label,
@@ -1852,6 +1868,8 @@ class OpenAIMimo25Backend:
         return {
             key: contract[key]
             for key in (
+                "reference_selection",
+                "reference_image_mapping",
                 "subject_definition_requirements",
                 "allowed_segment_ids",
                 "transcribed_segment_ids",

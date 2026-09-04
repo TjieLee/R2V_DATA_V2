@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import shutil
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -21,7 +22,7 @@ from r2v_data_v2.h3.jea_audio_production import (
     CanonicalAudioClip,
     jea_production_paths,
 )
-from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2
+from r2v_data_v2.h3.jea_final_renderer import FinalH3SampleV2, FinalVisualReference
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MODEL,
     MimoAVAnnotationDraft,
@@ -38,13 +39,15 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
 from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
-MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.3"
+MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.4"
 MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.9"
 MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.9"
 MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.5"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.5"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
 MIMO25_INVENTORY_SCOPE = "canonical_visual_target_inventory"
+MIMO25_REFERENCE_SELECTION_POLICY_VERSION = "h3_mimo25_reference_selection_v1"
+MIMO25_MAXIMUM_PICTURE_COUNT = 9
 
 
 def _compact_json(value: object) -> str:
@@ -84,6 +87,9 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 class MimoReferenceImage(SchemaModel):
     image_index: int = Field(gt=0)
     picture_label: str = Field(pattern=r"^<Picture [1-9]\d*>$")
+    source_image_index: int = Field(gt=0)
+    source_image_id: str = Field(min_length=1)
+    source_image_label: str = Field(pattern=r"^<Image [1-9]\d*>$")
     kind: Literal["subject", "object", "group", "background", "attribute"]
     entity_id: str | None = None
     attribute_id: str | None = None
@@ -96,6 +102,8 @@ class MimoReferenceImage(SchemaModel):
     def validate_image(self) -> MimoReferenceImage:
         if self.picture_label != f"<Picture {self.image_index}>":
             raise ValueError("MiMo Picture label must match image index")
+        if self.source_image_label != f"<Image {self.source_image_index}>":
+            raise ValueError("MiMo source Image label must match source image index")
         if not Path(self.image_artifact_path).is_absolute():
             raise ValueError("MiMo reference artifact path must be absolute")
         if self.kind == "attribute":
@@ -121,6 +129,262 @@ class MimoReferenceImage(SchemaModel):
         ):
             raise ValueError("MiMo entity reference requires only entity_id")
         return self
+
+
+MimoReferenceDropReason = Literal[
+    "hair_capacity_trim",
+    "face_capacity_trim",
+    "attribute_capacity_trim",
+]
+
+
+class MimoDroppedReference(SchemaModel):
+    source_image_index: int = Field(gt=0)
+    source_image_id: str = Field(min_length=1)
+    source_image_label: str = Field(pattern=r"^<Image [1-9]\d*>$")
+    kind: Literal["attribute"]
+    entity_id: None = None
+    attribute_id: str
+    owner_entity_id: str
+    attribute_type: str
+    drop_reason: MimoReferenceDropReason
+
+    @model_validator(mode="after")
+    def validate_drop(self) -> MimoDroppedReference:
+        if self.source_image_label != f"<Image {self.source_image_index}>":
+            raise ValueError("dropped MiMo source Image label differs")
+        if not all(
+            value.strip()
+            for value in (self.source_image_id, self.attribute_id, self.owner_entity_id)
+        ) or not self.attribute_type.strip():
+            raise ValueError("dropped MiMo attribute provenance is incomplete")
+        if self.drop_reason == "hair_capacity_trim" and self.attribute_type != "hair":
+            raise ValueError("MiMo hair trim requires a hair attribute")
+        if self.drop_reason == "face_capacity_trim" and self.attribute_type != "face":
+            raise ValueError("MiMo face trim requires a face attribute")
+        return self
+
+
+class MimoReferenceSelection(SchemaModel):
+    policy_version: Literal["h3_mimo25_reference_selection_v1"] = (
+        MIMO25_REFERENCE_SELECTION_POLICY_VERSION
+    )
+    original_picture_count: int = Field(gt=0)
+    selected_picture_count: int = Field(gt=0, le=MIMO25_MAXIMUM_PICTURE_COUNT)
+    selected_source_image_indexes: list[int] = Field(min_length=1)
+    selected_source_image_ids: list[str] = Field(min_length=1)
+    dropped_references: list[MimoDroppedReference]
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> MimoReferenceSelection:
+        if (
+            self.selected_picture_count != len(self.selected_source_image_indexes)
+            or self.selected_picture_count != len(self.selected_source_image_ids)
+            or self.original_picture_count
+            != self.selected_picture_count + len(self.dropped_references)
+        ):
+            raise ValueError("MiMo reference selection counts differ")
+        if self.selected_source_image_indexes != sorted(
+            self.selected_source_image_indexes
+        ):
+            raise ValueError("selected MiMo source references must preserve order")
+        all_indexes = self.selected_source_image_indexes + [
+            item.source_image_index for item in self.dropped_references
+        ]
+        all_ids = self.selected_source_image_ids + [
+            item.source_image_id for item in self.dropped_references
+        ]
+        if len(all_indexes) != len(set(all_indexes)) or len(all_ids) != len(set(all_ids)):
+            raise ValueError("MiMo reference selection identities must be unique")
+        if sorted(all_indexes) != list(range(1, self.original_picture_count + 1)):
+            raise ValueError("MiMo reference selection must cover the source inventory")
+        return self
+
+
+def _dropped_reference(
+    reference: FinalVisualReference,
+    reason: MimoReferenceDropReason,
+) -> MimoDroppedReference:
+    if (
+        reference.kind != "attribute"
+        or reference.attribute_id is None
+        or reference.owner_entity_id is None
+        or reference.attribute_type is None
+    ):
+        raise ValueError("only complete attribute references may be capacity-trimmed")
+    return MimoDroppedReference(
+        source_image_index=reference.image_index,
+        source_image_id=reference.image_id,
+        source_image_label=f"<Image {reference.image_index}>",
+        kind="attribute",
+        attribute_id=reference.attribute_id,
+        owner_entity_id=reference.owner_entity_id,
+        attribute_type=reference.attribute_type,
+        drop_reason=reason,
+    )
+
+
+def select_mimo_reference_projection(
+    clip_uid: str,
+    references: Sequence[FinalVisualReference],
+) -> tuple[MimoReferenceSelection, list[MimoReferenceImage]]:
+    ordered = sorted(references, key=lambda item: (item.image_index, item.image_id))
+    if [item.image_index for item in ordered] != list(range(1, len(ordered) + 1)):
+        raise ValueError("MiMo source references must use contiguous image indexes")
+    if not ordered:
+        raise ValueError("MiMo source reference inventory must not be empty")
+    selected = list(ordered)
+    dropped: list[MimoDroppedReference] = []
+    seed_text = f"{MIMO25_REFERENCE_SELECTION_POLICY_VERSION}:{clip_uid}"
+    rng = random.Random(int(_sha256_text(seed_text), 16))
+    tiers: tuple[
+        tuple[MimoReferenceDropReason, Callable[[FinalVisualReference], bool]], ...
+    ] = (
+        (
+            "hair_capacity_trim",
+            lambda item: item.kind == "attribute" and item.attribute_type == "hair",
+        ),
+        (
+            "face_capacity_trim",
+            lambda item: item.kind == "attribute" and item.attribute_type == "face",
+        ),
+        ("attribute_capacity_trim", lambda item: item.kind == "attribute"),
+    )
+    while len(selected) > MIMO25_MAXIMUM_PICTURE_COUNT:
+        removed_this_round = False
+        for reason, predicate in tiers:
+            if len(selected) <= MIMO25_MAXIMUM_PICTURE_COUNT:
+                break
+            candidates = sorted(
+                (item for item in selected if predicate(item)),
+                key=lambda item: (item.image_index, item.image_id),
+            )
+            if not candidates:
+                continue
+            chosen = rng.choice(candidates)
+            selected.remove(chosen)
+            dropped.append(_dropped_reference(chosen, reason))
+            removed_this_round = True
+        if len(selected) > MIMO25_MAXIMUM_PICTURE_COUNT and not removed_this_round:
+            raise ValueError(
+                "MiMo reference inventory exceeds the official 9-Picture limit "
+                "without a droppable attribute reference"
+            )
+    selected.sort(key=lambda item: (item.image_index, item.image_id))
+    projected = [
+        MimoReferenceImage(
+            image_index=index,
+            picture_label=f"<Picture {index}>",
+            source_image_index=reference.image_index,
+            source_image_id=reference.image_id,
+            source_image_label=f"<Image {reference.image_index}>",
+            kind=reference.kind,
+            entity_id=reference.entity_id,
+            attribute_id=reference.attribute_id,
+            owner_entity_id=reference.owner_entity_id,
+            attribute_type=reference.attribute_type,
+            image_artifact_path=str(
+                Path(reference.image_artifact_path).resolve(strict=True)
+            ),
+            image_sha256=sha256_file(
+                Path(reference.image_artifact_path).resolve(strict=True)
+            ),
+        )
+        for index, reference in enumerate(selected, start=1)
+    ]
+    selection = MimoReferenceSelection(
+        original_picture_count=len(ordered),
+        selected_picture_count=len(projected),
+        selected_source_image_indexes=[item.source_image_index for item in projected],
+        selected_source_image_ids=[item.source_image_id for item in projected],
+        dropped_references=dropped,
+    )
+    return selection, projected
+
+
+def project_mimo_h3_sample_references(
+    sample: FinalH3SampleV2,
+    *,
+    reference_images: Sequence[MimoReferenceImage],
+    reference_selection: MimoReferenceSelection,
+) -> FinalH3SampleV2:
+    if len(sample.visual_references) != reference_selection.original_picture_count:
+        raise ValueError("MiMo source H3 reference count differs from selection")
+    if (
+        len(reference_images) != reference_selection.selected_picture_count
+        or [item.source_image_index for item in reference_images]
+        != reference_selection.selected_source_image_indexes
+        or [item.source_image_id for item in reference_images]
+        != reference_selection.selected_source_image_ids
+    ):
+        raise ValueError("MiMo projected references differ from selection")
+    source_by_index = {item.image_index: item for item in sample.visual_references}
+    source_identities = {
+        (item.image_index, item.image_id) for item in sample.visual_references
+    }
+    selected_identities = set(
+        zip(
+            reference_selection.selected_source_image_indexes,
+            reference_selection.selected_source_image_ids,
+            strict=True,
+        )
+    )
+    dropped_identities = {
+        (item.source_image_index, item.source_image_id)
+        for item in reference_selection.dropped_references
+    }
+    if source_identities != selected_identities | dropped_identities:
+        raise ValueError("MiMo source H3 reference identities differ from selection")
+    for dropped in reference_selection.dropped_references:
+        source = source_by_index[dropped.source_image_index]
+        if (
+            source.image_id,
+            source.kind,
+            source.entity_id,
+            source.attribute_id,
+            source.owner_entity_id,
+            source.attribute_type,
+        ) != (
+            dropped.source_image_id,
+            dropped.kind,
+            dropped.entity_id,
+            dropped.attribute_id,
+            dropped.owner_entity_id,
+            dropped.attribute_type,
+        ):
+            raise ValueError("MiMo dropped reference provenance differs from source H3")
+    projected: list[dict[str, object]] = []
+    for reference in reference_images:
+        source = source_by_index.get(reference.source_image_index)
+        if source is None:
+            raise ValueError("MiMo selected source reference is missing")
+        expected = (
+            source.image_id,
+            source.kind,
+            source.entity_id,
+            source.attribute_id,
+            source.owner_entity_id,
+            source.attribute_type,
+            str(Path(source.image_artifact_path).resolve(strict=True)),
+        )
+        actual = (
+            reference.source_image_id,
+            reference.kind,
+            reference.entity_id,
+            reference.attribute_id,
+            reference.owner_entity_id,
+            reference.attribute_type,
+            str(Path(reference.image_artifact_path).resolve(strict=True)),
+        )
+        if actual != expected:
+            raise ValueError("MiMo selected reference provenance differs from source H3")
+        values = source.model_dump(mode="python")
+        values["image_index"] = reference.image_index
+        values["image_id"] = f"image_{reference.image_index}"
+        projected.append(values)
+    sample_values = sample.model_dump(mode="python")
+    sample_values["visual_references"] = projected
+    return FinalH3SampleV2.model_validate(sample_values)
 
 
 class MimoSegmentEvidence(SchemaModel):
@@ -167,6 +431,7 @@ class MimoClipJob(SchemaModel):
     target_full_audio_path: str
     target_full_audio_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     target_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+    reference_selection: MimoReferenceSelection
     reference_images: list[MimoReferenceImage] = Field(min_length=1)
     reference_subjects: list[RecaptionSubjectContract] = Field(min_length=1)
     segments: list[MimoSegmentEvidence]
@@ -180,6 +445,21 @@ class MimoClipJob(SchemaModel):
         indexes = [item.image_index for item in self.reference_images]
         if indexes != list(range(1, len(indexes) + 1)):
             raise ValueError("MiMo reference images must preserve canonical order")
+        if (
+            self.reference_selection.selected_picture_count
+            != len(self.reference_images)
+            or self.reference_selection.selected_source_image_indexes
+            != [item.source_image_index for item in self.reference_images]
+            or self.reference_selection.selected_source_image_ids
+            != [item.source_image_id for item in self.reference_images]
+        ):
+            raise ValueError("MiMo reference images differ from selection provenance")
+        picture_labels = {item.picture_label for item in self.reference_images}
+        if any(
+            not set(subject.source_picture_labels).issubset(picture_labels)
+            for subject in self.reference_subjects
+        ):
+            raise ValueError("MiMo Subject references an unselected Picture")
         segment_ids = [item.segment_id for item in self.segments]
         if len(segment_ids) != len(set(segment_ids)):
             raise ValueError("MiMo job segments must be unique")
@@ -206,7 +486,7 @@ class MimoCaseManifest(SchemaModel):
 
 
 class MimoInventory(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_inventory.3"] = MIMO25_INVENTORY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_inventory.4"] = MIMO25_INVENTORY_VERSION
     inventory_scope: Literal[
         "current_diarization_asr_target_inventory",
         "canonical_visual_target_inventory",
@@ -568,25 +848,18 @@ def build_mimo25_inventory(
             raise ValueError(f"MiMo target video hash differs: {clip_uid}")
         if sha256_file(target_audio) != canonical_clip.target_full_audio_sha256:
             raise ValueError(f"MiMo target audio hash differs: {clip_uid}")
-        reference_images = []
-        for reference in representative.visual_references:
-            artifact = Path(reference.image_artifact_path).resolve(strict=True)
-            reference_images.append(
-                MimoReferenceImage(
-                    image_index=reference.image_index,
-                    picture_label=f"<Picture {reference.image_index}>",
-                    kind=reference.kind,
-                    entity_id=reference.entity_id,
-                    attribute_id=reference.attribute_id,
-                    owner_entity_id=reference.owner_entity_id,
-                    attribute_type=reference.attribute_type,
-                    image_artifact_path=str(artifact),
-                    image_sha256=sha256_file(artifact),
-                )
-            )
+        reference_selection, reference_images = select_mimo_reference_projection(
+            clip_uid,
+            representative.visual_references,
+        )
+        projected_representative = project_mimo_h3_sample_references(
+            representative,
+            reference_images=reference_images,
+            reference_selection=reference_selection,
+        )
         variant = "visual_only"
         reference_subjects = build_reference_contract(
-            representative, variant
+            projected_representative, variant
         ).subjects
         _validate_clip_segment_inventory(
             clip_uid,
@@ -667,6 +940,7 @@ def build_mimo25_inventory(
             "target_full_audio_path": str(target_audio),
             "target_full_audio_sha256": canonical_clip.target_full_audio_sha256,
             "target_duration_seconds": canonical_clip.target_duration_seconds,
+            "reference_selection": reference_selection.model_dump(mode="json"),
             "reference_images": [item.model_dump(mode="json") for item in reference_images],
             "reference_subjects": [
                 item.model_dump(mode="json") for item in reference_subjects
@@ -923,6 +1197,7 @@ def known_case_manifest() -> MimoCaseManifest:
 __all__ = [
     "MIMO25_CASE_MANIFEST_VERSION",
     "MIMO25_INVENTORY_SCOPE",
+    "MIMO25_REFERENCE_SELECTION_POLICY_VERSION",
     "MimoBackend",
     "MimoCaseManifest",
     "MimoClipJob",
@@ -930,9 +1205,12 @@ __all__ = [
     "MimoInventory",
     "MimoRecord",
     "MimoReferenceImage",
+    "MimoReferenceSelection",
     "MimoSegmentEvidence",
     "MimoSummary",
     "build_mimo25_inventory",
     "known_case_manifest",
+    "project_mimo_h3_sample_references",
     "run_mimo25_av_reconcile",
+    "select_mimo_reference_projection",
 ]

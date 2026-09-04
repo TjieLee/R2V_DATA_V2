@@ -116,13 +116,14 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v18`
+- `h3_mimo25_unified_av_reconcile_v19`
 - `h3_mimo25_av_authority_contract_v13`
 - `r2v.h3.mimo25_av_annotation.12`
-- `r2v.h3.mimo25_backend.16`
-- `h3_mimo25_materializer_v11`
+- `r2v.h3.mimo25_backend.17`
+- `h3_mimo25_materializer_v12`
+- `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
-- `r2v.h3.mimo25_inventory.3`
+- `r2v.h3.mimo25_inventory.4`
 - `r2v.h3.mimo25_record.9`
 - `r2v.h3.mimo25_summary.9`
 - `r2v.h3.mimo25_failure.5`
@@ -151,6 +152,30 @@ tokens fail closed. If primary embedded-audio tokens are exactly zero, one
 request retries with canonical full audio; explicitly reported zero audio
 tokens on that request also fail closed. Unavailable usage details produce
 warnings and do not trigger a blind retry.
+
+MiniMax H3 Ref2VA retains its official hard reference limits: at most 9 Images,
+3 Audio files, and 12 mixed reference files total. MiMo reference-selection V1
+does not relax or bypass those checks. For a frozen Visual sample with more than
+9 Pictures, it creates an Audio/H3 task-local projection by repeatedly dropping
+one deterministically random hair attribute, then one face attribute, then one
+remaining attribute while capacity is still exceeded. It never drops a subject,
+object, group, or background reference and fails closed when no attribute can be
+removed. Clips already containing at most 9 Pictures remain byte-semantically
+unchanged at the selected-reference level.
+
+Selection uses a per-clip PRNG seeded from the selection-policy version and
+`clip_uid`; sorted candidates make it independent of process order and Python
+hash randomization. Surviving source `<Image N>` identities retain their original
+indexes and image IDs in provenance, while their task-local `<Picture N>` labels
+are reassigned contiguously. The frozen `r2v_instruction` is not rewritten.
+Instead, the machine contract publishes the exact source-Image-to-Picture map
+and dropped-attribute provenance. MiMo media input, Subject ownership, shadow
+materialization, Audio capacity accounting, and human review all consume that
+same serialized projection. Frozen Visual samples and image artifacts remain
+unchanged. The limits and label semantics follow the official MiniMax H3
+[repository](https://github.com/MiniMax-AI/MiniMax-H3),
+[prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/SKILL.md),
+and [Ref2VA guide](https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt).
 
 The exact request contract keeps `fps` and `media_resolution` beside the
 `video_url` object, not inside it:

@@ -27,6 +27,7 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MimoClipJob,
     MimoInventory,
     MimoRecord,
+    project_mimo_h3_sample_references,
 )
 from r2v_data_v2.h3.mimo25_backend import (
     MIMO25_MATERIALIZER_VERSION,
@@ -212,7 +213,10 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v11"] = (
+    materializer_version: Literal[
+        "h3_mimo25_materializer_v11",
+        "h3_mimo25_materializer_v12",
+    ] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -615,8 +619,13 @@ def _materialize_sample(
     extra_audio_contract: RecaptionAudioContract | None = None,
 ) -> tuple[list[FinalQwen3SpeechSegment], str, list[str]]:
     assert record.annotation is not None
-    corrected, warnings = _corrected_segments(sample, job, record)
-    corrected_payload = sample.model_dump(mode="python")
+    projected_sample = project_mimo_h3_sample_references(
+        sample,
+        reference_images=job.reference_images,
+        reference_selection=job.reference_selection,
+    )
+    corrected, warnings = _corrected_segments(projected_sample, job, record)
+    corrected_payload = projected_sample.model_dump(mode="python")
     corrected_payload["speech_segments"] = [
         item.model_dump(mode="python") for item in corrected
     ]
@@ -1190,7 +1199,7 @@ def materialize_mimo25_h3_shadow(
                 raise ValueError("MiMo source target voices contain duplicate entities")
             capacity = min(
                 3 - len(existing),
-                12 - len(canonical.visual_references) - len(existing),
+                12 - len(job.reference_images) - len(existing),
             )
             if mimo_record.status != "ready":
                 continue
@@ -1389,7 +1398,7 @@ def materialize_mimo25_h3_shadow(
                 _compact_json(canonical.model_dump(mode="json"))
             )
             if enable_full_audio_reuse:
-                if len(canonical.visual_references) + 1 > 12:
+                if len(job.reference_images) + 1 > 12:
                     warning_counts["full_audio_reuse_reference_limit"] += 1
                 else:
                     _probe_canonical_audio(job=job, audio_backend=active_audio_backend)
@@ -1432,7 +1441,7 @@ def materialize_mimo25_h3_shadow(
                         )
                     )
             if enable_music_reference:
-                if len(canonical.visual_references) + 1 > 12:
+                if len(job.reference_images) + 1 > 12:
                     music_rejection_counts["music_reference_limit"] += 1
                     continue
                 reference, temporary_path, rejections = _select_music_reference(

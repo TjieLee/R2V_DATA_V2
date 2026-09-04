@@ -33,19 +33,23 @@ from r2v_data_v2.h3.mimo25_av_reconcile import (
     MIMO25_FAILURE_VERSION,
     MIMO25_INVENTORY_VERSION,
     MIMO25_RECORD_VERSION,
+    MIMO25_REFERENCE_SELECTION_POLICY_VERSION,
     MimoCaseManifest,
     MimoClipJob,
     MimoFailure,
     MimoRawResponse,
     MimoRecord,
     MimoReferenceImage,
+    MimoReferenceSelection,
     MimoSegmentEvidence,
     _inventory,
     _job,
     _validate_clip_segment_inventory,
     _validate_h3_variant_observations,
     build_mimo25_inventory,
+    project_mimo_h3_sample_references,
     run_mimo25_av_reconcile,
+    select_mimo_reference_projection,
 )
 from r2v_data_v2.h3.mimo25_backend import (
     _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES,
@@ -255,6 +259,9 @@ def _job_fixture(tmp_path: Path) -> MimoClipJob:
     reference = MimoReferenceImage(
         image_index=1,
         picture_label="<Picture 1>",
+        source_image_index=1,
+        source_image_id="image_1",
+        source_image_label="<Image 1>",
         kind="subject",
         entity_id="e1",
         image_artifact_path=str(image.resolve()),
@@ -288,6 +295,13 @@ def _job_fixture(tmp_path: Path) -> MimoClipJob:
         "target_full_audio_path": str(audio.resolve()),
         "target_full_audio_sha256": "3" * 64,
         "target_duration_seconds": 1.0,
+        "reference_selection": MimoReferenceSelection(
+            original_picture_count=1,
+            selected_picture_count=1,
+            selected_source_image_indexes=[1],
+            selected_source_image_ids=["image_1"],
+            dropped_references=[],
+        ).model_dump(mode="json"),
         "reference_images": [reference.model_dump(mode="json")],
         "reference_subjects": [
             RecaptionSubjectContract(
@@ -313,11 +327,20 @@ def _multi_picture_job_fixture(tmp_path: Path) -> MimoClipJob:
         MimoReferenceImage(
             image_index=2,
             picture_label="<Picture 2>",
+            source_image_index=2,
+            source_image_id="image_2",
+            source_image_label="<Image 2>",
             kind="subject",
             entity_id="e1",
             image_artifact_path=str(second_image.resolve()),
             image_sha256="4" * 64,
         ).model_dump(mode="json")
+    )
+    values["reference_selection"].update(
+        original_picture_count=2,
+        selected_picture_count=2,
+        selected_source_image_indexes=[1, 2],
+        selected_source_image_ids=["image_1", "image_2"],
     )
     values["reference_subjects"][0]["source_picture_labels"] = [
         "<Picture 1>",
@@ -714,11 +737,11 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v11"
+    assert current.materializer_version == "h3_mimo25_materializer_v12"
 
 
-def test_mimo_v18_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v18"
+def test_mimo_v19_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v19"
     assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v13"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.12"
     for phrase in (
@@ -766,6 +789,9 @@ def test_mimo_v18_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "not continuous merely because its approximate event window spans multiple video frames",
         "1-4 natural English sentences",
         "ordinary observed target-video sounds never create <Audio N>",
+        "reference_selection maps each surviving source Image",
+        "Create no Picture or Subject for a dropped source Image",
+        "never reinterpret one surviving source Image as another",
     ):
         assert phrase in SYSTEM_PROMPT
     assert "natural official MiniMax H3 Ref2VA visual description" in (
@@ -788,6 +814,14 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
             "required_source_picture_labels": ["<Picture 1>", "<Picture 2>"],
         }
     ]
+    assert contract["reference_selection"]["selected_source_image_indexes"] == [
+        1,
+        2,
+    ]
+    assert [
+        (item["source_image_label"], item["picture_label"])
+        for item in contract["reference_image_mapping"]
+    ] == [("<Image 1>", "<Picture 1>"), ("<Image 2>", "<Picture 2>")]
     assert (
         json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         in prompt
@@ -2696,11 +2730,20 @@ def test_only_subject_reference_entities_are_speaker_bindable(tmp_path: Path) ->
         MimoReferenceImage(
             image_index=2,
             picture_label="<Picture 2>",
+            source_image_index=2,
+            source_image_id="image_2",
+            source_image_label="<Image 2>",
             kind="object",
             entity_id="e2",
             image_artifact_path=str(image.resolve()),
             image_sha256="4" * 64,
         ).model_dump(mode="json")
+    )
+    values["reference_selection"].update(
+        original_picture_count=2,
+        selected_picture_count=2,
+        selected_source_image_indexes=[1, 2],
+        selected_source_image_ids=["image_1", "image_2"],
     )
     with_object = _job(values)
     contract = OpenAIMimo25Backend.build_compact_task_contract(with_object)
@@ -3717,6 +3760,285 @@ def _sample(tmp_path: Path) -> FinalH3SampleV2:
     )
 
 
+def _visual_reference_inventory(
+    tmp_path: Path,
+    kinds: list[str],
+    *,
+    same_entity: bool = False,
+) -> list[FinalVisualReference]:
+    references = []
+    for index, value in enumerate(kinds, start=1):
+        image = tmp_path / f"selection-reference-{index}.png"
+        image.write_bytes(f"image-{index}".encode())
+        is_attribute = value not in {"subject", "object", "group", "background"}
+        kind = "attribute" if is_attribute else value
+        references.append(
+            FinalVisualReference(
+                image_id=f"image_{index}",
+                image_index=index,
+                kind=kind,
+                image_path=f"selected/reference-{index}.png",
+                image_artifact_path=str(image.resolve()),
+                entity_id=(
+                    None
+                    if kind in {"attribute", "background"}
+                    else "e1"
+                    if same_entity
+                    else f"e{index}"
+                ),
+                attribute_id=f"a{index}" if is_attribute else None,
+                owner_entity_id="e1" if is_attribute else None,
+                attribute_type=(
+                    "upper_clothing" if value == "clothing" else value
+                )
+                if is_attribute
+                else None,
+                source_frame_index=index - 1,
+                scope=(
+                    None
+                    if is_attribute
+                    else "scene"
+                    if kind == "background"
+                    else "full"
+                ),
+                visible_region=None if is_attribute else "whole",
+                synthetic=False,
+            )
+        )
+    return references
+
+
+def _sample_with_reference_inventory(
+    tmp_path: Path,
+    references: list[FinalVisualReference],
+) -> FinalH3SampleV2:
+    sample = _sample(tmp_path)
+    values = sample.model_dump(mode="python")
+    values.update(
+        sample_id="clip-1/canonical",
+        pair_id="canonical/clip-1",
+        pair_type="canonical",
+        subject_voices=[],
+    )
+    values["visual_references"] = [
+        item.model_dump(mode="python") for item in references
+    ]
+    return FinalH3SampleV2.model_validate(values)
+
+
+def _job_for_reference_inventory(
+    tmp_path: Path,
+    sample: FinalH3SampleV2,
+) -> MimoClipJob:
+    base = _job_fixture(tmp_path)
+    selection, images = select_mimo_reference_projection(
+        sample.clip_uid,
+        sample.visual_references,
+    )
+    projected = project_mimo_h3_sample_references(
+        sample,
+        reference_images=images,
+        reference_selection=selection,
+    )
+    contract = mimo25_materializer.build_reference_contract(projected, "visual_only")
+    values = base.model_dump(mode="json", exclude={"request_fingerprint"})
+    values.update(
+        r2v_instruction=sample.r2v_instruction,
+        reference_selection=selection.model_dump(mode="json"),
+        reference_images=[item.model_dump(mode="json") for item in images],
+        reference_subjects=[
+            item.model_dump(mode="json") for item in contract.subjects
+        ],
+        source_h3_sample_ids=[sample.sample_id],
+    )
+    return _job(values)
+
+
+@pytest.mark.parametrize("picture_count", [8, 9])
+def test_mimo_reference_selection_is_exact_noop_at_or_below_limit(
+    tmp_path: Path,
+    picture_count: int,
+) -> None:
+    references = _visual_reference_inventory(
+        tmp_path,
+        ["subject"] * picture_count,
+        same_entity=True,
+    )
+    selection, projected = select_mimo_reference_projection("clip-1", references)
+
+    assert selection.policy_version == MIMO25_REFERENCE_SELECTION_POLICY_VERSION
+    assert selection.original_picture_count == picture_count
+    assert selection.selected_picture_count == picture_count
+    assert selection.dropped_references == []
+    assert [item.source_image_id for item in projected] == [
+        item.image_id for item in references
+    ]
+    assert [item.image_index for item in projected] == list(
+        range(1, picture_count + 1)
+    )
+
+
+def test_mimo_reference_selection_drops_one_hair_deterministically(
+    tmp_path: Path,
+) -> None:
+    kinds = ["subject", "subject", "subject", "hair"] + ["subject"] * 6
+    references = _visual_reference_inventory(tmp_path, kinds, same_entity=True)
+
+    first = select_mimo_reference_projection("clip-1", references)
+    second = select_mimo_reference_projection("clip-1", list(reversed(references)))
+
+    assert first[0].model_dump(mode="json") == second[0].model_dump(mode="json")
+    assert [item.model_dump(mode="json") for item in first[1]] == [
+        item.model_dump(mode="json") for item in second[1]
+    ]
+    assert first[0].selected_picture_count == 9
+    assert [item.drop_reason for item in first[0].dropped_references] == [
+        "hair_capacity_trim"
+    ]
+    assert first[0].dropped_references[0].source_image_index == 4
+    assert [item.source_image_index for item in first[1]] == [
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ]
+    assert [item.picture_label for item in first[1]] == [
+        f"<Picture {index}>" for index in range(1, 10)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kinds", "expected_reasons"),
+    [
+        (
+            ["subject"] * 9 + ["hair", "face"],
+            ["hair_capacity_trim", "face_capacity_trim"],
+        ),
+        (
+            ["subject"] * 9 + ["hair", "face", "clothing"],
+            [
+                "hair_capacity_trim",
+                "face_capacity_trim",
+                "attribute_capacity_trim",
+            ],
+        ),
+        (["subject"] * 9 + ["face"], ["face_capacity_trim"]),
+        (["subject"] * 9 + ["clothing"], ["attribute_capacity_trim"]),
+    ],
+)
+def test_mimo_reference_selection_uses_exact_priority_cycle(
+    tmp_path: Path,
+    kinds: list[str],
+    expected_reasons: list[str],
+) -> None:
+    references = _visual_reference_inventory(tmp_path, kinds, same_entity=True)
+    selection, projected = select_mimo_reference_projection("clip-1", references)
+
+    assert selection.selected_picture_count == 9
+    assert len(projected) == 9
+    assert [item.drop_reason for item in selection.dropped_references] == (
+        expected_reasons
+    )
+    assert [item.source_image_index for item in projected] == sorted(
+        item.source_image_index for item in projected
+    )
+
+
+def test_mimo_reference_selection_fails_closed_without_attributes(
+    tmp_path: Path,
+) -> None:
+    references = _visual_reference_inventory(
+        tmp_path,
+        ["subject", "object", "group", "background", "subject"] * 2,
+    )
+    with pytest.raises(ValueError, match="without a droppable attribute reference"):
+        select_mimo_reference_projection("clip-1", references)
+
+
+def test_selected_reference_mapping_controls_media_and_materialization(
+    tmp_path: Path,
+) -> None:
+    kinds = ["subject", "subject", "subject", "hair"] + ["subject"] * 6
+    references = _visual_reference_inventory(tmp_path, kinds, same_entity=True)
+    sample = _sample_with_reference_inventory(tmp_path, references)
+    source_sample_snapshot = sample.model_dump_json()
+    source_image_snapshots = {
+        Path(item.image_artifact_path): Path(item.image_artifact_path).read_bytes()
+        for item in sample.visual_references
+    }
+    job = _job_for_reference_inventory(tmp_path, sample)
+    dropped = job.reference_selection.dropped_references[0]
+
+    assert dropped.source_image_index == 4
+    assert [item.source_image_index for item in job.reference_images] == [
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ]
+    assert [item.image_index for item in job.reference_images] == list(range(1, 10))
+
+    backend, _ = _backend(tmp_path, [])
+    content = backend._media_content(job, include_audio_fallback=False)
+    image_items = [item for item in content if item["type"] == "image_url"]
+    metadata = [
+        json.loads(str(item["text"]))
+        for item in content
+        if item["type"] == "text"
+    ]
+    assert len(image_items) == 9
+    assert [item["source_image_index"] for item in metadata] == [
+        1,
+        2,
+        3,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+    ]
+    assert dropped.source_image_id not in {
+        item["source_image_id"] for item in metadata
+    }
+
+    projected = project_mimo_h3_sample_references(
+        sample,
+        reference_images=job.reference_images,
+        reference_selection=job.reference_selection,
+    )
+    with pytest.raises(ValidationError, match="per-modality reference limit"):
+        mimo25_materializer.build_reference_contract(sample, "visual_only")
+    contract = mimo25_materializer.build_reference_contract(projected, "visual_only")
+    assert len(contract.pictures) == 9
+    assert [item.image_id for item in contract.pictures] == [
+        f"image_{index}" for index in range(1, 10)
+    ]
+
+    annotation = _annotation()
+    _, rendered, _ = _materialize_sample(
+        sample,
+        job,
+        _record_fixture(tmp_path, annotation, job=job),
+    )
+    assert "<Picture 9>" in rendered
+    assert "<Picture 10>" not in rendered
+    assert dropped.source_image_id not in rendered
+    assert "<Audio " not in rendered
+    assert sample.model_dump_json() == source_sample_snapshot
+    assert all(path.read_bytes() == content for path, content in source_image_snapshots.items())
+
+
 def _record_fixture(
     tmp_path: Path,
     annotation: MimoAVAnnotationDraft,
@@ -4254,11 +4576,20 @@ def _configure_recovery_materializer_fixture(
             MimoReferenceImage(
                 image_index=2,
                 picture_label="<Picture 2>",
+                source_image_index=2,
+                source_image_id="image_2",
+                source_image_label="<Image 2>",
                 kind="subject",
                 entity_id="e2",
                 image_artifact_path=str(image),
                 image_sha256=_file_sha256(image),
             ).model_dump(mode="json")
+        )
+        job_values["reference_selection"].update(
+            original_picture_count=2,
+            selected_picture_count=2,
+            selected_source_image_indexes=[1, 2],
+            selected_source_image_ids=["image_1", "image_2"],
         )
         job_values["reference_subjects"].append(
             RecaptionSubjectContract(
