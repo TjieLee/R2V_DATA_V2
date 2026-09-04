@@ -26,10 +26,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v17"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v12"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v18"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v13"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.12"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.15"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.16"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v11"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -523,7 +523,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.15"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.16"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -540,10 +540,10 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v17"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v18"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v12"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v13"] = (
         MIMO25_POLICY_VERSION
     )
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.12"] = (
@@ -791,9 +791,11 @@ SPEAKER / ENTITY / PRESENTATION
 
 AUDIO SEMANTICS
 - Perform a full-timeline pass for meaningful audible non-speech sound, covering persistent ambience and discrete events. Check door opening, closing, and latch sounds; knocks; footsteps; impacts; object placement or handling; scraping or sliding; salient fabric or paper movement; mechanical clicks; bells; electronic beeps; abrupt environmental sounds; and non-verbal human sounds. These examples are not an exhaustive whitelist, and a clearly audible event must not be omitted merely because it is brief.
+- Classify localized physical actions or object interactions as physical: door opening, closing, or latch sounds; knocks; footsteps; impacts; object placement or handling; scraping or sliding; physical clicks; and salient paper or fabric handling. Classify background or environmental sources such as wind, rain, flowing water, traffic ambience, crowd ambience, and outdoor layers as environmental. Use mechanical for machinery or device mechanisms operating as an audible source rather than one ordinary object action; electronic for beeps, alarms, tones, and device signals; and human_non_speech for laughter, coughing, sighs, breaths, gasps, crying, and similar non-verbal vocal sound. These examples guide semantic judgment and are not an exhaustive whitelist.
+- pattern=single means one localized transient occurrence, such as one door close, knock, impact, or beep. pattern=repeated means several distinct repetitions of substantially the same sound. pattern=continuous means a sustained audible layer or operation, such as rain, ventilation hum, or ongoing engine or mechanism noise. A short sound is not continuous merely because its approximate event window spans multiple video frames.
 - Emit an event only when genuinely audible. Visible motion alone never creates sound; visual evidence may only identify or disambiguate an audible source. Give localized events tight approximate internal start/end times for chronological placement. Coalesce micro-events from one continuous physical action, split genuinely distinct sounds, preserve contiguous chronological aeN IDs, and use concise literal acoustic generation-useful descriptions without transcript or H3 syntax.
 - Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
-- overall_soundscape is a required core H3 semantic. Use present with 1-4 natural English sentences whenever ambience, room tone, an environmental layer, a physical sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Summarize important physical action sounds across the full video instead of collapsing salient events into generic room-tone wording, while avoiding mechanical sentence duplication with timeline event prose. Do not repeat dialogue in overall_soundscape; do not repeat singing or diegetic music there, and do not use non-diegetic music as a substitute for it. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain.
+- overall_soundscape is a required core H3 semantic. Use present with 1-4 natural English sentences whenever ambience, room tone, an environmental layer, a physical action sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Summarize important physical action sounds across the full video instead of collapsing salient events into generic room-tone wording, while avoiding verbatim or mechanical duplication with timeline event prose. It must not summarize or repeat spoken dialogue or speech, narration or voice-over content, singing, diegetic music, or non-diegetic music/BGM/score. Dialogue is represented elsewhere; diegetic music belongs in detailed_description, and non-diegetic music belongs in non_diegetic_music. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain.
 - overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground or disambiguate a genuinely audible source but never create room tone or another sound from visual context.
 - Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Use acoustic-first wording: stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Supported audible descriptors such as male, female, youthful, or mature may supplement those acoustic properties but never establish visible identity. Never copy dialogue or infer nationality, ethnicity, occupation, role, named identity, family/social relationship, or personality.
 - audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.

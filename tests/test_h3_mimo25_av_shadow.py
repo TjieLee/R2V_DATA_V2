@@ -717,9 +717,9 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     assert current.materializer_version == "h3_mimo25_materializer_v11"
 
 
-def test_mimo_v17_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v17"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v12"
+def test_mimo_v18_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v18"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v13"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.12"
     for phrase in (
         "shot scale and framing",
@@ -733,8 +733,11 @@ def test_mimo_v17_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "Voice continuity may preserve speaker-group identity",
         "cannot alone bind a visible entity",
         "Use absent only for verified complete silence of the soundscape",
-        "Do not repeat dialogue in overall_soundscape",
-        "do not use non-diegetic music as a substitute for it",
+        "must not summarize or repeat spoken dialogue or speech",
+        "narration or voice-over content",
+        "singing, diegetic music, or non-diegetic music/BGM/score",
+        "diegetic music belongs in detailed_description",
+        "non-diegetic music belongs in non_diegetic_music",
         "never create room tone or another sound from visual context",
         "Subject definitions use typed subject_label",
         "Keep description visual-only",
@@ -752,6 +755,15 @@ def test_mimo_v17_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "door opening, closing, and latch sounds",
         "must not be omitted merely because it is brief",
         "Visible motion alone never creates sound",
+        "localized physical actions or object interactions as physical",
+        "traffic ambience, crowd ambience, and outdoor layers as environmental",
+        "machinery or device mechanisms operating as an audible source",
+        "beeps, alarms, tones, and device signals",
+        "laughter, coughing, sighs, breaths, gasps, crying",
+        "pattern=single means one localized transient occurrence",
+        "pattern=repeated means several distinct repetitions",
+        "pattern=continuous means a sustained audible layer or operation",
+        "not continuous merely because its approximate event window spans multiple video frames",
         "1-4 natural English sentences",
         "ordinary observed target-video sounds never create <Audio N>",
     ):
@@ -5026,6 +5038,12 @@ def test_observed_door_close_renders_once_without_creating_audio_reference(
         "Low indoor ambience is punctuated by the solid thud of a closing door."
     )
     annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    observed_event = annotation.audio_semantics.temporal_non_speech_events[0]
+    assert observed_event.category == "physical"
+    assert observed_event.pattern == "single"
+    assert observed_event.approximate_start_time == 0.45
+    assert observed_event.approximate_end_time == 0.55
 
     _, rendered, _ = _materialize_sample(
         canonical,

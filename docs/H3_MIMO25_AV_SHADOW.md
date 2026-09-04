@@ -116,10 +116,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v17`
-- `h3_mimo25_av_authority_contract_v12`
+- `h3_mimo25_unified_av_reconcile_v18`
+- `h3_mimo25_av_authority_contract_v13`
 - `r2v.h3.mimo25_av_annotation.12`
-- `r2v.h3.mimo25_backend.15`
+- `r2v.h3.mimo25_backend.16`
 - `h3_mimo25_materializer_v11`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
@@ -208,8 +208,11 @@ continuous global score may be present without a localized event.
 
 `overall_soundscape` remains a core section. Any audible ambience, room tone,
 environmental layer, physical sound, or non-verbal human sound requires
-`overall_soundscape_status=present` and a concise grounded description; dialogue
-is not repeated there, and non-diegetic music does not substitute for it. The
+`overall_soundscape_status=present` and a concise grounded description. It does
+not repeat dialogue/speech, narration/voice-over content, singing, diegetic
+music, or non-diegetic music/BGM/score. Diegetic music stays in
+`detailed_description`, while audience-only music stays in
+`non_diegetic_music`. The
 model may use `absent` only for verified silence of this soundscape layer, which
 materializes as `N/A`. `unknown` is reserved for genuinely unavailable or
 uncertain Audio evidence and fails closed during shadow materialization instead
@@ -220,6 +223,15 @@ door actions, knocks, footsteps, impacts, object handling, scraping, clicks,
 bells, and beeps. Each grounded event appears once at its typed chronological
 timeline position, while `overall_soundscape` may summarize salient events in
 natural wording rather than repeating the event sentence mechanically.
+Localized object interactions such as one door close, knock, footstep, impact,
+placement, scrape, or physical click are `physical`; background sources such as
+wind, rain, water, traffic, crowds, and outdoor layers are `environmental`.
+Operating machinery/device mechanisms are `mechanical`, device signals are
+`electronic`, and non-verbal vocal sounds are `human_non_speech`. The examples
+are illustrative rather than exhaustive. `single` denotes one transient,
+`repeated` several distinct repetitions, and `continuous` a sustained layer or
+operation; a multi-frame event window does not by itself make a brief sound
+continuous.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,
