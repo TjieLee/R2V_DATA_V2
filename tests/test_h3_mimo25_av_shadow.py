@@ -634,13 +634,13 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v8"
+    assert current.materializer_version == "h3_mimo25_materializer_v9"
 
 
-def test_mimo_v13_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v13"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v8"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.9"
+def test_mimo_v14_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v14"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v9"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.10"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -652,6 +652,10 @@ def test_mimo_v13_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "Never transcribe, quote, correct, paraphrase",
         "Voice continuity may preserve speaker-group identity",
         "cannot alone bind a visible entity",
+        "Use absent only for verified complete silence of the soundscape",
+        "Do not repeat dialogue in overall_soundscape",
+        "do not use non-diegetic music as a substitute for it",
+        "never create room tone or another sound from visual context",
     ):
         assert phrase in SYSTEM_PROMPT
     assert "Subject definitions are natural official MiniMax H3 Ref2VA prose" in (
@@ -3915,7 +3919,6 @@ def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
             "A low room hum and a light clink are audible.",
         ),
         ("absent", None, "N/A"),
-        ("unknown", None, "N/A"),
     ],
 )
 def test_materializer_renders_soundscape_status_without_ungrounded_prose(
@@ -3928,6 +3931,13 @@ def test_materializer_renders_soundscape_status_without_ungrounded_prose(
     semantics = payload["audio_semantics"]
     semantics["overall_soundscape_status"] = status
     semantics["overall_soundscape"] = description
+    if status == "absent":
+        semantics["temporal_non_speech_events"] = []
+        payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+            item
+            for item in payload["h3_draft"]["shots"][0]["timeline_parts"]
+            if item["type"] != "audio_event"
+        ]
     annotation = MimoAVAnnotationDraft.model_validate(payload)
 
     _, rendered, _ = _materialize_sample(
@@ -3938,6 +3948,93 @@ def test_materializer_renders_soundscape_status_without_ungrounded_prose(
 
     assert f"overall_soundscape:\n{expected}" in rendered
     assert "No additional soundscape is established" not in rendered
+
+
+def test_materializer_rejects_unknown_soundscape_as_confirmed_silence(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["temporal_non_speech_events"] = []
+    payload["audio_semantics"]["overall_soundscape_status"] = "unknown"
+    payload["audio_semantics"]["overall_soundscape"] = None
+    payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+        item
+        for item in payload["h3_draft"]["shots"][0]["timeline_parts"]
+        if item["type"] != "audio_event"
+    ]
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    with pytest.raises(
+        ValueError,
+        match="unknown MiMo soundscape cannot be materialized as confirmed silence",
+    ):
+        _materialize_sample(
+            _sample(tmp_path),
+            _job_fixture(tmp_path),
+            _record_fixture(tmp_path, annotation),
+        )
+
+
+@pytest.mark.parametrize("status", ["absent", "unknown"])
+def test_audible_non_speech_event_requires_present_soundscape(status: str) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["overall_soundscape_status"] = status
+    payload["audio_semantics"]["overall_soundscape"] = None
+
+    with pytest.raises(
+        ValidationError,
+        match="audible non-speech event requires present global soundscape semantics",
+    ):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_indoor_dialogue_with_low_room_ambience_renders_soundscape(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    event = payload["audio_semantics"]["temporal_non_speech_events"][0]
+    event.update(
+        {
+            "category": "environmental",
+            "pattern": "continuous",
+            "description": "A faint steady indoor room ambience is audible.",
+            "source_grounding": "audible_only",
+        }
+    )
+    payload["audio_semantics"]["overall_soundscape"] = (
+        "A faint steady indoor room ambience sits beneath the dialogue."
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    assert (
+        "overall_soundscape:\n"
+        "A faint steady indoor room ambience sits beneath the dialogue."
+    ) in rendered
+    assert "overall_soundscape:\nN/A" not in rendered
+
+
+def test_non_diegetic_music_does_not_substitute_for_soundscape() -> None:
+    payload = _annotation().model_dump(mode="json")
+    event = payload["audio_semantics"]["temporal_non_speech_events"][0]
+    event["category"] = "non_diegetic_music"
+    event["description"] = "A faint audience-only string score is audible."
+    payload["audio_semantics"]["overall_soundscape_status"] = "absent"
+    payload["audio_semantics"]["overall_soundscape"] = None
+    payload["audio_semantics"]["non_diegetic_music_status"] = "present"
+    payload["audio_semantics"]["non_diegetic_music"] = (
+        "A faint audience-only string score continues underneath."
+    )
+
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert annotation.audio_semantics.overall_soundscape_status == "absent"
+    assert annotation.audio_semantics.non_diegetic_music_status == "present"
 
 
 @pytest.mark.parametrize(

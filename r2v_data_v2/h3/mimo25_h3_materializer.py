@@ -67,8 +67,8 @@ from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.8"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.8"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.9"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.9"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
@@ -200,7 +200,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.8"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.9"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -210,7 +210,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v8"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v9"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -320,7 +320,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.8"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.9"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -642,11 +642,14 @@ def _materialize_sample(
         if semantics.non_diegetic_music_status == "present"
         else "N/A"
     )
-    soundscape = (
-        semantics.overall_soundscape
-        if semantics.overall_soundscape_status == "present"
-        else "N/A"
-    )
+    if semantics.overall_soundscape_status == "present":
+        soundscape = semantics.overall_soundscape
+    elif semantics.overall_soundscape_status == "absent":
+        soundscape = "N/A"
+    else:
+        raise ValueError(
+            "unknown MiMo soundscape cannot be materialized as confirmed silence"
+        )
     draft = Qwen38H3DraftResponse(
         subject_definitions=record.annotation.h3_draft.subject_definitions,
         summary=f"{prefix} {record.annotation.h3_draft.summary}",

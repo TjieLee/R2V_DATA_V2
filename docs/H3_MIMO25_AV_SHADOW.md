@@ -97,19 +97,19 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v13`
-- `h3_mimo25_av_authority_contract_v8`
-- `r2v.h3.mimo25_av_annotation.9`
-- `r2v.h3.mimo25_backend.11`
-- `h3_mimo25_materializer_v8`
+- `h3_mimo25_unified_av_reconcile_v14`
+- `h3_mimo25_av_authority_contract_v9`
+- `r2v.h3.mimo25_av_annotation.10`
+- `r2v.h3.mimo25_backend.12`
+- `h3_mimo25_materializer_v9`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
-- `r2v.h3.mimo25_record.6`
-- `r2v.h3.mimo25_summary.6`
+- `r2v.h3.mimo25_record.7`
+- `r2v.h3.mimo25_summary.7`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.8`
-- `r2v.h3.mimo25_h3_shadow_summary.8`
+- `r2v.h3.mimo25_h3_shadow.9`
+- `r2v.h3.mimo25_h3_shadow_summary.9`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -187,6 +187,16 @@ Music events distinguish audible in-scene `diegetic_music` from audience-only
 an event. Diegetic music alone does not imply an audience-only score, while a
 continuous global score may be present without a localized event.
 
+`overall_soundscape` remains a core section. Any audible ambience, room tone,
+environmental layer, physical sound, or non-verbal human sound requires
+`overall_soundscape_status=present` and a concise grounded description; dialogue
+is not repeated there, and non-diegetic music does not substitute for it. The
+model may use `absent` only for verified silence of this soundscape layer, which
+materializes as `N/A`. `unknown` is reserved for genuinely unavailable or
+uncertain Audio evidence and fails closed during shadow materialization instead
+of silently masquerading as confirmed silence. Visual context may disambiguate
+an audible source but can never invent room tone or another sound.
+
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,
 `detailed_description`, `overall_soundscape`, `non_diegetic_music` order;
@@ -256,9 +266,11 @@ music description; Subject/entity/`Sx` metadata appears only for voice assets.
 
 MiMo records retain explicit `present`, `absent`, or `unknown` status for the
 overall soundscape and non-diegetic music. The H3 training prompt renders a
-description only for `present`; both `absent` and `unknown` render as `N/A`.
-Thus uncertainty remains available in the annotation without emitting prose
-such as "not established" into training prompts.
+soundscape description only for `present`, and renders verified `absent` as
+`N/A`. An `unknown` soundscape remains explicit in the annotation but fails
+closed during shadow materialization rather than being rendered as silence.
+Music retains its independent three-state rendering contract. Neither section
+emits prose such as "not established" into training prompts.
 
 ## Server commands
 

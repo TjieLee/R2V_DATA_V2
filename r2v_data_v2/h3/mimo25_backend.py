@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v13"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v8"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.9"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.11"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v8"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v14"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v9"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.10"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.12"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v9"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -324,6 +324,14 @@ class MimoAudioSemantics(SchemaModel):
             raise ValueError(
                 "non-diegetic music event requires present global music semantics"
             )
+        has_audible_soundscape_event = any(
+            event.category != "non_diegetic_music"
+            for event in self.temporal_non_speech_events
+        )
+        if has_audible_soundscape_event and self.overall_soundscape_status != "present":
+            raise ValueError(
+                "audible non-speech event requires present global soundscape semantics"
+            )
         events = self.temporal_non_speech_events
         rows = [event.model_dump(mode="json") for event in events]
         if len({_compact_json(row) for row in rows}) != len(rows):
@@ -442,7 +450,7 @@ class MimoSpeakerVoiceProfile(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.9"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.10"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     audio_semantics: MimoAudioSemantics
@@ -455,7 +463,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.11"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.12"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -472,19 +480,20 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v13"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v14"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v8"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v9"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.9"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.10"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
         "h3_mimo25_materializer_v6",
         "h3_mimo25_materializer_v7",
         "h3_mimo25_materializer_v8",
+        "h3_mimo25_materializer_v9",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -716,7 +725,8 @@ SPEAKER / ENTITY / PRESENTATION
 AUDIO SEMANTICS
 - Emit only meaningful audible non-speech events. Coalesce repeated micro-events from one action; split distinct sources/times. Use contiguous chronological aeN IDs and concise English descriptions without transcript or H3 syntax.
 - Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
-- overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground an audible source but never create one.
+- overall_soundscape is a required core H3 semantic. Use present with one concise audible description whenever ambience, room tone, an environmental layer, a physical sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain. Do not repeat dialogue in overall_soundscape, and do not use non-diegetic music as a substitute for it.
+- overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground or disambiguate a genuinely audible source but never create room tone or another sound from visual context.
 - Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Describe only stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Never copy dialogue or infer age, gender, nationality, role, identity, or personality.
 - audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.
 
