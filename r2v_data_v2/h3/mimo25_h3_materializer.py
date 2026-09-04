@@ -36,6 +36,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoH3Shot,
     MimoH3SpeechPart,
     MimoSegmentDecision,
+    MimoSubjectDefinitionDraft,
 )
 from r2v_data_v2.h3.mimo25_recovered_voice import (
     RECOVERED_VOICE_POLICY_VERSION,
@@ -56,6 +57,7 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     RecaptionNonSpeechFact,
     RecaptionReferenceContract,
     RecaptionSpeechFact,
+    RecaptionSubjectContract,
     _render_locked_speech,
     build_reference_contract,
     materialize_h3_draft,
@@ -67,8 +69,8 @@ from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.10"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.10"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.11"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.11"
 MUSIC_REFERENCE_POLICY_VERSION = "h3_mimo25_clean_music_reference_v1"
 MUSIC_REFERENCE_SAMPLE_RATE_HZ = 32000
 MUSIC_REFERENCE_CHANNELS = 2
@@ -200,7 +202,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.10"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.11"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -210,7 +212,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v10"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v11"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -320,7 +322,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.10"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.11"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -577,6 +579,33 @@ def _render_timeline_parts(
     return " ".join(rendered)
 
 
+def _join_picture_labels(labels: Sequence[str]) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return ", ".join(labels[:-1]) + f", and {labels[-1]}"
+
+
+def _render_subject_definition(
+    draft: MimoSubjectDefinitionDraft,
+    contract: RecaptionSubjectContract,
+) -> str:
+    if draft.subject_label != contract.subject_label:
+        raise ValueError("MiMo Subject definition differs from frozen Subject contract")
+    description = draft.description.strip()
+    if description.casefold().startswith("is "):
+        description = description[3:].lstrip()
+    description = description.rstrip(". ")
+    pictures = _join_picture_labels(contract.source_picture_labels)
+    connector = {
+        "entity": "shown in",
+        "attribute": "with its visual detail sourced from",
+        "background": "depicted in",
+    }[contract.kind]
+    return f"{contract.subject_label} is {description}, {connector} {pictures}."
+
+
 def _materialize_sample(
     sample: FinalH3SampleV2,
     job: MimoClipJob,
@@ -652,7 +681,12 @@ def _materialize_sample(
         )
     draft = Qwen38H3DraftResponse(
         subject_definitions=[
-            item.render() for item in record.annotation.h3_draft.subject_definitions
+            _render_subject_definition(item, subject)
+            for item, subject in zip(
+                record.annotation.h3_draft.subject_definitions,
+                job.reference_subjects,
+                strict=True,
+            )
         ],
         summary=f"{prefix} {record.annotation.h3_draft.summary}",
         retention_analysis=[

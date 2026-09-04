@@ -9,7 +9,7 @@ import random
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v15"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v10"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.11"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.13"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v10"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v16"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v11"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.12"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.14"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v11"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -59,9 +59,11 @@ _SUBJECT_AUDIO_PROFILE = re.compile(
     flags=re.IGNORECASE,
 )
 _VOICE_IDENTITY_PROFILE = re.compile(
-    r"\b(?:male|female|man|woman|boy|girl|young|old|older|mature|child|adult)\b"
-    r"|\b(?:doctor|teacher|chef|officer|narrator|actor|actress)\b"
-    r"|\b(?:voice|speaker)\s+(?:of|from)\b",
+    r"\b(?:doctor|teacher|chef|officer|narrator|actor|actress)\b"
+    r"|\b(?:Chinese|American|British|Japanese|Korean|Indian|French|German|Russian)\b"
+    r"|\b(?:mother|father|sister|brother|husband|wife|manager|employee)\b"
+    r"|\b(?:personality|character|temperament)\b"
+    r"|\b(?:voice|speaker)\s+(?:of|named|identified\s+as)\b",
     flags=re.IGNORECASE,
 )
 _TRUNCATED_FINISH_REASONS = {
@@ -142,37 +144,38 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-class MimoSecondaryVocalActivity(SchemaModel):
-    present: bool
-    speaker_relation: Literal[
-        "none", "same_speaker", "different_speaker", "uncertain"
-    ]
-    kind: Literal[
-        "discourse_particle",
-        "interjection",
-        "laughter",
-        "cough",
-        "sigh",
-        "breath",
-        "gasp",
-        "crying",
-        "non_lyrical_singing",
-        "speech",
-        "other_nonlexical",
-        "unknown",
-    ] | None = None
+SecondaryVocalKind = Literal[
+    "discourse_particle",
+    "interjection",
+    "laughter",
+    "cough",
+    "sigh",
+    "breath",
+    "gasp",
+    "crying",
+    "non_lyrical_singing",
+    "speech",
+    "other_nonlexical",
+    "unknown",
+]
 
-    @model_validator(mode="after")
-    def validate_activity(self) -> MimoSecondaryVocalActivity:
-        if not self.present and (
-            self.speaker_relation != "none" or self.kind is not None
-        ):
-            raise ValueError("absent secondary vocal activity cannot claim semantics")
-        if self.present and (
-            self.speaker_relation == "none" or self.kind is None
-        ):
-            raise ValueError("present secondary vocal activity requires semantics")
-        return self
+
+class MimoAbsentSecondaryVocalActivity(SchemaModel):
+    present: Literal[False]
+    speaker_relation: Literal["none"]
+    kind: None
+
+
+class MimoPresentSecondaryVocalActivity(SchemaModel):
+    present: Literal[True]
+    speaker_relation: Literal["same_speaker", "different_speaker", "uncertain"]
+    kind: SecondaryVocalKind
+
+
+MimoSecondaryVocalActivity = Annotated[
+    MimoAbsentSecondaryVocalActivity | MimoPresentSecondaryVocalActivity,
+    Field(discriminator="present"),
+]
 
 
 class _MimoSegmentDecisionBase(SchemaModel):
@@ -186,7 +189,7 @@ class _MimoSegmentDecisionBase(SchemaModel):
     delivery_style: StrictStr | None
     secondary_vocal_activity: MimoSecondaryVocalActivity
     confidence: Literal["high", "medium", "low"]
-    evidence_codes: list[EvidenceCode] = Field(min_length=1)
+    evidence_codes: list[EvidenceCode] = Field(min_length=1, max_length=8)
 
     @model_validator(mode="after")
     def validate_decision(self) -> _MimoSegmentDecisionBase:
@@ -208,20 +211,20 @@ class _MimoSegmentDecisionBase(SchemaModel):
             raise ValueError("non-onscreen speech cannot claim a visible entity")
         secondary = self.secondary_vocal_activity
         if self.vocal_composition == "single_speaker":
-            if secondary.present or secondary.speaker_relation != "none" or secondary.kind is not None:
+            if secondary.present:
                 raise ValueError("single_speaker forbids secondary vocal activity")
         elif self.vocal_composition == "same_speaker_nonlexical":
             if (
                 not secondary.present
                 or secondary.speaker_relation != "same_speaker"
-                or secondary.kind in {None, "speech"}
+                or secondary.kind == "speech"
             ):
                 raise ValueError("same-speaker nonlexical composition is inconsistent")
         elif self.vocal_composition == "secondary_non_speech_vocalization":
             if (
                 not secondary.present
                 or secondary.speaker_relation not in {"different_speaker", "uncertain"}
-                or secondary.kind in {None, "speech"}
+                or secondary.kind == "speech"
             ):
                 raise ValueError("secondary non-speech vocalization is inconsistent")
         elif (
@@ -409,6 +412,13 @@ class MimoSubjectDefinitionDraft(SchemaModel):
             raise ValueError("MiMo Subject definition description repeats a Subject label")
         if _BARE_SUBJECT_LABEL.search(self.description):
             raise ValueError("MiMo Subject definition description contains a bare Subject label")
+        if any(
+            match.group(1) == "Picture"
+            for match in _PICTURE_OR_SUBJECT.finditer(self.description)
+        ):
+            raise ValueError(
+                "MiMo Subject definition description cannot own Picture provenance"
+            )
         return self
 
     def render(self) -> str:
@@ -497,7 +507,7 @@ class MimoSpeakerVoiceProfile(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.11"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.12"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     audio_semantics: MimoAudioSemantics
@@ -510,7 +520,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.13"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.14"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -527,13 +537,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v15"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v16"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v10"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v11"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.11"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.12"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -542,6 +552,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v8",
         "h3_mimo25_materializer_v9",
         "h3_mimo25_materializer_v10",
+        "h3_mimo25_materializer_v11",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -607,6 +618,7 @@ class MimoBackendResult:
         "target_video_with_embedded_audio",
         "target_video_plus_canonical_full_audio_fallback",
     ]
+    deterministic_correction_counts: dict[str, int] = field(default_factory=dict)
 
 
 class MimoBackendFailure(ValueError):
@@ -775,13 +787,13 @@ AUDIO SEMANTICS
 - Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
 - overall_soundscape is a required core H3 semantic. Use present with one concise audible description whenever ambience, room tone, an environmental layer, a physical sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain. Do not repeat dialogue in overall_soundscape, and do not use non-diegetic music as a substitute for it.
 - overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground or disambiguate a genuinely audible source but never create room tone or another sound from visual context.
-- Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Describe only stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Never copy dialogue or characterize a voice as male, female, man, woman, boy, girl, young, old, older, mature, or by nationality, role, identity, or personality.
+- Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Use acoustic-first wording: stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Supported audible descriptors such as male, female, youthful, or mature may supplement those acoustic properties but never establish visible identity. Never copy dialogue or infer nationality, ethnicity, occupation, role, named identity, family/social relationship, or personality.
 - audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.
 
 H3 DRAFT
 - Write dense generation-quality observed video prose, not a caption. For each real shot cover applicable visual style; shot scale and framing; camera angle; foreground, midground, and background composition; salient subject appearance and spatial relationships; pose; body, arm, hand, and head motion; gaze; facial expression changes; interactions; object states; environment/materials/readable text; lighting/color; camera motion or explicit stability; and temporal progression through early, middle, and late portions. Target roughly 300-450 English words only when evidence supports it; never pad.
 - Use observed evidence, not plausible filler. Do not infer unsupported emotion/psychology, intent, causality, relationships, identity, sound, offscreen events, or object detail. Non-onscreen speech must not create visible speaking/lip motion. Add later shots only for real hard cuts.
-- Subject definitions use typed subject_label plus natural official MiniMax H3 Ref2VA description. Set subject_label to the exact supplied Subject. Keep description visual-only, do not repeat any Subject label there, and naturally integrate every and only its required Picture labels exactly once. Avoid mechanically repeating one connector such as "as seen in" across all rows; natural forms such as "in", "shown in", "depicted in", "from", or "whose appearance comes from" are all valid. Never put voice, vocal, pitch, timbre, cadence, articulation, accent, dialect, or speaking-rate concepts in a visual Subject description. Pictures are content references, not first frames, last frames, or keyframes.
+- Subject definitions use typed subject_label plus natural official MiniMax H3 Ref2VA visual description. Set subject_label to the exact supplied Subject. Keep description visual-only and do not repeat any Subject or Picture label there. Frozen Subject-to-Picture provenance is pipeline-owned and will be appended deterministically after generation; never reproduce, reinterpret, omit, add, or reassign that provenance in description. Never put voice, vocal, pitch, timbre, cadence, articulation, accent, dialect, or speaking-rate concepts in a visual Subject description. Pictures are content references, not first frames, last frames, or keyframes.
 - Visual retention uses typed subject_label, marker, and description. Set subject_label to the exact supplied Subject; choose exactly one marker from fully_preserved, partially_preserved, weak_reference; and write visual explanation only in description without repeating a Subject label or marker. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
 - timeline_parts alone place typed prose, speech, and audio events. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in order and their descriptions are not repeated in prose. The deterministic materializer owns final official H3 syntax."""
 
@@ -1348,31 +1360,29 @@ def validate_annotation(
                 "definition rows must exactly cover supplied Subjects",
             )
         )
+    expected_subject_labels = [str(item.subject_label) for item in reference_subjects]
+    actual_subject_labels = [item.subject_label for item in draft.subject_definitions]
+    if actual_subject_labels != expected_subject_labels:
+        issues.append(
+            ValidationIssue(
+                "subject_definition_contract_mismatch",
+                "h3_draft.subject_definitions",
+                "definition rows must follow the exact supplied Subject order",
+            )
+        )
     for subject in reference_subjects:
         subject_label = str(subject.subject_label)
-        expected_pictures = list(subject.source_picture_labels)
         definitions = [
             item
             for item in draft.subject_definitions
             if item.subject_label == subject_label
         ]
-        actual_pictures = (
-            [
-                match.group(0)
-                for match in _PICTURE_OR_SUBJECT.finditer(definitions[0].description)
-                if match.group(1) == "Picture"
-            ]
-            if len(definitions) == 1
-            else []
-        )
-        if len(definitions) != 1 or sorted(actual_pictures) != sorted(
-            expected_pictures
-        ):
+        if len(definitions) != 1:
             issues.append(
                 ValidationIssue(
                     "subject_definition_contract_mismatch",
                     "h3_draft.subject_definitions",
-                    f"{subject_label} must retain exactly its source Pictures",
+                    f"{subject_label} requires exactly one visual description row",
                 )
             )
         if len(definitions) == 1 and _SUBJECT_AUDIO_PROFILE.search(
@@ -1456,6 +1466,48 @@ def validate_annotation(
             )
             break
     return issues
+
+
+_CONSERVATIVE_VISIBLE_SPEAKER_ISSUES = {
+    "visible_entity_requires_confirmed_onscreen_speech",
+    "onscreen_speech_requires_reliable_visible_speaker_evidence",
+}
+
+
+def _conservative_visible_speaker_downgrade(
+    annotation: MimoAVAnnotationDraft,
+    issues: list[ValidationIssue],
+) -> tuple[MimoAVAnnotationDraft, int]:
+    if not issues or any(
+        issue.code not in _CONSERVATIVE_VISIBLE_SPEAKER_ISSUES for issue in issues
+    ):
+        return annotation, 0
+    affected_segments = {issue.field for issue in issues if issue.field is not None}
+    payload = annotation.model_dump(mode="python")
+    correction_count = 0
+    for decision in payload["segment_decisions"]:
+        if decision["segment_id"] not in affected_segments or _has_onscreen_speaker_evidence(
+            decision["evidence_codes"]
+        ):
+            continue
+        evidence_codes = list(decision["evidence_codes"])
+        if "insufficient_evidence" not in evidence_codes and len(evidence_codes) >= 8:
+            return annotation, 0
+        if "offscreen_audio" in evidence_codes:
+            decision["binding_status"] = "offscreen"
+            decision["speech_presentation"] = "offscreen_spoken"
+        else:
+            decision["binding_status"] = "no_reliable_entity"
+            decision["speech_presentation"] = "uncertain"
+        decision["entity_id"] = None
+        decision["confidence"] = "low"
+        if "insufficient_evidence" not in evidence_codes:
+            evidence_codes.append("insufficient_evidence")
+        decision["evidence_codes"] = evidence_codes
+        correction_count += 1
+    if correction_count == 0:
+        return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), correction_count
 
 
 class OpenAIMimo25Backend:
@@ -1619,7 +1671,9 @@ class OpenAIMimo25Backend:
             "MANDATORY MACHINE CONTRACT:\n"
             + _compact_json(cls.build_mandatory_h3_draft_contract(job))
             + "\nUse allowed_segment_ids for all decisions and transcribed_segment_ids "
-            "for typed speech parts. Preserve exact Subject-to-Picture ownership."
+            "for typed speech parts. Author only each Subject's visual description; "
+            "do not put Picture labels in description because the pipeline owns and "
+            "materializes exact Subject-to-Picture provenance."
         )
 
     def _prompt(self, job: MimoBackendJob) -> str:
@@ -1732,9 +1786,10 @@ class OpenAIMimo25Backend:
             "subject_retention_contract_mismatch",
         }:
             issue_actions.append(
-                "Repair typed Subject definition or retention rows using the supplied "
-                "exact Subject-to-Pictures ownership. Do not guess, omit, add, duplicate, "
-                "or reassign a Subject or Picture."
+                "Repair typed Subject definition or retention rows to cover each exact "
+                "supplied Subject once. Write only the natural visual description and "
+                "do not put Picture labels in it; the pipeline materializes frozen "
+                "Subject-to-Picture ownership."
             )
         if "subject_definition_contains_audio_profile" in issue_codes:
             issue_actions.append(
@@ -1953,6 +2008,35 @@ class OpenAIMimo25Backend:
                 ),
             )
             annotation, issues = parse_and_validate(raw)
+        deterministic_correction_counts: dict[str, int] = {}
+        if annotation is not None and issues:
+            annotation, correction_count = _conservative_visible_speaker_downgrade(
+                annotation,
+                issues,
+            )
+            if correction_count:
+                issues = validate_annotation(
+                    annotation,
+                    segment_ids=segment_ids,
+                    segment_intervals={
+                        item.segment_id: (item.start_time, item.end_time)
+                        for item in job.segments
+                    },
+                    transcribed_segment_ids=transcribed_segment_ids,
+                    authoritative_transcripts=[
+                        item.asr_text
+                        for item in job.segments
+                        if item.asr_status == "transcribed" and item.asr_text is not None
+                    ],
+                    allowed_entity_ids=allowed_entity_ids,
+                    allowed_reference_labels=allowed_reference_labels,
+                    reference_subjects=job.reference_subjects,
+                    target_duration_seconds=job.target_duration_seconds,
+                )
+                if not issues:
+                    deterministic_correction_counts[
+                        "conservative_visible_speaker_downgrade"
+                    ] = correction_count
         if annotation is None or issues:
             raise contextual_failure(
                 MimoBackendFailure(
@@ -1972,6 +2056,7 @@ class OpenAIMimo25Backend:
             ),
             recheck_count=recheck_count,
             input_modality=modality,
+            deterministic_correction_counts=deterministic_correction_counts,
         )
 
 

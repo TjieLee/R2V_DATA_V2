@@ -67,6 +67,7 @@ from r2v_data_v2.h3.mimo25_backend import (
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
     _materialize_sample,
+    _render_subject_definition,
     materialize_mimo25_h3_shadow,
 )
 from r2v_data_v2.h3.mimo25_human_review import (
@@ -189,7 +190,7 @@ def _annotation(
                 "subject_definitions": [
                     _subject_definition(
                         "<Subject 1>",
-                        "is the person shown in <Picture 1>.",
+                        "a person with a clearly visible appearance.",
                     )
                 ],
                 "summary": "A person speaks while remaining visible.",
@@ -657,13 +658,13 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v10"
+    assert current.materializer_version == "h3_mimo25_materializer_v11"
 
 
-def test_mimo_v15_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v15"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v10"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.11"
+def test_mimo_v16_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v16"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v11"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.12"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -682,10 +683,13 @@ def test_mimo_v15_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "Subject definitions use typed subject_label",
         "Keep description visual-only",
         "Visual retention uses typed subject_label, marker, and description",
-        "Never copy dialogue or characterize a voice as male, female",
+        "Use acoustic-first wording",
+        "Supported audible descriptors such as male, female, youthful, or mature",
+        "Frozen Subject-to-Picture provenance is pipeline-owned",
+        "do not repeat any Subject or Picture label",
     ):
         assert phrase in SYSTEM_PROMPT
-    assert "natural official MiniMax H3 Ref2VA description" in (
+    assert "natural official MiniMax H3 Ref2VA visual description" in (
         SYSTEM_PROMPT
     )
 
@@ -709,9 +713,8 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
         json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         in prompt
     )
-    assert "Preserve exact Subject-to-Picture ownership" in prompt
-    assert "Avoid mechanically repeating one connector" in SYSTEM_PROMPT
-    assert '"as seen in"' in SYSTEM_PROMPT
+    assert "pipeline owns and materializes exact Subject-to-Picture provenance" in prompt
+    assert "do not put Picture labels in description" in prompt
 
 
 def test_primary_prompt_separates_decision_and_typed_speech_inventories(
@@ -825,11 +828,39 @@ def test_speaker_voice_profile_rejects_significant_transcript_copy() -> None:
     }
 
 
-def test_speaker_voice_profile_rejects_demographic_identity_wording() -> None:
+@pytest.mark.parametrize(
+    "description",
+    [
+        "A mid-range male voice with a slightly raspy timbre.",
+        "A mature male voice with a slightly raspy mid-low timbre.",
+    ],
+)
+def test_speaker_voice_profile_accepts_supported_audible_demographics(
+    description: str,
+) -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["speaker_voice_profiles"][0]["voice_characteristics"] = (
-        "A mature male voice with a raspy timbre."
-    )
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = description
+
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    assert "speaker_voice_profile_contains_identity_claim" not in {
+        issue.code for issue in issues
+    }
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "A doctor speaking with a measured low cadence.",
+        "The Chinese man has a clear mid-register voice.",
+        "The voice of Alice is calm and lightly raspy.",
+    ],
+)
+def test_speaker_voice_profile_rejects_role_nationality_or_named_identity(
+    description: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = description
 
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
 
@@ -948,6 +979,53 @@ def test_resolution_discriminator_structures_primary_speaker_group() -> None:
     del refinement_payload["segment_decisions"][0]["primary_speaker_group"]
     with pytest.raises(ValidationError):
         MimoAVAnnotationDraft.model_validate(refinement_payload)
+
+
+def test_evidence_codes_are_bounded_in_strict_json_schema() -> None:
+    branches = _segment_decision_branch_schemas()
+    for branch in branches.values():
+        evidence = branch["properties"]["evidence_codes"]
+        assert evidence["minItems"] == 1
+        assert evidence["maxItems"] == 8
+
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"] = [
+        "visible_lip_motion",
+        "speaker_visible_mouth_occluded",
+        "av_temporal_alignment",
+        "voice_continuity",
+        "speaker_turn_change",
+        "offscreen_audio",
+        "lr_asd_support",
+        "source_cluster_support",
+        "message_text_alignment",
+    ]
+    with pytest.raises(ValidationError, match="at most 8 items"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_secondary_vocal_activity_is_schema_discriminated_by_presence() -> None:
+    schema = MimoAVAnnotationDraft.model_json_schema()
+    decision = _segment_decision_branch_schemas()["resolved"]
+    secondary = decision["properties"]["secondary_vocal_activity"]
+    assert secondary["discriminator"]["propertyName"] == "present"
+
+    absent = schema["$defs"]["MimoAbsentSecondaryVocalActivity"]
+    assert set(absent["required"]) == {"present", "speaker_relation", "kind"}
+    assert absent["properties"]["present"]["const"] is False
+    assert absent["properties"]["speaker_relation"]["const"] == "none"
+    assert absent["properties"]["kind"]["type"] == "null"
+
+    present = schema["$defs"]["MimoPresentSecondaryVocalActivity"]
+    assert present["properties"]["present"]["const"] is True
+    assert "none" not in present["properties"]["speaker_relation"]["enum"]
+
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["secondary_vocal_activity"]["kind"] = (
+        "non_lyrical_singing"
+    )
+    with pytest.raises(ValidationError):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 def test_visible_entity_structural_relationships_remain_model_validated() -> None:
@@ -1647,7 +1725,7 @@ def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
         in prompt
     )
     assert "Repair typed Subject definition or retention rows" in prompt
-    assert "exact Subject-to-Pictures ownership" in prompt
+    assert "pipeline materializes frozen Subject-to-Picture ownership" in prompt
     assert "rebuild all typed speech timeline parts" in prompt
     assert "transcribed_segment_ids" in prompt
     assert "exactly equals" in prompt
@@ -1868,16 +1946,86 @@ def test_938_corrected_offscreen_segments_reuse_speaker_group() -> None:
     assert all("voice_continuity" in item.evidence_codes for item in later)
 
 
-def test_repeated_unreliable_onscreen_evidence_fails_after_one_recheck(
+@pytest.mark.parametrize(
+    ("evidence_codes", "binding_status", "speech_presentation"),
+    [
+        (["voice_continuity"], "no_reliable_entity", "uncertain"),
+        (
+            ["voice_continuity", "offscreen_audio"],
+            "offscreen",
+            "offscreen_spoken",
+        ),
+    ],
+)
+def test_repeated_unreliable_onscreen_evidence_is_conservatively_downgraded(
+    tmp_path: Path,
+    evidence_codes: list[str],
+    binding_status: str,
+    speech_presentation: str,
+) -> None:
+    invalid_payload = _annotation().model_dump(mode="json")
+    invalid_payload["segment_decisions"][0]["evidence_codes"] = evidence_codes
+    raw = json.dumps(invalid_payload)
+    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    decision = result.annotation.segment_decisions[0]
+    assert result.recheck_count == 1
+    assert result.model_call_count == 2
+    assert len(completions.requests) == 2
+    assert decision.binding_status == binding_status
+    assert decision.speech_presentation == speech_presentation
+    assert decision.entity_id is None
+    assert decision.confidence == "low"
+    assert decision.primary_speaker_group == "g1"
+    assert decision.vocal_composition == "single_speaker"
+    assert decision.delivery_style == "calm and clear"
+    assert set(decision.evidence_codes) == {
+        *evidence_codes,
+        "insufficient_evidence",
+    }
+    assert result.deterministic_correction_counts == {
+        "conservative_visible_speaker_downgrade": 1
+    }
+
+
+def test_recheck_visible_lip_motion_positive_stays_visible(tmp_path: Path) -> None:
+    invalid = "not json"
+    valid = _annotation().model_dump_json()
+    backend, _ = _backend(tmp_path, [(invalid, 5), (valid, 5)])
+
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert result.annotation.segment_decisions[0].binding_status == "visible_entity"
+    assert result.annotation.segment_decisions[0].entity_id == "e1"
+    assert result.deterministic_correction_counts == {}
+
+
+def test_visible_speaker_downgrade_does_not_hide_other_semantic_failures(
     tmp_path: Path,
 ) -> None:
     invalid_payload = _annotation().model_dump(mode="json")
     invalid_payload["segment_decisions"][0]["evidence_codes"] = [
-        "av_temporal_alignment",
-        "source_cluster_support",
+        "voice_continuity"
     ]
+    invalid_payload["h3_draft"]["subject_definitions"].append(
+        _subject_definition("<Subject 2>", "an invented extra person.")
+    )
     raw = json.dumps(invalid_payload)
-    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+    backend, _ = _backend(tmp_path, [(raw, 5), (raw, 5)])
 
     with pytest.raises(MimoBackendFailure) as exc_info:
         backend.reconcile(
@@ -1888,16 +2036,10 @@ def test_repeated_unreliable_onscreen_evidence_fails_after_one_recheck(
             allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
         )
 
-    failure = exc_info.value
-    assert failure.code == "mimo_structured_output_failed"
-    assert failure.recheck_count == 1
-    assert failure.model_call_count == 2
-    assert len(completions.requests) == 2
-    assert {item.code for item in failure.issues} == {
-        "visible_entity_requires_confirmed_onscreen_speech",
-        "onscreen_speech_requires_reliable_visible_speaker_evidence",
+    assert exc_info.value.code == "mimo_structured_output_failed"
+    assert "subject_definition_contract_mismatch" in {
+        issue.code for issue in exc_info.value.issues
     }
-    assert {item.field for item in failure.issues} == {"segment_1"}
 
 
 def test_sglang_full_av_recheck_preserves_primary_transport_contract(
@@ -2666,7 +2808,7 @@ def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
     ]
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"].append(
-        _subject_definition("<Subject 2>", "is sourced from <Picture 2>.")
+        _subject_definition("<Subject 2>", "a second person with a distinct coat.")
     )
     payload["h3_draft"]["visual_retention_analysis"].append(
         _retention(
@@ -2709,7 +2851,7 @@ def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
     "extra_description",
     [
         "An extra arbitrary definition.",
-        "<Picture 1> defines the person.",
+        "A second arbitrary visual definition.",
     ],
 )
 def test_subject_definitions_reject_noncanonical_extra_rows(
@@ -2869,7 +3011,7 @@ def test_audio_event_crossing_cut_may_use_either_overlapping_shot(
     assert "audio_event_placeholder_wrong_shot" not in {item.code for item in issues}
 
 
-def test_subject_definition_and_shot_bounds_fail_closed() -> None:
+def test_subject_definition_picture_omission_is_valid_but_shot_bounds_fail_closed() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"] = [
         _subject_definition("<Subject 1>", "has no supplied source Picture.")
@@ -2885,10 +3027,7 @@ def test_subject_definition_and_shot_bounds_fail_closed() -> None:
         MimoAVAnnotationDraft.model_validate(payload),
         target_duration_seconds=1.0,
     )
-    assert {item.code for item in issues} >= {
-        "subject_definition_contract_mismatch",
-        "shot_start_outside_target",
-    }
+    assert {item.code for item in issues} == {"shot_start_outside_target"}
 
 
 @pytest.mark.parametrize("start_time", [None, 0])
@@ -2951,59 +3090,13 @@ def test_later_positive_hard_cuts_remain_strictly_ordered() -> None:
         MimoAVAnnotationDraft.model_validate(payload)
 
 
-def test_subject_definition_rejects_wrong_supplied_picture() -> None:
+def test_subject_definition_rejects_model_authored_picture_provenance() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"] = [
         _subject_definition("<Subject 1>", "is shown only in <Picture 2>.")
     ]
-    issues = _validate(
-        MimoAVAnnotationDraft.model_validate(payload),
-        allowed_reference_labels={"<Picture 1>", "<Picture 2>", "<Subject 1>"},
-    )
-    assert "subject_definition_contract_mismatch" in {item.code for item in issues}
-
-
-def test_subject_definition_rejects_extra_supplied_picture() -> None:
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_draft"]["subject_definitions"] = [
-        _subject_definition(
-            "<Subject 1>",
-            "is the person in <Picture 1> and <Picture 2>.",
-        )
-    ]
-    issues = _validate(
-        MimoAVAnnotationDraft.model_validate(payload),
-        allowed_reference_labels={"<Picture 1>", "<Picture 2>", "<Subject 1>"},
-    )
-    assert "subject_definition_contract_mismatch" in {item.code for item in issues}
-
-
-def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None:
-    subjects = [
-        RecaptionSubjectContract(
-            subject_index=1,
-            subject_label="<Subject 1>",
-            kind="entity",
-            entity_id="e1",
-            source_picture_labels=["<Picture 1>", "<Picture 2>"],
-        )
-    ]
-    payload = _annotation().model_dump(mode="json")
-    payload["h3_draft"]["subject_definitions"] = [
-        _subject_definition(
-            "<Subject 1>",
-            (
-                "is the same person shown in <Picture 1> and <Picture 2>, with "
-                "the visible appearance combined across both references."
-            ),
-        )
-    ]
-    issues = _validate(
-        MimoAVAnnotationDraft.model_validate(payload),
-        allowed_reference_labels={"<Picture 1>", "<Picture 2>", "<Subject 1>"},
-        reference_subjects=subjects,
-    )
-    assert "subject_definition_contract_mismatch" not in {item.code for item in issues}
+    with pytest.raises(ValidationError, match="cannot own Picture provenance"):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 @pytest.mark.parametrize("subject_label", ["Subject 1", "<Subject 0>"])
@@ -3020,7 +3113,7 @@ def test_subject_definition_requires_exact_structured_subject_label(
 def test_subject_definition_description_rejects_bare_subject_label() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"][0]["description"] = (
-        "Subject 1 is the person shown in <Picture 1>."
+        "Subject 1 is the person with dark hair."
     )
 
     with pytest.raises(ValidationError, match="bare Subject label"):
@@ -3030,22 +3123,21 @@ def test_subject_definition_description_rejects_bare_subject_label() -> None:
 def test_subject_definition_description_rejects_bracketed_subject_label() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"][0]["description"] = (
-        "<Subject 1> is the person shown in <Picture 1>."
+        "<Subject 1> is the person with dark hair."
     )
 
     with pytest.raises(ValidationError, match="repeats a Subject label"):
         MimoAVAnnotationDraft.model_validate(payload)
 
 
-def test_subject_definition_rejects_duplicate_required_picture() -> None:
+def test_subject_definition_rejects_even_duplicate_model_picture_labels() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"][0]["description"] = (
         "is shown in <Picture 1>, with details repeated from <Picture 1>."
     )
 
-    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
-
-    assert "subject_definition_contract_mismatch" in {item.code for item in issues}
+    with pytest.raises(ValidationError, match="cannot own Picture provenance"):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 @pytest.mark.parametrize("audio_term", ["timbre", "cadence", "articulation"])
@@ -3054,7 +3146,7 @@ def test_visual_subject_definition_rejects_audio_profile_leakage(
 ) -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"][0]["description"] = (
-        f"is the face shown in <Picture 1> with a steady {audio_term}."
+        f"a clearly visible face with a steady {audio_term}."
     )
 
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
@@ -3230,6 +3322,7 @@ def _record_fixture(
         "raw_response_count": 1,
         "http_retry_count": 0,
         "recheck_count": 0,
+        "deterministic_correction_counts": {},
     }
     fingerprint = (
         __import__("hashlib")
@@ -3775,7 +3868,7 @@ def _configure_recovery_materializer_fixture(
         annotation_payload["h3_draft"]["subject_definitions"].append(
             _subject_definition(
                 "<Subject 2>",
-                "is the person shown in <Picture 2>.",
+                "a second person with a distinct visible appearance.",
             )
         )
         annotation_payload["h3_draft"]["visual_retention_analysis"].append(
@@ -4110,7 +4203,7 @@ def test_materializer_renders_typed_subject_and_retention_as_official_h3(
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"][0] = _subject_definition(
         "<Subject 1>",
-        "is the person whose appearance comes from <Picture 1>.",
+        "the person with dark wavy hair and a blue jacket.",
     )
     payload["h3_draft"]["visual_retention_analysis"][0] = _retention(
         "<Subject 1>",
@@ -4128,7 +4221,8 @@ def test_materializer_renders_typed_subject_and_retention_as_official_h3(
     )
 
     assert (
-        "<Subject 1> is the person whose appearance comes from <Picture 1>."
+        "<Subject 1> is the person with dark wavy hair and a blue jacket, shown in "
+        "<Picture 1>."
         in rendered
     )
     assert (
@@ -4137,6 +4231,20 @@ def test_materializer_renders_typed_subject_and_retention_as_official_h3(
     ) in rendered
     assert "Subject 1 is" not in rendered
     assert "is fully preserved" not in rendered
+
+
+def test_materializer_owns_exact_multi_picture_subject_provenance(
+    tmp_path: Path,
+) -> None:
+    job = _multi_picture_job_fixture(tmp_path)
+    draft = _annotation().h3_draft.subject_definitions[0]
+
+    rendered = _render_subject_definition(draft, job.reference_subjects[0])
+
+    assert rendered.startswith("<Subject 1> is ")
+    assert rendered.count("<Picture 1>") == 1
+    assert rendered.count("<Picture 2>") == 1
+    assert rendered.endswith("shown in <Picture 1> and <Picture 2>.")
 
 
 @pytest.mark.parametrize(
@@ -5257,6 +5365,9 @@ class _WarningBackend(_FakeBackend):
             http_retry_count=0,
             recheck_count=1,
             input_modality="target_video_with_embedded_audio",
+            deterministic_correction_counts={
+                "conservative_visible_speaker_downgrade": 2
+            },
         )
 
 
@@ -5298,6 +5409,14 @@ def test_shadow_runner_is_atomic_and_does_not_modify_inputs(tmp_path: Path) -> N
     assert summary.diagnostic_warning_counts == {
         "audio_tokens_unavailable": 1,
         "image_tokens_unavailable": 2,
+    }
+    assert summary.correction_counts["conservative_visible_speaker_downgrade"] == 2
+    published_records = [
+        MimoRecord.model_validate(json.loads(line))
+        for line in (output / "records.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert published_records[0].deterministic_correction_counts == {
+        "conservative_visible_speaker_downgrade": 2
     }
     assert summary.production_binding_modified is False
     assert summary.production_diarization_modified is False

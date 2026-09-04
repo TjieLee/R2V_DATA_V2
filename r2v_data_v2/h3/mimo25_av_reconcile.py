@@ -39,8 +39,8 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
 MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.3"
-MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.8"
-MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.8"
+MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.9"
+MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.9"
 MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.5"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.5"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
@@ -256,7 +256,7 @@ class MimoFailure(SchemaModel):
 
 
 class MimoRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_record.8"] = MIMO25_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_record.9"] = MIMO25_RECORD_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -273,6 +273,7 @@ class MimoRecord(SchemaModel):
     raw_response_count: int = Field(ge=0)
     http_retry_count: int = Field(ge=0)
     recheck_count: int = Field(ge=0, le=1)
+    deterministic_correction_counts: dict[str, int]
     record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -282,6 +283,8 @@ class MimoRecord(SchemaModel):
                 raise ValueError("ready MiMo record requires only annotation")
         elif self.annotation is not None or self.failure is None:
             raise ValueError("non-ready MiMo record requires only failure")
+        if any(value < 0 for value in self.deterministic_correction_counts.values()):
+            raise ValueError("MiMo deterministic correction counts cannot be negative")
         values = self.model_dump(mode="json", exclude={"record_fingerprint"})
         if self.record_fingerprint != _sha256_text(_compact_json(values)):
             raise ValueError("MiMo record fingerprint is invalid")
@@ -297,7 +300,7 @@ class MimoRawResponse(SchemaModel):
 
 
 class MimoSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_summary.8"] = MIMO25_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_summary.9"] = MIMO25_SUMMARY_VERSION
     inventory_scope: Literal[
         "current_diarization_asr_target_inventory",
         "canonical_visual_target_inventory",
@@ -784,10 +787,14 @@ def run_mimo25_av_reconcile(
                     "raw_response_count": len(result.raw_responses),
                     "http_retry_count": result.http_retry_count,
                     "recheck_count": result.recheck_count,
+                    "deterministic_correction_counts": (
+                        result.deterministic_correction_counts
+                    ),
                 }
                 records.append(_record(values))
                 modality_counts[result.input_modality] += 1
                 corrections.update(_correction_counts(job, result.annotation))
+                corrections.update(result.deterministic_correction_counts)
                 audio_event_count += len(result.annotation.audio_semantics.temporal_non_speech_events)
                 music_counts[result.annotation.audio_semantics.non_diegetic_music_status] += 1
                 case_diagnostics = result.diagnostics
@@ -824,6 +831,7 @@ def run_mimo25_av_reconcile(
                     "raw_response_count": len(exc.raw_responses),
                     "http_retry_count": exc.http_retry_count,
                     "recheck_count": exc.recheck_count,
+                    "deterministic_correction_counts": {},
                 }
                 records.append(_record(values))
                 case_diagnostics = exc.diagnostics

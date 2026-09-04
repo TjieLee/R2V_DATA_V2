@@ -46,18 +46,21 @@ mapping from its exact frozen `<Subject N>` label to all and only its owning
 `<Picture N>` labels. The annotation stores each definition as typed
 `subject_label` plus model-authored visual `description`; it stores retention as
 typed `subject_label`, constrained `marker`, and visual `description`. The
-materializer joins these fields into normal official Ref2VA prose. MiMo must cite
-the Picture labels explicitly, but the definition remains natural rather than a
-project-specific fixed English template. Subject descriptions reject narrow
-speaker-profile vocabulary, and voice profiles reject demographic or identity
-claims. The full-AV recheck receives the same mapping and exact transcribed
-segment inventory.
+materializer joins the description with the exact frozen Picture labels as
+normal official Ref2VA prose. MiMo does not author Picture provenance, and a
+model-authored Picture label is rejected rather than treated as authority.
+Subject descriptions reject narrow speaker-profile vocabulary. Voice profiles
+remain acoustic-first; supported audible age/gender descriptors are allowed,
+while nationality, role, named identity, relationship, or personality claims
+remain invalid. The full-AV recheck receives the same mapping and exact
+transcribed segment inventory.
 
 The annotation also carries one nullable `speaker_voice_profiles` row for each
 resolved speaker group that owns authoritative transcribed speech. A non-null
 profile is limited to stable audible pitch register, timbre, texture, cadence,
 articulation, and genuinely supported accent or dialect; it cannot copy
-dialogue or infer demographic, identity, role, or personality. The deterministic
+dialogue or infer nationality, identity, role, relationship, or personality.
+The deterministic
 materializer uses this profile in the definition and retention prose for a real
 voice Audio asset. Within each real shot it cites that Audio relationship only
 on the speaker's first speech event; every authoritative segment and `(Sx)` / `<d>`
@@ -82,6 +85,12 @@ LR-ASD support, source-cluster support, current bindings, and direct anchors are
 proposals rather than visible-speaking proof: MiMo may
 restore a supplied entity for an unbound or zero-anchor segment. Every DiariZen
 segment enters MiMo regardless of its current LR-ASD/binding evidence.
+If the one full-AV recheck still claims visible speech using continuity alone,
+the adapter deterministically removes that visible-entity claim: explicit
+`offscreen_audio` becomes `offscreen` / `offscreen_spoken`; otherwise it becomes
+`no_reliable_entity` / `uncertain`. The speaker group and other valid evidence
+are preserved, `insufficient_evidence` is recorded, and the corrected annotation
+must pass the complete validator before publication.
 `offscreen_spoken`, `voice_over`,
 `message_voice_over`, and `device_playback` preserve the authoritative speech
 and speaker group but never create a visible mouth-speaking action. An uncertain
@@ -102,19 +111,19 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v15`
-- `h3_mimo25_av_authority_contract_v10`
-- `r2v.h3.mimo25_av_annotation.11`
-- `r2v.h3.mimo25_backend.13`
-- `h3_mimo25_materializer_v10`
+- `h3_mimo25_unified_av_reconcile_v16`
+- `h3_mimo25_av_authority_contract_v11`
+- `r2v.h3.mimo25_av_annotation.12`
+- `r2v.h3.mimo25_backend.14`
+- `h3_mimo25_materializer_v11`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
-- `r2v.h3.mimo25_record.8`
-- `r2v.h3.mimo25_summary.8`
+- `r2v.h3.mimo25_record.9`
+- `r2v.h3.mimo25_summary.9`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.10`
-- `r2v.h3.mimo25_h3_shadow_summary.10`
+- `r2v.h3.mimo25_h3_shadow.11`
+- `r2v.h3.mimo25_h3_shadow_summary.11`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
