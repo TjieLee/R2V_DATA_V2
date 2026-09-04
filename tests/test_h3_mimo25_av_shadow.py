@@ -70,6 +70,7 @@ from r2v_data_v2.h3.mimo25_backend import (
     SpeechPresentation,
     _canonicalize_raw_annotation_payload,
     _canonicalize_same_visible_entity_speaker_groups,
+    _contains_positive_soundscape_contamination,
     _normalize_speaker_voice_profiles,
     validate_annotation,
 )
@@ -849,10 +850,10 @@ def test_mimo_v20_prompt_preserves_staged_visual_audio_authority_contract() -> N
         assert phrase in SYSTEM_PROMPT
 
 
-def test_backend_v20_records_pre_recheck_normalization_policy(tmp_path: Path) -> None:
+def test_backend_v21_records_negation_aware_soundscape_policy(tmp_path: Path) -> None:
     backend, _ = _backend(tmp_path, [])
 
-    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.20"
+    assert backend.provenance.schema_version == "r2v.h3.mimo25_backend.21"
 
 
 def test_primary_prompt_includes_exact_subject_picture_contract(
@@ -2217,6 +2218,43 @@ def test_natural_retention_restatement_does_not_trigger_recheck(
     assert result.deterministic_correction_counts == {}
 
 
+@pytest.mark.parametrize(
+    "soundscape",
+    [
+        "Quiet room tone, no music.",
+        "No discernible background music or prominent sound effects.",
+        "There are no distinct environmental sounds, nor any human speech or music.",
+        "Neither dialogue nor music is audible.",
+        "Without music, only a low ventilation hum remains.",
+        "Music is absent.",
+        "Speech is absent.",
+        "A low ambient drone remains; there is no human speech or music.",
+    ],
+)
+def test_negated_soundscape_exclusions_are_clean(soundscape: str) -> None:
+    assert not _contains_positive_soundscape_contamination(soundscape)
+
+
+@pytest.mark.parametrize(
+    "soundscape",
+    [
+        "Soft background music plays underneath the room tone.",
+        "A piano score continues underneath.",
+        "Music is audible in the background.",
+        "Dialogue remains audible.",
+        "A narrator speaks over the scene.",
+        "Singing continues softly.",
+        "Room tone is mixed with background music.",
+        "No traffic is audible, but soft background music plays.",
+        "Music is absent, while a narrator speaks.",
+    ],
+)
+def test_positive_soundscape_contamination_remains_detectable(
+    soundscape: str,
+) -> None:
+    assert _contains_positive_soundscape_contamination(soundscape)
+
+
 def test_non_visible_binding_entity_id_is_removed_before_pydantic_parse() -> None:
     payload = _annotation().model_dump(mode="json")
     grounding = payload["av_grounding"]["segment_groundings"][0]
@@ -2261,7 +2299,7 @@ def test_contaminated_soundscape_rebuilds_from_clean_typed_events(
         }
     )
     semantics["overall_soundscape"] = (
-        "No music is audible; quiet room tone and a door close dominate."
+        "Soft background music plays over quiet room tone and a door close."
     )
     payload["h3_projection"]["shots"][0]["timeline_parts"] = [
         _prose("visual"),
@@ -2424,7 +2462,7 @@ def test_mislabeled_soundscape_event_is_not_used_to_mask_contamination(
     } <= {issue.code for issue in exc_info.value.issues}
 
 
-def test_contaminated_soundscape_without_typed_events_still_fails_closed(
+def test_negated_soundscape_without_typed_events_remains_authored_and_ready(
     tmp_path: Path,
 ) -> None:
     payload = _annotation().model_dump(mode="json")
@@ -2435,23 +2473,22 @@ def test_contaminated_soundscape_without_typed_events_still_fails_closed(
         _prose("visual"),
         _speech("segment_1"),
     ]
-    raw = json.dumps(payload)
-    backend, completions = _backend(tmp_path, [(raw, 8), (raw, 8)])
+    backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
 
-    with pytest.raises(MimoBackendFailure) as exc_info:
-        backend.reconcile(
-            _job_fixture(tmp_path),
-            segment_ids=["segment_1"],
-            transcribed_segment_ids=["segment_1"],
-            allowed_entity_ids={"e1"},
-            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
-        )
+    result = backend.reconcile(
+        _job_fixture(tmp_path),
+        segment_ids=["segment_1"],
+        transcribed_segment_ids=["segment_1"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
 
-    assert exc_info.value.recheck_count == 1
-    assert len(completions.requests) == 2
-    assert "overall_soundscape_contains_music_or_speech" in {
-        issue.code for issue in exc_info.value.issues
-    }
+    assert result.annotation.audio_semantics.overall_soundscape == "No music is audible."
+    assert result.annotation.audio_semantics.temporal_non_speech_events == []
+    assert result.model_call_count == 1
+    assert result.recheck_count == 0
+    assert result.deterministic_correction_counts == {}
+    assert len(completions.requests) == 1
 
 
 def test_random10_mechanical_defects_normalize_in_one_model_call(
@@ -2475,7 +2512,7 @@ def test_random10_mechanical_defects_normalize_in_one_model_call(
         source_grounding="audible_only",
     )
     semantics["overall_soundscape"] = (
-        "No music is audible; only faint indoor room ambience remains."
+        "Soft background music plays over faint indoor room ambience."
     )
     backend, completions = _backend(tmp_path, [(json.dumps(payload), 8)])
 

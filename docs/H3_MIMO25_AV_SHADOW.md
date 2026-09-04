@@ -150,7 +150,7 @@ Prompt, policy, annotation schema, and materializer versions are:
 - `h3_mimo25_unified_av_reconcile_v20`
 - `h3_mimo25_av_authority_contract_v14`
 - `r2v.h3.mimo25_av_annotation.13`
-- `r2v.h3.mimo25_backend.20`
+- `r2v.h3.mimo25_backend.21`
 - `h3_mimo25_materializer_v14`
 - `h3_mimo25_reference_selection_v1`
 - `h3_mimo25_recovered_voice_quality_v1`
@@ -303,6 +303,14 @@ events in `physical`, `environmental`, `mechanical`, `electronic`,
 diegetic and non-diegetic music are excluded. If an eligible event itself contains
 dialogue/music semantics, or no clean eligible event exists, the adapter does not
 fabricate a replacement and retains the normal recheck/fail-closed path.
+Global soundscape validation treats local, explicit exclusions such as `no music`,
+`without music`, or `neither dialogue nor music is audible` as clean prose. The
+same clause-local check still rejects any positive music/dialogue mention, including
+one that follows an unrelated negation after `but`, `while`, or another clause
+boundary. Typed event descriptions retain the stricter lexical category guard
+because every event represents positively observed Audio evidence. Quiet ambience
+may therefore remain `present` with zero typed events; no event is invented merely
+to justify the global description.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,

@@ -31,7 +31,7 @@ MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v20"
 MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v14"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.13"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.20"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.21"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v14"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -65,8 +65,28 @@ _VOICE_IDENTITY_PROFILE = re.compile(
     flags=re.IGNORECASE,
 )
 _SOUNDSCAPE_CONTAMINATION = re.compile(
-    r"\b(?:BGM|background music|score|soundtrack|music|song|melody|"
-    r"instrumental music|dialogue|spoken dialogue|narration|voice-over|lyrics|singing)\b",
+    r"\b(?:BGM|background music|instrumental music|score|soundtrack|music|song|"
+    r"melody|spoken dialogue|human speech|dialogue|narration|narrator(?:\s+speaks?)?|"
+    r"voice-over|lyrics|singing)\b",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_CLAUSE_BOUNDARY = re.compile(
+    r"[,;:.!?\n]+|\b(?:but|however|while|whereas|yet)\b",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_LOCAL_NEGATOR = re.compile(
+    r"\b(?:no|not|without|neither|nor|none|lack|lacks|lacked|lacking|absent|"
+    r"undetectable|indiscernible)\b",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_NEGATION_SCOPE_BREAK = re.compile(
+    r"\b(?:is|are|was|were|plays?|continues?|remains?|speaks?|sings?|sounds?|"
+    r"hears?|heard)\b",
+    flags=re.IGNORECASE,
+)
+_SOUNDSCAPE_POST_NEGATION = re.compile(
+    r"^\s*(?:(?:is|are|was|were|seems?|remains?)\s+)?(?:not\s+"
+    r"(?:audible|present|detectable|discernible)|absent|undetectable|indiscernible)\b",
     flags=re.IGNORECASE,
 )
 _INTERNAL_ANNOTATION_SYNTAX = re.compile(
@@ -181,6 +201,36 @@ def _sha256_text(value: str) -> str:
 
 def _normalized_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _soundscape_contamination_match_is_negated(
+    clause: str,
+    match: re.Match[str],
+) -> bool:
+    if _SOUNDSCAPE_POST_NEGATION.match(clause[match.end() :]):
+        return True
+
+    prefix = clause[: match.start()]
+    negators = list(_SOUNDSCAPE_LOCAL_NEGATOR.finditer(prefix))
+    if not negators:
+        return False
+    negator = negators[-1]
+    between = prefix[negator.end() :]
+    if negator.group(0).casefold() == "not" and re.match(
+        r"\s+only\b", between, flags=re.IGNORECASE
+    ):
+        return False
+    if _SOUNDSCAPE_NEGATION_SCOPE_BREAK.search(between):
+        return False
+    return len(re.findall(r"\b[\w'-]+\b", between)) <= 8
+
+
+def _contains_positive_soundscape_contamination(text: str) -> bool:
+    for clause in _SOUNDSCAPE_CLAUSE_BOUNDARY.split(text):
+        for match in _SOUNDSCAPE_CONTAMINATION.finditer(clause):
+            if not _soundscape_contamination_match_is_negated(clause, match):
+                return True
+    return False
 
 
 def _deduplicate_exact_strings(values: object) -> tuple[object, int]:
@@ -803,7 +853,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.20"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.21"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -1923,7 +1973,9 @@ def validate_annotation(
     ]
     if (
         audio_semantics.overall_soundscape is not None
-        and _SOUNDSCAPE_CONTAMINATION.search(audio_semantics.overall_soundscape)
+        and _contains_positive_soundscape_contamination(
+            audio_semantics.overall_soundscape
+        )
     ):
         issues.append(
             ValidationIssue(
@@ -2142,7 +2194,7 @@ def _rebuild_contaminated_overall_soundscape_from_events(
     if (
         semantics.overall_soundscape_status != "present"
         or soundscape is None
-        or _SOUNDSCAPE_CONTAMINATION.search(soundscape) is None
+        or not _contains_positive_soundscape_contamination(soundscape)
     ):
         return annotation, 0
 
