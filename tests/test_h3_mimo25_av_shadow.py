@@ -64,6 +64,8 @@ from r2v_data_v2.h3.mimo25_backend import (
     MimoUsage,
     OpenAIMimo25Backend,
     SpeechPresentation,
+    _canonicalize_same_visible_entity_speaker_groups,
+    _normalize_speaker_voice_profiles,
     validate_annotation,
 )
 from r2v_data_v2.h3.mimo25_h3_materializer import (
@@ -365,6 +367,41 @@ def _three_transcribed_segment_job(tmp_path: Path) -> MimoClipJob:
         segment["asr_text"] = f"Exact text {index}."
         values["segments"].append(segment)
     return _job(values)
+
+
+def _three_segment_annotation(
+    assignments: list[tuple[str, str]],
+    *,
+    profiles: list[dict[str, str | None]] | None = None,
+    reliable: bool = True,
+) -> MimoAVAnnotationDraft:
+    payload = _annotation().model_dump(mode="json")
+    first = payload["segment_decisions"][0]
+    payload["segment_decisions"] = []
+    for index, (group, entity_id) in enumerate(assignments, start=1):
+        decision = dict(first)
+        decision["segment_id"] = f"segment_{index}"
+        decision["primary_speaker_group"] = group
+        decision["entity_id"] = entity_id
+        decision["delivery_style"] = f"measured delivery {index}"
+        decision["evidence_codes"] = (
+            ["visible_lip_motion", "av_temporal_alignment"]
+            if reliable
+            else ["voice_continuity"]
+        )
+        payload["segment_decisions"].append(decision)
+    if profiles is None:
+        profiles = [
+            {"speaker_group": group, "voice_characteristics": f"profile {group}"}
+            for group in dict.fromkeys(group for group, _ in assignments)
+        ]
+    payload["speaker_voice_profiles"] = profiles
+    payload["h3_draft"]["shots"][0]["timeline_parts"] = [
+        _prose("A visible conversation unfolds."),
+        _audio_event("ae1"),
+        *(_speech(f"segment_{index}") for index in range(1, 4)),
+    ]
+    return MimoAVAnnotationDraft.model_validate(payload)
 
 
 def _validate(
@@ -2102,6 +2139,203 @@ def test_mixed_a073_issues_allow_downgrade_and_profile_normalization(
         "conservative_visible_speaker_downgrade": 3,
         "speaker_voice_profile_inventory_normalization": 1,
     }
+
+
+def test_a073_reliable_same_entity_groups_are_safely_canonicalized(
+    tmp_path: Path,
+) -> None:
+    job = _three_transcribed_segment_job(tmp_path)
+    invalid_annotation = _three_segment_annotation(
+        [("g1", "e1"), ("g2", "e1"), ("g2", "e1")],
+        profiles=[
+            {
+                "speaker_group": "g2",
+                "voice_characteristics": "steady measured cadence",
+            }
+        ],
+    )
+    issue_codes = {
+        issue.code
+        for issue in _validate(
+            invalid_annotation,
+            segment_ids=["segment_1", "segment_2", "segment_3"],
+            segment_intervals={
+                "segment_1": (0.0, 1.0),
+                "segment_2": (1.0, 2.0),
+                "segment_3": (2.0, 3.0),
+            },
+            transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+            target_duration_seconds=3.0,
+        )
+    }
+    assert "visible_entity_speaker_group_contradiction" in issue_codes
+    assert "speaker_voice_profile_inventory_mismatch" in issue_codes
+    raw = invalid_annotation.model_dump_json()
+    backend, completions = _backend(tmp_path, [(raw, 5), (raw, 5)])
+
+    result = backend.reconcile(
+        job,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+        allowed_entity_ids={"e1"},
+        allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+    )
+
+    assert len(completions.requests) == 2
+    assert [item.primary_speaker_group for item in result.annotation.segment_decisions] == [
+        "g1",
+        "g1",
+        "g1",
+    ]
+    assert [item.entity_id for item in result.annotation.segment_decisions] == [
+        "e1",
+        "e1",
+        "e1",
+    ]
+    assert [item.speaker_group for item in result.annotation.speaker_voice_profiles] == [
+        "g1"
+    ]
+    assert result.annotation.speaker_voice_profiles[0].voice_characteristics == (
+        "steady measured cadence"
+    )
+    assert result.deterministic_correction_counts == {
+        "same_visible_entity_speaker_group_merge": 1,
+        "speaker_voice_profile_inventory_normalization": 1,
+    }
+
+
+def test_distinct_visible_entities_do_not_merge_speaker_groups() -> None:
+    annotation = _three_segment_annotation(
+        [("g1", "e1"), ("g2", "e2"), ("g2", "e2")]
+    )
+
+    corrected, counts, sources = _canonicalize_same_visible_entity_speaker_groups(
+        annotation,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        allowed_entity_ids={"e1", "e2"},
+    )
+
+    assert corrected == annotation
+    assert counts == {}
+    assert sources is None
+
+
+def test_group_resolved_to_different_visible_entity_blocks_same_entity_merge(
+    tmp_path: Path,
+) -> None:
+    annotation = _three_segment_annotation(
+        [("g1", "e1"), ("g2", "e1"), ("g2", "e2")]
+    )
+
+    corrected, counts, sources = _canonicalize_same_visible_entity_speaker_groups(
+        annotation,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        allowed_entity_ids={"e1", "e2"},
+    )
+
+    assert corrected == annotation
+    assert counts == {}
+    assert sources is None
+    issue_codes = {
+        issue.code
+        for issue in _validate(
+            annotation,
+            segment_ids=["segment_1", "segment_2", "segment_3"],
+            segment_intervals={
+                "segment_1": (0.0, 1.0),
+                "segment_2": (1.0, 2.0),
+                "segment_3": (2.0, 3.0),
+            },
+            transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+            authoritative_transcripts=["First", "Second", "Third"],
+            allowed_entity_ids={"e1", "e2"},
+            target_duration_seconds=3.0,
+        )
+    }
+    assert "speaker_group_entity_contradiction" in issue_codes
+    assert "visible_entity_speaker_group_contradiction" in issue_codes
+
+    raw = annotation.model_dump_json()
+    backend, _ = _backend(tmp_path, [(raw, 5), (raw, 5)])
+    with pytest.raises(MimoBackendFailure) as exc_info:
+        backend.reconcile(
+            _three_transcribed_segment_job(tmp_path),
+            segment_ids=["segment_1", "segment_2", "segment_3"],
+            transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+            allowed_entity_ids={"e1", "e2"},
+            allowed_reference_labels={"<Picture 1>", "<Subject 1>"},
+        )
+    assert "speaker_group_entity_contradiction" in {
+        issue.code for issue in exc_info.value.issues
+    }
+
+
+def test_uncertain_visible_entity_binding_blocks_same_entity_merge() -> None:
+    payload = _three_segment_annotation(
+        [("g1", "e1"), ("g2", "e1"), ("g3", "e1")]
+    ).model_dump(mode="json")
+    payload["segment_decisions"][2]["resolution"] = "uncertain"
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    corrected, counts, sources = _canonicalize_same_visible_entity_speaker_groups(
+        annotation,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        allowed_entity_ids={"e1"},
+    )
+
+    assert corrected == annotation
+    assert counts == {}
+    assert sources is None
+
+
+def test_group_merge_recanonicalizes_remaining_groups_and_profiles() -> None:
+    annotation = _three_segment_annotation(
+        [("g1", "e1"), ("g2", "e1"), ("g3", "e2")],
+        profiles=[
+            {"speaker_group": "g1", "voice_characteristics": "canonical profile"},
+            {"speaker_group": "g2", "voice_characteristics": "merged profile"},
+            {"speaker_group": "g3", "voice_characteristics": "second profile"},
+        ],
+    )
+
+    corrected, counts, sources = _canonicalize_same_visible_entity_speaker_groups(
+        annotation,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        allowed_entity_ids={"e1", "e2"},
+    )
+    corrected, profile_count = _normalize_speaker_voice_profiles(
+        corrected,
+        transcribed_segment_ids={"segment_1", "segment_2", "segment_3"},
+        source_groups_by_final_group=sources,
+    )
+
+    assert [item.primary_speaker_group for item in corrected.segment_decisions] == [
+        "g1",
+        "g1",
+        "g2",
+    ]
+    assert counts == {
+        "same_visible_entity_speaker_group_merge": 1,
+        "speaker_group_id_recanonicalization": 1,
+    }
+    assert profile_count == 1
+    assert [item.model_dump(mode="json") for item in corrected.speaker_voice_profiles] == [
+        {"speaker_group": "g1", "voice_characteristics": "canonical profile"},
+        {"speaker_group": "g2", "voice_characteristics": "second profile"},
+    ]
+    assert not _validate(
+        corrected,
+        segment_ids=["segment_1", "segment_2", "segment_3"],
+        segment_intervals={
+            "segment_1": (0.0, 1.0),
+            "segment_2": (1.0, 2.0),
+            "segment_3": (2.0, 3.0),
+        },
+        transcribed_segment_ids=["segment_1", "segment_2", "segment_3"],
+        authoritative_transcripts=["First", "Second", "Third"],
+        allowed_entity_ids={"e1", "e2"},
+        target_duration_seconds=3.0,
+    )
 
 
 def test_recheck_visible_lip_motion_positive_stays_visible(tmp_path: Path) -> None:

@@ -1490,27 +1490,43 @@ def _normalize_speaker_voice_profiles(
     annotation: MimoAVAnnotationDraft,
     *,
     transcribed_segment_ids: set[str],
+    source_groups_by_final_group: dict[str, list[str]] | None = None,
 ) -> tuple[MimoAVAnnotationDraft, int]:
     required_groups = _required_voice_profile_groups(
         annotation.segment_decisions,
         transcribed_segment_ids=transcribed_segment_ids,
     )
-    required_group_set = set(required_groups)
     profiles_by_group: dict[str, MimoSpeakerVoiceProfile] = {}
     for profile in annotation.speaker_voice_profiles:
-        if profile.speaker_group not in required_group_set:
-            continue
         if profile.speaker_group in profiles_by_group:
             return annotation, 0
         profiles_by_group[profile.speaker_group] = profile
-    normalized_profiles = [
-        profiles_by_group.get(group)
-        or MimoSpeakerVoiceProfile(
-            speaker_group=group,
-            voice_characteristics=None,
+    normalized_profiles: list[MimoSpeakerVoiceProfile] = []
+    for group in required_groups:
+        source_groups = (
+            source_groups_by_final_group.get(group, [group])
+            if source_groups_by_final_group is not None
+            else [group]
         )
-        for group in required_groups
-    ]
+        canonical_profile = profiles_by_group.get(source_groups[0])
+        if canonical_profile is not None:
+            voice_characteristics = canonical_profile.voice_characteristics
+        else:
+            voice_characteristics = next(
+                (
+                    profile.voice_characteristics
+                    for source_group in source_groups[1:]
+                    if (profile := profiles_by_group.get(source_group)) is not None
+                    and profile.voice_characteristics is not None
+                ),
+                None,
+            )
+        normalized_profiles.append(
+            MimoSpeakerVoiceProfile(
+                speaker_group=group,
+                voice_characteristics=voice_characteristics,
+            )
+        )
     if normalized_profiles == annotation.speaker_voice_profiles:
         return annotation, 0
     payload = annotation.model_dump(mode="python")
@@ -1523,9 +1539,7 @@ def _normalize_speaker_voice_profiles(
 def _conservative_visible_speaker_downgrade(
     annotation: MimoAVAnnotationDraft,
     issues: list[ValidationIssue],
-    *,
-    transcribed_segment_ids: set[str],
-) -> tuple[MimoAVAnnotationDraft, dict[str, int]]:
+) -> tuple[MimoAVAnnotationDraft, int]:
     affected_segments = {
         issue.field
         for issue in issues
@@ -1533,7 +1547,7 @@ def _conservative_visible_speaker_downgrade(
         and issue.field is not None
     }
     if not affected_segments:
-        return annotation, {}
+        return annotation, 0
     payload = annotation.model_dump(mode="python")
     correction_count = 0
     for decision in payload["segment_decisions"]:
@@ -1557,20 +1571,112 @@ def _conservative_visible_speaker_downgrade(
         decision["evidence_codes"] = evidence_codes
         correction_count += 1
     if correction_count == 0:
-        return annotation, {}
-    corrected = MimoAVAnnotationDraft.model_validate(payload)
-    corrected, profile_correction_count = _normalize_speaker_voice_profiles(
-        corrected,
-        transcribed_segment_ids=transcribed_segment_ids,
-    )
-    correction_counts = {
-        "conservative_visible_speaker_downgrade": correction_count,
+        return annotation, 0
+    return MimoAVAnnotationDraft.model_validate(payload), correction_count
+
+
+def _canonicalize_same_visible_entity_speaker_groups(
+    annotation: MimoAVAnnotationDraft,
+    *,
+    segment_ids: list[str],
+    allowed_entity_ids: set[str],
+) -> tuple[MimoAVAnnotationDraft, dict[str, int], dict[str, list[str]] | None]:
+    decisions = annotation.segment_decisions
+    if [decision.segment_id for decision in decisions] != segment_ids:
+        return annotation, {}, None
+
+    groups_by_entity: dict[str, list[str]] = {}
+    visible_entities_by_group: dict[str, set[str]] = {}
+    groups_with_uncertain_visible_binding: set[str] = set()
+    entities_with_uncertain_visible_binding: set[str] = set()
+    reliable_by_entity: dict[str, bool] = {}
+    for decision in decisions:
+        group = decision.primary_speaker_group
+        if (
+            group is not None
+            and decision.binding_status == "visible_entity"
+            and decision.entity_id is not None
+        ):
+            visible_entities_by_group.setdefault(group, set()).add(decision.entity_id)
+            if decision.resolution != "resolved":
+                groups_with_uncertain_visible_binding.add(group)
+                entities_with_uncertain_visible_binding.add(decision.entity_id)
+        if (
+            decision.resolution != "resolved"
+            or decision.binding_status != "visible_entity"
+            or decision.entity_id is None
+            or group is None
+        ):
+            continue
+        entity_id = decision.entity_id
+        groups = groups_by_entity.setdefault(entity_id, [])
+        if group not in groups:
+            groups.append(group)
+        reliable_by_entity[entity_id] = reliable_by_entity.get(
+            entity_id, True
+        ) and _has_onscreen_speaker_evidence(decision.evidence_codes)
+
+    merged_group_by_group: dict[str, str] = {}
+    for entity_id, groups in groups_by_entity.items():
+        if (
+            entity_id not in allowed_entity_ids
+            or entity_id in entities_with_uncertain_visible_binding
+            or len(groups) < 2
+            or not reliable_by_entity[entity_id]
+            or any(group in groups_with_uncertain_visible_binding for group in groups)
+            or any(visible_entities_by_group[group] != {entity_id} for group in groups)
+        ):
+            continue
+        canonical_group = groups[0]
+        for group in groups[1:]:
+            merged_group_by_group[group] = canonical_group
+    if not merged_group_by_group:
+        return annotation, {}, None
+
+    original_group_order: list[str] = []
+    merged_group_order: list[str] = []
+    for decision in decisions:
+        group = decision.primary_speaker_group
+        if group is None:
+            continue
+        if group not in original_group_order:
+            original_group_order.append(group)
+        merged_group = merged_group_by_group.get(group, group)
+        if merged_group not in merged_group_order:
+            merged_group_order.append(merged_group)
+    final_group_by_merged_group = {
+        group: f"g{index}"
+        for index, group in enumerate(merged_group_order, start=1)
     }
-    if profile_correction_count:
-        correction_counts["speaker_voice_profile_inventory_normalization"] = (
-            profile_correction_count
+    final_group_by_original_group = {
+        group: final_group_by_merged_group[merged_group_by_group.get(group, group)]
+        for group in original_group_order
+    }
+    source_groups_by_final_group: dict[str, list[str]] = {}
+    for group in original_group_order:
+        final_group = final_group_by_original_group[group]
+        source_groups_by_final_group.setdefault(final_group, []).append(group)
+
+    payload = annotation.model_dump(mode="python")
+    for decision in payload["segment_decisions"]:
+        group = decision["primary_speaker_group"]
+        if group is not None:
+            decision["primary_speaker_group"] = final_group_by_original_group[group]
+    correction_counts = {
+        "same_visible_entity_speaker_group_merge": len(merged_group_by_group),
+    }
+    recanonicalized_group_count = sum(
+        final_group_by_merged_group[group] != group for group in merged_group_order
+    )
+    if recanonicalized_group_count:
+        correction_counts["speaker_group_id_recanonicalization"] = (
+            recanonicalized_group_count
         )
-    return corrected, correction_counts
+    return (
+        MimoAVAnnotationDraft.model_validate(payload),
+        correction_counts,
+        source_groups_by_final_group,
+    )
 
 
 class OpenAIMimo25Backend:
@@ -2073,12 +2179,32 @@ class OpenAIMimo25Backend:
             annotation, issues = parse_and_validate(raw)
         deterministic_correction_counts: dict[str, int] = {}
         if annotation is not None and issues:
-            annotation, correction_counts = _conservative_visible_speaker_downgrade(
+            annotation, downgrade_count = _conservative_visible_speaker_downgrade(
                 annotation,
                 issues,
-                transcribed_segment_ids=set(transcribed_segment_ids),
             )
-            if correction_counts:
+            if downgrade_count:
+                deterministic_correction_counts[
+                    "conservative_visible_speaker_downgrade"
+                ] = downgrade_count
+            annotation, group_correction_counts, source_groups = (
+                _canonicalize_same_visible_entity_speaker_groups(
+                    annotation,
+                    segment_ids=segment_ids,
+                    allowed_entity_ids=allowed_entity_ids,
+                )
+            )
+            deterministic_correction_counts.update(group_correction_counts)
+            annotation, profile_correction_count = _normalize_speaker_voice_profiles(
+                annotation,
+                transcribed_segment_ids=set(transcribed_segment_ids),
+                source_groups_by_final_group=source_groups,
+            )
+            if profile_correction_count:
+                deterministic_correction_counts[
+                    "speaker_voice_profile_inventory_normalization"
+                ] = profile_correction_count
+            if deterministic_correction_counts:
                 issues = validate_annotation(
                     annotation,
                     segment_ids=segment_ids,
@@ -2097,8 +2223,6 @@ class OpenAIMimo25Backend:
                     reference_subjects=job.reference_subjects,
                     target_duration_seconds=job.target_duration_seconds,
                 )
-                if not issues:
-                    deterministic_correction_counts.update(correction_counts)
         if annotation is None or issues:
             raise contextual_failure(
                 MimoBackendFailure(
