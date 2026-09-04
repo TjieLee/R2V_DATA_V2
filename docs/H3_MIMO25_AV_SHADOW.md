@@ -43,10 +43,15 @@ non-transcribed decision uses `null`.
 
 Each draft Subject definition is constrained by a machine-readable, per-request
 mapping from its exact frozen `<Subject N>` label to all and only its owning
-`<Picture N>` labels. MiMo must cite those labels explicitly, but the definition
-remains natural official Ref2VA prose rather than a project-specific fixed
-English template. The full-AV recheck receives the same mapping and exact
-transcribed-segment inventory.
+`<Picture N>` labels. The annotation stores each definition as typed
+`subject_label` plus model-authored visual `description`; it stores retention as
+typed `subject_label`, constrained `marker`, and visual `description`. The
+materializer joins these fields into normal official Ref2VA prose. MiMo must cite
+the Picture labels explicitly, but the definition remains natural rather than a
+project-specific fixed English template. Subject descriptions reject narrow
+speaker-profile vocabulary, and voice profiles reject demographic or identity
+claims. The full-AV recheck receives the same mapping and exact transcribed
+segment inventory.
 
 The annotation also carries one nullable `speaker_voice_profiles` row for each
 resolved speaker group that owns authoritative transcribed speech. A non-null
@@ -97,19 +102,19 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v14`
-- `h3_mimo25_av_authority_contract_v9`
-- `r2v.h3.mimo25_av_annotation.10`
-- `r2v.h3.mimo25_backend.12`
-- `h3_mimo25_materializer_v9`
+- `h3_mimo25_unified_av_reconcile_v15`
+- `h3_mimo25_av_authority_contract_v10`
+- `r2v.h3.mimo25_av_annotation.11`
+- `r2v.h3.mimo25_backend.13`
+- `h3_mimo25_materializer_v10`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
-- `r2v.h3.mimo25_record.7`
-- `r2v.h3.mimo25_summary.7`
+- `r2v.h3.mimo25_record.8`
+- `r2v.h3.mimo25_summary.8`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.9`
-- `r2v.h3.mimo25_h3_shadow_summary.9`
+- `r2v.h3.mimo25_h3_shadow.10`
+- `r2v.h3.mimo25_h3_shadow_summary.10`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -257,7 +262,10 @@ Music boundaries remain explicitly MiMo-approximate and are recorded as rounded
 canonical 32 kHz sample coordinates. The extracted asset is a real stereo FLAC;
 it guides qualitative audience-only music style without copying the waveform.
 V1 does not publish partial music reuse or treat a dialogue-contaminated mix as
-an isolated score. Full-audio reuse, clean music reference, and voice reference
+an isolated score. A future policy should consider merging contiguous compatible
+non-diegetic-music spans from one cue; V1 deliberately keeps model event spans
+independent and does not merge arbitrary adjacent events. Full-audio reuse,
+clean music reference, and voice reference
 are distinct roles, and Audio numbering remains independent of `(Sx)` numbering.
 Every variant keeps all Pictures and is omitted rather than dropping Visual
 references if the official Audio <= 3 or Picture + Audio <= 12 limits would be

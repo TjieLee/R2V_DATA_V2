@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v14"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v9"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.10"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.12"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v9"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v15"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v10"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.11"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.13"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v10"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -48,17 +48,21 @@ _KEYFRAME_ROLE = re.compile(
     r"|\b(first frame|last frame|keyframe)\b[^.\n]{0,100}<Picture\s+[1-9]\d*>",
     flags=re.IGNORECASE,
 )
-_RETENTION_MARKER = re.compile(
-    r"^\s*<(?:Picture|Subject) [1-9]\d*>[^\n]*?:\s*([a-z]+_[a-z_]+)\b",
-    flags=re.MULTILINE,
-)
-_ALLOWED_RETENTION_MARKERS = {
-    "fully_preserved",
-    "partially_preserved",
-    "weak_reference",
-}
 _ALLOWED_RETENTION_MARKER_OCCURRENCE = re.compile(
-    r"\b(?:fully_preserved|partially_preserved|weak_reference)\b"
+    r"\b(?:fully[\s_-]+preserved|partially[\s_-]+preserved|weak[\s_-]+reference)\b",
+    flags=re.IGNORECASE,
+)
+_BARE_SUBJECT_LABEL = re.compile(r"(?<!<)\bSubject\s+[1-9]\d*\b(?!>)")
+_SUBJECT_AUDIO_PROFILE = re.compile(
+    r"\b(?:voice|vocal|pitch|timbre|cadence|articulation|accent|dialect)\b"
+    r"|\bspeaking(?:[\s-]+)rate\b",
+    flags=re.IGNORECASE,
+)
+_VOICE_IDENTITY_PROFILE = re.compile(
+    r"\b(?:male|female|man|woman|boy|girl|young|old|older|mature|child|adult)\b"
+    r"|\b(?:doctor|teacher|chef|officer|narrator|actor|actress)\b"
+    r"|\b(?:voice|speaker)\s+(?:of|from)\b",
+    flags=re.IGNORECASE,
 )
 _TRUNCATED_FINISH_REASONS = {
     "length",
@@ -390,18 +394,61 @@ class MimoH3Shot(SchemaModel):
     timeline_parts: list[MimoH3TimelinePart] = Field(min_length=1)
 
 
+class MimoSubjectDefinitionDraft(SchemaModel):
+    subject_label: str = Field(pattern=r"^<Subject [1-9]\d*>$")
+    description: StrictStr
+
+    @model_validator(mode="after")
+    def validate_definition(self) -> MimoSubjectDefinitionDraft:
+        if not self.description.strip():
+            raise ValueError("MiMo Subject definition description must not be empty")
+        if any(
+            match.group(1) == "Subject"
+            for match in _PICTURE_OR_SUBJECT.finditer(self.description)
+        ):
+            raise ValueError("MiMo Subject definition description repeats a Subject label")
+        if _BARE_SUBJECT_LABEL.search(self.description):
+            raise ValueError("MiMo Subject definition description contains a bare Subject label")
+        return self
+
+    def render(self) -> str:
+        return f"{self.subject_label} {self.description.strip()}"
+
+
+class MimoVisualRetentionDraft(SchemaModel):
+    subject_label: str = Field(pattern=r"^<Subject [1-9]\d*>$")
+    marker: Literal["fully_preserved", "partially_preserved", "weak_reference"]
+    description: StrictStr
+
+    @model_validator(mode="after")
+    def validate_retention(self) -> MimoVisualRetentionDraft:
+        if not self.description.strip():
+            raise ValueError("MiMo retention description must not be empty")
+        if any(
+            match.group(1) == "Subject"
+            for match in _PICTURE_OR_SUBJECT.finditer(self.description)
+        ) or _BARE_SUBJECT_LABEL.search(self.description):
+            raise ValueError("MiMo retention description repeats a Subject label")
+        if _ALLOWED_RETENTION_MARKER_OCCURRENCE.search(self.description):
+            raise ValueError("MiMo retention description repeats a retention marker")
+        return self
+
+    def render(self) -> str:
+        return f"{self.subject_label}: {self.marker} - {self.description.strip()}"
+
+
 class MimoH3Draft(SchemaModel):
-    subject_definitions: list[StrictStr] = Field(min_length=1)
+    subject_definitions: list[MimoSubjectDefinitionDraft] = Field(min_length=1)
     summary: StrictStr
-    visual_retention_analysis: list[StrictStr] = Field(min_length=1)
+    visual_retention_analysis: list[MimoVisualRetentionDraft] = Field(min_length=1)
     shots: list[MimoH3Shot] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_draft(self) -> MimoH3Draft:
         values = (
-            *self.subject_definitions,
+            *(item.description for item in self.subject_definitions),
             self.summary,
-            *self.visual_retention_analysis,
+            *(item.description for item in self.visual_retention_analysis),
             *(
                 part.text
                 for shot in self.shots
@@ -450,7 +497,7 @@ class MimoSpeakerVoiceProfile(SchemaModel):
 
 
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.10"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.11"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
     speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     audio_semantics: MimoAudioSemantics
@@ -463,7 +510,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.12"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.13"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -480,13 +527,13 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v14"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v15"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v9"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v10"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.10"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.11"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
@@ -494,6 +541,7 @@ class MimoBackendProvenance(SchemaModel):
         "h3_mimo25_materializer_v7",
         "h3_mimo25_materializer_v8",
         "h3_mimo25_materializer_v9",
+        "h3_mimo25_materializer_v10",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -727,14 +775,14 @@ AUDIO SEMANTICS
 - Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
 - overall_soundscape is a required core H3 semantic. Use present with one concise audible description whenever ambience, room tone, an environmental layer, a physical sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain. Do not repeat dialogue in overall_soundscape, and do not use non-diegetic music as a substitute for it.
 - overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground or disambiguate a genuinely audible source but never create room tone or another sound from visual context.
-- Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Describe only stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Never copy dialogue or infer age, gender, nationality, role, identity, or personality.
+- Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Describe only stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Never copy dialogue or characterize a voice as male, female, man, woman, boy, girl, young, old, older, mature, or by nationality, role, identity, or personality.
 - audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.
 
 H3 DRAFT
 - Write dense generation-quality observed video prose, not a caption. For each real shot cover applicable visual style; shot scale and framing; camera angle; foreground, midground, and background composition; salient subject appearance and spatial relationships; pose; body, arm, hand, and head motion; gaze; facial expression changes; interactions; object states; environment/materials/readable text; lighting/color; camera motion or explicit stability; and temporal progression through early, middle, and late portions. Target roughly 300-450 English words only when evidence supports it; never pad.
 - Use observed evidence, not plausible filler. Do not infer unsupported emotion/psychology, intent, causality, relationships, identity, sound, offscreen events, or object detail. Non-onscreen speech must not create visible speaking/lip motion. Add later shots only for real hard cuts.
-- Subject definitions are natural official MiniMax H3 Ref2VA prose. Begin each row with its exact Subject and naturally integrate every and only its required Picture labels exactly once. Avoid mechanically repeating one connector such as "as seen in" across all rows; natural forms such as "in", "shown in", "depicted in", "from", or "whose appearance comes from" are all valid. Pictures are content references, not first frames, last frames, or keyframes.
-- Retention has exactly one row per Subject and one of fully_preserved, partially_preserved, weak_reference. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
+- Subject definitions use typed subject_label plus natural official MiniMax H3 Ref2VA description. Set subject_label to the exact supplied Subject. Keep description visual-only, do not repeat any Subject label there, and naturally integrate every and only its required Picture labels exactly once. Avoid mechanically repeating one connector such as "as seen in" across all rows; natural forms such as "in", "shown in", "depicted in", "from", or "whose appearance comes from" are all valid. Never put voice, vocal, pitch, timbre, cadence, articulation, accent, dialect, or speaking-rate concepts in a visual Subject description. Pictures are content references, not first frames, last frames, or keyframes.
+- Visual retention uses typed subject_label, marker, and description. Set subject_label to the exact supplied Subject; choose exactly one marker from fully_preserved, partially_preserved, weak_reference; and write visual explanation only in description without repeating a Subject label or marker. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
 - timeline_parts alone place typed prose, speech, and audio events. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in order and their descriptions are not repeated in prose. The deterministic materializer owns final official H3 syntax."""
 
 
@@ -1041,6 +1089,18 @@ def validate_annotation(
                 "voice profiles must exactly follow resolved transcribed speaker groups",
             )
         )
+    for profile in annotation.speaker_voice_profiles:
+        if (
+            profile.voice_characteristics is not None
+            and _VOICE_IDENTITY_PROFILE.search(profile.voice_characteristics)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "speaker_voice_profile_contains_identity_claim",
+                    "speaker_voice_profiles",
+                    f"{profile.speaker_group} voice profile contains identity wording",
+                )
+            )
     for event in annotation.audio_semantics.temporal_non_speech_events:
         if event.approximate_end_time > target_duration_seconds + 1e-6:
             issues.append(
@@ -1129,9 +1189,9 @@ def validate_annotation(
         )
     non_shot_text = "\n".join(
         (
-            *draft.subject_definitions,
+            *(item.render() for item in draft.subject_definitions),
             draft.summary,
-            *draft.visual_retention_analysis,
+            *(item.render() for item in draft.visual_retention_analysis),
         )
     )
     if "[[" in non_shot_text or "]]" in non_shot_text:
@@ -1253,37 +1313,10 @@ def validate_annotation(
                 str(sorted(unknown_labels)),
             )
         )
-    retention_text = "\n".join(draft.visual_retention_analysis)
-    if "attribute_transfer" in retention_text:
-        issues.append(
-            ValidationIssue(
-                "unassigned_attribute_transfer",
-                "h3_draft.visual_retention_analysis",
-                "current contract does not assign attribute transfer",
-            )
-        )
-    unknown_markers = sorted(
-        {
-            marker
-            for marker in _RETENTION_MARKER.findall(retention_text)
-            if marker not in _ALLOWED_RETENTION_MARKERS
-            and marker != "attribute_transfer"
-        }
-    )
-    if unknown_markers:
-        issues.append(
-            ValidationIssue(
-                "unknown_visual_retention_marker",
-                "h3_draft.visual_retention_analysis",
-                str(unknown_markers),
-            )
-        )
     supplied_subject_labels = {str(item.subject_label) for item in reference_subjects}
-    retention_subject_labels: list[str] = []
-    for line in draft.visual_retention_analysis:
-        match = re.match(r"^\s*(<Subject [1-9]\d*>)", line)
-        if match is not None:
-            retention_subject_labels.append(match.group(1))
+    retention_subject_labels = [
+        item.subject_label for item in draft.visual_retention_analysis
+    ]
     unknown_retention_subjects = sorted(
         set(retention_subject_labels) - supplied_subject_labels
     )
@@ -1295,7 +1328,11 @@ def validate_annotation(
                 str(unknown_retention_subjects),
             )
         )
-    if len(draft.visual_retention_analysis) != len(reference_subjects):
+    if (
+        len(draft.visual_retention_analysis) != len(reference_subjects)
+        or len(retention_subject_labels) != len(set(retention_subject_labels))
+        or set(retention_subject_labels) != supplied_subject_labels
+    ):
         issues.append(
             ValidationIssue(
                 "subject_retention_contract_mismatch",
@@ -1303,38 +1340,6 @@ def validate_annotation(
                 "retention rows must exactly cover supplied Subjects",
             )
         )
-    for subject_label in sorted(supplied_subject_labels):
-        rows = [
-            line
-            for line in draft.visual_retention_analysis
-            if line.lstrip().startswith(subject_label)
-        ]
-        markers = [
-            marker
-            for line in rows
-            for marker in _ALLOWED_RETENTION_MARKER_OCCURRENCE.findall(line)
-        ]
-        subject_labels = (
-            [
-                match.group(0)
-                for match in _PICTURE_OR_SUBJECT.finditer(rows[0])
-                if match.group(1) == "Subject"
-            ]
-            if len(rows) == 1
-            else []
-        )
-        if (
-            len(rows) != 1
-            or len(markers) != 1
-            or subject_labels != [subject_label]
-        ):
-            issues.append(
-                ValidationIssue(
-                    "subject_retention_contract_mismatch",
-                    "h3_draft.visual_retention_analysis",
-                    f"{subject_label} requires exactly one allowed retention line",
-                )
-            )
     if len(draft.subject_definitions) != len(reference_subjects):
         issues.append(
             ValidationIssue(
@@ -1345,34 +1350,23 @@ def validate_annotation(
         )
     for subject in reference_subjects:
         subject_label = str(subject.subject_label)
-        expected_pictures = set(subject.source_picture_labels)
+        expected_pictures = list(subject.source_picture_labels)
         definitions = [
             item
             for item in draft.subject_definitions
-            if item.lstrip().startswith(subject_label)
+            if item.subject_label == subject_label
         ]
         actual_pictures = (
-            {
-                match.group(0)
-                for match in _PICTURE_OR_SUBJECT.finditer(definitions[0])
-                if match.group(1) == "Picture"
-            }
-            if len(definitions) == 1
-            else set()
-        )
-        definition_subjects = (
             [
                 match.group(0)
-                for match in _PICTURE_OR_SUBJECT.finditer(definitions[0])
-                if match.group(1) == "Subject"
+                for match in _PICTURE_OR_SUBJECT.finditer(definitions[0].description)
+                if match.group(1) == "Picture"
             ]
             if len(definitions) == 1
             else []
         )
-        if (
-            len(definitions) != 1
-            or definition_subjects != [subject_label]
-            or actual_pictures != expected_pictures
+        if len(definitions) != 1 or sorted(actual_pictures) != sorted(
+            expected_pictures
         ):
             issues.append(
                 ValidationIssue(
@@ -1381,12 +1375,22 @@ def validate_annotation(
                     f"{subject_label} must retain exactly its source Pictures",
                 )
             )
+        if len(definitions) == 1 and _SUBJECT_AUDIO_PROFILE.search(
+            definitions[0].description
+        ):
+            issues.append(
+                ValidationIssue(
+                    "subject_definition_contains_audio_profile",
+                    "h3_draft.subject_definitions",
+                    f"{subject_label} definition must remain visual-only",
+                )
+            )
     model_owned_text = _normalized_text(
         "\n".join(
             (
-                *draft.subject_definitions,
+                *(item.render() for item in draft.subject_definitions),
                 draft.summary,
-                *draft.visual_retention_analysis,
+                *(item.render() for item in draft.visual_retention_analysis),
                 *prose_parts,
             )
         )
@@ -1723,11 +1727,26 @@ class OpenAIMimo25Backend:
     ) -> str:
         issue_codes = {item.code for item in issues}
         issue_actions: list[str] = []
-        if "subject_definition_contract_mismatch" in issue_codes:
+        if issue_codes & {
+            "subject_definition_contract_mismatch",
+            "subject_retention_contract_mismatch",
+        }:
             issue_actions.append(
-                "For subject_definition_contract_mismatch, regenerate each affected "
-                "definition from the supplied exact Subject-to-Pictures mapping. Do not "
-                "guess, omit, add, duplicate, or reassign Picture ownership."
+                "Repair typed Subject definition or retention rows using the supplied "
+                "exact Subject-to-Pictures ownership. Do not guess, omit, add, duplicate, "
+                "or reassign a Subject or Picture."
+            )
+        if "subject_definition_contains_audio_profile" in issue_codes:
+            issue_actions.append(
+                "Remove voice, delivery, cadence, articulation, timbre, pitch, accent, "
+                "dialect, and other Audio-profile concepts from Subject definitions; "
+                "describe only visible appearance there."
+            )
+        if "speaker_voice_profile_contains_identity_claim" in issue_codes:
+            issue_actions.append(
+                "Remove demographic, identity, nationality, and role claims from "
+                "speaker_voice_profiles while retaining only supported acoustic voice "
+                "characteristics."
             )
         if "speech_placeholder_inventory_mismatch" in issue_codes:
             issue_actions.append(
@@ -1981,7 +2000,9 @@ __all__ = [
     "MimoMediaResolver",
     "MimoSegmentDecision",
     "MimoSpeakerVoiceProfile",
+    "MimoSubjectDefinitionDraft",
     "MimoTransport",
+    "MimoVisualRetentionDraft",
     "OpenAIMimo25Backend",
     "SpeechPresentation",
     "sha256_file",

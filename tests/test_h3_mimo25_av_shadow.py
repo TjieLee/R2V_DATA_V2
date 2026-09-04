@@ -88,6 +88,22 @@ from r2v_data_v2.structured_output import ValidationIssue
 from tools.materialize_h3_mimo25_shadow import _parser as _materializer_parser
 
 
+def _subject_definition(subject_label: str, description: str) -> dict[str, str]:
+    return {"subject_label": subject_label, "description": description}
+
+
+def _retention(
+    subject_label: str,
+    marker: str,
+    description: str,
+) -> dict[str, str]:
+    return {
+        "subject_label": subject_label,
+        "marker": marker,
+        "description": description,
+    }
+
+
 def _annotation(
     *,
     group: str = "g1",
@@ -171,11 +187,18 @@ def _annotation(
             },
             "h3_draft": {
                 "subject_definitions": [
-                    "<Subject 1> is the person shown in <Picture 1>."
+                    _subject_definition(
+                        "<Subject 1>",
+                        "is the person shown in <Picture 1>.",
+                    )
                 ],
                 "summary": "A person speaks while remaining visible.",
                 "visual_retention_analysis": [
-                    "<Subject 1>: fully_preserved - the person remains visible."
+                    _retention(
+                        "<Subject 1>",
+                        "fully_preserved",
+                        "the person remains visible.",
+                    )
                 ],
                 "shots": [
                     {
@@ -634,13 +657,13 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v9"
+    assert current.materializer_version == "h3_mimo25_materializer_v10"
 
 
-def test_mimo_v14_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v14"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v9"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.10"
+def test_mimo_v15_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v15"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v10"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.11"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -656,9 +679,13 @@ def test_mimo_v14_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "Do not repeat dialogue in overall_soundscape",
         "do not use non-diegetic music as a substitute for it",
         "never create room tone or another sound from visual context",
+        "Subject definitions use typed subject_label",
+        "Keep description visual-only",
+        "Visual retention uses typed subject_label, marker, and description",
+        "Never copy dialogue or characterize a voice as male, female",
     ):
         assert phrase in SYSTEM_PROMPT
-    assert "Subject definitions are natural official MiniMax H3 Ref2VA prose" in (
+    assert "natural official MiniMax H3 Ref2VA description" in (
         SYSTEM_PROMPT
     )
 
@@ -794,6 +821,32 @@ def test_speaker_voice_profile_rejects_significant_transcript_copy() -> None:
         authoritative_transcripts=[transcript],
     )
     assert "audio_semantics_contains_authoritative_transcript" in {
+        issue.code for issue in issues
+    }
+
+
+def test_speaker_voice_profile_rejects_demographic_identity_wording() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = (
+        "A mature male voice with a raspy timbre."
+    )
+
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    assert "speaker_voice_profile_contains_identity_claim" in {
+        issue.code for issue in issues
+    }
+
+
+def test_speaker_voice_profile_accepts_acoustic_characteristics() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = (
+        "A slightly raspy mid-to-low register voice with measured cadence."
+    )
+
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    assert "speaker_voice_profile_contains_identity_claim" not in {
         issue.code for issue in issues
     }
 
@@ -1593,11 +1646,36 @@ def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
         json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         in prompt
     )
-    assert "regenerate each affected definition" in prompt
-    assert "exact Subject-to-Pictures mapping" in prompt
+    assert "Repair typed Subject definition or retention rows" in prompt
+    assert "exact Subject-to-Pictures ownership" in prompt
     assert "rebuild all typed speech timeline parts" in prompt
     assert "transcribed_segment_ids" in prompt
     assert "exactly equals" in prompt
+
+
+def test_full_av_recheck_targets_visual_audio_and_voice_identity_leakage(
+    tmp_path: Path,
+) -> None:
+    backend, _ = _backend(tmp_path, [])
+    prompt = backend._full_av_recheck_prompt(
+        _job_fixture(tmp_path),
+        invalid_response="{}",
+        issues=[
+            ValidationIssue(
+                "subject_definition_contains_audio_profile",
+                "h3_draft.subject_definitions",
+                "visual definition contains timbre",
+            ),
+            ValidationIssue(
+                "speaker_voice_profile_contains_identity_claim",
+                "speaker_voice_profiles",
+                "voice profile contains demographic wording",
+            ),
+        ],
+    )
+
+    assert "describe only visible appearance" in prompt
+    assert "Remove demographic, identity, nationality, and role claims" in prompt
 
 
 def test_full_av_recheck_explains_speaker_identity_contradiction(
@@ -2294,7 +2372,13 @@ def test_cross_reference_validation_rejects_inventory_drift() -> None:
         ),
         (
             "visual_retention_analysis",
-            ["<Picture 1>: fully_preserved [[segment:segment_1]]"],
+            [
+                _retention(
+                    "<Subject 1>",
+                    "fully_preserved",
+                    "appearance remains [[segment:segment_1]]",
+                )
+            ],
             "speech_placeholder_outside_shot",
         ),
     ],
@@ -2350,6 +2434,27 @@ def test_timeline_parts_use_a_discriminated_union() -> None:
     }
 
 
+def test_subject_and_retention_fields_are_structured_in_json_schema() -> None:
+    schema = MimoAVAnnotationDraft.model_json_schema()
+    subject = schema["$defs"]["MimoSubjectDefinitionDraft"]
+    retention = schema["$defs"]["MimoVisualRetentionDraft"]
+
+    assert subject["properties"]["subject_label"]["pattern"] == (
+        r"^<Subject [1-9]\d*>$"
+    )
+    assert set(subject["required"]) == {"subject_label", "description"}
+    assert retention["properties"]["marker"]["enum"] == [
+        "fully_preserved",
+        "partially_preserved",
+        "weak_reference",
+    ]
+    assert set(retention["required"]) == {
+        "subject_label",
+        "marker",
+        "description",
+    }
+
+
 @pytest.mark.parametrize(
     "forbidden_text",
     [
@@ -2377,26 +2482,47 @@ def test_timeline_prose_rejects_pipeline_owned_syntax(forbidden_text: str) -> No
 def test_allowed_visual_retention_markers_pass(marker: str) -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["visual_retention_analysis"] = [
-        f"<Subject 1>: {marker} - observed appearance remains grounded."
+        _retention(
+            "<Subject 1>",
+            marker,
+            "observed appearance remains grounded.",
+        )
     ]
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
-    assert not {
-        "unassigned_attribute_transfer",
-        "unknown_visual_retention_marker",
-    } & {item.code for item in issues}
+    assert "subject_retention_contract_mismatch" not in {
+        item.code for item in issues
+    }
 
 
-def test_attribute_transfer_and_unknown_retention_marker_reject() -> None:
-    for marker, expected in (
-        ("attribute_transfer", "unassigned_attribute_transfer"),
-        ("invented_marker", "unknown_visual_retention_marker"),
-    ):
-        payload = _annotation().model_dump(mode="json")
-        payload["h3_draft"]["visual_retention_analysis"] = [
-            f"<Subject 1>: {marker} - invalid."
-        ]
-        issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
-        assert expected in {item.code for item in issues}
+@pytest.mark.parametrize("marker", ["attribute_transfer", "invented_marker"])
+def test_attribute_transfer_and_unknown_retention_marker_reject(marker: str) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["visual_retention_analysis"] = [
+        _retention("<Subject 1>", marker, "invalid.")
+    ]
+    with pytest.raises(ValidationError, match="marker"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("marker", "repeated"),
+    [
+        ("fully_preserved", "fully_preserved"),
+        ("fully_preserved", "fully preserved"),
+        ("partially_preserved", "partially preserved"),
+        ("weak_reference", "weak reference"),
+    ],
+)
+def test_retention_description_cannot_repeat_marker(
+    marker: str,
+    repeated: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["visual_retention_analysis"] = [
+        _retention("<Subject 1>", marker, f"the result is {repeated}.")
+    ]
+    with pytest.raises(ValidationError, match="repeats a retention marker"):
+        MimoAVAnnotationDraft.model_validate(payload)
 
 
 def _two_audio_event_annotation() -> MimoAVAnnotationDraft:
@@ -2540,10 +2666,14 @@ def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
     ]
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"].append(
-        "<Subject 2> is sourced from <Picture 2>."
+        _subject_definition("<Subject 2>", "is sourced from <Picture 2>.")
     )
     payload["h3_draft"]["visual_retention_analysis"].append(
-        "<Subject 2>: weak_reference - only limited observed structure is retained."
+        _retention(
+            "<Subject 2>",
+            "weak_reference",
+            "only limited observed structure is retained.",
+        )
     )
     annotation = MimoAVAnnotationDraft.model_validate(payload)
     assert not _validate(
@@ -2559,8 +2689,8 @@ def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
     )
     payload = annotation.model_dump(mode="json")
     payload["h3_draft"]["visual_retention_analysis"] = [
-        "<Subject 1>: fully_preserved - retained.",
-        "<Subject 1>: weak_reference - duplicated.",
+        _retention("<Subject 1>", "fully_preserved", "retained."),
+        _retention("<Subject 1>", "weak_reference", "duplicated."),
     ]
     issues = _validate(
         MimoAVAnnotationDraft.model_validate(payload),
@@ -2576,35 +2706,28 @@ def test_every_supplied_subject_requires_exactly_one_retention_line() -> None:
 
 
 @pytest.mark.parametrize(
-    "extra_definition",
+    "extra_description",
     [
         "An extra arbitrary definition.",
         "<Picture 1> defines the person.",
     ],
 )
 def test_subject_definitions_reject_noncanonical_extra_rows(
-    extra_definition: str,
+    extra_description: str,
 ) -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["h3_draft"]["subject_definitions"].append(extra_definition)
+    payload["h3_draft"]["subject_definitions"].append(
+        _subject_definition("<Subject 2>", extra_description)
+    )
     issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
     assert "subject_definition_contract_mismatch" in {item.code for item in issues}
 
 
-@pytest.mark.parametrize(
-    "retention_rows",
-    [
-        ["<Picture 1>: fully_preserved - visible."],
-        ["fully_preserved - visible."],
-        ["<Subject 1>: fully_preserved weak_reference - conflicting markers."],
-        ["<Subject 1> and <Subject 2>: fully_preserved - invalid owner."],
-    ],
-)
-def test_visual_retention_requires_exact_canonical_subject_rows(
-    retention_rows: list[str],
-) -> None:
+def test_visual_retention_requires_exact_canonical_subject_rows() -> None:
     payload = _annotation().model_dump(mode="json")
-    payload["h3_draft"]["visual_retention_analysis"] = retention_rows
+    payload["h3_draft"]["visual_retention_analysis"] = [
+        _retention("<Subject 2>", "fully_preserved", "visible.")
+    ]
     issues = _validate(
         MimoAVAnnotationDraft.model_validate(payload),
         allowed_reference_labels={"<Picture 1>", "<Subject 1>", "<Subject 2>"},
@@ -2749,7 +2872,7 @@ def test_audio_event_crossing_cut_may_use_either_overlapping_shot(
 def test_subject_definition_and_shot_bounds_fail_closed() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"] = [
-        "<Subject 1> has no supplied source Picture."
+        _subject_definition("<Subject 1>", "has no supplied source Picture.")
     ]
     payload["h3_draft"]["shots"].append(
         {
@@ -2831,7 +2954,7 @@ def test_later_positive_hard_cuts_remain_strictly_ordered() -> None:
 def test_subject_definition_rejects_wrong_supplied_picture() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"] = [
-        "<Subject 1> is shown only in <Picture 2>."
+        _subject_definition("<Subject 1>", "is shown only in <Picture 2>.")
     ]
     issues = _validate(
         MimoAVAnnotationDraft.model_validate(payload),
@@ -2843,7 +2966,10 @@ def test_subject_definition_rejects_wrong_supplied_picture() -> None:
 def test_subject_definition_rejects_extra_supplied_picture() -> None:
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"] = [
-        "<Subject 1> is the person in <Picture 1> and <Picture 2>."
+        _subject_definition(
+            "<Subject 1>",
+            "is the person in <Picture 1> and <Picture 2>.",
+        )
     ]
     issues = _validate(
         MimoAVAnnotationDraft.model_validate(payload),
@@ -2864,9 +2990,12 @@ def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None
     ]
     payload = _annotation().model_dump(mode="json")
     payload["h3_draft"]["subject_definitions"] = [
-        (
-            "<Subject 1> is the same person shown in <Picture 1> and <Picture 2>, "
-            "with the visible appearance combined across both references."
+        _subject_definition(
+            "<Subject 1>",
+            (
+                "is the same person shown in <Picture 1> and <Picture 2>, with "
+                "the visible appearance combined across both references."
+            ),
         )
     ]
     issues = _validate(
@@ -2875,6 +3004,64 @@ def test_subject_definition_accepts_natural_multi_picture_ref2va_prose() -> None
         reference_subjects=subjects,
     )
     assert "subject_definition_contract_mismatch" not in {item.code for item in issues}
+
+
+@pytest.mark.parametrize("subject_label", ["Subject 1", "<Subject 0>"])
+def test_subject_definition_requires_exact_structured_subject_label(
+    subject_label: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"][0]["subject_label"] = subject_label
+
+    with pytest.raises(ValidationError, match="subject_label"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_subject_definition_description_rejects_bare_subject_label() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"][0]["description"] = (
+        "Subject 1 is the person shown in <Picture 1>."
+    )
+
+    with pytest.raises(ValidationError, match="bare Subject label"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_subject_definition_description_rejects_bracketed_subject_label() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"][0]["description"] = (
+        "<Subject 1> is the person shown in <Picture 1>."
+    )
+
+    with pytest.raises(ValidationError, match="repeats a Subject label"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+
+def test_subject_definition_rejects_duplicate_required_picture() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"][0]["description"] = (
+        "is shown in <Picture 1>, with details repeated from <Picture 1>."
+    )
+
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    assert "subject_definition_contract_mismatch" in {item.code for item in issues}
+
+
+@pytest.mark.parametrize("audio_term", ["timbre", "cadence", "articulation"])
+def test_visual_subject_definition_rejects_audio_profile_leakage(
+    audio_term: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"][0]["description"] = (
+        f"is the face shown in <Picture 1> with a steady {audio_term}."
+    )
+
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    assert "subject_definition_contains_audio_profile" in {
+        issue.code for issue in issues
+    }
 
 
 @pytest.mark.parametrize(
@@ -3586,10 +3773,17 @@ def _configure_recovery_materializer_fixture(
     ]
     if recover_entity_id == "e2":
         annotation_payload["h3_draft"]["subject_definitions"].append(
-            "<Subject 2> is the person shown in <Picture 2>."
+            _subject_definition(
+                "<Subject 2>",
+                "is the person shown in <Picture 2>.",
+            )
         )
         annotation_payload["h3_draft"]["visual_retention_analysis"].append(
-            "<Subject 2>: fully_preserved - the person remains visible."
+            _retention(
+                "<Subject 2>",
+                "fully_preserved",
+                "the person remains visible.",
+            )
         )
     record = _record_fixture(
         Path(job.target_video_path).parent,
@@ -3908,6 +4102,41 @@ def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
     assert "[[" not in rendered
     assert "<Subject 1> (S1)" in rendered
     assert "<d>[English] Exact, text!</d>" in rendered
+
+
+def test_materializer_renders_typed_subject_and_retention_as_official_h3(
+    tmp_path: Path,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["h3_draft"]["subject_definitions"][0] = _subject_definition(
+        "<Subject 1>",
+        "is the person whose appearance comes from <Picture 1>.",
+    )
+    payload["h3_draft"]["visual_retention_analysis"][0] = _retention(
+        "<Subject 1>",
+        "fully_preserved",
+        "the referenced visual appearance remains intact.",
+    )
+
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(
+            tmp_path,
+            MimoAVAnnotationDraft.model_validate(payload),
+        ),
+    )
+
+    assert (
+        "<Subject 1> is the person whose appearance comes from <Picture 1>."
+        in rendered
+    )
+    assert (
+        "<Subject 1>: fully_preserved - the referenced visual appearance remains "
+        "intact."
+    ) in rendered
+    assert "Subject 1 is" not in rendered
+    assert "is fully preserved" not in rendered
 
 
 @pytest.mark.parametrize(
