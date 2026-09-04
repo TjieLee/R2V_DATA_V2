@@ -39,8 +39,8 @@ from r2v_data_v2.h3.schemas import SchemaModel
 from r2v_data_v2.h3.visual_production_source import load_visual_production_inventory
 
 MIMO25_INVENTORY_VERSION = "r2v.h3.mimo25_inventory.3"
-MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.5"
-MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.5"
+MIMO25_RECORD_VERSION = "r2v.h3.mimo25_record.6"
+MIMO25_SUMMARY_VERSION = "r2v.h3.mimo25_summary.6"
 MIMO25_FAILURE_VERSION = "r2v.h3.mimo25_failure.5"
 MIMO25_RAW_VERSION = "r2v.h3.mimo25_raw_response.5"
 MIMO25_CASE_MANIFEST_VERSION = "r2v.h3.mimo25_case_manifest.1"
@@ -256,7 +256,7 @@ class MimoFailure(SchemaModel):
 
 
 class MimoRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_record.5"] = MIMO25_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_record.6"] = MIMO25_RECORD_VERSION
     clip_uid: str
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -297,7 +297,7 @@ class MimoRawResponse(SchemaModel):
 
 
 class MimoSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_summary.5"] = MIMO25_SUMMARY_VERSION
+    schema_version: Literal["r2v.h3.mimo25_summary.6"] = MIMO25_SUMMARY_VERSION
     inventory_scope: Literal[
         "current_diarization_asr_target_inventory",
         "canonical_visual_target_inventory",

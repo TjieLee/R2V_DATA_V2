@@ -194,6 +194,7 @@ class RecaptionAudioContract(SchemaModel):
     subject_label: str | None = None
     entity_id: str | None = None
     speaker_id: str | None = Field(default=None, pattern=r"^S[1-9]\d*$")
+    voice_characteristics: str | None = None
     retention_marker: Literal["fully_copy", "reference"]
 
     @model_validator(mode="after")
@@ -206,6 +207,7 @@ class RecaptionAudioContract(SchemaModel):
                 or self.subject_label is not None
                 or self.entity_id is not None
                 or self.speaker_id is not None
+                or self.voice_characteristics is not None
             ):
                 raise ValueError("full-audio reuse must be an unbound full copy")
         elif (
@@ -214,6 +216,8 @@ class RecaptionAudioContract(SchemaModel):
             or self.entity_id is None
         ):
             raise ValueError("voice reference requires a bound Subject and entity")
+        if self.voice_characteristics is not None and not self.voice_characteristics.strip():
+            raise ValueError("voice characteristics must be non-empty or null")
         return self
 
 
@@ -1284,10 +1288,13 @@ def _canonical_audio_definition(audio: RecaptionAudioContract) -> str:
         return f"{audio.audio_label} is the supplied full-audio reference for the target."
     assert audio.subject_label is not None
     speaker = "" if audio.speaker_id is None else f" ({audio.speaker_id})"
-    return (
+    definition = (
         f"{audio.audio_label} is the voice-timbre reference for "
-        f"{audio.subject_label}{speaker}."
+        f"{audio.subject_label}{speaker}"
     )
+    if audio.voice_characteristics is not None:
+        definition += f", featuring {audio.voice_characteristics}"
+    return definition + "."
 
 
 def _canonical_audio_retention(audio: RecaptionAudioContract) -> str:
@@ -1297,8 +1304,13 @@ def _canonical_audio_retention(audio: RecaptionAudioContract) -> str:
             "in full."
         )
     assert audio.subject_label is not None
+    characteristics = (
+        "voice timbre and delivery"
+        if audio.voice_characteristics is None
+        else audio.voice_characteristics
+    )
     return (
-        f"{audio.audio_label}: reference - its voice timbre and delivery guide "
+        f"{audio.audio_label}: reference - its {characteristics} guide "
         f"{audio.subject_label}'s speech without copying the source signal."
     )
 
@@ -1325,13 +1337,20 @@ def _matching_voice_audio(
 def _render_locked_speech(
     speech: RecaptionSpeechFact,
     contract: RecaptionReferenceContract,
+    *,
+    include_audio_reference: bool = True,
 ) -> str:
     source = _speech_exact_source(speech)
     audio = _matching_voice_audio(speech, contract)
-    if audio is None:
+    if audio is None or not include_audio_reference:
         return f"{source} says, {speech.locked_dialogue_block}"
+    characteristics = (
+        "voice timbre"
+        if audio.voice_characteristics is None
+        else f"{audio.voice_characteristics} voice"
+    )
     return (
-        f"{source}, using the voice timbre referenced from {audio.audio_label}, "
+        f"{source}, using the {characteristics} referenced from {audio.audio_label}, "
         f"says, {speech.locked_dialogue_block}"
     )
 

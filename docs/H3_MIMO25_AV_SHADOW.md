@@ -33,9 +33,9 @@ exact speech and Audio-event inventories, dialogue text, and final H3 syntax.
 Free-form MiMo prose cannot contain internal placeholders or final `(Sx)`,
 `<d>`, or shot-header syntax.
 
-The per-request contract supplies the exact ordered transcribed-segment
-inventory and separately lists every forbidden non-transcribed segment ID.
-MiMo chooses the observed shot and temporal position, but it does not derive
+The compact per-request contract supplies the exact complete segment inventory
+and the exact ordered transcribed-segment inventory once. MiMo chooses the
+observed shot and temporal position, but it does not derive
 speech eligibility. Every segment decision explicitly publishes `entity_id`:
 an exact supplied ID for `visible_entity`, otherwise JSON `null`. Each
 transcribed decision also carries its own audible `delivery_style`; every
@@ -47,6 +47,16 @@ mapping from its exact frozen `<Subject N>` label to all and only its owning
 remains natural official Ref2VA prose rather than a project-specific fixed
 English template. The full-AV recheck receives the same mapping and exact
 transcribed-segment inventory.
+
+The annotation also carries one nullable `speaker_voice_profiles` row for each
+resolved speaker group that owns authoritative transcribed speech. A non-null
+profile is limited to stable audible pitch register, timbre, texture, cadence,
+articulation, and genuinely supported accent or dialect; it cannot copy
+dialogue or infer demographic, identity, role, or personality. The deterministic
+materializer uses this profile in the definition and retention prose for a real
+voice Audio asset. Within each real shot it cites that Audio relationship only
+on the speaker's first speech event; every authoritative segment and `(Sx)` / `<d>`
+block remains present, and a later real shot may cite the asset once again.
 
 MiMo never splits or deletes a DiariZen segment. Multiple vocal events can mark
 a segment as requiring acoustic refinement, but the authoritative segment and
@@ -87,19 +97,19 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v12`
-- `h3_mimo25_av_authority_contract_v7`
-- `r2v.h3.mimo25_av_annotation.8`
-- `r2v.h3.mimo25_backend.10`
-- `h3_mimo25_materializer_v7`
+- `h3_mimo25_unified_av_reconcile_v13`
+- `h3_mimo25_av_authority_contract_v8`
+- `r2v.h3.mimo25_av_annotation.9`
+- `r2v.h3.mimo25_backend.11`
+- `h3_mimo25_materializer_v8`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
-- `r2v.h3.mimo25_record.5`
-- `r2v.h3.mimo25_summary.5`
+- `r2v.h3.mimo25_record.6`
+- `r2v.h3.mimo25_summary.6`
 - `r2v.h3.mimo25_failure.5`
 - `r2v.h3.mimo25_raw_response.5`
-- `r2v.h3.mimo25_h3_shadow.6`
-- `r2v.h3.mimo25_h3_shadow_summary.6`
+- `r2v.h3.mimo25_h3_shadow.7`
+- `r2v.h3.mimo25_h3_shadow_summary.7`
 
 The OpenAI-compatible client defaults to the `xiaomi` transport, model
 `mimo-v2.5`, video FPS 4, `media_resolution=default`, disabled thinking,
@@ -110,7 +120,9 @@ and uses strict `json_schema` constrained decoding with the complete current
 `json_object` contract. The base URL never selects transport implicitly;
 transport and actual response-format mode are recorded in backend provenance
 and its configuration fingerprint.
-The `.8` annotation uses a `resolution`-discriminated segment-decision schema:
+For SGLang, the full schema is carried only by strict `response_format`; it is
+not duplicated in user text. Xiaomi retains the textual schema required by its
+JSON-object transport. The `.9` annotation uses a `resolution`-discriminated segment-decision schema:
 `resolved` requires a non-null `gN` `primary_speaker_group`, while acoustic
 refinement and uncertain decisions still require the field explicitly and may
 publish `null`. This invariant is enforced by SGLang constrained decoding and
@@ -161,13 +173,19 @@ or own that external source patch.
 After the authoritative primary or canonical-audio-fallback response is
 selected, parse or semantic validation failure may trigger at most one full AV
 recheck with the same references, target video, and selected audio modality.
-There is no text-only semantic repair. The `.7` annotation assigns chronological
+There is no text-only semantic repair. The `.9` annotation assigns chronological
 `ae1`, `ae2`, ... IDs to non-speech Audio events and requires exact ordered
 coverage by typed `audio_event` timeline parts. Typed `speech` parts likewise
 must exactly cover authoritative transcribed segments. The deterministic MiMo
 materializer renders those typed references into the existing internal Qwen3.8
 draft interface, then uses the unchanged validated final renderer. It does not
 repair missing, extra, duplicated, reordered, or misplaced model parts.
+
+Music events distinguish audible in-scene `diegetic_music` from audience-only
+`non_diegetic_music`. A typed non-diegetic event requires global music status
+`present` and a non-null grounded description; `absent` cannot coexist with such
+an event. Diegetic music alone does not imply an audience-only score, while a
+continuous global score may be present without a localized event.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,

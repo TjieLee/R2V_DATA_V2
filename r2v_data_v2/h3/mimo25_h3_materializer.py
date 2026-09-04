@@ -46,7 +46,9 @@ from r2v_data_v2.h3.qwen38_h3_recaption import (
     Qwen38RecaptionRequest,
     RecaptionAudioFacts,
     RecaptionNonSpeechFact,
+    RecaptionReferenceContract,
     RecaptionSpeechFact,
+    _render_locked_speech,
     build_reference_contract,
     materialize_h3_draft,
     render_h3_prompt,
@@ -57,8 +59,8 @@ from r2v_data_v2.h3.speech_presentation import (
     render_speech_presentation_clause,
 )
 
-MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.6"
-MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.6"
+MIMO25_SHADOW_RECORD_VERSION = "r2v.h3.mimo25_h3_shadow.7"
+MIMO25_SHADOW_SUMMARY_VERSION = "r2v.h3.mimo25_h3_shadow_summary.7"
 
 
 class MimoShadowAudioReference(SchemaModel):
@@ -115,7 +117,7 @@ def _write_jsonl(path: Path, values: Sequence[SchemaModel]) -> None:
 
 
 class MimoH3ShadowRecord(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow.6"] = MIMO25_SHADOW_RECORD_VERSION
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow.7"] = MIMO25_SHADOW_RECORD_VERSION
     sample_id: str
     source_h3_sample_id: str
     clip_uid: str
@@ -124,7 +126,7 @@ class MimoH3ShadowRecord(SchemaModel):
     status: Literal["ready", "failed"]
     source_mimo_record_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_h3_sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    materializer_version: Literal["h3_mimo25_materializer_v7"] = (
+    materializer_version: Literal["h3_mimo25_materializer_v8"] = (
         MIMO25_MATERIALIZER_VERSION
     )
     corrected_speech_segments: list[FinalQwen3SpeechSegment]
@@ -198,7 +200,7 @@ class MimoH3ShadowRecord(SchemaModel):
 
 
 class MimoH3ShadowSummary(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.6"] = (
+    schema_version: Literal["r2v.h3.mimo25_h3_shadow_summary.7"] = (
         MIMO25_SHADOW_SUMMARY_VERSION
     )
     source_mimo_inventory_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -328,8 +330,6 @@ def _audio_facts(
     record: MimoRecord,
     contract: object,
 ) -> RecaptionAudioFacts:
-    from r2v_data_v2.h3.qwen38_h3_recaption import RecaptionReferenceContract
-
     assert record.annotation is not None
     typed_contract = RecaptionReferenceContract.model_validate(contract)
     entity_subject = {
@@ -395,15 +395,42 @@ def _audio_facts(
 
 def _render_mimo_speech_clause(
     speech: RecaptionSpeechFact,
-    base_clause: str,
     decisions: dict[str, MimoSegmentDecision],
+    contract: RecaptionReferenceContract,
+    *,
+    include_audio_reference: bool,
 ) -> str:
     presentation = decisions[speech.segment_id].speech_presentation
     return render_speech_presentation_clause(
         speech=speech,
-        base_clause=base_clause,
+        base_clause=_render_locked_speech(
+            speech,
+            contract,
+            include_audio_reference=include_audio_reference,
+        ),
         presentation=presentation,
     )
+
+
+def _contract_with_voice_profiles(
+    contract: RecaptionReferenceContract,
+    *,
+    corrected: Sequence[FinalQwen3SpeechSegment],
+    record: MimoRecord,
+) -> RecaptionReferenceContract:
+    assert record.annotation is not None
+    speaker_by_group = _speaker_ids(corrected)
+    profile_by_speaker = {
+        speaker_by_group[profile.speaker_group]: profile.voice_characteristics
+        for profile in record.annotation.speaker_voice_profiles
+        if profile.speaker_group in speaker_by_group
+    }
+    values = contract.model_dump(mode="python")
+    for audio in values["audios"]:
+        speaker_id = audio.get("speaker_id")
+        if speaker_id in profile_by_speaker:
+            audio["voice_characteristics"] = profile_by_speaker[speaker_id]
+    return RecaptionReferenceContract.model_validate(values)
 
 
 def _render_timeline_parts(
@@ -437,7 +464,11 @@ def _materialize_sample(
     ]
     corrected_sample = FinalH3SampleV2.model_validate(corrected_payload)
     variant = _variant(corrected_sample)
-    contract = build_reference_contract(corrected_sample, variant)
+    contract = _contract_with_voice_profiles(
+        build_reference_contract(corrected_sample, variant),
+        corrected=corrected,
+        record=record,
+    )
     facts = _audio_facts(
         sample=corrected_sample,
         corrected=corrected,
@@ -502,12 +533,29 @@ def _materialize_sample(
         ],
     )
     decisions = {item.segment_id: item for item in record.annotation.segment_decisions}
+    shot_by_segment = {
+        part.segment_id: shot.shot_index
+        for shot in record.annotation.h3_draft.shots
+        for part in shot.timeline_parts
+        if isinstance(part, MimoH3SpeechPart)
+    }
+    cited_speakers: set[tuple[int, str]] = set()
+
+    def render_speech(speech: RecaptionSpeechFact, _base_clause: str) -> str:
+        key = (shot_by_segment[speech.segment_id], speech.speaker_id)
+        include_audio_reference = key not in cited_speakers
+        cited_speakers.add(key)
+        return _render_mimo_speech_clause(
+            speech,
+            decisions,
+            contract,
+            include_audio_reference=include_audio_reference,
+        )
+
     structured = materialize_h3_draft(
         draft,
         request,
-        speech_clause_transform=lambda speech, clause: _render_mimo_speech_clause(
-            speech, clause, decisions
-        ),
+        speech_clause_transform=render_speech,
     )
     if "[[audio_event:" in structured.detailed_description:
         raise ValueError("MiMo Audio-event placeholder survived materialization")

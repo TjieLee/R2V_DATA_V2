@@ -138,6 +138,18 @@ def _annotation(
                     ),
                 }
             ],
+            "speaker_voice_profiles": (
+                [
+                    {
+                        "speaker_group": group,
+                        "voice_characteristics": (
+                            "clear mid-register timbre with measured cadence"
+                        ),
+                    }
+                ]
+                if resolution == "resolved"
+                else []
+            ),
             "audio_semantics": {
                 "temporal_non_speech_events": [
                     {
@@ -568,6 +580,20 @@ def test_sglang_primary_uses_embedded_video_audio_and_non_thinking_contract(
     assert backend.provenance.transport == "sglang"
     assert backend.provenance.backend == "sglang_openai_compatible"
     assert backend.provenance.response_format == "json_schema"
+    prompt = content[-1]["text"]  # type: ignore[index]
+    assert '"$defs"' not in prompt
+    assert "constrained by the supplied response_format" in prompt
+
+
+def test_xiaomi_prompt_retains_textual_json_schema(tmp_path: Path) -> None:
+    backend, _ = _backend(tmp_path, [])
+    prompt = backend._prompt(_job_fixture(tmp_path))
+    assert json.dumps(
+        MimoAVAnnotationDraft.model_json_schema(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) in prompt
 
 
 def test_transport_changes_backend_configuration_fingerprint(tmp_path: Path) -> None:
@@ -607,13 +633,13 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     ).hexdigest()
     historical = type(current).model_validate(values)
     assert historical.materializer_version == "h3_mimo25_materializer_v6"
-    assert current.materializer_version == "h3_mimo25_materializer_v7"
+    assert current.materializer_version == "h3_mimo25_materializer_v8"
 
 
-def test_mimo_v12_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v12"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v7"
-    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.8"
+def test_mimo_v13_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v13"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v8"
+    assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.9"
     for phrase in (
         "shot scale and framing",
         "foreground, midground, and background composition",
@@ -622,12 +648,14 @@ def test_mimo_v12_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "300-450 English words",
         "attribute_transfer is forbidden",
         "Pictures are content references, not first frames, last frames, or keyframes",
-        "must not quote or paraphrase dialogue",
-        "voice continuity may preserve speaker-group identity",
+        "Never transcribe, quote, correct, paraphrase",
+        "Voice continuity may preserve speaker-group identity",
         "cannot alone bind a visible entity",
     ):
         assert phrase in SYSTEM_PROMPT
-    assert "SUPPLIED <Picture N> AND <Subject N> LABELS" in SYSTEM_PROMPT
+    assert "Subject definitions are natural official MiniMax H3 Ref2VA prose" in (
+        SYSTEM_PROMPT
+    )
 
 
 def test_primary_prompt_includes_exact_subject_picture_contract(
@@ -649,9 +677,9 @@ def test_primary_prompt_includes_exact_subject_picture_contract(
         json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         in prompt
     )
-    assert "ALL AND ONLY its required_source_picture_labels exactly once each" in prompt
-    assert "natural official H3 Ref2VA English prose" in prompt
-    assert "There is no required fixed English connector" in prompt
+    assert "Preserve exact Subject-to-Picture ownership" in prompt
+    assert "Avoid mechanically repeating one connector" in SYSTEM_PROMPT
+    assert '"as seen in"' in SYSTEM_PROMPT
 
 
 def test_primary_prompt_separates_decision_and_typed_speech_inventories(
@@ -665,11 +693,10 @@ def test_primary_prompt_separates_decision_and_typed_speech_inventories(
 
     assert contract["allowed_segment_ids"] == ["segment_1", "segment_2"]
     assert contract["transcribed_segment_ids"] == ["segment_1"]
-    assert contract["required_speech_segment_sequence"] == ["segment_1"]
-    assert contract["forbidden_speech_segment_ids"] == ["segment_2"]
-    assert "including non-transcribed segments" in prompt
-    assert "required_speech_segment_sequence exactly" in prompt
-    assert "forbidden_speech_segment_ids" in prompt
+    assert "required_speech_segment_sequence" not in contract
+    assert "forbidden_speech_segment_ids" not in contract
+    assert "Use allowed_segment_ids for all decisions" in prompt
+    assert "transcribed_segment_ids" in prompt
     assert "timeline_parts" in prompt
     assert "[[segment:" not in prompt
     assert "[[audio_event:" not in prompt
@@ -677,10 +704,10 @@ def test_primary_prompt_separates_decision_and_typed_speech_inventories(
 
 def test_prompt_defines_primary_speaker_group_as_identity() -> None:
     for phrase in (
-        "represents one clip-local speaker identity, not one speech turn",
+        "identify speakers by first appearance, not turns",
         "must not by itself create a new group",
-        "reuse the same primary_speaker_group",
-        "do not blindly merge groups",
+        "same resolved visible entity reuses one group",
+        "split or merge only with AV support",
     ):
         assert phrase in SYSTEM_PROMPT
 
@@ -688,13 +715,13 @@ def test_prompt_defines_primary_speaker_group_as_identity() -> None:
 def test_mimo_prompt_separates_voice_identity_from_visible_speech() -> None:
     for phrase in (
         "speaker_visible_mouth_occluded",
-        "LR-ASD activity and direct-anchor support are not required",
-        "an unbound current proposal",
-        "Every supplied DiariZen segment must receive exactly one decision",
-        "silently reads a phone",
+        "LR-ASD/direct anchors are neither sufficient nor required",
+        "no binding",
+        "Every segment receives one decision",
+        "Silent phone reading/typing",
         "message_voice_over",
-        "Never delete an authoritative segment",
-        "speech_presentation is not onscreen_spoken",
+        "Never delete a segment for non-onscreen presentation",
+        "Non-onscreen speech must not create visible speaking/lip motion",
     ):
         assert phrase in SYSTEM_PROMPT
 
@@ -732,6 +759,66 @@ def test_segment_decision_entity_id_is_required_but_nullable() -> None:
     invalid["segment_decisions"][0]["entity_id"] = "e1"
     with pytest.raises(ValidationError, match="only visible_entity"):
         MimoAVAnnotationDraft.model_validate(invalid)
+
+
+def test_speaker_voice_profiles_are_exact_ordered_and_nullable() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = None
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    assert not _validate(annotation)
+
+    for profiles in (
+        [],
+        payload["speaker_voice_profiles"] * 2,
+        [{"speaker_group": "g9", "voice_characteristics": None}],
+    ):
+        changed_payload = annotation.model_dump(mode="json")
+        changed_payload["speaker_voice_profiles"] = profiles
+        changed = MimoAVAnnotationDraft.model_validate(changed_payload)
+        assert "speaker_voice_profile_inventory_mismatch" in {
+            issue.code for issue in _validate(changed)
+        }
+
+
+def test_speaker_voice_profile_rejects_significant_transcript_copy() -> None:
+    transcript = "This authoritative transcript must never be copied verbatim."
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = transcript
+    issues = _validate(
+        MimoAVAnnotationDraft.model_validate(payload),
+        authoritative_transcripts=[transcript],
+    )
+    assert "audio_semantics_contains_authoritative_transcript" in {
+        issue.code for issue in issues
+    }
+
+
+def test_music_event_and_global_status_consistency() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["temporal_non_speech_events"][0]["category"] = (
+        "non_diegetic_music"
+    )
+    with pytest.raises(ValidationError, match="present global music"):
+        MimoAVAnnotationDraft.model_validate(payload)
+
+    payload["audio_semantics"].update(
+        non_diegetic_music_status="present",
+        non_diegetic_music="A soft acoustic guitar score plays.",
+    )
+    assert MimoAVAnnotationDraft.model_validate(payload)
+
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"]["temporal_non_speech_events"][0]["category"] = (
+        "diegetic_music"
+    )
+    assert MimoAVAnnotationDraft.model_validate(payload)
+
+    payload = _annotation().model_dump(mode="json")
+    payload["audio_semantics"].update(
+        non_diegetic_music_status="present",
+        non_diegetic_music="A continuous orchestral score is audible.",
+    )
+    assert MimoAVAnnotationDraft.model_validate(payload)
 
 
 def test_segment_decision_delivery_is_required_but_nullable() -> None:
@@ -1467,7 +1554,7 @@ def test_true_malformed_output_uses_exactly_one_full_av_recheck(tmp_path: Path) 
     content = completions.requests[1]["messages"][1]["content"]  # type: ignore[index]
     assert any(item["type"] == "video_url" for item in content)
     assert any(item["type"] == "image_url" for item in content)
-    assert "Reinspect the SAME audiovisual evidence" in content[-1]["text"]
+    assert "Reinspect the same full audiovisual evidence" in content[-1]["text"]
     assert completions.requests[1]["extra_body"] == {"thinking": {"type": "disabled"}}
     recheck = content[-1]["text"]
     assert job.r2v_instruction in recheck
@@ -1504,7 +1591,7 @@ def test_full_av_recheck_repeats_exact_draft_contract(tmp_path: Path) -> None:
     assert "regenerate each affected definition" in prompt
     assert "exact Subject-to-Pictures mapping" in prompt
     assert "rebuild all typed speech timeline parts" in prompt
-    assert "required_speech_segment_sequence" in prompt
+    assert "transcribed_segment_ids" in prompt
     assert "exactly equals" in prompt
 
 
@@ -1630,6 +1717,10 @@ def _annotation_for_938_review(*, corrected_offscreen: bool) -> MimoAVAnnotation
         )
         later.append(decision)
     payload["segment_decisions"] = [first, *later]
+    payload["speaker_voice_profiles"] = [
+        {"speaker_group": "g1", "voice_characteristics": "clear measured voice"},
+        {"speaker_group": "g2", "voice_characteristics": None},
+    ]
     payload["h3_draft"]["shots"][0]["timeline_parts"] = [
         _prose("The first visible speaker talks."),
         _audio_event("ae1"),
@@ -2130,6 +2221,10 @@ def _two_segment_annotation(
     second["entity_id"] = second_entity
     second["delivery_style"] = "brief and clear"
     payload["segment_decisions"].append(second)
+    if second_group != "g1":
+        payload["speaker_voice_profiles"].append(
+            {"speaker_group": second_group, "voice_characteristics": None}
+        )
     payload["h3_draft"]["shots"][0]["timeline_parts"].extend(
         [_prose("Then the action continues."), _speech("segment_2")]
     )
@@ -3580,6 +3675,118 @@ def test_materializer_audio_facts_use_segment_level_delivery(tmp_path: Path) -> 
     assert facts.speech[0].delivery == "calm and clear"
 
 
+def _repeated_speech_inputs(
+    tmp_path: Path,
+    *,
+    second_shot: bool,
+) -> tuple[FinalH3SampleV2, MimoClipJob, MimoRecord]:
+    sample = _sample(tmp_path)
+    job = _job_fixture(tmp_path)
+    annotation = _annotation()
+    sample_values = sample.model_dump(mode="python")
+    job_values = job.model_dump(mode="json", exclude={"request_fingerprint"})
+    annotation_values = annotation.model_dump(mode="json")
+    sample_segments = []
+    job_segments = []
+    decisions = []
+    for index in range(4):
+        segment_id = f"segment_{index + 1}"
+        start = float(index)
+        end = start + 0.75
+        sample_segment = sample.speech_segments[0].model_dump(mode="python")
+        sample_segment.update(
+            segment_id=segment_id,
+            source_start_sample=index * 32000,
+            source_end_sample=index * 32000 + 24000,
+            start_time=start,
+            end_time=end,
+            text=f"Exact line {index + 1}.",
+        )
+        source_segment = job.segments[0].model_dump(mode="json")
+        source_segment.update(
+            segment_id=segment_id,
+            source_start_sample=index * 32000,
+            source_end_sample=index * 32000 + 24000,
+            start_time=start,
+            end_time=end,
+            asr_text=f"Exact line {index + 1}.",
+        )
+        decision = dict(annotation.segment_decisions[0].model_dump(mode="json"))
+        decision["segment_id"] = segment_id
+        sample_segments.append(sample_segment)
+        job_segments.append(source_segment)
+        decisions.append(decision)
+    sample_values["speech_segments"] = sample_segments
+    job_values["segments"] = job_segments
+    job_values["target_duration_seconds"] = 4.0
+    annotation_values["segment_decisions"] = decisions
+    first_parts = [_prose("The speaker remains visible."), _audio_event("ae1")]
+    if second_shot:
+        annotation_values["h3_draft"]["shots"] = [
+            {
+                "shot_index": 1,
+                "start_time": None,
+                "timeline_parts": [*first_parts, _speech("segment_1"), _speech("segment_2")],
+            },
+            {
+                "shot_index": 2,
+                "start_time": 2.0,
+                "timeline_parts": [
+                    _prose("A real hard cut changes the view."),
+                    _speech("segment_3"),
+                    _speech("segment_4"),
+                ],
+            },
+        ]
+    else:
+        annotation_values["h3_draft"]["shots"][0]["timeline_parts"] = [
+            *first_parts,
+            *(_speech(f"segment_{index}") for index in range(1, 5)),
+        ]
+    typed_sample = FinalH3SampleV2.model_validate(sample_values)
+    typed_job = _job(job_values)
+    typed_annotation = MimoAVAnnotationDraft.model_validate(annotation_values)
+    return (
+        typed_sample,
+        typed_job,
+        _record_fixture(tmp_path, typed_annotation, job=typed_job),
+    )
+
+
+def test_materializer_cites_voice_audio_once_per_speaker_per_shot(
+    tmp_path: Path,
+) -> None:
+    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=False)
+    _, rendered, _ = _materialize_sample(sample, job, record)
+    assert rendered.count("referenced from <Audio 1>") == 1
+    assert rendered.count("<d>[English] Exact line") == 4
+
+
+def test_materializer_cites_voice_audio_again_in_new_shot(tmp_path: Path) -> None:
+    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=True)
+    _, rendered, _ = _materialize_sample(sample, job, record)
+    assert rendered.count("referenced from <Audio 1>") == 2
+    assert rendered.count("<d>[English] Exact line") == 4
+
+
+def test_materializer_voice_profile_and_null_fallback(tmp_path: Path) -> None:
+    _, profiled, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, _annotation()),
+    )
+    assert "featuring clear mid-register timbre with measured cadence" in profiled
+
+    payload = _annotation().model_dump(mode="json")
+    payload["speaker_voice_profiles"][0]["voice_characteristics"] = None
+    _, fallback, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, MimoAVAnnotationDraft.model_validate(payload)),
+    )
+    assert "<Audio 1> is the voice-timbre reference for <Subject 1> (S1)." in fallback
+
+
 def test_materializer_preserves_official_ref2va_format(tmp_path: Path) -> None:
     _, rendered, _ = _materialize_sample(
         _sample(tmp_path),
@@ -4159,10 +4366,16 @@ def test_canonical_only_asd_miss_derives_real_in_pair_without_mutating_source(
     assert len(derived.effective_subject_voices) == 1
     assert derived.audio_references[0].source_type == "mimo_recovered_target_voice"
     assert derived.audio_references[0].source_segment_id == "segment_1"
-    assert "<Audio 1> is the voice-timbre reference for <Subject 1> (S1)." in (
+    assert (
+        "<Audio 1> is the voice-timbre reference for <Subject 1> (S1), "
+        "featuring clear mid-register timbre with measured cadence."
+    ) in (
         derived.rendered_h3_prompt or ""
     )
-    assert "using the voice timbre referenced from <Audio 1>" in (
+    assert (
+        "using the clear mid-register timbre with measured cadence voice "
+        "referenced from <Audio 1>"
+    ) in (
         derived.rendered_h3_prompt or ""
     )
     assert "mimo_recovered" not in (derived.rendered_h3_prompt or "")
@@ -4195,7 +4408,10 @@ def test_existing_in_pair_is_enriched_in_subject_order_and_cross_is_unchanged(
         "existing_target_voice",
         "mimo_recovered_target_voice",
     ]
-    assert "<Audio 2> is the voice-timbre reference for <Subject 2> (S1)." in (
+    assert (
+        "<Audio 2> is the voice-timbre reference for <Subject 2> (S1), "
+        "featuring clear mid-register timbre with measured cadence."
+    ) in (
         in_pair.rendered_h3_prompt or ""
     )
     assert canonical.effective_subject_voices == []

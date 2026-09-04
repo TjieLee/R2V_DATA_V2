@@ -26,11 +26,11 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v12"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v7"
-MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.8"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.10"
-MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v7"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v13"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v8"
+MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.9"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.11"
+MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v8"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
 
@@ -270,6 +270,7 @@ class MimoAudioEvent(SchemaModel):
         "electronic",
         "human_non_speech",
         "diegetic_music",
+        "non_diegetic_music",
         "other",
     ]
     pattern: Literal["single", "repeated", "continuous"]
@@ -315,6 +316,14 @@ class MimoAudioSemantics(SchemaModel):
                 raise ValueError("present music requires a concise description")
         elif self.non_diegetic_music is not None:
             raise ValueError("absent or unknown music cannot publish a description")
+        has_non_diegetic_event = any(
+            event.category == "non_diegetic_music"
+            for event in self.temporal_non_speech_events
+        )
+        if has_non_diegetic_event and self.non_diegetic_music_status != "present":
+            raise ValueError(
+                "non-diegetic music event requires present global music semantics"
+            )
         events = self.temporal_non_speech_events
         rows = [event.model_dump(mode="json") for event in events]
         if len({_compact_json(row) for row in rows}) != len(rows):
@@ -421,9 +430,21 @@ class MimoAnnotationWarning(SchemaModel):
         return self
 
 
+class MimoSpeakerVoiceProfile(SchemaModel):
+    speaker_group: str = Field(pattern=r"^g[1-9]\d*$")
+    voice_characteristics: StrictStr | None
+
+    @model_validator(mode="after")
+    def validate_profile(self) -> MimoSpeakerVoiceProfile:
+        if self.voice_characteristics is not None and not self.voice_characteristics.strip():
+            raise ValueError("MiMo voice profile must be non-empty or null")
+        return self
+
+
 class MimoAVAnnotationDraft(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_av_annotation.8"] = MIMO25_SCHEMA_VERSION
+    schema_version: Literal["r2v.h3.mimo25_av_annotation.9"] = MIMO25_SCHEMA_VERSION
     segment_decisions: list[MimoSegmentDecision]
+    speaker_voice_profiles: list[MimoSpeakerVoiceProfile]
     audio_semantics: MimoAudioSemantics
     h3_draft: MimoH3Draft
     warnings: list[MimoAnnotationWarning] = Field(default_factory=list)
@@ -434,7 +455,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.10"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.11"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -451,17 +472,19 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v12"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v13"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v7"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v8"] = (
         MIMO25_POLICY_VERSION
     )
-    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.8"] = (
+    annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.9"] = (
         MIMO25_SCHEMA_VERSION
     )
     materializer_version: Literal[
-        "h3_mimo25_materializer_v6", "h3_mimo25_materializer_v7"
+        "h3_mimo25_materializer_v6",
+        "h3_mimo25_materializer_v7",
+        "h3_mimo25_materializer_v8",
     ] = (
         MIMO25_MATERIALIZER_VERSION
     )
@@ -678,55 +701,31 @@ class MimoBackendConfig:
 
 SYSTEM_PROMPT = """You are the unified audiovisual reconciliation model for an H3 shadow pipeline.
 
-AUTHORITATIVE PIPELINE FACTS
-1. Supplied DiariZen segment boundaries and sample ranges are authoritative acoustic boundaries for this pass. Every supplied DiariZen segment must receive exactly one decision, including segments with no LR-ASD binding or zero direct-anchor support. Never change, split, merge, delete, filter, or invent them and never invent precise subsegment timing.
-2. Supplied Qwen3-ASR text and language are authoritative transcript facts. Never transcribe, correct, rewrite, paraphrase, translate, repunctuate, complete, split, merge, or move their text. Your output schema contains no transcript field.
-3. Frozen Visual references define the only valid entities and reference ownership. Never invent an entity, Picture, Subject, or attribute owner.
-4. LR-ASD evidence, DiariZen source clusters, and current entity bindings are fallible proposals. Verify and correct only their speaker/entity structure using synchronized audiovisual evidence.
-5. The full target video is audiovisual observation evidence, not an H3 reference.
-6. Sound existence requires audible evidence. Video may identify or disambiguate an audible source but must not create an inaudible sound.
-7. Speaker identity is not vocal-event count. Multiple vocal sounds inside one segment never make that segment invalid.
-8. Never modify upstream files. Return exactly one compact JSON object matching the supplied schema.
+AUTHORITY
+- Preserve every supplied DiariZen segment, exact timing, and sample range. Every segment receives one decision even with LR-ASD=0, no binding, or zero direct-anchor support; never split, merge, delete, filter, or invent timing.
+- Qwen3-ASR text and language are immutable. Never transcribe, quote, correct, paraphrase, translate, repunctuate, or move dialogue; the schema has no transcript field.
+- Frozen Visual entities, Pictures, Subjects, order, and ownership are immutable. LR-ASD, source clusters, and current bindings are fallible proposals. The target video is observation, never <Video N>.
+- Sound requires audible evidence. Visual evidence may disambiguate a genuinely audible source but cannot invent sound. Return one compact JSON object matching the supplied contract.
 
-PASS 1 - SEGMENT / SPEAKER / ENTITY RECONCILIATION
-Return exactly one decision for every supplied segment ID, no more and no fewer. Preserve every segment. Temporary groups are clip-local g1, g2, ... ordered contiguously by chronological first appearance. Do not emit S1/S2. A source cluster may split and different source clusters may merge when AV evidence supports it.
+SPEAKER / ENTITY / PRESENTATION
+- segment_decisions follow every allowed_segment_id exactly once and in order. Clip-local g1, g2, ... identify speakers by first appearance, not turns. A pause, language, sentence, ASR, or segment boundary must not by itself create a new group. The same resolved visible entity reuses one group; one resolved group never maps to multiple visible entities. Source clusters may split or merge only with AV support.
+- Every decision includes entity_id. visible_entity requires one supplied entity and onscreen_spoken. Other binding statuses use null. Visible presence alone is insufficient. Reliable onscreen evidence is visible_lip_motion, or genuine mouth occlusion/back view marked speaker_visible_mouth_occluded together with av_temporal_alignment or voice_continuity. Voice continuity may preserve speaker-group identity but cannot alone bind a visible entity. LR-ASD/direct anchors are neither sufficient nor required.
+- Use offscreen_spoken, voice_over, message_voice_over, or device_playback when observed. Silent phone reading/typing must not become visible speech. Uncertain evidence stays uncertain and unbound. Never delete a segment for non-onscreen presentation.
+- Multiple vocal sounds inside one segment never make that segment invalid. Same-speaker particles/nonlexical sounds preserve the group; secondary non-speech vocalization preserves primary dialogue ownership. Overlapping or sequential secondary speech preserves the segment but requires acoustic refinement without invented internal timing.
 
-A primary_speaker_group represents one clip-local speaker identity, not one speech turn. A new segment, pause, language change, ASR change, sentence change, or turn boundary must not by itself create a new group. If multiple resolved visible_entity decisions identify the same entity_id, reuse the same primary_speaker_group. One resolved primary_speaker_group must never map to multiple visible entity_ids. Reconsider identity from audiovisual evidence when assignments conflict; do not blindly merge groups.
+AUDIO SEMANTICS
+- Emit only meaningful audible non-speech events. Coalesce repeated micro-events from one action; split distinct sources/times. Use contiguous chronological aeN IDs and concise English descriptions without transcript or H3 syntax.
+- Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
+- overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground an audible source but never create one.
+- Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Describe only stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Never copy dialogue or infer age, gender, nationality, role, identity, or personality.
+- audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.
 
-Every segment decision must explicitly include the entity_id key. For binding_status=visible_entity, entity_id must be one exact supplied bindable entity ID. For every other binding_status, entity_id must be null.
-
-Speaker identity, visible-entity binding, and speech audiovisual presentation are three different questions. A visible person being present is NOT by itself evidence that they are speaking. onscreen_spoken and visible_entity are allowed when synchronized mouth, lip, or jaw motion is visible, recorded as visible_lip_motion; or when the visible speaker's mouth is genuinely occluded or the speaker is back-facing and speaker_visible_mouth_occluded is paired with av_temporal_alignment or voice_continuity. av_temporal_alignment and voice_continuity may support clip-local speaker-group identity continuity, but without visible_lip_motion or speaker_visible_mouth_occluded they cannot establish that a visible entity is speaking. A face or visible body alone is insufficient. source_cluster_support, LR-ASD activity, direct-anchor support, and the current binding are proposals or supporting evidence and cannot independently establish visible_entity. LR-ASD activity and direct-anchor support are not required: a segment with LR-ASD=0, an unbound current proposal, or direct_anchor_seconds=0 may still be corrected to visible_entity when the target audiovisual evidence supplies direct or genuinely mouth-occluded visible-speaker evidence. onscreen_spoken with no reliable supplied identity remains legal with entity_id=null when the same onscreen-speaker evidence is present.
-
-If a visible person silently reads a phone, looks at a message, types, reacts, or listens while a voice is heard, do not classify the voice as onscreen_spoken merely because it sounds like that character. If speech audibly reads or represents displayed or typed messaging while the visible person does not speak, use message_voice_over with entity_id=null. Use voice_over for narration, inner voice, editorial voice-over, or other speech not produced by a visible speaking mouth. Use offscreen_spoken for speech from outside the frame. Use device_playback for speech audibly emitted by an in-scene phone, television, radio, video, or recording. When the audiovisual evidence is insufficient, use uncertain and remove visible-entity binding. Never delete an authoritative segment because its presentation is non-onscreen: Qwen3-ASR transcript/language and DiariZen exact timing remain authoritative.
-
-Conceptual examples: a visible person silently reads or types on a phone while a voice reads the message means speech_presentation=message_voice_over, binding_status must not be visible_entity, and entity_id=null. A visible person who visibly articulates speech in sync means speech_presentation=onscreen_spoken; binding_status may be visible_entity only when identity is independently supported.
-
-Do NOT interpret more than one audible vocal event as evidence that an upstream segment is invalid. A valid segment may include discourse particles or interjections from its primary speaker; sighing, breathing, laughter, coughing, hesitation, or other non-lexical vocalization from the same speaker; a brief non-speech vocalization from another person; overlapping secondary speech; or sequential speech by two speakers. Short particles such as 嗯, 啊, 唉, 哦, 诶, uh, um, hm, oh, and ah do not by themselves prove a speaker change. same_speaker_nonlexical preserves the group. secondary_non_speech_vocalization preserves primary dialogue ownership. overlapping_secondary_speech and sequential_multi_speaker_speech preserve the source segment but require needs_acoustic_refinement; never invent an internal change timestamp.
-
-PASS 2 - AV AUDIO SEMANTICS
-Describe only meaningfully audible non-speech events, delivery, soundscape, and music. Synchronized video may ground an audible door close, cup placement, or other source; visible action alone cannot establish sound. Use generic impact/clink when the source is uncertain. Coalesce repeated acoustically similar micro-events from one action into one event with pattern=repeated. Split only genuinely distinct sources, meanings, or times. Assign every temporal_non_speech_event a stable contiguous event_id ae1, ae2, ... in chronological order. Each event description must be one concise standalone English audible clause with no timestamp text, transcript, reference label, speaker syntax, dialogue markup, or placeholder. Do not guess HVAC, room acoustics, ventilation, machinery, or material source from scene plausibility. Set overall_soundscape_status to present only with a concise audible description, absent when no meaningful additional soundscape is audible, or unknown when the evidence is uncertain; absent and unknown require overall_soundscape=null. Music requires audible musical structure; visual context may distinguish diegetic from non-diegetic music. Set non_diegetic_music_status to present only with a concise audible description, absent when confidently absent, or unknown when uncertain; absent and unknown require non_diegetic_music=null. Each authoritative transcribed segment decision requires a non-empty delivery_style describing only audible pace, energy, loudness, articulation, hesitation, questioning, shouting, whispering, rhythm, and pauses. Every non-transcribed segment requires delivery_style=null. Never put transcript, gender, age, nationality, role, or identity in delivery_style.
-
-audiovisual_summary is a concise summary of directly observed audiovisual context. It must not quote or paraphrase dialogue and must not infer plot, relationship, intention, causality, or psychology.
-
-PASS 3 - H3 VISUAL / TEMPORAL DRAFT
-Write a generation-quality dense video description, not an ordinary caption or plot summary. For each real shot, cover every applicable observed dimension: visual style; shot scale and framing; camera angle; foreground, midground, and background composition; every salient visible subject's appearance; spatial positions and relationships; pose; body, arm, hand, and head motion; gaze; facial expression and visible expression changes; interactions; object state and state changes; environment; visible materials; readable scene text; lighting; color; camera motion or an explicitly stable/static camera; temporal progression through early, middle, and late portions; and supplied speech placeholders at their correct observed temporal positions.
-
-Use observed evidence, never plausible filler. Do not infer psychology or unsupported emotion, intent, causality, relationships, identity not supplied upstream, sounds from visible actions, invisible or offscreen events, or invented object details. For any segment whose speech_presentation is not onscreen_spoken, do not describe a visible subject as speaking, saying, replying verbally, whispering, shouting, uttering, moving lips to the dialogue, opening the mouth to say it, or lip-syncing. For message_voice_over, describe only observed messaging behavior such as looking at a phone, typing, reading, displayed text, or a visible reaction; never convert the voice-over into mouth-speaking action. The exact dialogue remains pipeline-owned placeholder material. For information-rich clips, target roughly 300-450 English words across the materialized detailed description when visual evidence supports that amount. Do not pad a simple clip to hit a word count. Current clips are normally single-shot; add a later shot only for a real hard cut. Never write [Shot N]; the pipeline owns shot headers.
-
-SUPPLIED <Picture N> AND <Subject N> LABELS are immutable pipeline-provided labels. Reuse them exactly where required; never renumber or invent them. Use supplied Picture and Subject labels in subject definitions and visual retention analysis. Do not emit <Video N>, <Audio N>, unknown Picture/Subject labels, your own reference numbering, (Sx), <d>, donor provenance, or final H3 formatting. The target video is observation only and is never <Video N>. Pictures are content references, not first frames, last frames, or keyframes.
-
-Subject definitions must remain natural official MiniMax H3 Ref2VA prose. The per-request mandatory H3 draft contract supplies the exact pipeline-owned Subject-to-Picture provenance. Write exactly one definition for each supplied Subject, begin it with that exact Subject label, and naturally cite every and only its required Picture labels exactly once. Do not impose or invent a fixed English phrase for that relationship.
-
-The only allowed visual retention markers are fully_preserved, partially_preserved, and weak_reference. attribute_transfer is forbidden by the current conditioning contract. Do not invent another marker.
-
-Every supplied DiariZen segment in allowed_segment_ids must receive exactly one segment_decisions row in supplied order, whether transcribed or not. Across shot timeline_parts, speech parts must exactly follow transcribed_segment_ids in authoritative chronological order, once each, at observed positions; never emit a speech part for a non-transcribed segment. Each speech part represents the complete pipeline-owned speech clause, so adjacent prose must not prefix it with says, speaks, asks, replies, shouts, whispers, a character name, pronoun, or role. Do not copy dialogue.
-
-Insert every emitted Audio event exactly once as an audio_event timeline part at its approximate observed position in the appropriate shot. Audio-event parts must follow event chronological order and may overlap speech parts. Each part represents the complete grounded Audio-event clause. Do not restate or paraphrase that event elsewhere in prose.
-
-Every supplied <Subject N> must have exactly one visual_retention_analysis line beginning with that exact Subject label and containing exactly one allowed retention marker. Do not use Picture labels as retention owners and do not emit unknown or duplicate Subject retention lines.
-
-PASS 4 - CONSISTENCY CHECK BEFORE JSON
-Check: every source segment exactly once even when LR-ASD is unbound or direct-anchor support is zero; every decision explicitly contains entity_id and the required segment-level delivery_style; no unknown segment/entity/reference; no timestamp or transcript changes; contiguous gN first appearance; primary_speaker_group denotes identity rather than turn; the same resolved visible entity reuses one group and one resolved group never maps to multiple visible entities; visible_entity only with onscreen_spoken plus visible_lip_motion OR speaker_visible_mouth_occluded with av_temporal_alignment or voice_continuity; voice continuity may preserve speaker-group identity but cannot alone bind a visible entity; every non-onscreen or uncertain presentation with entity_id=null; no segment dropped for multiple vocal events; repeated micro-events coalesced; no sound from visual evidence alone; typed speech and Audio-event inventories are exact and chronological; all supplied Subject definitions retain their source Pictures; every supplied Subject has exactly one retention line; prose contains no pipeline-owned syntax; JSON only with no markdown or extra fields."""
+H3 DRAFT
+- Write dense generation-quality observed video prose, not a caption. For each real shot cover applicable visual style; shot scale and framing; camera angle; foreground, midground, and background composition; salient subject appearance and spatial relationships; pose; body, arm, hand, and head motion; gaze; facial expression changes; interactions; object states; environment/materials/readable text; lighting/color; camera motion or explicit stability; and temporal progression through early, middle, and late portions. Target roughly 300-450 English words only when evidence supports it; never pad.
+- Use observed evidence, not plausible filler. Do not infer unsupported emotion/psychology, intent, causality, relationships, identity, sound, offscreen events, or object detail. Non-onscreen speech must not create visible speaking/lip motion. Add later shots only for real hard cuts.
+- Subject definitions are natural official MiniMax H3 Ref2VA prose. Begin each row with its exact Subject and naturally integrate every and only its required Picture labels exactly once. Avoid mechanically repeating one connector such as "as seen in" across all rows; natural forms such as "in", "shown in", "depicted in", "from", or "whose appearance comes from" are all valid. Pictures are content references, not first frames, last frames, or keyframes.
+- Retention has exactly one row per Subject and one of fully_preserved, partially_preserved, weak_reference. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
+- timeline_parts alone place typed prose, speech, and audio events. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in order and their descriptions are not repeated in prose. The deterministic materializer owns final official H3 syntax."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -1009,6 +1008,29 @@ def validate_annotation(
                     "non-transcribed segment requires delivery_style=null",
                 )
             )
+    required_profile_groups: list[str] = []
+    for decision in decisions:
+        group = decision.primary_speaker_group
+        if (
+            decision.resolution == "resolved"
+            and decision.segment_id in transcribed_segment_set
+            and group is not None
+            and group not in required_profile_groups
+        ):
+            required_profile_groups.append(group)
+    actual_profile_groups = [
+        profile.speaker_group for profile in annotation.speaker_voice_profiles
+    ]
+    if actual_profile_groups != required_profile_groups or len(
+        actual_profile_groups
+    ) != len(set(actual_profile_groups)):
+        issues.append(
+            ValidationIssue(
+                "speaker_voice_profile_inventory_mismatch",
+                "speaker_voice_profiles",
+                "voice profiles must exactly follow resolved transcribed speaker groups",
+            )
+        )
     for event in annotation.audio_semantics.temporal_non_speech_events:
         if event.approximate_end_time > target_duration_seconds + 1e-6:
             issues.append(
@@ -1393,6 +1415,11 @@ def validate_annotation(
             else []
         ),
         audio_semantics.audiovisual_summary,
+        *(
+            item.voice_characteristics
+            for item in annotation.speaker_voice_profiles
+            if item.voice_characteristics is not None
+        ),
     ]
     normalized_audio_fields = [
         _normalized_text(value) for value in model_owned_audio_fields
@@ -1525,20 +1552,6 @@ class OpenAIMimo25Backend:
     @staticmethod
     def build_compact_task_contract(job: MimoBackendJob) -> dict[str, object]:
         payload = job.model_dump(mode="json")
-        references = payload.get("reference_images", [])
-        if not isinstance(references, list):
-            raise TypeError("MiMo reference inventory is invalid")
-        compact_references = []
-        for reference in references:
-            if not isinstance(reference, dict):
-                raise TypeError("MiMo reference metadata is invalid")
-            compact_references.append(
-                {
-                    key: value
-                    for key, value in reference.items()
-                    if key not in {"image_artifact_path", "image_sha256"}
-                }
-            )
         segments = payload.get("segments", [])
         if not isinstance(segments, list):
             raise TypeError("MiMo segment inventory is invalid")
@@ -1546,8 +1559,15 @@ class OpenAIMimo25Backend:
             "clip_uid": job.clip_uid,
             "r2v_instruction": job.r2v_instruction,
             "target_duration_seconds": job.target_duration_seconds,
-            "reference_images": compact_references,
-            "reference_subjects": payload.get("reference_subjects", []),
+            "subject_definition_requirements": [
+                {
+                    "subject_label": subject.subject_label,
+                    "required_source_picture_labels": list(
+                        subject.source_picture_labels
+                    ),
+                }
+                for subject in job.reference_subjects
+            ],
             "segments": segments,
             "allowed_segment_ids": [item.segment_id for item in job.segments],
             "transcribed_segment_ids": [
@@ -1562,91 +1582,47 @@ class OpenAIMimo25Backend:
                     if item.kind == "subject" and item.entity_id is not None
                 }
             ),
-            "allowed_picture_labels": [
-                item.picture_label for item in job.reference_images
-            ],
-            "allowed_subject_labels": [
-                item.subject_label for item in job.reference_subjects
-            ],
         }
 
     @staticmethod
     def build_mandatory_h3_draft_contract(
         job: MimoBackendJob,
     ) -> dict[str, object]:
-        transcribed_segment_ids = [
-            item.segment_id
-            for item in job.segments
-            if item.asr_status == "transcribed"
-        ]
+        contract = OpenAIMimo25Backend.build_compact_task_contract(job)
         return {
-            "subject_definition_requirements": [
-                {
-                    "subject_label": subject.subject_label,
-                    "required_source_picture_labels": list(
-                        subject.source_picture_labels
-                    ),
-                }
-                for subject in job.reference_subjects
-            ],
-            "allowed_segment_ids": [item.segment_id for item in job.segments],
-            "transcribed_segment_ids": transcribed_segment_ids,
-            "required_speech_segment_sequence": transcribed_segment_ids,
-            "forbidden_speech_segment_ids": [
-                item.segment_id
-                for item in job.segments
-                if item.segment_id not in transcribed_segment_ids
-            ],
+            key: contract[key]
+            for key in (
+                "subject_definition_requirements",
+                "allowed_segment_ids",
+                "transcribed_segment_ids",
+                "allowed_speaker_bindable_entity_ids",
+            )
         }
 
     @classmethod
     def _mandatory_h3_draft_contract_text(cls, job: MimoBackendJob) -> str:
         return (
-            "MACHINE-READABLE MANDATORY H3 DRAFT CONTRACT:\n"
+            "MANDATORY MACHINE CONTRACT:\n"
             + _compact_json(cls.build_mandatory_h3_draft_contract(job))
-            + "\nMANDATORY H3 DRAFT SYNTAX RULES:\n"
-            "1. segment_decisions must cover every allowed_segment_ids item exactly "
-            "once and in supplied order, including non-transcribed segments. Every row "
-            "must explicitly include entity_id; visible_entity uses one supplied ID and "
-            "all other binding statuses use null. Each row whose segment_id appears in "
-            "transcribed_segment_ids requires a concise audible delivery_style; every "
-            "other row requires delivery_style=null.\n"
-            "2. Flatten speech timeline-part segment_id values across h3_draft.shots. "
-            "The resulting list must equal required_speech_segment_sequence exactly, once "
-            "each and in order. Never emit a speech part for forbidden_speech_segment_ids. "
-            "The model chooses only the observed shot and position, not eligibility.\n"
-            "3. primary_speaker_group is clip-local speaker identity, not turn identity. "
-            "Do not create a new group for a pause, segment, language, ASR, sentence, or "
-            "turn boundary. Reuse one group for resolved visible_entity decisions with "
-            "the same entity_id, and never map one resolved group to multiple visible "
-            "entity_ids.\n"
-            "4. subject_definitions must contain exactly one row per "
-            "subject_definition_requirements item. Each row must begin with its exact "
-            "subject_label, contain ALL AND ONLY its required_source_picture_labels "
-            "exactly once each, and contain no other Subject label.\n"
-            "5. Subject definitions must be natural official H3 Ref2VA English prose. "
-            "There is no required fixed English connector. Illustrative metasyntax only: "
-            "'{subject_label} is ... in {required_picture_label_1} and "
-            "{required_picture_label_2} ...'. Replace every brace token with the supplied "
-            "labels and do not emit brace tokens.\n"
-            "6. timeline_parts is the only place for typed speech and audio_event "
-            "references. Prose parts must not contain internal placeholders, (Sx), <d>, "
-            "[Shot N], <Video N>, or <Audio N>. The deterministic materializer owns final "
-            "MiniMax H3 rendering."
+            + "\nUse allowed_segment_ids for all decisions and transcribed_segment_ids "
+            "for typed speech parts. Preserve exact Subject-to-Picture ownership."
         )
 
     def _prompt(self, job: MimoBackendJob) -> str:
-        return (
-            "Return exactly one JSON object matching this schema, with no markdown or extra fields.\n"
+        schema = (
+            "Return one JSON object matching this schema, with no markdown or extra fields:\n"
             + _compact_json(MimoAVAnnotationDraft.model_json_schema())
-            + "\nR2V INSTRUCTION:\n"
-            + job.r2v_instruction
-            + "\nThis is task intent and a non-authoritative visual hint. It may tell you how "
-            "the supplied references are intended to participate in generation, but it must "
-            "never override what is actually observed in the target video."
             + "\n"
+            if self.config.transport == "xiaomi"
+            else "Return one JSON object constrained by the supplied response_format.\n"
+        )
+        return (
+            schema
+            + "R2V INSTRUCTION:\n"
+            + job.r2v_instruction
+            + "\nThis intent hint never overrides observed target evidence.\n"
             + self._mandatory_h3_draft_contract_text(job)
-            + "\nCOMPACT AUTHORITATIVE INPUT:\n"
+            + "\nAUTHORITATIVE INPUT:\n"
             + _compact_json(self.build_compact_task_contract(job))
         )
 
@@ -1747,8 +1723,8 @@ class OpenAIMimo25Backend:
             issue_actions.append(
                 "For speech_placeholder_inventory_mismatch, rebuild all typed speech "
                 "timeline parts so their flattened segment_id sequence exactly equals "
-                "required_speech_segment_sequence. Do not derive eligibility again or "
-                "emit any forbidden_speech_segment_id."
+                "transcribed_segment_ids. Do not derive eligibility again or emit any "
+                "other segment ID."
             )
         if issue_codes & {
             "visible_entity_speaker_group_contradiction",
@@ -1790,20 +1766,20 @@ class OpenAIMimo25Backend:
             if issue_actions
             else ""
         )
+        schema = (
+            "\nSCHEMA: " + _compact_json(MimoAVAnnotationDraft.model_json_schema())
+            if self.config.transport == "xiaomi"
+            else ""
+        )
         return (
-            "Reinspect the SAME audiovisual evidence. Do not merely edit fields to "
-            "satisfy validation. Resolve speaker/entity/audio-semantic contradictions "
-            "from the audiovisual evidence while preserving all authoritative DiariZen "
-            "timing and Qwen3-ASR text. Do not change segment boundaries, sample "
-            "boundaries, ASR text, ASR language, or the reference inventory. Return "
-            "exactly one compact JSON object with no markdown or extra fields."
-            "\n"
+            "Reinspect the same full audiovisual evidence and correct the listed issues. "
+            "Preserve authoritative DiariZen timing, Qwen3-ASR text/language, and frozen "
+            "references. Return one compact JSON object.\n"
             + self._mandatory_h3_draft_contract_text(job)
             + actions
-            + "\nCOMPACT AUTHORITATIVE TASK CONTRACT: "
+            + "\nAUTHORITATIVE INPUT: "
             + _compact_json(self.build_compact_task_contract(job))
-            + "\nSCHEMA: "
-            + _compact_json(MimoAVAnnotationDraft.model_json_schema())
+            + schema
             + "\nVALIDATION ISSUES: "
             + _compact_json([item.to_dict() for item in issues])
             + "\nPREVIOUS INVALID RESPONSE: "
@@ -1994,6 +1970,7 @@ __all__ = [
     "MimoH3TimelinePart",
     "MimoMediaResolver",
     "MimoSegmentDecision",
+    "MimoSpeakerVoiceProfile",
     "MimoTransport",
     "OpenAIMimo25Backend",
     "SpeechPresentation",
