@@ -79,8 +79,13 @@ facts. A visible person alone does not establish visible speech. An
 `onscreen_spoken` segment may materialize as `<Subject N> (Sx) says, ...` when
 MiMo observes either `visible_lip_motion`, or a visible speaker whose mouth is
 genuinely occluded/back-facing together with AV alignment or voice-continuity
-evidence. AV alignment and voice continuity may preserve clip-local speaker
-identity, but they cannot alone establish that a visible entity is speaking.
+evidence. `visible_lip_motion` means speech-correlated mouth, lip, or jaw
+articulation in that exact segment; adjacent motion, gaze, expression, breathing,
+or general body movement does not qualify. AV alignment and voice continuity may
+preserve clip-local speaker identity, but they cannot alone establish that a
+visible entity is speaking or transfer the audible speaker to a visible listener.
+The same clip-local group may therefore remain `g1` while a later segment becomes
+`offscreen` / `entity_id=null` / `offscreen_spoken`.
 LR-ASD support, source-cluster support, current bindings, and direct anchors are
 proposals rather than visible-speaking proof: MiMo may
 restore a supplied entity for an unbound or zero-anchor segment. Every DiariZen
@@ -111,10 +116,10 @@ they do not create additional MiMo model jobs.
 
 Prompt, policy, annotation schema, and materializer versions are:
 
-- `h3_mimo25_unified_av_reconcile_v16`
-- `h3_mimo25_av_authority_contract_v11`
+- `h3_mimo25_unified_av_reconcile_v17`
+- `h3_mimo25_av_authority_contract_v12`
 - `r2v.h3.mimo25_av_annotation.12`
-- `r2v.h3.mimo25_backend.14`
+- `r2v.h3.mimo25_backend.15`
 - `h3_mimo25_materializer_v11`
 - `h3_mimo25_recovered_voice_quality_v1`
 - `r2v.h3.mimo25_inventory.3`
@@ -209,7 +214,12 @@ model may use `absent` only for verified silence of this soundscape layer, which
 materializes as `N/A`. `unknown` is reserved for genuinely unavailable or
 uncertain Audio evidence and fails closed during shadow materialization instead
 of silently masquerading as confirmed silence. Visual context may disambiguate
-an audible source but can never invent room tone or another sound.
+an audible source but can never invent room tone or another sound. MiMo performs
+a full-timeline audible-event pass that includes brief physical sounds such as
+door actions, knocks, footsteps, impacts, object handling, scraping, clicks,
+bells, and beeps. Each grounded event appears once at its typed chronological
+timeline position, while `overall_soundscape` may summarize salient events in
+natural wording rather than repeating the event sentence mechanically.
 
 The materialized output remains official MiniMax H3 Ref2VA: the six sections
 are emitted in `subject_definitions`, `summary`, `retention_analysis`,
@@ -218,7 +228,9 @@ reference labels keep one meaning across sections; and dialogue uses stable
 `(Sx)` source IDs with `<d>[Language] ...</d>`. The mandatory draft contract
 does not redefine official reference-label or retention-marker semantics. The
 typed timeline is internal annotation structure only and never appears in the
-final Ref2VA text.
+final Ref2VA text. Approximate event times are internal placement evidence, and
+ordinary observed target-video sounds never create an `<Audio N>` reference;
+that label remains reserved for an actual copied or referenced Audio asset.
 
 ## Post-MiMo target voice recovery
 

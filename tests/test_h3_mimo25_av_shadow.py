@@ -717,9 +717,9 @@ def test_current_backend_schema_keeps_existing_materializer_v6_provenance_readab
     assert current.materializer_version == "h3_mimo25_materializer_v11"
 
 
-def test_mimo_v16_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
-    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v16"
-    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v11"
+def test_mimo_v17_prompt_preserves_dense_visual_and_audio_authority_contract() -> None:
+    assert MIMO25_PROMPT_VERSION == "h3_mimo25_unified_av_reconcile_v17"
+    assert MIMO25_POLICY_VERSION == "h3_mimo25_av_authority_contract_v12"
     assert MIMO25_SCHEMA_VERSION == "r2v.h3.mimo25_av_annotation.12"
     for phrase in (
         "shot scale and framing",
@@ -743,6 +743,17 @@ def test_mimo_v16_prompt_preserves_dense_visual_and_audio_authority_contract() -
         "Supported audible descriptors such as male, female, youthful, or mature",
         "Frozen Subject-to-Picture provenance is pipeline-owned",
         "do not repeat any Subject or Picture label",
+        "Decide clip-local speaker identity independently",
+        "articulation in an adjacent segment does not count",
+        "a visible listener must never inherit the audible speaker identity",
+        "must never carry entity_id into a later segment",
+        "self-audit every visible_entity decision",
+        "Perform a full-timeline pass",
+        "door opening, closing, and latch sounds",
+        "must not be omitted merely because it is brief",
+        "Visible motion alone never creates sound",
+        "1-4 natural English sentences",
+        "ordinary observed target-video sounds never create <Audio N>",
     ):
         assert phrase in SYSTEM_PROMPT
     assert "natural official MiniMax H3 Ref2VA visual description" in (
@@ -1188,6 +1199,36 @@ def test_visible_entity_allows_mouth_occluded_continuity_evidence(
     assert annotation.segment_decisions[0].entity_id == "e1"
     assert not _validate(annotation)
     assert "lr_asd_support" not in evidence_codes
+
+
+def test_mouth_occluded_path_allows_explicit_no_visible_lip_motion() -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"] = [
+        "speaker_visible_mouth_occluded",
+        "voice_continuity",
+        "no_visible_lip_motion",
+    ]
+
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    assert not _validate(annotation)
+
+
+@pytest.mark.parametrize(
+    "contradiction",
+    ["offscreen_audio", "voice_over_context", "device_playback_context"],
+)
+def test_visible_speaker_rejects_explicit_presentation_contradiction(
+    contradiction: str,
+) -> None:
+    payload = _annotation().model_dump(mode="json")
+    payload["segment_decisions"][0]["evidence_codes"].append(contradiction)
+
+    issues = _validate(MimoAVAnnotationDraft.model_validate(payload))
+
+    assert "visible_speaker_evidence_presentation_contradiction" in {
+        item.code for item in issues
+    }
 
 
 def test_mouth_occlusion_without_continuity_is_not_onscreen_evidence() -> None:
@@ -1856,8 +1897,9 @@ def test_full_av_recheck_targets_unreliable_onscreen_speaker_evidence(
     )
 
     for phrase in (
-        "reinspect every affected segment in the actual audiovisual media",
+        "reinspect every affected segment in its exact audiovisual interval",
         "synchronized mouth, lip, or jaw motion",
+        "not merely an adjacent segment",
         "include visible_lip_motion",
         "speaker_visible_mouth_occluded",
         "av_temporal_alignment and/or voice_continuity",
@@ -1869,9 +1911,31 @@ def test_full_av_recheck_targets_unreliable_onscreen_speaker_evidence(
         "Never invent lip motion or mouth occlusion",
         "never preserve visible_entity merely to satisfy validation",
         "never bind a person merely because the same voice continues",
+        "never transfer the audible speaker to a visible listener",
         "source_cluster_support or the current binding proposes it",
     ):
         assert phrase in prompt
+
+
+def test_full_av_recheck_explains_presentation_evidence_contradiction(
+    tmp_path: Path,
+) -> None:
+    backend, _ = _backend(tmp_path, [])
+    prompt = backend._full_av_recheck_prompt(
+        _job_fixture(tmp_path),
+        invalid_response="{}",
+        issues=[
+            ValidationIssue(
+                "visible_speaker_evidence_presentation_contradiction",
+                "segment_1",
+                "visible claim conflicts with offscreen evidence",
+            )
+        ],
+    )
+
+    assert "reinspect the exact segment" in prompt
+    assert "offscreen_audio, voice_over_context, or device_playback_context" in prompt
+    assert "Speaker-group identity may continue" in prompt
 
 
 def test_unreliable_onscreen_evidence_can_be_corrected_by_one_recheck(
@@ -4484,6 +4548,76 @@ def _repeated_speech_inputs(
     )
 
 
+def test_same_speaker_group_can_move_offscreen_without_entity_propagation(
+    tmp_path: Path,
+) -> None:
+    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=False)
+    assert record.annotation is not None
+    payload = record.annotation.model_dump(mode="json")
+    second = payload["segment_decisions"][1]
+    second.update(
+        binding_status="offscreen",
+        speech_presentation="offscreen_spoken",
+        entity_id=None,
+        evidence_codes=["offscreen_audio", "voice_continuity"],
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+    intervals = {
+        segment.segment_id: (segment.start_time, segment.end_time)
+        for segment in job.segments
+    }
+
+    assert not _validate(
+        annotation,
+        segment_ids=[segment.segment_id for segment in job.segments],
+        segment_intervals=intervals,
+        transcribed_segment_ids=[segment.segment_id for segment in job.segments],
+        authoritative_transcripts=[segment.asr_text or "" for segment in job.segments],
+        target_duration_seconds=job.target_duration_seconds,
+    )
+    corrected, rendered, _ = _materialize_sample(
+        sample,
+        job,
+        _record_fixture(tmp_path, annotation, job=job),
+    )
+
+    assert corrected[0].speaker_cluster_id == corrected[1].speaker_cluster_id == "g1"
+    assert corrected[0].entity_id == "e1"
+    assert corrected[1].entity_id is None
+    assert "<Subject 1> (S1)" in rendered
+    assert "(S1), speaking offscreen: <d>[English] Exact line 2.</d>" in rendered
+
+
+def test_visible_listener_prose_does_not_reattach_continuing_speaker_entity(
+    tmp_path: Path,
+) -> None:
+    sample, job, record = _repeated_speech_inputs(tmp_path, second_shot=False)
+    assert record.annotation is not None
+    payload = record.annotation.model_dump(mode="json")
+    payload["h3_draft"]["shots"][0]["timeline_parts"][0] = _prose(
+        "A visible listener keeps a closed mouth while the established voice continues."
+    )
+    second = payload["segment_decisions"][1]
+    second.update(
+        binding_status="no_reliable_entity",
+        speech_presentation="uncertain",
+        entity_id=None,
+        evidence_codes=["voice_continuity", "insufficient_evidence"],
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    corrected, rendered, _ = _materialize_sample(
+        sample,
+        job,
+        _record_fixture(tmp_path, annotation, job=job),
+    )
+
+    assert corrected[0].speaker_cluster_id == corrected[1].speaker_cluster_id == "g1"
+    assert corrected[1].entity_id is None
+    assert "(S1), with speech presentation uncertain" in rendered
+    assert "<Subject 1> (S1) says, <d>[English] Exact line 2.</d>" not in rendered
+
+
 def test_materializer_cites_voice_audio_once_per_speaker_per_shot(
     tmp_path: Path,
 ) -> None:
@@ -4864,6 +4998,82 @@ def test_materializer_inserts_every_audio_event_description_exactly_once(
     for event in annotation.audio_semantics.temporal_non_speech_events:
         assert rendered.count(event.description) == 1
     assert "[[audio_event:" not in rendered
+
+
+def test_observed_door_close_renders_once_without_creating_audio_reference(
+    tmp_path: Path,
+) -> None:
+    sample = _sample(tmp_path)
+    sample_payload = sample.model_dump(mode="python")
+    sample_payload.update(
+        sample_id="clip-1/canonical",
+        pair_id="canonical/clip-1",
+        pair_type="canonical",
+        subject_voices=[],
+    )
+    canonical = FinalH3SampleV2.model_validate(sample_payload)
+    payload = _annotation().model_dump(mode="json")
+    event = payload["audio_semantics"]["temporal_non_speech_events"][0]
+    event.update(
+        approximate_start_time=0.45,
+        approximate_end_time=0.55,
+        category="physical",
+        pattern="single",
+        description="A door closes with a brief solid thud.",
+        source_grounding="audiovisually_grounded",
+    )
+    payload["audio_semantics"]["overall_soundscape"] = (
+        "Low indoor ambience is punctuated by the solid thud of a closing door."
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    _, rendered, _ = _materialize_sample(
+        canonical,
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    assert rendered.count("A door closes with a brief solid thud.") == 1
+    assert "overall_soundscape:\nLow indoor ambience is punctuated" in rendered
+    assert "ae1" not in rendered
+    assert "0.45" not in rendered
+    assert "<audio_event>" not in rendered
+    assert "<sound_event>" not in rendered
+    assert "<Audio " not in rendered
+    assert rendered.index("A door closes with a brief solid thud.") < rendered.index(
+        "<d>[English] Exact, text!</d>"
+    )
+
+
+def test_multiple_physical_events_keep_chronological_materialized_order(
+    tmp_path: Path,
+) -> None:
+    payload = _two_audio_event_annotation().model_dump(mode="json")
+    first, second = payload["audio_semantics"]["temporal_non_speech_events"]
+    first.update(
+        category="physical",
+        description="A door latch clicks and the door closes.",
+    )
+    second.update(
+        category="physical",
+        description="Two quick footsteps cross the floor.",
+    )
+    payload["audio_semantics"]["overall_soundscape"] = (
+        "Quiet room ambience includes a closing door and quick footsteps."
+    )
+    annotation = MimoAVAnnotationDraft.model_validate(payload)
+
+    _, rendered, _ = _materialize_sample(
+        _sample(tmp_path),
+        _job_fixture(tmp_path),
+        _record_fixture(tmp_path, annotation),
+    )
+
+    first_text = "A door latch clicks and the door closes."
+    second_text = "Two quick footsteps cross the floor."
+    assert rendered.count(first_text) == rendered.count(second_text) == 1
+    assert rendered.index(first_text) < rendered.index(second_text)
+    assert "ae1" not in rendered and "ae2" not in rendered
 
 
 def test_materializer_retains_refinement_segment_without_entity(tmp_path: Path) -> None:

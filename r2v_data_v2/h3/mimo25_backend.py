@@ -26,10 +26,10 @@ from r2v_data_v2.structured_output import (
 
 MIMO25_MODEL = "mimo-v2.5"
 MIMO25_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
-MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v16"
-MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v11"
+MIMO25_PROMPT_VERSION = "h3_mimo25_unified_av_reconcile_v17"
+MIMO25_POLICY_VERSION = "h3_mimo25_av_authority_contract_v12"
 MIMO25_SCHEMA_VERSION = "r2v.h3.mimo25_av_annotation.12"
-MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.14"
+MIMO25_BACKEND_VERSION = "r2v.h3.mimo25_backend.15"
 MIMO25_MATERIALIZER_VERSION = "h3_mimo25_materializer_v11"
 DEFAULT_BASE64_LIMIT_BYTES = 50 * 1024 * 1024
 MimoTransport = Literal["xiaomi", "sglang"]
@@ -72,6 +72,9 @@ _TRUNCATED_FINISH_REASONS = {
     "max_completion_tokens",
     "token_limit",
 }
+_VISIBLE_PRESENTATION_CONTRADICTIONS = frozenset(
+    {"offscreen_audio", "voice_over_context", "device_playback_context"}
+)
 
 VocalComposition = Literal[
     "single_speaker",
@@ -520,7 +523,7 @@ class MimoThinkingContract(SchemaModel):
 
 
 class MimoBackendProvenance(SchemaModel):
-    schema_version: Literal["r2v.h3.mimo25_backend.14"] = MIMO25_BACKEND_VERSION
+    schema_version: Literal["r2v.h3.mimo25_backend.15"] = MIMO25_BACKEND_VERSION
     backend: Literal[
         "xiaomi_openai_compatible", "sglang_openai_compatible"
     ]
@@ -537,10 +540,10 @@ class MimoBackendProvenance(SchemaModel):
     media_mode: Literal["base64", "http"]
     media_root: str
     media_base_url: str | None = None
-    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v16"] = (
+    prompt_version: Literal["h3_mimo25_unified_av_reconcile_v17"] = (
         MIMO25_PROMPT_VERSION
     )
-    policy_version: Literal["h3_mimo25_av_authority_contract_v11"] = (
+    policy_version: Literal["h3_mimo25_av_authority_contract_v12"] = (
         MIMO25_POLICY_VERSION
     )
     annotation_schema_version: Literal["r2v.h3.mimo25_av_annotation.12"] = (
@@ -778,14 +781,19 @@ AUTHORITY
 
 SPEAKER / ENTITY / PRESENTATION
 - segment_decisions follow every allowed_segment_id exactly once and in order. Clip-local g1, g2, ... identify speakers by first appearance, not turns. A pause, language, sentence, ASR, or segment boundary must not by itself create a new group. The same resolved visible entity reuses one group; one resolved group never maps to multiple visible entities. Source clusters may split or merge only with AV support.
-- Every decision includes entity_id. visible_entity requires one supplied entity and onscreen_spoken. Other binding statuses use null. Visible presence alone is insufficient. Reliable onscreen evidence is visible_lip_motion, or genuine mouth occlusion/back view marked speaker_visible_mouth_occluded together with av_temporal_alignment or voice_continuity. Voice continuity may preserve speaker-group identity but cannot alone bind a visible entity. LR-ASD/direct anchors are neither sufficient nor required.
+- Decide clip-local speaker identity independently from per-segment visual presentation. primary_speaker_group may remain unchanged when that speaker goes off-screen, the camera cuts to a listener, or another person is visible. Previous visible binding, voice continuity, source-cluster continuity, LR-ASD proposals, and group continuity may preserve speaker identity, but must never carry entity_id into a later segment.
+- Every decision includes entity_id. visible_entity requires one supplied entity and onscreen_spoken, supported during that exact segment. visible_lip_motion means clearly observed speech-correlated mouth, lip, or jaw articulation during that segment; articulation in an adjacent segment does not count. A face, head motion, gaze change, expression, breathing, or general body motion does not count. A visible person with a closed or static mouth must not be bound merely because the same voice continues, and a visible listener must never inherit the audible speaker identity.
+- Reliable onscreen evidence is visible_lip_motion, or genuine mouth occlusion/back view marked speaker_visible_mouth_occluded together with av_temporal_alignment or voice_continuity. Voice continuity may preserve speaker-group identity but cannot alone bind a visible entity. LR-ASD/direct anchors are neither sufficient nor required, so a true visible speaker missed by ASD may still be recovered from reliable exact-segment AV evidence.
+- When the same known speaker continues outside the frame, preserve primary_speaker_group but use offscreen, entity_id=null, and offscreen_spoken. If the current visible source is not reliable, preserve the group when acoustically justified but use no_reliable_entity, entity_id=null, and uncertain rather than attaching a nearby visible person.
 - Use offscreen_spoken, voice_over, message_voice_over, or device_playback when observed. Silent phone reading/typing must not become visible speech. Uncertain evidence stays uncertain and unbound. Never delete a segment for non-onscreen presentation.
 - Multiple vocal sounds inside one segment never make that segment invalid. Same-speaker particles/nonlexical sounds preserve the group; secondary non-speech vocalization preserves primary dialogue ownership. Overlapping or sequential secondary speech preserves the segment but requires acoustic refinement without invented internal timing.
+- Before final JSON, self-audit every visible_entity decision without emitting extra fields or hidden reasoning: confirm the entity is visible in that exact segment; confirm exact-segment articulation or the strict mouth-occluded/back-facing evidence path; consider whether the camera instead shows a listener while the established speaker continues off-screen; and reject entity_id carried only from an earlier visible segment. If reliable current-segment onscreen evidence fails, do not publish visible_entity.
 
 AUDIO SEMANTICS
-- Emit only meaningful audible non-speech events. Coalesce repeated micro-events from one action; split distinct sources/times. Use contiguous chronological aeN IDs and concise English descriptions without transcript or H3 syntax.
+- Perform a full-timeline pass for meaningful audible non-speech sound, covering persistent ambience and discrete events. Check door opening, closing, and latch sounds; knocks; footsteps; impacts; object placement or handling; scraping or sliding; salient fabric or paper movement; mechanical clicks; bells; electronic beeps; abrupt environmental sounds; and non-verbal human sounds. These examples are not an exhaustive whitelist, and a clearly audible event must not be omitted merely because it is brief.
+- Emit an event only when genuinely audible. Visible motion alone never creates sound; visual evidence may only identify or disambiguate an audible source. Give localized events tight approximate internal start/end times for chronological placement. Coalesce micro-events from one continuous physical action, split genuinely distinct sounds, preserve contiguous chronological aeN IDs, and use concise literal acoustic generation-useful descriptions without transcript or H3 syntax.
 - Music requires audible musical structure. In-scene music characters can hear is diegetic_music; audience-only score/BGM is non_diegetic_music. Do not infer source from scene plausibility: uncertain source keeps global non-diegetic status unknown. A typed non_diegetic_music event requires present global non-diegetic music and a description.
-- overall_soundscape is a required core H3 semantic. Use present with one concise audible description whenever ambience, room tone, an environmental layer, a physical sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain. Do not repeat dialogue in overall_soundscape, and do not use non-diegetic music as a substitute for it.
+- overall_soundscape is a required core H3 semantic. Use present with 1-4 natural English sentences whenever ambience, room tone, an environmental layer, a physical sound, a non-verbal human sound, or another meaningful non-speech sound is audible, including low-level background sound in ordinary dialogue scenes. Summarize important physical action sounds across the full video instead of collapsing salient events into generic room-tone wording, while avoiding mechanical sentence duplication with timeline event prose. Do not repeat dialogue in overall_soundscape; do not repeat singing or diegetic music there, and do not use non-diegetic music as a substitute for it. Do not default a normal audiovisual clip to absent or unknown merely because no salient event was detected. Use absent only for verified complete silence of the soundscape; use unknown only when Audio evidence is genuinely unavailable or uncertain.
 - overall_soundscape and non_diegetic_music descriptions exist only when status=present. Video may ground or disambiguate a genuinely audible source but never create room tone or another sound from visual context.
 - Each transcribed segment requires concise audible delivery_style; non-transcribed segments use null. speaker_voice_profiles contains one row for every resolved speaker group owning transcribed speech, in first-appearance order. Use acoustic-first wording: stable audible pitch register, timbre, texture, baseline cadence, articulation, and clearly supported accent/dialect in one concise English sentence, or null. Supported audible descriptors such as male, female, youthful, or mature may supplement those acoustic properties but never establish visible identity. Never copy dialogue or infer nationality, ethnicity, occupation, role, named identity, family/social relationship, or personality.
 - audiovisual_summary is concise observed AV context without dialogue, plot, relationship, intention, causality, or psychology.
@@ -795,7 +803,7 @@ H3 DRAFT
 - Use observed evidence, not plausible filler. Do not infer unsupported emotion/psychology, intent, causality, relationships, identity, sound, offscreen events, or object detail. Non-onscreen speech must not create visible speaking/lip motion. Add later shots only for real hard cuts.
 - Subject definitions use typed subject_label plus natural official MiniMax H3 Ref2VA visual description. Set subject_label to the exact supplied Subject. Keep description visual-only and do not repeat any Subject or Picture label there. Frozen Subject-to-Picture provenance is pipeline-owned and will be appended deterministically after generation; never reproduce, reinterpret, omit, add, or reassign that provenance in description. Never put voice, vocal, pitch, timbre, cadence, articulation, accent, dialect, or speaking-rate concepts in a visual Subject description. Pictures are content references, not first frames, last frames, or keyframes.
 - Visual retention uses typed subject_label, marker, and description. Set subject_label to the exact supplied Subject; choose exactly one marker from fully_preserved, partially_preserved, weak_reference; and write visual explanation only in description without repeating a Subject label or marker. attribute_transfer is forbidden. Do not emit <Video N>, <Audio N>, (Sx), <d>, shot headers, donor provenance, or invented labels.
-- timeline_parts alone place typed prose, speech, and audio events. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in order and their descriptions are not repeated in prose. The deterministic materializer owns final official H3 syntax."""
+- timeline_parts alone place typed prose, speech, and audio events in target-video playback order. Speech parts exactly equal transcribed_segment_ids once each in order and contain no dialogue; prose must not prefix a complete speech clause. Audio-event parts exactly match emitted aeN events once each in chronological order and at the appropriate observed position; their descriptions are not repeated in prose. Internal event IDs and approximate event times never appear as final prose or invented sound timestamps. The deterministic materializer owns final official H3 syntax, and ordinary observed target-video sounds never create <Audio N> or a conditioning asset."""
 
 
 def _value(value: object, name: str) -> object | None:
@@ -971,6 +979,21 @@ def validate_annotation(
                     "onscreen_speech_requires_reliable_visible_speaker_evidence",
                     decision.segment_id,
                     "onscreen_spoken requires visible articulation or mouth-occluded visible-speaker continuity",
+                )
+            )
+        presentation_contradictions = sorted(
+            set(decision.evidence_codes) & _VISIBLE_PRESENTATION_CONTRADICTIONS
+        )
+        if (
+            decision.binding_status == "visible_entity"
+            or decision.speech_presentation == "onscreen_spoken"
+        ) and presentation_contradictions:
+            issues.append(
+                ValidationIssue(
+                    "visible_speaker_evidence_presentation_contradiction",
+                    decision.segment_id,
+                    "visible/onscreen speech conflicts with explicit non-onscreen "
+                    f"evidence: {presentation_contradictions}",
                 )
             )
         if (
@@ -1996,9 +2019,10 @@ class OpenAIMimo25Backend:
         }:
             issue_actions.append(
                 "For unreliable onscreen-speaker evidence, reinspect every affected "
-                "segment in the actual audiovisual media. Keep onscreen_spoken and "
+                "segment in its exact audiovisual interval. Keep onscreen_spoken and "
                 "visible_entity only if (A) synchronized mouth, lip, or jaw motion is "
-                "actually visible, then include visible_lip_motion; or (B) the visible "
+                "actually visible during that segment, not merely an adjacent segment, "
+                "then include visible_lip_motion; or (B) the visible "
                 "speaker's mouth is genuinely occluded or the speaker is back-facing, "
                 "then include speaker_visible_mouth_occluded together with "
                 "av_temporal_alignment and/or voice_continuity. If neither A nor B is "
@@ -2010,9 +2034,19 @@ class OpenAIMimo25Backend:
                 "not establish which visible entity is speaking. Never invent lip "
                 "motion or mouth occlusion, never preserve visible_entity merely to "
                 "satisfy validation, never bind a person merely because the same voice "
-                "continues while that person is visible, and never preserve "
+                "continues while that person is visible, never transfer the audible "
+                "speaker to a visible listener, and never preserve "
                 "visible_entity merely because source_cluster_support or the current "
                 "binding proposes it."
+            )
+        if "visible_speaker_evidence_presentation_contradiction" in issue_codes:
+            issue_actions.append(
+                "For a visible-speaker presentation contradiction, reinspect the exact "
+                "segment and publish only the supported presentation. Do not keep "
+                "visible_entity or onscreen_spoken together with offscreen_audio, "
+                "voice_over_context, or device_playback_context. Speaker-group identity "
+                "may continue while current entity_id becomes null; never transfer the "
+                "audible speaker to a visible listener."
             )
         actions = (
             "\nISSUE-SPECIFIC CONTRACT ACTIONS:\n" + "\n".join(issue_actions)
